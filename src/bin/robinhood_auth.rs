@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = RobinhoodClient::new("https://api.robinhood.com")?;
 
-    match client.initiate_login(&username, &password).await {
+    let challenge = match client.initiate_login(&username, &password).await {
         Ok(challenge) => {
             println!(
                 "Verification workflow ID: {}",
@@ -41,9 +41,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Device token: {}", challenge.device_token());
             println!("Request ID: {}", challenge.request_id());
+            challenge
         }
         Err(err) => {
             eprintln!("failed to initiate login: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    match client
+        .fetch_verification_result(&challenge.verification_workflow().id)
+        .await
+    {
+        Ok(result) => {
+            println!("Verification result: {result}");
+        }
+        Err(err) => {
+            eprintln!("failed to fetch verification result: {err}");
             std::process::exit(1);
         }
     }

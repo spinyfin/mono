@@ -9,7 +9,10 @@ use crate::error::RobinhoodClientError;
 pub struct RobinhoodClient {
     http: Client,
     base_url: Url,
+    identity_base_url: Url,
 }
+
+const DEFAULT_IDENTITY_BASE_URL: &str = "https://identi.robinhood.com/";
 
 impl RobinhoodClient {
     pub fn new(base_url: &str) -> Result<Self, RobinhoodClientError> {
@@ -18,8 +21,21 @@ impl RobinhoodClient {
     }
 
     pub fn with_http_client(http: Client, base_url: &str) -> Result<Self, RobinhoodClientError> {
+        Self::with_http_client_and_identity_base(http, base_url, DEFAULT_IDENTITY_BASE_URL)
+    }
+
+    pub fn with_http_client_and_identity_base(
+        http: Client,
+        base_url: &str,
+        identity_base_url: &str,
+    ) -> Result<Self, RobinhoodClientError> {
         let base_url = Url::parse(base_url)?;
-        Ok(Self { http, base_url })
+        let identity_base_url = Url::parse(identity_base_url)?;
+        Ok(Self {
+            http,
+            base_url,
+            identity_base_url,
+        })
     }
 
     pub fn base_url(&self) -> &Url {
@@ -64,6 +80,32 @@ impl RobinhoodClient {
             token_response.verification_workflow,
         ))
     }
+
+    pub async fn fetch_verification_result(
+        &self,
+        workflow_id: &str,
+    ) -> Result<bool, RobinhoodClientError> {
+        let path = format!("verification_workflows/polaris_migrated/{workflow_id}/");
+        let url = self
+            .identity_base_url
+            .join(&path)
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let response = self.http.get(url).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let verification: VerificationResultResponse = serde_json::from_slice(&body)?;
+        Ok(verification.result)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct VerificationResultResponse {
+    result: bool,
 }
 
 #[cfg(test)]
@@ -145,8 +187,13 @@ mod tests {
             .await;
 
         let base_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_http_client(Client::new(), &base_url).expect("valid base url");
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid base url");
 
         let challenge = client
             .initiate_login("user", "pass")
@@ -172,8 +219,13 @@ mod tests {
             .await;
 
         let base_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_http_client(Client::new(), &base_url).expect("valid base url");
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid base url");
 
         let err = client
             .initiate_login("user", "pass")
@@ -183,6 +235,71 @@ mod tests {
         match err {
             RobinhoodClientError::UnexpectedStatus(StatusCode::OK) => {}
             other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_verification_result_returns_true_on_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/verification_workflows/polaris_migrated/workflow-id/",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let result = client
+            .fetch_verification_result("workflow-id")
+            .await
+            .expect("result expected");
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn fetch_verification_result_errors_on_unexpected_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/verification_workflows/polaris_migrated/workflow-id/",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let err = client
+            .fetch_verification_result("workflow-id")
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RobinhoodClientError::UnexpectedStatus(StatusCode::NOT_FOUND) => {}
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }
