@@ -1,10 +1,12 @@
 use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use url::Url;
 use uuid::Uuid;
 
 use crate::auth::{
-    AUTH_ENDPOINT, AuthChallenge, IDENTITY_WORKFLOW_ENDPOINT_PREFIX, TokenRequest, TokenResponse,
-    WorkflowEntryPointRequest, WorkflowRoute, WorkflowRouteResponse,
+    AUTH_ENDPOINT, AuthChallenge, FinalTokenResponse, IDENTITY_WORKFLOW_ENDPOINT_PREFIX,
+    TokenRequest, TokenResponse, WorkflowEntryPointRequest, WorkflowProceedRequest, WorkflowRoute,
+    WorkflowRouteResponse,
 };
 use crate::error::RobinhoodClientError;
 
@@ -57,25 +59,12 @@ impl RobinhoodClient {
         let device_token = Uuid::new_v4();
         let request_id = Uuid::new_v4();
 
-        let device_token_string = device_token.to_string();
-        let request_id_string = request_id.to_string();
+        let device_token_str = device_token.to_string();
+        let request_id_str = request_id.to_string();
 
-        let payload =
-            TokenRequest::new(username, password, &device_token_string, &request_id_string);
+        let payload = TokenRequest::new(username, password, &device_token_str, &request_id_str);
 
-        let url = self
-            .base_url
-            .join(AUTH_ENDPOINT)
-            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
-
-        let response = self.http.post(url).json(&payload).send().await?;
-
-        if response.status() != StatusCode::FORBIDDEN {
-            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
-        }
-
-        let body = response.bytes().await?;
-        let token_response: TokenResponse = serde_json::from_slice(&body)?;
+        let token_response: TokenResponse = self.request_token(&payload, true).await?;
 
         Ok(AuthChallenge::new(
             device_token,
@@ -148,6 +137,69 @@ impl RobinhoodClient {
         let status: PushPromptStatusResponse = serde_json::from_slice(&body)?;
         Ok(status.challenge_status)
     }
+
+    pub async fn finalize_login(
+        &self,
+        username: &str,
+        password: &str,
+        device_token: &Uuid,
+        request_id: &Uuid,
+    ) -> Result<FinalTokenResponse, RobinhoodClientError> {
+        let device_token_str = device_token.to_string();
+        let request_id_str = request_id.to_string();
+
+        let payload = TokenRequest::new(username, password, &device_token_str, &request_id_str);
+
+        self.request_token(&payload, false).await
+    }
+
+    pub async fn complete_device_approval(
+        &self,
+        workflow_id: &str,
+    ) -> Result<WorkflowRoute, RobinhoodClientError> {
+        let path = format!("{IDENTITY_WORKFLOW_ENDPOINT_PREFIX}{workflow_id}/");
+        let url = self
+            .identity_base_url
+            .join(&path)
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let payload = WorkflowProceedRequest::new(workflow_id);
+
+        let response = self.http.patch(url).json(&payload).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let route: WorkflowRouteResponse = serde_json::from_slice(&body)?;
+        Ok(route.route)
+    }
+
+    async fn request_token<T>(
+        &self,
+        payload: &TokenRequest<'_>,
+        allow_forbidden: bool,
+    ) -> Result<T, RobinhoodClientError>
+    where
+        T: DeserializeOwned,
+    {
+        let url = self
+            .base_url
+            .join(AUTH_ENDPOINT)
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let response = self.http.post(url).json(payload).send().await?;
+
+        let status = response.status();
+        if !(status.is_success() || allow_forbidden && status == StatusCode::FORBIDDEN) {
+            return Err(RobinhoodClientError::UnexpectedStatus(status));
+        }
+
+        let body = response.bytes().await?;
+        let token = serde_json::from_slice(body.as_ref())?;
+        Ok(token)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -169,6 +221,7 @@ mod tests {
         TOKEN_REQUEST_PATH,
     };
     use serde_json::json;
+    use uuid::Uuid;
     use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -269,7 +322,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/oauth2/token/"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(ResponseTemplate::new(401))
             .expect(1)
             .mount(&server)
             .await;
@@ -289,7 +342,7 @@ mod tests {
             .expect_err("unexpected status should error");
 
         match err {
-            RobinhoodClientError::UnexpectedStatus(StatusCode::OK) => {}
+            RobinhoodClientError::UnexpectedStatus(StatusCode::UNAUTHORIZED) => {}
             other => panic!("unexpected error variant: {other:?}"),
         }
     }
@@ -516,6 +569,156 @@ mod tests {
 
         match err {
             RobinhoodClientError::UnexpectedStatus(StatusCode::NOT_FOUND) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_login_returns_token_on_success() {
+        let server = MockServer::start().await;
+
+        let device_token = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token/"))
+            .and(body_partial_json(json!({
+                "username": "user",
+                "password": "pass",
+                "grant_type": GRANT_TYPE,
+                "client_id": CLIENT_ID,
+                "device_token": device_token.to_string(),
+                "request_id": request_id.to_string(),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token",
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let token = client
+            .finalize_login("user", "pass", &device_token, &request_id)
+            .await
+            .expect("token response");
+
+        assert_eq!(token["access_token"], "token");
+    }
+
+    #[tokio::test]
+    async fn finalize_login_errors_on_unexpected_status() {
+        let server = MockServer::start().await;
+
+        let device_token = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token/"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let err = client
+            .finalize_login("user", "pass", &device_token, &request_id)
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RobinhoodClientError::UnexpectedStatus(StatusCode::BAD_REQUEST) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_device_approval_returns_route_exit() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/idl/v1/workflow/workflow-id/"))
+            .and(body_json(json!({
+                "clientVersion": IDENTITY_CLIENT_VERSION,
+                "screenName": "DEVICE_APPROVAL_CHALLENGE",
+                "id": "workflow-id",
+                "deviceApprovalChallengeAction": {
+                    "proceed": {}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "route": {
+                    "exit": {
+                        "status": "WORKFLOW_STATUS_APPROVED"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let route = client
+            .complete_device_approval("workflow-id")
+            .await
+            .expect("route expected");
+
+        let exit = route.exit.expect("exit route");
+        assert_eq!(exit.status, "WORKFLOW_STATUS_APPROVED");
+    }
+
+    #[tokio::test]
+    async fn complete_device_approval_errors_on_unexpected_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/idl/v1/workflow/workflow-id/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let err = client
+            .complete_device_approval("workflow-id")
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RobinhoodClientError::UnexpectedStatus(StatusCode::INTERNAL_SERVER_ERROR) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }

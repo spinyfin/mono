@@ -1,6 +1,7 @@
-use std::env;
+use std::{env, time::Duration};
 
 use broker_robinhood::{RobinhoodClient, WorkflowRoute, WorkflowScreen};
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let device_token = challenge.device_token();
+    let request_id = challenge.request_id();
+
     match client
         .fetch_verification_result(&challenge.verification_workflow().id)
         .await
@@ -68,7 +72,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(route) => {
             let challenge_id = print_route(&route);
-            poll_push_status(&client, challenge_id.as_deref()).await?;
+            let status = wait_for_push_validation(&client, challenge_id.as_deref()).await?;
+
+            match status.as_deref() {
+                Some("validated") => {
+                    complete_device_approval(&client, &challenge.verification_workflow().id)
+                        .await?;
+
+                    match client
+                        .finalize_login(&username, &password, &device_token, &request_id)
+                        .await
+                    {
+                        Ok(token) => {
+                            let formatted = serde_json::to_string_pretty(&token)?;
+                            println!("OAuth token response:\n{formatted}");
+                        }
+                        Err(err) => {
+                            eprintln!("failed to fetch final oauth token: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some("expired") => {
+                    println!("Push challenge expired; rerun the CLI to restart auth.");
+                }
+                Some(other) => {
+                    println!(
+                        "Push challenge ended with status `{other}`; skipping approval completion."
+                    );
+                }
+                None => {}
+            }
         }
         Err(err) => {
             eprintln!("failed to advance workflow entry point: {err}");
@@ -133,24 +167,64 @@ fn print_screen(screen: &WorkflowScreen) -> Option<String> {
     challenge_id
 }
 
-async fn poll_push_status(
+async fn wait_for_push_validation(
     client: &RobinhoodClient,
     challenge_id: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match challenge_id {
-        Some(challenge_id) => match client.fetch_push_prompt_status(challenge_id).await {
-            Ok(status) => {
-                println!("Push challenge status: {status}");
-            }
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(challenge_id) = challenge_id else {
+        println!("No sheriff challenge to poll.");
+        return Ok(None);
+    };
+
+    const MAX_ATTEMPTS: usize = 30;
+    const DELAY: Duration = Duration::from_secs(2);
+
+    let mut last_status: Option<String> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let status = match client.fetch_push_prompt_status(challenge_id).await {
+            Ok(status) => status,
             Err(err) => {
                 eprintln!("failed to fetch push prompt status: {err}");
                 std::process::exit(1);
             }
-        },
-        None => {
-            println!("No sheriff challenge to poll.");
+        };
+
+        println!("Push challenge status (attempt {attempt}/{MAX_ATTEMPTS}): {status}");
+
+        match status.as_str() {
+            "validated" | "expired" => return Ok(Some(status)),
+            _ => {
+                last_status = Some(status);
+                sleep(DELAY).await;
+            }
         }
     }
 
-    Ok(())
+    println!(
+        "Push challenge did not validate within allotted attempts (last status: {}).",
+        last_status.as_deref().unwrap_or("<unknown>")
+    );
+
+    Ok(last_status)
+}
+
+async fn complete_device_approval(
+    client: &RobinhoodClient,
+    workflow_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match client.complete_device_approval(workflow_id).await {
+        Ok(route) => {
+            if let Some(exit) = route.exit {
+                println!("Workflow exit status: {}", exit.status);
+            } else {
+                println!("Workflow completed without exit status.");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("failed to complete device approval: {err}");
+            std::process::exit(1);
+        }
+    }
 }

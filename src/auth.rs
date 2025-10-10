@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub(crate) const AUTH_ENDPOINT: &str = "oauth2/token/";
@@ -123,6 +124,41 @@ impl<'a> WorkflowEntryPointRequest<'a> {
 #[derive(Debug, Serialize)]
 struct EntryPointAction {}
 
+#[derive(Debug, Serialize)]
+pub(crate) struct WorkflowProceedRequest<'a> {
+    #[serde(rename = "clientVersion")]
+    client_version: &'a str,
+    #[serde(rename = "screenName")]
+    screen_name: &'a str,
+    #[serde(rename = "id")]
+    id: &'a str,
+    #[serde(rename = "deviceApprovalChallengeAction")]
+    device_approval_challenge_action: DeviceApprovalChallengeAction,
+}
+
+impl<'a> WorkflowProceedRequest<'a> {
+    pub(crate) fn new(workflow_id: &'a str) -> Self {
+        Self {
+            client_version: IDENTITY_CLIENT_VERSION,
+            screen_name: "DEVICE_APPROVAL_CHALLENGE",
+            id: workflow_id,
+            device_approval_challenge_action: DeviceApprovalChallengeAction {
+                proceed: Proceed {},
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceApprovalChallengeAction {
+    proceed: Proceed,
+}
+
+#[derive(Debug, Serialize)]
+struct Proceed {}
+
+pub type FinalTokenResponse = Value;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowRouteResponse {
     pub route: WorkflowRoute,
@@ -131,11 +167,17 @@ pub struct WorkflowRouteResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowRoute {
     pub replace: Option<WorkflowRouteReplace>,
+    pub exit: Option<WorkflowRouteExit>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct WorkflowRouteReplace {
     pub screen: WorkflowScreen,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowRouteExit {
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
