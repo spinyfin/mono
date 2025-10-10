@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "broker-robinhood",
+    crate_name = "broker_robinhood",
+    srcs = [
+        "src/client.rs",
+        "src/error.rs",
+        "src/lib.rs",
+    ],
+    deps = [
+        "@crates//:reqwest",
+        "@crates//:thiserror",
+        "@crates//:url",
+    ],
+)
+
+rust_test(
+    name = "broker_robinhood_tests",
+    size = "small",
+    crate = ":broker-robinhood",
+)
