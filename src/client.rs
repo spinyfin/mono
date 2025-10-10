@@ -127,11 +127,38 @@ impl RobinhoodClient {
         let route: WorkflowRouteResponse = serde_json::from_slice(&body)?;
         Ok(route.route)
     }
+
+    pub async fn fetch_push_prompt_status(
+        &self,
+        challenge_id: &str,
+    ) -> Result<String, RobinhoodClientError> {
+        let path = format!("push/{challenge_id}/get_prompts_status/");
+        let url = self
+            .base_url
+            .join(&path)
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let response = self.http.get(url).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let status: PushPromptStatusResponse = serde_json::from_slice(&body)?;
+        Ok(status.challenge_status)
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct VerificationResultResponse {
     result: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct PushPromptStatusResponse {
+    #[serde(rename = "challenge_status")]
+    challenge_status: String,
 }
 
 #[cfg(test)]
@@ -428,6 +455,67 @@ mod tests {
 
         match err {
             RobinhoodClientError::UnexpectedStatus(StatusCode::INTERNAL_SERVER_ERROR) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_push_prompt_status_returns_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/push/challenge-id/get_prompts_status/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge_status": "issued"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let status = client
+            .fetch_push_prompt_status("challenge-id")
+            .await
+            .expect("status expected");
+
+        assert_eq!(status, "issued");
+    }
+
+    #[tokio::test]
+    async fn fetch_push_prompt_status_errors_on_unexpected_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/push/challenge-id/get_prompts_status/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid urls");
+
+        let err = client
+            .fetch_push_prompt_status("challenge-id")
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RobinhoodClientError::UnexpectedStatus(StatusCode::NOT_FOUND) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }

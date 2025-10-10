@@ -67,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     {
         Ok(route) => {
-            print_route(&route);
+            let challenge_id = print_route(&route);
+            poll_push_status(&client, challenge_id.as_deref()).await?;
         }
         Err(err) => {
             eprintln!("failed to advance workflow entry point: {err}");
@@ -78,16 +79,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_route(route: &WorkflowRoute) {
+fn print_route(route: &WorkflowRoute) -> Option<String> {
     if let Some(replace) = &route.replace {
         println!("Route action: replace");
-        print_screen(&replace.screen);
+        print_screen(&replace.screen)
     } else {
         println!("Route action: none");
+        None
     }
 }
 
-fn print_screen(screen: &WorkflowScreen) {
+fn print_screen(screen: &WorkflowScreen) -> Option<String> {
+    let mut challenge_id = None;
+
     println!("Screen name: {}", screen.name);
     if let Some(block_id) = &screen.block_id {
         println!("Screen block ID: {block_id}");
@@ -102,6 +106,7 @@ fn print_screen(screen: &WorkflowScreen) {
         if let Some(challenge) = &params.sheriff_challenge {
             if let Some(id) = &challenge.id {
                 println!("Challenge ID: {id}");
+                challenge_id = Some(id.clone());
             }
             if let Some(challenge_type) = &challenge.challenge_type {
                 println!("Challenge type: {challenge_type}");
@@ -124,4 +129,28 @@ fn print_screen(screen: &WorkflowScreen) {
             println!("Fallback CTA text: {fallback}");
         }
     }
+
+    challenge_id
+}
+
+async fn poll_push_status(
+    client: &RobinhoodClient,
+    challenge_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match challenge_id {
+        Some(challenge_id) => match client.fetch_push_prompt_status(challenge_id).await {
+            Ok(status) => {
+                println!("Push challenge status: {status}");
+            }
+            Err(err) => {
+                eprintln!("failed to fetch push prompt status: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            println!("No sheriff challenge to poll.");
+        }
+    }
+
+    Ok(())
 }
