@@ -11,6 +11,8 @@ pub(crate) const LONG_SESSION: bool = true;
 pub(crate) const READ_ONLY_SECONDARY_TOKEN: bool = true;
 pub(crate) const SCOPE: &str = "internal";
 pub(crate) const TOKEN_REQUEST_PATH: &str = "/login/";
+pub(crate) const IDENTITY_CLIENT_VERSION: &str = "1.0.0";
+pub(crate) const IDENTITY_WORKFLOW_ENDPOINT_PREFIX: &str = "idl/v1/workflow/";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct TokenRequest<'a> {
@@ -96,4 +98,75 @@ impl AuthChallenge {
 #[derive(Debug, Deserialize)]
 pub(crate) struct TokenResponse {
     pub verification_workflow: VerificationWorkflow,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WorkflowEntryPointRequest<'a> {
+    #[serde(rename = "clientVersion")]
+    client_version: &'a str,
+    #[serde(rename = "id")]
+    id: &'a str,
+    #[serde(rename = "entryPointAction")]
+    entry_point_action: EntryPointAction,
+}
+
+impl<'a> WorkflowEntryPointRequest<'a> {
+    pub(crate) fn new(workflow_id: &'a str) -> Self {
+        Self {
+            client_version: IDENTITY_CLIENT_VERSION,
+            id: workflow_id,
+            entry_point_action: EntryPointAction {},
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EntryPointAction {}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowRouteResponse {
+    pub route: WorkflowRoute,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowRoute {
+    pub replace: Option<WorkflowRouteReplace>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowRouteReplace {
+    pub screen: WorkflowScreen,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkflowScreen {
+    pub name: String,
+    #[serde(rename = "blockId")]
+    pub block_id: Option<String>,
+    #[serde(rename = "deviceApprovalChallengeScreenParams")]
+    pub device_approval_challenge_screen_params: Option<DeviceApprovalChallengeScreenParams>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceApprovalChallengeScreenParams {
+    #[serde(rename = "sheriffChallenge")]
+    pub sheriff_challenge: Option<SheriffChallenge>,
+    #[serde(rename = "sheriffFlowId")]
+    pub sheriff_flow_id: Option<String>,
+    #[serde(rename = "fallbackCtaText")]
+    pub fallback_cta_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SheriffChallenge {
+    pub id: Option<String>,
+    #[serde(rename = "type")]
+    pub challenge_type: Option<String>,
+    pub status: Option<String>,
+    #[serde(rename = "remainingRetries")]
+    pub remaining_retries: Option<u32>,
+    #[serde(rename = "remainingAttempts")]
+    pub remaining_attempts: Option<u32>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<String>,
 }
