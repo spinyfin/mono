@@ -1,5 +1,5 @@
 use reqwest::{Client, StatusCode};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use url::Url;
 use uuid::Uuid;
 
@@ -27,6 +27,14 @@ impl RobinhoodClient {
 
     pub fn with_http_client(http: Client, base_url: &str) -> Result<Self, RobinhoodClientError> {
         Self::with_http_client_and_identity_base(http, base_url, DEFAULT_IDENTITY_BASE_URL)
+    }
+
+    pub fn with_base_urls(
+        base_url: &str,
+        identity_base_url: &str,
+    ) -> Result<Self, RobinhoodClientError> {
+        let http = Client::builder().build()?;
+        Self::with_http_client_and_identity_base(http, base_url, identity_base_url)
     }
 
     pub fn with_http_client_and_identity_base(
@@ -117,6 +125,34 @@ impl RobinhoodClient {
         Ok(route.route)
     }
 
+    pub async fn fetch_accounts(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<RobinhoodAccount>, RobinhoodClientError> {
+        let mut url = self
+            .base_url
+            .join("accounts/")
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+        url.set_query(Some(
+            "default_to_all_accounts=true&include_managed=true&include_multiple_individual=true&is_default=false",
+        ));
+
+        let response = self.http.get(url).bearer_auth(access_token).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let payload: RobinhoodAccountsResponse = serde_json::from_slice(&body)?;
+
+        Ok(payload
+            .results
+            .into_iter()
+            .map(RobinhoodAccount::from)
+            .collect())
+    }
+
     pub async fn fetch_push_prompt_status(
         &self,
         challenge_id: &str,
@@ -199,6 +235,36 @@ impl RobinhoodClient {
         let body = response.bytes().await?;
         let token = serde_json::from_slice(body.as_ref())?;
         Ok(token)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RobinhoodAccountsResponse {
+    results: Vec<RobinhoodAccountEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RobinhoodAccountEntry {
+    account_number: String,
+    brokerage_account_type: Option<String>,
+    #[serde(default)]
+    is_default: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RobinhoodAccount {
+    pub account_number: String,
+    pub brokerage_account_type: Option<String>,
+    pub is_default: bool,
+}
+
+impl From<RobinhoodAccountEntry> for RobinhoodAccount {
+    fn from(entry: RobinhoodAccountEntry) -> Self {
+        Self {
+            account_number: entry.account_number,
+            brokerage_account_type: entry.brokerage_account_type,
+            is_default: entry.is_default,
+        }
     }
 }
 
@@ -720,6 +786,101 @@ mod tests {
         match err {
             RobinhoodClientError::UnexpectedStatus(StatusCode::INTERNAL_SERVER_ERROR) => {}
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_accounts_returns_entries() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/accounts/"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer test-token",
+            ))
+            .and(wiremock::matchers::query_param(
+                "default_to_all_accounts",
+                "true",
+            ))
+            .and(wiremock::matchers::query_param("include_managed", "true"))
+            .and(wiremock::matchers::query_param(
+                "include_multiple_individual",
+                "true",
+            ))
+            .and(wiremock::matchers::query_param("is_default", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "account_number": "1234",
+                        "brokerage_account_type": "Cash",
+                        "is_default": true
+                    },
+                    {
+                        "account_number": "5678",
+                        "brokerage_account_type": "Margin",
+                        "is_default": false
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("construct client");
+
+        let accounts = client
+            .fetch_accounts("test-token")
+            .await
+            .expect("fetch accounts");
+
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].account_number, "1234");
+        assert_eq!(accounts[0].brokerage_account_type.as_deref(), Some("Cash"));
+        assert!(accounts[0].is_default);
+        assert_eq!(accounts[1].account_number, "5678");
+        assert_eq!(
+            accounts[1].brokerage_account_type.as_deref(),
+            Some("Margin")
+        );
+        assert!(!accounts[1].is_default);
+    }
+
+    #[tokio::test]
+    async fn fetch_accounts_errors_on_unexpected_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/accounts/"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("construct client");
+
+        let error = client
+            .fetch_accounts("test-token")
+            .await
+            .expect_err("unexpected status should error");
+
+        match error {
+            RobinhoodClientError::UnexpectedStatus(StatusCode::UNAUTHORIZED) => {}
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 }
