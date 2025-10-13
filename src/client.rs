@@ -1,4 +1,5 @@
 use reqwest::{Client, StatusCode};
+use serde::de::Error as _;
 use serde::{Deserialize, de::DeserializeOwned};
 use url::Url;
 use uuid::Uuid;
@@ -153,6 +154,81 @@ impl RobinhoodClient {
             .collect())
     }
 
+    pub async fn fetch_positions(
+        &self,
+        access_token: &str,
+        account_number: &str,
+    ) -> Result<Vec<RobinhoodPosition>, RobinhoodClientError> {
+        let mut url = self
+            .base_url
+            .join("positions/")
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+        url.set_query(Some(&format!(
+            "account_number={account_number}&nonzero=true"
+        )));
+
+        let mut positions = Vec::new();
+        let mut next_url: Option<Url> = Some(url);
+
+        while let Some(current_url) = next_url {
+            let response = self
+                .http
+                .get(current_url.clone())
+                .bearer_auth(access_token)
+                .send()
+                .await?;
+
+            if response.status() != StatusCode::OK {
+                return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+            }
+
+            let body = response.bytes().await?;
+            let page: RobinhoodPositionsResponse = serde_json::from_slice(&body)?;
+
+            for entry in page.results {
+                let symbol = entry.symbol.trim().to_uppercase();
+                if symbol.is_empty() {
+                    continue;
+                }
+
+                let quantity_text = entry.quantity.trim();
+                if quantity_text.is_empty() {
+                    continue;
+                }
+
+                let quantity = quantity_text.parse::<f64>().map_err(|error| {
+                    RobinhoodClientError::ResponseParse(serde_json::Error::custom(format!(
+                        "invalid quantity for symbol {symbol}: {error}"
+                    )))
+                })?;
+
+                positions.push(RobinhoodPosition { symbol, quantity });
+            }
+
+            next_url = match page.next {
+                Some(next) => {
+                    let trimmed = next.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        match Url::parse(trimmed) {
+                            Ok(url) => Some(url),
+                            Err(_) => match self.base_url.join(trimmed) {
+                                Ok(joined) => Some(joined),
+                                Err(err) => {
+                                    return Err(RobinhoodClientError::InvalidEndpointUrl(err));
+                                }
+                            },
+                        }
+                    }
+                }
+                None => None,
+            };
+        }
+
+        Ok(positions)
+    }
+
     pub async fn fetch_push_prompt_status(
         &self,
         challenge_id: &str,
@@ -251,6 +327,24 @@ struct RobinhoodAccountEntry {
     is_default: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RobinhoodPositionsResponse {
+    next: Option<String>,
+    results: Vec<RobinhoodPositionEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RobinhoodPositionEntry {
+    symbol: String,
+    quantity: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RobinhoodPosition {
+    pub symbol: String,
+    pub quantity: f64,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct RobinhoodAccount {
     pub account_number: String,
@@ -288,7 +382,7 @@ mod tests {
     };
     use serde_json::json;
     use uuid::Uuid;
-    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -411,6 +505,99 @@ mod tests {
             RobinhoodClientError::UnexpectedStatus(StatusCode::UNAUTHORIZED) => {}
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_positions_returns_positions() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/positions/"))
+            .and(query_param("account_number", "5QT29231"))
+            .and(query_param("nonzero", "true"))
+            .and(header("authorization", "Bearer access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "results": [
+                    { "symbol": "AMZN", "quantity": "1618.57743000" },
+                    { "symbol": "v", "quantity": "1500.00000000" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid base url");
+
+        let positions = client
+            .fetch_positions("access-token", "5QT29231")
+            .await
+            .expect("positions should load");
+
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].symbol, "AMZN");
+        assert!((positions[0].quantity - 1618.57743).abs() < 1e-6);
+        assert_eq!(positions[1].symbol, "V");
+        assert_eq!(positions[1].quantity, 1500.0);
+    }
+
+    #[tokio::test]
+    async fn fetch_positions_follows_pagination_links() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/positions/"))
+            .and(query_param("account_number", "12345678"))
+            .and(query_param("nonzero", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": "/positions/?cursor=cursor123",
+                "results": [
+                    { "symbol": "AAPL", "quantity": "42.0" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/positions/"))
+            .and(query_param("cursor", "cursor123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "results": [
+                    { "symbol": "MSFT", "quantity": "15.500000" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client = RobinhoodClient::with_http_client_and_identity_base(
+            Client::new(),
+            &base_url,
+            &identity_url,
+        )
+        .expect("valid base url");
+
+        let positions = client
+            .fetch_positions("token", "12345678")
+            .await
+            .expect("positions should load");
+
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].symbol, "AAPL");
+        assert_eq!(positions[0].quantity, 42.0);
+        assert_eq!(positions[1].symbol, "MSFT");
+        assert_eq!(positions[1].quantity, 15.5);
     }
 
     #[tokio::test]
