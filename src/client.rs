@@ -295,7 +295,9 @@ impl RobinhoodClient {
             match db.get_robinhood_instrument_symbol(trimmed_id)? {
                 Some(cached) => {
                     let normalized = cached.trim().to_uppercase();
-                    if !normalized.is_empty() {
+                    if normalized.is_empty() {
+                        missing.push(trimmed_id.to_owned());
+                    } else {
                         symbols.insert(trimmed_id.to_owned(), normalized);
                     }
                 }
@@ -309,7 +311,7 @@ impl RobinhoodClient {
 
             for entry in entries {
                 let entry_id = entry.id.trim();
-                let symbol_text = entry.symbol.as_deref().unwrap_or("").trim();
+                let symbol_text = entry.symbol.trim();
                 if entry_id.is_empty() || symbol_text.is_empty() {
                     continue;
                 }
@@ -340,7 +342,10 @@ impl RobinhoodClient {
             .base_url
             .join("instruments/")
             .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
-        url.set_query(Some(&format!("ids={}", instrument_ids.join(","))));
+        url.set_query(Some(&format!(
+            "ids={}&active_instruments_only=false",
+            instrument_ids.join(",")
+        )));
 
         let response = self.http.get(url).bearer_auth(access_token).send().await?;
 
@@ -350,7 +355,7 @@ impl RobinhoodClient {
 
         let body = response.bytes().await?;
         let payload: RobinhoodInstrumentsResponse = serde_json::from_slice(&body)?;
-        Ok(payload.results.into_iter().flatten().collect())
+        Ok(payload.results)
     }
 
     pub async fn fetch_push_prompt_status(
@@ -499,13 +504,13 @@ struct PushPromptStatusResponse {
 
 #[derive(Debug, Deserialize)]
 struct RobinhoodInstrumentsResponse {
-    results: Vec<Option<RobinhoodInstrumentEntry>>,
+    results: Vec<RobinhoodInstrumentEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RobinhoodInstrumentEntry {
     id: String,
-    symbol: Option<String>,
+    symbol: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1240,6 +1245,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_symbols_refetches_when_cache_value_is_empty() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let db = Database::open_at(temp_dir.path()).expect("open database");
+
+        let mut cached = HashMap::new();
+        cached.insert("instrument-1".to_string(), "   ".to_string());
+        db.set_robinhood_instrument_symbols(&cached)
+            .expect("cache instrument symbol");
+
+        let server = MockServer::start().await;
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        Mock::given(method("GET"))
+            .and(path("/instruments/"))
+            .and(query_param("ids", "instrument-1"))
+            .and(query_param("active_instruments_only", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": [
+                    { "id": "instrument-1", "symbol": "TSLA" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ids = vec!["instrument-1".to_string()];
+        let symbols = client
+            .get_symbols("test-token", &ids, &db)
+            .await
+            .expect("fetch symbols");
+
+        assert_eq!(symbols.get("instrument-1"), Some(&"TSLA".to_string()));
+    }
+
+    #[tokio::test]
     async fn get_symbols_fetches_and_caches_missing_entries() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let db = Database::open_at(temp_dir.path()).expect("open database");
@@ -1253,6 +1298,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/instruments/"))
             .and(query_param("ids", "instrument-1,instrument-2"))
+            .and(query_param("active_instruments_only", "false"))
             .and(header("authorization", "Bearer test-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "next": null,
@@ -1331,6 +1377,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/instruments/"))
             .and(query_param("ids", &first_ids))
+            .and(query_param("active_instruments_only", "false"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "next": null,
                 "previous": null,
@@ -1343,6 +1390,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/instruments/"))
             .and(query_param("ids", &second_ids))
+            .and(query_param("active_instruments_only", "false"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "next": null,
                 "previous": null,
