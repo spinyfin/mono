@@ -4,7 +4,7 @@ use db::Database;
 use reqwest::{Client, StatusCode};
 use serde::de::Error as _;
 use serde::{Deserialize, de::DeserializeOwned};
-use url::{Url, form_urlencoded};
+use url::Url;
 use uuid::Uuid;
 
 use crate::auth::{
@@ -244,15 +244,21 @@ impl RobinhoodClient {
             .join("orders/")
             .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
 
-        let mut serializer = form_urlencoded::Serializer::new(String::new());
-        serializer.append_pair("account_numbers", account_number);
-        serializer.append_pair("include_managed", "true");
-        serializer.append_pair("is_closed", "true");
-        serializer.append_pair("page_size", &page_size.to_string());
+        let mut params = vec![
+            ("account_numbers", account_number.to_owned()),
+            ("include_managed", "true".to_owned()),
+            ("is_closed", "true".to_owned()),
+            ("page_size", page_size.to_string()),
+        ];
+
         if let Some(cursor_value) = cursor.filter(|value| !value.is_empty()) {
-            serializer.append_pair("cursor", cursor_value);
+            params.push(("cursor", cursor_value.to_owned()));
         }
-        url.set_query(Some(&serializer.finish()));
+
+        let query = serde_urlencoded::to_string(&params).map_err(|error| {
+            RobinhoodClientError::ResponseParse(serde_json::Error::custom(error.to_string()))
+        })?;
+        url.set_query(Some(&query));
 
         let response = self.http.get(url).bearer_auth(access_token).send().await?;
 

@@ -17,6 +17,7 @@ rust_library(
         "@crates//:reqwest",
         "@crates//:serde",
         "@crates//:serde_json",
+        "@crates//:serde_urlencoded",
         "@crates//:thiserror",
         "@crates//:tokio",
         "@crates//:uuid",
