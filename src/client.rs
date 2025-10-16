@@ -4,7 +4,7 @@ use db::Database;
 use reqwest::{Client, StatusCode};
 use serde::de::Error as _;
 use serde::{Deserialize, de::DeserializeOwned};
-use url::Url;
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::auth::{
@@ -232,6 +232,39 @@ impl RobinhoodClient {
         Ok(positions)
     }
 
+    pub async fn fetch_orders_page(
+        &self,
+        access_token: &str,
+        account_number: &str,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<RobinhoodOrdersPage, RobinhoodClientError> {
+        let mut url = self
+            .base_url
+            .join("orders/")
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("account_numbers", account_number);
+        serializer.append_pair("include_managed", "true");
+        serializer.append_pair("is_closed", "true");
+        serializer.append_pair("page_size", &page_size.to_string());
+        if let Some(cursor_value) = cursor.filter(|value| !value.is_empty()) {
+            serializer.append_pair("cursor", cursor_value);
+        }
+        url.set_query(Some(&serializer.finish()));
+
+        let response = self.http.get(url).bearer_auth(access_token).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let page = serde_json::from_slice(&body)?;
+        Ok(page)
+    }
+
     pub async fn get_symbols(
         &self,
         access_token: &str,
@@ -455,6 +488,35 @@ struct RobinhoodInstrumentsResponse {
 struct RobinhoodInstrumentEntry {
     id: String,
     symbol: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOrdersPage {
+    pub next: Option<String>,
+    pub results: Vec<RobinhoodOrderEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOrderEntry {
+    pub id: String,
+    #[serde(rename = "instrument_id")]
+    pub instrument_id: String,
+    #[serde(default)]
+    pub executions: Vec<RobinhoodOrderExecutionEntry>,
+    pub created_at: String,
+    pub last_transaction_at: Option<String>,
+    pub side: String,
+    pub price: Option<String>,
+    pub quantity: Option<String>,
+    #[serde(rename = "type")]
+    pub order_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOrderExecutionEntry {
+    pub price: Option<String>,
+    pub quantity: Option<String>,
+    pub timestamp: Option<String>,
 }
 
 #[cfg(test)]
@@ -1204,6 +1266,89 @@ mod tests {
             .expect("fetch cached symbol")
             .expect("symbol should exist");
         assert_eq!(cached, "TSLA");
+    }
+
+    #[tokio::test]
+    async fn fetch_orders_page_requests_expected_query() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/orders/"))
+            .and(query_param("account_numbers", "5QT29231"))
+            .and(query_param("include_managed", "true"))
+            .and(query_param("is_closed", "true"))
+            .and(query_param("page_size", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": [
+                    {
+                        "id": "order-1",
+                        "instrument_id": "instrument-1",
+                        "executions": [
+                            {
+                                "price": "10.0",
+                                "quantity": "2.0",
+                                "timestamp": "2024-01-01T12:00:00Z"
+                            }
+                        ],
+                        "created_at": "2024-01-01T11:59:00Z",
+                        "last_transaction_at": "2024-01-01T12:00:00Z",
+                        "side": "buy",
+                        "price": "10.0",
+                        "quantity": "2.0",
+                        "type": "market"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        let page = client
+            .fetch_orders_page("token", "5QT29231", 200, None)
+            .await
+            .expect("fetch orders");
+
+        assert!(page.next.is_none());
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].id, "order-1");
+        assert_eq!(page.results[0].executions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_orders_page_includes_cursor_when_present() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/orders/"))
+            .and(query_param("cursor", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        let page = client
+            .fetch_orders_page("token", "5QT29231", 50, Some("abc123"))
+            .await
+            .expect("fetch orders");
+
+        assert!(page.results.is_empty());
+        assert!(page.next.is_none());
     }
 
     #[tokio::test]
