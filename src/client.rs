@@ -22,6 +22,7 @@ pub struct RobinhoodClient {
 }
 
 const DEFAULT_IDENTITY_BASE_URL: &str = "https://identi.robinhood.com/";
+const INSTRUMENT_LOOKUP_CHUNK: usize = 50;
 
 impl RobinhoodClient {
     pub fn new(base_url: &str) -> Result<Self, RobinhoodClientError> {
@@ -302,15 +303,44 @@ impl RobinhoodClient {
             }
         }
 
-        if missing.is_empty() {
-            return Ok(symbols);
+        let mut fetched_entries = HashMap::new();
+        for chunk in missing.chunks(INSTRUMENT_LOOKUP_CHUNK) {
+            let entries = self.fetch_instrument_chunk(access_token, chunk).await?;
+
+            for entry in entries {
+                let entry_id = entry.id.trim();
+                let symbol_text = entry.symbol.as_deref().unwrap_or("").trim();
+                if entry_id.is_empty() || symbol_text.is_empty() {
+                    continue;
+                }
+
+                let normalized_symbol = symbol_text.to_uppercase();
+                symbols.insert(entry_id.to_owned(), normalized_symbol.clone());
+                fetched_entries.insert(entry_id.to_owned(), normalized_symbol);
+            }
+        }
+
+        if !fetched_entries.is_empty() {
+            db.set_robinhood_instrument_symbols(&fetched_entries)?;
+        }
+
+        Ok(symbols)
+    }
+
+    async fn fetch_instrument_chunk(
+        &self,
+        access_token: &str,
+        instrument_ids: &[String],
+    ) -> Result<Vec<RobinhoodInstrumentEntry>, RobinhoodClientError> {
+        if instrument_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut url = self
             .base_url
             .join("instruments/")
             .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
-        url.set_query(Some(&format!("ids={}", missing.join(","))));
+        url.set_query(Some(&format!("ids={}", instrument_ids.join(","))));
 
         let response = self.http.get(url).bearer_auth(access_token).send().await?;
 
@@ -320,25 +350,7 @@ impl RobinhoodClient {
 
         let body = response.bytes().await?;
         let payload: RobinhoodInstrumentsResponse = serde_json::from_slice(&body)?;
-
-        let mut fetched_entries = HashMap::new();
-        for entry in payload.results {
-            let entry_id = entry.id.trim();
-            let entry_symbol = entry.symbol.trim();
-            if entry_id.is_empty() || entry_symbol.is_empty() {
-                continue;
-            }
-
-            let normalized_symbol = entry_symbol.to_uppercase();
-            symbols.insert(entry_id.to_owned(), normalized_symbol.clone());
-            fetched_entries.insert(entry_id.to_owned(), normalized_symbol);
-        }
-
-        if !fetched_entries.is_empty() {
-            db.set_robinhood_instrument_symbols(&fetched_entries)?;
-        }
-
-        Ok(symbols)
+        Ok(payload.results.into_iter().flatten().collect())
     }
 
     pub async fn fetch_push_prompt_status(
@@ -487,13 +499,13 @@ struct PushPromptStatusResponse {
 
 #[derive(Debug, Deserialize)]
 struct RobinhoodInstrumentsResponse {
-    results: Vec<RobinhoodInstrumentEntry>,
+    results: Vec<Option<RobinhoodInstrumentEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RobinhoodInstrumentEntry {
     id: String,
-    symbol: String,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1272,6 +1284,85 @@ mod tests {
             .expect("fetch cached symbol")
             .expect("symbol should exist");
         assert_eq!(cached, "TSLA");
+    }
+
+    #[tokio::test]
+    async fn get_symbols_batches_requests_when_needed() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let db = Database::open_at(temp_dir.path()).expect("open database");
+        let server = MockServer::start().await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        let total = INSTRUMENT_LOOKUP_CHUNK + 5;
+        let ids: Vec<String> = (0..total)
+            .map(|index| format!("instrument-{index}"))
+            .collect();
+
+        let first_ids = (0..INSTRUMENT_LOOKUP_CHUNK)
+            .map(|index| format!("instrument-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let second_ids = (INSTRUMENT_LOOKUP_CHUNK..total)
+            .map(|index| format!("instrument-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let first_results: Vec<_> = (0..INSTRUMENT_LOOKUP_CHUNK)
+            .map(|index| {
+                json!({
+                    "id": format!("instrument-{index}"),
+                    "symbol": format!("SYM{index}"),
+                })
+            })
+            .collect();
+        let second_results: Vec<_> = (INSTRUMENT_LOOKUP_CHUNK..total)
+            .map(|index| {
+                json!({
+                    "id": format!("instrument-{index}"),
+                    "symbol": format!("SYM{index}"),
+                })
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/instruments/"))
+            .and(query_param("ids", &first_ids))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": first_results,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/instruments/"))
+            .and(query_param("ids", &second_ids))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": second_results,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let symbols = client
+            .get_symbols("test-token", &ids, &db)
+            .await
+            .expect("fetch symbols");
+
+        assert_eq!(symbols.len(), total);
+        assert_eq!(symbols.get("instrument-0"), Some(&"SYM0".to_string()));
+        assert_eq!(
+            symbols.get(&format!("instrument-{}", total - 1)),
+            Some(&format!("SYM{}", total - 1)),
+        );
     }
 
     #[tokio::test]
