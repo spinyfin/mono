@@ -11,6 +11,8 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+db = { path = "../db" }
 
 [dev-dependencies]
 wiremock = "0.6"
+tempfile = "3.14"

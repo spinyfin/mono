@@ -21,6 +21,7 @@ rust_library(
         "@crates//:tokio",
         "@crates//:uuid",
         "@crates//:url",
+        "//backend/db:db",
     ],
 )
 
@@ -31,6 +32,8 @@ rust_test(
     deps = [
         "@crates//:serde_json",
         "@crates//:wiremock",
+        "@crates//:tempfile",
+        "//backend/db:db",
     ],
 )
 
