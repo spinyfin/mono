@@ -23,6 +23,7 @@ pub struct RobinhoodClient {
 
 const DEFAULT_IDENTITY_BASE_URL: &str = "https://identi.robinhood.com/";
 const INSTRUMENT_LOOKUP_CHUNK: usize = 50;
+const OPTION_ORDER_STATES: &str = "canceled,cancelled,filled,failed,partially_filled_rest_cancelled,voided,rejected,locate_failed";
 
 impl RobinhoodClient {
     pub fn new(base_url: &str) -> Result<Self, RobinhoodClientError> {
@@ -250,6 +251,57 @@ impl RobinhoodClient {
             ("include_managed", "true".to_owned()),
             ("is_closed", "true".to_owned()),
             ("page_size", page_size.to_string()),
+        ];
+
+        if let Some(cursor_value) = cursor.filter(|value| !value.is_empty()) {
+            params.push(("cursor", cursor_value.to_owned()));
+        }
+
+        let query = serde_urlencoded::to_string(&params).map_err(|error| {
+            RobinhoodClientError::ResponseParse(serde_json::Error::custom(error.to_string()))
+        })?;
+        url.set_query(Some(&query));
+
+        let response = self.http.get(url).bearer_auth(access_token).send().await?;
+
+        if response.status() != StatusCode::OK {
+            return Err(RobinhoodClientError::UnexpectedStatus(response.status()));
+        }
+
+        let body = response.bytes().await?;
+        let page = serde_json::from_slice(&body)?;
+        Ok(page)
+    }
+
+    pub async fn fetch_option_orders_page(
+        &self,
+        access_token: &str,
+        account_numbers: &[&str],
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<RobinhoodOptionOrdersPage, RobinhoodClientError> {
+        let mut url = self
+            .base_url
+            .join("options/orders/")
+            .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
+
+        let accounts_value = account_numbers
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<&str>>()
+            .join(",");
+
+        if accounts_value.is_empty() {
+            return Err(RobinhoodClientError::ResponseParse(
+                serde_json::Error::custom("at least one account number is required"),
+            ));
+        }
+
+        let mut params = vec![
+            ("account_numbers", accounts_value),
+            ("page_size", page_size.to_string()),
+            ("states", OPTION_ORDER_STATES.to_owned()),
         ];
 
         if let Some(cursor_value) = cursor.filter(|value| !value.is_empty()) {
@@ -539,6 +591,88 @@ pub struct RobinhoodOrderEntry {
 pub struct RobinhoodOrderExecutionEntry {
     pub price: Option<String>,
     pub quantity: Option<String>,
+    pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOptionOrdersPage {
+    pub next: Option<String>,
+    pub previous: Option<String>,
+    pub results: Vec<RobinhoodOptionOrderEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOptionOrderEntry {
+    pub id: String,
+    pub account_number: Option<String>,
+    pub average_net_premium_paid: Option<String>,
+    pub cancel_url: Option<String>,
+    pub canceled_quantity: Option<String>,
+    pub chain_id: Option<String>,
+    pub chain_symbol: Option<String>,
+    pub client_ask_at_submission: Option<String>,
+    pub client_bid_at_submission: Option<String>,
+    pub client_time_at_submission: Option<String>,
+    pub closing_strategy: Option<String>,
+    pub contract_fees: Option<String>,
+    pub created_at: Option<String>,
+    pub derived_state: Option<String>,
+    pub direction: Option<String>,
+    pub estimated_total_net_amount: Option<String>,
+    pub estimated_total_net_amount_direction: Option<String>,
+    pub form_source: Option<String>,
+    pub gold_savings: Option<String>,
+    pub is_replaceable: Option<bool>,
+    #[serde(default)]
+    pub legs: Vec<RobinhoodOptionOrderLeg>,
+    pub market_hours: Option<String>,
+    pub net_amount: Option<String>,
+    pub net_amount_direction: Option<String>,
+    pub opening_strategy: Option<String>,
+    pub pending_quantity: Option<String>,
+    pub premium: Option<String>,
+    pub price: Option<String>,
+    pub processed_premium: Option<String>,
+    pub processed_premium_direction: Option<String>,
+    pub processed_quantity: Option<String>,
+    pub quantity: Option<String>,
+    pub ref_id: Option<String>,
+    pub regulatory_fees: Option<String>,
+    pub response_category: Option<String>,
+    #[serde(default)]
+    pub sales_taxes: Vec<serde_json::Value>,
+    pub state: Option<String>,
+    pub stop_price: Option<String>,
+    pub strategy: Option<String>,
+    pub time_in_force: Option<String>,
+    pub trigger: Option<String>,
+    #[serde(rename = "type")]
+    pub order_type: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOptionOrderLeg {
+    pub id: Option<String>,
+    pub expiration_date: Option<String>,
+    pub long_strategy_code: Option<String>,
+    pub option: Option<String>,
+    pub option_type: Option<String>,
+    pub position_effect: Option<String>,
+    pub ratio_quantity: Option<i64>,
+    pub short_strategy_code: Option<String>,
+    pub side: Option<String>,
+    pub strike_price: Option<String>,
+    #[serde(default)]
+    pub executions: Vec<RobinhoodOptionOrderExecution>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RobinhoodOptionOrderExecution {
+    pub id: Option<String>,
+    pub price: Option<String>,
+    pub quantity: Option<String>,
+    pub settlement_date: Option<String>,
     pub timestamp: Option<String>,
 }
 
@@ -1494,6 +1628,88 @@ mod tests {
 
         assert!(page.results.is_empty());
         assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_option_orders_page_requests_expected_query() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/options/orders/"))
+            .and(query_param("account_numbers", "5QT29231,926053604"))
+            .and(query_param("page_size", "25"))
+            .and(query_param("states", OPTION_ORDER_STATES))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": null,
+                "previous": null,
+                "results": [
+                    {
+                        "id": "option-order-1",
+                        "account_number": "5QT29231",
+                        "chain_symbol": "CSX",
+                        "legs": [
+                            {
+                                "id": "leg-1",
+                                "executions": [
+                                    {
+                                        "id": "exec-1",
+                                        "price": "0.75"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        let page = client
+            .fetch_option_orders_page("token", &["5QT29231", "926053604"], 25, None)
+            .await
+            .expect("fetch option orders");
+
+        assert!(page.next.is_none());
+        assert_eq!(page.results.len(), 1);
+        let first = &page.results[0];
+        assert_eq!(first.chain_symbol.as_deref(), Some("CSX"));
+        assert_eq!(first.legs.len(), 1);
+        assert_eq!(first.legs[0].executions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_option_orders_page_includes_cursor_when_present() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/options/orders/"))
+            .and(query_param("cursor", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "next": "cursor",
+                "previous": null,
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let identity_url = format!("{}/", server.uri());
+        let client =
+            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+
+        let page = client
+            .fetch_option_orders_page("token", &["5QT29231"], 10, Some("abc123"))
+            .await
+            .expect("fetch option orders");
+
+        assert!(page.results.is_empty());
     }
 
     #[tokio::test]
