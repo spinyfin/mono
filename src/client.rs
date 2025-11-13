@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use db::Database;
 use reqwest::{Client, StatusCode};
 use serde::de::Error as _;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 use uuid::Uuid;
 
@@ -594,14 +594,14 @@ pub struct RobinhoodOrderExecutionEntry {
     pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RobinhoodOptionOrdersPage {
     pub next: Option<String>,
     pub previous: Option<String>,
     pub results: Vec<RobinhoodOptionOrderEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RobinhoodOptionOrderEntry {
     pub id: String,
     pub account_number: Option<String>,
@@ -651,7 +651,7 @@ pub struct RobinhoodOptionOrderEntry {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RobinhoodOptionOrderLeg {
     pub id: Option<String>,
     pub expiration_date: Option<String>,
@@ -667,7 +667,7 @@ pub struct RobinhoodOptionOrderLeg {
     pub executions: Vec<RobinhoodOptionOrderExecution>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RobinhoodOptionOrderExecution {
     pub id: Option<String>,
     pub price: Option<String>,
