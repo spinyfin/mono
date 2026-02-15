@@ -1,0 +1,26 @@
+site_name: Checks framework
+site_url: https://spinyfin.dev/tools/checks
+site_description: User manual for running, configuring, and extending a presubmit-style checks framework.
+docs_dir: docs
+theme:
+  name: material
+  features:
+    - content.code.copy
+nav:
+  - Home: index.md
+  - Motivation: motivation.md
+  - Concepts: concepts.md
+  - Configuring checks: checks-toml.md
+  - Running checks: cli.md
+  - Writing checks: check-author-api.md
+  - Built-in checks: canned-checks.md
+  - Bypassing checks: bypass.md
+markdown_extensions:
+  - tables
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
