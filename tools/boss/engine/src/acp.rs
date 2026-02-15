@@ -622,6 +622,14 @@ impl ClientHost {
 
         let request: WriteRequest =
             serde_json::from_value(params).context("invalid write request")?;
+        let path = Path::new(&request.path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("failed to create parent directories for {}", request.path))?;
+            }
+        }
         tokio::fs::write(&request.path, request.content)
             .await
             .with_context(|| format!("failed to write file {}", request.path))?;
