@@ -5,6 +5,7 @@ rust_library(
     name = "engine_lib",
     crate_name = "boss_engine",
     srcs = [
+        "src/acp.rs",
         "src/app.rs",
         "src/cli.rs",
         "src/config.rs",

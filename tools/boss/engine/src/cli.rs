@@ -14,4 +14,7 @@ pub struct Cli {
 
     #[arg(long)]
     pub socket_path: Option<String>,
+
+    #[arg(long)]
+    pub prompt: Option<String>,
 }
