@@ -18,13 +18,28 @@ final class EngineClient: @unchecked Sendable {
     private let queue = DispatchQueue(label: "BossMacApp.EngineClient")
     private var connection: NWConnection?
     private var buffer = Data()
+    private var shouldReconnect = false
 
     init(socketPath: String) {
         self.socketPath = socketPath
     }
 
     func start() {
-        stop()
+        shouldReconnect = true
+        connect()
+    }
+
+    func stop() {
+        shouldReconnect = false
+        connection?.cancel()
+        connection = nil
+        buffer.removeAll(keepingCapacity: false)
+    }
+
+    private func connect() {
+        guard connection == nil else {
+            return
+        }
 
         let parameters = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
         let endpoint = NWEndpoint.unix(path: socketPath)
@@ -39,21 +54,19 @@ final class EngineClient: @unchecked Sendable {
                 self.receiveNext()
             case .failed(let error):
                 self.emit(.error("socket failed: \(error.localizedDescription)"))
+                self.connection = nil
                 self.emit(.disconnected)
+                self.scheduleReconnect()
             case .cancelled:
+                self.connection = nil
                 self.emit(.disconnected)
+                self.scheduleReconnect()
             default:
                 break
             }
         }
 
         connection.start(queue: queue)
-    }
-
-    func stop() {
-        connection?.cancel()
-        connection = nil
-        buffer.removeAll(keepingCapacity: false)
     }
 
     func sendPrompt(_ text: String) {
@@ -109,7 +122,9 @@ final class EngineClient: @unchecked Sendable {
             }
 
             if isComplete {
+                self.connection = nil
                 self.emit(.disconnected)
+                self.scheduleReconnect()
                 return
             }
 
@@ -161,6 +176,19 @@ final class EngineClient: @unchecked Sendable {
     private func emit(_ event: EngineEvent) {
         Task { @MainActor in
             onEvent?(event)
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard shouldReconnect else {
+            return
+        }
+
+        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.shouldReconnect, self.connection == nil else {
+                return
+            }
+            self.connect()
         }
     }
 }
