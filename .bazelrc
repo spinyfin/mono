@@ -1,0 +1,2 @@
+build --jobs=200
+build --disk_cache=~/.cache/bazelcache
