@@ -770,20 +770,44 @@ impl TerminalManager {
 
         let request: CreateRequest =
             serde_json::from_value(params).context("invalid terminal/create request")?;
+        let CreateRequest {
+            command: raw_command,
+            args: request_args,
+            cwd,
+            env,
+            output_byte_limit,
+        } = request;
 
-        let mut command = Command::new(&request.command);
+        let (executable, args, launch_mode) =
+            normalize_terminal_command(raw_command.clone(), request_args);
+
+        let cwd_label = cwd.clone().unwrap_or_else(|| "<none>".to_owned());
+        info!(
+            raw_command = %raw_command,
+            executable = %executable,
+            args = ?args,
+            cwd = %cwd_label,
+            launch_mode,
+            "handling terminal/create request",
+        );
+
+        let mut command = Command::new(&executable);
         command
-            .args(request.args.unwrap_or_default())
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        if let Some(cwd) = request.cwd {
+        if let Some(cwd) = cwd {
+            let cwd_path = Path::new(&cwd);
+            if !cwd_path.is_dir() {
+                bail!("terminal/create cwd does not exist or is not a directory: {cwd}");
+            }
             command.current_dir(cwd);
         }
 
-        if let Some(env_vars) = request.env {
+        if let Some(env_vars) = env {
             for env_var in env_vars {
                 command.env(env_var.name, env_var.value);
             }
@@ -791,15 +815,18 @@ impl TerminalManager {
 
         let child = command
             .spawn()
-            .context("failed to spawn terminal command")?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn terminal command executable={} args={args:?}",
+                    executable
+                )
+            })?;
 
         let terminal_id = format!(
             "terminal-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let output_limit = request
-            .output_byte_limit
-            .unwrap_or(DEFAULT_TERMINAL_OUTPUT_LIMIT);
+        let output_limit = output_byte_limit.unwrap_or(DEFAULT_TERMINAL_OUTPUT_LIMIT);
 
         let terminal = Arc::new(TerminalProcess::new(child, output_limit));
         terminal.start_output_pumps().await?;
@@ -862,6 +889,71 @@ impl TerminalManager {
         map.get(terminal_id)
             .cloned()
             .with_context(|| format!("terminal not found: {terminal_id}"))
+    }
+}
+
+fn normalize_terminal_command(
+    raw_command: String,
+    request_args: Option<Vec<String>>,
+) -> (String, Vec<String>, &'static str) {
+    if let Some(args) = request_args {
+        return (raw_command, args, "structured");
+    }
+
+    if command_uses_shell_operators(&raw_command) {
+        return (
+            "/bin/bash".to_owned(),
+            vec!["-lc".to_owned(), raw_command],
+            "shell",
+        );
+    }
+
+    match shlex::split(&raw_command) {
+        Some(parts) => {
+            if let Some((program, rest)) = parts.split_first() {
+                (program.to_owned(), rest.to_vec(), "shlex")
+            } else {
+                (raw_command, Vec::new(), "raw")
+            }
+        }
+        None => (raw_command, Vec::new(), "raw"),
+    }
+}
+
+fn command_uses_shell_operators(command: &str) -> bool {
+    const SHELL_TOKENS: [&str; 8] = ["&&", "||", "|", ";", "$(", "`", ">", "<"];
+    SHELL_TOKENS.iter().any(|token| command.contains(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_terminal_command;
+
+    #[test]
+    fn normalize_terminal_command_uses_structured_args() {
+        let (program, args, mode) =
+            normalize_terminal_command("javac".to_owned(), Some(vec!["/tmp/hello.java".to_owned()]));
+        assert_eq!(program, "javac");
+        assert_eq!(args, vec!["/tmp/hello.java"]);
+        assert_eq!(mode, "structured");
+    }
+
+    #[test]
+    fn normalize_terminal_command_splits_shell_words() {
+        let (program, args, mode) =
+            normalize_terminal_command("javac /tmp/hello.java".to_owned(), None);
+        assert_eq!(program, "javac");
+        assert_eq!(args, vec!["/tmp/hello.java"]);
+        assert_eq!(mode, "shlex");
+    }
+
+    #[test]
+    fn normalize_terminal_command_uses_shell_for_operators() {
+        let (program, args, mode) =
+            normalize_terminal_command("cd /tmp && ls".to_owned(), None);
+        assert_eq!(program, "/bin/bash");
+        assert_eq!(args, vec!["-lc", "cd /tmp && ls"]);
+        assert_eq!(mode, "shell");
     }
 }
 
