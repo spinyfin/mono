@@ -12,6 +12,18 @@ struct ContentView: View {
             composer
         }
         .frame(minWidth: 860, minHeight: 560)
+        .alert(item: $model.pendingPermission) { request in
+            Alert(
+                title: Text("Permission Request"),
+                message: Text(request.title),
+                primaryButton: .default(Text("Allow")) {
+                    model.respondToPendingPermission(granted: true)
+                },
+                secondaryButton: .destructive(Text("Deny")) {
+                    model.respondToPendingPermission(granted: false)
+                }
+            )
+        }
     }
 
     private var header: some View {
