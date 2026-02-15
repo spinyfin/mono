@@ -125,6 +125,16 @@ managed via the engine API without a frontend. This enables:
 - Scripted workflows: define a sequence of tasks and let the team execute.
 - Scheduled work: run agents on a schedule for maintenance tasks.
 
+## Safety Model
+
+For the initial PoC, boss prioritizes end-to-end architecture validation over a
+strict sandbox. The engine may execute ACP file system and terminal requests
+with normal local user permissions.
+
+This is intentional for speed in the PoC. A production-ready version should add
+explicit safety boundaries such as workspace scoping, allow/deny policy,
+approval defaults, and audit logging.
+
 ## Future Considerations
 
 - **Additional frontends**: web UI, Linux native, TUI.
@@ -135,3 +145,5 @@ managed via the engine API without a frontend. This enables:
   machines from a single boss instance.
 - **Agent-to-agent coordination**: letting agents communicate directly when
   appropriate, reducing the need for human routing.
+- **Protocol hardening**: versioned/stable engine-frontend schema for
+  multi-client compatibility.
