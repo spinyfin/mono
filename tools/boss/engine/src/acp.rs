@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -37,6 +38,7 @@ pub enum AcpEvent {
     },
     PermissionRequest {
         session_id: String,
+        permission_id: String,
         title: String,
     },
 }
@@ -62,10 +64,19 @@ pub struct AcpClient {
     events_tx: broadcast::Sender<AcpEvent>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     next_request_id: AtomicU64,
+    permission_coordinator: PermissionCoordinator,
 }
 
 impl AcpClient {
     pub async fn connect(cfg: &RuntimeConfig) -> Result<Self> {
+        Self::connect_internal(cfg, false).await
+    }
+
+    pub async fn connect_with_external_permissions(cfg: &RuntimeConfig) -> Result<Self> {
+        Self::connect_internal(cfg, true).await
+    }
+
+    async fn connect_internal(cfg: &RuntimeConfig, interactive_permissions: bool) -> Result<Self> {
         let mut command = Command::new(&cfg.acp_command);
         command
             .args(&cfg.acp_args)
@@ -100,8 +111,12 @@ impl AcpClient {
         let (events_tx, _) = broadcast::channel::<AcpEvent>(1024);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let permission_coordinator = PermissionCoordinator::default();
 
-        let client_host = Arc::new(ClientHost::new(events_tx.clone()));
+        let client_host = Arc::new(ClientHost::new(
+            interactive_permissions,
+            permission_coordinator.clone(),
+        ));
 
         tokio::spawn(write_loop(stdin, request_rx));
         tokio::spawn(stderr_loop(stderr));
@@ -119,6 +134,7 @@ impl AcpClient {
             events_tx,
             pending,
             next_request_id: AtomicU64::new(1),
+            permission_coordinator,
         })
     }
 
@@ -231,6 +247,19 @@ impl AcpClient {
 
         rx.await
             .context("response channel closed before JSON-RPC response")?
+    }
+
+    pub async fn respond_permission(&self, permission_id: &str, granted: bool) -> Result<()> {
+        let applied = self
+            .permission_coordinator
+            .resolve(permission_id.to_owned(), granted)
+            .await;
+
+        if !applied {
+            bail!("unknown permission request id: {permission_id}");
+        }
+
+        Ok(())
     }
 }
 
@@ -465,15 +494,54 @@ async fn stderr_loop<R: AsyncRead + Unpin>(stderr: R) {
     }
 }
 
+#[derive(Clone, Default)]
+struct PermissionCoordinator {
+    inner: Arc<PermissionCoordinatorInner>,
+}
+
+#[derive(Default)]
+struct PermissionCoordinatorInner {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+impl PermissionCoordinator {
+    async fn register(&self) -> (String, oneshot::Receiver<bool>) {
+        let request_id = format!(
+            "perm-{}",
+            self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending
+            .lock()
+            .await
+            .insert(request_id.clone(), tx);
+        (request_id, rx)
+    }
+
+    async fn resolve(&self, request_id: String, granted: bool) -> bool {
+        if let Some(tx) = self.inner.pending.lock().await.remove(&request_id) {
+            let _ = tx.send(granted);
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Default)]
 struct ClientHost {
     terminals: TerminalManager,
+    interactive_permissions: bool,
+    permission_coordinator: PermissionCoordinator,
 }
 
 impl ClientHost {
-    fn new(_events_tx: broadcast::Sender<AcpEvent>) -> Self {
+    fn new(interactive_permissions: bool, permission_coordinator: PermissionCoordinator) -> Self {
         Self {
             terminals: TerminalManager::default(),
+            interactive_permissions,
+            permission_coordinator,
         }
     }
 
@@ -561,31 +629,84 @@ impl ClientHost {
             .unwrap_or("Tool permission")
             .to_owned();
 
-        let _ = events_tx.send(AcpEvent::PermissionRequest {
-            session_id,
-            title: title.clone(),
-        });
-
         let Some(options) = params.get("options").and_then(Value::as_array) else {
             return Ok(json!({ "outcome": { "outcome": "cancelled" } }));
         };
 
-        let preferred = options.iter().find(|option| {
+        let allow_option = options.iter().find_map(|option| {
             option
                 .get("kind")
                 .and_then(Value::as_str)
-                .map(|kind| kind == "allow_once" || kind == "allow_always")
-                .unwrap_or(false)
-        });
-
-        let selected = preferred.or_else(|| options.first()).and_then(|option| {
-            option
-                .get("optionId")
-                .and_then(Value::as_str)
+                .and_then(|kind| {
+                    if kind == "allow_once" || kind == "allow_always" {
+                        option.get("optionId").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
                 .map(str::to_owned)
         });
 
-        match selected {
+        let reject_option = options.iter().find_map(|option| {
+            option
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(|kind| {
+                    if kind == "reject_once" {
+                        option.get("optionId").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .map(str::to_owned)
+        });
+
+        if !self.interactive_permissions {
+            return match allow_option.or_else(|| {
+                options.first().and_then(|option| {
+                    option
+                        .get("optionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            }) {
+                Some(option_id) => Ok(json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id,
+                    }
+                })),
+                None => Ok(json!({ "outcome": { "outcome": "cancelled" } })),
+            };
+        }
+
+        let (permission_id, rx) = self.permission_coordinator.register().await;
+        let _ = events_tx.send(AcpEvent::PermissionRequest {
+            session_id,
+            permission_id: permission_id.clone(),
+            title: title.clone(),
+        });
+
+        let granted = match tokio::time::timeout(Duration::from_secs(600), rx).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => false,
+            Err(_) => false,
+        };
+
+        let selected = if granted { allow_option } else { reject_option };
+
+        match selected.or_else(|| {
+            if granted {
+                options.first().and_then(|option| {
+                    option
+                        .get("optionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            } else {
+                None
+            }
+        }) {
             Some(option_id) => Ok(json!({
                 "outcome": {
                     "outcome": "selected",
