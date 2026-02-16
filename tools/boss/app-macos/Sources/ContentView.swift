@@ -19,9 +19,13 @@ struct ContentView: View {
             Text("Boss")
                 .font(.title2.weight(.semibold))
             Spacer()
-            Text("PoC")
-                .foregroundStyle(.secondary)
+            Label(model.isConnected ? "Connected" : "Disconnected", systemImage: "circle.fill")
+                .foregroundStyle(model.isConnected ? .green : .red)
                 .font(.callout)
+            if model.isSending {
+                ProgressView()
+                    .controlSize(.small)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -61,6 +65,7 @@ struct ContentView: View {
             }
             .keyboardShortcut(.return, modifiers: [.command])
             .buttonStyle(.borderedProminent)
+            .disabled(model.isSending)
         }
         .padding(16)
     }
