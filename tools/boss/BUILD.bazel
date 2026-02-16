@@ -1,1 +1,3 @@
 # boss tool
+
+package(default_visibility = ["//visibility:public"])

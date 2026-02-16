@@ -1,0 +1,5 @@
+{
+  "name": "mono",
+  "private": true,
+  "packageManager": "pnpm@8.11.0"
+}

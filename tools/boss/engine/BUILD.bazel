@@ -1,0 +1,27 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@boss_engine_crates//:defs.bzl", "all_crate_deps")
+
+rust_library(
+    name = "engine_lib",
+    crate_name = "boss_engine",
+    srcs = [
+        "src/app.rs",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/lib.rs",
+    ],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_binary(
+    name = "engine",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    deps = [
+        ":engine_lib",
+    ] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
