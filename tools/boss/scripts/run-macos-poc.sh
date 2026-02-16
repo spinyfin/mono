@@ -12,9 +12,12 @@ Required environment variables:
 
 Optional environment variables:
   BOSS_ACP_CMD        ACP adapter command override.
+  BOSS_ENGINE_PID_PATH
   BOSS_ENGINE_LOG_PATH
   BOSS_SOCKET_PATH    Unix socket path (default /tmp/boss-engine.sock).
+  BOSS_ENGINE_FORCE_RESTART   Set 1 to force-stop existing engine before launch.
   BOSS_ENGINE_AUTOSTART
+  BOSS_ENGINE_STOP_ON_EXIT    Set 1 to stop engine when app exits.
   BOSS_ENGINE_CMD
   RUST_LOG
   BOSS_SKIP_INSTALL   Set to 1 to skip pnpm install (same effect as --skip-install).
@@ -83,14 +86,20 @@ if (( skip_install == 0 )); then
 fi
 
 export BOSS_ACP_CMD="${BOSS_ACP_CMD:-pnpm --filter @mono/claude-code-acp exec claude-code-acp}"
+export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-/tmp/boss-engine.pid}"
 export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-/tmp/boss-engine.log}"
+export BOSS_ENGINE_FORCE_RESTART="${BOSS_ENGINE_FORCE_RESTART:-0}"
+export BOSS_ENGINE_STOP_ON_EXIT="${BOSS_ENGINE_STOP_ON_EXIT:-0}"
 export RUST_LOG="${RUST_LOG:-info,acp_stderr=debug}"
 
 echo "Launching BossMacApp..."
 echo "Repo: $repo_root"
 echo "Node: $(node -v)"
 echo "BOSS_ACP_CMD: $BOSS_ACP_CMD"
+echo "BOSS_ENGINE_PID_PATH: $BOSS_ENGINE_PID_PATH"
 echo "BOSS_ENGINE_LOG_PATH: $BOSS_ENGINE_LOG_PATH"
+echo "BOSS_ENGINE_FORCE_RESTART: $BOSS_ENGINE_FORCE_RESTART"
+echo "BOSS_ENGINE_STOP_ON_EXIT: $BOSS_ENGINE_STOP_ON_EXIT"
 echo "RUST_LOG: $RUST_LOG"
 
 exec swift run --package-path "$repo_root/tools/boss/app-macos" BossMacApp

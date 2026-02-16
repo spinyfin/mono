@@ -17,6 +17,8 @@ final class ChatViewModel: ObservableObject {
 
     private let engine: EngineClient
     private let processController = EngineProcessController()
+    private let socketPath: String
+    private var didStart = false
     private var activeAssistantMessageID: UUID?
     private var permissionQueue: [PendingPermission] = []
 
@@ -24,6 +26,7 @@ final class ChatViewModel: ObservableObject {
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
             ?? "/tmp/boss-engine.sock"
     ) {
+        self.socketPath = socketPath
         engine = EngineClient(socketPath: socketPath)
 
         processController.onOutputLine = { [weak self] line in
@@ -32,31 +35,6 @@ final class ChatViewModel: ObservableObject {
 
         engine.onEvent = { [weak self] event in
             self?.handle(event)
-        }
-
-        let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
-        if autostart {
-            do {
-                try processController.start(socketPath: socketPath)
-                messages.append(ChatMessage(role: .system, text: "Launching engine process…"))
-            } catch {
-                messages.append(
-                    ChatMessage(role: .system, text: "Failed to launch engine: \(error.localizedDescription)")
-                )
-            }
-
-            Task {
-                try? await Task.sleep(for: .seconds(1.0))
-                engine.start()
-            }
-        } else {
-            messages.append(
-                ChatMessage(
-                    role: .system,
-                    text: "Auto-start disabled. Connects to an external engine socket."
-                )
-            )
-            engine.start()
         }
     }
 
@@ -76,6 +54,39 @@ final class ChatViewModel: ObservableObject {
         activeAssistantMessageID = nil
         engine.sendPrompt(trimmed)
         draft = ""
+    }
+
+    func startIfNeeded() {
+        guard !didStart else {
+            return
+        }
+        didStart = true
+
+        let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
+        if autostart {
+            messages.append(ChatMessage(role: .system, text: "Ensuring engine process is running…"))
+            let socketPath = self.socketPath
+            let processController = self.processController
+            Task.detached {
+                do {
+                    try processController.start(socketPath: socketPath)
+                } catch {
+                    await MainActor.run {
+                        processController.onOutputLine?(
+                            "Failed to launch engine: \(error.localizedDescription)"
+                        )
+                    }
+                }
+            }
+        } else {
+            messages.append(
+                ChatMessage(
+                    role: .system,
+                    text: "Auto-start disabled. Connects to an external engine socket."
+                )
+            )
+        }
+        engine.start()
     }
 
     func respondToPendingPermission(granted: Bool) {

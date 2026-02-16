@@ -52,6 +52,12 @@ final class EngineClient: @unchecked Sendable {
             case .ready:
                 self.emit(.connected)
                 self.receiveNext()
+            case .waiting(let error):
+                self.emit(.error("socket waiting: \(error.localizedDescription)"))
+                self.connection = nil
+                connection.cancel()
+                self.emit(.disconnected)
+                self.scheduleReconnect()
             case .failed(let error):
                 self.emit(.error("socket failed: \(error.localizedDescription)"))
                 self.connection = nil
@@ -112,7 +118,9 @@ final class EngineClient: @unchecked Sendable {
 
             if let error {
                 self.emit(.error("socket receive failed: \(error.localizedDescription)"))
+                self.connection = nil
                 self.emit(.disconnected)
+                self.scheduleReconnect()
                 return
             }
 

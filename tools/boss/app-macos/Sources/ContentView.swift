@@ -12,6 +12,9 @@ struct ContentView: View {
             composer
         }
         .frame(minWidth: 860, minHeight: 560)
+        .task {
+            model.startIfNeeded()
+        }
         .alert(item: $model.pendingPermission) { request in
             Alert(
                 title: Text("Permission Request"),
