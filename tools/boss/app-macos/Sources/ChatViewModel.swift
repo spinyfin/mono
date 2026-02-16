@@ -1,29 +1,68 @@
 import Foundation
 
+struct PendingPermission: Identifiable {
+    let id: String
+    let title: String
+}
+
 @MainActor
 final class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = [
-        ChatMessage(
-            role: .system,
-            text: "Connect the engine with: bazel run //tools/boss/engine:engine -- --mode=server"
-        ),
+        ChatMessage(role: .system, text: "Starting boss frontend…"),
     ]
     @Published var draft: String = ""
     @Published var isConnected: Bool = false
     @Published var isSending: Bool = false
+    @Published var pendingPermission: PendingPermission?
 
     private let engine: EngineClient
+    private let processController = EngineProcessController()
     private var activeAssistantMessageID: UUID?
+    private var permissionQueue: [PendingPermission] = []
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
             ?? "/tmp/boss-engine.sock"
     ) {
         engine = EngineClient(socketPath: socketPath)
+
+        processController.onOutputLine = { [weak self] line in
+            self?.messages.append(ChatMessage(role: .system, text: line))
+        }
+
         engine.onEvent = { [weak self] event in
             self?.handle(event)
         }
-        engine.start()
+
+        let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
+        if autostart {
+            do {
+                try processController.start(socketPath: socketPath)
+                messages.append(ChatMessage(role: .system, text: "Launching engine process…"))
+            } catch {
+                messages.append(
+                    ChatMessage(role: .system, text: "Failed to launch engine: \(error.localizedDescription)")
+                )
+            }
+
+            Task {
+                try? await Task.sleep(for: .seconds(1.0))
+                engine.start()
+            }
+        } else {
+            messages.append(
+                ChatMessage(
+                    role: .system,
+                    text: "Auto-start disabled. Connects to an external engine socket."
+                )
+            )
+            engine.start()
+        }
+    }
+
+    deinit {
+        processController.stop()
+        engine.stop()
     }
 
     func sendDraft() {
@@ -37,6 +76,23 @@ final class ChatViewModel: ObservableObject {
         activeAssistantMessageID = nil
         engine.sendPrompt(trimmed)
         draft = ""
+    }
+
+    func respondToPendingPermission(granted: Bool) {
+        guard let pendingPermission else {
+            return
+        }
+
+        engine.sendPermissionResponse(id: pendingPermission.id, granted: granted)
+        messages.append(
+            ChatMessage(
+                role: .system,
+                text: "[permission] \(granted ? "allowed" : "denied"): \(pendingPermission.title)"
+            )
+        )
+
+        self.pendingPermission = nil
+        showNextPermissionIfNeeded()
     }
 
     private func handle(_ event: EngineEvent) {
@@ -58,13 +114,29 @@ final class ChatViewModel: ObservableObject {
         case .toolCall(let name, let status):
             messages.append(ChatMessage(role: .system, text: "[tool] \(name) (\(status))"))
         case .permissionRequest(let id, let title):
-            messages.append(ChatMessage(role: .system, text: "[permission] auto-allowing: \(title)"))
-            engine.sendPermissionResponse(id: id, granted: true)
+            enqueuePermission(id: id, title: title)
         case .error(let message):
             isSending = false
             activeAssistantMessageID = nil
             messages.append(ChatMessage(role: .system, text: "[error] \(message)"))
         }
+    }
+
+    private func enqueuePermission(id: String, title: String) {
+        let request = PendingPermission(id: id, title: title)
+        if pendingPermission == nil {
+            pendingPermission = request
+        } else {
+            permissionQueue.append(request)
+        }
+    }
+
+    private func showNextPermissionIfNeeded() {
+        guard pendingPermission == nil, !permissionQueue.isEmpty else {
+            return
+        }
+
+        pendingPermission = permissionQueue.removeFirst()
     }
 
     private func appendAssistantChunk(_ text: String) {
