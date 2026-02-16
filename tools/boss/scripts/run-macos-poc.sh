@@ -18,6 +18,7 @@ Optional environment variables:
   BOSS_ENGINE_FORCE_RESTART   Set 1 to force-stop existing engine before launch.
   BOSS_ENGINE_AUTOSTART
   BOSS_ENGINE_STOP_ON_EXIT    Set 1 to stop engine when app exits.
+  BOSS_SHOW_SYSTEM_MESSAGES   Set 1 to show internal system status lines in UI.
   BOSS_ENGINE_CMD
   RUST_LOG
   BOSS_SKIP_INSTALL   Set to 1 to skip pnpm install (same effect as --skip-install).
@@ -90,6 +91,7 @@ export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-/tmp/boss-engine.pid}"
 export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-/tmp/boss-engine.log}"
 export BOSS_ENGINE_FORCE_RESTART="${BOSS_ENGINE_FORCE_RESTART:-0}"
 export BOSS_ENGINE_STOP_ON_EXIT="${BOSS_ENGINE_STOP_ON_EXIT:-0}"
+export BOSS_SHOW_SYSTEM_MESSAGES="${BOSS_SHOW_SYSTEM_MESSAGES:-0}"
 export RUST_LOG="${RUST_LOG:-info,acp_stderr=debug}"
 
 echo "Launching BossMacApp..."
@@ -100,6 +102,7 @@ echo "BOSS_ENGINE_PID_PATH: $BOSS_ENGINE_PID_PATH"
 echo "BOSS_ENGINE_LOG_PATH: $BOSS_ENGINE_LOG_PATH"
 echo "BOSS_ENGINE_FORCE_RESTART: $BOSS_ENGINE_FORCE_RESTART"
 echo "BOSS_ENGINE_STOP_ON_EXIT: $BOSS_ENGINE_STOP_ON_EXIT"
+echo "BOSS_SHOW_SYSTEM_MESSAGES: $BOSS_SHOW_SYSTEM_MESSAGES"
 echo "RUST_LOG: $RUST_LOG"
 
 exec swift run --package-path "$repo_root/tools/boss/app-macos" BossMacApp

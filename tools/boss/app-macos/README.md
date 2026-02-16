@@ -16,6 +16,8 @@ Engine logs are written to `/tmp/boss-engine.log` by default (override with
 `BOSS_ENGINE_LOG_PATH`).
 Engine PID is written to `/tmp/boss-engine.pid` by default (override with
 `BOSS_ENGINE_PID_PATH`).
+Internal system status messages are hidden by default. Set
+`BOSS_SHOW_SYSTEM_MESSAGES=1` to show them in the chat transcript.
 
 ## Default flow (auto-launch engine)
 
@@ -59,5 +61,6 @@ BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock swift run BossMac
 - `BOSS_ENGINE_PID_PATH`: engine pid file path (default `/tmp/boss-engine.pid`)
 - `BOSS_ENGINE_FORCE_RESTART`: set `1` to force-restart the engine on app launch
 - `BOSS_ENGINE_STOP_ON_EXIT`: set `1` to stop engine when app exits
+- `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
 - `RUST_LOG`: tracing filter for engine logs (default `info,acp_stderr=debug`)

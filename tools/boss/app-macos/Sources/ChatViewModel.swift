@@ -7,9 +7,7 @@ struct PendingPermission: Identifiable {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
-    @Published var messages: [ChatMessage] = [
-        ChatMessage(role: .system, text: "Starting boss frontend…"),
-    ]
+    @Published var messages: [ChatMessage] = []
     @Published var draft: String = ""
     @Published var isConnected: Bool = false
     @Published var isSending: Bool = false
@@ -18,6 +16,7 @@ final class ChatViewModel: ObservableObject {
     private let engine: EngineClient
     private let processController = EngineProcessController()
     private let socketPath: String
+    private let showSystemMessages: Bool
     private var didStart = false
     private var activeAssistantMessageID: UUID?
     private var permissionQueue: [PendingPermission] = []
@@ -27,15 +26,19 @@ final class ChatViewModel: ObservableObject {
             ?? "/tmp/boss-engine.sock"
     ) {
         self.socketPath = socketPath
+        let showSystem = ProcessInfo.processInfo.environment["BOSS_SHOW_SYSTEM_MESSAGES"] ?? ""
+        showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
         engine = EngineClient(socketPath: socketPath)
 
         processController.onOutputLine = { [weak self] line in
-            self?.messages.append(ChatMessage(role: .system, text: line))
+            self?.appendSystemMessage(line)
         }
 
         engine.onEvent = { [weak self] event in
             self?.handle(event)
         }
+
+        appendSystemMessage("Starting boss frontend…")
     }
 
     deinit {
@@ -64,26 +67,24 @@ final class ChatViewModel: ObservableObject {
 
         let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
         if autostart {
-            messages.append(ChatMessage(role: .system, text: "Ensuring engine process is running…"))
+            appendSystemMessage("Ensuring engine process is running…")
             let socketPath = self.socketPath
             let processController = self.processController
-            Task.detached {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 do {
                     try processController.start(socketPath: socketPath)
                 } catch {
-                    await MainActor.run {
-                        processController.onOutputLine?(
-                            "Failed to launch engine: \(error.localizedDescription)"
+                    DispatchQueue.main.async {
+                        self?.appendSystemMessage(
+                            "Failed to launch engine: \(error.localizedDescription)",
+                            alwaysShow: true
                         )
                     }
                 }
             }
         } else {
-            messages.append(
-                ChatMessage(
-                    role: .system,
-                    text: "Auto-start disabled. Connects to an external engine socket."
-                )
+            appendSystemMessage(
+                "Auto-start disabled. Connects to an external engine socket."
             )
         }
         engine.start()
@@ -95,11 +96,8 @@ final class ChatViewModel: ObservableObject {
         }
 
         engine.sendPermissionResponse(id: pendingPermission.id, granted: granted)
-        messages.append(
-            ChatMessage(
-                role: .system,
-                text: "[permission] \(granted ? "allowed" : "denied"): \(pendingPermission.title)"
-            )
+        appendSystemMessage(
+            "[permission] \(granted ? "allowed" : "denied"): \(pendingPermission.title)"
         )
 
         self.pendingPermission = nil
@@ -110,27 +108,34 @@ final class ChatViewModel: ObservableObject {
         switch event {
         case .connected:
             isConnected = true
-            messages.append(ChatMessage(role: .system, text: "Connected to engine socket."))
+            appendSystemMessage("Connected to engine socket.")
         case .disconnected:
             isConnected = false
             isSending = false
             activeAssistantMessageID = nil
-            messages.append(ChatMessage(role: .system, text: "Disconnected from engine socket."))
+            appendSystemMessage("Disconnected from engine socket.")
         case .chunk(let text):
             appendAssistantChunk(text)
         case .done(let stopReason):
             isSending = false
             activeAssistantMessageID = nil
-            messages.append(ChatMessage(role: .system, text: "[done] \(stopReason)"))
+            appendSystemMessage("[done] \(stopReason)")
         case .toolCall(let name, let status):
-            messages.append(ChatMessage(role: .system, text: "[tool] \(name) (\(status))"))
+            appendSystemMessage("[tool] \(name) (\(status))")
         case .permissionRequest(let id, let title):
             enqueuePermission(id: id, title: title)
         case .error(let message):
             isSending = false
             activeAssistantMessageID = nil
-            messages.append(ChatMessage(role: .system, text: "[error] \(message)"))
+            appendSystemMessage("[error] \(message)", alwaysShow: true)
         }
+    }
+
+    private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
+        guard alwaysShow || showSystemMessages else {
+            return
+        }
+        messages.append(ChatMessage(role: .system, text: text))
     }
 
     private func enqueuePermission(id: String, title: String) {
