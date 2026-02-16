@@ -7,6 +7,9 @@ enum EngineEvent {
     case chunk(String)
     case done(String)
     case toolCall(name: String, status: String)
+    case terminalStarted(id: String, title: String, command: String, cwd: String?)
+    case terminalOutput(id: String, text: String)
+    case terminalDone(id: String, exitCode: Int?, signal: String?)
     case permissionRequest(id: String, title: String)
     case error(String)
 }
@@ -168,6 +171,27 @@ final class EngineClient: @unchecked Sendable {
                 let name = payload["name"] as? String ?? "tool"
                 let status = payload["status"] as? String ?? "update"
                 emit(.toolCall(name: name, status: status))
+            case "terminal_started":
+                let id = payload["id"] as? String ?? UUID().uuidString
+                let title = payload["title"] as? String ?? "Terminal"
+                let command = payload["command"] as? String ?? ""
+                let cwd = payload["cwd"] as? String
+                emit(.terminalStarted(id: id, title: title, command: command, cwd: cwd))
+            case "terminal_output":
+                let id = payload["id"] as? String ?? ""
+                let text = payload["text"] as? String ?? ""
+                guard !id.isEmpty, !text.isEmpty else {
+                    break
+                }
+                emit(.terminalOutput(id: id, text: text))
+            case "terminal_done":
+                let id = payload["id"] as? String ?? ""
+                guard !id.isEmpty else {
+                    break
+                }
+                let exitCode = (payload["exit_code"] as? NSNumber)?.intValue
+                let signal = payload["signal"] as? String
+                emit(.terminalDone(id: id, exitCode: exitCode, signal: signal))
             case "permission_request":
                 let id = payload["id"] as? String ?? ""
                 let title = payload["title"] as? String ?? "Permission"

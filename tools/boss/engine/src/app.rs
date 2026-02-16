@@ -44,11 +44,38 @@ enum FrontendRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum FrontendEvent {
-    Chunk { text: String },
-    Done { stop_reason: String },
-    ToolCall { name: String, status: String },
-    PermissionRequest { id: String, title: String },
-    Error { message: String },
+    Chunk {
+        text: String,
+    },
+    Done {
+        stop_reason: String,
+    },
+    ToolCall {
+        name: String,
+        status: String,
+    },
+    TerminalStarted {
+        id: String,
+        title: String,
+        command: String,
+        cwd: Option<String>,
+    },
+    TerminalOutput {
+        id: String,
+        text: String,
+    },
+    TerminalDone {
+        id: String,
+        exit_code: Option<i64>,
+        signal: Option<String>,
+    },
+    PermissionRequest {
+        id: String,
+        title: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -196,7 +223,10 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
 
         match request {
             FrontendRequest::Prompt { text } => {
-                tracing::info!(prompt_chars = text.chars().count(), "received prompt from frontend");
+                tracing::info!(
+                    prompt_chars = text.chars().count(),
+                    "received prompt from frontend"
+                );
                 let acp = acp.clone();
                 let session_id = session_id.clone();
                 let event_tx = event_tx.clone();
@@ -238,6 +268,35 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
                                 let _ = event_tx.send(FrontendEvent::PermissionRequest {
                                     id: permission_id,
                                     title,
+                                });
+                            }
+                            AcpEvent::TerminalStarted {
+                                id,
+                                title,
+                                command,
+                                cwd,
+                                ..
+                            } => {
+                                let _ = event_tx.send(FrontendEvent::TerminalStarted {
+                                    id,
+                                    title,
+                                    command,
+                                    cwd,
+                                });
+                            }
+                            AcpEvent::TerminalOutput { id, text, .. } => {
+                                let _ = event_tx.send(FrontendEvent::TerminalOutput { id, text });
+                            }
+                            AcpEvent::TerminalDone {
+                                id,
+                                exit_code,
+                                signal,
+                                ..
+                            } => {
+                                let _ = event_tx.send(FrontendEvent::TerminalDone {
+                                    id,
+                                    exit_code,
+                                    signal,
                                 });
                             }
                         })
@@ -304,6 +363,33 @@ async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<(
             }
             AcpEvent::PermissionRequest { title, .. } => {
                 eprintln!("\n[permission] auto-approving: {title}");
+            }
+            AcpEvent::TerminalStarted {
+                title,
+                command,
+                cwd,
+                ..
+            } => {
+                if let Some(cwd) = cwd {
+                    eprintln!("\n[terminal] {title} (cwd={cwd})");
+                } else {
+                    eprintln!("\n[terminal] {title}");
+                }
+                eprintln!("{command}");
+            }
+            AcpEvent::TerminalOutput { text, .. } => {
+                eprint!("{text}");
+            }
+            AcpEvent::TerminalDone {
+                exit_code, signal, ..
+            } => {
+                if let Some(code) = exit_code {
+                    eprintln!("\n[terminal done] exit={code}");
+                } else if let Some(signal) = signal {
+                    eprintln!("\n[terminal done] signal={signal}");
+                } else {
+                    eprintln!("\n[terminal done]");
+                }
             }
         })
         .await?;

@@ -7,7 +7,7 @@ struct PendingPermission: Identifiable {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
-    @Published var messages: [ChatMessage] = []
+    @Published var timeline: [TranscriptItem] = []
     @Published var draft: String = ""
     @Published var isConnected: Bool = false
     @Published var isSending: Bool = false
@@ -18,8 +18,13 @@ final class ChatViewModel: ObservableObject {
     private let socketPath: String
     private let showSystemMessages: Bool
     private var didStart = false
+    private var didStartEngine = false
+    private var hasConnectedOnce = false
     private var activeAssistantMessageID: UUID?
     private var permissionQueue: [PendingPermission] = []
+    private var terminalEntryIndexByID: [String: Int] = [:]
+
+    private let maxTerminalOutputChars = 200_000
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -52,7 +57,7 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        messages.append(ChatMessage(role: .user, text: trimmed))
+        appendMessage(role: .user, text: trimmed)
         isSending = true
         activeAssistantMessageID = nil
         engine.sendPrompt(trimmed)
@@ -73,6 +78,9 @@ final class ChatViewModel: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 do {
                     try processController.start(socketPath: socketPath)
+                    DispatchQueue.main.async {
+                        self?.startEngineIfNeeded()
+                    }
                 } catch {
                     DispatchQueue.main.async {
                         self?.appendSystemMessage(
@@ -86,8 +94,8 @@ final class ChatViewModel: ObservableObject {
             appendSystemMessage(
                 "Auto-start disabled. Connects to an external engine socket."
             )
+            startEngineIfNeeded()
         }
-        engine.start()
     }
 
     func respondToPendingPermission(granted: Bool) {
@@ -108,6 +116,7 @@ final class ChatViewModel: ObservableObject {
         switch event {
         case .connected:
             isConnected = true
+            hasConnectedOnce = true
             appendSystemMessage("Connected to engine socket.")
         case .disconnected:
             isConnected = false
@@ -122,20 +131,55 @@ final class ChatViewModel: ObservableObject {
             appendSystemMessage("[done] \(stopReason)")
         case .toolCall(let name, let status):
             appendSystemMessage("[tool] \(name) (\(status))")
+        case .terminalStarted(let id, let title, let command, let cwd):
+            // Once a terminal starts, subsequent assistant chunks should render after it.
+            activeAssistantMessageID = nil
+            upsertTerminalActivity(id: id, title: title, command: command, cwd: cwd)
+        case .terminalOutput(let id, let text):
+            appendTerminalOutput(id: id, text: text)
+        case .terminalDone(let id, let exitCode, let signal):
+            completeTerminalActivity(id: id, exitCode: exitCode, signal: signal)
         case .permissionRequest(let id, let title):
             enqueuePermission(id: id, title: title)
         case .error(let message):
             isSending = false
             activeAssistantMessageID = nil
+            if shouldSuppressSocketStartupError(message) {
+                return
+            }
             appendSystemMessage("[error] \(message)", alwaysShow: true)
         }
+    }
+
+    private func startEngineIfNeeded() {
+        guard !didStartEngine else {
+            return
+        }
+        didStartEngine = true
+        engine.start()
+    }
+
+    private func shouldSuppressSocketStartupError(_ message: String) -> Bool {
+        guard !showSystemMessages, !hasConnectedOnce else {
+            return false
+        }
+
+        if message.hasPrefix("socket failed:") || message.hasPrefix("socket waiting:") {
+            return true
+        }
+
+        return false
+    }
+
+    private func appendMessage(role: ChatRole, text: String) {
+        timeline.append(.message(ChatMessage(role: role, text: text)))
     }
 
     private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
         guard alwaysShow || showSystemMessages else {
             return
         }
-        messages.append(ChatMessage(role: .system, text: text))
+        appendMessage(role: .system, text: text)
     }
 
     private func enqueuePermission(id: String, title: String) {
@@ -156,15 +200,100 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func appendAssistantChunk(_ text: String) {
-        if let id = activeAssistantMessageID,
-            let index = messages.firstIndex(where: { $0.id == id })
-        {
-            messages[index].text += text
+        if let id = activeAssistantMessageID, let index = messageIndex(for: id) {
+            guard case .message(var message) = timeline[index] else {
+                return
+            }
+            message.text += text
+            timeline[index] = .message(message)
             return
         }
 
         let message = ChatMessage(role: .assistant, text: text)
         activeAssistantMessageID = message.id
-        messages.append(message)
+        timeline.append(.message(message))
+    }
+
+    private func messageIndex(for id: UUID) -> Int? {
+        timeline.firstIndex { item in
+            guard case .message(let message) = item else {
+                return false
+            }
+            return message.id == id
+        }
+    }
+
+    private func upsertTerminalActivity(id: String, title: String, command: String, cwd: String?) {
+        let index = ensureTerminalActivity(id: id)
+        guard case .terminal(var activity) = timeline[index] else {
+            return
+        }
+
+        activity.title = title
+        if !command.isEmpty {
+            activity.command = command
+        }
+        if let cwd {
+            activity.cwd = cwd
+        }
+        activity.status = "Running…"
+        timeline[index] = .terminal(activity)
+    }
+
+    private func appendTerminalOutput(id: String, text: String) {
+        let index = ensureTerminalActivity(id: id)
+        guard case .terminal(var activity) = timeline[index] else {
+            return
+        }
+
+        activity.output += text
+        if activity.output.count > maxTerminalOutputChars {
+            let overflow = activity.output.count - maxTerminalOutputChars
+            activity.output.removeFirst(overflow)
+        }
+        timeline[index] = .terminal(activity)
+    }
+
+    private func completeTerminalActivity(id: String, exitCode: Int?, signal: String?) {
+        let index = ensureTerminalActivity(id: id)
+        guard case .terminal(var activity) = timeline[index] else {
+            return
+        }
+
+        if let exitCode {
+            if exitCode == 0 {
+                activity.status = "Done"
+            } else {
+                activity.status = "Failed (exit \(exitCode))"
+            }
+        } else if let signal, !signal.isEmpty {
+            activity.status = "Terminated (signal \(signal))"
+        } else {
+            activity.status = "Done"
+        }
+
+        timeline[index] = .terminal(activity)
+    }
+
+    private func ensureTerminalActivity(id: String) -> Int {
+        if let index = terminalEntryIndexByID[id],
+            index < timeline.count,
+            case .terminal = timeline[index]
+        {
+            return index
+        }
+
+        let activity = TerminalActivity(
+            id: id,
+            title: "Terminal command",
+            command: "",
+            cwd: nil,
+            output: "",
+            status: "Running…"
+        )
+        let index = timeline.count
+        timeline.append(.terminal(activity))
+        terminalEntryIndexByID[id] = index
+        return index
     }
 }

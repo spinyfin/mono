@@ -41,6 +41,24 @@ pub enum AcpEvent {
         permission_id: String,
         title: String,
     },
+    TerminalStarted {
+        session_id: String,
+        id: String,
+        title: String,
+        command: String,
+        cwd: Option<String>,
+    },
+    TerminalOutput {
+        session_id: String,
+        id: String,
+        text: String,
+    },
+    TerminalDone {
+        session_id: String,
+        id: String,
+        exit_code: Option<i64>,
+        signal: Option<String>,
+    },
 }
 
 impl AcpEvent {
@@ -49,7 +67,10 @@ impl AcpEvent {
             AcpEvent::AgentMessageChunk { session_id, .. }
             | AcpEvent::ToolCall { session_id, .. }
             | AcpEvent::ToolCallUpdate { session_id, .. }
-            | AcpEvent::PermissionRequest { session_id, .. } => session_id,
+            | AcpEvent::PermissionRequest { session_id, .. }
+            | AcpEvent::TerminalStarted { session_id, .. }
+            | AcpEvent::TerminalOutput { session_id, .. }
+            | AcpEvent::TerminalDone { session_id, .. } => session_id,
         }
     }
 }
@@ -572,7 +593,7 @@ impl ClientHost {
         match method {
             "fs/read_text_file" => self.read_text_file(params).await,
             "fs/write_text_file" => self.write_text_file(params).await,
-            "terminal/create" => self.terminals.create(params).await,
+            "terminal/create" => self.terminals.create(params, events_tx).await,
             "terminal/output" => self.terminals.output(params).await,
             "terminal/wait_for_exit" => self.terminals.wait_for_exit(params).await,
             "terminal/kill" => self.terminals.kill(params).await,
@@ -625,9 +646,9 @@ impl ClientHost {
         let path = Path::new(&request.path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("failed to create parent directories for {}", request.path))?;
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!("failed to create parent directories for {}", request.path)
+                })?;
             }
         }
         tokio::fs::write(&request.path, request.content)
@@ -751,7 +772,11 @@ struct TerminalManager {
 }
 
 impl TerminalManager {
-    async fn create(&self, params: Value) -> Result<Value> {
+    async fn create(
+        &self,
+        params: Value,
+        events_tx: &broadcast::Sender<AcpEvent>,
+    ) -> Result<Value> {
         #[derive(Deserialize)]
         struct EnvVariable {
             name: String,
@@ -759,7 +784,18 @@ impl TerminalManager {
         }
 
         #[derive(Deserialize)]
+        struct ToolCallContext {
+            title: Option<String>,
+        }
+
+        #[derive(Deserialize)]
         struct CreateRequest {
+            #[serde(rename = "sessionId")]
+            session_id: Option<String>,
+            #[serde(rename = "toolCallId")]
+            tool_call_id: Option<String>,
+            #[serde(rename = "toolCall")]
+            tool_call: Option<ToolCallContext>,
             command: String,
             args: Option<Vec<String>>,
             cwd: Option<String>,
@@ -771,6 +807,9 @@ impl TerminalManager {
         let request: CreateRequest =
             serde_json::from_value(params).context("invalid terminal/create request")?;
         let CreateRequest {
+            session_id,
+            tool_call_id,
+            tool_call,
             command: raw_command,
             args: request_args,
             cwd,
@@ -799,7 +838,7 @@ impl TerminalManager {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = &cwd {
             let cwd_path = Path::new(&cwd);
             if !cwd_path.is_dir() {
                 bail!("terminal/create cwd does not exist or is not a directory: {cwd}");
@@ -813,28 +852,46 @@ impl TerminalManager {
             }
         }
 
-        let child = command
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn terminal command executable={} args={args:?}",
-                    executable
-                )
-            })?;
+        let child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn terminal command executable={} args={args:?}",
+                executable
+            )
+        })?;
 
         let terminal_id = format!(
             "terminal-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
         );
+        let stream_id = tool_call_id.unwrap_or_else(|| terminal_id.clone());
+        let session_id = session_id.unwrap_or_default();
+        let title = tool_call
+            .and_then(|call| call.title)
+            .unwrap_or_else(|| "Terminal command".to_owned());
+
         let output_limit = output_byte_limit.unwrap_or(DEFAULT_TERMINAL_OUTPUT_LIMIT);
 
-        let terminal = Arc::new(TerminalProcess::new(child, output_limit));
+        let terminal = Arc::new(TerminalProcess::new(
+            child,
+            output_limit,
+            session_id.clone(),
+            stream_id.clone(),
+            events_tx.clone(),
+        ));
         terminal.start_output_pumps().await?;
 
         self.terminals
             .lock()
             .await
             .insert(terminal_id.clone(), terminal);
+
+        let _ = events_tx.send(AcpEvent::TerminalStarted {
+            session_id,
+            id: stream_id,
+            title,
+            command: raw_command,
+            cwd,
+        });
 
         Ok(json!({ "terminalId": terminal_id }))
     }
@@ -931,8 +988,10 @@ mod tests {
 
     #[test]
     fn normalize_terminal_command_uses_structured_args() {
-        let (program, args, mode) =
-            normalize_terminal_command("javac".to_owned(), Some(vec!["/tmp/hello.java".to_owned()]));
+        let (program, args, mode) = normalize_terminal_command(
+            "javac".to_owned(),
+            Some(vec!["/tmp/hello.java".to_owned()]),
+        );
         assert_eq!(program, "javac");
         assert_eq!(args, vec!["/tmp/hello.java"]);
         assert_eq!(mode, "structured");
@@ -949,8 +1008,7 @@ mod tests {
 
     #[test]
     fn normalize_terminal_command_uses_shell_for_operators() {
-        let (program, args, mode) =
-            normalize_terminal_command("cd /tmp && ls".to_owned(), None);
+        let (program, args, mode) = normalize_terminal_command("cd /tmp && ls".to_owned(), None);
         assert_eq!(program, "/bin/bash");
         assert_eq!(args, vec!["-lc", "cd /tmp && ls"]);
         assert_eq!(mode, "shell");
@@ -963,16 +1021,30 @@ struct TerminalProcess {
     truncated: Arc<AtomicBool>,
     output_limit: usize,
     exit_status: Arc<Mutex<Option<Value>>>,
+    events_tx: broadcast::Sender<AcpEvent>,
+    session_id: String,
+    stream_id: String,
+    completion_emitted: AtomicBool,
 }
 
 impl TerminalProcess {
-    fn new(child: Child, output_limit: usize) -> Self {
+    fn new(
+        child: Child,
+        output_limit: usize,
+        session_id: String,
+        stream_id: String,
+        events_tx: broadcast::Sender<AcpEvent>,
+    ) -> Self {
         Self {
             child: Mutex::new(child),
             output: Arc::new(Mutex::new(String::new())),
             truncated: Arc::new(AtomicBool::new(false)),
             output_limit,
             exit_status: Arc::new(Mutex::new(None)),
+            events_tx,
+            session_id,
+            stream_id,
+            completion_emitted: AtomicBool::new(false),
         }
     }
 
@@ -985,6 +1057,9 @@ impl TerminalProcess {
                 self.output.clone(),
                 self.truncated.clone(),
                 self.output_limit,
+                self.events_tx.clone(),
+                self.session_id.clone(),
+                self.stream_id.clone(),
             ));
         }
 
@@ -994,6 +1069,9 @@ impl TerminalProcess {
                 self.output.clone(),
                 self.truncated.clone(),
                 self.output_limit,
+                self.events_tx.clone(),
+                self.session_id.clone(),
+                self.stream_id.clone(),
             ));
         }
 
@@ -1005,6 +1083,9 @@ impl TerminalProcess {
         output: Arc<Mutex<String>>,
         truncated: Arc<AtomicBool>,
         output_limit: usize,
+        events_tx: broadcast::Sender<AcpEvent>,
+        session_id: String,
+        stream_id: String,
     ) {
         let mut buf = vec![0_u8; 4096];
 
@@ -1013,8 +1094,9 @@ impl TerminalProcess {
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = String::from_utf8_lossy(&buf[..n]);
+                    let chunk_string = chunk.to_string();
                     let mut locked = output.lock().await;
-                    locked.push_str(&chunk);
+                    locked.push_str(&chunk_string);
 
                     if locked.len() > output_limit {
                         let excess = locked.len() - output_limit;
@@ -1025,6 +1107,12 @@ impl TerminalProcess {
                         locked.drain(..drain_to);
                         truncated.store(true, Ordering::Relaxed);
                     }
+
+                    let _ = events_tx.send(AcpEvent::TerminalOutput {
+                        session_id: session_id.clone(),
+                        id: stream_id.clone(),
+                        text: chunk_string,
+                    });
                 }
                 Err(err) => {
                     warn!(?err, "failed to read terminal output");
@@ -1044,6 +1132,7 @@ impl TerminalProcess {
             Ok(Some(status)) => {
                 let mapped = map_exit_status(status);
                 *self.exit_status.lock().await = Some(mapped.clone());
+                self.emit_completion_if_needed(&mapped);
                 Some(mapped)
             }
             Ok(None) => None,
@@ -1063,6 +1152,7 @@ impl TerminalProcess {
         let status = child.wait().await.context("terminal wait failed")?;
         let mapped = map_exit_status(status);
         *self.exit_status.lock().await = Some(mapped.clone());
+        self.emit_completion_if_needed(&mapped);
         Ok(mapped)
     }
 
@@ -1073,6 +1163,29 @@ impl TerminalProcess {
             Ok(None) => child.kill().await.context("terminal kill failed"),
             Err(err) => Err(anyhow!(err).context("failed to inspect terminal process state")),
         }
+    }
+
+    fn emit_completion_if_needed(&self, status: &Value) {
+        if self
+            .completion_emitted
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let exit_code = status.get("exitCode").and_then(Value::as_i64);
+        let signal = status
+            .get("signal")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let _ = self.events_tx.send(AcpEvent::TerminalDone {
+            session_id: self.session_id.clone(),
+            id: self.stream_id.clone(),
+            exit_code,
+            signal,
+        });
     }
 }
 
