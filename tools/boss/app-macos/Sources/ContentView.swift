@@ -74,22 +74,222 @@ struct ContentView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 12) {
-            TextField("Type a message…", text: $model.draft, axis: .vertical)
-                .lineLimit(4)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit {
-                    model.sendDraft()
-                }
+        let isDraftEmpty = model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-            Button("Send") {
+        return HStack(alignment: .center, spacing: 10) {
+            ComposerTextView(text: $model.draft, placeholder: "Type a message…", autoFocus: true) {
                 model.sendDraft()
             }
+            .frame(height: 36)
+            .frame(maxWidth: .infinity)
+
+            Button {
+                model.sendDraft()
+            } label: {
+                Image(systemName: "paperplane.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isDraftEmpty || model.isSending ? .secondary : .primary)
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
             .keyboardShortcut(.return, modifiers: [.command])
-            .buttonStyle(.borderedProminent)
-            .disabled(model.isSending)
+            .disabled(model.isSending || isDraftEmpty)
+            .help("Send")
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .underPageBackgroundColor))
+    }
+}
+
+private struct ComposerTextView: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let autoFocus: Bool
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+
+        let textView = ComposerNSTextView()
+        textView.delegate = context.coordinator
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.textColor = .labelColor
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.focusRingType = .none
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.textContainer?.widthTracksTextView = true
+        textView.submitHandler = onSubmit
+        textView.placeholder = placeholder
+        textView.string = text
+
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.didAutoFocus = false
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let textView = context.coordinator.textView else {
+            return
+        }
+
+        textView.submitHandler = onSubmit
+        textView.placeholder = placeholder
+        if textView.string != text {
+            textView.string = text
+            textView.needsDisplay = true
+        }
+
+        if autoFocus, !context.coordinator.didAutoFocus {
+            context.coordinator.didAutoFocus = true
+            DispatchQueue.main.async {
+                guard let window = textView.window else {
+                    return
+                }
+                window.makeFirstResponder(textView)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: ComposerTextView
+        weak var textView: ComposerNSTextView?
+        var didAutoFocus = false
+
+        init(parent: ComposerTextView) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else {
+                return
+            }
+            parent.text = textView.string
+            textView.needsDisplay = true
+        }
+    }
+}
+
+private final class ComposerNSTextView: NSTextView {
+    var submitHandler: (() -> Void)?
+    var placeholder: String = "" {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        guard let layoutManager, let textContainer, let scrollView = enclosingScrollView else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let textHeight = layoutManager.usedRect(for: textContainer).height
+        let visibleHeight = scrollView.contentSize.height
+        let topInset = max(0, (visibleHeight - textHeight) / 2)
+        if abs(textContainerInset.height - topInset) > 0.5 {
+            textContainerInset = NSSize(width: 0, height: topInset)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard string.isEmpty, !placeholder.isEmpty, let font else {
+            return
+        }
+
+        let origin = textContainerOrigin
+        let x = origin.x + (textContainer?.lineFragmentPadding ?? 0)
+        let y = origin.y
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.placeholderTextColor,
+        ]
+        (placeholder as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard modifiers == [.command], let chars = event.charactersIgnoringModifiers else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch chars.lowercased() {
+        case "a":
+            selectAll(nil)
+            return true
+        case "c":
+            copy(nil)
+            return true
+        case "v":
+            paste(nil)
+            return true
+        case "x":
+            cut(nil)
+            return true
+        case "z":
+            undoManager?.undo()
+            return true
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+
+    override func doCommand(by selector: Selector) {
+        let isNewlineCommand = selector == #selector(insertNewline(_:))
+            || selector == #selector(insertLineBreak(_:))
+            || selector == #selector(insertNewlineIgnoringFieldEditor(_:))
+        guard isNewlineCommand, !hasMarkedText() else {
+            super.doCommand(by: selector)
+            return
+        }
+
+        let modifiers = NSApp.currentEvent?.modifierFlags.intersection([
+            .shift,
+            .control,
+            .option,
+            .command,
+        ]) ?? []
+
+        if modifiers == [.shift] {
+            insertNewline(nil)
+            return
+        }
+
+        if modifiers.isEmpty {
+            submitHandler?()
+            return
+        }
+
+        super.doCommand(by: selector)
     }
 }
 
