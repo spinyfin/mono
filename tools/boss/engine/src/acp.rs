@@ -218,7 +218,9 @@ impl AcpClient {
                 }
                 maybe_event = events.recv() => {
                     if let Ok(event) = maybe_event {
-                        if event.session_id() == session_id {
+                        // Some adapter-initiated client requests may omit sessionId.
+                        // Route those updates to the active prompt in this PoC runtime.
+                        if event.session_id() == session_id || event.session_id().is_empty() {
                             on_event(event);
                         }
                     }
@@ -453,6 +455,11 @@ async fn handle_incoming_request(
     let method = message.get("method")?.as_str()?.to_owned();
     let request_id = message.get("id")?.clone();
     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
 
     match client_host.handle_request(&method, params, events_tx).await {
         Ok(result) => Some(json!({
@@ -461,6 +468,17 @@ async fn handle_incoming_request(
             "result": result,
         })),
         Err(err) => {
+            let status = err
+                .chain()
+                .map(|cause| cause.to_string())
+                .collect::<Vec<_>>()
+                .join(": ");
+            let _ = events_tx.send(AcpEvent::ToolCall {
+                session_id,
+                tool_call_id: None,
+                title: method.clone(),
+                status: Some(format!("failed: {status}")),
+            });
             warn!(?err, method, "failed to handle incoming ACP request");
             Some(json!({
                 "jsonrpc": "2.0",
