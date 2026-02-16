@@ -109,6 +109,25 @@ The frontend provides:
 - Agent output: streaming view of what each agent is doing.
 - Intervention controls: pause, redirect, provide feedback to agents.
 
+### Agent Authentication
+
+Boss should support ACP adapters that authenticate in different ways. For the
+Claude Code ACP adapter, the design should allow both:
+
+- **API key auth**: `ANTHROPIC_API_KEY` is present and passed through to the
+  adapter process.
+- **Claude Code login auth**: no API key is required if the local Claude Code
+  CLI is already authenticated (for example via `claude /login` with stored
+  local credentials).
+
+For PoC ergonomics, the engine should not hard-require an API key at startup.
+Instead, it should:
+
+- pass `ANTHROPIC_API_KEY` only when provided,
+- surface ACP auth-required responses clearly to the frontend,
+- expose adapter-provided auth methods/metadata so the frontend can guide the
+  user through login when needed.
+
 ## Modes of Operation
 
 ### Interactive
