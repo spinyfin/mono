@@ -13,6 +13,26 @@ use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
+const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+
+struct PidFileGuard {
+    path: String,
+    pid: u32,
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let content = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(_) => return,
+        };
+
+        let parsed = content.trim().parse::<u32>().ok();
+        if parsed == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -94,11 +114,27 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind unix socket {socket_path}"))?;
+
+    let pid_path =
+        std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
+    let pid = std::process::id();
+    std::fs::write(&pid_path, format!("{pid}\n"))
+        .with_context(|| format!("failed to write pid file {pid_path}"))?;
+    let _pid_guard = PidFileGuard {
+        path: pid_path.clone(),
+        pid,
+    };
+
     tracing::info!(socket_path = %socket_path, "frontend socket is ready");
+    tracing::info!(pid, pid_file = %pid_path, "engine pid file is ready");
     println!("boss-engine listening on {socket_path}");
 
-    let (stream, _) = listener.accept().await.context("socket accept failed")?;
-    handle_frontend_connection(stream, cfg).await
+    loop {
+        let (stream, _) = listener.accept().await.context("socket accept failed")?;
+        if let Err(err) = handle_frontend_connection(stream, cfg).await {
+            tracing::error!(?err, "frontend connection failed");
+        }
+    }
 }
 
 async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> Result<()> {
