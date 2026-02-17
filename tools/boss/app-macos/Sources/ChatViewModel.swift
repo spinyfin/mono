@@ -2,16 +2,34 @@ import Foundation
 
 struct PendingPermission: Identifiable {
     let id: String
+    let agentId: String
     let title: String
 }
 
 @MainActor
 final class ChatViewModel: ObservableObject {
-    @Published var timeline: [TranscriptItem] = []
+    @Published var agents: [Agent] = []
+    @Published var selectedAgentID: String?
     @Published var draft: String = ""
     @Published var isConnected: Bool = false
-    @Published var isSending: Bool = false
     @Published var pendingPermission: PendingPermission?
+
+    var selectedAgent: Agent? {
+        guard let id = selectedAgentID else { return nil }
+        return agents.first { $0.id == id }
+    }
+
+    var selectedAgentTimeline: [TranscriptItem] {
+        selectedAgent?.timeline ?? []
+    }
+
+    var isSelectedAgentSending: Bool {
+        selectedAgent?.isSending ?? false
+    }
+
+    var isSelectedAgentReady: Bool {
+        selectedAgent?.isReady ?? false
+    }
 
     private let engine: EngineClient
     private let processController = EngineProcessController()
@@ -20,9 +38,7 @@ final class ChatViewModel: ObservableObject {
     private var didStart = false
     private var didStartEngine = false
     private var hasConnectedOnce = false
-    private var activeAssistantMessageID: UUID?
     private var permissionQueue: [PendingPermission] = []
-    private var terminalEntryIndexByID: [String: Int] = [:]
 
     private let maxTerminalOutputChars = 200_000
 
@@ -42,8 +58,6 @@ final class ChatViewModel: ObservableObject {
         engine.onEvent = { [weak self] event in
             self?.handle(event)
         }
-
-        appendSystemMessage("Starting boss frontend…")
     }
 
     deinit {
@@ -51,28 +65,28 @@ final class ChatViewModel: ObservableObject {
         engine.stop()
     }
 
-    func sendDraft() {
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return
-        }
+    func createAgent(name: String? = nil) {
+        engine.sendCreateAgent(name: name)
+    }
 
-        appendMessage(role: .user, text: trimmed)
-        isSending = true
-        activeAssistantMessageID = nil
-        engine.sendPrompt(trimmed)
+    func sendDraft() {
+        guard let agentId = selectedAgentID else { return }
+        guard isSelectedAgentReady else { return }
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        appendMessage(agentId: agentId, role: .user, text: trimmed)
+        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
+        engine.sendPrompt(agentId: agentId, text: trimmed)
         draft = ""
     }
 
     func startIfNeeded() {
-        guard !didStart else {
-            return
-        }
+        guard !didStart else { return }
         didStart = true
 
         let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
         if autostart {
-            appendSystemMessage("Ensuring engine process is running…")
             let socketPath = self.socketPath
             let processController = self.processController
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -91,99 +105,124 @@ final class ChatViewModel: ObservableObject {
                 }
             }
         } else {
-            appendSystemMessage(
-                "Auto-start disabled. Connects to an external engine socket."
-            )
             startEngineIfNeeded()
         }
     }
 
     func respondToPendingPermission(granted: Bool) {
-        guard let pendingPermission else {
-            return
-        }
-
-        engine.sendPermissionResponse(id: pendingPermission.id, granted: granted)
+        guard let pending = pendingPermission else { return }
+        engine.sendPermissionResponse(agentId: pending.agentId, id: pending.id, granted: granted)
         appendSystemMessage(
-            "[permission] \(granted ? "allowed" : "denied"): \(pendingPermission.title)"
+            "[permission] \(granted ? "allowed" : "denied"): \(pending.title)",
+            agentId: pending.agentId
         )
-
         self.pendingPermission = nil
         showNextPermissionIfNeeded()
     }
+
+    // MARK: - Event Handling
 
     private func handle(_ event: EngineEvent) {
         switch event {
         case .connected:
             isConnected = true
             hasConnectedOnce = true
-            appendSystemMessage("Connected to engine socket.")
+            // Auto-create the first agent on connect
+            if agents.isEmpty {
+                createAgent()
+            }
         case .disconnected:
             isConnected = false
-            isSending = false
-            activeAssistantMessageID = nil
-            appendSystemMessage("Disconnected from engine socket.")
-        case .chunk(let text):
-            appendAssistantChunk(text)
-        case .done(let stopReason):
-            isSending = false
-            activeAssistantMessageID = nil
-            appendSystemMessage("[done] \(stopReason)")
-        case .toolCall(let name, let status):
-            appendSystemMessage("[tool] \(name) (\(status))")
-        case .terminalStarted(let id, let title, let command, let cwd):
-            // Once a terminal starts, subsequent assistant chunks should render after it.
-            activeAssistantMessageID = nil
-            upsertTerminalActivity(id: id, title: title, command: command, cwd: cwd)
-        case .terminalOutput(let id, let text):
-            appendTerminalOutput(id: id, text: text)
-        case .terminalDone(let id, let exitCode, let signal):
-            completeTerminalActivity(id: id, exitCode: exitCode, signal: signal)
-        case .permissionRequest(let id, let title):
-            enqueuePermission(id: id, title: title)
-        case .error(let message):
-            isSending = false
-            activeAssistantMessageID = nil
-            if shouldSuppressSocketStartupError(message) {
-                return
+            for i in agents.indices {
+                agents[i].isSending = false
+                agents[i].activeAssistantMessageID = nil
             }
-            appendSystemMessage("[error] \(message)", alwaysShow: true)
+        case .agentCreated(let agentId, let name):
+            let agent = Agent(id: agentId, name: name, isReady: false)
+            agents.append(agent)
+            if selectedAgentID == nil {
+                selectedAgentID = agentId
+            }
+        case .agentReady(let agentId):
+            mutateAgent(agentId) { $0.isReady = true }
+        case .agentList(let list):
+            for entry in list {
+                if !agents.contains(where: { $0.id == entry.id }) {
+                    agents.append(Agent(id: entry.id, name: entry.name, isReady: true))
+                }
+            }
+            if selectedAgentID == nil, let first = agents.first {
+                selectedAgentID = first.id
+            }
+        case .agentRemoved(let agentId):
+            agents.removeAll { $0.id == agentId }
+            if selectedAgentID == agentId {
+                selectedAgentID = agents.first?.id
+            }
+        case .chunk(let agentId, let text):
+            appendAssistantChunk(agentId: agentId, text: text)
+        case .done(let agentId, let stopReason):
+            mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
+            appendSystemMessage("[done] \(stopReason)", agentId: agentId)
+        case .toolCall(let agentId, let name, let status):
+            appendSystemMessage("[tool] \(name) (\(status))", agentId: agentId)
+        case .terminalStarted(let agentId, let id, let title, let command, let cwd):
+            mutateAgent(agentId) { $0.activeAssistantMessageID = nil }
+            upsertTerminalActivity(agentId: agentId, id: id, title: title, command: command, cwd: cwd)
+        case .terminalOutput(let agentId, let id, let text):
+            appendTerminalOutput(agentId: agentId, id: id, text: text)
+        case .terminalDone(let agentId, let id, let exitCode, let signal):
+            completeTerminalActivity(agentId: agentId, id: id, exitCode: exitCode, signal: signal)
+        case .permissionRequest(let agentId, let id, let title):
+            enqueuePermission(agentId: agentId, id: id, title: title)
+        case .error(let agentId, let message):
+            if let agentId {
+                mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
+            }
+            if shouldSuppressSocketStartupError(message) { return }
+            if let agentId {
+                appendSystemMessage("[error] \(message)", agentId: agentId, alwaysShow: true)
+            }
         }
     }
 
+    // MARK: - Private Helpers
+
     private func startEngineIfNeeded() {
-        guard !didStartEngine else {
-            return
-        }
+        guard !didStartEngine else { return }
         didStartEngine = true
         engine.start()
     }
 
     private func shouldSuppressSocketStartupError(_ message: String) -> Bool {
-        guard !showSystemMessages, !hasConnectedOnce else {
-            return false
-        }
-
-        if message.hasPrefix("socket failed:") || message.hasPrefix("socket waiting:") {
-            return true
-        }
-
-        return false
+        guard !showSystemMessages, !hasConnectedOnce else { return false }
+        return message.hasPrefix("socket failed:") || message.hasPrefix("socket waiting:")
     }
 
-    private func appendMessage(role: ChatRole, text: String) {
-        timeline.append(.message(ChatMessage(role: role, text: text)))
+    private func agentIndex(_ agentId: String) -> Int? {
+        agents.firstIndex { $0.id == agentId }
     }
 
-    private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
-        guard alwaysShow || showSystemMessages else {
-            return
+    private func mutateAgent(_ agentId: String, _ body: (inout Agent) -> Void) {
+        guard let index = agentIndex(agentId) else { return }
+        body(&agents[index])
+    }
+
+    private func appendMessage(agentId: String, role: ChatRole, text: String) {
+        mutateAgent(agentId) {
+            $0.timeline.append(.message(ChatMessage(role: role, text: text)))
         }
-        appendMessage(role: .system, text: text)
     }
 
-    private func enqueuePermission(id: String, title: String) {
-        let request = PendingPermission(id: id, title: title)
+    private func appendSystemMessage(_ text: String, agentId: String? = nil, alwaysShow: Bool = false) {
+        guard alwaysShow || showSystemMessages else { return }
+        if let agentId {
+            appendMessage(agentId: agentId, role: .system, text: text)
+        }
+    }
+
+    private func enqueuePermission(agentId: String, id: String, title: String) {
+        let request = PendingPermission(id: id, agentId: agentId, title: title)
         if pendingPermission == nil {
             pendingPermission = request
         } else {
@@ -192,108 +231,91 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func showNextPermissionIfNeeded() {
-        guard pendingPermission == nil, !permissionQueue.isEmpty else {
-            return
-        }
-
+        guard pendingPermission == nil, !permissionQueue.isEmpty else { return }
         pendingPermission = permissionQueue.removeFirst()
     }
 
-    private func appendAssistantChunk(_ text: String) {
-        if let id = activeAssistantMessageID, let index = messageIndex(for: id) {
-            guard case .message(var message) = timeline[index] else {
-                return
-            }
+    private func appendAssistantChunk(agentId: String, text: String) {
+        guard let agentIdx = agentIndex(agentId) else { return }
+        let agent = agents[agentIdx]
+
+        if let msgId = agent.activeAssistantMessageID,
+           let timelineIdx = messageIndex(in: agents[agentIdx].timeline, for: msgId) {
+            guard case .message(var message) = agents[agentIdx].timeline[timelineIdx] else { return }
             message.text += text
-            timeline[index] = .message(message)
+            agents[agentIdx].timeline[timelineIdx] = .message(message)
             return
         }
 
         let message = ChatMessage(role: .assistant, text: text)
-        activeAssistantMessageID = message.id
-        timeline.append(.message(message))
+        agents[agentIdx].activeAssistantMessageID = message.id
+        agents[agentIdx].timeline.append(.message(message))
     }
 
-    private func messageIndex(for id: UUID) -> Int? {
+    private func messageIndex(in timeline: [TranscriptItem], for id: UUID) -> Int? {
         timeline.firstIndex { item in
-            guard case .message(let message) = item else {
-                return false
-            }
+            guard case .message(let message) = item else { return false }
             return message.id == id
         }
     }
 
-    private func upsertTerminalActivity(id: String, title: String, command: String, cwd: String?) {
-        let index = ensureTerminalActivity(id: id)
-        guard case .terminal(var activity) = timeline[index] else {
-            return
-        }
-
+    private func upsertTerminalActivity(agentId: String, id: String, title: String, command: String, cwd: String?) {
+        let index = ensureTerminalActivity(agentId: agentId, id: id)
+        guard let agentIdx = agentIndex(agentId),
+              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
         activity.title = title
-        if !command.isEmpty {
-            activity.command = command
-        }
-        if let cwd {
-            activity.cwd = cwd
-        }
+        if !command.isEmpty { activity.command = command }
+        if let cwd { activity.cwd = cwd }
         activity.status = "Running…"
-        timeline[index] = .terminal(activity)
+        agents[agentIdx].timeline[index] = .terminal(activity)
     }
 
-    private func appendTerminalOutput(id: String, text: String) {
-        let index = ensureTerminalActivity(id: id)
-        guard case .terminal(var activity) = timeline[index] else {
-            return
-        }
-
+    private func appendTerminalOutput(agentId: String, id: String, text: String) {
+        let index = ensureTerminalActivity(agentId: agentId, id: id)
+        guard let agentIdx = agentIndex(agentId),
+              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
         activity.output += text
         if activity.output.count > maxTerminalOutputChars {
             let overflow = activity.output.count - maxTerminalOutputChars
             activity.output.removeFirst(overflow)
         }
-        timeline[index] = .terminal(activity)
+        agents[agentIdx].timeline[index] = .terminal(activity)
     }
 
-    private func completeTerminalActivity(id: String, exitCode: Int?, signal: String?) {
-        let index = ensureTerminalActivity(id: id)
-        guard case .terminal(var activity) = timeline[index] else {
-            return
-        }
-
+    private func completeTerminalActivity(agentId: String, id: String, exitCode: Int?, signal: String?) {
+        let index = ensureTerminalActivity(agentId: agentId, id: id)
+        guard let agentIdx = agentIndex(agentId),
+              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
         if let exitCode {
-            if exitCode == 0 {
-                activity.status = "Done"
-            } else {
-                activity.status = "Failed (exit \(exitCode))"
-            }
+            activity.status = exitCode == 0 ? "Done" : "Failed (exit \(exitCode))"
         } else if let signal, !signal.isEmpty {
             activity.status = "Terminated (signal \(signal))"
         } else {
             activity.status = "Done"
         }
-
-        timeline[index] = .terminal(activity)
+        agents[agentIdx].timeline[index] = .terminal(activity)
     }
 
-    private func ensureTerminalActivity(id: String) -> Int {
-        if let index = terminalEntryIndexByID[id],
-            index < timeline.count,
-            case .terminal = timeline[index]
-        {
+    private func ensureTerminalActivity(agentId: String, id: String) -> Int {
+        guard let agentIdx = agentIndex(agentId) else {
+            // Should not happen; create agent on the fly as fallback
+            let agent = Agent(id: agentId, name: agentId)
+            agents.append(agent)
+            return ensureTerminalActivity(agentId: agentId, id: id)
+        }
+
+        if let index = agents[agentIdx].terminalEntryIndexByID[id],
+           index < agents[agentIdx].timeline.count,
+           case .terminal = agents[agentIdx].timeline[index] {
             return index
         }
 
         let activity = TerminalActivity(
-            id: id,
-            title: "Terminal command",
-            command: "",
-            cwd: nil,
-            output: "",
-            status: "Running…"
+            id: id, title: "Terminal command", command: "", cwd: nil, output: "", status: "Running…"
         )
-        let index = timeline.count
-        timeline.append(.terminal(activity))
-        terminalEntryIndexByID[id] = index
+        let index = agents[agentIdx].timeline.count
+        agents[agentIdx].timeline.append(.terminal(activity))
+        agents[agentIdx].terminalEntryIndexByID[id] = index
         return index
     }
 }

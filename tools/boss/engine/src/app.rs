@@ -64,6 +64,9 @@ enum FrontendEvent {
         agent_id: String,
         name: String,
     },
+    AgentReady {
+        agent_id: String,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },
@@ -141,29 +144,32 @@ impl AgentRegistry {
         }
     }
 
-    async fn create_agent(&self, name: Option<String>) -> Result<(String, String)> {
+    fn allocate_agent(&self, name: Option<String>) -> (String, String) {
         let id = format!(
             "agent-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed)
         );
         let name = name.unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id)));
+        (id, name)
+    }
 
+    async fn initialize_agent(&self, id: &str, name: &str) -> Result<()> {
         let acp_client = Arc::new(AcpClient::connect_with_external_permissions(&self.cfg).await?);
         acp_client.initialize().await?;
         let session_id = acp_client.new_session(&self.cfg.cwd).await?;
 
-        tracing::info!(agent_id = %id, name = %name, session_id = %session_id, "agent created");
+        tracing::info!(agent_id = %id, name = %name, session_id = %session_id, "agent ready");
 
         let agent = Agent {
-            id: id.clone(),
-            name: name.clone(),
+            id: id.to_owned(),
+            name: name.to_owned(),
             acp_client,
             session_id,
             prompt_lock: Arc::new(Mutex::new(())),
         };
 
-        self.agents.lock().await.insert(id.clone(), agent);
-        Ok((id, name))
+        self.agents.lock().await.insert(id.to_owned(), agent);
+        Ok(())
     }
 
     async fn remove_agent(&self, agent_id: &str) -> Result<()> {
@@ -338,18 +344,26 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
 
         match request {
             FrontendRequest::CreateAgent { name } => {
+                let (agent_id, agent_name) = registry.allocate_agent(name);
+                let _ = event_tx.send(FrontendEvent::AgentCreated {
+                    agent_id: agent_id.clone(),
+                    name: agent_name.clone(),
+                });
+
                 let event_tx = event_tx.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
-                    match registry.create_agent(name).await {
-                        Ok((agent_id, name)) => {
-                            let _ = event_tx.send(FrontendEvent::AgentCreated { agent_id, name });
+                    match registry.initialize_agent(&agent_id, &agent_name).await {
+                        Ok(()) => {
+                            let _ = event_tx.send(FrontendEvent::AgentReady {
+                                agent_id,
+                            });
                         }
                         Err(err) => {
-                            tracing::error!(?err, "failed to create agent");
+                            tracing::error!(?err, agent_id = %agent_id, "failed to initialize agent");
                             let _ = event_tx.send(FrontendEvent::Error {
-                                agent_id: None,
-                                message: format!("failed to create agent: {err}"),
+                                agent_id: Some(agent_id),
+                                message: format!("failed to initialize agent: {err}"),
                             });
                         }
                     }

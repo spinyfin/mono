@@ -1,5 +1,15 @@
 import Foundation
 
+struct Agent: Identifiable {
+    let id: String
+    var name: String
+    var isReady: Bool = false
+    var timeline: [TranscriptItem] = []
+    var isSending: Bool = false
+    var activeAssistantMessageID: UUID?
+    var terminalEntryIndexByID: [String: Int] = [:]
+}
+
 enum ChatRole {
     case user
     case assistant
