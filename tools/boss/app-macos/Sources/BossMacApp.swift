@@ -27,7 +27,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         window.title = "Boss"
-        window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
 
         let toolbar = NSToolbar(identifier: "BossToolbar")

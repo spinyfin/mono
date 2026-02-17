@@ -60,12 +60,11 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderless)
                 Spacer()
-                Label(
-                    model.isConnected ? "Connected" : "Disconnected",
-                    systemImage: "circle.fill"
-                )
-                .foregroundStyle(model.isConnected ? .green : .red)
-                .font(.caption)
+                if !model.isConnected {
+                    Label("Disconnected", systemImage: "circle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -114,7 +113,7 @@ struct ContentView: View {
 
         return VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
-                ComposerTextView(text: $model.draft, placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…", autoFocus: true) {
+                ComposerTextView(text: $model.draft, placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…", autoFocus: true, focusTrigger: model.selectedAgentID) {
                     model.sendDraft()
                 }
                 .frame(height: 36)
@@ -165,6 +164,7 @@ private struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
     let autoFocus: Bool
+    var focusTrigger: String?
     let onSubmit: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -224,8 +224,18 @@ private struct ComposerTextView: NSViewRepresentable {
             textView.needsDisplay = true
         }
 
-        if autoFocus, !context.coordinator.didAutoFocus {
+        let shouldFocus: Bool
+        if !context.coordinator.didAutoFocus, autoFocus {
             context.coordinator.didAutoFocus = true
+            shouldFocus = true
+        } else if focusTrigger != context.coordinator.lastFocusTrigger {
+            context.coordinator.lastFocusTrigger = focusTrigger
+            shouldFocus = true
+        } else {
+            shouldFocus = false
+        }
+
+        if shouldFocus {
             DispatchQueue.main.async {
                 guard let window = textView.window else {
                     return
@@ -239,6 +249,7 @@ private struct ComposerTextView: NSViewRepresentable {
         var parent: ComposerTextView
         weak var textView: ComposerNSTextView?
         var didAutoFocus = false
+        var lastFocusTrigger: String?
 
         init(parent: ComposerTextView) {
             self.parent = parent
