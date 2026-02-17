@@ -68,7 +68,9 @@ struct ContentView: View {
             }
             .onReceive(model.$timeline) { _ in
                 if let last = model.timeline.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
         }
