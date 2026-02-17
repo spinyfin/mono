@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Textual
 
 struct ContentView: View {
     @StateObject private var model = ChatViewModel()
@@ -309,9 +310,8 @@ private struct MessageBubble: View {
 
     private var assistantText: some View {
         HStack {
-            Text(message.text)
-                .font(.body)
-                .textSelection(.enabled)
+            StructuredText(markdown: message.text)
+                .textual.textSelection(.enabled)
                 .frame(maxWidth: 720, alignment: .leading)
             Spacer(minLength: 60)
         }
