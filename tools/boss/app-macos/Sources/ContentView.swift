@@ -6,12 +6,10 @@ struct ContentView: View {
     @StateObject private var model = ChatViewModel()
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            messageList
-            Divider()
-            composer
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            detail
         }
         .frame(minWidth: 860, minHeight: 560)
         .task {
@@ -31,29 +29,63 @@ struct ContentView: View {
         }
     }
 
-    private var header: some View {
-        HStack {
-            Text("Boss")
-                .font(.title2.weight(.semibold))
-            Spacer()
-            Label(model.isConnected ? "Connected" : "Disconnected", systemImage: "circle.fill")
-                .foregroundStyle(model.isConnected ? .green : .red)
-                .font(.callout)
-            if model.isSending {
-                ProgressView()
-                    .controlSize(.small)
+    private var sidebar: some View {
+        List(model.agents, selection: $model.selectedAgentID) { agent in
+            HStack {
+                Image(systemName: "person.circle")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(agent.name)
+                        .font(.body)
+                    if !agent.isReady {
+                        Text("Starting…")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else if agent.isSending {
+                        Text("Working…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
+            .tag(agent.id)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(.regularMaterial)
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Button {
+                    model.createAgent()
+                } label: {
+                    Label("New Agent", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Label(
+                    model.isConnected ? "Connected" : "Disconnected",
+                    systemImage: "circle.fill"
+                )
+                .foregroundStyle(model.isConnected ? .green : .red)
+                .font(.caption)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
+    }
+
+    private var detail: some View {
+        VStack(spacing: 0) {
+            messageList
+            composer
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(model.timeline) { item in
+                    ForEach(model.selectedAgentTimeline) { item in
                         switch item {
                         case .message(let message):
                             MessageBubble(message: message)
@@ -66,8 +98,8 @@ struct ContentView: View {
                 }
                 .padding(16)
             }
-            .onReceive(model.$timeline) { _ in
-                if let last = model.timeline.last {
+            .onChange(of: model.selectedAgentTimeline.count) {
+                if let last = model.selectedAgentTimeline.last {
                     DispatchQueue.main.async {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -78,30 +110,54 @@ struct ContentView: View {
 
     private var composer: some View {
         let isDraftEmpty = model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let canSend = model.selectedAgentID != nil && !isDraftEmpty && !model.isSelectedAgentSending && model.isSelectedAgentReady
 
-        return HStack(alignment: .center, spacing: 10) {
-            ComposerTextView(text: $model.draft, placeholder: "Type a message…", autoFocus: true) {
-                model.sendDraft()
-            }
-            .frame(height: 36)
-            .frame(maxWidth: .infinity)
+        return VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                ComposerTextView(text: $model.draft, placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…", autoFocus: true) {
+                    model.sendDraft()
+                }
+                .frame(height: 36)
+                .frame(maxWidth: .infinity)
 
-            Button {
-                model.sendDraft()
-            } label: {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(isDraftEmpty || model.isSending ? .secondary : .primary)
-                    .frame(width: 18, height: 18)
+                Button {
+                    model.sendDraft()
+                } label: {
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(canSend ? .primary : .secondary)
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(!canSend)
+                .help("Send")
             }
-            .buttonStyle(.plain)
-            .keyboardShortcut(.return, modifiers: [.command])
-            .disabled(model.isSending || isDraftEmpty)
-            .help("Send")
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+            .padding(.top, 4)
+
+            if model.isSelectedAgentSending {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Working…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(Color(nsColor: .underPageBackgroundColor))
     }
 }
 

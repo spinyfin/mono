@@ -20,13 +20,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = NSHostingView(rootView: content)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
 
         window.title = "Boss"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+
+        let toolbar = NSToolbar(identifier: "BossToolbar")
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+
         window.contentView = host
         window.center()
         window.makeKeyAndOrderFront(nil)

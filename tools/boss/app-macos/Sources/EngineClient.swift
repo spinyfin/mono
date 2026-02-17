@@ -4,14 +4,18 @@ import Network
 enum EngineEvent {
     case connected
     case disconnected
-    case chunk(String)
-    case done(String)
-    case toolCall(name: String, status: String)
-    case terminalStarted(id: String, title: String, command: String, cwd: String?)
-    case terminalOutput(id: String, text: String)
-    case terminalDone(id: String, exitCode: Int?, signal: String?)
-    case permissionRequest(id: String, title: String)
-    case error(String)
+    case agentCreated(agentId: String, name: String)
+    case agentList(agents: [(id: String, name: String)])
+    case agentRemoved(agentId: String)
+    case chunk(agentId: String, text: String)
+    case done(agentId: String, stopReason: String)
+    case toolCall(agentId: String, name: String, status: String)
+    case terminalStarted(agentId: String, id: String, title: String, command: String, cwd: String?)
+    case terminalOutput(agentId: String, id: String, text: String)
+    case terminalDone(agentId: String, id: String, exitCode: Int?, signal: String?)
+    case permissionRequest(agentId: String, id: String, title: String)
+    case agentReady(agentId: String)
+    case error(agentId: String?, message: String)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -56,13 +60,13 @@ final class EngineClient: @unchecked Sendable {
                 self.emit(.connected)
                 self.receiveNext()
             case .waiting(let error):
-                self.emit(.error("socket waiting: \(error.localizedDescription)"))
+                self.emit(.error(agentId: nil, message: "socket waiting: \(error.localizedDescription)"))
                 self.connection = nil
                 connection.cancel()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .failed(let error):
-                self.emit(.error("socket failed: \(error.localizedDescription)"))
+                self.emit(.error(agentId: nil, message: "socket failed: \(error.localizedDescription)"))
                 self.connection = nil
                 self.emit(.disconnected)
                 self.scheduleReconnect()
@@ -78,16 +82,37 @@ final class EngineClient: @unchecked Sendable {
         connection.start(queue: queue)
     }
 
-    func sendPrompt(_ text: String) {
+    func sendCreateAgent(name: String?) {
+        var payload: [String: Any] = ["type": "create_agent"]
+        if let name {
+            payload["name"] = name
+        }
+        sendLine(payload)
+    }
+
+    func sendListAgents() {
+        sendLine(["type": "list_agents"])
+    }
+
+    func sendRemoveAgent(agentId: String) {
+        sendLine([
+            "type": "remove_agent",
+            "agent_id": agentId,
+        ])
+    }
+
+    func sendPrompt(agentId: String, text: String) {
         sendLine([
             "type": "prompt",
+            "agent_id": agentId,
             "text": text,
         ])
     }
 
-    func sendPermissionResponse(id: String, granted: Bool) {
+    func sendPermissionResponse(agentId: String, id: String, granted: Bool) {
         sendLine([
             "type": "permission_response",
+            "agent_id": agentId,
             "id": id,
             "granted": granted,
         ])
@@ -95,7 +120,7 @@ final class EngineClient: @unchecked Sendable {
 
     private func sendLine(_ payload: [String: Any]) {
         guard let connection else {
-            emit(.error("engine connection is not established"))
+            emit(.error(agentId: nil, message: "engine connection is not established"))
             return
         }
 
@@ -106,11 +131,11 @@ final class EngineClient: @unchecked Sendable {
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if let error {
-                    self.emit(.error("socket send failed: \(error.localizedDescription)"))
+                    self.emit(.error(agentId: nil, message: "socket send failed: \(error.localizedDescription)"))
                 }
             })
         } catch {
-            emit(.error("failed to encode payload: \(error.localizedDescription)"))
+            emit(.error(agentId: nil, message: "failed to encode payload: \(error.localizedDescription)"))
         }
     }
 
@@ -120,7 +145,7 @@ final class EngineClient: @unchecked Sendable {
             guard let self else { return }
 
             if let error {
-                self.emit(.error("socket receive failed: \(error.localizedDescription)"))
+                self.emit(.error(agentId: nil, message: "socket receive failed: \(error.localizedDescription)"))
                 self.connection = nil
                 self.emit(.disconnected)
                 self.scheduleReconnect()
@@ -155,35 +180,55 @@ final class EngineClient: @unchecked Sendable {
             guard let payload = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
                 let type = payload["type"] as? String
             else {
-                emit(.error("received invalid JSON message from engine"))
+                emit(.error(agentId: nil, message: "received invalid JSON message from engine"))
                 continue
             }
 
+            let agentId = payload["agent_id"] as? String
+
             switch type {
+            case "agent_created":
+                let aid = agentId ?? ""
+                let name = payload["name"] as? String ?? ""
+                emit(.agentCreated(agentId: aid, name: name))
+            case "agent_ready":
+                emit(.agentReady(agentId: agentId ?? ""))
+            case "agent_list":
+                var agents: [(id: String, name: String)] = []
+                if let list = payload["agents"] as? [[String: Any]] {
+                    for entry in list {
+                        let aid = entry["agent_id"] as? String ?? ""
+                        let name = entry["name"] as? String ?? ""
+                        agents.append((id: aid, name: name))
+                    }
+                }
+                emit(.agentList(agents: agents))
+            case "agent_removed":
+                emit(.agentRemoved(agentId: agentId ?? ""))
             case "chunk":
-                if let text = payload["text"] as? String {
-                    emit(.chunk(text))
+                if let text = payload["text"] as? String, let aid = agentId {
+                    emit(.chunk(agentId: aid, text: text))
                 }
             case "done":
                 let stopReason = payload["stop_reason"] as? String ?? "unknown"
-                emit(.done(stopReason))
+                emit(.done(agentId: agentId ?? "", stopReason: stopReason))
             case "tool_call":
                 let name = payload["name"] as? String ?? "tool"
                 let status = payload["status"] as? String ?? "update"
-                emit(.toolCall(name: name, status: status))
+                emit(.toolCall(agentId: agentId ?? "", name: name, status: status))
             case "terminal_started":
                 let id = payload["id"] as? String ?? UUID().uuidString
                 let title = payload["title"] as? String ?? "Terminal"
                 let command = payload["command"] as? String ?? ""
                 let cwd = payload["cwd"] as? String
-                emit(.terminalStarted(id: id, title: title, command: command, cwd: cwd))
+                emit(.terminalStarted(agentId: agentId ?? "", id: id, title: title, command: command, cwd: cwd))
             case "terminal_output":
                 let id = payload["id"] as? String ?? ""
                 let text = payload["text"] as? String ?? ""
                 guard !id.isEmpty, !text.isEmpty else {
                     break
                 }
-                emit(.terminalOutput(id: id, text: text))
+                emit(.terminalOutput(agentId: agentId ?? "", id: id, text: text))
             case "terminal_done":
                 let id = payload["id"] as? String ?? ""
                 guard !id.isEmpty else {
@@ -191,14 +236,14 @@ final class EngineClient: @unchecked Sendable {
                 }
                 let exitCode = (payload["exit_code"] as? NSNumber)?.intValue
                 let signal = payload["signal"] as? String
-                emit(.terminalDone(id: id, exitCode: exitCode, signal: signal))
+                emit(.terminalDone(agentId: agentId ?? "", id: id, exitCode: exitCode, signal: signal))
             case "permission_request":
                 let id = payload["id"] as? String ?? ""
                 let title = payload["title"] as? String ?? "Permission"
-                emit(.permissionRequest(id: id, title: title))
+                emit(.permissionRequest(agentId: agentId ?? "", id: id, title: title))
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
-                emit(.error(message))
+                emit(.error(agentId: agentId, message: message))
             default:
                 break
             }
