@@ -11,6 +11,7 @@ nav:
   - Motivation: motivation.md
   - Concepts: concepts.md
   - Configuring checks: checks-toml.md
+  - External checks contract: external-check-package-contract.md
   - Running checks: cli.md
   - Writing checks: check-author-api.md
   - Built-in checks: canned-checks.md
