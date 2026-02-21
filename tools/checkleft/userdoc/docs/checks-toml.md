@@ -99,7 +99,3 @@ enabled = false
 - Unknown `check` implementation IDs produce an error finding.
 - Invalid check config shapes are surfaced as check execution errors.
 - Invalid `policy.severity` values fail config resolution.
-
-## Compatibility note
-
-Some built-ins still accept legacy policy keys under `[checks.config]` (for example `severity`, `allow_bypass`, `bypass_name`) during migration. Prefer `[checks.policy]` for new configs.
