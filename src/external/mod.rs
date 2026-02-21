@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::path::validate_relative_path;
@@ -106,6 +106,8 @@ pub use provider::{
     FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
     NoopExternalCheckPackageProvider,
 };
+mod source_builder;
+pub use source_builder::{ExternalSourcePackageBuilder, JavaScriptComponentSourcePackageBuilder};
 mod runtime;
 pub use runtime::{ExternalCheckExecutor, NoopExternalCheckExecutor, WasmExternalCheckExecutor};
 
