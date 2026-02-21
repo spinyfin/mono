@@ -201,7 +201,7 @@ allow_bypass = true
 }
 
 #[tokio::test]
-async fn runner_uses_legacy_config_policy_fields_as_fallback() {
+async fn runner_ignores_legacy_config_policy_fields() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
@@ -243,13 +243,12 @@ bypass_name = "BYPASS_LEGACY_POLICY_CHECK"
         }]))
         .await
         .expect("run checks");
-    assert_eq!(results_without_bypass[0].findings[0].severity, Severity::Info);
-    assert!(
+    assert_eq!(results_without_bypass[0].findings[0].severity, Severity::Error);
+    assert_eq!(
         results_without_bypass[0].findings[0]
             .remediation
-            .as_deref()
-            .unwrap_or_default()
-            .contains("BYPASS_LEGACY_POLICY_CHECK")
+            .as_deref(),
+        Some("fix me")
     );
 
     let results_with_bypass = runner
@@ -265,11 +264,10 @@ bypass_name = "BYPASS_LEGACY_POLICY_CHECK"
         )
         .await
         .expect("run checks");
-    assert_eq!(results_with_bypass[0].findings[0].severity, Severity::Warning);
-    assert!(
-        results_with_bypass[0].findings[0]
-            .message
-            .contains("BYPASS_LEGACY_POLICY_CHECK")
+    assert_eq!(results_with_bypass[0].findings[0].severity, Severity::Error);
+    assert_eq!(
+        results_with_bypass[0].findings[0].message,
+        "synthetic policy finding"
     );
 }
 

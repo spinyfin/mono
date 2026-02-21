@@ -9,7 +9,7 @@ use crate::bypass::{
     bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
 };
 use crate::check::CheckRegistry;
-use crate::config::{CheckConfig, CheckPolicyConfig, ConfigResolver};
+use crate::config::{CheckConfig, ConfigResolver};
 use crate::external::{
     ExternalCheckPackage, ExternalCheckPackageProvider, NoopExternalCheckPackageProvider,
 };
@@ -298,18 +298,12 @@ impl Runner {
     }
 
     fn resolve_effective_policy(&self, check: &CheckConfig) -> EffectiveCheckPolicy {
-        let legacy_policy = legacy_policy_from_check_config(&check.config, &check.id);
-        let severity_override = check.policy.severity.or(legacy_policy.severity);
-        let allow_bypass = check
-            .policy
-            .allow_bypass
-            .or(legacy_policy.allow_bypass)
-            .unwrap_or(false);
+        let severity_override = check.policy.severity;
+        let allow_bypass = check.policy.allow_bypass.unwrap_or(false);
         let bypass_name = check
             .policy
             .bypass_name
             .clone()
-            .or(legacy_policy.bypass_name)
             .unwrap_or_else(|| bypass_name_for_check_id(&check.id));
 
         EffectiveCheckPolicy {
@@ -411,49 +405,6 @@ fn apply_policy_to_result(
     }
 
     result
-}
-
-fn legacy_policy_from_check_config(config: &toml::Value, check_id: &str) -> CheckPolicyConfig {
-    let Some(table) = config.as_table() else {
-        return CheckPolicyConfig::default();
-    };
-
-    let severity = table
-        .get("severity")
-        .and_then(toml::Value::as_str)
-        .and_then(parse_known_severity);
-    let allow_bypass = table.get("allow_bypass").and_then(toml::Value::as_bool);
-    let bypass_name = table
-        .get("bypass_name")
-        .and_then(toml::Value::as_str)
-        .map(|raw| normalize_bypass_name(raw, check_id));
-
-    CheckPolicyConfig {
-        severity,
-        allow_bypass,
-        bypass_name,
-    }
-}
-
-fn parse_known_severity(raw: &str) -> Option<Severity> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "error" => Some(Severity::Error),
-        "warning" => Some(Severity::Warning),
-        "info" => Some(Severity::Info),
-        _ => None,
-    }
-}
-
-fn normalize_bypass_name(raw: &str, check_id: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return bypass_name_for_check_id(check_id);
-    }
-    if trimmed.to_ascii_uppercase().starts_with("BYPASS_") {
-        return trimmed.to_ascii_uppercase();
-    }
-
-    bypass_name_for_check_id(trimmed)
 }
 
 #[cfg(test)]
