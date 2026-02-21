@@ -128,7 +128,7 @@ impl Runner {
                                 ),
                                 location: None,
                                 remediation: Some(
-                                    "Register this check implementation in the binary or fix `check = ...` in CHECKS.toml."
+                                    "Register this check implementation in the binary or fix `check = ...` in CHECKS.yaml."
                                         .to_owned(),
                                 ),
                                 suggested_fix: None,
@@ -387,7 +387,8 @@ fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::Resolv
 }
 
 fn is_checks_config_file(path: &std::path::Path) -> bool {
-    path.file_name() == Some(OsStr::new("CHECKS.toml"))
+    let file_name = path.file_name();
+    file_name == Some(OsStr::new("CHECKS.yaml")) || file_name == Some(OsStr::new("CHECKS.toml"))
 }
 
 fn apply_policy_to_result(
