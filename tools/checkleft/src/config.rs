@@ -9,7 +9,8 @@ use crate::path::validate_relative_path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-const CHECKS_FILE_NAME: &str = "CHECKS.toml";
+const CHECKS_FILE_NAME_YAML: &str = "CHECKS.yaml";
+const CHECKS_FILE_NAME_TOML: &str = "CHECKS.toml";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckConfig {
@@ -85,10 +86,10 @@ impl ConfigResolver {
 
         let mut resolved = ResolvedChecks::default();
         for relative_dir in search_dirs {
-            let config_path = self.root.join(relative_dir).join(CHECKS_FILE_NAME);
-            if !config_path.exists() {
+            let config_dir = self.root.join(relative_dir);
+            let Some(config_path) = resolve_checks_file_path(&config_dir) else {
                 continue;
-            }
+            };
 
             let checks_file = parse_checks_file(&config_path)?;
             if let Some(include_config_files) = checks_file.settings.include_config_files {
@@ -160,8 +161,18 @@ struct ParsedCheckPolicyConfig {
 fn parse_checks_file(path: &Path) -> Result<ParsedChecksFile> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
 
-    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    match extension {
+        "yaml" | "yml" => serde_yaml::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        "toml" => toml::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        _ => bail!(
+            "unsupported checks config extension for {} (expected .yaml or .toml)",
+            path.display()
+        ),
+    }
 }
 
 fn enabled_default() -> bool {
@@ -255,6 +266,20 @@ fn root_to_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     }
 
     Ok(output)
+}
+
+fn resolve_checks_file_path(dir: &Path) -> Option<PathBuf> {
+    let yaml_path = dir.join(CHECKS_FILE_NAME_YAML);
+    if yaml_path.exists() {
+        return Some(yaml_path);
+    }
+
+    let toml_path = dir.join(CHECKS_FILE_NAME_TOML);
+    if toml_path.exists() {
+        return Some(toml_path);
+    }
+
+    None
 }
 
 #[cfg(test)]

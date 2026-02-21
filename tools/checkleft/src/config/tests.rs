@@ -9,6 +9,8 @@ use crate::output::Severity;
 
 use super::ConfigResolver;
 
+mod yaml;
+
 #[test]
 fn resolves_single_config_file() {
     let temp = tempdir().expect("create temp dir");
