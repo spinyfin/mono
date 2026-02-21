@@ -13,8 +13,8 @@ use crate::output::{CheckResult, Finding};
 
 use super::{
     ExternalCheckArtifactPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalSourcePackageBuilder, JavaScriptComponentSourcePackageBuilder,
-    EXTERNAL_CHECK_RUNTIME_V1,
+    ExternalCommandCapabilities, ExternalSourcePackageBuilder,
+    JavaScriptComponentSourcePackageBuilder, EXTERNAL_CHECK_RUNTIME_V1,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -87,10 +87,7 @@ impl WasmExternalCheckExecutor {
             bail!("check runtime root is not a directory: {}", root.display());
         }
 
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).context("failed to initialize Wasmtime engine")?;
+        let engine = build_wasmtime_engine()?;
 
         let source_package_builder =
             Arc::new(JavaScriptComponentSourcePackageBuilder::new(root.clone()));
@@ -117,10 +114,7 @@ impl WasmExternalCheckExecutor {
             bail!("check runtime root is not a directory: {}", root.display());
         }
 
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).context("failed to initialize Wasmtime engine")?;
+        let engine = build_wasmtime_engine()?;
 
         Ok(Self {
             root,
@@ -133,6 +127,7 @@ impl WasmExternalCheckExecutor {
         &self,
         package: &ExternalCheckPackage,
         artifact: &ExternalCheckArtifactPackage,
+        command_capabilities: &ExternalCommandCapabilities,
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> Result<CheckResult> {
@@ -141,10 +136,22 @@ impl WasmExternalCheckExecutor {
             .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
         validate_artifact_sha256(package, artifact, &module_bytes)?;
 
-        match self.execute_core_artifact(package, &module_bytes, changeset, config) {
+        match self.execute_core_artifact(
+            package,
+            &module_bytes,
+            command_capabilities,
+            changeset,
+            config,
+        ) {
             Ok(result) => Ok(result),
             Err(CoreArtifactExecutionError::ArtifactMismatch(core_error)) => self
-                .execute_component_artifact(package, &module_bytes, changeset, config)
+                .execute_component_artifact(
+                    package,
+                    &module_bytes,
+                    command_capabilities,
+                    changeset,
+                    config,
+                )
                 .with_context(|| {
                     format!(
                         "failed to execute package `{}` as component after core mismatch: {core_error:#}",
@@ -159,6 +166,7 @@ impl WasmExternalCheckExecutor {
         &self,
         package: &ExternalCheckPackage,
         module_bytes: &[u8],
+        command_capabilities: &ExternalCommandCapabilities,
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> std::result::Result<CheckResult, CoreArtifactExecutionError> {
@@ -188,7 +196,7 @@ impl WasmExternalCheckExecutor {
             })
             .map_err(CoreArtifactExecutionError::mismatch)?;
 
-        let input = ExternalCheckRuntimeInput { changeset, config };
+        let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
         let input_bytes = serde_json::to_vec(&input)
             .context("failed to encode runtime input payload as JSON")
             .map_err(CoreArtifactExecutionError::execution)?;
@@ -234,6 +242,7 @@ impl WasmExternalCheckExecutor {
         &self,
         package: &ExternalCheckPackage,
         component_bytes: &[u8],
+        command_capabilities: &ExternalCommandCapabilities,
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> Result<CheckResult> {
@@ -255,7 +264,7 @@ impl WasmExternalCheckExecutor {
                 )
             })?;
 
-        let input = ExternalCheckRuntimeInput { changeset, config };
+        let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
         let input_json =
             serde_json::to_string(&input).context("failed to encode component runtime input")?;
         let (output_json,) = run
@@ -295,24 +304,82 @@ impl ExternalCheckExecutor for WasmExternalCheckExecutor {
             );
         }
 
+        let command_capabilities = ExternalCommandCapabilities::from_manifest(
+            &package.capabilities,
+        )
+        .with_context(|| {
+            format!(
+                "invalid command capability declaration for package `{}`",
+                package.id
+            )
+        })?;
+
         match &package.implementation {
             ExternalCheckPackageImplementation::Artifact(artifact) => {
-                self.execute_artifact(package, artifact, changeset, config)
+                self.execute_artifact(package, artifact, &command_capabilities, changeset, config)
             }
             ExternalCheckPackageImplementation::Source(source) => {
                 let built_artifact = self
                     .source_package_builder
                     .build_source_package(package, source)?;
-                self.execute_artifact(package, &built_artifact, changeset, config)
+                self.execute_artifact(
+                    package,
+                    &built_artifact,
+                    &command_capabilities,
+                    changeset,
+                    config,
+                )
             }
         }
     }
+}
+
+fn build_wasmtime_engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+
+    if let Err(error) = config.cache_config_load_default() {
+        eprintln!(
+            "warning: unable to load Wasmtime cache config, continuing without cache: {error}"
+        );
+    }
+
+    Engine::new(&config).context("failed to initialize Wasmtime engine")
 }
 
 #[derive(Serialize)]
 struct ExternalCheckRuntimeInput<'a> {
     changeset: &'a ChangeSet,
     config: &'a toml::Value,
+    capabilities: ExternalCheckRuntimeCapabilities,
+}
+
+impl<'a> ExternalCheckRuntimeInput<'a> {
+    fn new(
+        changeset: &'a ChangeSet,
+        config: &'a toml::Value,
+        command_capabilities: &ExternalCommandCapabilities,
+    ) -> Self {
+        Self {
+            changeset,
+            config,
+            capabilities: ExternalCheckRuntimeCapabilities {
+                commands: command_capabilities.allowed_commands().to_vec(),
+                command_timeout_ms: command_capabilities.timeout_ms(),
+                max_stdout_bytes: command_capabilities.max_stdout_bytes(),
+                max_stderr_bytes: command_capabilities.max_stderr_bytes(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ExternalCheckRuntimeCapabilities {
+    commands: Vec<String>,
+    command_timeout_ms: u64,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
 }
 
 #[derive(Deserialize)]

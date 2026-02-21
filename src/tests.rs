@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
 use super::{
-    OutputStyle, normalize_optional_description, render_human_results, sort_results_for_output,
+    ExternalProviderMode, OutputStyle, normalize_optional_description,
+    parse_external_provider_mode, render_human_results, sort_results_for_output,
 };
 
 #[test]
@@ -143,5 +144,37 @@ fn normalize_optional_description_trims_and_filters_empty_values() {
     assert_eq!(
         normalize_optional_description(Some("  235  ".to_owned())),
         Some("235".to_owned())
+    );
+}
+
+#[test]
+fn parse_external_provider_mode_defaults_to_auto() {
+    let parsed = parse_external_provider_mode(None).expect("parse mode");
+    assert_eq!(parsed, ExternalProviderMode::Auto);
+}
+
+#[test]
+fn parse_external_provider_mode_accepts_supported_values() {
+    assert_eq!(
+        parse_external_provider_mode(Some("file-only".to_owned())).expect("parse"),
+        ExternalProviderMode::FileOnly
+    );
+    assert_eq!(
+        parse_external_provider_mode(Some("generated-only".to_owned())).expect("parse"),
+        ExternalProviderMode::GeneratedOnly
+    );
+    assert_eq!(
+        parse_external_provider_mode(Some("off".to_owned())).expect("parse"),
+        ExternalProviderMode::Off
+    );
+}
+
+#[test]
+fn parse_external_provider_mode_rejects_invalid_values() {
+    let error = parse_external_provider_mode(Some("unknown".to_owned())).expect_err("must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid `CHECKLEFT_EXTERNAL_PROVIDER_MODE`")
     );
 }

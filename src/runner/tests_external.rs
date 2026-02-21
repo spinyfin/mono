@@ -10,6 +10,9 @@ async fn runner_reports_missing_external_package() {
 id = "domain-typo"
 check = "domain-typo-check"
 implementation = "generated:domain-typo-check"
+
+[checks.policy]
+allow_bypass = true
 "#,
     )
     .expect("write config");
@@ -51,6 +54,9 @@ async fn runner_reports_external_package_id_mismatch() {
 id = "domain-typo"
 check = "domain-typo-check"
 implementation = "generated:domain-typo-check"
+
+[checks.policy]
+allow_bypass = true
 "#,
     )
     .expect("write config");
@@ -105,6 +111,9 @@ async fn runner_executes_external_package_via_executor() {
 id = "domain-typo"
 check = "domain-typo-check"
 implementation = "generated:domain-typo-check"
+
+[checks.policy]
+allow_bypass = true
 "#,
     )
     .expect("write config");
@@ -166,6 +175,156 @@ implementation = "generated:domain-typo-check"
 
     let seen_packages = seen_packages.lock().expect("lock seen packages").clone();
     assert_eq!(seen_packages, vec!["domain-typo-check".to_owned()]);
+}
+
+#[tokio::test]
+async fn runner_applies_policy_severity_override_to_external_results() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "domain-typo"
+check = "domain-typo-check"
+implementation = "generated:domain-typo-check"
+
+[checks.policy]
+severity = "error"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(ExternalCheckPackage {
+            id: "domain-typo-check".to_owned(),
+            runtime: "sandbox-v1".to_owned(),
+            api_version: "v1".to_owned(),
+            capabilities: Default::default(),
+            implementation: ExternalCheckPackageImplementation::Source(
+                ExternalCheckSourcePackage {
+                    language: "javascript".to_owned(),
+                    entry: "./check.ts".to_owned(),
+                    build_adapter: "javascript-component".to_owned(),
+                    sources: Vec::new(),
+                },
+            ),
+        }),
+    };
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                message: "external warning".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings[0].severity, Severity::Error);
+}
+
+#[tokio::test]
+async fn runner_applies_bypass_to_external_results() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "domain-typo"
+check = "domain-typo-check"
+implementation = "generated:domain-typo-check"
+
+[checks.policy]
+allow_bypass = true
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(ExternalCheckPackage {
+            id: "domain-typo-check".to_owned(),
+            runtime: "sandbox-v1".to_owned(),
+            api_version: "v1".to_owned(),
+            capabilities: Default::default(),
+            implementation: ExternalCheckPackageImplementation::Source(
+                ExternalCheckSourcePackage {
+                    language: "javascript".to_owned(),
+                    entry: "./check.ts".to_owned(),
+                    build_adapter: "javascript-component".to_owned(),
+                    sources: Vec::new(),
+                },
+            ),
+        }),
+    };
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "external error".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: Path::new("docs/file.md").to_path_buf(),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }])
+    .with_commit_description(Some(
+        "BYPASS_DOMAIN_TYPO=temporary external parity coverage".to_owned(),
+    ));
+
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings[0].severity, Severity::Warning);
+    assert!(
+        results[0].findings[0]
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("temporary external parity coverage")
+    );
 }
 
 #[tokio::test]

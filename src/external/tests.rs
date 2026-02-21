@@ -5,11 +5,11 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use super::{
-    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckImplementationRef,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
-    parse_external_check_package_manifest,
+    parse_external_check_package_manifest, CompositeExternalCheckPackageProvider,
+    ConfiguredExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider, EXTERNAL_CHECK_API_V1,
+    EXTERNAL_CHECK_RUNTIME_V1,
 };
 
 struct StaticProvider {
@@ -259,6 +259,8 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
     fs::write(
         temp.path().join("generated/index.toml"),
         r#"
+version = 1
+
 [[packages]]
 implementation = "generated:domain-typo-check"
 manifest = "./domain_typo.check.toml"
@@ -280,6 +282,28 @@ manifest = "./domain_typo.check.toml"
         .expect("package");
 
     assert_eq!(package.id, "domain-typo-check");
+}
+
+#[test]
+fn generated_provider_rejects_unsupported_index_version() {
+    let temp = tempdir().expect("temp dir");
+    fs::create_dir_all(temp.path().join("generated")).expect("create dirs");
+    fs::write(
+        temp.path().join("generated/index.toml"),
+        r#"
+version = 2
+"#,
+    )
+    .expect("write index");
+
+    let error = GeneratedExternalCheckPackageProvider::from_index_path(
+        temp.path(),
+        &PathBuf::from("generated/index.toml"),
+    )
+    .expect_err("must reject unsupported version");
+    assert!(error
+        .to_string()
+        .contains("unsupported generated external package index version"));
 }
 
 #[test]

@@ -10,7 +10,8 @@ use checkleft::config::ConfigResolver;
 use checkleft::external::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
     ExternalCheckExecutor, ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider, WasmExternalCheckExecutor,
+    GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
+    NoopExternalCheckPackageProvider, WasmExternalCheckExecutor,
 };
 use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
@@ -57,6 +58,15 @@ const CHECKS_PR_NUMBER_ENV: &str = "CHECKS_PR_NUMBER";
 const CHECKS_REPOSITORY_ENV: &str = "CHECKS_REPOSITORY";
 const CHECKS_GITHUB_TOKEN_ENV: &str = "CHECKS_GITHUB_TOKEN";
 const CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV: &str = "CHECKLEFT_EXTERNAL_CHECK_INDEX";
+const CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV: &str = "CHECKLEFT_EXTERNAL_PROVIDER_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalProviderMode {
+    Auto,
+    FileOnly,
+    GeneratedOnly,
+    Off,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -137,29 +147,70 @@ async fn run_cli() -> Result<ExitCode> {
 }
 
 fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckPackageProvider>> {
-    let mut providers = vec![ConfiguredExternalCheckPackageProvider::new(
-        "file",
-        Arc::new(FileExternalCheckPackageProvider::new(root)?),
-    )];
+    let mode = external_provider_mode()?;
+    if mode == ExternalProviderMode::Off {
+        return Ok(Arc::new(NoopExternalCheckPackageProvider));
+    }
 
-    if let Some(index_path) =
-        normalize_optional_description(std::env::var(CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV).ok())
-    {
-        let generated_provider =
-            GeneratedExternalCheckPackageProvider::from_index_path(root, Path::new(&index_path))?;
+    let mut providers = Vec::new();
+    if mode != ExternalProviderMode::GeneratedOnly {
         providers.push(ConfiguredExternalCheckPackageProvider::new(
-            "generated-index",
-            Arc::new(generated_provider),
+            "file",
+            Arc::new(FileExternalCheckPackageProvider::new(root)?),
         ));
     }
 
+    let index_path =
+        normalize_optional_description(std::env::var(CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV).ok());
+    if mode == ExternalProviderMode::GeneratedOnly && index_path.is_none() {
+        anyhow::bail!(
+            "`{CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV}=generated-only` requires `{CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV}` to be set"
+        );
+    }
+    if mode != ExternalProviderMode::FileOnly {
+        if let Some(index_path) = index_path {
+            let generated_provider = GeneratedExternalCheckPackageProvider::from_index_path(
+                root,
+                Path::new(&index_path),
+            )?;
+            providers.push(ConfiguredExternalCheckPackageProvider::new(
+                "generated-index",
+                Arc::new(generated_provider),
+            ));
+        }
+    }
+
+    if providers.is_empty() {
+        return Ok(Arc::new(NoopExternalCheckPackageProvider));
+    }
     Ok(Arc::new(CompositeExternalCheckPackageProvider::new(
         providers,
     )))
 }
 
 fn build_external_check_executor(root: &Path) -> Result<Arc<dyn ExternalCheckExecutor>> {
+    if external_provider_mode()? == ExternalProviderMode::Off {
+        return Ok(Arc::new(NoopExternalCheckExecutor));
+    }
     Ok(Arc::new(WasmExternalCheckExecutor::new(root)?))
+}
+
+fn external_provider_mode() -> Result<ExternalProviderMode> {
+    parse_external_provider_mode(normalize_optional_description(
+        std::env::var(CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV).ok(),
+    ))
+}
+
+fn parse_external_provider_mode(raw: Option<String>) -> Result<ExternalProviderMode> {
+    match raw.as_deref() {
+        None | Some("auto") => Ok(ExternalProviderMode::Auto),
+        Some("file-only") => Ok(ExternalProviderMode::FileOnly),
+        Some("generated-only") => Ok(ExternalProviderMode::GeneratedOnly),
+        Some("off") => Ok(ExternalProviderMode::Off),
+        Some(other) => anyhow::bail!(
+            "invalid `{CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV}` value `{other}` (expected one of: auto, file-only, generated-only, off)"
+        ),
+    }
 }
 
 fn resolve_changeset(vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<ChangeSet> {

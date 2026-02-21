@@ -106,6 +106,8 @@ pub use provider::{
     FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
     NoopExternalCheckPackageProvider,
 };
+mod command_policy;
+pub use command_policy::ExternalCommandCapabilities;
 mod source_builder;
 pub use source_builder::{ExternalSourcePackageBuilder, JavaScriptComponentSourcePackageBuilder};
 mod runtime;
