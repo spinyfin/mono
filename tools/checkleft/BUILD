@@ -16,7 +16,10 @@ rust_library(
 
 rust_binary(
     name = "checkleft",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/main.rs",
+        "src/tests.rs",
+    ],
     crate_root = "src/main.rs",
     deps = all_crate_deps(normal = True) + [
         ":checkleft_lib",

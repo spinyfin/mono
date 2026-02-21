@@ -33,6 +33,31 @@ Validation requirements:
 2. File references must be safe relative paths (no absolute paths, no `..` traversal).
 3. `generated:` references must include a non-empty ID suffix.
 
+## Provider Contract (Phase 1)
+
+`checkleft` resolves external packages through provider implementations:
+
+1. File provider (always enabled): resolves file references from repo root.
+2. Generated-index provider (optional): resolves `generated:` references from an index TOML.
+
+Generated provider configuration:
+
+1. Set `CHECKLEFT_EXTERNAL_CHECK_INDEX` to an index TOML path (relative to repo root or absolute).
+
+Generated index shape:
+
+```toml
+[[packages]]
+implementation = "generated:domain-typo-check"
+manifest = "./domain_typo.check.toml"
+```
+
+Validation/diagnostics requirements:
+
+1. Missing package for an `implementation` reference is an error.
+2. Malformed package manifests are errors.
+3. If multiple providers resolve the same implementation, resolution fails with a provider conflict error.
+
 ## Manifest Schema Contract
 
 All external check package manifests are TOML.

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,15 @@ impl ExternalCheckImplementationRef {
         let path = PathBuf::from(trimmed);
         validate_relative_path(&path)?;
         Ok(Self::File(path))
+    }
+}
+
+impl fmt::Display for ExternalCheckImplementationRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Generated(id) => write!(f, "{GENERATED_IMPLEMENTATION_PREFIX}{id}"),
+        }
     }
 }
 
@@ -89,6 +99,13 @@ pub trait ExternalCheckPackageProvider: Send + Sync {
         implementation_ref: &ExternalCheckImplementationRef,
     ) -> Result<Option<ExternalCheckPackage>>;
 }
+
+mod provider;
+pub use provider::{
+    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
+    NoopExternalCheckPackageProvider,
+};
 
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
@@ -346,197 +363,4 @@ fn required_relative_path_string(field_name: &str, value: String) -> Result<Stri
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::{
-        EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckImplementationRef,
-        ExternalCheckPackageImplementation, parse_external_check_package_manifest,
-    };
-
-    #[test]
-    fn parses_source_mode_manifest() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-sources = ["./check.ts", "./package.json", "./pnpm-lock.yaml"]
-
-[capabilities]
-commands = ["grep", "sed"]
-"#;
-
-        let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
-
-        assert_eq!(package.id, "workflow-shell-strict-v2");
-        assert_eq!(package.runtime, EXTERNAL_CHECK_RUNTIME_V1);
-        assert_eq!(package.api_version, EXTERNAL_CHECK_API_V1);
-        assert_eq!(package.capabilities.commands, vec!["grep", "sed"]);
-        assert!(matches!(
-            package.implementation,
-            ExternalCheckPackageImplementation::Source(_)
-        ));
-    }
-
-    #[test]
-    fn parses_artifact_mode_manifest() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "artifact"
-runtime = "sandbox-v1"
-api_version = "v1"
-artifact_path = "bazel-bin/checks/workflow_shell_strict/check.wasm"
-artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-[provenance]
-generator = "bazel"
-target = "//checks/workflow_shell_strict:check_wasm"
-"#;
-
-        let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
-        assert!(matches!(
-            package.implementation,
-            ExternalCheckPackageImplementation::Artifact(_)
-        ));
-    }
-
-    #[test]
-    fn source_mode_rejects_artifact_fields() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-artifact_path = "x.wasm"
-artifact_sha256 = "abc"
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        assert!(error.to_string().contains("artifact_path"));
-    }
-
-    #[test]
-    fn artifact_mode_requires_required_fields() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "artifact"
-runtime = "sandbox-v1"
-api_version = "v1"
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        assert!(error.to_string().contains("artifact_path"));
-    }
-
-    #[test]
-    fn rejects_invalid_runtime() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v2"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        assert!(error.to_string().contains("unsupported runtime"));
-    }
-
-    #[test]
-    fn rejects_duplicate_commands() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-
-[capabilities]
-commands = ["grep", "grep"]
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        assert!(error.to_string().contains("duplicate command"));
-    }
-
-    #[test]
-    fn rejects_unknown_manifest_fields() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-api_vesion = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains("unknown field"));
-        assert!(message.contains("api_vesion"));
-    }
-
-    #[test]
-    fn rejects_non_canonical_artifact_sha256() {
-        let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "artifact"
-runtime = "sandbox-v1"
-api_version = "v1"
-artifact_path = "bazel-bin/checks/workflow_shell_strict/check.wasm"
-artifact_sha256 = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
-"#;
-
-        let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-        assert!(error.to_string().contains("canonical sha256 digest"));
-    }
-
-    #[test]
-    fn parses_generated_implementation_ref() {
-        let implementation_ref =
-            ExternalCheckImplementationRef::parse("generated:domain-typo-check")
-                .expect("valid generated ref");
-        assert!(matches!(
-            implementation_ref,
-            ExternalCheckImplementationRef::Generated(ref id) if id == "domain-typo-check"
-        ));
-    }
-
-    #[test]
-    fn parses_file_implementation_ref() {
-        let implementation_ref =
-            ExternalCheckImplementationRef::parse("checks/workflow-shell-strict/check.toml")
-                .expect("valid file ref");
-        assert_eq!(
-            implementation_ref,
-            ExternalCheckImplementationRef::File(PathBuf::from(
-                "checks/workflow-shell-strict/check.toml"
-            ))
-        );
-    }
-
-    #[test]
-    fn rejects_empty_generated_id() {
-        let error = ExternalCheckImplementationRef::parse("generated:").expect_err("must fail");
-        assert!(error.to_string().contains("include an id"));
-    }
-
-    #[test]
-    fn rejects_absolute_file_implementation_ref() {
-        let error = ExternalCheckImplementationRef::parse("/tmp/check.toml").expect_err("must fail");
-        assert!(error.to_string().contains("absolute paths are not allowed"));
-    }
-}
+mod tests;
