@@ -11,7 +11,8 @@ use crate::bypass::{
 use crate::check::CheckRegistry;
 use crate::config::{CheckConfig, ConfigResolver};
 use crate::external::{
-    ExternalCheckPackage, ExternalCheckPackageProvider, NoopExternalCheckPackageProvider,
+    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageProvider,
+    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Severity};
@@ -60,6 +61,7 @@ pub struct Runner {
     resolver: Arc<ConfigResolver>,
     source_tree: Arc<dyn SourceTree>,
     external_package_provider: Arc<dyn ExternalCheckPackageProvider>,
+    external_executor: Arc<dyn ExternalCheckExecutor>,
 }
 
 impl Runner {
@@ -68,11 +70,12 @@ impl Runner {
         resolver: Arc<ConfigResolver>,
         source_tree: Arc<dyn SourceTree>,
     ) -> Self {
-        Self::with_external_package_provider(
+        Self::with_external(
             registry,
             resolver,
             source_tree,
             Arc::new(NoopExternalCheckPackageProvider),
+            Arc::new(NoopExternalCheckExecutor),
         )
     }
 
@@ -82,11 +85,28 @@ impl Runner {
         source_tree: Arc<dyn SourceTree>,
         external_package_provider: Arc<dyn ExternalCheckPackageProvider>,
     ) -> Self {
+        Self::with_external(
+            registry,
+            resolver,
+            source_tree,
+            external_package_provider,
+            Arc::new(NoopExternalCheckExecutor),
+        )
+    }
+
+    pub fn with_external(
+        registry: Arc<CheckRegistry>,
+        resolver: Arc<ConfigResolver>,
+        source_tree: Arc<dyn SourceTree>,
+        external_package_provider: Arc<dyn ExternalCheckPackageProvider>,
+        external_executor: Arc<dyn ExternalCheckExecutor>,
+    ) -> Self {
         Self {
             registry,
             resolver,
             source_tree,
             external_package_provider,
+            external_executor,
         }
     }
 
@@ -138,21 +158,20 @@ impl Runner {
                     });
                 }
                 ScheduledExecution::ExternalResolved { package } => {
-                    results.push(CheckResult {
-                        check_id: run.configured_check_id,
-                        findings: vec![Finding {
-                            severity: Severity::Error,
-                            message: format!(
-                                "external check package `{}` resolved successfully but sandbox runtime execution is not implemented yet",
-                                package.id
-                            ),
-                            location: None,
-                            remediation: Some(
-                                "External package execution will be wired in Phase 2. Use a built-in check for now."
-                                    .to_owned(),
-                            ),
-                            suggested_fix: None,
-                        }],
+                    let external_executor = Arc::clone(&self.external_executor);
+                    let source_tree = Arc::clone(&self.source_tree);
+                    let configured_check_id = run.configured_check_id.clone();
+                    let run_changeset = run.changeset;
+                    let run_config = run.config;
+
+                    join_set.spawn(async move {
+                        external_executor
+                            .execute(&package, &run_changeset, source_tree.as_ref(), &run_config)
+                            .map(|mut result| {
+                                result.check_id = configured_check_id.clone();
+                                result
+                            })
+                            .map_err(|err| (configured_check_id, err))
                     });
                 }
                 ScheduledExecution::Invalid {

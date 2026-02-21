@@ -106,6 +106,8 @@ pub use provider::{
     FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
     NoopExternalCheckPackageProvider,
 };
+mod runtime;
+pub use runtime::{ExternalCheckExecutor, NoopExternalCheckExecutor, WasmExternalCheckExecutor};
 
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
