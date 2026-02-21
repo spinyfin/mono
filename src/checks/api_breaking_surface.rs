@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
-use crate::bypass::{bypass_failure_guidance, bypass_name_for_check_id, maybe_bypass_findings};
 use crate::check::Check;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -51,39 +50,17 @@ impl Check for ApiBreakingSurfaceCheck {
             });
         }
 
-        if let Some(findings) = maybe_bypass_findings(
-            changeset,
-            config.allow_bypass,
-            &config.bypass_name,
-            &trigger_files,
-        ) {
-            return Ok(CheckResult {
-                check_id: self.id().to_owned(),
-                findings,
-            });
-        }
-
-        let remediation = if config.allow_bypass {
-            format!(
-                "{} {}",
-                config.remediation,
-                bypass_failure_guidance(&config.bypass_name)
-            )
-        } else {
-            config.remediation.clone()
-        };
-
         let findings = trigger_files
             .into_iter()
             .map(|path| Finding {
-                severity: config.severity,
+                severity: Severity::Error,
                 message: config.message.clone(),
                 location: Some(Location {
                     path,
                     line: None,
                     column: None,
                 }),
-                remediation: Some(remediation.clone()),
+                remediation: Some(config.remediation.clone()),
                 suggested_fix: None,
             })
             .collect();
@@ -105,10 +82,6 @@ struct ApiBreakingSurfaceConfig {
     message: Option<String>,
     #[serde(default)]
     remediation: Option<String>,
-    #[serde(default)]
-    severity: Option<String>,
-    #[serde(default)]
-    allow_bypass: Option<bool>,
 }
 
 struct CompiledApiBreakingSurfaceConfig {
@@ -116,9 +89,6 @@ struct CompiledApiBreakingSurfaceConfig {
     required_globs: GlobSet,
     message: String,
     remediation: String,
-    severity: Severity,
-    allow_bypass: bool,
-    bypass_name: String,
 }
 
 fn parse_config(config: &toml::Value) -> Result<CompiledApiBreakingSurfaceConfig> {
@@ -144,9 +114,6 @@ fn parse_config(config: &toml::Value) -> Result<CompiledApiBreakingSurfaceConfig
         remediation: parsed.remediation.unwrap_or_else(|| {
             "Update the configured companion docs/version marker files in this change.".to_owned()
         }),
-        severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
-        allow_bypass: parsed.allow_bypass.unwrap_or(false),
-        bypass_name: bypass_name_for_check_id("api-breaking-surface"),
     })
 }
 
@@ -168,7 +135,6 @@ mod tests {
 
     use crate::check::Check;
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
-    use crate::output::Severity;
     use crate::source_tree::LocalSourceTree;
     use tempfile::tempdir;
 
@@ -190,7 +156,6 @@ mod tests {
                 &toml::Value::Table(toml::toml! {
                     trigger_globs = ["backend/blob/src/v3/**"]
                     required_globs = ["docs/backend.md"]
-                    allow_bypass = true
                 }),
             )
             .await
@@ -250,117 +215,11 @@ mod tests {
                         "backend/blob/src/v2/model.rs",
                     ]
                     required_globs = ["docs/backend.md"]
-                    allow_bypass = true
                 }),
             )
             .await
             .expect("run check");
 
         assert!(result.findings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn emits_warning_when_bypass_directive_exists_and_bypass_is_enabled() {
-        let temp = tempdir().expect("create temp dir");
-        let check = ApiBreakingSurfaceCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let changeset = ChangeSet::new(vec![ChangedFile {
-            path: Path::new("backend/blob/src/v3/auth.rs").to_path_buf(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        }])
-        .with_commit_description(Some(
-            "BYPASS_API_BREAKING_SURFACE=No public API behavior changed.".to_owned(),
-        ));
-
-        let result = check
-            .run(
-                &changeset,
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    trigger_globs = ["backend/blob/src/v3/**"]
-                    required_globs = ["docs/backend.md"]
-                    allow_bypass = true
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].severity, Severity::Warning);
-        assert!(
-            result.findings[0]
-                .message
-                .contains("BYPASS_API_BREAKING_SURFACE")
-        );
-        assert!(
-            result.findings[0]
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("No public API behavior changed.")
-        );
-    }
-
-    #[tokio::test]
-    async fn includes_bypass_guidance_when_bypass_is_enabled_and_missing() {
-        let temp = tempdir().expect("create temp dir");
-        let check = ApiBreakingSurfaceCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-
-        let result = check
-            .run(
-                &ChangeSet::new(vec![ChangedFile {
-                    path: Path::new("backend/blob/src/v3/auth.rs").to_path_buf(),
-                    kind: ChangeKind::Modified,
-                    old_path: None,
-                }]),
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    trigger_globs = ["backend/blob/src/v3/**"]
-                    required_globs = ["docs/backend.md"]
-                    allow_bypass = true
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
-        let remediation = result.findings[0]
-            .remediation
-            .as_ref()
-            .expect("remediation present");
-        assert!(remediation.contains("BYPASS_API_BREAKING_SURFACE"));
-        assert!(remediation.contains("Never use bypasses for convenience"));
-    }
-
-    #[tokio::test]
-    async fn does_not_bypass_when_bypass_is_disabled() {
-        let temp = tempdir().expect("create temp dir");
-        let check = ApiBreakingSurfaceCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let changeset = ChangeSet::new(vec![ChangedFile {
-            path: Path::new("backend/blob/src/v3/auth.rs").to_path_buf(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        }])
-        .with_commit_description(Some(
-            "BYPASS_API_BREAKING_SURFACE=No public API behavior changed.".to_owned(),
-        ));
-
-        let result = check
-            .run(
-                &changeset,
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    trigger_globs = ["backend/blob/src/v3/**"]
-                    required_globs = ["docs/backend.md"]
-                    allow_bypass = false
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
     }
 }
