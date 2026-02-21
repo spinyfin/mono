@@ -14,7 +14,7 @@ use crate::external::{
     ExternalCheckPackageProvider, ExternalCheckSourcePackage,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
-use crate::output::{CheckResult, Severity};
+use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::source_tree::LocalSourceTree;
 
 use super::Runner;
@@ -464,4 +464,5 @@ check = "capture"
     assert_eq!(results[0].check_id, "spelling");
 }
 
+include!("tests_policy.rs");
 include!("tests_external.rs");

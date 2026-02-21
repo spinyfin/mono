@@ -5,8 +5,11 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use tokio::task::JoinSet;
 
+use crate::bypass::{
+    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+};
 use crate::check::CheckRegistry;
-use crate::config::{CheckConfig, ConfigResolver};
+use crate::config::{CheckConfig, CheckPolicyConfig, ConfigResolver};
 use crate::external::{
     ExternalCheckPackage, ExternalCheckPackageProvider, NoopExternalCheckPackageProvider,
 };
@@ -17,6 +20,7 @@ use crate::output::{CheckResult, Finding, Severity};
 struct ScheduledCheckRun {
     configured_check_id: String,
     execution: ScheduledExecution,
+    policy: EffectiveCheckPolicy,
     config: toml::Value,
     changeset: ChangeSet,
 }
@@ -33,6 +37,22 @@ enum ScheduledExecution {
         message: String,
         remediation: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveCheckPolicy {
+    severity_override: Option<Severity>,
+    allow_bypass: bool,
+    bypass_name: String,
+}
+
+impl EffectiveCheckPolicy {
+    fn fingerprint(&self) -> String {
+        format!(
+            "severity={:?};allow_bypass={};bypass_name={}",
+            self.severity_override, self.allow_bypass, self.bypass_name
+        )
+    }
 }
 
 pub struct Runner {
@@ -103,6 +123,7 @@ impl Runner {
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
                     let run_config = run.config;
+                    let run_policy = run.policy;
 
                     join_set.spawn(async move {
                         check
@@ -111,7 +132,7 @@ impl Runner {
                             .map(|mut result| {
                                 // Report findings under the configured instance id.
                                 result.check_id = configured_check_id.clone();
-                                result
+                                apply_policy_to_result(result, &run_policy, &run_changeset)
                             })
                             .map_err(|err| (configured_check_id, err))
                     });
@@ -213,7 +234,7 @@ impl Runner {
     }
 
     fn schedule_runs(&self, changeset: &ChangeSet) -> Result<Vec<ScheduledCheckRun>> {
-        let mut grouped_runs: BTreeMap<(String, String, String, String), ScheduledCheckRun> =
+        let mut grouped_runs: BTreeMap<(String, String, String, String, String), ScheduledCheckRun> =
             BTreeMap::new();
 
         for changed_file in &changeset.changed_files {
@@ -226,17 +247,20 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
+                let policy = self.resolve_effective_policy(check);
                 let config_fingerprint = toml::to_string(&check.config).unwrap_or_default();
                 let implementation_fingerprint = check
                     .implementation
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_default();
+                let policy_fingerprint = policy.fingerprint();
                 let key = (
                     check.id.clone(),
                     check.check.clone(),
                     implementation_fingerprint,
                     config_fingerprint,
+                    policy_fingerprint,
                 );
 
                 let entry = grouped_runs
@@ -244,6 +268,7 @@ impl Runner {
                     .or_insert_with(|| ScheduledCheckRun {
                         configured_check_id: check.id.clone(),
                         execution: self.resolve_scheduled_execution(check),
+                        policy,
                         config: check.config.clone(),
                         changeset: ChangeSet {
                             changed_files: Vec::new(),
@@ -270,6 +295,28 @@ impl Runner {
         }
 
         Ok(grouped_runs.into_values().collect())
+    }
+
+    fn resolve_effective_policy(&self, check: &CheckConfig) -> EffectiveCheckPolicy {
+        let legacy_policy = legacy_policy_from_check_config(&check.config, &check.id);
+        let severity_override = check.policy.severity.or(legacy_policy.severity);
+        let allow_bypass = check
+            .policy
+            .allow_bypass
+            .or(legacy_policy.allow_bypass)
+            .unwrap_or(false);
+        let bypass_name = check
+            .policy
+            .bypass_name
+            .clone()
+            .or(legacy_policy.bypass_name)
+            .unwrap_or_else(|| bypass_name_for_check_id(&check.id));
+
+        EffectiveCheckPolicy {
+            severity_override,
+            allow_bypass,
+            bypass_name,
+        }
     }
 
     fn resolve_scheduled_execution(&self, check: &CheckConfig) -> ScheduledExecution {
@@ -327,6 +374,86 @@ fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::Resolv
 
 fn is_checks_config_file(path: &std::path::Path) -> bool {
     path.file_name() == Some(OsStr::new("CHECKS.toml"))
+}
+
+fn apply_policy_to_result(
+    mut result: CheckResult,
+    policy: &EffectiveCheckPolicy,
+    changeset: &ChangeSet,
+) -> CheckResult {
+    if result.findings.is_empty() {
+        return result;
+    }
+
+    if policy.allow_bypass {
+        if let Some(reason) = changeset.bypass_reason(&policy.bypass_name) {
+            let location = result
+                .findings
+                .iter()
+                .find_map(|finding| finding.location.clone());
+            result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
+            return result;
+        }
+
+        let guidance = bypass_failure_guidance(&policy.bypass_name);
+        for finding in &mut result.findings {
+            finding.remediation = Some(match finding.remediation.take() {
+                Some(remediation) => format!("{remediation} {guidance}"),
+                None => guidance.clone(),
+            });
+        }
+    }
+
+    if let Some(severity_override) = policy.severity_override {
+        for finding in &mut result.findings {
+            finding.severity = severity_override;
+        }
+    }
+
+    result
+}
+
+fn legacy_policy_from_check_config(config: &toml::Value, check_id: &str) -> CheckPolicyConfig {
+    let Some(table) = config.as_table() else {
+        return CheckPolicyConfig::default();
+    };
+
+    let severity = table
+        .get("severity")
+        .and_then(toml::Value::as_str)
+        .and_then(parse_known_severity);
+    let allow_bypass = table.get("allow_bypass").and_then(toml::Value::as_bool);
+    let bypass_name = table
+        .get("bypass_name")
+        .and_then(toml::Value::as_str)
+        .map(|raw| normalize_bypass_name(raw, check_id));
+
+    CheckPolicyConfig {
+        severity,
+        allow_bypass,
+        bypass_name,
+    }
+}
+
+fn parse_known_severity(raw: &str) -> Option<Severity> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "error" => Some(Severity::Error),
+        "warning" => Some(Severity::Warning),
+        "info" => Some(Severity::Info),
+        _ => None,
+    }
+}
+
+fn normalize_bypass_name(raw: &str, check_id: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return bypass_name_for_check_id(check_id);
+    }
+    if trimmed.to_ascii_uppercase().starts_with("BYPASS_") {
+        return trimmed.to_ascii_uppercase();
+    }
+
+    bypass_name_for_check_id(trimmed)
 }
 
 #[cfg(test)]
