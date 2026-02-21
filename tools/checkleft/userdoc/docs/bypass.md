@@ -15,20 +15,20 @@ This page describes bypass support for checks that opt into bypass.
 [[checks]]
 id = "api-breaking-surface"
 
-[checks.config]
+[checks.policy]
 allow_bypass = true
 
 [[checks]]
 id = "file-size"
 
-[checks.config]
+[checks.policy]
 allow_bypass = true
 
 [[checks]]
 id = "no-usfa-typo"
 check = "typo"
 
-[checks.config]
+[checks.policy]
 allow_bypass = true
 bypass_name = "BYPASS_NO_USFA_TYPO"
 ```
@@ -70,7 +70,7 @@ If both contain the same bypass name, PR description wins.
 
 ## Behavior when bypass applies
 
-When a check has `allow_bypass = true` and a matching directive with non-empty reason exists:
+When a check has `[checks.policy] allow_bypass = true` and a matching directive with non-empty reason exists:
 
 - the normal failure is bypassed
 - the check emits a `warning` finding recording bypass use and reason
@@ -83,6 +83,10 @@ If policy fails and bypass is enabled but no directive exists:
 
 - normal policy failure is emitted
 - remediation text includes bypass instructions and warns against convenience bypasses
+
+## Legacy config compatibility
+
+During migration, some checks still honor `allow_bypass` / `bypass_name` under `[checks.config]`. Prefer `[checks.policy]` for all new or updated configuration.
 
 ## CI/environment context
 

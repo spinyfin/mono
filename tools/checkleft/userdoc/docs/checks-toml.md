@@ -25,7 +25,12 @@ enabled = true
 # Check-specific config passed to the file-size implementation.
 [checks.config]
 max_lines = 500
-severity = "warning"
+
+# Optional shared policy controls (applied by the framework, not check code).
+[checks.policy]
+severity = "error"
+allow_bypass = true
+bypass_name = "BYPASS_FILE_SIZE"
 ```
 
 ## `[settings]`
@@ -44,6 +49,13 @@ Supported keys:
 - `check` (optional): implementation ID; defaults to `id`.
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
+- `policy` (optional table): framework-managed severity/bypass controls.
+
+`[checks.policy]` keys:
+
+- `severity` (optional `error|warning|info`): overrides finding severity for the check instance.
+- `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
+- `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
 
 ## Pattern: Multiple instances of one implementation
 
@@ -86,3 +98,8 @@ enabled = false
 
 - Unknown `check` implementation IDs produce an error finding.
 - Invalid check config shapes are surfaced as check execution errors.
+- Invalid `policy.severity` values fail config resolution.
+
+## Compatibility note
+
+Some built-ins still accept legacy policy keys under `[checks.config]` (for example `severity`, `allow_bypass`, `bypass_name`) during migration. Prefer `[checks.policy]` for new configs.
