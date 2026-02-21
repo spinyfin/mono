@@ -1,0 +1,5 @@
+package checkleft:runtime;
+
+world check-runtime {
+  export run: func(input: string) -> string;
+}
