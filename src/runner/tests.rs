@@ -10,8 +10,8 @@ use tempfile::tempdir;
 use crate::check::{Check, CheckRegistry};
 use crate::config::ConfigResolver;
 use crate::external::{
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, ExternalCheckSourcePackage,
+    ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, ExternalCheckSourcePackage,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -29,6 +29,36 @@ impl ExternalCheckPackageProvider for StaticExternalProvider {
         _implementation_ref: &ExternalCheckImplementationRef,
     ) -> Result<Option<ExternalCheckPackage>> {
         Ok(self.package.clone())
+    }
+}
+
+struct StaticExternalExecutor {
+    result: Option<CheckResult>,
+    error_message: Option<String>,
+    seen_packages: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExternalCheckExecutor for StaticExternalExecutor {
+    fn execute(
+        &self,
+        package: &ExternalCheckPackage,
+        _changeset: &ChangeSet,
+        _source_tree: &dyn SourceTree,
+        _config: &toml::Value,
+    ) -> Result<CheckResult> {
+        self.seen_packages
+            .lock()
+            .expect("lock seen packages")
+            .push(package.id.clone());
+
+        if let Some(error_message) = self.error_message.as_ref() {
+            anyhow::bail!("{error_message}");
+        }
+
+        Ok(self.result.clone().unwrap_or_else(|| CheckResult {
+            check_id: package.id.clone(),
+            findings: Vec::new(),
+        }))
     }
 }
 

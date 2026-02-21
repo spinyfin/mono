@@ -9,8 +9,8 @@ use checkleft::checks::register_builtin_checks;
 use checkleft::config::ConfigResolver;
 use checkleft::external::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider,
+    ExternalCheckExecutor, ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
+    GeneratedExternalCheckPackageProvider, WasmExternalCheckExecutor,
 };
 use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
@@ -77,15 +77,17 @@ async fn run_cli() -> Result<ExitCode> {
     let resolver = Arc::new(ConfigResolver::new(&root)?);
     let source_tree = Arc::new(LocalSourceTree::new(&root)?);
     let external_provider = build_external_package_provider(&root)?;
+    let external_executor = build_external_check_executor(&root)?;
 
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry)?;
 
-    let runner = Runner::with_external_package_provider(
+    let runner = Runner::with_external(
         Arc::new(registry),
         resolver,
         source_tree,
         external_provider,
+        external_executor,
     );
 
     match cli.command {
@@ -154,6 +156,10 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
     Ok(Arc::new(CompositeExternalCheckPackageProvider::new(
         providers,
     )))
+}
+
+fn build_external_check_executor(root: &Path) -> Result<Arc<dyn ExternalCheckExecutor>> {
+    Ok(Arc::new(WasmExternalCheckExecutor::new(root)?))
 }
 
 fn resolve_changeset(vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<ChangeSet> {
