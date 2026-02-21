@@ -24,6 +24,22 @@ const INPUT_OFFSET: usize = 0;
 const WASM_PAGE_SIZE_BYTES: usize = 65_536;
 const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
 
+#[derive(Debug)]
+enum CoreArtifactExecutionError {
+    ArtifactMismatch(anyhow::Error),
+    Execution(anyhow::Error),
+}
+
+impl CoreArtifactExecutionError {
+    fn mismatch(err: anyhow::Error) -> Self {
+        Self::ArtifactMismatch(err)
+    }
+
+    fn execution(err: anyhow::Error) -> Self {
+        Self::Execution(err)
+    }
+}
+
 pub trait ExternalCheckExecutor: Send + Sync {
     fn execute(
         &self,
@@ -125,10 +141,18 @@ impl WasmExternalCheckExecutor {
             .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
         validate_artifact_sha256(package, artifact, &module_bytes)?;
 
-        if let Ok(result) = self.execute_core_artifact(package, &module_bytes, changeset, config) {
-            return Ok(result);
+        match self.execute_core_artifact(package, &module_bytes, changeset, config) {
+            Ok(result) => Ok(result),
+            Err(CoreArtifactExecutionError::ArtifactMismatch(core_error)) => self
+                .execute_component_artifact(package, &module_bytes, changeset, config)
+                .with_context(|| {
+                    format!(
+                        "failed to execute package `{}` as component after core mismatch: {core_error:#}",
+                        package.id
+                    )
+                }),
+            Err(CoreArtifactExecutionError::Execution(error)) => Err(error),
         }
-        self.execute_component_artifact(package, &module_bytes, changeset, config)
     }
 
     fn execute_core_artifact(
@@ -137,56 +161,68 @@ impl WasmExternalCheckExecutor {
         module_bytes: &[u8],
         changeset: &ChangeSet,
         config: &toml::Value,
-    ) -> Result<CheckResult> {
+    ) -> std::result::Result<CheckResult, CoreArtifactExecutionError> {
         let module = Module::new(&self.engine, module_bytes)
-            .with_context(|| format!("failed to compile core wasm module for `{}`", package.id))?;
+            .with_context(|| format!("failed to compile core wasm module for `{}`", package.id))
+            .map_err(CoreArtifactExecutionError::mismatch)?;
         let mut store = Store::new(&self.engine, ());
         store
             .set_fuel(EXECUTION_FUEL_LIMIT)
-            .context("failed to configure runtime fuel limit")?;
+            .context("failed to configure runtime fuel limit")
+            .map_err(CoreArtifactExecutionError::execution)?;
 
         let instance = Instance::new(&mut store, &module, &[])
-            .with_context(|| format!("failed to instantiate wasm module for `{}`", package.id))?;
+            .with_context(|| format!("failed to instantiate wasm module for `{}`", package.id))
+            .map_err(CoreArtifactExecutionError::mismatch)?;
 
         let memory = instance
             .get_memory(&mut store, MEMORY_EXPORT)
-            .context("wasm module must export `memory`")?;
+            .context("wasm module must export `memory`")
+            .map_err(CoreArtifactExecutionError::mismatch)?;
         let run = instance
             .get_typed_func::<(i32, i32), i64>(&mut store, CORE_ENTRYPOINT_EXPORT)
             .with_context(|| {
                 format!(
                     "core wasm module must export `{CORE_ENTRYPOINT_EXPORT}` with signature (i32, i32) -> i64"
                 )
-            })?;
+            })
+            .map_err(CoreArtifactExecutionError::mismatch)?;
 
         let input = ExternalCheckRuntimeInput { changeset, config };
-        let input_bytes =
-            serde_json::to_vec(&input).context("failed to encode runtime input payload as JSON")?;
+        let input_bytes = serde_json::to_vec(&input)
+            .context("failed to encode runtime input payload as JSON")
+            .map_err(CoreArtifactExecutionError::execution)?;
 
-        ensure_memory_capacity(&memory, &mut store, INPUT_OFFSET, input_bytes.len())?;
+        ensure_memory_capacity(&memory, &mut store, INPUT_OFFSET, input_bytes.len())
+            .map_err(CoreArtifactExecutionError::execution)?;
         memory
             .write(&mut store, INPUT_OFFSET, &input_bytes)
-            .context("failed to write runtime input into wasm memory")?;
+            .context("failed to write runtime input into wasm memory")
+            .map_err(CoreArtifactExecutionError::execution)?;
 
+        let input_offset =
+            i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32");
+        let input_offset = input_offset.map_err(CoreArtifactExecutionError::execution)?;
+        let input_len = i32::try_from(input_bytes.len()).context("runtime input length exceeds i32");
+        let input_len = input_len.map_err(CoreArtifactExecutionError::execution)?;
         let output_range_encoded = run
-            .call(
-                &mut store,
-                (
-                    i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32")?,
-                    i32::try_from(input_bytes.len()).context("runtime input length exceeds i32")?,
-                ),
-            )
-            .context("external wasm check execution failed")?;
-        let (output_offset, output_len) = decode_output_range(output_range_encoded)?;
+            .call(&mut store, (input_offset, input_len))
+            .context("external wasm check execution failed")
+            .map_err(CoreArtifactExecutionError::execution)?;
+        let (output_offset, output_len) =
+            decode_output_range(output_range_encoded).map_err(CoreArtifactExecutionError::execution)?;
 
-        ensure_memory_capacity(&memory, &mut store, output_offset, output_len)?;
+        ensure_memory_capacity(&memory, &mut store, output_offset, output_len)
+            .map_err(CoreArtifactExecutionError::execution)?;
         let mut output_bytes = vec![0_u8; output_len];
         memory
             .read(&mut store, output_offset, &mut output_bytes)
-            .context("failed to read runtime output from wasm memory")?;
+            .context("failed to read runtime output from wasm memory")
+            .map_err(CoreArtifactExecutionError::execution)?;
 
         let output: ExternalCheckRuntimeOutput = serde_json::from_slice(&output_bytes)
-            .context("runtime output was not valid JSON CheckResult payload")?;
+            .context("runtime output was not valid JSON CheckResult payload")
+            .map_err(CoreArtifactExecutionError::execution)?;
 
         Ok(CheckResult {
             check_id: package.id.clone(),
