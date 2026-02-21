@@ -2,8 +2,7 @@
 
 This directory contains the pinned JavaScript toolchain used by `checkleft` to
 build external checks in `source` mode (`language = "javascript"` or
-`language = "typescript"` and
-`build_adapter = "javascript-component"`).
+`language = "typescript"`; the build adapter is derived from language).
 
 `checkleft` runs:
 
