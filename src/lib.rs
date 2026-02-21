@@ -2,6 +2,7 @@ pub mod bypass;
 pub mod check;
 pub mod checks;
 pub mod config;
+pub mod external;
 pub mod input;
 pub mod output;
 pub mod path;
