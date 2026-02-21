@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::path::validate_relative_path;
@@ -174,9 +174,6 @@ impl JavaScriptComponentSourcePackageBuilder {
             let absolute = self
                 .resolve_relative_path(path.to_string_lossy().as_ref())
                 .with_context(|| format!("invalid source path `{}`", path.display()))?;
-            if !absolute.exists() {
-                bail!("source path does not exist: {}", absolute.display());
-            }
             resolved_paths.push(absolute);
         }
         Ok(resolved_paths)
@@ -185,7 +182,20 @@ impl JavaScriptComponentSourcePackageBuilder {
     fn resolve_relative_path(&self, raw: &str) -> Result<PathBuf> {
         let path = Path::new(raw);
         validate_relative_path(path)?;
-        Ok(self.root.join(path))
+        let resolved = self.root.join(path);
+        let canonical = resolved
+            .canonicalize()
+            .with_context(|| format!("source path does not exist: {}", resolved.display()))?;
+        let root = self.root.canonicalize().with_context(|| {
+            format!("failed to canonicalize source root {}", self.root.display())
+        })?;
+        if !canonical.starts_with(&root) {
+            bail!(
+                "source path escapes repository root: {}",
+                resolved.display()
+            );
+        }
+        Ok(canonical)
     }
 
     fn compute_cache_key(
@@ -297,8 +307,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::external::{
-        ExternalCheckCapabilities, ExternalCheckPackage, ExternalCheckPackageImplementation,
-        EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1,
+        EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckCapabilities,
+        ExternalCheckPackage, ExternalCheckPackageImplementation,
     };
 
     use super::{
@@ -442,6 +452,44 @@ mod tests {
         assert_ne!(
             first.artifact_path, second.artifact_path,
             "cache key should include source bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_build_rejects_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let outside = tempdir().expect("outside temp dir");
+        std::fs::write(
+            outside.path().join("check.js"),
+            "export function run(input){return input;}",
+        )
+        .expect("write outside source");
+
+        let package = make_source_package(temp.path());
+        std::fs::remove_file(temp.path().join("checks/js/check.js")).expect("remove source file");
+        symlink(
+            outside.path().join("check.js"),
+            temp.path().join("checks/js/check.js"),
+        )
+        .expect("create symlink");
+
+        let source = match &package.implementation {
+            ExternalCheckPackageImplementation::Source(source) => source,
+            _ => panic!("expected source implementation"),
+        };
+        let runner = Arc::new(MockCommandRunner::default());
+        let builder =
+            JavaScriptComponentSourcePackageBuilder::with_command_runner(temp.path(), runner);
+
+        let error = builder
+            .build_source_package(&package, source)
+            .expect_err("must reject escaping source path");
+        let message = error.to_string();
+        assert!(
+            message.contains("escapes repository root") || message.contains("invalid source path")
         );
     }
 }

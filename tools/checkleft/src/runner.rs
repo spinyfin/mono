@@ -5,9 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use tokio::task::JoinSet;
 
-use crate::bypass::{
-    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
-};
+use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::CheckRegistry;
 use crate::config::{CheckConfig, ConfigResolver};
 use crate::external::{
@@ -163,13 +161,14 @@ impl Runner {
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
                     let run_config = run.config;
+                    let run_policy = run.policy;
 
                     join_set.spawn(async move {
                         external_executor
                             .execute(&package, &run_changeset, source_tree.as_ref(), &run_config)
                             .map(|mut result| {
                                 result.check_id = configured_check_id.clone();
-                                result
+                                apply_policy_to_result(result, &run_policy, &run_changeset)
                             })
                             .map_err(|err| (configured_check_id, err))
                     });
@@ -253,8 +252,10 @@ impl Runner {
     }
 
     fn schedule_runs(&self, changeset: &ChangeSet) -> Result<Vec<ScheduledCheckRun>> {
-        let mut grouped_runs: BTreeMap<(String, String, String, String, String), ScheduledCheckRun> =
-            BTreeMap::new();
+        let mut grouped_runs: BTreeMap<
+            (String, String, String, String, String),
+            ScheduledCheckRun,
+        > = BTreeMap::new();
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -404,7 +405,11 @@ fn apply_policy_to_result(
                 .findings
                 .iter()
                 .find_map(|finding| finding.location.clone());
-            result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
+            result.findings = vec![bypass_applied_finding(
+                &policy.bypass_name,
+                &reason,
+                location,
+            )];
             return result;
         }
 

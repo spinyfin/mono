@@ -3,14 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::path::validate_relative_path;
 
 use super::{
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageProvider,
-    GENERATED_IMPLEMENTATION_PREFIX, load_external_check_package_manifest,
+    load_external_check_package_manifest, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageProvider, GENERATED_IMPLEMENTATION_PREFIX,
 };
 
 #[derive(Debug, Default)]
@@ -86,6 +86,14 @@ impl GeneratedExternalCheckPackageProvider {
                     full_index_path.display()
                 )
             })?;
+        if let Some(version) = raw_index.version {
+            if version != 1 {
+                bail!(
+                    "unsupported generated external package index version `{version}` in {} (expected 1)",
+                    full_index_path.display()
+                );
+            }
+        }
 
         let index_dir = full_index_path
             .parent()
@@ -202,6 +210,8 @@ impl ExternalCheckPackageProvider for CompositeExternalCheckPackageProvider {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGeneratedExternalCheckPackageIndex {
+    #[serde(default)]
+    version: Option<u32>,
     #[serde(default)]
     packages: Vec<RawGeneratedExternalCheckPackageEntry>,
 }
