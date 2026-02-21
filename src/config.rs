@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::bypass::bypass_name_for_check_id;
 use crate::external::ExternalCheckImplementationRef;
+use crate::output::Severity;
 use crate::path::validate_relative_path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -15,7 +17,15 @@ pub struct CheckConfig {
     pub id: String,
     pub implementation: Option<ExternalCheckImplementationRef>,
     pub enabled: bool,
+    pub policy: CheckPolicyConfig,
     pub config: toml::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckPolicyConfig {
+    pub severity: Option<Severity>,
+    pub allow_bypass: Option<bool>,
+    pub bypass_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -91,11 +101,14 @@ impl ConfigResolver {
                 } else {
                     None
                 };
+                let policy =
+                    parse_policy_config(&configured_id, check.policy, check.enabled, &config_path)?;
                 resolved.upsert(CheckConfig {
                     check: check.check.unwrap_or_else(|| configured_id.clone()),
                     id: configured_id,
                     implementation,
                     enabled: check.enabled,
+                    policy,
                     config: check.config,
                 });
             }
@@ -128,8 +141,20 @@ struct ParsedCheckConfig {
     implementation: Option<String>,
     #[serde(default = "enabled_default")]
     enabled: bool,
+    #[serde(default)]
+    policy: ParsedCheckPolicyConfig,
     #[serde(default = "empty_toml_table")]
     config: toml::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ParsedCheckPolicyConfig {
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    allow_bypass: Option<bool>,
+    #[serde(default)]
+    bypass_name: Option<String>,
 }
 
 fn parse_checks_file(path: &Path) -> Result<ParsedChecksFile> {
@@ -163,6 +188,58 @@ fn parse_check_implementation(
             )
         })?;
     Ok(Some(implementation))
+}
+
+fn parse_policy_config(
+    check_id: &str,
+    policy: ParsedCheckPolicyConfig,
+    enabled: bool,
+    config_path: &Path,
+) -> Result<CheckPolicyConfig> {
+    if !enabled {
+        return Ok(CheckPolicyConfig::default());
+    }
+
+    let severity = match policy.severity {
+        Some(raw) => Some(parse_policy_severity(&raw).with_context(|| {
+            format!(
+                "invalid `policy.severity` for check `{check_id}` in {}",
+                config_path.display()
+            )
+        })?),
+        None => None,
+    };
+
+    let bypass_name = policy
+        .bypass_name
+        .map(|raw| normalize_bypass_name(raw, check_id));
+
+    Ok(CheckPolicyConfig {
+        severity,
+        allow_bypass: policy.allow_bypass,
+        bypass_name,
+    })
+}
+
+fn parse_policy_severity(raw: &str) -> Result<Severity> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "error" => Ok(Severity::Error),
+        "warning" => Ok(Severity::Warning),
+        "info" => Ok(Severity::Info),
+        _ => bail!("expected one of `error`, `warning`, or `info`"),
+    }
+}
+
+fn normalize_bypass_name(raw: String, check_id: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return bypass_name_for_check_id(check_id);
+    }
+    if trimmed.to_ascii_uppercase().starts_with("BYPASS_") {
+        return trimmed.to_ascii_uppercase();
+    }
+
+    bypass_name_for_check_id(trimmed)
 }
 
 fn root_to_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>> {

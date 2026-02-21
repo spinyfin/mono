@@ -5,6 +5,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use crate::external::ExternalCheckImplementationRef;
+use crate::output::Severity;
 
 use super::ConfigResolver;
 
@@ -198,6 +199,9 @@ implementation = "generated:domain-typo-check"
             "domain-typo-check".to_owned()
         ))
     );
+    assert_eq!(check.policy.severity, None);
+    assert_eq!(check.policy.allow_bypass, None);
+    assert_eq!(check.policy.bypass_name, None);
 }
 
 #[test]
@@ -246,6 +250,161 @@ implementation = "../escape/check.toml"
 
     assert!(!check.enabled);
     assert_eq!(check.implementation, None);
+}
+
+#[test]
+fn parses_policy_config_for_enabled_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.policy]
+severity = "error"
+allow_bypass = true
+bypass_name = "BYPASS_FILE_SIZE_LIMIT"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("docs/file.md"))
+        .expect("resolve checks");
+    let check = checks.get("file-size").expect("check exists");
+
+    assert_eq!(check.policy.severity, Some(Severity::Error));
+    assert_eq!(check.policy.allow_bypass, Some(true));
+    assert_eq!(
+        check.policy.bypass_name.as_deref(),
+        Some("BYPASS_FILE_SIZE_LIMIT")
+    );
+}
+
+#[test]
+fn normalizes_policy_bypass_name_from_non_prefixed_value() {
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "domain-typo"
+
+[checks.policy]
+bypass_name = "domain-typo"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("docs/file.md"))
+        .expect("resolve checks");
+    let check = checks.get("domain-typo").expect("check exists");
+
+    assert_eq!(
+        check.policy.bypass_name.as_deref(),
+        Some("BYPASS_DOMAIN_TYPO")
+    );
+}
+
+#[test]
+fn child_config_overrides_policy_values() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend")).expect("create backend dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.policy]
+severity = "warning"
+allow_bypass = false
+"#,
+    )
+    .expect("write root config");
+
+    fs::write(
+        temp.path().join("backend/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.policy]
+severity = "error"
+allow_bypass = true
+bypass_name = "BYPASS_CUSTOM_CHILD"
+"#,
+    )
+    .expect("write child config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+    let check = checks.get("file-size").expect("check exists");
+
+    assert_eq!(check.policy.severity, Some(Severity::Error));
+    assert_eq!(check.policy.allow_bypass, Some(true));
+    assert_eq!(
+        check.policy.bypass_name.as_deref(),
+        Some("BYPASS_CUSTOM_CHILD")
+    );
+}
+
+#[test]
+fn rejects_invalid_policy_severity_for_enabled_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.policy]
+severity = "fatal"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let error = resolver
+        .resolve_for_file(Path::new("docs/file.md"))
+        .expect_err("must fail");
+    assert!(error.to_string().contains("invalid `policy.severity`"));
+}
+
+#[test]
+fn ignores_invalid_policy_severity_for_disabled_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+enabled = false
+
+[checks.policy]
+severity = "fatal"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("docs/file.md"))
+        .expect("resolve checks");
+    let check = checks.get("file-size").expect("check exists");
+    assert!(!check.enabled);
+    assert_eq!(check.policy.severity, None);
 }
 
 #[test]
