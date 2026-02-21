@@ -40,8 +40,7 @@ try {
       "--bundle",
       "--platform=neutral",
       "--format=esm",
-      "--outfile",
-      bundlePath,
+      `--outfile=${bundlePath}`,
       "--log-level=warning",
     ],
     toolchainRoot,
@@ -89,11 +88,40 @@ import * as userModule from ${JSON.stringify(entryPath)};
 
 const impl = userModule.run ?? userModule.check ?? userModule.default;
 
-export function run(input) {
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeInput(inputJson) {
+  const parsed = JSON.parse(typeof inputJson === "string" && inputJson.length > 0 ? inputJson : "{}");
+  const root = isObject(parsed) ? parsed : {};
+  const changesetSource = isObject(root.changeset) ? root.changeset : {};
+  const changedFiles = Array.isArray(changesetSource.changed_files)
+    ? changesetSource.changed_files
+    : [];
+  const config = isObject(root.config) ? root.config : {};
+  const capabilities = isObject(root.capabilities) ? root.capabilities : {};
+  const normalized = {
+    ...root,
+    changeset: {
+      ...changesetSource,
+      changed_files: changedFiles,
+    },
+    config,
+    capabilities,
+  };
+  Object.defineProperty(normalized, "toString", {
+    value: () => (typeof inputJson === "string" ? inputJson : "{}"),
+    enumerable: false,
+  });
+  return normalized;
+}
+
+export function run(inputJson) {
   if (typeof impl !== "function") {
     throw new Error("JS check entry must export run(input) (or check/default).");
   }
-  const result = impl(input);
+  const result = impl(normalizeInput(inputJson));
   if (typeof result === "string") {
     return result;
   }
