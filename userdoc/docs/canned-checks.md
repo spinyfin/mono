@@ -14,8 +14,11 @@ Config keys:
 - `required_globs` (required, array of glob strings)
 - `message` (optional string)
 - `remediation` (optional string)
-- `severity` (optional `error|warning|info`, default `error`)
-- `allow_bypass` (optional boolean, default `false`; see [Bypass mechanism](bypass.md))
+
+Notes:
+
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass` (see [Bypass mechanism](bypass.md)).
 
 ## `docs-link-integrity`
 
@@ -41,10 +44,12 @@ Purpose:
 Config keys:
 
 - `max_lines` (optional integer, default `500`)
-- `severity` (optional `error|warning|info`, default `warning`)
 - `exclude_globs` (optional array of glob strings)
-- `allow_bypass` (optional boolean, default `false`; see [Bypass mechanism](bypass.md))
-- `bypass_name` (optional string; defaults to `BYPASS_FILE_SIZE` when bypass is enabled)
+
+Notes:
+
+- Findings default to `warning`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
 
 ## `forbidden-imports-deps`
 
@@ -107,7 +112,7 @@ Config keys:
 
 Severity:
 
-- `error`.
+- `error` by default; can be overridden per instance with `[checks.policy].severity`.
 
 ## `todo-expiry`
 

@@ -61,8 +61,8 @@ Each finding supports:
 - Skip deleted files unless your check explicitly needs them.
 - Parse config once per run.
 - Keep findings stable and actionable.
-- Use `warning` when guidance should not fail builds.
-- Use `error` for policy that must block merges.
+- Default check findings to the implementation's intrinsic severity; use `[checks.policy].severity` for per-instance overrides.
+- Use framework policy for bypass behavior (`[checks.policy].allow_bypass`) instead of check-local bypass parsing.
 
 ## Minimal skeleton
 
