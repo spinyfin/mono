@@ -1,12 +1,8 @@
-use std::collections::BTreeSet;
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::bypass::{bypass_failure_guidance, bypass_name_for_check_id, maybe_bypass_findings};
 use crate::check::Check;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -36,8 +32,6 @@ impl Check for TypoCheck {
             changeset,
             tree,
             &parsed.rules,
-            parsed.allow_bypass,
-            &parsed.bypass_name,
         )
     }
 }
@@ -67,10 +61,6 @@ impl Default for MatchKind {
 struct TypoConfig {
     #[serde(default)]
     rules: Vec<TypoRuleConfig>,
-    #[serde(default)]
-    allow_bypass: Option<bool>,
-    #[serde(default)]
-    bypass_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,8 +87,6 @@ enum Matcher {
 
 struct ParsedTypoConfig {
     rules: Vec<TypoRule>,
-    allow_bypass: bool,
-    bypass_name: String,
 }
 
 fn run_typo_check(
@@ -106,8 +94,6 @@ fn run_typo_check(
     changeset: &ChangeSet,
     tree: &dyn SourceTree,
     rules: &[TypoRule],
-    allow_bypass: bool,
-    bypass_name: &str,
 ) -> Result<CheckResult> {
     let compiled_rules = compile_rules(rules)?;
     let mut findings = Vec::new();
@@ -156,26 +142,6 @@ fn run_typo_check(
         }
     }
 
-    let trigger_files = finding_paths(&findings);
-    if let Some(findings) =
-        maybe_bypass_findings(changeset, allow_bypass, bypass_name, &trigger_files)
-    {
-        return Ok(CheckResult {
-            check_id: check_id.to_owned(),
-            findings,
-        });
-    }
-
-    if allow_bypass && !findings.is_empty() {
-        let guidance = bypass_failure_guidance(bypass_name);
-        for finding in &mut findings {
-            finding.remediation = Some(match finding.remediation.take() {
-                Some(remediation) => format!("{remediation} {guidance}"),
-                None => guidance.clone(),
-            });
-        }
-    }
-
     Ok(CheckResult {
         check_id: check_id.to_owned(),
         findings,
@@ -198,8 +164,6 @@ fn parse_typo_config(config: &toml::Value) -> Result<ParsedTypoConfig> {
             .into_iter()
             .map(typo_rule_from_config)
             .collect(),
-        allow_bypass: parsed.allow_bypass.unwrap_or(false),
-        bypass_name: resolve_bypass_name(parsed.bypass_name),
     })
 }
 
@@ -259,32 +223,6 @@ fn is_hyphen_or_underscore_adjacent(line: &str, start: usize, end: usize) -> boo
     matches!(previous, Some('-' | '_')) || matches!(next, Some('-' | '_'))
 }
 
-fn finding_paths(findings: &[Finding]) -> Vec<PathBuf> {
-    let mut paths = BTreeSet::new();
-    for finding in findings {
-        if let Some(location) = finding.location.as_ref() {
-            paths.insert(location.path.clone());
-        }
-    }
-
-    paths.into_iter().collect()
-}
-
-fn resolve_bypass_name(config_bypass_name: Option<String>) -> String {
-    let Some(name) = config_bypass_name else {
-        return bypass_name_for_check_id("typo");
-    };
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return bypass_name_for_check_id("typo");
-    }
-    if trimmed.to_ascii_uppercase().starts_with("BYPASS_") {
-        return trimmed.to_ascii_uppercase();
-    }
-
-    bypass_name_for_check_id(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -294,7 +232,6 @@ mod tests {
 
     use crate::check::Check;
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
-    use crate::output::Severity;
     use crate::source_tree::LocalSourceTree;
 
     use super::TypoCheck;
@@ -384,124 +321,5 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn emits_warning_when_bypass_directive_exists_and_bypass_is_enabled() {
-        let temp = tempdir().expect("create temp dir");
-        fs::write(temp.path().join("typo.txt"), "let usfa_id = \"123\";\n").expect("write file");
-
-        let check = TypoCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let changeset = ChangeSet::new(vec![ChangedFile {
-            path: Path::new("typo.txt").to_path_buf(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        }])
-        .with_commit_description(Some(
-            "BYPASS_NO_USFA_TYPO=Legacy upstream field name is intentionally retained."
-                .to_owned(),
-        ));
-        let result = check
-            .run(
-                &changeset,
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    rules = [
-                        { typo = "usfa_id", canonical = "usaf_id", kind = "substring", guidance = "USAF stands for USA Fencing." },
-                    ]
-                    allow_bypass = true
-                    bypass_name = "BYPASS_NO_USFA_TYPO"
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].severity, Severity::Warning);
-        assert!(result.findings[0].message.contains("BYPASS_NO_USFA_TYPO"));
-        assert!(
-            result.findings[0]
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Legacy upstream field name is intentionally retained.")
-        );
-    }
-
-    #[tokio::test]
-    async fn includes_bypass_guidance_when_bypass_is_enabled_and_missing() {
-        let temp = tempdir().expect("create temp dir");
-        fs::write(temp.path().join("typo.txt"), "let usfa_id = \"123\";\n").expect("write file");
-
-        let check = TypoCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let result = check
-            .run(
-                &ChangeSet::new(vec![ChangedFile {
-                    path: Path::new("typo.txt").to_path_buf(),
-                    kind: ChangeKind::Modified,
-                    old_path: None,
-                }]),
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    rules = [
-                        { typo = "usfa_id", canonical = "usaf_id", kind = "substring", guidance = "USAF stands for USA Fencing." },
-                    ]
-                    allow_bypass = true
-                    bypass_name = "BYPASS_NO_USFA_TYPO"
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].severity, Severity::Error);
-        let remediation = result.findings[0]
-            .remediation
-            .as_deref()
-            .unwrap_or_default()
-            .to_owned();
-        assert!(remediation.contains("BYPASS_NO_USFA_TYPO"));
-        assert!(remediation.contains("Never use bypasses for convenience"));
-    }
-
-    #[tokio::test]
-    async fn does_not_bypass_when_bypass_is_disabled() {
-        let temp = tempdir().expect("create temp dir");
-        fs::write(temp.path().join("typo.txt"), "let usfa_id = \"123\";\n").expect("write file");
-
-        let check = TypoCheck;
-        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let changeset = ChangeSet::new(vec![ChangedFile {
-            path: Path::new("typo.txt").to_path_buf(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        }])
-        .with_commit_description(Some(
-            "BYPASS_NO_USFA_TYPO=Legacy upstream field name is intentionally retained."
-                .to_owned(),
-        ));
-        let result = check
-            .run(
-                &changeset,
-                &tree,
-                &toml::Value::Table(toml::toml! {
-                    rules = [
-                        { typo = "usfa_id", canonical = "usaf_id", kind = "substring", guidance = "USAF stands for USA Fencing." },
-                    ]
-                    allow_bypass = false
-                    bypass_name = "BYPASS_NO_USFA_TYPO"
-                }),
-            )
-            .await
-            .expect("run check");
-
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].severity, Severity::Error);
-        assert!(
-            !result.findings[0].message.contains("check was bypassed"),
-            "expected normal typo finding when bypass is disabled"
-        );
     }
 }
