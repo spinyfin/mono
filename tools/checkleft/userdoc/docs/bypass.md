@@ -7,12 +7,19 @@ This page describes bypass support for checks that opt into bypass.
 - Bypass is opt-in per check.
 - By default, checks do not allow bypass.
 - In the current default config, bypass is enabled for:
+  - `file-size`
   - `api-breaking-surface`
   - `no-usfa-typo` (directive name: `BYPASS_NO_USFA_TYPO`)
 
 ```toml
 [[checks]]
 id = "api-breaking-surface"
+
+[checks.config]
+allow_bypass = true
+
+[[checks]]
+id = "file-size"
 
 [checks.config]
 allow_bypass = true
@@ -38,6 +45,12 @@ For `api-breaking-surface`:
 
 ```text
 BYPASS_API_BREAKING_SURFACE=No public API behavior changed; docs update would be misleading.
+```
+
+For `file-size`:
+
+```text
+BYPASS_FILE_SIZE=Generated file mirrors upstream source and cannot be split safely.
 ```
 
 For `no-usfa-typo`:

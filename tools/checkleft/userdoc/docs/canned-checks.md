@@ -43,6 +43,8 @@ Config keys:
 - `max_lines` (optional integer, default `500`)
 - `severity` (optional `error|warning|info`, default `warning`)
 - `exclude_globs` (optional array of glob strings)
+- `allow_bypass` (optional boolean, default `false`; see [Bypass mechanism](bypass.md))
+- `bypass_name` (optional string; defaults to `BYPASS_FILE_SIZE` when bypass is enabled)
 
 ## `forbidden-imports-deps`
 
