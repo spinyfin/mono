@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::sync::Arc;
 
@@ -292,6 +292,7 @@ impl Runner {
                         config: check.config.clone(),
                         changeset: ChangeSet {
                             changed_files: Vec::new(),
+                            file_line_deltas: HashMap::new(),
                             commit_description: changeset.commit_description.clone(),
                             pr_description: changeset.pr_description.clone(),
                             change_id: changeset.change_id.clone(),
@@ -310,6 +311,12 @@ impl Runner {
                         kind: changed_file.kind,
                         old_path: changed_file.old_path.clone(),
                     });
+                    if let Some(delta) = changeset.file_line_deltas.get(&changed_file.path) {
+                        entry
+                            .changeset
+                            .file_line_deltas
+                            .insert(changed_file.path.clone(), *delta);
+                    }
                 }
             }
         }

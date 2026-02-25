@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -8,6 +9,8 @@ use crate::bypass::parse_bypass_directives_from_descriptions;
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub changed_files: Vec<ChangedFile>,
+    #[serde(default)]
+    pub file_line_deltas: HashMap<PathBuf, FileLineDelta>,
     #[serde(default)]
     pub commit_description: Option<String>,
     #[serde(default)]
@@ -22,6 +25,7 @@ impl ChangeSet {
     pub fn new(changed_files: Vec<ChangedFile>) -> Self {
         Self {
             changed_files,
+            file_line_deltas: HashMap::new(),
             commit_description: None,
             pr_description: None,
             change_id: None,
@@ -53,6 +57,11 @@ impl ChangeSet {
         self
     }
 
+    pub fn with_file_line_delta(mut self, path: PathBuf, delta: FileLineDelta) -> Self {
+        self.file_line_deltas.insert(path, delta);
+        self
+    }
+
     pub fn bypass_reason(&self, bypass_name: &str) -> Option<String> {
         parse_bypass_directives_from_descriptions(
             self.commit_description.as_deref(),
@@ -61,6 +70,12 @@ impl ChangeSet {
         .get(bypass_name)
         .cloned()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FileLineDelta {
+    pub added_lines: usize,
+    pub removed_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,6 +6,10 @@ use serde::Deserialize;
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 
+mod patch_line_deltas;
+
+use patch_line_deltas::parse_line_deltas_from_git_patch;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcsKind {
     Jujutsu,
@@ -49,12 +53,18 @@ impl Vcs {
     pub fn current_changeset(&self) -> Result<ChangeSet> {
         match self.kind {
             VcsKind::Jujutsu => {
-                let output = run_command(&self.root, "jj", &["diff", "--summary"])?;
-                parse_jj_diff_summary(&output)
+                let summary = run_command(&self.root, "jj", &["diff", "--summary"])?;
+                let mut changeset = parse_jj_diff_summary(&summary)?;
+                let patch = run_command(&self.root, "jj", &["diff", "--git"])?;
+                attach_line_deltas(&mut changeset, &patch);
+                Ok(changeset)
             }
             VcsKind::Git => {
-                let output = run_command(&self.root, "git", &["diff", "--name-status", "HEAD"])?;
-                parse_git_name_status(&output)
+                let summary = run_command(&self.root, "git", &["diff", "--name-status", "HEAD"])?;
+                let mut changeset = parse_git_name_status(&summary)?;
+                let patch = run_command(&self.root, "git", &["diff", "--patch", "HEAD"])?;
+                attach_line_deltas(&mut changeset, &patch);
+                Ok(changeset)
             }
         }
     }
@@ -62,17 +72,27 @@ impl Vcs {
     pub fn changeset_since(&self, base_ref: &str) -> Result<ChangeSet> {
         match self.kind {
             VcsKind::Jujutsu => {
-                let output = run_command(
+                let summary = run_command(
                     &self.root,
                     "jj",
                     &["diff", "--summary", "--from", base_ref, "--to", "@"],
                 )?;
-                parse_jj_diff_summary(&output)
+                let mut changeset = parse_jj_diff_summary(&summary)?;
+                let patch = run_command(
+                    &self.root,
+                    "jj",
+                    &["diff", "--git", "--from", base_ref, "--to", "@"],
+                )?;
+                attach_line_deltas(&mut changeset, &patch);
+                Ok(changeset)
             }
             VcsKind::Git => {
                 let range = format!("{base_ref}...HEAD");
-                let output = run_command(&self.root, "git", &["diff", "--name-status", &range])?;
-                parse_git_name_status(&output)
+                let summary = run_command(&self.root, "git", &["diff", "--name-status", &range])?;
+                let mut changeset = parse_git_name_status(&summary)?;
+                let patch = run_command(&self.root, "git", &["diff", "--patch", &range])?;
+                attach_line_deltas(&mut changeset, &patch);
+                Ok(changeset)
             }
         }
     }
@@ -312,6 +332,17 @@ fn parse_arrow_rename(input: &str) -> Result<(PathBuf, PathBuf)> {
     }
 
     Ok((PathBuf::from(old_path), PathBuf::from(new_path)))
+}
+
+fn attach_line_deltas(changeset: &mut ChangeSet, patch: &str) {
+    let line_deltas = parse_line_deltas_from_git_patch(patch);
+    for changed_file in &changeset.changed_files {
+        if let Some(delta) = line_deltas.get(&changed_file.path) {
+            changeset
+                .file_line_deltas
+                .insert(changed_file.path.clone(), *delta);
+        }
+    }
 }
 
 fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {

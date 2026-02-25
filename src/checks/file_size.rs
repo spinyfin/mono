@@ -53,11 +53,26 @@ impl Check for FileSizeCheck {
                 continue;
             }
 
+            if !file_grew_in_change(changed_file, changeset) {
+                continue;
+            }
+
+            let growth_message = changeset
+                .file_line_deltas
+                .get(&changed_file.path)
+                .map(|delta| {
+                    format!(
+                        " File grew by +{} / -{} lines in this change.",
+                        delta.added_lines, delta.removed_lines
+                    )
+                })
+                .unwrap_or_default();
+
             findings.push(Finding {
                 severity: Severity::Warning,
                 message: format!(
-                    "file has {line_count} lines, exceeding configured max_lines={}",
-                    config.max_lines
+                    "file has {line_count} lines, exceeding configured max_lines={}.{}",
+                    config.max_lines, growth_message
                 ),
                 location: Some(Location {
                     path: changed_file.path.clone(),
@@ -77,6 +92,18 @@ impl Check for FileSizeCheck {
             findings,
         })
     }
+}
+
+fn file_grew_in_change(changed_file: &crate::input::ChangedFile, changeset: &ChangeSet) -> bool {
+    if matches!(changed_file.kind, ChangeKind::Added) {
+        return true;
+    }
+
+    let Some(delta) = changeset.file_line_deltas.get(&changed_file.path) else {
+        return false;
+    };
+
+    delta.added_lines > delta.removed_lines
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +126,9 @@ fn parse_config(config: &toml::Value) -> Result<ParsedFileSizeConfig> {
         .context("invalid file-size check config")?;
 
     let max_lines = match parsed.max_lines {
-        Some(value) => usize::try_from(value).context("`max_lines` must be a non-negative integer")?,
+        Some(value) => {
+            usize::try_from(value).context("`max_lines` must be a non-negative integer")?
+        }
         None => DEFAULT_MAX_LINES,
     };
 
@@ -138,7 +167,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::check::Check;
-    use crate::input::{ChangeKind, ChangeSet, ChangedFile};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, FileLineDelta};
     use crate::source_tree::LocalSourceTree;
 
     use super::FileSizeCheck;
@@ -156,7 +185,14 @@ mod tests {
                     path: Path::new("big.rs").to_path_buf(),
                     kind: ChangeKind::Modified,
                     old_path: None,
-                }]),
+                }])
+                .with_file_line_delta(
+                    Path::new("big.rs").to_path_buf(),
+                    FileLineDelta {
+                        added_lines: 2,
+                        removed_lines: 0,
+                    },
+                ),
                 &tree,
                 &toml::Value::Table(toml::toml! { max_lines = 2 }),
             )
@@ -191,6 +227,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_oversized_file_when_net_lines_do_not_increase() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("big.rs"), "a\nb\nc\n").expect("write file");
+
+        let check = FileSizeCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("big.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }])
+                .with_file_line_delta(
+                    Path::new("big.rs").to_path_buf(),
+                    FileLineDelta {
+                        added_lines: 1,
+                        removed_lines: 2,
+                    },
+                ),
+                &tree,
+                &toml::Value::Table(toml::toml! { max_lines = 2 }),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
     async fn excludes_configured_paths() {
         let temp = tempdir().expect("create temp dir");
         fs::write(temp.path().join("package-lock.json"), "a\nb\nc\n").expect("write file");
@@ -215,5 +281,4 @@ mod tests {
 
         assert!(result.findings.is_empty());
     }
-
 }
