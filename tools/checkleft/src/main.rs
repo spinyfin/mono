@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use checkleft::check::CheckRegistry;
@@ -111,11 +112,13 @@ async fn run_cli() -> Result<ExitCode> {
                 &vcs,
             )
             .await;
+            let run_started_at = Instant::now();
             let mut results = runner.run_changeset(&changeset).await?;
+            let elapsed = run_started_at.elapsed();
             sort_results_for_output(&mut results);
 
             match format {
-                OutputFormat::Human => print_human_results(&results),
+                OutputFormat::Human => print_human_results(&results, elapsed),
                 OutputFormat::Json => print_json_results(&results)?,
             }
 
@@ -293,10 +296,10 @@ fn normalize_optional_description(value: Option<String>) -> Option<String> {
         .filter(|description| !description.is_empty())
 }
 
-fn print_human_results(results: &[CheckResult]) {
+fn print_human_results(results: &[CheckResult], elapsed: Duration) {
     print!(
         "{}",
-        render_human_results(results, OutputStyle::detect_for_stdout())
+        render_human_results(results, OutputStyle::detect_for_stdout(), elapsed)
     );
 }
 
@@ -336,7 +339,7 @@ fn severity_sort_key(severity: Severity) -> u8 {
     }
 }
 
-fn render_human_results(results: &[CheckResult], style: OutputStyle) -> String {
+fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {
     if results.is_empty() {
         return "No checks ran.\n".to_owned();
     }
@@ -344,9 +347,10 @@ fn render_human_results(results: &[CheckResult], style: OutputStyle) -> String {
     let total_findings: usize = results.iter().map(|result| result.findings.len()).sum();
     if total_findings == 0 {
         return format!(
-            "{}: no findings ({} checks run)\n",
+            "{}: no findings ({} checks run in {})\n",
             style.paint_info("checks"),
-            results.len()
+            results.len(),
+            format!("{}s", elapsed.as_secs())
         );
     }
 

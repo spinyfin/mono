@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
@@ -25,6 +26,7 @@ fn human_output_includes_line_and_column() {
             }],
         }],
         OutputStyle { color: false },
+        Duration::from_secs(12),
     );
 
     assert!(output.contains("error[typo]: Found typo `teh`; use `the` instead."));
@@ -57,11 +59,26 @@ fn human_output_omits_ansi_when_color_is_disabled() {
             }],
         }],
         OutputStyle { color: false },
+        Duration::from_secs(12),
     );
 
     assert!(!output.contains("\u{1b}["));
     assert!(output.contains("  --> backend/src/lib.rs:200"));
     assert!(output.contains("   = fix: Split file by module. (1 edit)"));
+}
+
+#[test]
+fn human_output_no_findings_includes_elapsed_time() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "example".to_owned(),
+            findings: vec![],
+        }],
+        OutputStyle { color: false },
+        Duration::from_secs(12),
+    );
+
+    assert_eq!(output, "checks: no findings (1 checks run in 12s)\n");
 }
 
 #[test]
