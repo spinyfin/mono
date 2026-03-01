@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -30,6 +31,13 @@ impl Check for DocsLinkIntegrityCheck {
         let mut findings = Vec::new();
         let link_regex = Regex::new(r"\[[^\]]+\]\(([^)]+)\)").expect("valid markdown link regex");
 
+        let changeset_paths: HashSet<&Path> = changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted))
+            .map(|f| f.path.as_path())
+            .collect();
+
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
@@ -60,7 +68,12 @@ impl Check for DocsLinkIntegrityCheck {
                     if should_skip_link_target(target) {
                         continue;
                     }
-                    if link_target_exists(&changed_file.path, target, tree) {
+                    if link_target_exists(
+                        &changed_file.path,
+                        target,
+                        tree,
+                        &changeset_paths,
+                    ) {
                         continue;
                     }
 
@@ -105,7 +118,12 @@ fn should_skip_link_target(target: &str) -> bool {
         || lower.starts_with('#')
 }
 
-fn link_target_exists(current_file: &Path, target: &str, tree: &dyn SourceTree) -> bool {
+fn link_target_exists(
+    current_file: &Path,
+    target: &str,
+    tree: &dyn SourceTree,
+    changeset_paths: &HashSet<&Path>,
+) -> bool {
     let path_part = target
         .split_once('#')
         .map(|(path, _)| path)
@@ -122,7 +140,7 @@ fn link_target_exists(current_file: &Path, target: &str, tree: &dyn SourceTree) 
         normalize_relative_path(&parent.join(path_part))
     };
 
-    tree.exists(&resolved)
+    tree.exists(&resolved) || changeset_paths.contains(resolved.as_path())
 }
 
 fn normalize_relative_path(path: &Path) -> PathBuf {
@@ -193,6 +211,44 @@ mod tests {
                     kind: ChangeKind::Modified,
                     old_path: None,
                 }]),
+                &tree,
+                &toml::Value::Table(Default::default()),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepts_link_to_file_added_in_same_changeset() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("docs/design-docs")).expect("create docs dir");
+        // The index links to new-feature.md, but that file only exists in the
+        // changeset (not on disk).  This simulates adding a new doc and a link
+        // to it in the same commit.
+        fs::write(
+            temp.path().join("docs/design-docs/index.md"),
+            "[New Feature](new-feature.md)\n",
+        )
+        .expect("write index");
+
+        let check = DocsLinkIntegrityCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![
+                    ChangedFile {
+                        path: Path::new("docs/design-docs/index.md").to_path_buf(),
+                        kind: ChangeKind::Modified,
+                        old_path: None,
+                    },
+                    ChangedFile {
+                        path: Path::new("docs/design-docs/new-feature.md").to_path_buf(),
+                        kind: ChangeKind::Added,
+                        old_path: None,
+                    },
+                ]),
                 &tree,
                 &toml::Value::Table(Default::default()),
             )
