@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use broker_robinhood::RobinhoodClient;
 use broker_robinhood::RobinhoodClientError;
 use broker_robinhood::client::RobinhoodAccount;
@@ -5,6 +7,7 @@ use comfy_table::{
     Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_BORDERS_ONLY,
 };
 use console::set_colors_enabled;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::creds;
@@ -23,11 +26,22 @@ pub enum PositionsError {
     UnknownAccount { account: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const QUOTE_LOOKUP_CHUNK: usize = 50;
+
+#[derive(Clone, Debug, PartialEq)]
 struct PositionRow {
     account_number: String,
     symbol: String,
-    quantity: String,
+    quantity: f64,
+    equity: Option<f64>,
+    percentage_change: Option<f64>,
+    todays_return: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct QuoteSnapshot {
+    last_trade_price: Option<f64>,
+    previous_close: Option<f64>,
 }
 
 pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
@@ -56,7 +70,10 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
             rows.push(PositionRow {
                 account_number: account.account_number.clone(),
                 symbol: position.symbol,
-                quantity: format_quantity(position.quantity),
+                quantity: position.quantity,
+                equity: None,
+                percentage_change: None,
+                todays_return: None,
             });
         }
     }
@@ -64,6 +81,21 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
     if rows.is_empty() {
         println!("No open positions found.");
         return Ok(());
+    }
+
+    let symbols = rows
+        .iter()
+        .map(|row| row.symbol.clone())
+        .collect::<Vec<String>>();
+    let quotes = fetch_quote_snapshots(&client, &access_token, &symbols).await?;
+
+    for row in &mut rows {
+        let quote = quotes.get(&row.symbol);
+        let (equity, percentage_change, todays_return) =
+            calculate_position_metrics(row.quantity, quote);
+        row.equity = equity;
+        row.percentage_change = percentage_change;
+        row.todays_return = todays_return;
     }
 
     rows.sort_by(|left, right| {
@@ -77,7 +109,10 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
     Ok(())
 }
 
-fn select_accounts(accounts: Vec<RobinhoodAccount>, account: &str) -> Result<Vec<RobinhoodAccount>> {
+fn select_accounts(
+    accounts: Vec<RobinhoodAccount>,
+    account: &str,
+) -> Result<Vec<RobinhoodAccount>> {
     if account == "default" {
         let default = accounts
             .into_iter()
@@ -100,29 +135,185 @@ fn select_accounts(accounts: Vec<RobinhoodAccount>, account: &str) -> Result<Vec
 }
 
 fn render_positions_table(rows: &[PositionRow]) -> String {
+    let show_account_column = rows
+        .iter()
+        .map(|row| row.account_number.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
+    let quantity_values = rows
+        .iter()
+        .map(|row| format_quantity(row.quantity))
+        .collect::<Vec<_>>();
+    let aligned_quantities = align_decimal_column(&quantity_values);
+
     let mut table = Table::new();
     table
         .load_preset(UTF8_BORDERS_ONLY)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("Account").add_attribute(Attribute::Bold),
-            Cell::new("Symbol").add_attribute(Attribute::Bold),
-            Cell::new("Quantity")
-                .add_attribute(Attribute::Bold)
-                .set_alignment(CellAlignment::Right),
-        ]);
+        .set_content_arrangement(ContentArrangement::Dynamic);
 
-    for row in rows {
-        table.add_row(vec![
-            Cell::new(&row.account_number).fg(Color::Cyan),
+    let mut header = Vec::new();
+    if show_account_column {
+        header.push(Cell::new("Account").add_attribute(Attribute::Bold));
+    }
+    header.extend([
+        Cell::new("Symbol").add_attribute(Attribute::Bold),
+        Cell::new("Quantity")
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Equity")
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Percentage Change")
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Today's Return")
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+    ]);
+    table.set_header(header);
+
+    for (row, aligned_quantity) in rows.iter().zip(aligned_quantities.iter()) {
+        let mut row_cells = Vec::new();
+        if show_account_column {
+            row_cells.push(Cell::new(&row.account_number).fg(Color::Cyan));
+        }
+        row_cells.extend([
             Cell::new(&row.symbol).fg(Color::Yellow),
-            Cell::new(&row.quantity)
-                .fg(Color::Green)
+            Cell::new(aligned_quantity)
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_optional_currency(row.equity))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_optional_percentage(row.percentage_change))
+                .fg(color_for_change(row.percentage_change))
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_optional_signed_currency(row.todays_return))
+                .fg(color_for_change(row.todays_return))
                 .set_alignment(CellAlignment::Right),
         ]);
+        table.add_row(row_cells);
     }
 
     table.to_string()
+}
+
+async fn fetch_quote_snapshots(
+    client: &RobinhoodClient,
+    access_token: &str,
+    symbols: &[String],
+) -> Result<HashMap<String, QuoteSnapshot>> {
+    let mut unique_symbols = Vec::new();
+    let mut seen = HashSet::new();
+
+    for symbol in symbols {
+        let normalized = symbol.trim().to_uppercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            unique_symbols.push(normalized);
+        }
+    }
+
+    if unique_symbols.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut quotes = HashMap::new();
+    for chunk in unique_symbols.chunks(QUOTE_LOOKUP_CHUNK) {
+        let mut url = client
+            .base_url()
+            .join("marketdata/quotes/")
+            .map_err(|error| {
+                PositionsError::RobinhoodClient(RobinhoodClientError::InvalidEndpointUrl(error))
+            })?;
+        url.set_query(Some(&format!("symbols={}", chunk.join(","))));
+
+        let response = client
+            .http()
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(PositionsError::RobinhoodClient(
+                RobinhoodClientError::UnexpectedStatus(response.status()),
+            ));
+        }
+
+        let body = response.bytes().await.map_err(|error| {
+            PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error))
+        })?;
+        let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+            PositionsError::RobinhoodClient(RobinhoodClientError::ResponseBodyParse(error))
+        })?;
+
+        let Some(results) = payload.get("results").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for entry in results {
+            let Some(symbol) = entry.get("symbol").and_then(Value::as_str) else {
+                continue;
+            };
+            let normalized = symbol.trim().to_uppercase();
+            if normalized.is_empty() {
+                continue;
+            }
+
+            quotes.insert(
+                normalized,
+                QuoteSnapshot {
+                    last_trade_price: parse_quote_number(entry.get("last_trade_price")),
+                    previous_close: parse_quote_number(entry.get("previous_close")),
+                },
+            );
+        }
+    }
+
+    Ok(quotes)
+}
+
+fn parse_quote_number(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        Some(Value::Number(number)) => number.as_f64(),
+        _ => None,
+    }
+}
+
+fn calculate_position_metrics(
+    quantity: f64,
+    quote: Option<&QuoteSnapshot>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let Some(quote) = quote else {
+        return (None, None, None);
+    };
+
+    let equity = quote.last_trade_price.map(|price| price * quantity);
+    let (percentage_change, todays_return) = if let (Some(last_trade_price), Some(previous_close)) =
+        (quote.last_trade_price, quote.previous_close)
+    {
+        if previous_close.abs() > f64::EPSILON {
+            let change = last_trade_price - previous_close;
+            (
+                Some((change / previous_close) * 100.0),
+                Some(change * quantity),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    (equity, percentage_change, todays_return)
 }
 
 fn format_quantity(quantity: f64) -> String {
@@ -166,13 +357,105 @@ fn format_integer_with_grouping(integer: &str) -> String {
     grouped
 }
 
+fn align_decimal_column(values: &[String]) -> Vec<String> {
+    let mut max_integer_width = 0usize;
+    let mut max_fractional_width = 0usize;
+
+    for value in values {
+        if let Some((integer, fractional)) = value.split_once('.') {
+            max_integer_width = max_integer_width.max(integer.len());
+            max_fractional_width = max_fractional_width.max(fractional.len());
+        } else {
+            max_integer_width = max_integer_width.max(value.len());
+        }
+    }
+
+    values
+        .iter()
+        .map(|value| {
+            if let Some((integer, fractional)) = value.split_once('.') {
+                format!("{integer:>max_integer_width$}.{fractional:<max_fractional_width$}")
+            } else if max_fractional_width > 0 {
+                format!(
+                    "{value:>max_integer_width$} {padding}",
+                    padding = " ".repeat(max_fractional_width)
+                )
+            } else {
+                format!("{value:>max_integer_width$}")
+            }
+        })
+        .collect()
+}
+
+fn format_optional_currency(value: Option<f64>) -> String {
+    value
+        .map(format_currency)
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_optional_percentage(value: Option<f64>) -> String {
+    value
+        .map(format_percentage_change)
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_optional_signed_currency(value: Option<f64>) -> String {
+    value
+        .map(format_signed_currency)
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_currency(value: f64) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let absolute = value.abs();
+    let text = format!("{absolute:.2}");
+    let (integer, fractional) = text.split_once('.').unwrap_or((&text, "00"));
+    let grouped = format_integer_with_grouping(integer);
+    format!("{sign}${grouped}.{fractional}")
+}
+
+fn format_signed_currency(value: f64) -> String {
+    let sign = if value < 0.0 {
+        "-"
+    } else if value > 0.0 {
+        "+"
+    } else {
+        ""
+    };
+    let absolute = value.abs();
+    let text = format!("{absolute:.2}");
+    let (integer, fractional) = text.split_once('.').unwrap_or((&text, "00"));
+    let grouped = format_integer_with_grouping(integer);
+    format!("{sign}${grouped}.{fractional}")
+}
+
+fn format_percentage_change(value: f64) -> String {
+    if value > 0.0 {
+        format!("+{value:.2}%")
+    } else {
+        format!("{value:.2}%")
+    }
+}
+
+fn color_for_change(value: Option<f64>) -> Color {
+    match value {
+        Some(change) if change > 0.0 => Color::Green,
+        Some(change) if change < 0.0 => Color::Red,
+        _ => Color::White,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use console::strip_ansi_codes;
 
     use broker_robinhood::client::RobinhoodAccount;
 
-    use super::{PositionRow, format_quantity, render_positions_table, select_accounts};
+    use super::{
+        PositionRow, QuoteSnapshot, align_decimal_column, calculate_position_metrics,
+        format_currency, format_percentage_change, format_quantity, format_signed_currency,
+        render_positions_table, select_accounts,
+    };
 
     #[test]
     fn format_quantity_groups_and_trims_precision() {
@@ -187,31 +470,108 @@ mod tests {
     }
 
     #[test]
-    fn render_positions_table_contains_headers_and_rows() {
+    fn align_decimal_column_aligns_quantities_for_readability() {
+        let aligned = align_decimal_column(&[
+            "1,500".to_string(),
+            "12.5".to_string(),
+            "1,618.57743".to_string(),
+        ]);
+
+        assert_eq!(aligned[0], "1,500      ");
+        assert_eq!(aligned[1], "   12.5    ");
+        assert_eq!(aligned[2], "1,618.57743");
+    }
+
+    #[test]
+    fn calculate_position_metrics_uses_quote_snapshot() {
+        let quote = QuoteSnapshot {
+            last_trade_price: Some(110.0),
+            previous_close: Some(100.0),
+        };
+
+        let (equity, percentage_change, todays_return) =
+            calculate_position_metrics(2.0, Some(&quote));
+
+        assert_eq!(equity, Some(220.0));
+        assert_eq!(percentage_change, Some(10.0));
+        assert_eq!(todays_return, Some(20.0));
+    }
+
+    #[test]
+    fn render_positions_table_hides_account_for_single_account() {
         let rows = vec![
             PositionRow {
                 account_number: "116748102690".to_string(),
                 symbol: "AMZN".to_string(),
-                quantity: "1,618.57743".to_string(),
+                quantity: 1_618.57743,
+                equity: Some(300_000.12),
+                percentage_change: Some(2.5),
+                todays_return: Some(120.45),
+            },
+            PositionRow {
+                account_number: "116748102690".to_string(),
+                symbol: "V".to_string(),
+                quantity: 1_500.0,
+                equity: Some(150_000.0),
+                percentage_change: Some(-1.2),
+                todays_return: Some(-30.0),
+            },
+        ];
+
+        let table = strip_ansi_codes(&render_positions_table(&rows)).to_string();
+
+        assert!(!table.contains("Account"));
+        assert!(table.contains("Symbol"));
+        assert!(table.contains("Quantity"));
+        assert!(table.contains("Equity"));
+        assert!(table.contains("Percentage Change"));
+        assert!(table.contains("Today's Return"));
+        assert!(table.contains("AMZN"));
+        assert!(table.contains("1,618.57743"));
+        assert!(table.contains("$300,000.12"));
+        assert!(table.contains("+2.50%"));
+        assert!(table.contains("+$120.45"));
+        assert!(table.contains("-1.20%"));
+        assert!(table.contains("-$30.00"));
+        assert!(table.contains("V"));
+        assert!(table.contains("1,500"));
+    }
+
+    #[test]
+    fn render_positions_table_shows_account_for_multiple_accounts() {
+        let rows = vec![
+            PositionRow {
+                account_number: "116748102690".to_string(),
+                symbol: "AMZN".to_string(),
+                quantity: 10.0,
+                equity: Some(1500.0),
+                percentage_change: Some(1.0),
+                todays_return: Some(15.0),
             },
             PositionRow {
                 account_number: "5QT29231".to_string(),
                 symbol: "V".to_string(),
-                quantity: "1,500".to_string(),
+                quantity: 20.0,
+                equity: Some(2000.0),
+                percentage_change: Some(-0.5),
+                todays_return: Some(-10.0),
             },
         ];
 
         let table = strip_ansi_codes(&render_positions_table(&rows)).to_string();
 
         assert!(table.contains("Account"));
-        assert!(table.contains("Symbol"));
-        assert!(table.contains("Quantity"));
         assert!(table.contains("116748102690"));
-        assert!(table.contains("AMZN"));
-        assert!(table.contains("1,618.57743"));
         assert!(table.contains("5QT29231"));
-        assert!(table.contains("V"));
-        assert!(table.contains("1,500"));
+    }
+
+    #[test]
+    fn formatters_render_expected_output() {
+        assert_eq!(format_currency(1234.5), "$1,234.50");
+        assert_eq!(format_signed_currency(1234.5), "+$1,234.50");
+        assert_eq!(format_signed_currency(-1234.5), "-$1,234.50");
+        assert_eq!(format_percentage_change(1.234), "+1.23%");
+        assert_eq!(format_percentage_change(-1.234), "-1.23%");
     }
 
     #[test]
@@ -229,7 +589,8 @@ mod tests {
             },
         ];
 
-        let selected = select_accounts(accounts, "default").expect("default account should resolve");
+        let selected =
+            select_accounts(accounts, "default").expect("default account should resolve");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].account_number, "5678");
     }
