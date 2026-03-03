@@ -9,7 +9,7 @@ broker-robinhood = { path = "../../lib/rust/broker-robinhood" }
 clap = { workspace = true, features = ["derive"] }
 console = { workspace = true }
 indicatif = { workspace = true }
-keyring = { workspace = true }
+keyring = { workspace = true, features = ["apple-native"] }
 rpassword = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
