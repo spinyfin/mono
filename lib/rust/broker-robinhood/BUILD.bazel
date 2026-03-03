@@ -1,0 +1,44 @@
+load("@broker_robinhood_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+])
+
+rust_library(
+    name = "broker-robinhood",
+    crate_name = "broker_robinhood",
+    srcs = [
+        "src/auth.rs",
+        "src/client.rs",
+        "src/error.rs",
+        "src/lib.rs",
+    ],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "broker_robinhood_tests",
+    size = "small",
+    crate = ":broker-robinhood",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_binary(
+    name = "robinhood_auth_cli",
+    crate_name = "robinhood_auth",
+    srcs = ["src/bin/robinhood_auth.rs"],
+    deps = [":broker-robinhood"] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
