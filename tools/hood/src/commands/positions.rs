@@ -45,7 +45,7 @@ struct QuoteSnapshot {
     previous_close: Option<f64>,
 }
 
-pub async fn run(username: Option<&str>, account: &str, follow: bool) -> Result<()> {
+pub async fn run(username: Option<&str>, account: &str, follow: bool, csv: bool) -> Result<()> {
     set_colors_enabled(true);
 
     let (_, access_token) = creds::load_access_token(username)?;
@@ -63,12 +63,18 @@ pub async fn run(username: Option<&str>, account: &str, follow: bool) -> Result<
     loop {
         let rows = build_position_rows(&client, &access_token, &selected_accounts).await?;
 
-        if follow {
+        if follow && !csv {
             print!("\x1B[2J\x1B[H");
         }
 
         if rows.is_empty() {
-            println!("No open positions found.");
+            if csv {
+                print!("{}", render_positions_csv(&rows));
+            } else {
+                println!("No open positions found.");
+            }
+        } else if csv {
+            print!("{}", render_positions_csv(&rows));
         } else {
             println!("{}", render_positions_table(&rows));
         }
@@ -221,6 +227,24 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
     }
 
     table.to_string()
+}
+
+fn render_positions_csv(rows: &[PositionRow]) -> String {
+    let mut output =
+        String::from("account,symbol,quantity,equity,percentage_change,todays_return\n");
+    for row in rows {
+        let fields = [
+            csv_escape(&row.account_number),
+            csv_escape(&row.symbol),
+            row.quantity.to_string(),
+            format_optional_raw_number(row.equity),
+            format_optional_raw_number(row.percentage_change),
+            format_optional_raw_number(row.todays_return),
+        ];
+        output.push_str(&fields.join(","));
+        output.push('\n');
+    }
+    output
 }
 
 async fn fetch_quote_snapshots(
@@ -429,6 +453,10 @@ fn format_optional_signed_currency(value: Option<f64>) -> String {
         .unwrap_or_else(|| "N/A".to_string())
 }
 
+fn format_optional_raw_number(value: Option<f64>) -> String {
+    value.map(|number| number.to_string()).unwrap_or_default()
+}
+
 fn format_currency(value: f64) -> String {
     let sign = if value < 0.0 { "-" } else { "" };
     let absolute = value.abs();
@@ -461,6 +489,14 @@ fn format_percentage_change(value: f64) -> String {
     }
 }
 
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn color_for_change(value: Option<f64>) -> Color {
     match value {
         Some(change) if change > 0.0 => Color::Green,
@@ -478,7 +514,7 @@ mod tests {
     use super::{
         PositionRow, QuoteSnapshot, align_decimal_column, calculate_position_metrics,
         format_currency, format_percentage_change, format_quantity, format_signed_currency,
-        render_positions_table, select_accounts,
+        render_positions_csv, render_positions_table, select_accounts,
     };
 
     #[test]
@@ -587,6 +623,41 @@ mod tests {
         assert!(table.contains("Account"));
         assert!(table.contains("116748102690"));
         assert!(table.contains("5QT29231"));
+    }
+
+    #[test]
+    fn render_positions_csv_outputs_raw_values() {
+        let rows = vec![
+            PositionRow {
+                account_number: "116748102690".to_string(),
+                symbol: "AMZN".to_string(),
+                quantity: 1618.57743,
+                equity: Some(300000.12),
+                percentage_change: Some(2.5),
+                todays_return: Some(120.45),
+            },
+            PositionRow {
+                account_number: "5QT29231".to_string(),
+                symbol: "V".to_string(),
+                quantity: 1500.0,
+                equity: Some(150000.0),
+                percentage_change: Some(-1.2),
+                todays_return: Some(-30.0),
+            },
+        ];
+
+        let csv = render_positions_csv(&rows);
+        let lines = csv.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            lines[0],
+            "account,symbol,quantity,equity,percentage_change,todays_return"
+        );
+        assert_eq!(
+            lines[1],
+            "116748102690,AMZN,1618.57743,300000.12,2.5,120.45"
+        );
+        assert_eq!(lines[2], "5QT29231,V,1500,150000,-1.2,-30");
     }
 
     #[test]
