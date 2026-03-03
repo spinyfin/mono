@@ -9,6 +9,7 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0.97"
 clap = "4.5.39"
+console = "0.15.11"
 indicatif = "0.17.11"
 keyring = "3.6.3"
 reqwest = "0.11"

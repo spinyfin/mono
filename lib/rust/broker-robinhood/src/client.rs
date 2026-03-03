@@ -21,11 +21,16 @@ pub struct RobinhoodClient {
 }
 
 const DEFAULT_IDENTITY_BASE_URL: &str = "https://identi.robinhood.com/";
+const DEFAULT_API_BASE_URL: &str = "https://api.robinhood.com/";
 const INSTRUMENT_LOOKUP_CHUNK: usize = 50;
 const OPTION_ORDER_STATES: &str = "canceled,cancelled,filled,failed,partially_filled_rest_cancelled,voided,rejected,locate_failed";
 
 impl RobinhoodClient {
-    pub fn new(base_url: &str) -> Result<Self, RobinhoodClientError> {
+    pub fn new() -> Result<Self, RobinhoodClientError> {
+        Self::with_base_urls(DEFAULT_API_BASE_URL, DEFAULT_IDENTITY_BASE_URL)
+    }
+
+    pub fn with_base_url(base_url: &str) -> Result<Self, RobinhoodClientError> {
         let http = Client::builder().build()?;
         Self::with_http_client(http, base_url)
     }
@@ -669,8 +674,7 @@ mod tests {
 
     #[test]
     fn new_initializes_with_default_http_client() {
-        let client = RobinhoodClient::new("https://api.robinhood.com")
-            .expect("expected client to be constructed");
+        let client = RobinhoodClient::new().expect("expected client to be constructed");
 
         assert_eq!(client.base_url().as_str(), "https://api.robinhood.com/");
     }

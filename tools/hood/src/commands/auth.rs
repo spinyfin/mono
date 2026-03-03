@@ -10,7 +10,6 @@ use tokio::time::sleep;
 
 use crate::creds;
 
-const ROBINHOOD_API_BASE_URL: &str = "https://api.robinhood.com";
 const MAX_PUSH_ATTEMPTS: usize = 30;
 const PUSH_POLL_DELAY: Duration = Duration::from_secs(2);
 const PROGRESS_TICK_INTERVAL_MS: u64 = 120;
@@ -65,8 +64,7 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
     let progress = new_spinner()?;
     progress.set_message("Connecting to Robinhood");
 
-    let client = RobinhoodClient::new(ROBINHOOD_API_BASE_URL)
-        .context("failed to initialize Robinhood client")?;
+    let client = RobinhoodClient::new().context("failed to initialize Robinhood client")?;
 
     progress.set_message("Initiating login");
     let challenge = client

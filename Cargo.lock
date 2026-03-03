@@ -603,10 +603,12 @@ dependencies = [
  "anyhow",
  "broker-robinhood",
  "clap",
+ "console",
  "indicatif",
  "keyring",
  "rpassword",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
