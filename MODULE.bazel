@@ -15,4 +15,10 @@ crate.from_cargo(
     cargo_lockfile = "//tools/boss/engine:Cargo.lock",
     manifests = ["//tools/boss/engine:Cargo.toml"],
 )
+crate.from_cargo(
+    name = "broker_robinhood_crates",
+    cargo_lockfile = "//lib/rust/broker-robinhood:Cargo.lock",
+    manifests = ["//lib/rust/broker-robinhood:Cargo.toml"],
+)
 use_repo(crate, "boss_engine_crates")
+use_repo(crate, "broker_robinhood_crates")

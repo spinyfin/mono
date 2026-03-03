@@ -1,7 +1,7 @@
 [package]
 name = "broker-robinhood"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json"] }
@@ -12,8 +12,6 @@ serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-db = { path = "../db" }
 
 [dev-dependencies]
-wiremock = "0.6"
-tempfile = "3.14"
+wiremock = "0.5.22"

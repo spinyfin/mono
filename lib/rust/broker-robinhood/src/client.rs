@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use db::Database;
 use reqwest::{Client, StatusCode};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -328,36 +327,21 @@ impl RobinhoodClient {
         &self,
         access_token: &str,
         instrument_ids: &[String],
-        db: &Database,
     ) -> Result<HashMap<String, String>, RobinhoodClientError> {
-        let mut symbols = HashMap::new();
-        if instrument_ids.is_empty() {
-            return Ok(symbols);
-        }
-
         let mut seen = HashSet::new();
-        let mut missing = Vec::new();
+        let missing: Vec<String> = instrument_ids
+            .iter()
+            .map(|instrument_id| instrument_id.trim())
+            .filter(|trimmed_id| !trimmed_id.is_empty())
+            .filter(|trimmed_id| seen.insert((*trimmed_id).to_owned()))
+            .map(ToOwned::to_owned)
+            .collect();
 
-        for instrument_id in instrument_ids {
-            let trimmed_id = instrument_id.trim();
-            if trimmed_id.is_empty() || !seen.insert(trimmed_id.to_owned()) {
-                continue;
-            }
-
-            match db.get_robinhood_instrument_symbol(trimmed_id)? {
-                Some(cached) => {
-                    let normalized = cached.trim().to_uppercase();
-                    if normalized.is_empty() {
-                        missing.push(trimmed_id.to_owned());
-                    } else {
-                        symbols.insert(trimmed_id.to_owned(), normalized);
-                    }
-                }
-                None => missing.push(trimmed_id.to_owned()),
-            }
+        if missing.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        let mut fetched_entries = HashMap::new();
+        let mut symbols = HashMap::new();
         for chunk in missing.chunks(INSTRUMENT_LOOKUP_CHUNK) {
             let entries = self.fetch_instrument_chunk(access_token, chunk).await?;
 
@@ -370,12 +354,7 @@ impl RobinhoodClient {
 
                 let normalized_symbol = symbol_text.to_uppercase();
                 symbols.insert(entry_id.to_owned(), normalized_symbol.clone());
-                fetched_entries.insert(entry_id.to_owned(), normalized_symbol);
             }
-        }
-
-        if !fetched_entries.is_empty() {
-            db.set_robinhood_instrument_symbols(&fetched_entries)?;
         }
 
         Ok(symbols)
@@ -684,7 +663,6 @@ mod tests {
         TOKEN_REQUEST_PATH,
     };
     use serde_json::json;
-    use tempfile::TempDir;
     use uuid::Uuid;
     use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1345,49 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_symbols_returns_cached_entries_without_fetching() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let db = Database::open_at(temp_dir.path()).expect("open database");
-
-        let mut cached = HashMap::new();
-        cached.insert("instrument-1".to_string(), "tsla".to_string());
-        db.set_robinhood_instrument_symbols(&cached)
-            .expect("cache instrument symbol");
-
-        let server = MockServer::start().await;
-        let base_url = format!("{}/", server.uri());
-        let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
-
-        let ids = vec!["instrument-1".to_string()];
-        let symbols = client
-            .get_symbols("ignored-token", &ids, &db)
-            .await
-            .expect("fetch symbols");
-
-        assert_eq!(symbols.get("instrument-1"), Some(&"TSLA".to_string()));
-
-        let requests = server
-            .received_requests()
-            .await
-            .expect("inspect received requests");
-        assert!(
-            requests.is_empty(),
-            "expected no network requests when cache is populated"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_symbols_refetches_when_cache_value_is_empty() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let db = Database::open_at(temp_dir.path()).expect("open database");
-
-        let mut cached = HashMap::new();
-        cached.insert("instrument-1".to_string(), "   ".to_string());
-        db.set_robinhood_instrument_symbols(&cached)
-            .expect("cache instrument symbol");
-
+    async fn get_symbols_fetches_and_normalizes_entries() {
         let server = MockServer::start().await;
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
@@ -1411,7 +1347,7 @@ mod tests {
 
         let ids = vec!["instrument-1".to_string()];
         let symbols = client
-            .get_symbols("test-token", &ids, &db)
+            .get_symbols("test-token", &ids)
             .await
             .expect("fetch symbols");
 
@@ -1419,9 +1355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_symbols_fetches_and_caches_missing_entries() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let db = Database::open_at(temp_dir.path()).expect("open database");
+    async fn get_symbols_deduplicates_and_ignores_empty_ids() {
         let server = MockServer::start().await;
 
         let base_url = format!("{}/", server.uri());
@@ -1449,27 +1383,20 @@ mod tests {
         let ids = vec![
             "instrument-1".to_string(),
             "instrument-2".to_string(),
+            " ".to_string(),
             "instrument-1".to_string(),
         ];
         let symbols = client
-            .get_symbols("test-token", &ids, &db)
+            .get_symbols("test-token", &ids)
             .await
             .expect("fetch symbols");
 
         assert_eq!(symbols.get("instrument-1"), Some(&"TSLA".to_string()));
         assert_eq!(symbols.get("instrument-2"), Some(&"AAPL".to_string()));
-
-        let cached = db
-            .get_robinhood_instrument_symbol("instrument-1")
-            .expect("fetch cached symbol")
-            .expect("symbol should exist");
-        assert_eq!(cached, "TSLA");
     }
 
     #[tokio::test]
     async fn get_symbols_batches_requests_when_needed() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let db = Database::open_at(temp_dir.path()).expect("open database");
         let server = MockServer::start().await;
 
         let base_url = format!("{}/", server.uri());
@@ -1535,7 +1462,7 @@ mod tests {
             .await;
 
         let symbols = client
-            .get_symbols("test-token", &ids, &db)
+            .get_symbols("test-token", &ids)
             .await
             .expect("fetch symbols");
 

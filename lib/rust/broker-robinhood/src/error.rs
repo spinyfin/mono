@@ -1,4 +1,3 @@
-use db::DbError;
 use reqwest::StatusCode;
 use thiserror::Error;
 
@@ -18,7 +17,4 @@ pub enum RobinhoodClientError {
 
     #[error("failed to parse response body: {0}")]
     ResponseParse(#[from] serde_json::Error),
-
-    #[error("database error: {0}")]
-    Database(#[from] DbError),
 }
