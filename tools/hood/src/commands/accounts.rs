@@ -18,7 +18,7 @@ pub enum AccountsError {
     RobinhoodClient(#[from] RobinhoodClientError),
 }
 
-pub async fn run(username: Option<&str>) -> Result<()> {
+pub async fn run(username: Option<&str>, _account: &str) -> Result<()> {
     set_colors_enabled(true);
 
     let (_, access_token) = creds::load_access_token(username)?;

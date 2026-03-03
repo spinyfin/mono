@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 mod commands;
 mod creds;
@@ -11,6 +11,17 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Clone, Args)]
+struct CommonFlags {
+    /// Robinhood username to use. Uses the most recently authenticated user when omitted.
+    #[arg(long, short = 'u')]
+    username: Option<String>,
+
+    /// Robinhood account number to use. `default` is an alias for the default account.
+    #[arg(long, default_value = "default")]
+    account: String,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Authenticate with Robinhood and store OAuth credentials in the system keychain.
@@ -20,17 +31,9 @@ enum Command {
         verbose: bool,
     },
     /// List Robinhood accounts for an authenticated user.
-    Accounts {
-        /// Robinhood username to use. Uses the most recently authenticated user when omitted.
-        #[arg(long, short = 'u')]
-        username: Option<String>,
-    },
+    Accounts(CommonFlags),
     /// Verify stored credentials and connectivity to Robinhood APIs.
-    Status {
-        /// Robinhood username to check. Uses the most recently authenticated user when omitted.
-        #[arg(long, short = 'u')]
-        username: Option<String>,
-    },
+    Status(CommonFlags),
 }
 
 #[tokio::main]
@@ -39,9 +42,53 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Auth { verbose } => commands::auth::run(verbose).await?,
-        Command::Accounts { username } => commands::accounts::run(username.as_deref()).await?,
-        Command::Status { username } => commands::status::run(username.as_deref()).await?,
+        Command::Accounts(common) => {
+            commands::accounts::run(common.username.as_deref(), &common.account).await?
+        }
+        Command::Status(common) => {
+            commands::status::run(common.username.as_deref(), &common.account).await?
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn accounts_defaults_account_to_default_alias() {
+        let cli = Cli::parse_from(["hood", "accounts"]);
+
+        match cli.command {
+            Command::Accounts(common) => {
+                assert_eq!(common.account, "default");
+                assert_eq!(common.username, None);
+            }
+            _ => panic!("expected accounts command"),
+        }
+    }
+
+    #[test]
+    fn status_allows_overriding_common_flags() {
+        let cli = Cli::parse_from([
+            "hood",
+            "status",
+            "--username",
+            "alice",
+            "--account",
+            "12345678",
+        ]);
+
+        match cli.command {
+            Command::Status(common) => {
+                assert_eq!(common.username.as_deref(), Some("alice"));
+                assert_eq!(common.account, "12345678");
+            }
+            _ => panic!("expected status command"),
+        }
+    }
 }
