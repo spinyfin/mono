@@ -164,7 +164,7 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
         Cell::new("Equity")
             .add_attribute(Attribute::Bold)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Percentage Change")
+        Cell::new("% Change")
             .add_attribute(Attribute::Bold)
             .set_alignment(CellAlignment::Right),
         Cell::new("Today's Return")
@@ -524,7 +524,7 @@ mod tests {
         assert!(table.contains("Symbol"));
         assert!(table.contains("Quantity"));
         assert!(table.contains("Equity"));
-        assert!(table.contains("Percentage Change"));
+        assert!(table.contains("% Change"));
         assert!(table.contains("Today's Return"));
         assert!(table.contains("AMZN"));
         assert!(table.contains("1,618.57743"));
