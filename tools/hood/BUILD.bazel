@@ -5,7 +5,13 @@ exports_files(["Cargo.toml"])
 
 rust_binary(
     name = "hood",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/commands/auth.rs",
+        "src/commands/mod.rs",
+        "src/commands/status.rs",
+        "src/creds.rs",
+        "src/main.rs",
+    ],
     deps = ["//lib/rust/broker-robinhood"] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )

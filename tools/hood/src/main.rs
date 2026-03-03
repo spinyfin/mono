@@ -19,6 +19,12 @@ enum Command {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
+    /// Verify stored credentials and connectivity to Robinhood APIs.
+    Status {
+        /// Robinhood username to check. Uses the most recently authenticated user when omitted.
+        #[arg(long, short = 'u')]
+        username: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -27,6 +33,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Auth { verbose } => commands::auth::run(verbose).await?,
+        Command::Status { username } => commands::status::run(username.as_deref()).await?,
     }
 
     Ok(())
