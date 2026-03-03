@@ -19,6 +19,12 @@ enum Command {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
+    /// List Robinhood accounts for an authenticated user.
+    Accounts {
+        /// Robinhood username to use. Uses the most recently authenticated user when omitted.
+        #[arg(long, short = 'u')]
+        username: Option<String>,
+    },
     /// Verify stored credentials and connectivity to Robinhood APIs.
     Status {
         /// Robinhood username to check. Uses the most recently authenticated user when omitted.
@@ -33,6 +39,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Auth { verbose } => commands::auth::run(verbose).await?,
+        Command::Accounts { username } => commands::accounts::run(username.as_deref()).await?,
         Command::Status { username } => commands::status::run(username.as_deref()).await?,
     }
 
