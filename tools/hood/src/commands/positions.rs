@@ -9,6 +9,7 @@ use comfy_table::{
 use console::set_colors_enabled;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::time::{Duration, sleep};
 
 use crate::creds;
 
@@ -44,7 +45,7 @@ struct QuoteSnapshot {
     previous_close: Option<f64>,
 }
 
-pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
+pub async fn run(username: Option<&str>, account: &str, follow: bool) -> Result<()> {
     set_colors_enabled(true);
 
     let (_, access_token) = creds::load_access_token(username)?;
@@ -59,6 +60,32 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
 
     let selected_accounts = select_accounts(accounts, account)?;
 
+    loop {
+        let rows = build_position_rows(&client, &access_token, &selected_accounts).await?;
+
+        if follow {
+            print!("\x1B[2J\x1B[H");
+        }
+
+        if rows.is_empty() {
+            println!("No open positions found.");
+        } else {
+            println!("{}", render_positions_table(&rows));
+        }
+
+        if !follow {
+            return Ok(());
+        }
+
+        sleep(Duration::from_secs(10)).await;
+    }
+}
+
+async fn build_position_rows(
+    client: &RobinhoodClient,
+    access_token: &str,
+    selected_accounts: &[RobinhoodAccount],
+) -> Result<Vec<PositionRow>> {
     let mut rows = Vec::new();
     for account in selected_accounts {
         let mut positions = client
@@ -79,8 +106,7 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
     }
 
     if rows.is_empty() {
-        println!("No open positions found.");
-        return Ok(());
+        return Ok(rows);
     }
 
     let symbols = rows
@@ -104,9 +130,7 @@ pub async fn run(username: Option<&str>, account: &str) -> Result<()> {
             .then_with(|| left.symbol.cmp(&right.symbol))
     });
 
-    println!("{}", render_positions_table(&rows));
-
-    Ok(())
+    Ok(rows)
 }
 
 fn select_accounts(
