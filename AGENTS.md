@@ -1,0 +1,1 @@
+- always use minimal bazel visibility, never default to public. Maintain bazel visibility health.
