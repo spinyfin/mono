@@ -10,6 +10,7 @@ exports_files([
 rust_library(
     name = "broker-robinhood",
     crate_name = "broker_robinhood",
+    visibility = ["//tools/hood:__pkg__"],
     srcs = [
         "src/auth.rs",
         "src/client.rs",
@@ -32,12 +33,4 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-)
-
-rust_binary(
-    name = "robinhood_auth_cli",
-    crate_name = "robinhood_auth",
-    srcs = ["src/bin/robinhood_auth.rs"],
-    deps = [":broker-robinhood"] + all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )

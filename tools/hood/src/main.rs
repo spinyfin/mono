@@ -1,36 +1,37 @@
-use std::{env, time::Duration};
+use std::time::Duration;
 
 use broker_robinhood::{RobinhoodClient, WorkflowRoute, WorkflowScreen};
+use clap::{Parser, Subcommand};
 use tokio::time::sleep;
+
+#[derive(Debug, Parser)]
+#[command(name = "hood", about = "Robinhood CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Authenticate with Robinhood and print the final OAuth token response.
+    Auth { username: String, password: String },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(1);
+    let cli = Cli::parse();
 
-    let username = match args.next() {
-        Some(value) => value,
-        None => {
-            eprintln!("usage: robinhood-auth <username> <password>");
-            std::process::exit(64);
-        }
-    };
-
-    let password = match args.next() {
-        Some(value) => value,
-        None => {
-            eprintln!("usage: robinhood-auth <username> <password>");
-            std::process::exit(64);
-        }
-    };
-
-    if args.next().is_some() {
-        eprintln!("usage: robinhood-auth <username> <password>");
-        std::process::exit(64);
+    match cli.command {
+        Command::Auth { username, password } => auth(&username, &password).await?,
     }
 
+    Ok(())
+}
+
+async fn auth(username: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
     let client = RobinhoodClient::new("https://api.robinhood.com")?;
 
-    let challenge = match client.initiate_login(&username, &password).await {
+    let challenge = match client.initiate_login(username, password).await {
         Ok(challenge) => {
             println!(
                 "Verification workflow ID: {}",
@@ -80,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?;
 
                     match client
-                        .finalize_login(&username, &password, &device_token, &request_id)
+                        .finalize_login(username, password, &device_token, &request_id)
                         .await
                     {
                         Ok(token) => {
