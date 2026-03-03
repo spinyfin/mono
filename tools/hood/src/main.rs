@@ -1,10 +1,21 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use broker_robinhood::{RobinhoodClient, WorkflowRoute, WorkflowScreen};
+use anyhow::{Context, Result, bail};
+use broker_robinhood::{AuthChallenge, RobinhoodClient, WorkflowRoute, WorkflowScreen};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
+use keyring::Entry;
 use rpassword::prompt_password;
+use serde_json::Value;
 use tokio::time::sleep;
+
+const ROBINHOOD_API_BASE_URL: &str = "https://api.robinhood.com";
+const KEYRING_SERVICE: &str = "hood.robinhood.oauth";
+const MAX_PUSH_ATTEMPTS: usize = 30;
+const PUSH_POLL_DELAY: Duration = Duration::from_secs(2);
+const PROGRESS_TICK_INTERVAL_MS: u64 = 120;
+const REDACTED: &str = "<redacted>";
 
 #[derive(Debug, Parser)]
 #[command(name = "hood", about = "Robinhood CLI")]
@@ -15,40 +26,46 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Authenticate with Robinhood and print the final OAuth token response.
-    Auth,
+    /// Authenticate with Robinhood and store OAuth credentials in the system keychain.
+    Auth {
+        /// Print extra diagnostics with sensitive fields redacted.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Auth => {
+        Command::Auth { verbose } => {
             let (username, password) = prompt_for_credentials()?;
-            auth(&username, &password).await?;
+            auth(&username, &password, verbose).await?;
         }
     }
 
     Ok(())
 }
 
-fn prompt_for_credentials() -> Result<(String, String), Box<dyn std::error::Error>> {
+fn prompt_for_credentials() -> Result<(String, String)> {
     let username = prompt_non_empty("Username: ")?;
     let password = prompt_non_empty_password("Password: ")?;
     Ok((username, password))
 }
 
-fn prompt_non_empty(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn prompt_non_empty(prompt: &str) -> Result<String> {
     let mut input = String::new();
     loop {
         print!("{prompt}");
-        io::stdout().flush()?;
+        io::stdout().flush().context("failed to flush stdout")?;
 
         input.clear();
-        let bytes_read = io::stdin().read_line(&mut input)?;
+        let bytes_read = io::stdin()
+            .read_line(&mut input)
+            .context("failed to read username")?;
         if bytes_read == 0 {
-            return Err("stdin closed while reading username".into());
+            bail!("stdin closed while reading username");
         }
 
         let value = input.trim().to_string();
@@ -60,9 +77,9 @@ fn prompt_non_empty(prompt: &str) -> Result<String, Box<dyn std::error::Error>> 
     }
 }
 
-fn prompt_non_empty_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn prompt_non_empty_password(prompt: &str) -> Result<String> {
     loop {
-        let password = prompt_password(prompt)?;
+        let password = prompt_password(prompt).context("failed to read password")?;
         if !password.trim().is_empty() {
             return Ok(password);
         }
@@ -71,204 +88,339 @@ fn prompt_non_empty_password(prompt: &str) -> Result<String, Box<dyn std::error:
     }
 }
 
-async fn auth(username: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let client = RobinhoodClient::new("https://api.robinhood.com")?;
+async fn auth(username: &str, password: &str, verbose: bool) -> Result<()> {
+    let progress = new_spinner()?;
+    progress.set_message("Connecting to Robinhood");
 
-    let challenge = match client.initiate_login(username, password).await {
-        Ok(challenge) => {
-            println!(
-                "Verification workflow ID: {}",
-                challenge.verification_workflow().id
-            );
-            println!(
-                "Workflow status: {}",
-                challenge.verification_workflow().workflow_status
-            );
-            println!("Device token: {}", challenge.device_token());
-            println!("Request ID: {}", challenge.request_id());
-            challenge
-        }
-        Err(err) => {
-            eprintln!("failed to initiate login: {err}");
-            std::process::exit(1);
-        }
-    };
+    let client = RobinhoodClient::new(ROBINHOOD_API_BASE_URL)
+        .context("failed to initialize Robinhood client")?;
 
+    progress.set_message("Initiating login");
+    let challenge = client
+        .initiate_login(username, password)
+        .await
+        .context("failed to initiate login")?;
+    log_challenge(verbose, &challenge);
+
+    let workflow_id = challenge.verification_workflow().id.clone();
     let device_token = challenge.device_token();
     let request_id = challenge.request_id();
 
-    match client
-        .fetch_verification_result(&challenge.verification_workflow().id)
+    progress.set_message("Checking verification workflow");
+    let verification_result = client
+        .fetch_verification_result(&workflow_id)
         .await
-    {
-        Ok(result) => {
-            println!("Verification result: {result}");
+        .context("failed to fetch verification result")?;
+    vprintln(
+        verbose,
+        format_args!("Verification result: {verification_result}"),
+    );
+
+    progress.set_message("Requesting device approval challenge");
+    let route = client
+        .advance_workflow_entry_point(&workflow_id)
+        .await
+        .context("failed to advance workflow entry point")?;
+    log_route(verbose, &route);
+
+    let challenge_id = extract_challenge_id(&route);
+    let status = wait_for_push_validation(&client, challenge_id.as_deref(), &progress, verbose)
+        .await
+        .context("failed while waiting for push validation")?;
+
+    match status.as_deref() {
+        Some("validated") => {}
+        Some("expired") => {
+            progress.abandon_with_message("Push challenge expired; rerun `hood auth` to retry.");
+            return Ok(());
         }
-        Err(err) => {
-            eprintln!("failed to fetch verification result: {err}");
-            std::process::exit(1);
+        Some(other) => {
+            progress.abandon_with_message(format!(
+                "Push challenge ended with status `{other}`; rerun `hood auth`."
+            ));
+            return Ok(());
+        }
+        None => {
+            progress.abandon_with_message(
+                "No push challenge was available; rerun `hood auth` to retry.",
+            );
+            return Ok(());
         }
     }
 
-    match client
-        .advance_workflow_entry_point(&challenge.verification_workflow().id)
+    progress.set_message("Completing device approval");
+    complete_device_approval(&client, &workflow_id, verbose).await?;
+
+    progress.set_message("Finalizing login");
+    let token = client
+        .finalize_login(username, password, &device_token, &request_id)
         .await
-    {
-        Ok(route) => {
-            let challenge_id = print_route(&route);
-            let status = wait_for_push_validation(&client, challenge_id.as_deref()).await?;
+        .context("failed to fetch final OAuth token")?;
 
-            match status.as_deref() {
-                Some("validated") => {
-                    complete_device_approval(&client, &challenge.verification_workflow().id)
-                        .await?;
+    vprintln(
+        verbose,
+        format_args!(
+            "Final OAuth token response (redacted):\n{}",
+            serde_json::to_string_pretty(&redact_sensitive_value(token.clone()))?
+        ),
+    );
 
-                    match client
-                        .finalize_login(username, password, &device_token, &request_id)
-                        .await
-                    {
-                        Ok(token) => {
-                            let formatted = serde_json::to_string_pretty(&token)?;
-                            println!("OAuth token response:\n{formatted}");
-                        }
-                        Err(err) => {
-                            eprintln!("failed to fetch final oauth token: {err}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Some("expired") => {
-                    println!("Push challenge expired; rerun the CLI to restart auth.");
-                }
-                Some(other) => {
-                    println!(
-                        "Push challenge ended with status `{other}`; skipping approval completion."
-                    );
-                }
-                None => {}
-            }
-        }
-        Err(err) => {
-            eprintln!("failed to advance workflow entry point: {err}");
-            std::process::exit(1);
-        }
-    }
+    progress.set_message("Saving credentials securely");
+    store_credentials(username, &token).context("failed to store credentials securely")?;
 
+    progress.finish_with_message("Authenticated. Credentials stored in system keychain.");
     Ok(())
 }
 
-fn print_route(route: &WorkflowRoute) -> Option<String> {
+fn new_spinner() -> Result<ProgressBar> {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg}")
+            .context("failed to configure progress style")?,
+    );
+    progress.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_INTERVAL_MS));
+    Ok(progress)
+}
+
+fn extract_challenge_id(route: &WorkflowRoute) -> Option<String> {
+    route
+        .replace
+        .as_ref()
+        .and_then(|replace| {
+            replace
+                .screen
+                .device_approval_challenge_screen_params
+                .as_ref()
+        })
+        .and_then(|params| params.sheriff_challenge.as_ref())
+        .and_then(|challenge| challenge.id.clone())
+}
+
+fn log_challenge(verbose: bool, challenge: &AuthChallenge) {
+    if !verbose {
+        return;
+    }
+
+    eprintln!(
+        "Verification workflow ID: {}",
+        challenge.verification_workflow().id
+    );
+    eprintln!(
+        "Workflow status: {}",
+        challenge.verification_workflow().workflow_status
+    );
+    eprintln!(
+        "Device token: {}",
+        redact_string(&challenge.device_token().to_string())
+    );
+    eprintln!(
+        "Request ID: {}",
+        redact_string(&challenge.request_id().to_string())
+    );
+}
+
+fn log_route(verbose: bool, route: &WorkflowRoute) {
+    if !verbose {
+        return;
+    }
+
     if let Some(replace) = &route.replace {
-        println!("Route action: replace");
-        print_screen(&replace.screen)
+        eprintln!("Route action: replace");
+        log_screen(&replace.screen);
     } else {
-        println!("Route action: none");
-        None
+        eprintln!("Route action: none");
     }
 }
 
-fn print_screen(screen: &WorkflowScreen) -> Option<String> {
-    let mut challenge_id = None;
-
-    println!("Screen name: {}", screen.name);
+fn log_screen(screen: &WorkflowScreen) {
+    eprintln!("Screen name: {}", screen.name);
     if let Some(block_id) = &screen.block_id {
-        println!("Screen block ID: {block_id}");
+        eprintln!("Screen block ID: {block_id}");
     }
 
     if let Some(params) = &screen.device_approval_challenge_screen_params {
-        println!(
+        eprintln!(
             "Device approval challenge flow ID: {}",
             params.sheriff_flow_id.as_deref().unwrap_or("<unknown>")
         );
 
         if let Some(challenge) = &params.sheriff_challenge {
             if let Some(id) = &challenge.id {
-                println!("Challenge ID: {id}");
-                challenge_id = Some(id.clone());
+                eprintln!("Challenge ID: {}", redact_string(id));
             }
             if let Some(challenge_type) = &challenge.challenge_type {
-                println!("Challenge type: {challenge_type}");
+                eprintln!("Challenge type: {challenge_type}");
             }
             if let Some(status) = &challenge.status {
-                println!("Challenge status: {status}");
+                eprintln!("Challenge status: {status}");
             }
             if let Some(retries) = challenge.remaining_retries {
-                println!("Remaining retries: {retries}");
+                eprintln!("Remaining retries: {retries}");
             }
             if let Some(attempts) = challenge.remaining_attempts {
-                println!("Remaining attempts: {attempts}");
+                eprintln!("Remaining attempts: {attempts}");
             }
             if let Some(expires_at) = &challenge.expires_at {
-                println!("Challenge expires at: {expires_at}");
+                eprintln!("Challenge expires at: {expires_at}");
             }
         }
 
         if let Some(fallback) = &params.fallback_cta_text {
-            println!("Fallback CTA text: {fallback}");
+            eprintln!("Fallback CTA text: {fallback}");
         }
     }
-
-    challenge_id
 }
 
 async fn wait_for_push_validation(
     client: &RobinhoodClient,
     challenge_id: Option<&str>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    progress: &ProgressBar,
+    verbose: bool,
+) -> Result<Option<String>> {
     let Some(challenge_id) = challenge_id else {
-        println!("No sheriff challenge to poll.");
+        vprintln(verbose, format_args!("No sheriff challenge to poll."));
         return Ok(None);
     };
 
-    const MAX_ATTEMPTS: usize = 30;
-    const DELAY: Duration = Duration::from_secs(2);
-
     let mut last_status: Option<String> = None;
 
-    for attempt in 1..=MAX_ATTEMPTS {
-        let status = match client.fetch_push_prompt_status(challenge_id).await {
-            Ok(status) => status,
-            Err(err) => {
-                eprintln!("failed to fetch push prompt status: {err}");
-                std::process::exit(1);
-            }
-        };
+    for attempt in 1..=MAX_PUSH_ATTEMPTS {
+        progress.set_message(format!(
+            "Waiting for push approval ({attempt}/{MAX_PUSH_ATTEMPTS})"
+        ));
+        let status = client
+            .fetch_push_prompt_status(challenge_id)
+            .await
+            .context("failed to fetch push prompt status")?;
 
-        println!("Push challenge status (attempt {attempt}/{MAX_ATTEMPTS}): {status}");
+        vprintln(
+            verbose,
+            format_args!("Push challenge status (attempt {attempt}/{MAX_PUSH_ATTEMPTS}): {status}"),
+        );
 
         match status.as_str() {
             "validated" | "expired" => return Ok(Some(status)),
             _ => {
                 last_status = Some(status);
-                sleep(DELAY).await;
+                sleep(PUSH_POLL_DELAY).await;
             }
         }
     }
 
-    println!(
-        "Push challenge did not validate within allotted attempts (last status: {}).",
-        last_status.as_deref().unwrap_or("<unknown>")
+    vprintln(
+        verbose,
+        format_args!(
+            "Push challenge did not validate within allotted attempts (last status: {}).",
+            last_status.as_deref().unwrap_or("<unknown>")
+        ),
     );
-
     Ok(last_status)
 }
 
 async fn complete_device_approval(
     client: &RobinhoodClient,
     workflow_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match client.complete_device_approval(workflow_id).await {
-        Ok(route) => {
-            if let Some(exit) = route.exit {
-                println!("Workflow exit status: {}", exit.status);
-            } else {
-                println!("Workflow completed without exit status.");
+    verbose: bool,
+) -> Result<()> {
+    let route = client
+        .complete_device_approval(workflow_id)
+        .await
+        .context("failed to complete device approval")?;
+
+    if verbose {
+        if let Some(exit) = route.exit {
+            eprintln!("Workflow exit status: {}", exit.status);
+        } else {
+            eprintln!("Workflow completed without exit status.");
+        }
+    }
+
+    Ok(())
+}
+
+fn store_credentials(username: &str, token: &Value) -> Result<()> {
+    let entry = Entry::new(KEYRING_SERVICE, username).context("failed to open keychain entry")?;
+    entry
+        .set_password(&serde_json::to_string(token).context("failed to serialize credentials")?)
+        .context("failed to write credentials to keychain")?;
+    Ok(())
+}
+
+fn redact_sensitive_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    if is_sensitive_key(&key) {
+                        (key, Value::String(REDACTED.to_string()))
+                    } else {
+                        (key, redact_sensitive_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "token",
+        "password",
+        "secret",
+        "credential",
+        "authorization",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn redact_string(value: &str) -> String {
+    let visible = 4;
+    if value.len() <= visible * 2 {
+        REDACTED.to_string()
+    } else {
+        format!(
+            "{}...{}",
+            &value[..visible],
+            &value[value.len().saturating_sub(visible)..]
+        )
+    }
+}
+
+fn vprintln(verbose: bool, args: std::fmt::Arguments<'_>) {
+    if verbose {
+        eprintln!("{args}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{REDACTED, redact_sensitive_value};
+
+    #[test]
+    fn redact_sensitive_fields_in_verbose_output() {
+        let input = json!({
+            "access_token": "secret-access-token",
+            "refresh_token": "secret-refresh-token",
+            "token_type": "Bearer",
+            "profile": {
+                "email": "person@example.com"
             }
-            Ok(())
-        }
-        Err(err) => {
-            eprintln!("failed to complete device approval: {err}");
-            std::process::exit(1);
-        }
+        });
+
+        let redacted = redact_sensitive_value(input);
+
+        assert_eq!(redacted["access_token"], REDACTED);
+        assert_eq!(redacted["refresh_token"], REDACTED);
+        assert_eq!(redacted["token_type"], REDACTED);
+        assert_eq!(redacted["profile"]["email"], "person@example.com");
     }
 }
