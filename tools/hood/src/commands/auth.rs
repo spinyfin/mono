@@ -1,11 +1,13 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use broker_robinhood::{AuthChallenge, RobinhoodClient, WorkflowRoute, WorkflowScreen};
+use broker_robinhood::{
+    AuthChallenge, RobinhoodClient, RobinhoodClientError, WorkflowRoute, WorkflowScreen,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use rpassword::prompt_password;
 use serde_json::Value;
+use thiserror::Error;
 use tokio::time::sleep;
 
 use crate::creds;
@@ -14,6 +16,24 @@ const MAX_PUSH_ATTEMPTS: usize = 30;
 const PUSH_POLL_DELAY: Duration = Duration::from_secs(2);
 const PROGRESS_TICK_INTERVAL_MS: u64 = 120;
 const REDACTED: &str = "<redacted>";
+
+type Result<T> = std::result::Result<T, AuthError>;
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("stdin closed while reading username")]
+    ClosedStdin,
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    RobinhoodClient(#[from] RobinhoodClientError),
+    #[error(transparent)]
+    Credentials(#[from] creds::CredentialsError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    ProgressStyle(#[from] indicatif::style::TemplateError),
+}
 
 pub async fn run(verbose: bool) -> Result<()> {
     let (username, password) = prompt_for_credentials()?;
@@ -30,14 +50,12 @@ fn prompt_non_empty(prompt: &str) -> Result<String> {
     let mut input = String::new();
     loop {
         print!("{prompt}");
-        io::stdout().flush().context("failed to flush stdout")?;
+        io::stdout().flush()?;
 
         input.clear();
-        let bytes_read = io::stdin()
-            .read_line(&mut input)
-            .context("failed to read username")?;
+        let bytes_read = io::stdin().read_line(&mut input)?;
         if bytes_read == 0 {
-            bail!("stdin closed while reading username");
+            return Err(AuthError::ClosedStdin);
         }
 
         let value = input.trim().to_string();
@@ -51,7 +69,7 @@ fn prompt_non_empty(prompt: &str) -> Result<String> {
 
 fn prompt_non_empty_password(prompt: &str) -> Result<String> {
     loop {
-        let password = prompt_password(prompt).context("failed to read password")?;
+        let password = prompt_password(prompt)?;
         if !password.trim().is_empty() {
             return Ok(password);
         }
@@ -64,13 +82,10 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
     let progress = new_spinner()?;
     progress.set_message("Connecting to Robinhood");
 
-    let client = RobinhoodClient::new().context("failed to initialize Robinhood client")?;
+    let client = RobinhoodClient::new()?;
 
     progress.set_message("Initiating login");
-    let challenge = client
-        .initiate_login(username, password)
-        .await
-        .context("failed to initiate login")?;
+    let challenge = client.initiate_login(username, password).await?;
     log_challenge(verbose, &challenge);
 
     let workflow_id = challenge.verification_workflow().id.clone();
@@ -78,26 +93,19 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
     let request_id = challenge.request_id();
 
     progress.set_message("Checking verification workflow");
-    let verification_result = client
-        .fetch_verification_result(&workflow_id)
-        .await
-        .context("failed to fetch verification result")?;
+    let verification_result = client.fetch_verification_result(&workflow_id).await?;
     vprintln(
         verbose,
         format_args!("Verification result: {verification_result}"),
     );
 
     progress.set_message("Requesting device approval challenge");
-    let route = client
-        .advance_workflow_entry_point(&workflow_id)
-        .await
-        .context("failed to advance workflow entry point")?;
+    let route = client.advance_workflow_entry_point(&workflow_id).await?;
     log_route(verbose, &route);
 
     let challenge_id = extract_challenge_id(&route);
-    let status = wait_for_push_validation(&client, challenge_id.as_deref(), &progress, verbose)
-        .await
-        .context("failed while waiting for push validation")?;
+    let status =
+        wait_for_push_validation(&client, challenge_id.as_deref(), &progress, verbose).await?;
 
     match status.as_deref() {
         Some("validated") => {}
@@ -125,8 +133,7 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
     progress.set_message("Finalizing login");
     let token = client
         .finalize_login(username, password, &device_token, &request_id)
-        .await
-        .context("failed to fetch final OAuth token")?;
+        .await?;
 
     vprintln(
         verbose,
@@ -137,7 +144,7 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
     );
 
     progress.set_message("Saving credentials securely");
-    creds::store_credentials(username, &token).context("failed to store credentials securely")?;
+    creds::store_credentials(username, &token)?;
 
     progress.finish_with_message("Authenticated. Credentials stored in system keychain.");
     Ok(())
@@ -145,10 +152,7 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
 
 fn new_spinner() -> Result<ProgressBar> {
     let progress = ProgressBar::new_spinner();
-    progress.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")
-            .context("failed to configure progress style")?,
-    );
+    progress.set_style(ProgressStyle::with_template("{spinner:.green} {msg}")?);
     progress.enable_steady_tick(Duration::from_millis(PROGRESS_TICK_INTERVAL_MS));
     Ok(progress)
 }
@@ -259,10 +263,7 @@ async fn wait_for_push_validation(
         progress.set_message(format!(
             "Waiting for push approval ({attempt}/{MAX_PUSH_ATTEMPTS})"
         ));
-        let status = client
-            .fetch_push_prompt_status(challenge_id)
-            .await
-            .context("failed to fetch push prompt status")?;
+        let status = client.fetch_push_prompt_status(challenge_id).await?;
 
         vprintln(
             verbose,
@@ -293,10 +294,7 @@ async fn complete_device_approval(
     workflow_id: &str,
     verbose: bool,
 ) -> Result<()> {
-    let route = client
-        .complete_device_approval(workflow_id)
-        .await
-        .context("failed to complete device approval")?;
+    let route = client.complete_device_approval(workflow_id).await?;
 
     if verbose {
         if let Some(exit) = route.exit {

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use reqwest::{Client, StatusCode};
-use serde::de::Error as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 use uuid::Uuid;
@@ -206,9 +205,10 @@ impl RobinhoodClient {
                 }
 
                 let quantity = quantity_text.parse::<f64>().map_err(|error| {
-                    RobinhoodClientError::ResponseParse(serde_json::Error::custom(format!(
-                        "invalid quantity for symbol {symbol}: {error}"
-                    )))
+                    RobinhoodClientError::InvalidPositionQuantity {
+                        symbol: symbol.clone(),
+                        source: error,
+                    }
                 })?;
 
                 positions.push(RobinhoodPosition { symbol, quantity });
@@ -261,9 +261,7 @@ impl RobinhoodClient {
             params.push(("cursor", cursor_value.to_owned()));
         }
 
-        let query = serde_urlencoded::to_string(&params).map_err(|error| {
-            RobinhoodClientError::ResponseParse(serde_json::Error::custom(error.to_string()))
-        })?;
+        let query = serde_urlencoded::to_string(&params)?;
         url.set_query(Some(&query));
 
         let response = self.http.get(url).bearer_auth(access_token).send().await?;
@@ -297,9 +295,7 @@ impl RobinhoodClient {
             .join(",");
 
         if accounts_value.is_empty() {
-            return Err(RobinhoodClientError::ResponseParse(
-                serde_json::Error::custom("at least one account number is required"),
-            ));
+            return Err(RobinhoodClientError::MissingAccountNumbers);
         }
 
         let mut params = vec![
@@ -312,9 +308,7 @@ impl RobinhoodClient {
             params.push(("cursor", cursor_value.to_owned()));
         }
 
-        let query = serde_urlencoded::to_string(&params).map_err(|error| {
-            RobinhoodClientError::ResponseParse(serde_json::Error::custom(error.to_string()))
-        })?;
+        let query = serde_urlencoded::to_string(&params)?;
         url.set_query(Some(&query));
 
         let response = self.http.get(url).bearer_auth(access_token).send().await?;

@@ -1,22 +1,30 @@
 use std::borrow::Cow;
 
-use anyhow::{Context, Result};
 use broker_robinhood::RobinhoodClient;
+use broker_robinhood::RobinhoodClientError;
 use broker_robinhood::client::RobinhoodAccount;
 use console::{set_colors_enabled, style};
+use thiserror::Error;
 
 use crate::creds;
+
+type Result<T> = std::result::Result<T, AccountsError>;
+
+#[derive(Debug, Error)]
+pub enum AccountsError {
+    #[error(transparent)]
+    Credentials(#[from] creds::CredentialsError),
+    #[error(transparent)]
+    RobinhoodClient(#[from] RobinhoodClientError),
+}
 
 pub async fn run(username: Option<&str>) -> Result<()> {
     set_colors_enabled(true);
 
     let (_, access_token) = creds::load_access_token(username)?;
 
-    let client = RobinhoodClient::new().context("failed to initialize Robinhood client")?;
-    let accounts = client
-        .fetch_accounts(&access_token)
-        .await
-        .context("failed to fetch Robinhood accounts")?;
+    let client = RobinhoodClient::new()?;
+    let accounts = client.fetch_accounts(&access_token).await?;
 
     if accounts.is_empty() {
         println!("No Robinhood accounts found.");
