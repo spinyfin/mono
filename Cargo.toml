@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "lib/rust/broker-robinhood",
+  "tools/hood",
   "tools/boss/engine",
 ]
 resolver = "2"
