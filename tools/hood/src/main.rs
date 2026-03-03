@@ -30,8 +30,11 @@ struct PositionsFlags {
     /// Refresh the positions table every 10 seconds.
     #[arg(long, short = 'f')]
     follow: bool,
-}
 
+    /// Output raw position data as comma-separated values.
+    #[arg(long, conflicts_with = "follow")]
+    csv: bool,
+}
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Authenticate with Robinhood and store OAuth credentials in the system keychain.
@@ -65,6 +68,7 @@ async fn main() -> Result<()> {
                 positions.common.username.as_deref(),
                 &positions.common.account,
                 positions.follow,
+                positions.csv,
             )
             .await?
         }
@@ -121,6 +125,29 @@ mod tests {
                 assert_eq!(positions.common.account, "default");
                 assert_eq!(positions.common.username, None);
                 assert!(!positions.follow);
+                assert!(!positions.csv);
+            }
+            _ => panic!("expected positions command"),
+        }
+    }
+
+    #[test]
+    fn positions_supports_csv_flag() {
+        let cli = Cli::parse_from([
+            "hood",
+            "positions",
+            "--username",
+            "alice",
+            "--account",
+            "12345678",
+            "--csv",
+        ]);
+
+        match cli.command {
+            Command::Positions(positions) => {
+                assert_eq!(positions.common.username.as_deref(), Some("alice"));
+                assert_eq!(positions.common.account, "12345678");
+                assert!(positions.csv);
             }
             _ => panic!("expected positions command"),
         }
