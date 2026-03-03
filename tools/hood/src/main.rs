@@ -22,6 +22,16 @@ struct CommonFlags {
     account: String,
 }
 
+#[derive(Debug, Clone, Args)]
+struct PositionsFlags {
+    #[command(flatten)]
+    common: CommonFlags,
+
+    /// Refresh the positions table every 10 seconds.
+    #[arg(long, short = 'f')]
+    follow: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Authenticate with Robinhood and store OAuth credentials in the system keychain.
@@ -35,7 +45,7 @@ enum Command {
     /// Verify stored credentials and connectivity to Robinhood APIs.
     Status(CommonFlags),
     /// List open positions for a Robinhood account.
-    Positions(CommonFlags),
+    Positions(PositionsFlags),
 }
 
 #[tokio::main]
@@ -50,8 +60,13 @@ async fn main() -> Result<()> {
         Command::Status(common) => {
             commands::status::run(common.username.as_deref(), &common.account).await?
         }
-        Command::Positions(common) => {
-            commands::positions::run(common.username.as_deref(), &common.account).await?
+        Command::Positions(positions) => {
+            commands::positions::run(
+                positions.common.username.as_deref(),
+                &positions.common.account,
+                positions.follow,
+            )
+            .await?
         }
     }
 
@@ -102,10 +117,21 @@ mod tests {
         let cli = Cli::parse_from(["hood", "positions"]);
 
         match cli.command {
-            Command::Positions(common) => {
-                assert_eq!(common.account, "default");
-                assert_eq!(common.username, None);
+            Command::Positions(positions) => {
+                assert_eq!(positions.common.account, "default");
+                assert_eq!(positions.common.username, None);
+                assert!(!positions.follow);
             }
+            _ => panic!("expected positions command"),
+        }
+    }
+
+    #[test]
+    fn positions_accepts_follow_flag() {
+        let cli = Cli::parse_from(["hood", "positions", "-f"]);
+
+        match cli.command {
+            Command::Positions(positions) => assert!(positions.follow),
             _ => panic!("expected positions command"),
         }
     }
