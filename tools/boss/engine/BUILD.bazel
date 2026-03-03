@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
-load("@boss_engine_crates//:defs.bzl", "all_crate_deps")
+load("@mono_crates//:defs.bzl", "all_crate_deps")
 
 rust_library(
     name = "engine_lib",
