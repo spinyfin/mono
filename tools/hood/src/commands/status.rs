@@ -30,17 +30,14 @@ pub async fn run(username: Option<&str>) -> Result<()> {
         }
     };
 
-    let client = RobinhoodClient::new(ROBINHOOD_API_BASE_URL)
-        .context("failed to initialize Robinhood client")?;
-
-    match client.fetch_accounts(access_token).await {
+    match verify_connection(access_token).await {
         Ok(_) => {
             print_check(true, "Connection successful");
             Ok(())
         }
         Err(error) => {
             print_check(false, "Connection successful");
-            bail!("authenticated API call failed: {error}");
+            bail!("{error:#}");
         }
     }
 }
@@ -61,6 +58,16 @@ fn extract_access_token(credentials: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
+}
+
+async fn verify_connection(access_token: &str) -> Result<()> {
+    let client = RobinhoodClient::new(ROBINHOOD_API_BASE_URL)
+        .context("failed to initialize Robinhood client")?;
+    client
+        .fetch_accounts(access_token)
+        .await
+        .context("authenticated API call failed")?;
+    Ok(())
 }
 
 fn print_check(ok: bool, message: &str) {
