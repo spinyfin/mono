@@ -16,5 +16,17 @@ pub enum RobinhoodClientError {
     UnexpectedStatus(StatusCode),
 
     #[error("failed to parse response body: {0}")]
-    ResponseParse(#[from] serde_json::Error),
+    ResponseBodyParse(#[from] serde_json::Error),
+
+    #[error("failed to serialize request query parameters: {0}")]
+    QuerySerialize(#[from] serde_urlencoded::ser::Error),
+
+    #[error("invalid position quantity for symbol `{symbol}`: {source}")]
+    InvalidPositionQuantity {
+        symbol: String,
+        source: std::num::ParseFloatError,
+    },
+
+    #[error("at least one account number is required")]
+    MissingAccountNumbers,
 }

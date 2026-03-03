@@ -1,8 +1,19 @@
-use anyhow::{Context, Result, bail};
 use broker_robinhood::RobinhoodClient;
+use broker_robinhood::RobinhoodClientError;
 use console::{set_colors_enabled, style};
+use thiserror::Error;
 
 use crate::creds;
+
+type Result<T> = std::result::Result<T, StatusError>;
+
+#[derive(Debug, Error)]
+pub enum StatusError {
+    #[error(transparent)]
+    Credentials(#[from] creds::CredentialsError),
+    #[error(transparent)]
+    RobinhoodClient(#[from] RobinhoodClientError),
+}
 
 pub async fn run(username: Option<&str>) -> Result<()> {
     set_colors_enabled(true);
@@ -15,7 +26,7 @@ pub async fn run(username: Option<&str>) -> Result<()> {
         Err(error) => {
             print_check(false, "Authenticated");
             print_check(false, "Connection successful");
-            bail!("{error:#}");
+            return Err(StatusError::Credentials(error));
         }
     };
 
@@ -26,17 +37,14 @@ pub async fn run(username: Option<&str>) -> Result<()> {
         }
         Err(error) => {
             print_check(false, "Connection successful");
-            bail!("{error:#}");
+            Err(error)
         }
     }
 }
 
 async fn verify_connection(access_token: &str) -> Result<()> {
-    let client = RobinhoodClient::new().context("failed to initialize Robinhood client")?;
-    client
-        .fetch_accounts(access_token)
-        .await
-        .context("authenticated API call failed")?;
+    let client = RobinhoodClient::new()?;
+    client.fetch_accounts(access_token).await?;
     Ok(())
 }
 
