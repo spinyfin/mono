@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = { workspace = true }
 broker-robinhood = { path = "../../lib/rust/broker-robinhood" }
 clap = { workspace = true, features = ["derive"] }
+comfy-table = { workspace = true }
 console = { workspace = true }
 indicatif = { workspace = true }
 keyring = { workspace = true, features = ["apple-native"] }

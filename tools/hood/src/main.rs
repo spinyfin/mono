@@ -34,6 +34,8 @@ enum Command {
     Accounts(CommonFlags),
     /// Verify stored credentials and connectivity to Robinhood APIs.
     Status(CommonFlags),
+    /// List open positions for a Robinhood account.
+    Positions(CommonFlags),
 }
 
 #[tokio::main]
@@ -47,6 +49,9 @@ async fn main() -> Result<()> {
         }
         Command::Status(common) => {
             commands::status::run(common.username.as_deref(), &common.account).await?
+        }
+        Command::Positions(common) => {
+            commands::positions::run(common.username.as_deref(), &common.account).await?
         }
     }
 
@@ -89,6 +94,19 @@ mod tests {
                 assert_eq!(common.account, "12345678");
             }
             _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
+    fn positions_defaults_account_to_default_alias() {
+        let cli = Cli::parse_from(["hood", "positions"]);
+
+        match cli.command {
+            Command::Positions(common) => {
+                assert_eq!(common.account, "default");
+                assert_eq!(common.username, None);
+            }
+            _ => panic!("expected positions command"),
         }
     }
 }
