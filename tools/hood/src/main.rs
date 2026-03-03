@@ -1,7 +1,9 @@
+use std::io::{self, Write};
 use std::time::Duration;
 
 use broker_robinhood::{RobinhoodClient, WorkflowRoute, WorkflowScreen};
 use clap::{Parser, Subcommand};
+use rpassword::prompt_password;
 use tokio::time::sleep;
 
 #[derive(Debug, Parser)]
@@ -14,7 +16,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Authenticate with Robinhood and print the final OAuth token response.
-    Auth { username: String, password: String },
+    Auth,
 }
 
 #[tokio::main]
@@ -22,10 +24,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Auth { username, password } => auth(&username, &password).await?,
+        Command::Auth => {
+            let (username, password) = prompt_for_credentials()?;
+            auth(&username, &password).await?;
+        }
     }
 
     Ok(())
+}
+
+fn prompt_for_credentials() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let username = prompt_non_empty("Username: ")?;
+    let password = prompt_non_empty_password("Password: ")?;
+    Ok((username, password))
+}
+
+fn prompt_non_empty(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut input = String::new();
+    loop {
+        print!("{prompt}");
+        io::stdout().flush()?;
+
+        input.clear();
+        let bytes_read = io::stdin().read_line(&mut input)?;
+        if bytes_read == 0 {
+            return Err("stdin closed while reading username".into());
+        }
+
+        let value = input.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+
+        eprintln!("username cannot be empty");
+    }
+}
+
+fn prompt_non_empty_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    loop {
+        let password = prompt_password(prompt)?;
+        if !password.trim().is_empty() {
+            return Ok(password);
+        }
+
+        eprintln!("password cannot be empty");
+    }
 }
 
 async fn auth(username: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
