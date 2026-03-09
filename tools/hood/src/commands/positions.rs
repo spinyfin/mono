@@ -171,6 +171,9 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
         .collect::<HashSet<_>>()
         .len()
         > 1;
+    let total_equity = sum_optional_values(rows.iter().map(|row| row.equity));
+    let total_percentage_change = sum_optional_values(rows.iter().map(|row| row.percentage_change));
+    let total_todays_return = sum_optional_values(rows.iter().map(|row| row.todays_return));
     let quantity_values = rows
         .iter()
         .map(|row| format_quantity(row.quantity))
@@ -225,6 +228,30 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
         ]);
         table.add_row(row_cells);
     }
+
+    let mut total_row = Vec::new();
+    if show_account_column {
+        total_row.push(Cell::new(""));
+    }
+    total_row.extend([
+        Cell::new("Total").add_attribute(Attribute::Bold),
+        Cell::new("")
+            .fg(Color::White)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_optional_currency(total_equity))
+            .fg(Color::White)
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_optional_percentage(total_percentage_change))
+            .fg(color_for_change(total_percentage_change))
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_optional_signed_currency(total_todays_return))
+            .fg(color_for_change(total_todays_return))
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+    ]);
+    table.add_row(total_row);
 
     table.to_string()
 }
@@ -457,6 +484,18 @@ fn format_optional_raw_number(value: Option<f64>) -> String {
     value.map(|number| number.to_string()).unwrap_or_default()
 }
 
+fn sum_optional_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut has_value = false;
+
+    for value in values.flatten() {
+        total += value;
+        has_value = true;
+    }
+
+    has_value.then_some(total)
+}
+
 fn format_currency(value: f64) -> String {
     let sign = if value < 0.0 { "-" } else { "" };
     let absolute = value.abs();
@@ -595,6 +634,10 @@ mod tests {
         assert!(table.contains("-$30.00"));
         assert!(table.contains("V"));
         assert!(table.contains("1,500"));
+        assert!(table.contains("Total"));
+        assert!(table.contains("$450,000.12"));
+        assert!(table.contains("+1.30%"));
+        assert!(table.contains("+$90.45"));
     }
 
     #[test]
@@ -623,6 +666,10 @@ mod tests {
         assert!(table.contains("Account"));
         assert!(table.contains("116748102690"));
         assert!(table.contains("5QT29231"));
+        assert!(table.contains("Total"));
+        assert!(table.contains("$3,500.00"));
+        assert!(table.contains("+0.50%"));
+        assert!(table.contains("+$5.00"));
     }
 
     #[test]
