@@ -172,8 +172,9 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
         .len()
         > 1;
     let total_equity = sum_optional_values(rows.iter().map(|row| row.equity));
-    let total_percentage_change = sum_optional_values(rows.iter().map(|row| row.percentage_change));
     let total_todays_return = sum_optional_values(rows.iter().map(|row| row.todays_return));
+    let total_percentage_change =
+        calculate_total_percentage_change(total_equity, total_todays_return);
     let quantity_values = rows
         .iter()
         .map(|row| format_quantity(row.quantity))
@@ -496,6 +497,23 @@ fn sum_optional_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64>
     has_value.then_some(total)
 }
 
+fn calculate_total_percentage_change(
+    total_equity: Option<f64>,
+    total_todays_return: Option<f64>,
+) -> Option<f64> {
+    let (Some(total_equity), Some(total_todays_return)) = (total_equity, total_todays_return)
+    else {
+        return None;
+    };
+
+    let previous_close_equity = total_equity - total_todays_return;
+    if previous_close_equity.abs() <= f64::EPSILON {
+        return None;
+    }
+
+    Some((total_todays_return / previous_close_equity) * 100.0)
+}
+
 fn format_currency(value: f64) -> String {
     let sign = if value < 0.0 { "-" } else { "" };
     let absolute = value.abs();
@@ -552,8 +570,9 @@ mod tests {
 
     use super::{
         PositionRow, QuoteSnapshot, align_decimal_column, calculate_position_metrics,
-        format_currency, format_percentage_change, format_quantity, format_signed_currency,
-        render_positions_csv, render_positions_table, select_accounts,
+        calculate_total_percentage_change, format_currency, format_percentage_change,
+        format_quantity, format_signed_currency, render_positions_csv, render_positions_table,
+        select_accounts,
     };
 
     #[test]
@@ -597,6 +616,14 @@ mod tests {
     }
 
     #[test]
+    fn calculate_total_percentage_change_uses_total_return_and_previous_close_equity() {
+        let total_percentage_change =
+            calculate_total_percentage_change(Some(3_500.0), Some(5.0)).expect("has totals");
+
+        assert!((total_percentage_change - 0.1430615164520744).abs() < 1e-12);
+    }
+
+    #[test]
     fn render_positions_table_hides_account_for_single_account() {
         let rows = vec![
             PositionRow {
@@ -636,7 +663,7 @@ mod tests {
         assert!(table.contains("1,500"));
         assert!(table.contains("Total"));
         assert!(table.contains("$450,000.12"));
-        assert!(table.contains("+1.30%"));
+        assert!(table.contains("+0.02%"));
         assert!(table.contains("+$90.45"));
     }
 
@@ -668,7 +695,7 @@ mod tests {
         assert!(table.contains("5QT29231"));
         assert!(table.contains("Total"));
         assert!(table.contains("$3,500.00"));
-        assert!(table.contains("+0.50%"));
+        assert!(table.contains("+0.14%"));
         assert!(table.contains("+$5.00"));
     }
 
