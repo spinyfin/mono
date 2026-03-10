@@ -78,13 +78,16 @@ async fn main() -> Result<()> {
     let file_writer = match open_log_file(&log_path) {
         Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(err) => {
-            eprintln!("boss-engine: could not enable file logging at {}: {err}", log_path.display());
+            eprintln!(
+                "boss-engine: could not enable file logging at {}: {err}",
+                log_path.display()
+            );
             None
         }
     };
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,acp_stderr=debug"));
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,acp_stderr=debug"));
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)

@@ -10,6 +10,7 @@ rust_library(
         "src/cli.rs",
         "src/config.rs",
         "src/lib.rs",
+        "src/work.rs",
     ],
     crate_root = "src/lib.rs",
     edition = "2024",
