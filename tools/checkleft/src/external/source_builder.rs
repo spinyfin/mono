@@ -13,7 +13,7 @@ use crate::path::validate_relative_path;
 use super::{ExternalCheckArtifactPackage, ExternalCheckPackage, ExternalCheckSourcePackage};
 
 const SOURCE_MODE_CACHE_ROOT: &str = ".checkleft-cache/external-checks/source-mode";
-const JS_COMPONENTIZER_TOOLCHAIN_DIR: &str = "tools/checks_js_componentizer";
+const JS_COMPONENTIZER_TOOLCHAIN_DIR: &str = "tools/checkleft/checks_js_componentizer";
 const JS_COMPONENTIZER_LOCKFILE: &str = "pnpm-lock.yaml";
 const JS_COMPONENTIZER_BUILD_SCRIPT: &str = "scripts/build_check.mjs";
 const JS_COMPONENTIZER_BOOTSTRAP_ROOT: &str = ".checkleft-cache/js-componentizer/bootstrap";
@@ -355,15 +355,15 @@ mod tests {
 
     fn make_source_package(root: &Path) -> ExternalCheckPackage {
         std::fs::create_dir_all(root.join("checks/js")).expect("mkdir");
-        std::fs::create_dir_all(root.join("tools/checks_js_componentizer/scripts"))
+        std::fs::create_dir_all(root.join("tools/checkleft/checks_js_componentizer/scripts"))
             .expect("mkdir scripts");
         std::fs::write(
-            root.join("tools/checks_js_componentizer/pnpm-lock.yaml"),
+            root.join("tools/checkleft/checks_js_componentizer/pnpm-lock.yaml"),
             "lockfileVersion: '9.0'\n",
         )
         .expect("lock");
         std::fs::write(
-            root.join("tools/checks_js_componentizer/scripts/build_check.mjs"),
+            root.join("tools/checkleft/checks_js_componentizer/scripts/build_check.mjs"),
             "// test stub\n",
         )
         .expect("script");
