@@ -19,6 +19,7 @@ task-oriented operations:
 - create and mutate stacked changes,
 - rebase a stack or subtree onto updated `main`,
 - sync commits to GitHub PRs,
+- merge stacked PRs without exposing forge-specific branch lifecycle hazards,
 - report enough underlying state that an agent can fall back to `jj`, `git`,
   `gh`, `bazel`, or repo-local tools directly when needed.
 
@@ -34,6 +35,8 @@ remote synchronization and GitHub PR integration.
 - Model stacked commits as a first-class concept, including forked stacks.
 - Make the common agent operations simple and deterministic.
 - Preserve compatibility with GitHub PR workflows.
+- Hide forge-specific stacked-PR edge cases such as base-branch retargeting
+  during merges.
 - Reuse workspaces long enough to benefit incremental build systems such as
   Bazel.
 
@@ -106,9 +109,12 @@ A change node corresponds to one logical commit in a stack. Cube stores:
 - underlying `jj` change id and commit id,
 - parent change ids,
 - branch/bookmark name for Git export,
+- preferred review base change and current remote base branch,
 - PR number/url if one exists,
 - title/body metadata,
 - sync status,
+- whether the exported branch is pinned because another open PR still targets
+  it as a base,
 - whether the node is the root of a task, a child, or one branch of a fork.
 
 The change graph is a DAG, not only a linear stack. That allows one parent to
@@ -250,10 +256,28 @@ Behavior:
 - Create the PR if one does not exist.
 - Update an existing PR if the branch already maps to one.
 - Recompute parent/child PR relationships for stacks.
+- Refresh existing PR state from GitHub before changing bases or deleting
+  branches.
 
-For a linear stack, the default PR base is the previous exported change. For a
-fork, each child PR bases on its direct parent change. This makes the PR graph
-mirror the local change graph.
+For a linear stack, Cube should prefer the previous exported change as the
+review base. For a fork, each child PR should prefer its direct parent change.
+This keeps the review graph close to the local change graph, but the local
+graph remains the source of truth. GitHub base branches are transport state
+that Cube may retarget as ancestors merge.
+
+That distinction matters for stacked merges. If PR `#35` merges and its branch
+is deleted while descendant PR `#37` still targets that branch, GitHub may
+auto-close `#37` even though the descendant change is still valid. Cube should
+prevent that class of failure by enforcing these invariants:
+
+- never delete an exported branch while an open descendant PR still targets it
+  as a base,
+- retarget descendants onto the nearest surviving ancestor branch or `main`
+  before branch cleanup,
+- keep branch-retention state in local metadata so recovery does not depend on
+  branch names alone,
+- treat reopened or retargeted PRs as a normal sync outcome, not a manual
+  repair path.
 
 Cube should emit structured output such as:
 
@@ -270,7 +294,29 @@ Cube should emit structured output such as:
 }
 ```
 
-### 6. Status and Recovery
+### 6. PR Merge
+
+```text
+cube pr merge --change <change-id>
+cube pr merge --stack <root-change-id>
+```
+
+Behavior:
+
+- Merge one PR or a whole ready sub-stack in dependency order.
+- After each merge, refresh GitHub state before touching descendant PRs.
+- Retarget open descendants off the merged branch before deleting or unpinning
+  that branch.
+- Re-export or reopen descendants automatically if an external branch deletion
+  closed them unexpectedly.
+- Rebase or restack remaining local descendants when the merge advances
+  `main`.
+
+This command exists to hide GitHub's stacked-PR lifecycle quirks from agents.
+The safe merge sequence should be owned by Cube rather than hand-written into
+agent prompts.
+
+### 7. Status and Recovery
 
 ```text
 cube workspace status --workspace <path>
@@ -455,7 +501,12 @@ PR synchronization rules:
 - If the parent change changes, update the PR base branch when the forge allows
   it.
 - If a node is closed or merged, mark its local metadata accordingly.
-- If the stack forks, each child PR targets its direct parent branch.
+- If the stack forks, each child PR prefers its direct parent change as the
+  review base.
+- An exported branch stays pinned while any open descendant PR still targets it
+  as its current remote base.
+- Branch deletion happens only after descendants are retargeted to a surviving
+  base branch.
 
 This model allows a stack to be reviewed incrementally while preserving the
 graph structure that agents used locally.
@@ -504,6 +555,21 @@ manual repair instead of guessing.
 A PR is retargeted or closed manually on GitHub. The next `cube pr sync` should
 refresh remote state and either adopt the change or surface a repair action.
 
+### Deleted Base Branch
+
+An ancestor PR merges, its branch is deleted, and a descendant PR still targets
+that deleted branch as its base. GitHub may auto-close the descendant PR even
+though the local `jj` change graph is still healthy.
+
+Cube should treat this as a first-class recovery case:
+
+- detect descendants whose current base branch is about to disappear,
+- retarget them before branch deletion whenever Cube controls the merge flow,
+- if an external actor already deleted the branch, recreate the exported branch
+  or reopen the descendant PR as needed,
+- restack local descendants onto updated `main` or their new surviving parent
+  after the remote repair.
+
 ## Implementation Sketch
 
 Suggested phases:
@@ -512,8 +578,9 @@ Suggested phases:
 2. Setup/provisioning engine and per-workspace setup fingerprints.
 3. Local change metadata on top of `jj`.
 4. PR sync to GitHub for linear stacks.
-5. Forked change graphs and subtree rebases.
-6. Recovery commands and higher-quality status reporting.
+5. Safe stacked-PR merge and retarget orchestration.
+6. Forked change graphs and subtree rebases.
+7. Recovery commands and higher-quality status reporting.
 
 Likely implementation language:
 
@@ -536,8 +603,8 @@ before implementation starts:
 4. Do we want the change metadata to live purely in Cube's local database, or
    should some mapping also be encoded into `jj` bookmarks/commit metadata for
    easier recovery?
-5. For stacked PRs, do we want every child PR to target its direct parent by
-   default, or should Cube support a repo-level policy for always targeting
-   `main` and using labels/body metadata to express dependencies?
+5. For stacked PRs, how much review-base policy should be configurable beyond
+   Cube's safety invariant that descendants must be retargeted before their
+   current base branch is deleted?
 6. Which setup-step inputs should Cube fingerprint automatically, and which
    should the repo configuration declare explicitly?
