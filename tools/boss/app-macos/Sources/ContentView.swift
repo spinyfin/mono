@@ -15,6 +15,54 @@ struct ContentView: View {
         .task {
             model.startIfNeeded()
         }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Picker("Mode", selection: Binding(
+                    get: { model.navigationMode },
+                    set: { model.setNavigationMode($0) }
+                )) {
+                    ForEach(NavigationMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 170)
+            }
+
+            ToolbarItem {
+                if model.navigationMode == .agents {
+                    Button {
+                        model.createAgent()
+                    } label: {
+                        Label("New Agent", systemImage: "plus")
+                    }
+                } else {
+                    Menu {
+                        Button("New Product") {
+                            model.presentCreateProduct()
+                        }
+                        .disabled(!model.isConnected)
+
+                        Button("New Project") {
+                            model.presentCreateProject()
+                        }
+                        .disabled(model.selectedProduct == nil || !model.isConnected)
+
+                        Button("New Task") {
+                            model.presentCreateTask()
+                        }
+                        .disabled(model.selectedProject == nil || !model.isConnected)
+
+                        Button("New Chore") {
+                            model.presentCreateChore()
+                        }
+                        .disabled(model.selectedProduct == nil || !model.isConnected)
+                    } label: {
+                        Label("New", systemImage: "plus")
+                    }
+                }
+            }
+        }
         .alert(item: $model.pendingPermission) { request in
             Alert(
                 title: Text("Permission Request"),
@@ -27,9 +75,63 @@ struct ContentView: View {
                 }
             )
         }
+        .alert(
+            "Work Error",
+            isPresented: Binding(
+                get: { model.workErrorMessage != nil },
+                set: { newValue in
+                    if !newValue {
+                        model.workErrorMessage = nil
+                    }
+                }
+            ),
+            actions: {
+                Button("OK", role: .cancel) {}
+            },
+            message: {
+                Text(model.workErrorMessage ?? "")
+            }
+        )
+        .sheet(item: $model.pendingWorkCreateRequest) { request in
+            WorkCreateSheet(
+                request: request,
+                onCancel: { model.dismissWorkCreateRequest() },
+                onCreate: { name, description, repoRemoteURL, goal in
+                    model.submitWorkCreateRequest(
+                        request,
+                        name: name,
+                        description: description,
+                        repoRemoteURL: repoRemoteURL,
+                        goal: goal
+                    )
+                }
+            )
+        }
     }
 
     private var sidebar: some View {
+        Group {
+            if model.navigationMode == .agents {
+                agentSidebar
+            } else {
+                workSidebar
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
+    }
+
+    private var detail: some View {
+        Group {
+            if model.navigationMode == .agents {
+                agentDetail
+            } else {
+                workDetail
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var agentSidebar: some View {
         List(model.agents, selection: $model.selectedAgentID) { agent in
             HStack {
                 Image(systemName: "person.circle")
@@ -69,15 +171,167 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
     }
 
-    private var detail: some View {
+    private var workSidebar: some View {
+        List(selection: Binding(
+            get: { model.selectedWorkNodeID },
+            set: { model.selectWorkNode($0) }
+        )) {
+            ForEach(model.workSidebarRows) { row in
+                HStack(spacing: 8) {
+                    Color.clear
+                        .frame(width: CGFloat(row.depth * 14), height: 1)
+                    Image(systemName: row.systemImage)
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(row.title)
+                            .font(.body)
+                        if let subtitle = row.subtitle {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .tag(row.id)
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Button {
+                    model.refreshWork()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                if !model.isConnected {
+                    Label("Disconnected", systemImage: "circle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var agentDetail: some View {
         VStack(spacing: 0) {
             messageList
             composer
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var workDetail: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let product = model.selectedProduct, model.selectedProject == nil, model.selectedTask == nil {
+                    workSectionHeader(
+                        title: product.name,
+                        subtitle: "Product",
+                        actions: [
+                            ("New Project", model.presentCreateProject),
+                            ("New Chore", model.presentCreateChore),
+                        ]
+                    )
+                    if !product.description.isEmpty {
+                        Text(product.description)
+                    }
+                    workMetadataRow("Status", value: product.status.capitalized)
+                    workMetadataRow("Remote", value: product.repoRemoteURL ?? "Not set")
+                    workMetadataRow(
+                        "Projects",
+                        value: "\(model.projectsByProductID[product.id]?.count ?? 0)"
+                    )
+                    workMetadataRow(
+                        "Chores",
+                        value: "\(model.choresByProductID[product.id]?.count ?? 0)"
+                    )
+                } else if let project = model.selectedProject {
+                    workSectionHeader(
+                        title: project.name,
+                        subtitle: "Project",
+                        actions: [("New Task", model.presentCreateTask)]
+                    )
+                    if !project.description.isEmpty {
+                        Text(project.description)
+                    }
+                    workMetadataRow("Status", value: project.status.capitalized)
+                    workMetadataRow("Priority", value: project.priority.capitalized)
+                    workMetadataRow("Goal", value: project.goal.isEmpty ? "Not set" : project.goal)
+                    let tasks = model.tasksByProjectID[project.id] ?? []
+                    if !tasks.isEmpty {
+                        Divider()
+                        Text("Phases")
+                            .font(.headline)
+                        ForEach(
+                            tasks.sorted { lhs, rhs in
+                                switch (lhs.ordinal, rhs.ordinal) {
+                                case let (left?, right?) where left != right:
+                                    return left < right
+                                default:
+                                    if lhs.createdAt == rhs.createdAt {
+                                        return lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+                                            == .orderedAscending
+                                    }
+                                    return lhs.createdAt < rhs.createdAt
+                                }
+                            }
+                        ) { task in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(task.name)
+                                    .font(.body.weight(.medium))
+                                Text(task.status.capitalized)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4)
+                        }
+                    }
+                } else if let task = model.selectedTask {
+                    workSectionHeader(
+                        title: task.name,
+                        subtitle: task.isChore ? "Chore" : "Task",
+                        actions: []
+                    )
+                    if !task.description.isEmpty {
+                        Text(task.description)
+                    }
+                    workMetadataRow("Status", value: task.status.capitalized)
+                    if let ordinal = task.ordinal, !task.isChore {
+                        workMetadataRow("Phase", value: "\(ordinal)")
+                    }
+                    workMetadataRow("PR", value: task.prURL ?? "Not set")
+                } else if model.products.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("No work items yet")
+                            .font(.title2.weight(.semibold))
+                        Text("Create a product to start organizing projects, phases, and chores.")
+                            .foregroundStyle(.secondary)
+                        Button("New Product") {
+                            model.presentCreateProduct()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(24)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Select a work item")
+                            .font(.title3.weight(.semibold))
+                        Text("Choose a product, project, phase, or chore from the sidebar.")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(24)
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private var messageList: some View {
@@ -109,11 +363,18 @@ struct ContentView: View {
 
     private var composer: some View {
         let isDraftEmpty = model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let canSend = model.selectedAgentID != nil && !isDraftEmpty && !model.isSelectedAgentSending && model.isSelectedAgentReady
+        let canSend =
+            model.selectedAgentID != nil && !isDraftEmpty && !model.isSelectedAgentSending
+            && model.isSelectedAgentReady
 
         return VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
-                ComposerTextView(text: $model.draft, placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…", autoFocus: true, focusTrigger: model.selectedAgentID) {
+                ComposerTextView(
+                    text: $model.draft,
+                    placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…",
+                    autoFocus: true,
+                    focusTrigger: model.selectedAgentID
+                ) {
                     model.sendDraft()
                 }
                 .frame(height: 36)
@@ -156,6 +417,96 @@ struct ContentView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 8)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func workSectionHeader(
+        title: String,
+        subtitle: String,
+        actions: [(String, () -> Void)]
+    ) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            HStack {
+                ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                    Button(action.0, action: action.1)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func workMetadataRow(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.body)
+        }
+    }
+}
+
+private struct WorkCreateSheet: View {
+    let request: WorkCreateRequest
+    let onCancel: () -> Void
+    let onCreate: (String, String, String, String) -> Void
+
+    @State private var name = ""
+    @State private var description = ""
+    @State private var repoRemoteURL = ""
+    @State private var goal = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title)
+                .font(.title3.weight(.semibold))
+
+            TextField("Name", text: $name)
+
+            switch request.kind {
+            case .product:
+                TextField("Description", text: $description)
+                TextField("Remote URL", text: $repoRemoteURL)
+            case .project:
+                TextField("Description", text: $description)
+                TextField("Goal", text: $goal)
+            case .task, .chore:
+                TextField("Description", text: $description)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Create") {
+                    onCreate(name, description, repoRemoteURL, goal)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+
+    private var title: String {
+        switch request.kind {
+        case .product:
+            return "New Product"
+        case .project:
+            return "New Project"
+        case .task:
+            return "New Task"
+        case .chore:
+            return "New Chore"
         }
     }
 }
