@@ -10,6 +10,7 @@ pub struct RuntimeConfig {
     pub acp_command: String,
     pub acp_args: Vec<String>,
     pub cwd: PathBuf,
+    pub db_path: PathBuf,
 }
 
 impl RuntimeConfig {
@@ -27,12 +28,17 @@ impl RuntimeConfig {
         };
 
         let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+        let db_path = match std::env::var_os("BOSS_DB_PATH") {
+            Some(path) => PathBuf::from(path),
+            None => default_db_path()?,
+        };
 
         Ok(Self {
             anthropic_api_key,
             acp_command: acp_command.clone(),
             acp_args: acp_args.to_vec(),
             cwd,
+            db_path,
         })
     }
 
@@ -54,4 +60,12 @@ impl RuntimeConfig {
 
         Ok(())
     }
+}
+
+fn default_db_path() -> Result<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        bail!("HOME must be set to derive the default Boss database path");
+    };
+
+    Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
 }

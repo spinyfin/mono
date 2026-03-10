@@ -13,6 +13,10 @@ use tokio::sync::{Mutex, mpsc};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
+use crate::work::{
+    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
+    Task, WorkDb, WorkItem, WorkItemPatch,
+};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
@@ -39,6 +43,40 @@ impl Drop for PidFileGuard {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum FrontendRequest {
+    CreateProduct {
+        #[serde(flatten)]
+        input: CreateProductInput,
+    },
+    ListProducts,
+    ListProjects {
+        product_id: String,
+    },
+    CreateProject {
+        #[serde(flatten)]
+        input: CreateProjectInput,
+    },
+    CreateTask {
+        #[serde(flatten)]
+        input: CreateTaskInput,
+    },
+    CreateChore {
+        #[serde(flatten)]
+        input: CreateChoreInput,
+    },
+    UpdateWorkItem {
+        id: String,
+        patch: WorkItemPatch,
+    },
+    DeleteWorkItem {
+        id: String,
+    },
+    GetWorkTree {
+        product_id: String,
+    },
+    ReorderProjectTasks {
+        project_id: String,
+        task_ids: Vec<String>,
+    },
     CreateAgent {
         name: Option<String>,
     },
@@ -60,6 +98,35 @@ enum FrontendRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum FrontendEvent {
+    ProductsList {
+        products: Vec<Product>,
+    },
+    ProjectsList {
+        product_id: String,
+        projects: Vec<Project>,
+    },
+    WorkTree {
+        product: Product,
+        projects: Vec<Project>,
+        tasks: Vec<Task>,
+        chores: Vec<Task>,
+    },
+    WorkItemCreated {
+        item: WorkItem,
+    },
+    WorkItemUpdated {
+        item: WorkItem,
+    },
+    ProjectTasksReordered {
+        project_id: String,
+        task_ids: Vec<String>,
+    },
+    WorkItemDeleted {
+        id: String,
+    },
+    WorkError {
+        message: String,
+    },
     AgentCreated {
         agent_id: String,
         name: String,
@@ -145,11 +212,9 @@ impl AgentRegistry {
     }
 
     fn allocate_agent(&self, name: Option<String>) -> (String, String) {
-        let id = format!(
-            "agent-{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        );
-        let name = name.unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id)));
+        let id = format!("agent-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let name =
+            name.unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id)));
         (id, name)
     }
 
@@ -193,7 +258,10 @@ impl AgentRegistry {
             .collect()
     }
 
-    async fn get_acp_and_session(&self, agent_id: &str) -> Result<(Arc<AcpClient>, String, Arc<Mutex<()>>)> {
+    async fn get_acp_and_session(
+        &self,
+        agent_id: &str,
+    ) -> Result<(Arc<AcpClient>, String, Arc<Mutex<()>>)> {
         let agents = self.agents.lock().await;
         let agent = agents
             .get(agent_id)
@@ -213,6 +281,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         acp_command = %cfg.acp_command,
         acp_args = ?cfg.acp_args,
         cwd = %cfg.cwd.display(),
+        db_path = %cfg.db_path.display(),
         "starting boss-engine runtime",
     );
 
@@ -257,6 +326,7 @@ async fn run_cli(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 }
 
 async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
+    let work_db = Arc::new(WorkDb::open(cfg.db_path.clone())?);
     let socket_path = cli
         .socket_path
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
@@ -286,13 +356,17 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
-        if let Err(err) = handle_frontend_connection(stream, cfg).await {
+        if let Err(err) = handle_frontend_connection(stream, cfg, work_db.clone()).await {
             tracing::error!(?err, "frontend connection failed");
         }
     }
 }
 
-async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> Result<()> {
+async fn handle_frontend_connection(
+    stream: UnixStream,
+    cfg: &RuntimeConfig,
+    work_db: Arc<WorkDb>,
+) -> Result<()> {
     tracing::info!("frontend connected");
 
     let registry = Arc::new(AgentRegistry::new(cfg.clone()));
@@ -343,6 +417,133 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
         };
 
         match request {
+            FrontendRequest::CreateProduct { input } => match work_db.create_product(input) {
+                Ok(product) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
+                        item: WorkItem::Product(product),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::ListProducts => match work_db.list_products() {
+                Ok(products) => {
+                    let _ = event_tx.send(FrontendEvent::ProductsList { products });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::ListProjects { product_id } => {
+                match work_db.list_projects(&product_id) {
+                    Ok(projects) => {
+                        let _ = event_tx.send(FrontendEvent::ProjectsList {
+                            product_id,
+                            projects,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
+                Ok(project) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
+                        item: WorkItem::Project(project),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::CreateTask { input } => match work_db.create_task(input) {
+                Ok(task) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
+                        item: WorkItem::Task(task),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::CreateChore { input } => match work_db.create_chore(input) {
+                Ok(task) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
+                        item: WorkItem::Chore(task),
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::UpdateWorkItem { id, patch } => {
+                match work_db.update_work_item(&id, patch) {
+                    Ok(item) => {
+                        let _ = event_tx.send(FrontendEvent::WorkItemUpdated { item });
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FrontendRequest::DeleteWorkItem { id } => match work_db.delete_work_item(&id) {
+                Ok(()) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemDeleted { id });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::GetWorkTree { product_id } => match work_db.get_work_tree(&product_id)
+            {
+                Ok(tree) => {
+                    let _ = event_tx.send(FrontendEvent::WorkTree {
+                        product: tree.product,
+                        projects: tree.projects,
+                        tasks: tree.tasks,
+                        chores: tree.chores,
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::ReorderProjectTasks {
+                project_id,
+                task_ids,
+            } => match work_db.reorder_project_tasks(&project_id, &task_ids) {
+                Ok(()) => {
+                    let _ = event_tx.send(FrontendEvent::ProjectTasksReordered {
+                        project_id,
+                        task_ids,
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
             FrontendRequest::CreateAgent { name } => {
                 let (agent_id, agent_name) = registry.allocate_agent(name);
                 let _ = event_tx.send(FrontendEvent::AgentCreated {
@@ -355,9 +556,7 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
                 tokio::spawn(async move {
                     match registry.initialize_agent(&agent_id, &agent_name).await {
                         Ok(()) => {
-                            let _ = event_tx.send(FrontendEvent::AgentReady {
-                                agent_id,
-                            });
+                            let _ = event_tx.send(FrontendEvent::AgentReady { agent_id });
                         }
                         Err(err) => {
                             tracing::error!(?err, agent_id = %agent_id, "failed to initialize agent");
@@ -394,16 +593,17 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
                     "received prompt from frontend"
                 );
 
-                let (acp, session_id, prompt_lock) = match registry.get_acp_and_session(&agent_id).await {
-                    Ok(tuple) => tuple,
-                    Err(err) => {
-                        let _ = event_tx.send(FrontendEvent::Error {
-                            agent_id: Some(agent_id),
-                            message: err.to_string(),
-                        });
-                        continue;
-                    }
-                };
+                let (acp, session_id, prompt_lock) =
+                    match registry.get_acp_and_session(&agent_id).await {
+                        Ok(tuple) => tuple,
+                        Err(err) => {
+                            let _ = event_tx.send(FrontendEvent::Error {
+                                agent_id: Some(agent_id),
+                                message: err.to_string(),
+                            });
+                            continue;
+                        }
+                    };
 
                 let event_tx = event_tx.clone();
                 let agent_id_owned = agent_id.clone();
@@ -513,7 +713,11 @@ async fn handle_frontend_connection(stream: UnixStream, cfg: &RuntimeConfig) -> 
                     }
                 });
             }
-            FrontendRequest::PermissionResponse { agent_id, id, granted } => {
+            FrontendRequest::PermissionResponse {
+                agent_id,
+                id,
+                granted,
+            } => {
                 tracing::info!(
                     agent_id = %agent_id,
                     permission_id = %id,
