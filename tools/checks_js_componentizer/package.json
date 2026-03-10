@@ -1,0 +1,12 @@
+{
+  "name": "checkleft-js-componentizer",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@8.11.0",
+  "description": "Pinned JS source-mode toolchain for checkleft external checks.",
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.18.3",
+    "@bytecodealliance/jco": "1.15.0",
+    "esbuild": "0.25.0"
+  }
+}

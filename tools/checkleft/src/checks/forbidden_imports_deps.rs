@@ -1,0 +1,259 @@
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
+use serde::Deserialize;
+
+use crate::check::Check;
+use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::output::{CheckResult, Finding, Location, Severity};
+
+#[derive(Debug, Default)]
+pub struct ForbiddenImportsDepsCheck;
+
+#[async_trait]
+impl Check for ForbiddenImportsDepsCheck {
+    fn id(&self) -> &str {
+        "forbidden-imports-deps"
+    }
+
+    fn description(&self) -> &str {
+        "flags changed files containing forbidden dependency/import patterns"
+    }
+
+    async fn run(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        config: &toml::Value,
+    ) -> Result<CheckResult> {
+        let compiled = parse_config(config)?;
+        let mut findings = Vec::new();
+
+        for changed_file in &changeset.changed_files {
+            if matches!(changed_file.kind, ChangeKind::Deleted) {
+                continue;
+            }
+
+            let Ok(contents) = tree.read_file(&changed_file.path) else {
+                continue;
+            };
+            let Ok(contents) = String::from_utf8(contents) else {
+                continue;
+            };
+
+            for (line_index, line) in contents.lines().enumerate() {
+                for rule in &compiled.rules {
+                    if !rule.applies_to(&changed_file.path) {
+                        continue;
+                    }
+                    if !rule.pattern.is_match(line) {
+                        continue;
+                    }
+
+                    findings.push(Finding {
+                        severity: rule.severity,
+                        message: rule.message.clone(),
+                        location: Some(Location {
+                            path: changed_file.path.clone(),
+                            line: Some((line_index + 1) as u32),
+                            column: Some(1),
+                        }),
+                        remediation: Some(rule.remediation.clone()),
+                        suggested_fix: None,
+                    });
+                }
+            }
+        }
+
+        Ok(CheckResult {
+            check_id: self.id().to_owned(),
+            findings,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ForbiddenImportsDepsConfig {
+    #[serde(default)]
+    rules: Vec<ForbiddenImportsDepsRuleConfig>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    remediation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForbiddenImportsDepsRuleConfig {
+    pattern: String,
+    message: String,
+    #[serde(default)]
+    include_globs: Vec<String>,
+    #[serde(default)]
+    exclude_globs: Vec<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    remediation: Option<String>,
+}
+
+struct CompiledForbiddenImportsDepsConfig {
+    rules: Vec<CompiledRule>,
+}
+
+struct CompiledRule {
+    pattern: Regex,
+    include_globs: Option<GlobSet>,
+    exclude_globs: Option<GlobSet>,
+    message: String,
+    remediation: String,
+    severity: Severity,
+}
+
+impl CompiledRule {
+    fn applies_to(&self, path: &std::path::Path) -> bool {
+        if let Some(exclude_globs) = &self.exclude_globs {
+            if exclude_globs.is_match(path) {
+                return false;
+            }
+        }
+        if let Some(include_globs) = &self.include_globs {
+            return include_globs.is_match(path);
+        }
+        true
+    }
+}
+
+fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenImportsDepsConfig> {
+    let parsed: ForbiddenImportsDepsConfig = config
+        .clone()
+        .try_into()
+        .context("invalid forbidden-imports-deps config")?;
+    if parsed.rules.is_empty() {
+        bail!("forbidden-imports-deps config must contain at least one `rules` entry");
+    }
+
+    let default_severity =
+        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_remediation = parsed.remediation.unwrap_or_else(|| {
+        "Replace the forbidden import/dependency usage with approved project patterns.".to_owned()
+    });
+
+    let mut rules = Vec::with_capacity(parsed.rules.len());
+    for rule in parsed.rules {
+        let pattern = Regex::new(&rule.pattern)
+            .with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
+        rules.push(CompiledRule {
+            pattern,
+            include_globs: compile_globs("include_globs", &rule.include_globs)?,
+            exclude_globs: compile_globs("exclude_globs", &rule.exclude_globs)?,
+            message: rule.message,
+            remediation: rule
+                .remediation
+                .unwrap_or_else(|| default_remediation.clone()),
+            severity: Severity::parse_with_default(rule.severity.as_deref(), default_severity),
+        });
+    }
+
+    Ok(CompiledForbiddenImportsDepsConfig { rules })
+}
+
+fn compile_globs(field_name: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern)
+            .with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
+        builder.add(glob);
+    }
+    let globset = builder
+        .build()
+        .with_context(|| format!("failed to compile `{field_name}` globs"))?;
+    Ok(Some(globset))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use crate::check::Check;
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile};
+    use crate::source_tree::LocalSourceTree;
+
+    use super::ForbiddenImportsDepsCheck;
+
+    #[tokio::test]
+    async fn flags_forbidden_pattern_in_included_file() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("frontend/src/components")).expect("create dirs");
+        fs::write(
+            temp.path().join("frontend/src/components/Foo.tsx"),
+            "const x = fetch(url(\"/api/v2/statusz\"));\n",
+        )
+        .expect("write source");
+
+        let check = ForbiddenImportsDepsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/src/components/Foo.tsx").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{
+                        pattern = "\\bfetch\\(url\\(",
+                        message = "Use frontend api/* modules for backend calls.",
+                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        exclude_globs = ["frontend/src/api/**"]
+                    }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ignores_excluded_paths() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("frontend/src/api")).expect("create dirs");
+        fs::write(
+            temp.path().join("frontend/src/api/http.ts"),
+            "const x = fetch(url(\"/api/v2/statusz\"));\n",
+        )
+        .expect("write source");
+
+        let check = ForbiddenImportsDepsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/src/api/http.ts").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{
+                        pattern = "\\bfetch\\(url\\(",
+                        message = "Use frontend api/* modules for backend calls.",
+                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        exclude_globs = ["frontend/src/api/**"]
+                    }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+}
