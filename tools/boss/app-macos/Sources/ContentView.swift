@@ -107,6 +107,24 @@ struct ContentView: View {
                 }
             )
         }
+        .sheet(item: $model.pendingWorkEditRequest) { request in
+            WorkEditSheet(
+                request: request,
+                onCancel: { model.dismissWorkEditRequest() },
+                onSave: { name, description, status, repoRemoteURL, goal, priority, prURL in
+                    model.submitWorkEditRequest(
+                        request,
+                        name: name,
+                        description: description,
+                        status: status,
+                        repoRemoteURL: repoRemoteURL,
+                        goal: goal,
+                        priority: priority,
+                        prURL: prURL
+                    )
+                }
+            )
+        }
     }
 
     private var sidebar: some View {
@@ -193,11 +211,16 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    Spacer(minLength: 8)
+                    if let status = row.statusBadge {
+                        WorkStatusBadge(text: status)
+                    }
                 }
                 .tag(row.id)
             }
         }
         .listStyle(.sidebar)
+        .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter work")
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
@@ -233,6 +256,7 @@ struct ContentView: View {
                         title: product.name,
                         subtitle: "Product",
                         actions: [
+                            ("Edit", model.presentEditSelectedWorkItem),
                             ("New Project", model.presentCreateProject),
                             ("New Chore", model.presentCreateChore),
                         ]
@@ -254,7 +278,10 @@ struct ContentView: View {
                     workSectionHeader(
                         title: project.name,
                         subtitle: "Project",
-                        actions: [("New Task", model.presentCreateTask)]
+                        actions: [
+                            ("Edit", model.presentEditSelectedWorkItem),
+                            ("New Task", model.presentCreateTask),
+                        ]
                     )
                     if !project.description.isEmpty {
                         Text(project.description)
@@ -296,7 +323,7 @@ struct ContentView: View {
                     workSectionHeader(
                         title: task.name,
                         subtitle: task.isChore ? "Chore" : "Task",
-                        actions: []
+                        actions: [("Edit", model.presentEditSelectedWorkItem)]
                     )
                     if !task.description.isEmpty {
                         Text(task.description)
@@ -306,6 +333,19 @@ struct ContentView: View {
                         workMetadataRow("Phase", value: "\(ordinal)")
                     }
                     workMetadataRow("PR", value: task.prURL ?? "Not set")
+                    HStack {
+                        if !task.isChore {
+                            Button("Move Up") {
+                                model.moveSelectedTask(offset: -1)
+                            }
+                            Button("Move Down") {
+                                model.moveSelectedTask(offset: 1)
+                            }
+                        }
+                        Button("Delete", role: .destructive) {
+                            model.deleteSelectedWorkItem()
+                        }
+                    }
                 } else if model.products.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("No work items yet")
@@ -508,6 +548,135 @@ private struct WorkCreateSheet: View {
         case .chore:
             return "New Chore"
         }
+    }
+}
+
+private struct WorkEditSheet: View {
+    let request: WorkEditRequest
+    let onCancel: () -> Void
+    let onSave: (String, String, String, String, String, String, String) -> Void
+
+    @State private var name: String
+    @State private var description: String
+    @State private var status: String
+    @State private var repoRemoteURL: String
+    @State private var goal: String
+    @State private var priority: String
+    @State private var prURL: String
+
+    init(
+        request: WorkEditRequest,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (String, String, String, String, String, String, String) -> Void
+    ) {
+        self.request = request
+        self.onCancel = onCancel
+        self.onSave = onSave
+
+        switch request.item {
+        case .product(let product):
+            _name = State(initialValue: product.name)
+            _description = State(initialValue: product.description)
+            _status = State(initialValue: product.status)
+            _repoRemoteURL = State(initialValue: product.repoRemoteURL ?? "")
+            _goal = State(initialValue: "")
+            _priority = State(initialValue: "")
+            _prURL = State(initialValue: "")
+        case .project(let project):
+            _name = State(initialValue: project.name)
+            _description = State(initialValue: project.description)
+            _status = State(initialValue: project.status)
+            _repoRemoteURL = State(initialValue: "")
+            _goal = State(initialValue: project.goal)
+            _priority = State(initialValue: project.priority)
+            _prURL = State(initialValue: "")
+        case .task(let task), .chore(let task):
+            _name = State(initialValue: task.name)
+            _description = State(initialValue: task.description)
+            _status = State(initialValue: task.status)
+            _repoRemoteURL = State(initialValue: "")
+            _goal = State(initialValue: "")
+            _priority = State(initialValue: "")
+            _prURL = State(initialValue: task.prURL ?? "")
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title)
+                .font(.title3.weight(.semibold))
+
+            TextField("Name", text: $name)
+            TextField("Description", text: $description)
+
+            switch request.item {
+            case .product:
+                Picker("Status", selection: $status) {
+                    ForEach(["active", "paused", "archived"], id: \.self) { status in
+                        Text(status.capitalized).tag(status)
+                    }
+                }
+                TextField("Remote URL", text: $repoRemoteURL)
+            case .project:
+                Picker("Status", selection: $status) {
+                    ForEach(["planned", "active", "blocked", "done", "archived"], id: \.self) { status in
+                        Text(status.capitalized).tag(status)
+                    }
+                }
+                Picker("Priority", selection: $priority) {
+                    ForEach(["low", "medium", "high"], id: \.self) { priority in
+                        Text(priority.capitalized).tag(priority)
+                    }
+                }
+                TextField("Goal", text: $goal)
+            case .task, .chore:
+                Picker("Status", selection: $status) {
+                    ForEach(["todo", "active", "blocked", "in_review", "done"], id: \.self) { status in
+                        Text(status.replacingOccurrences(of: "_", with: " ").capitalized).tag(status)
+                    }
+                }
+                TextField("PR URL", text: $prURL)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Save") {
+                    onSave(name, description, status, repoRemoteURL, goal, priority, prURL)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+
+    private var title: String {
+        switch request.item {
+        case .product:
+            return "Edit Product"
+        case .project:
+            return "Edit Project"
+        case .task:
+            return "Edit Task"
+        case .chore:
+            return "Edit Chore"
+        }
+    }
+}
+
+private struct WorkStatusBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(Capsule())
     }
 }
 
