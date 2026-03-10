@@ -1,3 +1,0 @@
-checks:
-  - id: no-usfa-typo
-    enabled: false
