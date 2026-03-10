@@ -130,6 +130,7 @@ struct WorkSidebarRow: Identifiable {
     let id: WorkNodeID
     let title: String
     let subtitle: String?
+    let statusBadge: String?
     let systemImage: String
     let depth: Int
 }
@@ -144,4 +145,9 @@ enum WorkCreateKind {
 struct WorkCreateRequest: Identifiable {
     let id = UUID()
     let kind: WorkCreateKind
+}
+
+struct WorkEditRequest: Identifiable {
+    let id = UUID()
+    let item: WorkItemPayload
 }

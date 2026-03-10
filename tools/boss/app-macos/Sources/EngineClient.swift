@@ -175,6 +175,29 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendUpdateWorkItem(id: String, patch: [String: Any]) {
+        sendLine([
+            "type": "update_work_item",
+            "id": id,
+            "patch": patch,
+        ])
+    }
+
+    func sendDeleteWorkItem(id: String) {
+        sendLine([
+            "type": "delete_work_item",
+            "id": id,
+        ])
+    }
+
+    func sendReorderProjectTasks(projectId: String, taskIds: [String]) {
+        sendLine([
+            "type": "reorder_project_tasks",
+            "project_id": projectId,
+            "task_ids": taskIds,
+        ])
+    }
+
     private func sendLine(_ payload: [String: Any]) {
         guard let connection else {
             emit(.error(agentId: nil, message: "engine connection is not established"))

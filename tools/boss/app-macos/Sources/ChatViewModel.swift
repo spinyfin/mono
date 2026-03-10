@@ -20,7 +20,9 @@ final class ChatViewModel: ObservableObject {
     @Published var choresByProductID: [String: [WorkTask]] = [:]
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
+    @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
+    @Published var workSearchText: String = ""
 
     var selectedAgent: Agent? {
         guard let id = selectedAgentID else { return nil }
@@ -71,7 +73,8 @@ final class ChatViewModel: ObservableObject {
                 WorkSidebarRow(
                     id: .product(product.id),
                     title: product.name,
-                    subtitle: product.status.capitalized,
+                    subtitle: product.repoRemoteURL,
+                    statusBadge: product.status.capitalized,
                     systemImage: "shippingbox",
                     depth: 0
                 )
@@ -82,7 +85,8 @@ final class ChatViewModel: ObservableObject {
                     WorkSidebarRow(
                         id: .project(project.id),
                         title: project.name,
-                        subtitle: project.status.capitalized,
+                        subtitle: project.priority.capitalized,
+                        statusBadge: project.status.capitalized,
                         systemImage: "folder",
                         depth: 1
                     )
@@ -93,7 +97,8 @@ final class ChatViewModel: ObservableObject {
                         WorkSidebarRow(
                             id: .task(task.id),
                             title: task.name,
-                            subtitle: task.status.capitalized,
+                            subtitle: task.ordinal.map { "Phase \($0)" },
+                            statusBadge: task.status.capitalized,
                             systemImage: "circle.hexagongrid",
                             depth: 2
                         )
@@ -107,6 +112,7 @@ final class ChatViewModel: ObservableObject {
                         id: .chore(chore.id),
                         title: chore.name,
                         subtitle: "Chore",
+                        statusBadge: chore.status.capitalized,
                         systemImage: "wrench.and.screwdriver",
                         depth: 1
                     )
@@ -114,7 +120,14 @@ final class ChatViewModel: ObservableObject {
             }
         }
 
-        return rows
+        let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return rows }
+
+        return rows.filter { row in
+            row.title.localizedCaseInsensitiveContains(query)
+                || (row.subtitle?.localizedCaseInsensitiveContains(query) ?? false)
+                || (row.statusBadge?.localizedCaseInsensitiveContains(query) ?? false)
+        }
     }
 
     private let engine: EngineClient
@@ -125,8 +138,11 @@ final class ChatViewModel: ObservableObject {
     private var didStartEngine = false
     private var hasConnectedOnce = false
     private var permissionQueue: [PendingPermission] = []
+    private let defaults = UserDefaults.standard
 
     private let maxTerminalOutputChars = 200_000
+    private let navigationModeDefaultsKey = "boss.navigationMode"
+    private let selectedWorkNodeDefaultsKey = "boss.selectedWorkNode"
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -136,6 +152,14 @@ final class ChatViewModel: ObservableObject {
         let showSystem = ProcessInfo.processInfo.environment["BOSS_SHOW_SYSTEM_MESSAGES"] ?? ""
         showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
         engine = EngineClient(socketPath: socketPath)
+
+        if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
+           let persistedMode = NavigationMode(rawValue: rawMode) {
+            navigationMode = persistedMode
+        }
+        if let storedNode = defaults.string(forKey: selectedWorkNodeDefaultsKey) {
+            selectedWorkNodeID = deserializeWorkNode(storedNode)
+        }
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
@@ -169,13 +193,14 @@ final class ChatViewModel: ObservableObject {
 
     func setNavigationMode(_ mode: NavigationMode) {
         navigationMode = mode
+        defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
         if mode == .work {
             refreshWork()
         }
     }
 
     func selectWorkNode(_ nodeID: WorkNodeID?) {
-        selectedWorkNodeID = nodeID
+        setSelectedWorkNode(nodeID)
         if let productID = productID(for: nodeID) {
             engine.sendGetWorkTree(productId: productID)
         }
@@ -204,6 +229,20 @@ final class ChatViewModel: ObservableObject {
 
     func dismissWorkCreateRequest() {
         pendingWorkCreateRequest = nil
+    }
+
+    func presentEditSelectedWorkItem() {
+        if let product = selectedProduct, selectedProject == nil, selectedTask == nil {
+            pendingWorkEditRequest = WorkEditRequest(item: .product(product))
+        } else if let project = selectedProject {
+            pendingWorkEditRequest = WorkEditRequest(item: .project(project))
+        } else if let task = selectedTask {
+            pendingWorkEditRequest = WorkEditRequest(item: task.isChore ? .chore(task) : .task(task))
+        }
+    }
+
+    func dismissWorkEditRequest() {
+        pendingWorkEditRequest = nil
     }
 
     func submitWorkCreateRequest(
@@ -247,6 +286,65 @@ final class ChatViewModel: ObservableObject {
         }
 
         pendingWorkCreateRequest = nil
+    }
+
+    func submitWorkEditRequest(
+        _ request: WorkEditRequest,
+        name: String,
+        description: String,
+        status: String,
+        repoRemoteURL: String = "",
+        goal: String = "",
+        priority: String = "",
+        prURL: String = ""
+    ) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+
+        var patch: [String: Any] = [
+            "name": trimmedName,
+            "description": description,
+            "status": status,
+        ]
+
+        let id: String
+        switch request.item {
+        case .product(let product):
+            id = product.id
+            patch["repo_remote_url"] = repoRemoteURL
+        case .project(let project):
+            id = project.id
+            patch["goal"] = goal
+            patch["priority"] = priority
+        case .task(let task), .chore(let task):
+            id = task.id
+            patch["pr_url"] = prURL
+        }
+
+        engine.sendUpdateWorkItem(id: id, patch: patch)
+        pendingWorkEditRequest = nil
+    }
+
+    func deleteSelectedWorkItem() {
+        guard let task = selectedTask else { return }
+        engine.sendDeleteWorkItem(id: task.id)
+    }
+
+    func moveSelectedTask(offset: Int) {
+        guard let task = selectedTask,
+              !task.isChore,
+              let projectID = task.projectID,
+              var tasks = tasksByProjectID[projectID]?.sorted(by: taskSort),
+              let currentIndex = tasks.firstIndex(where: { $0.id == task.id })
+        else {
+            return
+        }
+
+        let destination = currentIndex + offset
+        guard tasks.indices.contains(destination) else { return }
+
+        tasks.swapAt(currentIndex, destination)
+        engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
     }
 
     func startIfNeeded() {
@@ -319,7 +417,7 @@ final class ChatViewModel: ObservableObject {
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             if selectedWorkNodeID == nil, let first = self.products.first {
-                selectedWorkNodeID = .product(first.id)
+                setSelectedWorkNode(.product(first.id))
                 engine.sendGetWorkTree(productId: first.id)
             } else if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
@@ -350,8 +448,16 @@ final class ChatViewModel: ObservableObject {
             if let productID = productID(forProjectID: projectId) {
                 engine.sendGetWorkTree(productId: productID)
             }
-        case .workItemDeleted:
-            if let productID = currentSelectedProductID {
+        case .workItemDeleted(let id):
+            let deletedTask = task(withID: id)
+            if selectedTask?.id == id, let deletedTask {
+                if let projectID = deletedTask.projectID {
+                    setSelectedWorkNode(.project(projectID))
+                } else {
+                    setSelectedWorkNode(.product(deletedTask.productID))
+                }
+            }
+            if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
         case .workError(let message):
@@ -411,6 +517,15 @@ final class ChatViewModel: ObservableObject {
 
     private var currentSelectedProductID: String? {
         productID(for: selectedWorkNodeID)
+    }
+
+    private func setSelectedWorkNode(_ nodeID: WorkNodeID?) {
+        selectedWorkNodeID = nodeID
+        if let nodeID {
+            defaults.set(serializeWorkNode(nodeID), forKey: selectedWorkNodeDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: selectedWorkNodeDefaultsKey)
+        }
     }
 
     private func startEngineIfNeeded() {
@@ -601,16 +716,16 @@ final class ChatViewModel: ObservableObject {
         switch item {
         case .product(let product):
             upsertProduct(product)
-            selectedWorkNodeID = .product(product.id)
+            setSelectedWorkNode(.product(product.id))
             engine.sendGetWorkTree(productId: product.id)
         case .project(let project):
-            selectedWorkNodeID = .project(project.id)
+            setSelectedWorkNode(.project(project.id))
             engine.sendGetWorkTree(productId: project.productID)
         case .task(let task):
-            selectedWorkNodeID = .task(task.id)
+            setSelectedWorkNode(.task(task.id))
             engine.sendGetWorkTree(productId: task.productID)
         case .chore(let task):
-            selectedWorkNodeID = .chore(task.id)
+            setSelectedWorkNode(.chore(task.id))
             engine.sendGetWorkTree(productId: task.productID)
         }
     }
@@ -644,5 +759,36 @@ private func taskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
         return lhs.createdAt < rhs.createdAt
+    }
+}
+
+private func serializeWorkNode(_ node: WorkNodeID) -> String {
+    switch node {
+    case .product(let id):
+        return "product:\(id)"
+    case .project(let id):
+        return "project:\(id)"
+    case .task(let id):
+        return "task:\(id)"
+    case .chore(let id):
+        return "chore:\(id)"
+    }
+}
+
+private func deserializeWorkNode(_ rawValue: String) -> WorkNodeID? {
+    let parts = rawValue.split(separator: ":", maxSplits: 1).map(String.init)
+    guard parts.count == 2 else { return nil }
+
+    switch parts[0] {
+    case "product":
+        return .product(parts[1])
+    case "project":
+        return .project(parts[1])
+    case "task":
+        return .task(parts[1])
+    case "chore":
+        return .chore(parts[1])
+    default:
+        return nil
     }
 }
