@@ -4,6 +4,14 @@ import Network
 enum EngineEvent {
     case connected
     case disconnected
+    case productsList(products: [WorkProduct])
+    case projectsList(productId: String, projects: [WorkProject])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask])
+    case workItemCreated(item: WorkItemPayload)
+    case workItemUpdated(item: WorkItemPayload)
+    case projectTasksReordered(projectId: String, taskIds: [String])
+    case workItemDeleted(id: String)
+    case workError(message: String)
     case agentCreated(agentId: String, name: String)
     case agentList(agents: [(id: String, name: String)])
     case agentRemoved(agentId: String)
@@ -118,6 +126,55 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendListProducts() {
+        sendLine(["type": "list_products"])
+    }
+
+    func sendGetWorkTree(productId: String) {
+        sendLine([
+            "type": "get_work_tree",
+            "product_id": productId,
+        ])
+    }
+
+    func sendCreateProduct(name: String, description: String, repoRemoteURL: String) {
+        sendLine([
+            "type": "create_product",
+            "name": name,
+            "description": description,
+            "repo_remote_url": repoRemoteURL,
+        ])
+    }
+
+    func sendCreateProject(productId: String, name: String, description: String, goal: String) {
+        sendLine([
+            "type": "create_project",
+            "product_id": productId,
+            "name": name,
+            "description": description,
+            "goal": goal,
+        ])
+    }
+
+    func sendCreateTask(productId: String, projectId: String, name: String, description: String) {
+        sendLine([
+            "type": "create_task",
+            "product_id": productId,
+            "project_id": projectId,
+            "name": name,
+            "description": description,
+        ])
+    }
+
+    func sendCreateChore(productId: String, name: String, description: String) {
+        sendLine([
+            "type": "create_chore",
+            "product_id": productId,
+            "name": name,
+            "description": description,
+        ])
+    }
+
     private func sendLine(_ payload: [String: Any]) {
         guard let connection else {
             emit(.error(agentId: nil, message: "engine connection is not established"))
@@ -187,6 +244,53 @@ final class EngineClient: @unchecked Sendable {
             let agentId = payload["agent_id"] as? String
 
             switch type {
+            case "products_list":
+                let products = (payload["products"] as? [[String: Any]] ?? []).compactMap(parseProduct)
+                emit(.productsList(products: products))
+            case "projects_list":
+                let productId = payload["product_id"] as? String ?? ""
+                let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
+                emit(.projectsList(productId: productId, projects: projects))
+            case "work_tree":
+                guard let productPayload = payload["product"] as? [String: Any],
+                      let product = parseProduct(productPayload)
+                else {
+                    emit(.error(agentId: nil, message: "received invalid work tree payload from engine"))
+                    break
+                }
+                let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
+                let tasks = (payload["tasks"] as? [[String: Any]] ?? []).compactMap(parseTask)
+                let chores = (payload["chores"] as? [[String: Any]] ?? []).compactMap(parseTask)
+                emit(.workTree(product: product, projects: projects, tasks: tasks, chores: chores))
+            case "work_item_created":
+                guard let itemPayload = payload["item"] as? [String: Any],
+                      let item = parseWorkItem(itemPayload)
+                else {
+                    emit(.error(agentId: nil, message: "received invalid work item payload from engine"))
+                    break
+                }
+                emit(.workItemCreated(item: item))
+            case "work_item_updated":
+                guard let itemPayload = payload["item"] as? [String: Any],
+                      let item = parseWorkItem(itemPayload)
+                else {
+                    emit(.error(agentId: nil, message: "received invalid work item payload from engine"))
+                    break
+                }
+                emit(.workItemUpdated(item: item))
+            case "project_tasks_reordered":
+                let projectId = payload["project_id"] as? String ?? ""
+                let taskIds = payload["task_ids"] as? [String] ?? []
+                emit(.projectTasksReordered(projectId: projectId, taskIds: taskIds))
+            case "work_item_deleted":
+                let id = payload["id"] as? String ?? ""
+                guard !id.isEmpty else {
+                    break
+                }
+                emit(.workItemDeleted(id: id))
+            case "work_error":
+                let message = payload["message"] as? String ?? "unknown work error"
+                emit(.workError(message: message))
             case "agent_created":
                 let aid = agentId ?? ""
                 let name = payload["name"] as? String ?? ""
@@ -266,6 +370,113 @@ final class EngineClient: @unchecked Sendable {
                 return
             }
             self.connect()
+        }
+    }
+
+    private func parseProduct(_ payload: [String: Any]) -> WorkProduct? {
+        guard let id = payload["id"] as? String,
+              let name = payload["name"] as? String,
+              let slug = payload["slug"] as? String,
+              let description = payload["description"] as? String,
+              let status = payload["status"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let updatedAt = payload["updated_at"] as? String
+        else {
+            return nil
+        }
+
+        return WorkProduct(
+            id: id,
+            name: name,
+            slug: slug,
+            description: description,
+            repoRemoteURL: payload["repo_remote_url"] as? String,
+            status: status,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func parseProject(_ payload: [String: Any]) -> WorkProject? {
+        guard let id = payload["id"] as? String,
+              let productId = payload["product_id"] as? String,
+              let name = payload["name"] as? String,
+              let slug = payload["slug"] as? String,
+              let description = payload["description"] as? String,
+              let goal = payload["goal"] as? String,
+              let status = payload["status"] as? String,
+              let priority = payload["priority"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let updatedAt = payload["updated_at"] as? String
+        else {
+            return nil
+        }
+
+        return WorkProject(
+            id: id,
+            productID: productId,
+            name: name,
+            slug: slug,
+            description: description,
+            goal: goal,
+            status: status,
+            priority: priority,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func parseTask(_ payload: [String: Any]) -> WorkTask? {
+        guard let id = payload["id"] as? String,
+              let productId = payload["product_id"] as? String,
+              let kind = payload["kind"] as? String,
+              let name = payload["name"] as? String,
+              let description = payload["description"] as? String,
+              let status = payload["status"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let updatedAt = payload["updated_at"] as? String
+        else {
+            return nil
+        }
+
+        let ordinal = (payload["ordinal"] as? NSNumber)?.intValue
+
+        return WorkTask(
+            id: id,
+            productID: productId,
+            projectID: payload["project_id"] as? String,
+            kind: kind,
+            name: name,
+            description: description,
+            status: status,
+            ordinal: ordinal,
+            prURL: payload["pr_url"] as? String,
+            deletedAt: payload["deleted_at"] as? String,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
+
+    private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
+        guard let itemType = payload["item_type"] as? String else {
+            return nil
+        }
+
+        switch itemType {
+        case "product":
+            guard let product = parseProduct(payload) else { return nil }
+            return .product(product)
+        case "project":
+            guard let project = parseProject(payload) else { return nil }
+            return .project(project)
+        case "task":
+            guard let task = parseTask(payload) else { return nil }
+            return .task(task)
+        case "chore":
+            guard let task = parseTask(payload) else { return nil }
+            return .chore(task)
+        default:
+            return nil
         }
     }
 }
