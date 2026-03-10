@@ -11,7 +11,6 @@ export ANTHROPIC_API_KEY=...
 tools/boss/scripts/run-macos-poc.sh
 ```
 
-Use `tools/boss/scripts/run-macos-poc.sh --skip-install` to skip `pnpm install`.
 Engine logs are written to `/tmp/boss-engine.log` by default (override with
 `BOSS_ENGINE_LOG_PATH`).
 Engine PID is written to `/tmp/boss-engine.pid` by default (override with
@@ -24,8 +23,7 @@ Internal system status messages are hidden by default. Set
 Run the app and let it launch the engine automatically:
 
 ```bash
-cd tools/boss/app-macos
-ANTHROPIC_API_KEY=... swift run BossMacApp
+ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:BossMacApp
 ```
 
 By default the app launches:
@@ -49,8 +47,7 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --mode=server --so
 ```
 
 ```bash
-cd tools/boss/app-macos
-BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock swift run BossMacApp
+BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools/boss/app-macos:BossMacApp
 ```
 
 ## Overrides

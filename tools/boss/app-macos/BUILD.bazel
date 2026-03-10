@@ -1,0 +1,26 @@
+load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files([
+    "Package.resolved",
+    "Package.swift",
+])
+
+swift_library(
+    name = "boss_mac_app_lib",
+    module_name = "BossMacApp",
+    srcs = glob(["Sources/*.swift"]),
+    deps = [
+        "@swiftpkg_textual//:Textual",
+    ],
+)
+
+macos_application(
+    name = "BossMacApp",
+    bundle_id = "dev.brianduff.bossmacapp",
+    infoplists = ["Info.plist"],
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_lib"],
+)
