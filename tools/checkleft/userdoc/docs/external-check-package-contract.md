@@ -151,6 +151,6 @@ Semantics:
 
 Phase 0 schema stubs and validators live in:
 
-1. `cli/checkleft/src/external/mod.rs`
+1. `tools/checkleft/src/external/mod.rs`
 
 These stubs define the frozen contract types and parsing/validation behavior without integrating runtime execution yet.
