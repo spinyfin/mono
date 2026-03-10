@@ -1,0 +1,3 @@
+# checkleft tool
+
+package(default_visibility = ["//visibility:private"])
