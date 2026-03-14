@@ -2,7 +2,48 @@ module(
     name = "mono",
 )
 
+bazel_dep(name = "rules_nodejs", version = "6.7.3")
+bazel_dep(name = "aspect_rules_js", version = "2.8.2")
 bazel_dep(name = "rules_rust", version = "0.68.1")
+bazel_dep(name = "apple_support", version = "1.24.2", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "rules_swift", version = "3.4.1", repo_name = "build_bazel_rules_swift")
+bazel_dep(name = "rules_apple", version = "4.3.3", repo_name = "build_bazel_rules_apple")
+bazel_dep(name = "rules_swift_package_manager", version = "1.13.0")
+
+apple_cc_configure = use_extension(
+    "@build_bazel_apple_support//crosstool:setup.bzl",
+    "apple_cc_configure_extension",
+)
+use_repo(
+    apple_cc_configure,
+    "local_config_apple_cc",
+    "local_config_apple_cc_toolchains",
+)
+register_toolchains("@local_config_apple_cc_toolchains//:all")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(
+    node_version = "22.11.0",
+)
+use_repo(node, "nodejs_toolchains")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(pnpm_version_from = "//:package.json")
+use_repo(pnpm, "pnpm")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    bins = {
+        "@zed-industries/claude-code-acp": ["claude-code-acp=./dist/index.js"],
+    },
+    pnpm_lock = "//:pnpm-lock.yaml",
+)
+use_repo(
+    npm,
+    "npm",
+    "npm__at_zed-industries_claude-code-acp__0.16.1_zod_4.3.6",
+)
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
@@ -20,3 +61,17 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml"],
 )
 use_repo(crate, "mono_crates")
+
+swift_deps = use_extension(
+    "@rules_swift_package_manager//:extensions.bzl",
+    "swift_deps",
+)
+swift_deps.from_package(
+    resolved = "//tools/boss/app-macos:Package.resolved",
+    swift = "//tools/boss/app-macos:Package.swift",
+)
+use_repo(
+    swift_deps,
+    "swift_package",
+    "swiftpkg_textual",
+)

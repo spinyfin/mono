@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-const DEFAULT_ACP_COMMAND: &str = "pnpm --filter @mono/claude-code-acp exec claude-code-acp";
+const DEFAULT_ACP_COMMAND: &str = "bazel run //tools/boss/js/claude-code-acp:claude-code-acp --";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
