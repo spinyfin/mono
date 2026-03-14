@@ -4,6 +4,7 @@ members = [
   "tools/hood",
   "tools/boss/engine",
   "tools/checkleft",
+  "tools/cube",
 ]
 resolver = "2"
 
