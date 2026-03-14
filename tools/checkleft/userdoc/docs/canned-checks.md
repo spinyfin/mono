@@ -24,7 +24,7 @@ Notes:
 
 Purpose:
 
-- Validates internal markdown links in changed `docs/**/*.md` files.
+- Validates internal markdown links in changed `*.md` files anywhere in the repo.
 
 Config keys:
 

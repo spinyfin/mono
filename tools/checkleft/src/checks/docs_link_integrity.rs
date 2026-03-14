@@ -19,7 +19,7 @@ impl Check for DocsLinkIntegrityCheck {
     }
 
     fn description(&self) -> &str {
-        "validates internal markdown links in changed docs files"
+        "validates internal markdown links in changed markdown files"
     }
 
     async fn run(
@@ -42,7 +42,7 @@ impl Check for DocsLinkIntegrityCheck {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if !is_docs_markdown_file(&changed_file.path) {
+            if !is_markdown_file(&changed_file.path) {
                 continue;
             }
 
@@ -68,12 +68,7 @@ impl Check for DocsLinkIntegrityCheck {
                     if should_skip_link_target(target) {
                         continue;
                     }
-                    if link_target_exists(
-                        &changed_file.path,
-                        target,
-                        tree,
-                        &changeset_paths,
-                    ) {
+                    if link_target_exists(&changed_file.path, target, tree, &changeset_paths) {
                         continue;
                     }
 
@@ -102,10 +97,7 @@ impl Check for DocsLinkIntegrityCheck {
     }
 }
 
-fn is_docs_markdown_file(path: &Path) -> bool {
-    if !path.starts_with(Path::new("docs")) {
-        return false;
-    }
+fn is_markdown_file(path: &Path) -> bool {
     matches!(path.extension().and_then(|ext| ext.to_str()), Some("md"))
 }
 
@@ -256,5 +248,33 @@ mod tests {
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checks_markdown_files_outside_docs_directory() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("guides")).expect("create guides dir");
+        fs::write(
+            temp.path().join("guides/setup.md"),
+            "[Missing](missing.md)\n",
+        )
+        .expect("write guide");
+
+        let check = DocsLinkIntegrityCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("guides/setup.md").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(Default::default()),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
     }
 }
