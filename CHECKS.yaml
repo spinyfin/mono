@@ -1,0 +1,25 @@
+checks:
+  - id: no-generated-artifacts
+    check: forbidden-paths
+    config:
+      patterns:
+        - "**/target/**"
+        - "**/node_modules/**"
+        - "**/.build/**"
+        - "bazel-*"
+        - "bazel-*/**"
+      remediation: "Do not commit generated build output. Remove the artifact from the change."
+
+  - id: oversized-files
+    check: file-size
+    config:
+      max_lines: 500
+      exclude_globs:
+        - "**/*.md"
+        - "**/*.lock"
+        - "**/Package.resolved"
+        - "pnpm-lock.yaml"
+
+  - id: rust-test-rule-coverage
+
+  - id: todo-expiry
