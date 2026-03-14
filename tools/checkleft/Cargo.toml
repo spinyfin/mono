@@ -17,6 +17,8 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-starlark = { workspace = true }
 walkdir = { workspace = true }
 wasmtime = { workspace = true }
 
