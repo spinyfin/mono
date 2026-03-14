@@ -48,3 +48,9 @@ pub struct WorkspaceRecord {
     pub leased_at_epoch_s: Option<i64>,
     pub head_commit: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCandidate {
+    pub workspace_id: String,
+    pub workspace_path: PathBuf,
+}

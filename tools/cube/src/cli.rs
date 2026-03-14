@@ -198,7 +198,14 @@ mod tests {
 
     #[test]
     fn workspace_lease_matches_docs_shape() {
-        let cli = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement parser"]);
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "implement parser",
+        ]);
 
         match cli.command {
             Command::Workspace {

@@ -4,7 +4,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::CubeError;
-use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
+use crate::metadata::{RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState};
 use crate::paths::database_path;
 
 pub struct Store {
@@ -165,6 +165,224 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
+    pub fn sync_workspaces(
+        &mut self,
+        repo: &str,
+        candidates: &[WorkspaceCandidate],
+    ) -> Result<(), CubeError> {
+        let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
+        for candidate in candidates {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO workspaces (
+                        repo,
+                        workspace_id,
+                        workspace_path,
+                        state
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(repo, workspace_id) DO UPDATE SET
+                        workspace_path = excluded.workspace_path
+                    "#,
+                    params![
+                        repo,
+                        candidate.workspace_id,
+                        candidate.workspace_path.display().to_string(),
+                        WorkspaceState::Free.as_str(),
+                    ],
+                )
+                .map_err(CubeError::Storage)?;
+        }
+        transaction.commit().map_err(CubeError::Storage)
+    }
+
+    pub fn claim_workspace(
+        &mut self,
+        repo: &str,
+        holder: &str,
+        task: &str,
+        lease_id: &str,
+        leased_at_epoch_s: i64,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
+        let candidate = transaction
+            .query_row(
+                r#"
+                SELECT workspace_id, workspace_path
+                FROM workspaces
+                WHERE repo = ?1 AND state = ?2
+                ORDER BY workspace_id
+                LIMIT 1
+                "#,
+                params![repo, WorkspaceState::Free.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(CubeError::Storage)?;
+
+        let Some((workspace_id, workspace_path)) = candidate else {
+            transaction.rollback().map_err(CubeError::Storage)?;
+            return Ok(None);
+        };
+
+        transaction
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    state = ?1,
+                    lease_id = ?2,
+                    holder = ?3,
+                    task = ?4,
+                    leased_at_epoch_s = ?5,
+                    head_commit = NULL
+                WHERE repo = ?6 AND workspace_id = ?7 AND state = ?8
+                "#,
+                params![
+                    WorkspaceState::Leased.as_str(),
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    repo,
+                    workspace_id,
+                    WorkspaceState::Free.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+
+        let claimed = transaction
+            .query_row(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    workspace_path,
+                    state,
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    head_commit
+                FROM workspaces
+                WHERE repo = ?1 AND workspace_id = ?2
+                "#,
+                params![repo, workspace_id],
+                |row| row_to_workspace_record(row),
+            )
+            .map_err(CubeError::Storage)?;
+        transaction.commit().map_err(CubeError::Storage)?;
+
+        debug_assert_eq!(claimed.workspace_path, Path::new(&workspace_path));
+        Ok(Some(claimed))
+    }
+
+    pub fn update_workspace_head_commit(
+        &self,
+        lease_id: &str,
+        head_commit: Option<&str>,
+    ) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET head_commit = ?2
+                WHERE lease_id = ?1
+                "#,
+                params![lease_id, head_commit],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
+    pub fn get_workspace_by_path(
+        &self,
+        workspace_path: &Path,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    workspace_path,
+                    state,
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    head_commit
+                FROM workspaces
+                WHERE workspace_path = ?1
+                "#,
+                params![workspace_path.display().to_string()],
+                row_to_workspace_record,
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn get_workspace_by_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    workspace_path,
+                    state,
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    head_commit
+                FROM workspaces
+                WHERE lease_id = ?1
+                "#,
+                params![lease_id],
+                row_to_workspace_record,
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn release_workspace(&self, lease_id: &str) -> Result<Option<WorkspaceRecord>, CubeError> {
+        let before = self.get_workspace_by_lease(lease_id)?;
+        let Some(record) = before else {
+            return Ok(None);
+        };
+
+        self.connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    state = ?2,
+                    lease_id = NULL,
+                    holder = NULL,
+                    task = NULL,
+                    leased_at_epoch_s = NULL,
+                    head_commit = NULL
+                WHERE lease_id = ?1
+                "#,
+                params![lease_id, WorkspaceState::Free.as_str()],
+            )
+            .map_err(CubeError::Storage)?;
+
+        Ok(Some(WorkspaceRecord {
+            state: WorkspaceState::Free,
+            lease_id: None,
+            holder: None,
+            task: None,
+            leased_at_epoch_s: None,
+            head_commit: None,
+            ..record
+        }))
+    }
+
     fn migrate(&self) -> Result<(), CubeError> {
         self.connection
             .execute_batch(
@@ -204,6 +422,29 @@ impl Store {
 
 fn path_to_string(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    let state_raw: String = row.get(3)?;
+    Ok(WorkspaceRecord {
+        repo: row.get(0)?,
+        workspace_id: row.get(1)?,
+        workspace_path: row.get::<_, String>(2)?.into(),
+        state: WorkspaceState::from_str(&state_raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "invalid workspace state `{state_raw}`"
+                )),
+            )
+        })?,
+        lease_id: row.get(4)?,
+        holder: row.get(5)?,
+        task: row.get(6)?,
+        leased_at_epoch_s: row.get(7)?,
+        head_commit: row.get(8)?,
+    })
 }
 
 #[cfg(test)]
