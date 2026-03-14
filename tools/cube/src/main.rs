@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(result) => {
             if json {
-                match serde_json::to_string_pretty(&result) {
+                match serde_json::to_string_pretty(&result.payload) {
                     Ok(output) => println!("{output}"),
                     Err(error) => {
                         eprintln!("error: failed to encode JSON output: {error}");

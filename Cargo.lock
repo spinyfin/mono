@@ -587,8 +587,10 @@ name = "cube"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
