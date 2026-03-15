@@ -23,3 +23,5 @@ checks:
   - id: rust-test-rule-coverage
 
   - id: todo-expiry
+
+  - id: repo-visibility
