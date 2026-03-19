@@ -20,6 +20,54 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass` (see [Bypass mechanism](bypass.md)).
 
+## `code-patterns`
+
+Purpose:
+
+- Flags configured language-aware code patterns in changed source files.
+
+Config keys:
+
+- `lang` (required, currently only `java`)
+- `rules` (required array)
+- `message` (optional default for rules)
+- `severity` (optional default for rules, default `error`)
+- `remediation` (optional default for rules)
+
+Per-rule keys:
+
+- `nocall` (required string pattern)
+- `message` (optional string)
+- `severity` (optional `error|warning|info`)
+- `remediation` (optional string)
+
+Java `nocall` syntax:
+
+- `<fully.qualified.Type>#<method>()`
+
+Example:
+
+```yaml
+checks:
+  - id: blocking-java-calls
+    check: code-patterns
+    config:
+      lang: java
+      message: Blocking wait without timeout.
+      remediation: Use a timeout-bearing API or propagate the async result instead of blocking.
+      rules:
+        - nocall: java.util.concurrent.Future#get()
+        - nocall: com.linkedin.parseq.Task#await()
+        - nocall: com.linkedin.parseq.Task#get()
+```
+
+Notes:
+
+- The initial implementation is Java-only and matches zero-argument instance method calls.
+- Java matching is AST-backed with best-effort local type resolution, not raw text matching.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
+
 ## `docs-link-integrity`
 
 Purpose:
