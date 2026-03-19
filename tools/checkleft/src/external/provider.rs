@@ -3,14 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::path::validate_relative_path;
 
 use super::{
-    load_external_check_package_manifest, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageProvider, GENERATED_IMPLEMENTATION_PREFIX,
+    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageProvider,
+    GENERATED_IMPLEMENTATION_PREFIX, load_external_check_package_manifest,
 };
 
 #[derive(Debug, Default)]
