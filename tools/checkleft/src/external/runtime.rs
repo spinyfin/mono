@@ -252,7 +252,7 @@ impl WasmExternalCheckExecutor {
     fn resolve_artifact_path(&self, artifact_path: &str) -> Result<PathBuf> {
         let path = Path::new(artifact_path);
         if path.is_absolute() {
-            bail!("artifact path must be relative to repository root");
+            return Ok(path.to_path_buf());
         }
         Ok(self.root.join(path))
     }

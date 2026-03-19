@@ -108,6 +108,22 @@ Not allowed in `artifact` mode:
 3. `build_adapter`
 4. `sources`
 
+## Source Build Cache
+
+For JavaScript and TypeScript `source` mode packages using the
+`javascript-component` adapter, `checkleft` keeps derived state in a per-user,
+cache root:
+
+1. `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/repos/<repo>-<repo-hash>/source-mode/artifacts/<build-hash>/check.wasm`
+2. `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/toolchains/js-componentizer/toolchains/<toolchain-hash>/`
+
+Built artifacts remain repo-scoped so unrelated repos do not share those
+entries. The JS toolchain install is shared across repos when the checked-in
+toolchain inputs match. The cache contents are disposable and may be removed to
+force a fresh toolchain install and rebuild. Manifest-declared `artifact_path`
+values remain repository-relative; the per-user cache is only used for
+internally generated source-mode artifacts.
+
 ## Capability Contract
 
 Capabilities are deny-by-default.
