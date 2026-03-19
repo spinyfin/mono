@@ -8,7 +8,13 @@ use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 
 mod patch_line_deltas;
 
-use patch_line_deltas::parse_line_deltas_from_git_patch;
+use patch_line_deltas::parse_file_diffs_from_git_patch;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseRevision {
+    Jujutsu(String),
+    Git(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcsKind {
@@ -104,6 +110,28 @@ impl Vcs {
         }?;
 
         Ok(parse_tracked_file_list(&output))
+    }
+
+    pub fn base_revision(&self, all: bool, base_ref: Option<&str>) -> Result<Option<BaseRevision>> {
+        if all {
+            return Ok(None);
+        }
+
+        match self.kind {
+            VcsKind::Jujutsu => Ok(Some(BaseRevision::Jujutsu(
+                base_ref
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("@-")
+                    .to_owned(),
+            ))),
+            VcsKind::Git => {
+                let revision = match base_ref.filter(|value| !value.trim().is_empty()) {
+                    Some(base_ref) => resolve_git_merge_base(&self.root, base_ref)?,
+                    None => "HEAD".to_owned(),
+                };
+                Ok(Some(BaseRevision::Git(revision)))
+            }
+        }
     }
 
     pub fn current_commit_description(&self) -> Result<String> {
@@ -335,14 +363,27 @@ fn parse_arrow_rename(input: &str) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn attach_line_deltas(changeset: &mut ChangeSet, patch: &str) {
-    let line_deltas = parse_line_deltas_from_git_patch(patch);
+    let file_diffs = parse_file_diffs_from_git_patch(patch);
     for changed_file in &changeset.changed_files {
-        if let Some(delta) = line_deltas.get(&changed_file.path) {
+        if let Some(diff) = file_diffs.get(&changed_file.path) {
             changeset
                 .file_line_deltas
-                .insert(changed_file.path.clone(), *delta);
+                .insert(changed_file.path.clone(), diff.line_delta);
+            changeset
+                .file_diffs
+                .insert(changed_file.path.clone(), diff.file_diff.clone());
         }
     }
+}
+
+fn resolve_git_merge_base(root: &Path, base_ref: &str) -> Result<String> {
+    let output = run_command(root, "git", &["merge-base", base_ref, "HEAD"])?;
+    let revision = output.trim();
+    if revision.is_empty() {
+        bail!("git merge-base returned an empty revision for `{base_ref}`");
+    }
+
+    Ok(revision.to_owned())
 }
 
 fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {

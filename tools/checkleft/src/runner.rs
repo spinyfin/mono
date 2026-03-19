@@ -293,6 +293,7 @@ impl Runner {
                         changeset: ChangeSet {
                             changed_files: Vec::new(),
                             file_line_deltas: HashMap::new(),
+                            file_diffs: HashMap::new(),
                             commit_description: changeset.commit_description.clone(),
                             pr_description: changeset.pr_description.clone(),
                             change_id: changeset.change_id.clone(),
@@ -316,6 +317,12 @@ impl Runner {
                             .changeset
                             .file_line_deltas
                             .insert(changed_file.path.clone(), *delta);
+                    }
+                    if let Some(diff) = changeset.file_diffs.get(&changed_file.path) {
+                        entry
+                            .changeset
+                            .file_diffs
+                            .insert(changed_file.path.clone(), diff.clone());
                     }
                 }
             }
