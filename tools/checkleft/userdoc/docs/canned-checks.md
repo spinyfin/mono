@@ -79,14 +79,26 @@ Top-level defaults:
 
 Purpose:
 
-- Flags changed file paths matching forbidden globs.
+- Flags changed file paths matching rule-scoped forbidden globs.
 
 Config keys:
 
-- `patterns` (required array of glob strings)
+- `rules` (required array)
 - `exclude_globs` (optional array of glob strings)
 - `severity` (optional `error|warning|info`, default `error`)
 - `remediation` (optional string)
+
+Per-rule keys:
+
+- `remediation` (required string)
+- `when` (required array of `added|modified|deleted|renamed`)
+- `patterns` (required array of glob strings)
+
+Notes:
+
+- Rules match repository-relative paths, so filename policies can use patterns like `**/*.swp` or `**/package-lock.json`.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
 
 ## `frontend-no-legacy-api`
 
