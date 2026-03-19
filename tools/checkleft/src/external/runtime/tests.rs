@@ -5,14 +5,14 @@ use anyhow::Result;
 use tempfile::tempdir;
 
 use crate::external::{
-    ExternalCheckArtifactPackage, ExternalCheckCapabilities, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalSourcePackageBuilder, EXTERNAL_CHECK_API_V1,
+    EXTERNAL_CHECK_API_V1, ExternalCheckArtifactPackage, ExternalCheckCapabilities,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalSourcePackageBuilder,
 };
 use crate::input::ChangeSet;
 use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
-use super::{sha256_hex, ExternalCheckExecutor, WasmExternalCheckExecutor};
+use super::{ExternalCheckExecutor, WasmExternalCheckExecutor, sha256_hex};
 
 #[test]
 fn executes_artifact_module_and_parses_findings() {
@@ -264,7 +264,9 @@ i64.const 0
             &toml::Value::Table(Default::default()),
         )
         .expect_err("shell declarations must be rejected");
-    assert!(error
-        .to_string()
-        .contains("invalid command capability declaration"));
+    assert!(
+        error
+            .to_string()
+            .contains("invalid command capability declaration")
+    );
 }

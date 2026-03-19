@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use super::ExternalCheckCapabilities;
 

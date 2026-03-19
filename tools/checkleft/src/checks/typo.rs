@@ -27,12 +27,7 @@ impl Check for TypoCheck {
         config: &toml::Value,
     ) -> Result<CheckResult> {
         let parsed = parse_typo_config(config)?;
-        run_typo_check(
-            self.id(),
-            changeset,
-            tree,
-            &parsed.rules,
-        )
+        run_typo_check(self.id(), changeset, tree, &parsed.rules)
     }
 }
 

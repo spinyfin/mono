@@ -166,8 +166,9 @@ fn parse_checks_file(path: &Path) -> Result<ParsedChecksFile> {
     match extension {
         "yaml" | "yml" => serde_yaml::from_str(&contents)
             .with_context(|| format!("failed to parse {}", path.display())),
-        "toml" => toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        "toml" => {
+            toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+        }
         _ => bail!(
             "unsupported checks config extension for {} (expected .yaml or .toml)",
             path.display()

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker};
@@ -12,9 +12,9 @@ use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding};
 
 use super::{
-    ExternalCheckArtifactPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCommandCapabilities, ExternalSourcePackageBuilder,
-    JavaScriptComponentSourcePackageBuilder, EXTERNAL_CHECK_RUNTIME_V1,
+    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCommandCapabilities, ExternalSourcePackageBuilder,
+    JavaScriptComponentSourcePackageBuilder,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -208,17 +208,17 @@ impl WasmExternalCheckExecutor {
             .context("failed to write runtime input into wasm memory")
             .map_err(CoreArtifactExecutionError::execution)?;
 
-        let input_offset =
-            i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32");
+        let input_offset = i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32");
         let input_offset = input_offset.map_err(CoreArtifactExecutionError::execution)?;
-        let input_len = i32::try_from(input_bytes.len()).context("runtime input length exceeds i32");
+        let input_len =
+            i32::try_from(input_bytes.len()).context("runtime input length exceeds i32");
         let input_len = input_len.map_err(CoreArtifactExecutionError::execution)?;
         let output_range_encoded = run
             .call(&mut store, (input_offset, input_len))
             .context("external wasm check execution failed")
             .map_err(CoreArtifactExecutionError::execution)?;
-        let (output_offset, output_len) =
-            decode_output_range(output_range_encoded).map_err(CoreArtifactExecutionError::execution)?;
+        let (output_offset, output_len) = decode_output_range(output_range_encoded)
+            .map_err(CoreArtifactExecutionError::execution)?;
 
         ensure_memory_capacity(&memory, &mut store, output_offset, output_len)
             .map_err(CoreArtifactExecutionError::execution)?;

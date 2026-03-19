@@ -5,11 +5,11 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use super::{
-    parse_external_check_package_manifest, CompositeExternalCheckPackageProvider,
-    ConfiguredExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider, EXTERNAL_CHECK_API_V1,
-    EXTERNAL_CHECK_RUNTIME_V1,
+    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckImplementationRef,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
+    parse_external_check_package_manifest,
 };
 
 struct StaticProvider {
@@ -301,9 +301,11 @@ version = 2
         &PathBuf::from("generated/index.toml"),
     )
     .expect_err("must reject unsupported version");
-    assert!(error
-        .to_string()
-        .contains("unsupported generated external package index version"));
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported generated external package index version")
+    );
 }
 
 #[test]
