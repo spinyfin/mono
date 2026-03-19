@@ -199,9 +199,9 @@ mod tests {
             old_path: None,
         }])
         .with_change_id(Some("235".to_owned()))
-        .with_repository(Some("brianduff/flunge".to_owned()));
+        .with_repository(Some("example/flunge".to_owned()));
 
         assert_eq!(changeset.change_id.as_deref(), Some("235"));
-        assert_eq!(changeset.repository.as_deref(), Some("brianduff/flunge"));
+        assert_eq!(changeset.repository.as_deref(), Some("example/flunge"));
     }
 }

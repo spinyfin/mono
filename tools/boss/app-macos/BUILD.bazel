@@ -19,7 +19,7 @@ swift_library(
 
 macos_application(
     name = "BossMacApp",
-    bundle_id = "dev.brianduff.bossmacapp",
+    bundle_id = "dev.spinyfin.bossmacapp",
     infoplists = ["Info.plist"],
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_lib"],

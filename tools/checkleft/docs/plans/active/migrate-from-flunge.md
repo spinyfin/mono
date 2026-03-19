@@ -20,8 +20,8 @@ The current `checkleft` implementation in `flunge` contains:
 
 `mono` already has the core infrastructure needed for a future move:
 
-- a Rust workspace rooted at [Cargo.toml](/Users/brianduff/Documents/dev/workspaces/mono-agent-003/Cargo.toml),
-- Bazel crate-universe wiring in [MODULE.bazel](/Users/brianduff/Documents/dev/workspaces/mono-agent-003/MODULE.bazel),
+- a Rust workspace rooted at [Cargo.toml](../../../../../Cargo.toml),
+- Bazel crate-universe wiring in [MODULE.bazel](../../../../../MODULE.bazel),
 - an existing `tools/` layout with tool-local docs patterns.
 
 ## Preferred Import Strategy
