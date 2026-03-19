@@ -38,8 +38,13 @@ bypass_name = "BYPASS_FILE_SIZE"
 Supported keys:
 
 - `include_config_files` (boolean, default `false`)
+- `external_checks_url` (string, root config only)
 
 When `false`, changed `CHECKS.toml` files are excluded from check scheduling.
+
+When `external_checks_url` is set in the repository root config, `checkleft`
+fetches that remote `CHECKS.yaml` or `CHECKS.toml`, applies it first, and then
+merges the local root config and any child configs on top.
 
 ## `[[checks]]` entry
 

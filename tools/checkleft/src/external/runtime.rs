@@ -173,8 +173,7 @@ impl WasmExternalCheckExecutor {
         let module = compile_core_module(&self.engine, package.id.as_str(), module_bytes)
             .map_err(CoreArtifactExecutionError::mismatch)?;
         let mut store = Store::new(&self.engine, ());
-        configure_store_fuel(&mut store)
-            .map_err(CoreArtifactExecutionError::execution)?;
+        configure_store_fuel(&mut store).map_err(CoreArtifactExecutionError::execution)?;
 
         let instance = instantiate_core_module(&mut store, &module, package.id.as_str())
             .map_err(CoreArtifactExecutionError::mismatch)?;
@@ -349,7 +348,11 @@ fn call_core_run(
         .context("external wasm check execution failed")
 }
 
-fn compile_component(engine: &Engine, package_id: &str, component_bytes: &[u8]) -> Result<Component> {
+fn compile_component(
+    engine: &Engine,
+    package_id: &str,
+    component_bytes: &[u8],
+) -> Result<Component> {
     wasmtime(Component::new(engine, component_bytes))
         .with_context(|| format!("failed to compile component for `{package_id}`"))
 }
@@ -389,7 +392,8 @@ fn configure_store_fuel(store: &mut Store<()>) -> Result<()> {
 }
 
 fn write_memory(memory: &Memory, store: &mut Store<()>, offset: usize, bytes: &[u8]) -> Result<()> {
-    any_result(memory.write(store, offset, bytes)).context("failed to write runtime input into wasm memory")
+    any_result(memory.write(store, offset, bytes))
+        .context("failed to write runtime input into wasm memory")
 }
 
 fn read_memory(
@@ -398,7 +402,8 @@ fn read_memory(
     offset: usize,
     bytes: &mut [u8],
 ) -> Result<()> {
-    any_result(memory.read(store, offset, bytes)).context("failed to read runtime output from wasm memory")
+    any_result(memory.read(store, offset, bytes))
+        .context("failed to read runtime output from wasm memory")
 }
 
 #[derive(Serialize)]
@@ -489,7 +494,7 @@ fn ensure_memory_capacity(
         &mut *store,
         u64::try_from(additional_pages).context("page count does not fit in u64")?,
     ))
-        .context("failed to grow wasm memory")?;
+    .context("failed to grow wasm memory")?;
     Ok(())
 }
 
