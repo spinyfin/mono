@@ -222,10 +222,16 @@ implementation = "../escape/check.toml"
     .expect("write root config");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let error = resolver
+    let checks = resolver
         .resolve_for_file(Path::new("docs/file.md"))
-        .expect_err("must fail");
-    assert!(error.to_string().contains("invalid `implementation`"));
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(checks.get("domain-typo").is_none());
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].check_id, "domain-typo");
+    assert_eq!(diagnostics[0].location.path, Path::new("CHECKS.toml"));
+    assert!(diagnostics[0].message.contains("invalid `implementation`"));
 }
 
 #[test]
@@ -377,10 +383,16 @@ severity = "fatal"
     .expect("write root config");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let error = resolver
+    let checks = resolver
         .resolve_for_file(Path::new("docs/file.md"))
-        .expect_err("must fail");
-    assert!(error.to_string().contains("invalid `policy.severity`"));
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(checks.get("file-size").is_none());
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].check_id, "file-size");
+    assert_eq!(diagnostics[0].location.path, Path::new("CHECKS.toml"));
+    assert!(diagnostics[0].message.contains("invalid `policy.severity`"));
 }
 
 #[test]
@@ -481,4 +493,34 @@ include_config_files = false
         .expect("resolve checks");
 
     assert!(!checks.include_config_files());
+}
+
+#[test]
+fn malformed_toml_reports_diagnostic_instead_of_failing() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+config = { max_lines = [1, 2 }
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("docs/file.md"))
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert_eq!(checks.enabled().count(), 0);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].check_id, "checks-config");
+    assert_eq!(diagnostics[0].location.path, Path::new("CHECKS.toml"));
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("failed to parse checks config")
+    );
 }

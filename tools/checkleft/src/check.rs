@@ -8,17 +8,26 @@ use crate::input::{ChangeSet, SourceTree};
 use crate::output::CheckResult;
 
 #[async_trait]
+pub trait ConfiguredCheck: Send + Sync {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult>;
+}
+
+#[async_trait]
 pub trait Check: Send + Sync {
     fn id(&self) -> &str;
 
     fn description(&self) -> &str;
+
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>>;
 
     async fn run(
         &self,
         changeset: &ChangeSet,
         tree: &dyn SourceTree,
         config: &toml::Value,
-    ) -> Result<CheckResult>;
+    ) -> Result<CheckResult> {
+        self.configure(config)?.run(changeset, tree).await
+    }
 }
 
 #[derive(Default)]

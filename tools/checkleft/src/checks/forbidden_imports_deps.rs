@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -21,13 +22,14 @@ impl Check for ForbiddenImportsDepsCheck {
         "flags changed files containing forbidden dependency/import patterns"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let compiled = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
@@ -43,7 +45,7 @@ impl Check for ForbiddenImportsDepsCheck {
             };
 
             for (line_index, line) in contents.lines().enumerate() {
-                for rule in &compiled.rules {
+                for rule in &self.rules {
                     if !rule.applies_to(&changed_file.path) {
                         continue;
                     }
@@ -67,7 +69,7 @@ impl Check for ForbiddenImportsDepsCheck {
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "forbidden-imports-deps".to_owned(),
             findings,
         })
     }

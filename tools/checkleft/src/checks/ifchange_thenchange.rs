@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::ifchange::{
     LineRange, ParsedIfChangeBlock, ParsedIfChangeFile, ThenChangeTarget, parse_ifchange_file,
 };
@@ -24,12 +25,14 @@ impl Check for IfChangeThenChangeCheck {
         "requires linked files or blocks to change together"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(Self))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for IfChangeThenChangeCheck {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let analyses: Vec<_> = changeset
             .changed_files
             .iter()

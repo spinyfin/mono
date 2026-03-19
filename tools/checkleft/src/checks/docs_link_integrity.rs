@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -22,12 +23,14 @@ impl Check for DocsLinkIntegrityCheck {
         "validates internal markdown links in changed markdown files"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(Self))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for DocsLinkIntegrityCheck {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
         let link_regex = Regex::new(r"\[[^\]]+\]\(([^)]+)\)").expect("valid markdown link regex");
 

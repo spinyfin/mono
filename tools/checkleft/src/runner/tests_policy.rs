@@ -1,3 +1,4 @@
+#[derive(Clone)]
 struct StaticFindingCheck {
     id: String,
     severity: Severity,
@@ -14,11 +15,17 @@ impl Check for StaticFindingCheck {
         "emits one static finding"
     }
 
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for StaticFindingCheck {
     async fn run(
         &self,
         changeset: &ChangeSet,
         _tree: &dyn SourceTree,
-        _config: &toml::Value,
     ) -> Result<CheckResult> {
         let path = changeset
             .changed_files

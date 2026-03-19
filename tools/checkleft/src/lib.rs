@@ -23,7 +23,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use crate::check::{Check, CheckRegistry};
+    use crate::check::{Check, CheckRegistry, ConfiguredCheck};
     use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
     use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
@@ -59,12 +59,14 @@ mod tests {
             "dummy check"
         }
 
-        async fn run(
-            &self,
-            _changeset: &ChangeSet,
-            _tree: &dyn SourceTree,
-            _config: &toml::Value,
-        ) -> Result<CheckResult> {
+        fn configure(&self, _config: &toml::Value) -> Result<std::sync::Arc<dyn ConfiguredCheck>> {
+            Ok(std::sync::Arc::new(Self))
+        }
+    }
+
+    #[async_trait]
+    impl ConfiguredCheck for DummyCheck {
+        async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
             Ok(CheckResult {
                 check_id: self.id().to_owned(),
                 findings: Vec::new(),

@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -22,13 +23,14 @@ impl Check for WorkflowActionVersionCheck {
         "requires configured GitHub Actions `uses:` refs to match expected versions"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let config = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
@@ -69,9 +71,9 @@ impl Check for WorkflowActionVersionCheck {
                 }
             };
 
-            for violation in find_version_violations(&workflow, &config.rules) {
+            for violation in find_version_violations(&workflow, &self.rules) {
                 findings.push(Finding {
-                    severity: config.severity,
+                    severity: self.severity,
                     message: format!(
                         "GitHub Action `{}` in job `{}` step {} must use `@{}` (found `@{}`).",
                         violation.action,
@@ -85,14 +87,14 @@ impl Check for WorkflowActionVersionCheck {
                         line: None,
                         column: None,
                     }),
-                    remediation: Some(config.remediation.clone()),
+                    remediation: Some(self.remediation.clone()),
                     suggested_fix: None,
                 });
             }
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "workflow-action-version".to_owned(),
             findings,
         })
     }

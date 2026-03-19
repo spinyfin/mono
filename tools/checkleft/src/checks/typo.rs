@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -20,14 +21,8 @@ impl Check for TypoCheck {
         "flags configured terminology typos in changed files"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let parsed = parse_typo_config(config)?;
-        run_typo_check(self.id(), changeset, tree, &parsed.rules)
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_typo_config(config)?))
     }
 }
 
@@ -82,6 +77,13 @@ enum Matcher {
 
 struct ParsedTypoConfig {
     rules: Vec<TypoRule>,
+}
+
+#[async_trait]
+impl ConfiguredCheck for ParsedTypoConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        run_typo_check("typo", changeset, tree, &self.rules)
+    }
 }
 
 fn run_typo_check(

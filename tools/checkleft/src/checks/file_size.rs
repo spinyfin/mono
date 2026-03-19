@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -22,20 +23,21 @@ impl Check for FileSizeCheck {
         "flags files exceeding configured line limits"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let config = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for ParsedFileSizeConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if let Some(exclude_globs) = &config.exclude_globs {
+            if let Some(exclude_globs) = &self.exclude_globs {
                 if exclude_globs.is_match(&changed_file.path) {
                     continue;
                 }
@@ -49,7 +51,7 @@ impl Check for FileSizeCheck {
             };
 
             let line_count = contents.lines().count();
-            if line_count <= config.max_lines {
+            if line_count <= self.max_lines {
                 continue;
             }
 
@@ -72,11 +74,11 @@ impl Check for FileSizeCheck {
                 severity: Severity::Warning,
                 message: format!(
                     "file has {line_count} lines, exceeding configured max_lines={}.{}",
-                    config.max_lines, growth_message
+                    self.max_lines, growth_message
                 ),
                 location: Some(Location {
                     path: changed_file.path.clone(),
-                    line: Some((config.max_lines.saturating_add(1)) as u32),
+                    line: Some((self.max_lines.saturating_add(1)) as u32),
                     column: Some(1),
                 }),
                 remediation: Some(
@@ -88,7 +90,7 @@ impl Check for FileSizeCheck {
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "file-size".to_owned(),
             findings,
         })
     }

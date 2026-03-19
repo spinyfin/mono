@@ -10,9 +10,19 @@ Each check implements:
 
 ```rust
 #[async_trait]
+pub trait ConfiguredCheck: Send + Sync {
+    async fn run(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+    ) -> Result<CheckResult>;
+}
+
+#[async_trait]
 pub trait Check: Send + Sync {
     fn id(&self) -> &str;
     fn description(&self) -> &str;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>>;
 
     async fn run(
         &self,
@@ -27,7 +37,7 @@ pub trait Check: Send + Sync {
 
 - `changeset`: changed files, kinds, and optional description metadata.
 - `tree`: safe source-tree access (`read_file`, `exists`, `list_dir`, `glob`).
-- `config`: the resolved `[checks.<id>.config]` table as TOML.
+- `config`: the resolved `[checks.<id>.config]` table as TOML, passed once to `configure()`.
 
 ## Output contract
 
@@ -58,8 +68,9 @@ Each finding supports:
 
 ## Best practices
 
+- Parse and validate config in `configure()` so bad `CHECKS.yaml` / `CHECKS.toml` entries are reported as config-file findings before execution.
 - Skip deleted files unless your check explicitly needs them.
-- Parse config once per run.
+- Parse config once per configured instance.
 - Keep findings stable and actionable.
 - Default check findings to the implementation's intrinsic severity; use `[checks.policy].severity` for per-instance overrides.
 - Use framework policy for bypass behavior (`[checks.policy].allow_bypass`) instead of check-local bypass parsing.
@@ -70,16 +81,31 @@ Each finding supports:
 #[derive(Debug, Default)]
 pub struct ExampleCheck;
 
+struct ConfiguredExampleCheck {
+    threshold: usize,
+}
+
 #[async_trait]
 impl Check for ExampleCheck {
     fn id(&self) -> &str { "example" }
     fn description(&self) -> &str { "validates example policy" }
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        let threshold = config
+            .get("threshold")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(1);
+        Ok(Arc::new(ConfiguredExampleCheck {
+            threshold: usize::try_from(threshold)?,
+        }))
+    }
+}
 
+#[async_trait]
+impl ConfiguredCheck for ConfiguredExampleCheck {
     async fn run(
         &self,
         changeset: &ChangeSet,
         tree: &dyn SourceTree,
-        config: &toml::Value,
     ) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
@@ -95,7 +121,7 @@ impl Check for ExampleCheck {
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "example".to_owned(),
             findings,
         })
     }

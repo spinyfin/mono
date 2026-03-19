@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tree_sitter::{Node, Parser};
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -21,12 +22,14 @@ impl Check for RepoVisibilityCheck {
         "rejects Bazel packages that default to //visibility:public"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(Self))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for RepoVisibilityCheck {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
