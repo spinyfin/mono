@@ -66,14 +66,18 @@ You can instantiate the same implementation more than once by using unique IDs w
 id = "forbidden-generated-outputs"
 check = "forbidden-paths"
 
-[checks.config]
+[[checks.config.rules]]
+remediation = "Generated outputs must not be checked in. Remove them from the change."
+when = ["added", "modified", "renamed"]
 patterns = ["**/target/**", "**/node_modules/**"]
 
 [[checks]]
 id = "forbidden-ios-build-dir"
 check = "forbidden-paths"
 
-[checks.config]
+[[checks.config.rules]]
+remediation = "iOS build directories must not be checked in. Remove them from the change."
+when = ["added", "modified", "renamed"]
 patterns = ["mobile/ios/.build/**"]
 ```
 

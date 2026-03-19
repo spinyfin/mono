@@ -1,10 +1,12 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 use crate::check::Check;
-use crate::input::{ChangeKind, ChangeSet, SourceTree};
+use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
@@ -30,32 +32,33 @@ impl Check for ForbiddenPathsCheck {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
-            if matches!(changed_file.kind, ChangeKind::Deleted) {
-                continue;
-            }
-            if let Some(exclude_globs) = &compiled.exclude_globs {
-                if exclude_globs.is_match(&changed_file.path) {
+            for rule in &compiled.rules {
+                if !rule.when.contains(&changed_file.kind) {
                     continue;
                 }
-            }
 
-            let matches = compiled.patterns.matches(&changed_file.path);
-            if matches.is_empty() {
-                continue;
-            }
-            let matched_pattern = &compiled.pattern_strings[matches[0]];
+                let Some((matched_path, matched_pattern)) =
+                    first_match(rule, changed_file, compiled.exclude_globs.as_ref())
+                else {
+                    continue;
+                };
 
-            findings.push(Finding {
-                severity: compiled.severity,
-                message: format!("path matches forbidden pattern `{matched_pattern}`"),
-                location: Some(Location {
-                    path: changed_file.path.clone(),
-                    line: None,
-                    column: None,
-                }),
-                remediation: Some(compiled.remediation.clone()),
-                suggested_fix: None,
-            });
+                findings.push(Finding {
+                    severity: compiled.severity,
+                    message: format!(
+                        "path `{}` is forbidden for {} changes. (matched `{matched_pattern}`)",
+                        matched_path.display(),
+                        change_kind_name(changed_file.kind),
+                    ),
+                    location: Some(Location {
+                        path: matched_path,
+                        line: None,
+                        column: None,
+                    }),
+                    remediation: Some(rule.remediation.clone()),
+                    suggested_fix: None,
+                });
+            }
         }
 
         Ok(CheckResult {
@@ -68,21 +71,33 @@ impl Check for ForbiddenPathsCheck {
 #[derive(Debug, Deserialize)]
 struct ForbiddenPathsConfig {
     #[serde(default)]
-    patterns: Vec<String>,
+    rules: Vec<ForbiddenPathRuleConfig>,
     #[serde(default)]
     exclude_globs: Vec<String>,
     #[serde(default)]
     severity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForbiddenPathRuleConfig {
+    remediation: String,
     #[serde(default)]
-    remediation: Option<String>,
+    when: Vec<ChangeKind>,
+    #[serde(default)]
+    patterns: Vec<String>,
 }
 
 struct CompiledForbiddenPathsConfig {
-    pattern_strings: Vec<String>,
-    patterns: GlobSet,
+    rules: Vec<CompiledForbiddenPathRule>,
     exclude_globs: Option<GlobSet>,
     severity: Severity,
+}
+
+struct CompiledForbiddenPathRule {
     remediation: String,
+    when: Vec<ChangeKind>,
+    pattern_strings: Vec<String>,
+    patterns: GlobSet,
 }
 
 fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenPathsConfig> {
@@ -91,11 +106,35 @@ fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenPathsConfig> {
         .try_into()
         .context("invalid forbidden-paths check config")?;
 
-    if parsed.patterns.is_empty() {
-        bail!("forbidden-paths check config must contain at least one `patterns` entry");
+    if parsed.rules.is_empty() {
+        bail!("forbidden-paths check config must contain at least one `rules` entry");
     }
 
-    let patterns = compile_globset("patterns", &parsed.patterns)?;
+    let mut rules = Vec::with_capacity(parsed.rules.len());
+    for (index, rule) in parsed.rules.into_iter().enumerate() {
+        let field_prefix = format!("rules[{index}]");
+        if rule.remediation.trim().is_empty() {
+            bail!("forbidden-paths check config `{field_prefix}.remediation` must not be empty");
+        }
+        if rule.when.is_empty() {
+            bail!(
+                "forbidden-paths check config `{field_prefix}.when` must contain at least one change kind"
+            );
+        }
+        if rule.patterns.is_empty() {
+            bail!(
+                "forbidden-paths check config `{field_prefix}.patterns` must contain at least one pattern"
+            );
+        }
+
+        rules.push(CompiledForbiddenPathRule {
+            remediation: rule.remediation,
+            when: rule.when,
+            pattern_strings: rule.patterns.clone(),
+            patterns: compile_globset(&format!("{field_prefix}.patterns"), &rule.patterns)?,
+        });
+    }
+
     let exclude_globs = if parsed.exclude_globs.is_empty() {
         None
     } else {
@@ -103,14 +142,9 @@ fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenPathsConfig> {
     };
 
     Ok(CompiledForbiddenPathsConfig {
-        pattern_strings: parsed.patterns,
-        patterns,
+        rules,
         exclude_globs,
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
-        remediation: parsed.remediation.unwrap_or_else(|| {
-            "Do not commit generated output artifacts. Remove this path from versioned changes."
-                .to_owned()
-        }),
     })
 }
 
@@ -125,6 +159,48 @@ fn compile_globset(field_name: &str, patterns: &[String]) -> Result<GlobSet> {
     builder
         .build()
         .with_context(|| format!("failed to compile `{field_name}` glob patterns"))
+}
+
+fn first_match<'a>(
+    rule: &'a CompiledForbiddenPathRule,
+    changed_file: &'a ChangedFile,
+    exclude_globs: Option<&GlobSet>,
+) -> Option<(PathBuf, &'a str)> {
+    for candidate in candidate_paths(changed_file) {
+        if exclude_globs.is_some_and(|globs| globs.is_match(candidate)) {
+            continue;
+        }
+
+        let matches = rule.patterns.matches(candidate);
+        if matches.is_empty() {
+            continue;
+        }
+
+        return Some((candidate.to_path_buf(), &rule.pattern_strings[matches[0]]));
+    }
+
+    None
+}
+
+fn candidate_paths(changed_file: &ChangedFile) -> Vec<&Path> {
+    let mut paths = vec![changed_file.path.as_path()];
+    if matches!(changed_file.kind, ChangeKind::Renamed) {
+        if let Some(old_path) = changed_file.old_path.as_deref() {
+            if old_path != changed_file.path.as_path() {
+                paths.push(old_path);
+            }
+        }
+    }
+    paths
+}
+
+fn change_kind_name(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +218,7 @@ mod tests {
     use super::ForbiddenPathsCheck;
 
     #[tokio::test]
-    async fn flags_forbidden_output_path() {
+    async fn flags_added_path_for_matching_rule() {
         let temp = tempdir().expect("create temp dir");
         let artifact = temp.path().join("mobile/ios/.build/workspace-state.json");
         fs::create_dir_all(artifact.parent().expect("artifact parent")).expect("create dirs");
@@ -159,7 +235,7 @@ mod tests {
                 }]),
                 &tree,
                 &toml::Value::Table(toml::toml! {
-                    patterns = ["**/.build/**"]
+                    rules = [{ remediation = "Generated artifacts must not be committed. Remove them from the change.", when = ["added"], patterns = ["**/.build/**"] }]
                 }),
             )
             .await
@@ -167,11 +243,15 @@ mod tests {
 
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].severity, Severity::Error);
+        assert_eq!(
+            result.findings[0].remediation.as_deref(),
+            Some("Generated artifacts must not be committed. Remove them from the change.")
+        );
         assert!(result.findings[0].message.contains("**/.build/**"));
     }
 
     #[tokio::test]
-    async fn ignores_deleted_files() {
+    async fn does_not_flag_added_file_for_modified_only_rule() {
         let temp = tempdir().expect("create temp dir");
         let check = ForbiddenPathsCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");
@@ -179,18 +259,103 @@ mod tests {
             .run(
                 &ChangeSet::new(vec![ChangedFile {
                     path: Path::new("mobile/ios/.build/workspace-state.json").to_path_buf(),
-                    kind: ChangeKind::Deleted,
+                    kind: ChangeKind::Added,
                     old_path: None,
                 }]),
                 &tree,
                 &toml::Value::Table(toml::toml! {
-                    patterns = ["**/.build/**"]
+                    rules = [{ remediation = "Generated artifacts must not be edited.", when = ["modified"], patterns = ["**/.build/**"] }]
                 }),
             )
             .await
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flags_deleted_files_when_delete_rule_matches() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("backend/legacy/config.toml").to_path_buf(),
+                    kind: ChangeKind::Deleted,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "Compatibility config must not be removed. Restore the file to the change.", when = ["deleted"], patterns = ["backend/legacy/config.toml"] }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(
+            result.findings[0].remediation.as_deref(),
+            Some("Compatibility config must not be removed. Restore the file to the change.")
+        );
+        assert_eq!(
+            result.findings[0].location.as_ref().expect("location").path,
+            Path::new("backend/legacy/config.toml")
+        );
+    }
+
+    #[tokio::test]
+    async fn flags_renamed_files_when_new_path_matches() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/dist/app.js").to_path_buf(),
+                    kind: ChangeKind::Renamed,
+                    old_path: Some(Path::new("frontend/src/app.js").to_path_buf()),
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "Distribution assets must not be committed. Move them out of versioned paths.", when = ["renamed"], patterns = ["**/dist/**"] }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(
+            result.findings[0].location.as_ref().expect("location").path,
+            Path::new("frontend/dist/app.js")
+        );
+    }
+
+    #[tokio::test]
+    async fn flags_renamed_files_when_old_path_matches() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/src/app.js").to_path_buf(),
+                    kind: ChangeKind::Renamed,
+                    old_path: Some(Path::new("frontend/dist/app.js").to_path_buf()),
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "Distribution assets must not be renamed into tracked source paths.", when = ["renamed"], patterns = ["**/dist/**"] }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(
+            result.findings[0].location.as_ref().expect("location").path,
+            Path::new("frontend/dist/app.js")
+        );
     }
 
     #[tokio::test]
@@ -207,7 +372,7 @@ mod tests {
                 }]),
                 &tree,
                 &toml::Value::Table(toml::toml! {
-                    patterns = ["**/.build/**"]
+                    rules = [{ remediation = "Generated artifacts must not be committed.", when = ["added"], patterns = ["**/.build/**"] }]
                     exclude_globs = ["mobile/ios/.build/**"]
                 }),
             )
@@ -218,7 +383,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requires_at_least_one_pattern() {
+    async fn emits_one_finding_per_matching_rule() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/dist/app.js.swp").to_path_buf(),
+                    kind: ChangeKind::Added,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [
+                        { remediation = "Distribution assets must not be committed.", when = ["added"], patterns = ["**/dist/**", "**/build/**"] },
+                        { remediation = "Editor scratch files do not belong in the repo.", when = ["added", "modified"], patterns = ["**/*.swp", "**/*~"] }
+                    ]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn emits_one_finding_when_multiple_patterns_match_same_rule() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/dist/app.js").to_path_buf(),
+                    kind: ChangeKind::Added,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "Generated outputs must not be checked in.", when = ["added"], patterns = ["frontend/**", "**/dist/**"] }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn requires_at_least_one_rule() {
         let temp = tempdir().expect("create temp dir");
         let check = ForbiddenPathsCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");
@@ -231,6 +445,94 @@ mod tests {
                 }]),
                 &tree,
                 &toml::Value::Table(Default::default()),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_rule_remediation() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("backend/src/lib.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "   ", when = ["modified"], patterns = ["backend/**"] }]
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_when_list() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("backend/src/lib.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "No edits allowed.", when = [], patterns = ["backend/**"] }]
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_patterns_list() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("backend/src/lib.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "No edits allowed.", when = ["modified"], patterns = [] }]
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_glob_pattern() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("backend/src/lib.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "No edits allowed.", when = ["modified"], patterns = ["["] }]
+                }),
             )
             .await;
 

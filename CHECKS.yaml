@@ -2,13 +2,18 @@ checks:
   - id: no-generated-artifacts
     check: forbidden-paths
     config:
-      patterns:
-        - "**/target/**"
-        - "**/node_modules/**"
-        - "**/.build/**"
-        - "bazel-*"
-        - "bazel-*/**"
-      remediation: "Do not commit generated build output. Remove the artifact from the change."
+      rules:
+        - remediation: Generated build output must not be committed. Remove the artifact from the change.
+          when:
+            - added
+            - modified
+            - renamed
+          patterns:
+            - "**/target/**"
+            - "**/node_modules/**"
+            - "**/.build/**"
+            - "bazel-*"
+            - "bazel-*/**"
 
   - id: oversized-files
     check: file-size
