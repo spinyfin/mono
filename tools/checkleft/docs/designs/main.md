@@ -70,3 +70,9 @@ while still allowing the `mono` version to diverge afterward.
 - Updating `flunge` to consume `mono/tools/checkleft`.
 - Redesigning the framework API during the initial move.
 - Broadening the check catalog beyond what already exists in `flunge`.
+
+## Related Designs
+
+- [`ifchange-thenchange`](ifchange-thenchange.md)
+- [`forbidden-paths-evolution`](forbidden-paths-evolution.md)
+- [`code-patterns`](code-patterns.md)
