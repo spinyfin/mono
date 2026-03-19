@@ -39,6 +39,15 @@ pub struct ParsedIfChangeBlock {
     pub target: ThenChangeTarget,
 }
 
+impl ParsedIfChangeBlock {
+    pub fn full_range(&self) -> LineRange {
+        LineRange {
+            start: self.ifchange_line,
+            end: self.thenchange_line,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
     pub start: usize,

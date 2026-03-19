@@ -100,6 +100,35 @@ Config keys:
 - `severity` (optional `error|warning|info`, default `error`)
 - `remediation` (optional string)
 
+## `ifchange-thenchange`
+
+Purpose:
+
+- Enforces `LINT.IfChange` / `LINT.ThenChange` contracts so linked files or
+  linked blocks change together.
+
+Config keys:
+
+- None.
+
+Syntax:
+
+```text
+LINT.IfChange
+LINT.IfChange(label)
+LINT.ThenChange(path)
+LINT.ThenChange(path:label)
+```
+
+Notes:
+
+- Directives should live on their own lines inside normal source comments.
+- `ThenChange(path)` requires any change to the linked file.
+- `ThenChange(path:label)` requires a touched `LINT.IfChange(label)` block in
+  the linked file.
+- Severity defaults to `error`.
+- Use normal per-instance bypass policy if you need an exception.
+
 ## `rust-test-rule-coverage`
 
 Purpose:
