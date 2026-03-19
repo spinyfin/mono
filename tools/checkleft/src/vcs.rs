@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -10,6 +11,13 @@ use tracing::info;
 mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
+
+fn ensure_rustls_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaseRevision {
@@ -168,6 +176,7 @@ pub async fn github_pull_request_description(
     github_token: Option<&str>,
 ) -> Option<String> {
     let url = format!("https://api.github.com/repos/{repository}/pulls/{change_id}");
+    ensure_rustls_provider();
     let client = reqwest::Client::new();
     let mut request = client
         .get(url)
@@ -183,7 +192,8 @@ pub async fn github_pull_request_description(
         return None;
     }
 
-    let payload: GithubPullRequestResponse = response.json().await.ok()?;
+    let response_bytes = response.bytes().await.ok()?;
+    let payload: GithubPullRequestResponse = serde_json::from_slice(&response_bytes).ok()?;
     normalize_non_empty(payload.body)
 }
 
