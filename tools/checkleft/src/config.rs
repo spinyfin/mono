@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
@@ -94,6 +95,7 @@ pub struct ConfigDiagnostic {
 pub struct ConfigResolver {
     root: PathBuf,
     external_root_configs: Vec<LoadedChecksFile>,
+    resolution_cache: Mutex<HashMap<PathBuf, ResolvedChecks>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,6 +109,7 @@ impl ConfigResolver {
         Ok(Self {
             root,
             external_root_configs: Vec::new(),
+            resolution_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -130,6 +133,7 @@ impl ConfigResolver {
         Ok(Self {
             root,
             external_root_configs,
+            resolution_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -137,84 +141,139 @@ impl ConfigResolver {
         validate_relative_path(file_path)?;
         info!(path = %file_path.display(), "resolving checks for file");
 
-        let parent_dir = file_path.parent().unwrap_or(Path::new(""));
-        let search_dirs = root_to_leaf_dirs(parent_dir)?;
+        self.resolve_for_dir(file_path.parent().unwrap_or(Path::new("")))
+    }
 
+    #[cfg(feature = "benchmarking")]
+    #[doc(hidden)]
+    pub fn resolve_for_file_without_cache(&self, file_path: &Path) -> Result<ResolvedChecks> {
+        validate_relative_path(file_path)?;
+
+        self.resolve_for_dir_without_cache(file_path.parent().unwrap_or(Path::new("")))
+    }
+
+    fn resolve_for_dir(&self, relative_dir: &Path) -> Result<ResolvedChecks> {
+        validate_relative_path(relative_dir)?;
+
+        if let Some(cached) = self.cached_resolution(relative_dir) {
+            return Ok(cached);
+        }
+
+        let mut resolved = if relative_dir.as_os_str().is_empty() {
+            self.base_resolution()?
+        } else {
+            self.resolve_for_dir(relative_dir.parent().unwrap_or(Path::new("")))?
+        };
+
+        self.apply_local_config(&mut resolved, relative_dir);
+        self.store_cached_resolution(relative_dir, &resolved);
+        Ok(resolved)
+    }
+
+    #[cfg(feature = "benchmarking")]
+    fn resolve_for_dir_without_cache(&self, relative_dir: &Path) -> Result<ResolvedChecks> {
+        validate_relative_path(relative_dir)?;
+
+        let mut resolved = if relative_dir.as_os_str().is_empty() {
+            self.base_resolution()?
+        } else {
+            self.resolve_for_dir_without_cache(relative_dir.parent().unwrap_or(Path::new("")))?
+        };
+
+        self.apply_local_config(&mut resolved, relative_dir);
+        Ok(resolved)
+    }
+
+    fn cached_resolution(&self, relative_dir: &Path) -> Option<ResolvedChecks> {
+        self.resolution_cache
+            .lock()
+            .expect("config resolution cache poisoned")
+            .get(relative_dir)
+            .cloned()
+    }
+
+    fn store_cached_resolution(&self, relative_dir: &Path, resolved: &ResolvedChecks) {
+        self.resolution_cache
+            .lock()
+            .expect("config resolution cache poisoned")
+            .insert(relative_dir.to_path_buf(), resolved.clone());
+    }
+
+    fn base_resolution(&self) -> Result<ResolvedChecks> {
         let mut resolved = ResolvedChecks::default();
         for external_checks_file in &self.external_root_configs {
             apply_external_checks_file(&mut resolved, external_checks_file)?;
         }
-
-        for relative_dir in search_dirs {
-            let config_dir = self.root.join(relative_dir);
-            let Some(config_path) = resolve_checks_file_path(&config_dir) else {
-                continue;
-            };
-            info!(path = %config_path.display(), "loading checks config");
-            let config_relative_path = config_path
-                .strip_prefix(&self.root)
-                .unwrap_or(config_path.as_path())
-                .to_path_buf();
-
-            let checks_file = match parse_checks_file(&config_path, &config_relative_path) {
-                Ok(checks_file) => checks_file,
-                Err(diagnostic) => {
-                    resolved.push_diagnostic(diagnostic);
-                    continue;
-                }
-            };
-            apply_local_settings(
-                &mut resolved,
-                &checks_file.settings,
-                config_dir == self.root,
-                &config_relative_path,
-            );
-            for check in checks_file.checks {
-                let configured_id = check.id;
-                let implementation = if check.enabled {
-                    match parse_check_implementation(
-                        check.implementation.as_deref(),
-                        &configured_id,
-                        None,
-                    ) {
-                        Ok(implementation) => implementation,
-                        Err(err) => {
-                            resolved.push_diagnostic(config_check_diagnostic(
-                                configured_id.clone(),
-                                config_relative_path.clone(),
-                                err.to_string(),
-                            ));
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-                let policy =
-                    match parse_policy_config(&configured_id, &check.policy, check.enabled, None) {
-                        Ok(policy) => policy,
-                        Err(err) => {
-                            resolved.push_diagnostic(config_check_diagnostic(
-                                configured_id.clone(),
-                                config_relative_path.clone(),
-                                err.to_string(),
-                            ));
-                            continue;
-                        }
-                    };
-                resolved.upsert(CheckConfig {
-                    check: check.check.unwrap_or_else(|| configured_id.clone()),
-                    id: configured_id,
-                    source_path: config_relative_path.clone(),
-                    implementation,
-                    enabled: check.enabled,
-                    policy,
-                    config: check.config,
-                });
-            }
-        }
-
         Ok(resolved)
+    }
+
+    fn apply_local_config(&self, resolved: &mut ResolvedChecks, relative_dir: &Path) {
+        let config_dir = self.root.join(relative_dir);
+        let Some(config_path) = resolve_checks_file_path(&config_dir) else {
+            return;
+        };
+        info!(path = %config_path.display(), "loading checks config");
+        let config_relative_path = config_path
+            .strip_prefix(&self.root)
+            .unwrap_or(config_path.as_path())
+            .to_path_buf();
+
+        let checks_file = match parse_checks_file(&config_path, &config_relative_path) {
+            Ok(checks_file) => checks_file,
+            Err(diagnostic) => {
+                resolved.push_diagnostic(diagnostic);
+                return;
+            }
+        };
+        apply_local_settings(
+            resolved,
+            &checks_file.settings,
+            config_dir == self.root,
+            &config_relative_path,
+        );
+        for check in checks_file.checks {
+            let configured_id = check.id;
+            let implementation = if check.enabled {
+                match parse_check_implementation(
+                    check.implementation.as_deref(),
+                    &configured_id,
+                    None,
+                ) {
+                    Ok(implementation) => implementation,
+                    Err(err) => {
+                        resolved.push_diagnostic(config_check_diagnostic(
+                            configured_id.clone(),
+                            config_relative_path.clone(),
+                            err.to_string(),
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let policy =
+                match parse_policy_config(&configured_id, &check.policy, check.enabled, None) {
+                    Ok(policy) => policy,
+                    Err(err) => {
+                        resolved.push_diagnostic(config_check_diagnostic(
+                            configured_id.clone(),
+                            config_relative_path.clone(),
+                            err.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+            resolved.upsert(CheckConfig {
+                check: check.check.unwrap_or_else(|| configured_id.clone()),
+                id: configured_id,
+                source_path: config_relative_path.clone(),
+                implementation,
+                enabled: check.enabled,
+                policy,
+                config: check.config,
+            });
+        }
     }
 }
 
@@ -783,21 +842,6 @@ fn external_checks_retry_delay(attempt: u32, status: StatusCode) -> Duration {
         EXTERNAL_CHECKS_FETCH_BASE_DELAY
     };
     base_delay.saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
-}
-
-fn root_to_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>> {
-    validate_relative_path(path)?;
-
-    let mut output = vec![PathBuf::new()];
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        if let Component::Normal(part) = component {
-            current.push(part);
-            output.push(current.clone());
-        }
-    }
-
-    Ok(output)
 }
 
 fn resolve_checks_file_path(dir: &Path) -> Option<PathBuf> {

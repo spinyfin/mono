@@ -112,6 +112,48 @@ id = "rust-naming"
 }
 
 #[test]
+fn caches_ancestor_config_resolution_across_sibling_directories() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/src")).expect("create src dir");
+    fs::create_dir_all(temp.path().join("backend/tests")).expect("create tests dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write root config");
+
+    fs::write(
+        temp.path().join("backend/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "spelling-typos"
+"#,
+    )
+    .expect("write backend config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let initial = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve backend/src checks");
+    let initial_enabled: Vec<_> = initial.enabled().map(|check| check.id.as_str()).collect();
+    assert_eq!(initial_enabled, vec!["file-size", "spelling-typos"]);
+
+    fs::remove_file(temp.path().join("CHECKS.toml")).expect("remove root config");
+    fs::remove_file(temp.path().join("backend/CHECKS.toml")).expect("remove backend config");
+
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/tests/lib.rs"))
+        .expect("resolve backend/tests checks");
+
+    let enabled: Vec<_> = checks.enabled().map(|check| check.id.as_str()).collect();
+    assert_eq!(enabled, vec!["file-size", "spelling-typos"]);
+}
+
+#[test]
 fn child_can_disable_inherited_check() {
     let temp = tempdir().expect("create temp dir");
 
