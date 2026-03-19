@@ -84,6 +84,7 @@ impl ExternalSourcePackageBuilder for StaticSourcePackageBuilder {
 #[test]
 fn source_mode_executes_with_built_artifact() {
     let temp = tempdir().expect("temp dir");
+    let artifact_cache = tempdir().expect("artifact cache");
     let output_json = r#"{"findings":[{"severity":"warning","message":"from-source","location":null,"remediation":null,"suggested_fix":null}]}"#;
     let output_offset = 2048_u64;
     let output_len = output_json.len() as u64;
@@ -101,11 +102,16 @@ i64.const {encoded}
         encoded = encoded,
     );
     let wasm_bytes = wat::parse_str(&wat).expect("parse wat");
-    fs::write(temp.path().join("built.wasm"), wasm_bytes).expect("write built artifact");
-    let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("built.wasm")).expect("read"));
+    fs::write(artifact_cache.path().join("built.wasm"), wasm_bytes).expect("write built artifact");
+    let artifact_sha256 =
+        sha256_hex(&fs::read(artifact_cache.path().join("built.wasm")).expect("read"));
     let source_builder = Arc::new(StaticSourcePackageBuilder {
         artifact: ExternalCheckArtifactPackage {
-            artifact_path: "built.wasm".to_owned(),
+            artifact_path: artifact_cache
+                .path()
+                .join("built.wasm")
+                .to_string_lossy()
+                .into_owned(),
             artifact_sha256,
             provenance: None,
         },

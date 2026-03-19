@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,12 +13,20 @@ use crate::path::validate_relative_path;
 
 use super::{ExternalCheckArtifactPackage, ExternalCheckPackage, ExternalCheckSourcePackage};
 
-const SOURCE_MODE_CACHE_ROOT: &str = ".checkleft-cache/external-checks/source-mode";
-const JS_COMPONENTIZER_TOOLCHAIN_DIR: &str = "tools/checks_js_componentizer";
+const CHECKLEFT_CACHE_DIR_NAME: &str = "checkleft";
+const CHECKLEFT_REPOS_CACHE_DIR: &str = "repos";
+const CHECKLEFT_TOOLCHAINS_CACHE_DIR: &str = "toolchains";
+const SOURCE_MODE_ARTIFACTS_DIR: &str = "source-mode/artifacts";
+const JS_COMPONENTIZER_TOOLCHAIN_SOURCE_DIR: &str = "tools/checks_js_componentizer";
+const JS_COMPONENTIZER_TOOLCHAINS_DIR: &str = "js-componentizer/toolchains";
+const JS_COMPONENTIZER_PACKAGE_JSON: &str = "package.json";
 const JS_COMPONENTIZER_LOCKFILE: &str = "pnpm-lock.yaml";
 const JS_COMPONENTIZER_BUILD_SCRIPT: &str = "scripts/build_check.mjs";
-const JS_COMPONENTIZER_BOOTSTRAP_ROOT: &str = ".checkleft-cache/js-componentizer/bootstrap";
-const SOURCE_BUILD_ABI_VERSION: &str = "source-build-v1";
+const JS_COMPONENTIZER_SCRIPTS_DIR: &str = "scripts";
+const JS_COMPONENTIZER_WIT_DIR: &str = "wit";
+const JS_COMPONENTIZER_BOOTSTRAP_STAMP: &str = ".bootstrap.ok";
+const SOURCE_BUILD_ABI_VERSION: &str = "source-build-v2";
+const TOOLCHAIN_STATE_ABI_VERSION: &str = "js-componentizer-toolchain-v1";
 
 pub trait ExternalSourcePackageBuilder: Send + Sync {
     fn build_source_package(
@@ -29,6 +38,8 @@ pub trait ExternalSourcePackageBuilder: Send + Sync {
 
 pub struct JavaScriptComponentSourcePackageBuilder {
     root: PathBuf,
+    repo_cache_root: Option<PathBuf>,
+    toolchain_cache_root: Option<PathBuf>,
     command_runner: Arc<dyn CommandRunner>,
 }
 
@@ -36,17 +47,23 @@ impl JavaScriptComponentSourcePackageBuilder {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            repo_cache_root: None,
+            toolchain_cache_root: None,
             command_runner: Arc::new(ProcessCommandRunner),
         }
     }
 
     #[cfg(test)]
-    fn with_command_runner(
+    fn with_cache_roots(
         root: impl Into<PathBuf>,
+        repo_cache_root: impl Into<PathBuf>,
+        toolchain_cache_root: impl Into<PathBuf>,
         command_runner: Arc<dyn CommandRunner>,
     ) -> Self {
         Self {
             root: root.into(),
+            repo_cache_root: Some(repo_cache_root.into()),
+            toolchain_cache_root: Some(toolchain_cache_root.into()),
             command_runner,
         }
     }
@@ -56,17 +73,22 @@ impl JavaScriptComponentSourcePackageBuilder {
         package: &ExternalCheckPackage,
         source: &ExternalCheckSourcePackage,
     ) -> Result<ExternalCheckArtifactPackage> {
-        let toolchain_dir = self.root.join(JS_COMPONENTIZER_TOOLCHAIN_DIR);
-        let lock_path = toolchain_dir.join(JS_COMPONENTIZER_LOCKFILE);
-        let lock_contents = fs::read(&lock_path).with_context(|| {
-            format!("missing JS componentizer lockfile {}", lock_path.display())
-        })?;
-        let lock_hash = sha256_hex(&lock_contents);
-        self.ensure_toolchain_bootstrapped(&toolchain_dir, &lock_hash)?;
+        let repo_cache_root = self.repo_cache_root()?;
+        let toolchain_cache_root = self.toolchain_cache_root()?;
+        let toolchain_source_dir = self.root.join(JS_COMPONENTIZER_TOOLCHAIN_SOURCE_DIR);
+        let prepared_toolchain =
+            self.prepare_toolchain(&toolchain_cache_root, &toolchain_source_dir)?;
 
         let source_inputs = self.collect_source_inputs(source)?;
-        let cache_key = self.compute_cache_key(package, source, &lock_hash, &source_inputs);
-        let artifact_dir = self.root.join(SOURCE_MODE_CACHE_ROOT).join(cache_key);
+        let cache_key = self.compute_cache_key(
+            package,
+            source,
+            &prepared_toolchain.state_hash,
+            &source_inputs,
+        );
+        let artifact_dir = repo_cache_root
+            .join(SOURCE_MODE_ARTIFACTS_DIR)
+            .join(cache_key);
         let artifact_path = artifact_dir.join("check.wasm");
 
         if !artifact_path.exists() {
@@ -83,10 +105,10 @@ impl JavaScriptComponentSourcePackageBuilder {
                     source.entry, package.id
                 )
             })?;
-            let build_script = toolchain_dir.join(JS_COMPONENTIZER_BUILD_SCRIPT);
+            let build_script = prepared_toolchain.dir.join(JS_COMPONENTIZER_BUILD_SCRIPT);
 
             self.command_runner.run(
-                &toolchain_dir,
+                &prepared_toolchain.dir,
                 "node",
                 &[
                     build_script.to_string_lossy().into_owned(),
@@ -107,16 +129,38 @@ impl JavaScriptComponentSourcePackageBuilder {
             )
         })?;
         let artifact_sha256 = sha256_hex(&artifact_bytes);
-        let artifact_rel_path = relative_to_root(&self.root, &artifact_path)?;
 
         Ok(ExternalCheckArtifactPackage {
-            artifact_path: artifact_rel_path,
+            artifact_path: artifact_path.to_string_lossy().into_owned(),
             artifact_sha256,
             provenance: None,
         })
     }
 
-    fn ensure_toolchain_bootstrapped(&self, toolchain_dir: &Path, lock_hash: &str) -> Result<()> {
+    fn prepare_toolchain(
+        &self,
+        cache_root: &Path,
+        toolchain_source_dir: &Path,
+    ) -> Result<PreparedToolchain> {
+        let toolchain_state_hash = self.compute_toolchain_state_hash(toolchain_source_dir)?;
+        let toolchain_dir = cache_root
+            .join(JS_COMPONENTIZER_TOOLCHAINS_DIR)
+            .join(&toolchain_state_hash);
+
+        self.sync_toolchain_inputs(toolchain_source_dir, &toolchain_dir)?;
+        self.ensure_toolchain_bootstrapped(&toolchain_dir, &toolchain_state_hash)?;
+
+        Ok(PreparedToolchain {
+            dir: toolchain_dir,
+            state_hash: toolchain_state_hash,
+        })
+    }
+
+    fn ensure_toolchain_bootstrapped(
+        &self,
+        toolchain_dir: &Path,
+        toolchain_state_hash: &str,
+    ) -> Result<()> {
         fs::create_dir_all(toolchain_dir).with_context(|| {
             format!(
                 "failed to create JS componentizer toolchain directory {}",
@@ -124,11 +168,8 @@ impl JavaScriptComponentSourcePackageBuilder {
             )
         })?;
 
-        let stamp = self
-            .root
-            .join(JS_COMPONENTIZER_BOOTSTRAP_ROOT)
-            .join(format!("{lock_hash}.ok"));
-        if stamp.exists() {
+        let stamp = toolchain_dir.join(JS_COMPONENTIZER_BOOTSTRAP_STAMP);
+        if stamp.exists() && toolchain_dir.join("node_modules").is_dir() {
             return Ok(());
         }
 
@@ -153,12 +194,95 @@ impl JavaScriptComponentSourcePackageBuilder {
                 stamp_parent.display()
             )
         })?;
-        fs::write(&stamp, lock_hash).with_context(|| {
+        fs::write(&stamp, toolchain_state_hash).with_context(|| {
             format!(
                 "failed to write JS componentizer bootstrap stamp {}",
                 stamp.display()
             )
         })?;
+        Ok(())
+    }
+
+    fn repo_cache_root(&self) -> Result<PathBuf> {
+        match &self.repo_cache_root {
+            Some(cache_root) => Ok(cache_root.clone()),
+            None => default_repo_cache_root(&self.root),
+        }
+    }
+
+    fn toolchain_cache_root(&self) -> Result<PathBuf> {
+        match &self.toolchain_cache_root {
+            Some(cache_root) => Ok(cache_root.clone()),
+            None => default_toolchain_cache_root(),
+        }
+    }
+
+    fn compute_toolchain_state_hash(&self, toolchain_source_dir: &Path) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(TOOLCHAIN_STATE_ABI_VERSION);
+
+        let inputs = self.collect_toolchain_inputs(toolchain_source_dir)?;
+        for path in inputs {
+            let relative = path.strip_prefix(toolchain_source_dir).with_context(|| {
+                format!(
+                    "toolchain input {} is not under {}",
+                    path.display(),
+                    toolchain_source_dir.display()
+                )
+            })?;
+            hasher.update(relative_to_unix_string(relative).as_bytes());
+            let bytes = fs::read(&path)
+                .with_context(|| format!("failed to read toolchain input {}", path.display()))?;
+            hasher.update(bytes);
+        }
+
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn collect_toolchain_inputs(&self, toolchain_source_dir: &Path) -> Result<Vec<PathBuf>> {
+        let package_json = toolchain_source_dir.join(JS_COMPONENTIZER_PACKAGE_JSON);
+        let lockfile = toolchain_source_dir.join(JS_COMPONENTIZER_LOCKFILE);
+        if !package_json.is_file() {
+            bail!(
+                "missing JS componentizer package manifest {}",
+                package_json.display()
+            );
+        }
+        if !lockfile.is_file() {
+            bail!("missing JS componentizer lockfile {}", lockfile.display());
+        }
+
+        let mut inputs = vec![package_json, lockfile];
+        let scripts_dir = toolchain_source_dir.join(JS_COMPONENTIZER_SCRIPTS_DIR);
+        if scripts_dir.exists() {
+            collect_files_recursively(&scripts_dir, &mut inputs)?;
+        }
+        let wit_dir = toolchain_source_dir.join(JS_COMPONENTIZER_WIT_DIR);
+        if wit_dir.exists() {
+            collect_files_recursively(&wit_dir, &mut inputs)?;
+        }
+
+        inputs.sort();
+        Ok(inputs)
+    }
+
+    fn sync_toolchain_inputs(&self, source_dir: &Path, target_dir: &Path) -> Result<()> {
+        copy_file(
+            &source_dir.join(JS_COMPONENTIZER_PACKAGE_JSON),
+            &target_dir.join(JS_COMPONENTIZER_PACKAGE_JSON),
+        )?;
+        copy_file(
+            &source_dir.join(JS_COMPONENTIZER_LOCKFILE),
+            &target_dir.join(JS_COMPONENTIZER_LOCKFILE),
+        )?;
+        copy_directory(
+            &source_dir.join(JS_COMPONENTIZER_SCRIPTS_DIR),
+            &target_dir.join(JS_COMPONENTIZER_SCRIPTS_DIR),
+        )?;
+        copy_directory(
+            &source_dir.join(JS_COMPONENTIZER_WIT_DIR),
+            &target_dir.join(JS_COMPONENTIZER_WIT_DIR),
+        )?;
         Ok(())
     }
 
@@ -226,6 +350,11 @@ impl JavaScriptComponentSourcePackageBuilder {
     }
 }
 
+struct PreparedToolchain {
+    dir: PathBuf,
+    state_hash: String,
+}
+
 impl ExternalSourcePackageBuilder for JavaScriptComponentSourcePackageBuilder {
     fn build_source_package(
         &self,
@@ -279,19 +408,134 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
-fn relative_to_root(root: &Path, path: &Path) -> Result<String> {
-    let relative = path
-        .strip_prefix(root)
-        .with_context(|| format!("path {} is not under {}", path.display(), root.display()))?;
-    validate_relative_path(relative)?;
+fn default_repo_cache_root(root: &Path) -> Result<PathBuf> {
+    let cache_home = default_cache_home()?;
+    repo_cache_root_from_base(&cache_home, root)
+}
 
-    let rendered = relative
-        .components()
+fn default_toolchain_cache_root() -> Result<PathBuf> {
+    let cache_home = default_cache_home()?;
+    Ok(toolchain_cache_root_from_base(&cache_home))
+}
+
+fn repo_cache_root_from_base(cache_home: &Path, root: &Path) -> Result<PathBuf> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repository root {}", root.display()))?;
+    let repo_hash = sha256_hex(canonical_root.to_string_lossy().as_bytes());
+    let repo_name = canonical_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(sanitize_path_component)
+        .unwrap_or_else(|| "repo".to_owned());
+
+    Ok(cache_home
+        .join(CHECKLEFT_CACHE_DIR_NAME)
+        .join(CHECKLEFT_REPOS_CACHE_DIR)
+        .join(format!("{repo_name}-{repo_hash}")))
+}
+
+fn toolchain_cache_root_from_base(cache_home: &Path) -> PathBuf {
+    cache_home
+        .join(CHECKLEFT_CACHE_DIR_NAME)
+        .join(CHECKLEFT_TOOLCHAINS_CACHE_DIR)
+}
+
+fn default_cache_home() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    let home = env::var_os("HOME").context("XDG_CACHE_HOME and HOME are unset")?;
+    Ok(PathBuf::from(home).join(".cache"))
+}
+
+fn sanitize_path_component(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn relative_to_unix_string(path: &Path) -> String {
+    path.components()
         .map(|part| part.as_os_str())
         .map(OsStr::to_string_lossy)
         .collect::<Vec<_>>()
-        .join("/");
-    Ok(rendered)
+        .join("/")
+}
+
+fn collect_files_recursively(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read directory {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to determine file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_files_recursively(&path, output)?;
+        } else if file_type.is_file() {
+            output.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_file(source: &Path, target: &Path) -> Result<()> {
+    let target_parent = target
+        .parent()
+        .context("copied file target has no parent")?;
+    fs::create_dir_all(target_parent).with_context(|| {
+        format!(
+            "failed to create copied file parent directory {}",
+            target_parent.display()
+        )
+    })?;
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy toolchain input from {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_directory(source: &Path, target: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed to read directory {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to determine file type for {}", path.display()))?;
+        let target_path = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory(&path, &target_path)?;
+        } else if file_type.is_file() {
+            copy_file(&path, &target_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -300,7 +544,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
@@ -317,15 +561,24 @@ mod tests {
 
     #[derive(Default)]
     struct MockCommandRunner {
-        calls: Mutex<Vec<(String, Vec<String>)>>,
+        calls: Mutex<Vec<(PathBuf, String, Vec<String>)>>,
     }
 
     impl CommandRunner for MockCommandRunner {
         fn run(&self, cwd: &Path, program: &str, args: &[String]) -> Result<()> {
-            self.calls
-                .lock()
-                .expect("lock calls")
-                .push((program.to_owned(), args.to_vec()));
+            self.calls.lock().expect("lock calls").push((
+                cwd.to_path_buf(),
+                program.to_owned(),
+                args.to_vec(),
+            ));
+
+            if program == "corepack"
+                && args
+                    .windows(2)
+                    .any(|window| window == ["pnpm".to_owned(), "install".to_owned()])
+            {
+                std::fs::create_dir_all(cwd.join("node_modules")).expect("mkdir node_modules");
+            }
 
             if program == "node" && args.first().is_some_and(|arg| arg.ends_with(".mjs")) {
                 let out_index = args
@@ -357,6 +610,12 @@ mod tests {
         std::fs::create_dir_all(root.join("checks/js")).expect("mkdir");
         std::fs::create_dir_all(root.join("tools/checks_js_componentizer/scripts"))
             .expect("mkdir scripts");
+        std::fs::create_dir_all(root.join("tools/checks_js_componentizer/wit")).expect("mkdir wit");
+        std::fs::write(
+            root.join("tools/checks_js_componentizer/package.json"),
+            r#"{"name":"checkleft-js-componentizer","private":true}"#,
+        )
+        .expect("package");
         std::fs::write(
             root.join("tools/checks_js_componentizer/pnpm-lock.yaml"),
             "lockfileVersion: '9.0'\n",
@@ -367,6 +626,11 @@ mod tests {
             "// test stub\n",
         )
         .expect("script");
+        std::fs::write(
+            root.join("tools/checks_js_componentizer/wit/check-runtime.wit"),
+            "package checkleft:test;\n",
+        )
+        .expect("wit");
         std::fs::write(
             root.join("checks/js/check.js"),
             "export function run(input) { return input; }\n",
@@ -392,14 +656,18 @@ mod tests {
     #[test]
     fn source_build_uses_cache_between_runs() {
         let temp = tempdir().expect("temp dir");
+        let repo_cache_root = temp.path().join("repo-cache-root");
+        let toolchain_cache_root = temp.path().join("toolchain-cache-root");
         let package = make_source_package(temp.path());
         let source = match &package.implementation {
             ExternalCheckPackageImplementation::Source(source) => source,
             _ => panic!("expected source implementation"),
         };
         let runner = Arc::new(MockCommandRunner::default());
-        let builder = JavaScriptComponentSourcePackageBuilder::with_command_runner(
+        let builder = JavaScriptComponentSourcePackageBuilder::with_cache_roots(
             temp.path(),
+            &repo_cache_root,
+            &toolchain_cache_root,
             runner.clone(),
         );
 
@@ -412,28 +680,68 @@ mod tests {
 
         assert_eq!(first.artifact_path, second.artifact_path);
         assert_eq!(first.artifact_sha256, second.artifact_sha256);
+        assert!(Path::new(&first.artifact_path).starts_with(&repo_cache_root));
+        assert!(
+            !temp.path().join(".checkleft-cache").exists(),
+            "repo-local cache root should not be recreated"
+        );
+        assert!(
+            !temp
+                .path()
+                .join("tools/checks_js_componentizer/node_modules")
+                .exists(),
+            "repo-local JS install should remain unused"
+        );
 
         let calls = runner.calls.lock().expect("calls").clone();
         let compile_calls = calls
             .iter()
-            .filter(|(program, args)| {
+            .filter(|(_, program, args)| {
                 program == "node" && args.first().is_some_and(|arg| arg.ends_with(".mjs"))
             })
             .count();
         assert_eq!(compile_calls, 1, "compile should be cached");
+        let install_call_cwds = calls
+            .iter()
+            .filter(|(_, program, args)| {
+                program == "corepack"
+                    && args
+                        .windows(2)
+                        .any(|window| window == ["pnpm".to_owned(), "install".to_owned()])
+            })
+            .map(|(cwd, _, _)| cwd.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            install_call_cwds.len(),
+            1,
+            "toolchain install should be cached"
+        );
+        let install_cwd = install_call_cwds
+            .into_iter()
+            .next()
+            .expect("install call should exist");
+        assert!(
+            install_cwd
+                .starts_with(toolchain_cache_root.join(super::JS_COMPONENTIZER_TOOLCHAINS_DIR)),
+            "toolchain install should happen in the shared toolchain cache"
+        );
     }
 
     #[test]
     fn source_build_rebuilds_when_sources_change() {
         let temp = tempdir().expect("temp dir");
+        let repo_cache_root = temp.path().join("repo-cache-root");
+        let toolchain_cache_root = temp.path().join("toolchain-cache-root");
         let package = make_source_package(temp.path());
         let source = match &package.implementation {
             ExternalCheckPackageImplementation::Source(source) => source,
             _ => panic!("expected source implementation"),
         };
         let runner = Arc::new(MockCommandRunner::default());
-        let builder = JavaScriptComponentSourcePackageBuilder::with_command_runner(
+        let builder = JavaScriptComponentSourcePackageBuilder::with_cache_roots(
             temp.path(),
+            &repo_cache_root,
+            &toolchain_cache_root,
             runner.clone(),
         );
 
@@ -452,6 +760,96 @@ mod tests {
         assert_ne!(
             first.artifact_path, second.artifact_path,
             "cache key should include source bytes"
+        );
+    }
+
+    #[test]
+    fn repo_cache_root_is_scoped_by_canonical_root() {
+        let temp = tempdir().expect("temp dir");
+        let cache_home = temp.path().join("user-cache");
+        let repo_a = temp.path().join("repo-a");
+        let repo_b = temp.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).expect("mkdir repo a");
+        std::fs::create_dir_all(&repo_b).expect("mkdir repo b");
+
+        let repo_a_cache =
+            super::repo_cache_root_from_base(&cache_home, &repo_a).expect("repo a cache");
+        let repo_b_cache =
+            super::repo_cache_root_from_base(&cache_home, &repo_b).expect("repo b cache");
+
+        assert_ne!(repo_a_cache, repo_b_cache);
+        assert!(repo_a_cache.starts_with(&cache_home));
+        assert!(repo_b_cache.starts_with(&cache_home));
+    }
+
+    #[test]
+    fn toolchain_install_is_shared_across_repos() {
+        let temp = tempdir().expect("temp dir");
+        let repo_a = temp.path().join("repo-a");
+        let repo_b = temp.path().join("repo-b");
+        let repo_a_cache_root = temp.path().join("repo-a-cache");
+        let repo_b_cache_root = temp.path().join("repo-b-cache");
+        let toolchain_cache_root = temp.path().join("shared-toolchain-cache");
+        let package_a = make_source_package(&repo_a);
+        let package_b = make_source_package(&repo_b);
+        let source_a = match &package_a.implementation {
+            ExternalCheckPackageImplementation::Source(source) => source,
+            _ => panic!("expected source implementation"),
+        };
+        let source_b = match &package_b.implementation {
+            ExternalCheckPackageImplementation::Source(source) => source,
+            _ => panic!("expected source implementation"),
+        };
+        let runner = Arc::new(MockCommandRunner::default());
+        let builder_a = JavaScriptComponentSourcePackageBuilder::with_cache_roots(
+            &repo_a,
+            &repo_a_cache_root,
+            &toolchain_cache_root,
+            runner.clone(),
+        );
+        let builder_b = JavaScriptComponentSourcePackageBuilder::with_cache_roots(
+            &repo_b,
+            &repo_b_cache_root,
+            &toolchain_cache_root,
+            runner.clone(),
+        );
+
+        let artifact_a = builder_a
+            .build_source_package(&package_a, source_a)
+            .expect("build repo a");
+        let artifact_b = builder_b
+            .build_source_package(&package_b, source_b)
+            .expect("build repo b");
+
+        assert!(
+            Path::new(&artifact_a.artifact_path).starts_with(&repo_a_cache_root),
+            "repo a artifact should stay repo-scoped"
+        );
+        assert!(
+            Path::new(&artifact_b.artifact_path).starts_with(&repo_b_cache_root),
+            "repo b artifact should stay repo-scoped"
+        );
+
+        let calls = runner.calls.lock().expect("calls").clone();
+        let install_call_cwds = calls
+            .iter()
+            .filter(|(_, program, args)| {
+                program == "corepack"
+                    && args
+                        .windows(2)
+                        .any(|window| window == ["pnpm".to_owned(), "install".to_owned()])
+            })
+            .map(|(cwd, _, _)| cwd.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            install_call_cwds.len(),
+            1,
+            "matching repos should share one toolchain install"
+        );
+        assert!(
+            install_call_cwds[0]
+                .starts_with(toolchain_cache_root.join(super::JS_COMPONENTIZER_TOOLCHAINS_DIR)),
+            "shared install should live under the shared toolchain cache"
         );
     }
 
@@ -481,8 +879,12 @@ mod tests {
             _ => panic!("expected source implementation"),
         };
         let runner = Arc::new(MockCommandRunner::default());
-        let builder =
-            JavaScriptComponentSourcePackageBuilder::with_command_runner(temp.path(), runner);
+        let builder = JavaScriptComponentSourcePackageBuilder::with_cache_roots(
+            temp.path(),
+            temp.path().join("repo-cache-root"),
+            temp.path().join("toolchain-cache-root"),
+            runner,
+        );
 
         let error = builder
             .build_source_package(&package, source)
