@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
@@ -27,6 +27,13 @@ const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
 const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
+
+fn ensure_rustls_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckConfig {
@@ -685,6 +692,7 @@ fn normalize_configured_external_checks_url(
 
 async fn load_external_checks_chain(external_checks_url: &str) -> Result<Vec<LoadedChecksFile>> {
     info!(external_checks_url, "loading external checks config chain");
+    ensure_rustls_provider();
     let client = reqwest::Client::builder()
         .user_agent(CHECKLEFT_HTTP_USER_AGENT)
         .build()

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -24,12 +25,20 @@ const DEFAULT_API_BASE_URL: &str = "https://api.robinhood.com/";
 const INSTRUMENT_LOOKUP_CHUNK: usize = 50;
 const OPTION_ORDER_STATES: &str = "canceled,cancelled,filled,failed,partially_filled_rest_cancelled,voided,rejected,locate_failed";
 
+fn ensure_rustls_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl RobinhoodClient {
     pub fn new() -> Result<Self, RobinhoodClientError> {
         Self::with_base_urls(DEFAULT_API_BASE_URL, DEFAULT_IDENTITY_BASE_URL)
     }
 
     pub fn with_base_url(base_url: &str) -> Result<Self, RobinhoodClientError> {
+        ensure_rustls_provider();
         let http = Client::builder().build()?;
         Self::with_http_client(http, base_url)
     }
@@ -42,6 +51,7 @@ impl RobinhoodClient {
         base_url: &str,
         identity_base_url: &str,
     ) -> Result<Self, RobinhoodClientError> {
+        ensure_rustls_provider();
         let http = Client::builder().build()?;
         Self::with_http_client_and_identity_base(http, base_url, identity_base_url)
     }
@@ -666,6 +676,11 @@ mod tests {
     use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn test_http_client() -> Client {
+        ensure_rustls_provider();
+        Client::new()
+    }
+
     #[test]
     fn new_initializes_with_default_http_client() {
         let client = RobinhoodClient::new().expect("expected client to be constructed");
@@ -675,7 +690,7 @@ mod tests {
 
     #[test]
     fn new_with_http_client_rejects_invalid_url() {
-        let http = Client::new();
+        let http = test_http_client();
 
         let err =
             RobinhoodClient::with_http_client(http, "not a url").expect_err("expected invalid url");
@@ -738,7 +753,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -770,7 +785,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -810,7 +825,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -862,7 +877,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -898,7 +913,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -928,7 +943,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -985,7 +1000,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1028,7 +1043,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1061,7 +1076,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1089,7 +1104,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1134,7 +1149,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1165,7 +1180,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1210,7 +1225,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1239,7 +1254,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
@@ -1297,7 +1312,7 @@ mod tests {
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
         let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
+            test_http_client(),
             &base_url,
             &identity_url,
         )
