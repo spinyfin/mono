@@ -170,30 +170,20 @@ impl WasmExternalCheckExecutor {
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> std::result::Result<CheckResult, CoreArtifactExecutionError> {
-        let module = Module::new(&self.engine, module_bytes)
-            .with_context(|| format!("failed to compile core wasm module for `{}`", package.id))
+        let module = compile_core_module(&self.engine, package.id.as_str(), module_bytes)
             .map_err(CoreArtifactExecutionError::mismatch)?;
         let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(EXECUTION_FUEL_LIMIT)
-            .context("failed to configure runtime fuel limit")
+        configure_store_fuel(&mut store)
             .map_err(CoreArtifactExecutionError::execution)?;
 
-        let instance = Instance::new(&mut store, &module, &[])
-            .with_context(|| format!("failed to instantiate wasm module for `{}`", package.id))
+        let instance = instantiate_core_module(&mut store, &module, package.id.as_str())
             .map_err(CoreArtifactExecutionError::mismatch)?;
 
         let memory = instance
             .get_memory(&mut store, MEMORY_EXPORT)
             .context("wasm module must export `memory`")
             .map_err(CoreArtifactExecutionError::mismatch)?;
-        let run = instance
-            .get_typed_func::<(i32, i32), i64>(&mut store, CORE_ENTRYPOINT_EXPORT)
-            .with_context(|| {
-                format!(
-                    "core wasm module must export `{CORE_ENTRYPOINT_EXPORT}` with signature (i32, i32) -> i64"
-                )
-            })
+        let run = get_core_run_function(&instance, &mut store)
             .map_err(CoreArtifactExecutionError::mismatch)?;
 
         let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
@@ -203,9 +193,7 @@ impl WasmExternalCheckExecutor {
 
         ensure_memory_capacity(&memory, &mut store, INPUT_OFFSET, input_bytes.len())
             .map_err(CoreArtifactExecutionError::execution)?;
-        memory
-            .write(&mut store, INPUT_OFFSET, &input_bytes)
-            .context("failed to write runtime input into wasm memory")
+        write_memory(&memory, &mut store, INPUT_OFFSET, &input_bytes)
             .map_err(CoreArtifactExecutionError::execution)?;
 
         let input_offset = i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32");
@@ -213,9 +201,7 @@ impl WasmExternalCheckExecutor {
         let input_len =
             i32::try_from(input_bytes.len()).context("runtime input length exceeds i32");
         let input_len = input_len.map_err(CoreArtifactExecutionError::execution)?;
-        let output_range_encoded = run
-            .call(&mut store, (input_offset, input_len))
-            .context("external wasm check execution failed")
+        let output_range_encoded = call_core_run(&run, &mut store, input_offset, input_len)
             .map_err(CoreArtifactExecutionError::execution)?;
         let (output_offset, output_len) = decode_output_range(output_range_encoded)
             .map_err(CoreArtifactExecutionError::execution)?;
@@ -223,9 +209,7 @@ impl WasmExternalCheckExecutor {
         ensure_memory_capacity(&memory, &mut store, output_offset, output_len)
             .map_err(CoreArtifactExecutionError::execution)?;
         let mut output_bytes = vec![0_u8; output_len];
-        memory
-            .read(&mut store, output_offset, &mut output_bytes)
-            .context("failed to read runtime output from wasm memory")
+        read_memory(&memory, &mut store, output_offset, &mut output_bytes)
             .map_err(CoreArtifactExecutionError::execution)?;
 
         let output: ExternalCheckRuntimeOutput = serde_json::from_slice(&output_bytes)
@@ -246,30 +230,17 @@ impl WasmExternalCheckExecutor {
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> Result<CheckResult> {
-        let component = Component::new(&self.engine, component_bytes)
-            .with_context(|| format!("failed to compile component for `{}`", package.id))?;
+        let component = compile_component(&self.engine, package.id.as_str(), component_bytes)?;
         let linker = Linker::<()>::new(&self.engine);
         let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(EXECUTION_FUEL_LIMIT)
-            .context("failed to configure runtime fuel limit")?;
-        let instance = linker
-            .instantiate(&mut store, &component)
-            .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
-        let run = instance
-            .get_typed_func::<(String,), (String,)>(&mut store, COMPONENT_ENTRYPOINT_EXPORT)
-            .with_context(|| {
-                format!(
-                    "component must export `{COMPONENT_ENTRYPOINT_EXPORT}` with signature (string) -> (string)"
-                )
-            })?;
+        configure_store_fuel(&mut store)?;
+        let instance = instantiate_component(&linker, &mut store, &component, package.id.as_str())?;
+        let run = get_component_run_function(&instance, &mut store)?;
 
         let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
         let input_json =
             serde_json::to_string(&input).context("failed to encode component runtime input")?;
-        let (output_json,) = run
-            .call(&mut store, (input_json,))
-            .context("external component check execution failed")?;
+        let (output_json,) = call_component_run(&run, &mut store, input_json)?;
         let output: ExternalCheckRuntimeOutput =
             serde_json::from_str(&output_json).context("component output was not valid JSON")?;
 
@@ -339,13 +310,95 @@ fn build_wasmtime_engine() -> Result<Engine> {
     config.wasm_component_model(true);
     config.consume_fuel(true);
 
-    if let Err(error) = config.cache_config_load_default() {
-        eprintln!(
-            "warning: unable to load Wasmtime cache config, continuing without cache: {error}"
-        );
-    }
+    Ok(wasmtime(Engine::new(&config)).context("failed to initialize Wasmtime engine")?)
+}
 
-    Engine::new(&config).context("failed to initialize Wasmtime engine")
+fn compile_core_module(engine: &Engine, package_id: &str, module_bytes: &[u8]) -> Result<Module> {
+    wasmtime(Module::new(engine, module_bytes))
+        .with_context(|| format!("failed to compile core wasm module for `{package_id}`"))
+}
+
+fn instantiate_core_module(
+    store: &mut Store<()>,
+    module: &Module,
+    package_id: &str,
+) -> Result<Instance> {
+    wasmtime(Instance::new(store, module, &[]))
+        .with_context(|| format!("failed to instantiate wasm module for `{package_id}`"))
+}
+
+fn get_core_run_function(
+    instance: &Instance,
+    store: &mut Store<()>,
+) -> Result<wasmtime::TypedFunc<(i32, i32), i64>> {
+    wasmtime(instance.get_typed_func::<(i32, i32), i64>(store, CORE_ENTRYPOINT_EXPORT))
+        .with_context(|| {
+            format!(
+                "core wasm module must export `{CORE_ENTRYPOINT_EXPORT}` with signature (i32, i32) -> i64"
+            )
+        })
+}
+
+fn call_core_run(
+    run: &wasmtime::TypedFunc<(i32, i32), i64>,
+    store: &mut Store<()>,
+    input_offset: i32,
+    input_len: i32,
+) -> Result<i64> {
+    wasmtime(run.call(store, (input_offset, input_len)))
+        .context("external wasm check execution failed")
+}
+
+fn compile_component(engine: &Engine, package_id: &str, component_bytes: &[u8]) -> Result<Component> {
+    wasmtime(Component::new(engine, component_bytes))
+        .with_context(|| format!("failed to compile component for `{package_id}`"))
+}
+
+fn instantiate_component(
+    linker: &Linker<()>,
+    store: &mut Store<()>,
+    component: &Component,
+    package_id: &str,
+) -> Result<wasmtime::component::Instance> {
+    wasmtime(linker.instantiate(store, component))
+        .with_context(|| format!("failed to instantiate component for `{package_id}`"))
+}
+
+fn get_component_run_function(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<()>,
+) -> Result<wasmtime::component::TypedFunc<(String,), (String,)>> {
+    wasmtime(instance.get_typed_func::<(String,), (String,)>(store, COMPONENT_ENTRYPOINT_EXPORT))
+        .with_context(|| {
+            format!(
+                "component must export `{COMPONENT_ENTRYPOINT_EXPORT}` with signature (string) -> (string)"
+            )
+        })
+}
+
+fn call_component_run(
+    run: &wasmtime::component::TypedFunc<(String,), (String,)>,
+    store: &mut Store<()>,
+    input_json: String,
+) -> Result<(String,)> {
+    wasmtime(run.call(store, (input_json,))).context("external component check execution failed")
+}
+
+fn configure_store_fuel(store: &mut Store<()>) -> Result<()> {
+    wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
+}
+
+fn write_memory(memory: &Memory, store: &mut Store<()>, offset: usize, bytes: &[u8]) -> Result<()> {
+    any_result(memory.write(store, offset, bytes)).context("failed to write runtime input into wasm memory")
+}
+
+fn read_memory(
+    memory: &Memory,
+    store: &mut Store<()>,
+    offset: usize,
+    bytes: &mut [u8],
+) -> Result<()> {
+    any_result(memory.read(store, offset, bytes)).context("failed to read runtime output from wasm memory")
 }
 
 #[derive(Serialize)]
@@ -432,11 +485,10 @@ fn ensure_memory_capacity(
 
     let needed_bytes = required_size - current_size;
     let additional_pages = needed_bytes.div_ceil(WASM_PAGE_SIZE_BYTES);
-    memory
-        .grow(
-            &mut *store,
-            u64::try_from(additional_pages).context("page count does not fit in u64")?,
-        )
+    wasmtime(memory.grow(
+        &mut *store,
+        u64::try_from(additional_pages).context("page count does not fit in u64")?,
+    ))
         .context("failed to grow wasm memory")?;
     Ok(())
 }
@@ -446,6 +498,17 @@ fn decode_output_range(encoded: i64) -> Result<(usize, usize)> {
     let offset = usize::try_from((encoded >> 32) as u32).context("output offset does not fit")?;
     let len = usize::try_from((encoded & 0xffff_ffff) as u32).context("output len does not fit")?;
     Ok((offset, len))
+}
+
+fn wasmtime<T>(result: std::result::Result<T, wasmtime::Error>) -> Result<T> {
+    result.map_err(anyhow::Error::from)
+}
+
+fn any_result<T, E>(result: std::result::Result<T, E>) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    result.map_err(Into::into)
 }
 
 #[cfg(test)]
