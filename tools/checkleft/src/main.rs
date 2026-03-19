@@ -1,10 +1,11 @@
 use std::io::IsTerminal;
+use std::io::stderr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
@@ -20,11 +21,16 @@ use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{Vcs, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use tracing::info;
+use tracing_subscriber::filter::LevelFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
 #[command(about = "Run repository convention checks")]
 struct Cli {
+    #[arg(long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -92,9 +98,12 @@ async fn main() -> ExitCode {
 
 async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
+    init_tracing(cli.verbose)?;
     let root = std::env::current_dir()?;
+    info!(root = %root.display(), "starting checkleft");
 
     let vcs = Vcs::detect(&root)?;
+    info!(kind = ?vcs.kind(), "detected repository");
     match cli.command {
         Commands::Run {
             config,
@@ -102,6 +111,7 @@ async fn run_cli() -> Result<ExitCode> {
             base_ref,
             format,
         } => {
+            info!("building runner for run");
             let runner = build_runner(
                 &root,
                 &vcs,
@@ -110,11 +120,16 @@ async fn run_cli() -> Result<ExitCode> {
                 config.external_checks_url,
             )
             .await?;
+            info!("resolving changeset for run");
             let changeset = attach_description_context(
                 resolve_changeset(&vcs, all, base_ref.as_deref())?,
                 &vcs,
             )
             .await;
+            info!(
+                changed_files = changeset.changed_files.len(),
+                "resolved changeset for run"
+            );
             let run_started_at = Instant::now();
             let mut results = runner.run_changeset(&changeset).await?;
             let elapsed = run_started_at.elapsed();
@@ -142,6 +157,7 @@ async fn run_cli() -> Result<ExitCode> {
             all,
             base_ref,
         } => {
+            info!("building runner for list");
             let runner = build_runner(
                 &root,
                 &vcs,
@@ -150,7 +166,12 @@ async fn run_cli() -> Result<ExitCode> {
                 config.external_checks_url,
             )
             .await?;
+            info!("resolving changeset for list");
             let changeset = resolve_changeset(&vcs, all, base_ref.as_deref())?;
+            info!(
+                changed_files = changeset.changed_files.len(),
+                "resolved changeset for list"
+            );
             let checks = runner.list_configured_checks(&changeset)?;
             if checks.is_empty() {
                 println!("No configured checks found.");
@@ -171,8 +192,10 @@ async fn build_runner(
     base_ref: Option<&str>,
     external_checks_url: Option<String>,
 ) -> Result<Runner> {
+    info!("registering built-in checks");
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry)?;
+    info!("initializing config resolver");
     let resolver = Arc::new(
         ConfigResolver::new_with_options(
             root,
@@ -182,11 +205,14 @@ async fn build_runner(
         )
         .await?,
     );
+    info!("initializing source tree");
     let source_tree = Arc::new(LocalSourceTree::with_base_revision(
         root,
         vcs.base_revision(all, base_ref)?,
     )?);
+    info!("initializing external package provider");
     let external_provider = build_external_package_provider(root)?;
+    info!("initializing external executor");
     let external_executor = build_external_check_executor(root)?;
 
     Ok(Runner::with_external(
@@ -200,6 +226,7 @@ async fn build_runner(
 
 fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckPackageProvider>> {
     let mode = external_provider_mode()?;
+    info!(?mode, "resolved external package provider mode");
     if mode == ExternalProviderMode::Off {
         return Ok(Arc::new(NoopExternalCheckPackageProvider));
     }
@@ -221,6 +248,7 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
     }
     if mode != ExternalProviderMode::FileOnly {
         if let Some(index_path) = index_path {
+            info!(index_path = %index_path, "loading generated external package index");
             let generated_provider = GeneratedExternalCheckPackageProvider::from_index_path(
                 root,
                 Path::new(&index_path),
@@ -267,20 +295,25 @@ fn parse_external_provider_mode(raw: Option<String>) -> Result<ExternalProviderM
 
 fn resolve_changeset(vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<ChangeSet> {
     if all {
+        info!("resolving all tracked files");
         return vcs.all_files_changeset();
     }
 
     if let Some(base_ref) = base_ref {
         if !base_ref.trim().is_empty() {
+            info!(base_ref, "resolving changes since base ref");
             return vcs.changeset_since(base_ref);
         }
+        info!("base ref was empty; resolving current changeset");
         return vcs.current_changeset();
     }
 
+    info!("resolving current changeset");
     vcs.current_changeset()
 }
 
 async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSet {
+    info!("attaching commit and PR metadata");
     let commit_description = normalize_optional_description(vcs.current_commit_description().ok());
     let change_id = resolve_change_id();
     let repository = resolve_repository(vcs);
@@ -325,8 +358,27 @@ async fn resolve_pr_description(
         return None;
     };
 
+    info!(
+        repository = repository,
+        change_id = change_id,
+        "fetching PR description"
+    );
     let github_token = detect_github_token();
     github_pull_request_description(repository, change_id, github_token.as_deref()).await
+}
+
+fn init_tracing(verbose: bool) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(if verbose {
+            LevelFilter::INFO
+        } else {
+            LevelFilter::OFF
+        })
+        .with_writer(stderr)
+        .try_init()
+        .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
+
+    Ok(())
 }
 
 fn detect_github_token() -> Option<String> {
