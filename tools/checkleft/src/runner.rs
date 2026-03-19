@@ -1,32 +1,35 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use tokio::task::JoinSet;
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
-use crate::check::CheckRegistry;
-use crate::config::{CheckConfig, ConfigResolver};
+use crate::check::{CheckRegistry, ConfiguredCheck};
+use crate::config::{CheckConfig, ConfigDiagnostic, ConfigResolver};
 use crate::external::{
     ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageProvider,
     NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
-use crate::output::{CheckResult, Finding, Severity};
+use crate::output::{CheckResult, Finding, Location, Severity};
 
-#[derive(Debug, Clone)]
 struct ScheduledCheckRun {
     configured_check_id: String,
+    source_path: PathBuf,
     execution: ScheduledExecution,
     policy: EffectiveCheckPolicy,
     config: toml::Value,
     changeset: ChangeSet,
 }
 
-#[derive(Debug, Clone)]
 enum ScheduledExecution {
-    BuiltIn {
+    BuiltInConfigured {
+        check: Arc<dyn ConfiguredCheck>,
+    },
+    BuiltInMissing {
         implementation_check_id: String,
     },
     ExternalResolved {
@@ -52,6 +55,12 @@ impl EffectiveCheckPolicy {
             self.severity_override, self.allow_bypass, self.bypass_name
         )
     }
+}
+
+#[derive(Default)]
+struct ScheduledRuns {
+    runs: Vec<ScheduledCheckRun>,
+    diagnostics: Vec<CheckResult>,
 }
 
 pub struct Runner {
@@ -111,41 +120,19 @@ impl Runner {
     pub async fn run_changeset(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
         let scheduled = self.schedule_runs(changeset)?;
 
-        let mut results = Vec::new();
+        let mut results = scheduled.diagnostics;
         let mut join_set = JoinSet::new();
-        for run in scheduled {
+        for run in scheduled.runs {
             match run.execution {
-                ScheduledExecution::BuiltIn {
-                    implementation_check_id,
-                } => {
-                    let Some(check) = self.registry.get(&implementation_check_id) else {
-                        results.push(CheckResult {
-                            check_id: run.configured_check_id,
-                            findings: vec![Finding {
-                                severity: Severity::Error,
-                                message: format!(
-                                    "configured check references unknown implementation `{implementation_check_id}`"
-                                ),
-                                location: None,
-                                remediation: Some(
-                                    "Register this check implementation in the binary or fix `check = ...` in CHECKS.yaml."
-                                        .to_owned(),
-                                ),
-                                suggested_fix: None,
-                            }],
-                        });
-                        continue;
-                    };
-
+                ScheduledExecution::BuiltInConfigured { check } => {
                     let source_tree = Arc::clone(&self.source_tree);
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
-                    let run_config = run.config;
                     let run_policy = run.policy;
 
                     join_set.spawn(async move {
                         check
-                            .run(&run_changeset, source_tree.as_ref(), &run_config)
+                            .run(&run_changeset, source_tree.as_ref())
                             .await
                             .map(|mut result| {
                                 // Report findings under the configured instance id.
@@ -153,6 +140,29 @@ impl Runner {
                                 apply_policy_to_result(result, &run_policy, &run_changeset)
                             })
                             .map_err(|err| (configured_check_id, err))
+                    });
+                }
+                ScheduledExecution::BuiltInMissing {
+                    implementation_check_id,
+                } => {
+                    results.push(CheckResult {
+                        check_id: run.configured_check_id,
+                        findings: vec![Finding {
+                            severity: Severity::Error,
+                            message: format!(
+                                "configured check references unknown implementation `{implementation_check_id}`"
+                            ),
+                            location: Some(Location {
+                                path: run.source_path.clone(),
+                                line: None,
+                                column: None,
+                            }),
+                            remediation: Some(
+                                "Register this check implementation in the binary or fix `check = ...` in CHECKS.yaml."
+                                    .to_owned(),
+                            ),
+                            suggested_fix: None,
+                        }],
                     });
                 }
                 ScheduledExecution::ExternalResolved { package } => {
@@ -182,7 +192,11 @@ impl Runner {
                         findings: vec![Finding {
                             severity: Severity::Error,
                             message,
-                            location: None,
+                            location: Some(Location {
+                                path: run.source_path.clone(),
+                                line: None,
+                                column: None,
+                            }),
                             remediation,
                             suggested_fix: None,
                         }],
@@ -219,6 +233,7 @@ impl Runner {
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
         let mut checks = BTreeSet::new();
         let mut resolution_errors = BTreeMap::new();
+        let mut config_diagnostics = BTreeSet::new();
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -226,6 +241,9 @@ impl Runner {
             }
 
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
+            for diagnostic in resolved.diagnostics() {
+                config_diagnostics.insert(format_config_diagnostic(diagnostic));
+            }
             if should_skip_file(changed_file, &resolved) {
                 continue;
             }
@@ -248,13 +266,25 @@ impl Runner {
             bail!("failed to resolve external check packages:\n- {details}");
         }
 
+        if !config_diagnostics.is_empty() {
+            let details = config_diagnostics
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            bail!("failed to resolve checks configuration:\n- {details}");
+        }
+
         Ok(checks.into_iter().collect())
     }
 
-    fn schedule_runs(&self, changeset: &ChangeSet) -> Result<Vec<ScheduledCheckRun>> {
+    fn schedule_runs(&self, changeset: &ChangeSet) -> Result<ScheduledRuns> {
         let mut grouped_runs: BTreeMap<
             (String, String, String, String, String),
             ScheduledCheckRun,
+        > = BTreeMap::new();
+        let mut grouped_diagnostics: BTreeMap<
+            (String, PathBuf, Option<u32>, Option<u32>, String, String),
+            CheckResult,
         > = BTreeMap::new();
 
         for changed_file in &changeset.changed_files {
@@ -263,6 +293,20 @@ impl Runner {
             }
 
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
+            for diagnostic in resolved.diagnostics() {
+                let remediation = diagnostic.remediation.clone().unwrap_or_default();
+                let key = (
+                    diagnostic.check_id.clone(),
+                    diagnostic.location.path.clone(),
+                    diagnostic.location.line,
+                    diagnostic.location.column,
+                    diagnostic.message.clone(),
+                    remediation,
+                );
+                grouped_diagnostics
+                    .entry(key)
+                    .or_insert_with(|| config_diagnostic_result(diagnostic));
+            }
             if should_skip_file(changed_file, &resolved) {
                 continue;
             }
@@ -287,6 +331,7 @@ impl Runner {
                     .entry(key)
                     .or_insert_with(|| ScheduledCheckRun {
                         configured_check_id: check.id.clone(),
+                        source_path: check.source_path.clone(),
                         execution: self.resolve_scheduled_execution(check),
                         policy,
                         config: check.config.clone(),
@@ -328,7 +373,10 @@ impl Runner {
             }
         }
 
-        Ok(grouped_runs.into_values().collect())
+        Ok(ScheduledRuns {
+            runs: grouped_runs.into_values().collect(),
+            diagnostics: grouped_diagnostics.into_values().collect(),
+        })
     }
 
     fn resolve_effective_policy(&self, check: &CheckConfig) -> EffectiveCheckPolicy {
@@ -349,8 +397,20 @@ impl Runner {
 
     fn resolve_scheduled_execution(&self, check: &CheckConfig) -> ScheduledExecution {
         let Some(implementation_ref) = check.implementation.clone() else {
-            return ScheduledExecution::BuiltIn {
-                implementation_check_id: check.check.clone(),
+            let Some(built_in) = self.registry.get(&check.check) else {
+                return ScheduledExecution::BuiltInMissing {
+                    implementation_check_id: check.check.clone(),
+                };
+            };
+
+            return match built_in.configure(&check.config) {
+                Ok(configured) => ScheduledExecution::BuiltInConfigured { check: configured },
+                Err(err) => ScheduledExecution::Invalid {
+                    message: err.to_string(),
+                    remediation: Some(
+                        "Fix this check's `config` block in the CHECKS file.".to_owned(),
+                    ),
+                },
             };
         };
 
@@ -398,6 +458,28 @@ impl Runner {
 
 fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {
     is_checks_config_file(&changed_file.path) && !resolved.include_config_files()
+}
+
+fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
+    CheckResult {
+        check_id: diagnostic.check_id.clone(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: diagnostic.message.clone(),
+            location: Some(diagnostic.location.clone()),
+            remediation: diagnostic.remediation.clone(),
+            suggested_fix: None,
+        }],
+    }
+}
+
+fn format_config_diagnostic(diagnostic: &ConfigDiagnostic) -> String {
+    format!(
+        "`{}` at {}: {}",
+        diagnostic.check_id,
+        diagnostic.location.path.display(),
+        diagnostic.message
+    )
 }
 
 fn is_checks_config_file(path: &std::path::Path) -> bool {

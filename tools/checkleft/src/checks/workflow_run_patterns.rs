@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -23,13 +24,14 @@ impl Check for WorkflowRunPatternsCheck {
         "flags GitHub workflow run scripts that match configured regex patterns"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let compiled = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
@@ -71,7 +73,7 @@ impl Check for WorkflowRunPatternsCheck {
             };
 
             for script in list_run_scripts(&workflow) {
-                for rule in &compiled.rules {
+                for rule in &self.rules {
                     if !script_violates_rule(script.script, rule) {
                         continue;
                     }
@@ -94,7 +96,7 @@ impl Check for WorkflowRunPatternsCheck {
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "workflow-run-patterns".to_owned(),
             findings,
         })
     }

@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -20,13 +21,14 @@ impl Check for FrontendNoLegacyApiCheck {
         "prevents frontend imports from deprecated API modules"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let config = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let import_re =
             Regex::new(r#"^\s*import\b[^;]*\bfrom\s*["']([^"']+)["']"#).expect("valid regex");
         let mut findings = Vec::new();
@@ -55,7 +57,7 @@ impl Check for FrontendNoLegacyApiCheck {
                 };
 
                 let normalized = normalize_import_module(module);
-                let Some(legacy_match) = config
+                let Some(legacy_match) = self
                     .legacy_modules
                     .iter()
                     .find(|legacy| normalized.ends_with(legacy.as_str()))
@@ -64,21 +66,21 @@ impl Check for FrontendNoLegacyApiCheck {
                 };
 
                 findings.push(Finding {
-                    severity: config.severity,
+                    severity: self.severity,
                     message: format!("import from deprecated frontend API module `{legacy_match}`"),
                     location: Some(Location {
                         path: changed_file.path.clone(),
                         line: Some((line_index + 1) as u32),
                         column: Some(1),
                     }),
-                    remediation: Some(config.remediation.clone()),
+                    remediation: Some(self.remediation.clone()),
                     suggested_fix: None,
                 });
             }
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "frontend-no-legacy-api".to_owned(),
             findings,
         })
     }

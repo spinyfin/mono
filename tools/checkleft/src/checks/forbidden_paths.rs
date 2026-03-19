@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -22,29 +23,30 @@ impl Check for ForbiddenPathsCheck {
         "flags changed files whose paths match forbidden glob patterns"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        _tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let compiled = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledForbiddenPathsConfig {
+    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
-            for rule in &compiled.rules {
+            for rule in &self.rules {
                 if !rule.when.contains(&changed_file.kind) {
                     continue;
                 }
 
                 let Some((matched_path, matched_pattern)) =
-                    first_match(rule, changed_file, compiled.exclude_globs.as_ref())
+                    first_match(rule, changed_file, self.exclude_globs.as_ref())
                 else {
                     continue;
                 };
 
                 findings.push(Finding {
-                    severity: compiled.severity,
+                    severity: self.severity,
                     message: format!(
                         "path `{}` is forbidden for {} changes. (matched `{matched_pattern}`)",
                         matched_path.display(),
@@ -62,7 +64,7 @@ impl Check for ForbiddenPathsCheck {
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "forbidden-paths".to_owned(),
             findings,
         })
     }

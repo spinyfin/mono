@@ -7,7 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::tempdir;
 
-use crate::check::{Check, CheckRegistry};
+use crate::check::{Check, CheckRegistry, ConfiguredCheck};
+use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
 use crate::external::{
     ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage,
@@ -62,6 +63,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
     }
 }
 
+#[derive(Clone)]
 struct CapturingCheck {
     id: String,
     seen_files: Arc<Mutex<Vec<String>>>,
@@ -77,12 +79,14 @@ impl Check for CapturingCheck {
         "captures the input files"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        _tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CapturingCheck {
+    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
         let files: Vec<_> = changeset
             .changed_files
             .iter()
@@ -97,6 +101,7 @@ impl Check for CapturingCheck {
     }
 }
 
+#[derive(Clone)]
 struct MetadataCapturingCheck {
     id: String,
     directive_name: String,
@@ -115,12 +120,14 @@ impl Check for MetadataCapturingCheck {
         "captures description and change metadata"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        _tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for MetadataCapturingCheck {
+    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
         *self.seen_bypass_reason.lock().expect("lock bypass reason") =
             changeset.bypass_reason(&self.directive_name);
         *self.seen_change_id.lock().expect("lock change id") = changeset.change_id.clone();
@@ -367,12 +374,14 @@ async fn runner_reports_check_errors_in_output() {
             "fails intentionally"
         }
 
-        async fn run(
-            &self,
-            _changeset: &ChangeSet,
-            _tree: &dyn SourceTree,
-            _config: &toml::Value,
-        ) -> Result<CheckResult> {
+        fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+            Ok(Arc::new(Self))
+        }
+    }
+
+    #[async_trait]
+    impl ConfiguredCheck for FailingCheck {
+        async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
             anyhow::bail!("boom");
         }
     }
@@ -410,6 +419,107 @@ id = "fails"
     assert_eq!(results[0].check_id, "fails");
     assert_eq!(results[0].findings[0].severity, Severity::Error);
     assert!(results[0].findings[0].message.contains("boom"));
+}
+
+#[tokio::test]
+async fn runner_reports_malformed_checks_yaml_as_config_finding() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: file-size
+    config:
+      max_lines: [1, 2
+"#,
+    )
+    .expect("write config");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("backend/src/a.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].check_id, "checks-config");
+    assert_eq!(
+        results[0].findings[0]
+            .location
+            .as_ref()
+            .map(|location| &location.path),
+        Some(&Path::new("CHECKS.yaml").to_path_buf())
+    );
+    assert!(
+        results[0].findings[0]
+            .message
+            .contains("failed to parse checks config")
+    );
+}
+
+#[tokio::test]
+async fn runner_reports_invalid_builtin_config_on_checks_file() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.config]
+max_lines = "many"
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register built-ins");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("backend/src/a.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].check_id, "file-size");
+    assert_eq!(
+        results[0].findings[0]
+            .location
+            .as_ref()
+            .map(|location| &location.path),
+        Some(&Path::new("CHECKS.toml").to_path_buf())
+    );
+    assert!(
+        results[0].findings[0]
+            .message
+            .contains("invalid file-size check config")
+    );
+    assert!(
+        !results[0].findings[0]
+            .message
+            .contains("check execution failed")
+    );
 }
 
 #[tokio::test]

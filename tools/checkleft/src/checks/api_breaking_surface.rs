@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -20,13 +21,14 @@ impl Check for ApiBreakingSurfaceCheck {
         "requires API-facing backend changes to include configured documentation/version marker updates"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        _tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let config = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledApiBreakingSurfaceConfig {
+    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut trigger_files = Vec::new();
         let mut required_updated = false;
 
@@ -35,17 +37,17 @@ impl Check for ApiBreakingSurfaceCheck {
                 continue;
             }
 
-            if config.required_globs.is_match(&changed_file.path) {
+            if self.required_globs.is_match(&changed_file.path) {
                 required_updated = true;
             }
-            if config.trigger_globs.is_match(&changed_file.path) {
+            if self.trigger_globs.is_match(&changed_file.path) {
                 trigger_files.push(changed_file.path.clone());
             }
         }
 
         if trigger_files.is_empty() || required_updated {
             return Ok(CheckResult {
-                check_id: self.id().to_owned(),
+                check_id: "api-breaking-surface".to_owned(),
                 findings: Vec::new(),
             });
         }
@@ -54,19 +56,19 @@ impl Check for ApiBreakingSurfaceCheck {
             .into_iter()
             .map(|path| Finding {
                 severity: Severity::Error,
-                message: config.message.clone(),
+                message: self.message.clone(),
                 location: Some(Location {
                     path,
                     line: None,
                     column: None,
                 }),
-                remediation: Some(config.remediation.clone()),
+                remediation: Some(self.remediation.clone()),
                 suggested_fix: None,
             })
             .collect();
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "api-breaking-surface".to_owned(),
             findings,
         })
     }

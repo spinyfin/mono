@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
+use std::sync::Arc;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -20,13 +21,14 @@ impl Check for TodoExpiryCheck {
         "requires TODO/FIXME annotations to include owner and date tags"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let config = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for CompiledTodoExpiryConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
@@ -41,29 +43,29 @@ impl Check for TodoExpiryCheck {
             };
 
             for (line_index, line) in contents.lines().enumerate() {
-                if !config.todo_detector.is_match(line) {
+                if !self.todo_detector.is_match(line) {
                     continue;
                 }
-                if config.required_format.is_match(line) {
+                if self.required_format.is_match(line) {
                     continue;
                 }
 
                 findings.push(Finding {
-                    severity: config.severity,
+                    severity: self.severity,
                     message: "TODO/FIXME must include `(@owner,YYYY-MM-DD)` metadata".to_owned(),
                     location: Some(Location {
                         path: changed_file.path.clone(),
                         line: Some((line_index + 1) as u32),
                         column: Some(1),
                     }),
-                    remediation: Some(config.remediation.clone()),
+                    remediation: Some(self.remediation.clone()),
                     suggested_fix: None,
                 });
             }
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "todo-expiry".to_owned(),
             findings,
         })
     }

@@ -1,9 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::CheckResult;
 
@@ -26,20 +27,21 @@ impl Check for CodePatternsCheck {
         "flags configured language-aware code patterns in changed files"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let compiled = parse_config(config)?;
+    fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config)?))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for config::CompiledCodePatternsConfig {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if !matches_language_path(&changed_file.path, compiled.language) {
+            if !matches_language_path(&changed_file.path, self.language) {
                 continue;
             }
 
@@ -50,15 +52,11 @@ impl Check for CodePatternsCheck {
                 continue;
             };
 
-            findings.extend(analyze_java_file(
-                &changed_file.path,
-                contents,
-                &compiled.rules,
-            ));
+            findings.extend(analyze_java_file(&changed_file.path, contents, &self.rules));
         }
 
         Ok(CheckResult {
-            check_id: self.id().to_owned(),
+            check_id: "code-patterns".to_owned(),
             findings,
         })
     }

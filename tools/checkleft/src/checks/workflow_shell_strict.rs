@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_yaml::{Mapping, Value};
 
-use crate::check::Check;
+use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -23,12 +24,14 @@ impl Check for WorkflowShellStrictCheck {
         "requires GitHub Actions run scripts to start with strict shell mode"
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        _config: &toml::Value,
-    ) -> Result<CheckResult> {
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(Self))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for WorkflowShellStrictCheck {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
