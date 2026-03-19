@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::path::validate_relative_path;
+use tracing::info;
 
 use super::{
     ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageProvider,
@@ -56,6 +57,7 @@ impl ExternalCheckPackageProvider for FileExternalCheckPackageProvider {
         };
 
         let manifest_path = self.root.join(relative_path);
+        info!(path = %manifest_path.display(), "resolving file external package manifest");
         if !manifest_path.exists() {
             return Ok(None);
         }
@@ -72,6 +74,7 @@ pub struct GeneratedExternalCheckPackageProvider {
 impl GeneratedExternalCheckPackageProvider {
     pub fn from_index_path(root: &Path, index_path: &Path) -> Result<Self> {
         let full_index_path = resolve_rooted_path(root, index_path, "generated index path")?;
+        info!(path = %full_index_path.display(), "loading generated external package index");
         let index_contents = fs::read_to_string(&full_index_path).with_context(|| {
             format!(
                 "failed to read generated external package index {}",
@@ -175,6 +178,11 @@ impl ExternalCheckPackageProvider for CompositeExternalCheckPackageProvider {
         &self,
         implementation_ref: &ExternalCheckImplementationRef,
     ) -> Result<Option<ExternalCheckPackage>> {
+        info!(
+            implementation_ref = %implementation_ref,
+            providers = self.providers.len(),
+            "resolving external package reference"
+        );
         let mut matches = Vec::new();
 
         for configured in &self.providers {

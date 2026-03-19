@@ -10,6 +10,7 @@ use crate::path::validate_relative_path;
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use tracing::info;
 
 const CHECKS_FILE_NAME_YAML: &str = "CHECKS.yaml";
 const CHECKS_FILE_NAME_TOML: &str = "CHECKS.toml";
@@ -134,6 +135,7 @@ impl ConfigResolver {
 
     pub fn resolve_for_file(&self, file_path: &Path) -> Result<ResolvedChecks> {
         validate_relative_path(file_path)?;
+        info!(path = %file_path.display(), "resolving checks for file");
 
         let parent_dir = file_path.parent().unwrap_or(Path::new(""));
         let search_dirs = root_to_leaf_dirs(parent_dir)?;
@@ -148,6 +150,7 @@ impl ConfigResolver {
             let Some(config_path) = resolve_checks_file_path(&config_dir) else {
                 continue;
             };
+            info!(path = %config_path.display(), "loading checks config");
             let config_relative_path = config_path
                 .strip_prefix(&self.root)
                 .unwrap_or(config_path.as_path())
@@ -622,6 +625,7 @@ fn normalize_configured_external_checks_url(
 }
 
 async fn load_external_checks_chain(external_checks_url: &str) -> Result<Vec<LoadedChecksFile>> {
+    info!(external_checks_url, "loading external checks config chain");
     let client = reqwest::Client::builder()
         .user_agent(CHECKLEFT_HTTP_USER_AGENT)
         .build()
@@ -682,6 +686,12 @@ async fn fetch_external_checks_file(
     let mut last_retryable_error = None;
 
     for attempt in 1..=EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+        info!(
+            url = %url,
+            attempt,
+            max_attempts = EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS,
+            "fetching external checks config"
+        );
         match client.get(url.clone()).send().await {
             Ok(response) => {
                 let status = response.status();

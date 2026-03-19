@@ -20,6 +20,7 @@ Run from the root of a Git or Jujutsu repository:
 
 ```bash
 checkleft run
+checkleft run --verbose
 checkleft run --all
 checkleft run --external-checks-url https://example.com/CHECKS.yaml
 checkleft list

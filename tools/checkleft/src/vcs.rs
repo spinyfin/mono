@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
+use tracing::info;
 
 mod patch_line_deltas;
 
@@ -187,6 +188,12 @@ pub async fn github_pull_request_description(
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
+    info!(
+        root = %root.display(),
+        binary,
+        args = args.join(" "),
+        "running command"
+    );
     let output = Command::new(binary)
         .args(args)
         .current_dir(root)

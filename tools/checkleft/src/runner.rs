@@ -15,6 +15,7 @@ use crate::external::{
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use tracing::info;
 
 struct ScheduledCheckRun {
     configured_check_id: String,
@@ -119,6 +120,11 @@ impl Runner {
 
     pub async fn run_changeset(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
         let scheduled = self.schedule_runs(changeset)?;
+        info!(
+            scheduled_runs = scheduled.runs.len(),
+            diagnostics = scheduled.diagnostics.len(),
+            "scheduled check execution"
+        );
 
         let mut results = scheduled.diagnostics;
         let mut join_set = JoinSet::new();
@@ -129,6 +135,12 @@ impl Runner {
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
                     let run_policy = run.policy;
+                    let file_count = run_changeset.changed_files.len();
+                    info!(
+                        check_id = %configured_check_id,
+                        file_count,
+                        "running built-in check"
+                    );
 
                     join_set.spawn(async move {
                         check
@@ -172,6 +184,13 @@ impl Runner {
                     let run_changeset = run.changeset;
                     let run_config = run.config;
                     let run_policy = run.policy;
+                    let file_count = run_changeset.changed_files.len();
+                    info!(
+                        check_id = %configured_check_id,
+                        package_id = %package.id,
+                        file_count,
+                        "running external check"
+                    );
 
                     join_set.spawn(async move {
                         external_executor
@@ -231,6 +250,10 @@ impl Runner {
     }
 
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
+        info!(
+            changed_files = changeset.changed_files.len(),
+            "listing configured checks"
+        );
         let mut checks = BTreeSet::new();
         let mut resolution_errors = BTreeMap::new();
         let mut config_diagnostics = BTreeSet::new();
@@ -278,6 +301,10 @@ impl Runner {
     }
 
     fn schedule_runs(&self, changeset: &ChangeSet) -> Result<ScheduledRuns> {
+        info!(
+            changed_files = changeset.changed_files.len(),
+            "scheduling checks"
+        );
         let mut grouped_runs: BTreeMap<
             (String, String, String, String, String),
             ScheduledCheckRun,
@@ -291,6 +318,7 @@ impl Runner {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
+            info!(path = %changed_file.path.display(), "evaluating changed file");
 
             let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
             for diagnostic in resolved.diagnostics() {
@@ -396,6 +424,7 @@ impl Runner {
     }
 
     fn resolve_scheduled_execution(&self, check: &CheckConfig) -> ScheduledExecution {
+        info!(check_id = %check.id, "resolving configured check execution");
         let Some(implementation_ref) = check.implementation.clone() else {
             let Some(built_in) = self.registry.get(&check.check) else {
                 return ScheduledExecution::BuiltInMissing {
