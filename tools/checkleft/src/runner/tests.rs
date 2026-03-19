@@ -230,7 +230,7 @@ id = "capture-descriptions"
                 "BYPASS_CAPTURE_DESCRIPTIONS=Legitimate exception for validation.".to_owned(),
             ))
             .with_change_id(Some("235".to_owned()))
-            .with_repository(Some("brianduff/flunge".to_owned())),
+            .with_repository(Some("example/flunge".to_owned())),
         )
         .await
         .expect("run checks");
@@ -246,7 +246,7 @@ id = "capture-descriptions"
     );
     assert_eq!(
         *seen_repository.lock().expect("lock repository"),
-        Some("brianduff/flunge".to_owned())
+        Some("example/flunge".to_owned())
     );
 }
 

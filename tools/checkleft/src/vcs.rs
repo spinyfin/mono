@@ -487,16 +487,16 @@ R docs/old.md => docs/new.md
     #[test]
     fn parses_repo_slug_from_supported_remote_url_formats() {
         assert_eq!(
-            parse_repo_slug_from_remote_url("git@github.com:brianduff/flunge.git"),
-            Some("brianduff/flunge".to_owned())
+            parse_repo_slug_from_remote_url("git@github.com:example/flunge.git"),
+            Some("example/flunge".to_owned())
         );
         assert_eq!(
-            parse_repo_slug_from_remote_url("https://github.com/brianduff/flunge"),
-            Some("brianduff/flunge".to_owned())
+            parse_repo_slug_from_remote_url("https://github.com/example/flunge"),
+            Some("example/flunge".to_owned())
         );
         assert_eq!(
-            parse_repo_slug_from_remote_url("ssh://git@github.com/brianduff/flunge.git"),
-            Some("brianduff/flunge".to_owned())
+            parse_repo_slug_from_remote_url("ssh://git@github.com/example/flunge.git"),
+            Some("example/flunge".to_owned())
         );
     }
 
@@ -505,8 +505,8 @@ R docs/old.md => docs/new.md
         assert_eq!(normalize_non_empty(None), None);
         assert_eq!(normalize_non_empty(Some("".to_owned())), None);
         assert_eq!(
-            normalize_non_empty(Some("  brianduff/flunge  ".to_owned())),
-            Some("brianduff/flunge".to_owned())
+            normalize_non_empty(Some("  example/flunge  ".to_owned())),
+            Some("example/flunge".to_owned())
         );
     }
 }
