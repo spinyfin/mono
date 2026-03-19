@@ -23,6 +23,9 @@ include = [
 [lib]
 path = "src/lib.rs"
 
+[features]
+benchmarking = []
+
 [[bin]]
 name = "checkleft"
 path = "src/main.rs"
