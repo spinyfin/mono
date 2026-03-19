@@ -21,11 +21,17 @@ Run from the root of a Git or Jujutsu repository:
 ```bash
 checkleft run
 checkleft run --all
+checkleft run --external-checks-url https://example.com/CHECKS.yaml
 checkleft list
 ```
 
 `checkleft` looks for `CHECKS.yaml` or `CHECKS.toml` files from the repository
 root down to the file being evaluated.
+
+The root config can also set `settings.external_checks_url` to merge an
+externally hosted root config before applying local root and child overrides.
+The CLI flag `--external-checks-url` provides the same behavior for repos that
+do not yet have a root config file.
 
 ## Minimal config
 

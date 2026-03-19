@@ -1,17 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 const CHECKS_FILE_NAME_YAML: &str = "CHECKS.yaml";
 const CHECKS_FILE_NAME_TOML: &str = "CHECKS.toml";
 const CHECKS_CONFIG_DIAGNOSTIC_ID: &str = "checks-config";
+const CHECKLEFT_HTTP_USER_AGENT: &str = "checkleft-cli";
+const EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS: u32 = 5;
+#[cfg(not(test))]
+const EXTERNAL_CHECKS_FETCH_BASE_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const EXTERNAL_CHECKS_FETCH_BASE_DELAY: Duration = Duration::from_millis(5);
+#[cfg(not(test))]
+const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
+const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckConfig {
@@ -79,22 +92,44 @@ pub struct ConfigDiagnostic {
 #[derive(Debug)]
 pub struct ConfigResolver {
     root: PathBuf,
+    external_root_configs: Vec<LoadedChecksFile>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigResolverOptions {
+    pub external_checks_url: Option<String>,
 }
 
 impl ConfigResolver {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
-        if !root.is_dir() {
-            bail!(
-                "config resolver root is not a directory: {}",
-                root.display()
-            );
-        }
+        let root = canonicalize_root(root.into())?;
+        Ok(Self {
+            root,
+            external_root_configs: Vec::new(),
+        })
+    }
 
-        Ok(Self { root })
+    pub async fn new_with_options(
+        root: impl Into<PathBuf>,
+        options: ConfigResolverOptions,
+    ) -> Result<Self> {
+        let root = canonicalize_root(root.into())?;
+        let external_root_configs = if let Some(external_checks_url) =
+            normalize_optional_cli_value(options.external_checks_url)
+        {
+            load_external_checks_chain(&external_checks_url).await?
+        } else if let Some(external_checks_url) =
+            discover_root_external_checks_url_for_prefetch(&root)?
+        {
+            load_external_checks_chain(&external_checks_url).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            root,
+            external_root_configs,
+        })
     }
 
     pub fn resolve_for_file(&self, file_path: &Path) -> Result<ResolvedChecks> {
@@ -104,6 +139,10 @@ impl ConfigResolver {
         let search_dirs = root_to_leaf_dirs(parent_dir)?;
 
         let mut resolved = ResolvedChecks::default();
+        for external_checks_file in &self.external_root_configs {
+            apply_external_checks_file(&mut resolved, external_checks_file)?;
+        }
+
         for relative_dir in search_dirs {
             let config_dir = self.root.join(relative_dir);
             let Some(config_path) = resolve_checks_file_path(&config_dir) else {
@@ -121,13 +160,20 @@ impl ConfigResolver {
                     continue;
                 }
             };
-            if let Some(include_config_files) = checks_file.settings.include_config_files {
-                resolved.include_config_files = include_config_files;
-            }
+            apply_local_settings(
+                &mut resolved,
+                &checks_file.settings,
+                config_dir == self.root,
+                &config_relative_path,
+            );
             for check in checks_file.checks {
                 let configured_id = check.id;
                 let implementation = if check.enabled {
-                    match parse_check_implementation(check.implementation, &configured_id) {
+                    match parse_check_implementation(
+                        check.implementation.as_deref(),
+                        &configured_id,
+                        None,
+                    ) {
                         Ok(implementation) => implementation,
                         Err(err) => {
                             resolved.push_diagnostic(config_check_diagnostic(
@@ -141,18 +187,18 @@ impl ConfigResolver {
                 } else {
                     None
                 };
-                let policy = match parse_policy_config(&configured_id, check.policy, check.enabled)
-                {
-                    Ok(policy) => policy,
-                    Err(err) => {
-                        resolved.push_diagnostic(config_check_diagnostic(
-                            configured_id.clone(),
-                            config_relative_path.clone(),
-                            err.to_string(),
-                        ));
-                        continue;
-                    }
-                };
+                let policy =
+                    match parse_policy_config(&configured_id, &check.policy, check.enabled, None) {
+                        Ok(policy) => policy,
+                        Err(err) => {
+                            resolved.push_diagnostic(config_check_diagnostic(
+                                configured_id.clone(),
+                                config_relative_path.clone(),
+                                err.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
                 resolved.upsert(CheckConfig {
                     check: check.check.unwrap_or_else(|| configured_id.clone()),
                     id: configured_id,
@@ -169,7 +215,7 @@ impl ConfigResolver {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ParsedChecksFile {
     #[serde(default)]
     settings: ParsedSettings,
@@ -177,13 +223,15 @@ struct ParsedChecksFile {
     checks: Vec<ParsedCheckConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct ParsedSettings {
     #[serde(default)]
     include_config_files: Option<bool>,
+    #[serde(default)]
+    external_checks_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ParsedCheckConfig {
     id: String,
     #[serde(default)]
@@ -198,7 +246,7 @@ struct ParsedCheckConfig {
     config: toml::Value,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct ParsedCheckPolicyConfig {
     #[serde(default)]
     severity: Option<String>,
@@ -206,6 +254,13 @@ struct ParsedCheckPolicyConfig {
     allow_bypass: Option<bool>,
     #[serde(default)]
     bypass_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct LoadedChecksFile {
+    source_label: String,
+    source_path: PathBuf,
+    parsed: ParsedChecksFile,
 }
 
 fn parse_checks_file(
@@ -241,6 +296,24 @@ fn parse_checks_file(
     }
 }
 
+fn parse_checks_contents(
+    contents: &str,
+    extension: &str,
+    source_label: &str,
+) -> Result<ParsedChecksFile> {
+    match extension {
+        "yaml" | "yml" => serde_yaml::from_str(contents)
+            .with_context(|| format!("failed to parse {source_label}")),
+        "toml" => {
+            toml::from_str(contents).with_context(|| format!("failed to parse {source_label}"))
+        }
+        _ => bail!(
+            "unsupported checks config extension for {} (expected .yaml or .toml)",
+            source_label
+        ),
+    }
+}
+
 fn enabled_default() -> bool {
     true
 }
@@ -250,36 +323,49 @@ fn empty_toml_table() -> toml::Value {
 }
 
 fn parse_check_implementation(
-    implementation: Option<String>,
+    implementation: Option<&str>,
     check_id: &str,
+    config_source: Option<&str>,
 ) -> Result<Option<ExternalCheckImplementationRef>> {
     let Some(implementation) = implementation else {
         return Ok(None);
     };
-    let implementation = ExternalCheckImplementationRef::parse(&implementation)
-        .with_context(|| format!("invalid `implementation` for check `{check_id}`"))?;
+    let implementation = ExternalCheckImplementationRef::parse(implementation).with_context(
+        || match config_source {
+            Some(config_source) => {
+                format!("invalid `implementation` for check `{check_id}` in {config_source}")
+            }
+            None => format!("invalid `implementation` for check `{check_id}`"),
+        },
+    )?;
     Ok(Some(implementation))
 }
 
 fn parse_policy_config(
     check_id: &str,
-    policy: ParsedCheckPolicyConfig,
+    policy: &ParsedCheckPolicyConfig,
     enabled: bool,
+    config_source: Option<&str>,
 ) -> Result<CheckPolicyConfig> {
     if !enabled {
         return Ok(CheckPolicyConfig::default());
     }
 
-    let severity = match policy.severity {
+    let severity = match policy.severity.as_deref() {
         Some(raw) => Some(
-            parse_policy_severity(&raw)
-                .with_context(|| format!("invalid `policy.severity` for check `{check_id}`"))?,
+            parse_policy_severity(raw).with_context(|| match config_source {
+                Some(config_source) => {
+                    format!("invalid `policy.severity` for check `{check_id}` in {config_source}")
+                }
+                None => format!("invalid `policy.severity` for check `{check_id}`"),
+            })?,
         ),
         None => None,
     };
 
     let bypass_name = policy
         .bypass_name
+        .clone()
         .map(|raw| normalize_bypass_name(raw, check_id));
 
     Ok(CheckPolicyConfig {
@@ -390,6 +476,303 @@ fn offset_to_line_column(contents: &str, offset: usize) -> (u32, u32) {
     }
 
     (line, column)
+}
+
+fn canonicalize_root(root: PathBuf) -> Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
+    if !root.is_dir() {
+        bail!(
+            "config resolver root is not a directory: {}",
+            root.display()
+        );
+    }
+
+    Ok(root)
+}
+
+fn apply_local_settings(
+    resolved: &mut ResolvedChecks,
+    settings: &ParsedSettings,
+    is_root_config: bool,
+    source_path: &Path,
+) {
+    if let Some(include_config_files) = settings.include_config_files {
+        resolved.include_config_files = include_config_files;
+    }
+
+    let Some(external_checks_url) = settings.external_checks_url.as_deref() else {
+        return;
+    };
+    if !is_root_config {
+        resolved.push_diagnostic(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            "`settings.external_checks_url` is only supported in the repository root config"
+                .to_owned(),
+            None,
+            None,
+            Some("Remove `settings.external_checks_url` from child CHECKS files.".to_owned()),
+        ));
+        return;
+    }
+
+    if let Err(error) = validate_external_checks_url(external_checks_url, None) {
+        resolved.push_diagnostic(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid `settings.external_checks_url`: {error}"),
+            None,
+            None,
+            Some("Set `settings.external_checks_url` to a valid absolute URL.".to_owned()),
+        ));
+    }
+}
+
+fn apply_external_checks_file(
+    resolved: &mut ResolvedChecks,
+    external_checks_file: &LoadedChecksFile,
+) -> Result<()> {
+    if let Some(include_config_files) = external_checks_file.parsed.settings.include_config_files {
+        resolved.include_config_files = include_config_files;
+    }
+
+    for check in &external_checks_file.parsed.checks {
+        let configured_id = check.id.clone();
+        let implementation = if check.enabled {
+            parse_check_implementation(
+                check.implementation.as_deref(),
+                &configured_id,
+                Some(&external_checks_file.source_label),
+            )?
+        } else {
+            None
+        };
+        let policy = parse_policy_config(
+            &configured_id,
+            &check.policy,
+            check.enabled,
+            Some(&external_checks_file.source_label),
+        )?;
+        resolved.upsert(CheckConfig {
+            check: check.check.clone().unwrap_or_else(|| configured_id.clone()),
+            id: configured_id,
+            source_path: external_checks_file.source_path.clone(),
+            implementation,
+            enabled: check.enabled,
+            policy,
+            config: check.config.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn discover_root_external_checks_url_for_prefetch(root: &Path) -> Result<Option<String>> {
+    let Some(config_path) = resolve_checks_file_path(root) else {
+        return Ok(None);
+    };
+    let relative_path = config_path
+        .strip_prefix(root)
+        .unwrap_or(config_path.as_path())
+        .to_path_buf();
+    let Ok(checks_file) = parse_checks_file(&config_path, &relative_path) else {
+        return Ok(None);
+    };
+    let Some(external_checks_url) = checks_file.settings.external_checks_url else {
+        return Ok(None);
+    };
+    let Some(external_checks_url) = normalize_optional_cli_value(Some(external_checks_url)) else {
+        return Ok(None);
+    };
+    if resolve_external_checks_url(&external_checks_url, None).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(external_checks_url))
+}
+
+fn normalize_optional_cli_value(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn validate_external_checks_url(raw_url: &str, base_url: Option<&reqwest::Url>) -> Result<()> {
+    resolve_external_checks_url(raw_url, base_url).map(|_| ())
+}
+
+fn normalize_configured_external_checks_url(
+    raw: Option<String>,
+    source_label: &str,
+) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("`settings.external_checks_url` in {source_label} must not be empty");
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+async fn load_external_checks_chain(external_checks_url: &str) -> Result<Vec<LoadedChecksFile>> {
+    let client = reqwest::Client::builder()
+        .user_agent(CHECKLEFT_HTTP_USER_AGENT)
+        .build()
+        .context("failed to build HTTP client for external checks config")?;
+    let mut seen_urls = HashSet::new();
+    let mut loaded = Vec::new();
+    let mut next_url = Some(resolve_external_checks_url(external_checks_url, None)?);
+
+    while let Some(url) = next_url {
+        if loaded.len() >= EXTERNAL_CHECKS_MAX_CHAIN_DEPTH {
+            bail!(
+                "external checks config chain exceeded {} entries while loading {}",
+                EXTERNAL_CHECKS_MAX_CHAIN_DEPTH,
+                external_checks_url
+            );
+        }
+        if !seen_urls.insert(url.as_str().to_owned()) {
+            bail!("external checks config cycle detected at {}", url);
+        }
+
+        let fetched = fetch_external_checks_file(&client, url.clone()).await?;
+        next_url = normalize_configured_external_checks_url(
+            fetched.parsed.settings.external_checks_url.clone(),
+            &fetched.source_label,
+        )?
+        .map(|nested_url| resolve_external_checks_url(&nested_url, Some(&url)))
+        .transpose()?;
+        loaded.push(fetched);
+    }
+
+    loaded.reverse();
+    Ok(loaded)
+}
+
+fn resolve_external_checks_url(
+    raw_url: &str,
+    base_url: Option<&reqwest::Url>,
+) -> Result<reqwest::Url> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        bail!("external checks URL must not be empty");
+    }
+
+    let parsed = match base_url {
+        Some(base_url) => base_url
+            .join(trimmed)
+            .or_else(|_| reqwest::Url::parse(trimmed)),
+        None => reqwest::Url::parse(trimmed),
+    };
+
+    parsed.with_context(|| format!("invalid external checks URL `{trimmed}`"))
+}
+
+async fn fetch_external_checks_file(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+) -> Result<LoadedChecksFile> {
+    let mut last_retryable_error = None;
+
+    for attempt in 1..=EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+        match client.get(url.clone()).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status == StatusCode::NOT_FOUND {
+                    if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+                        bail!(
+                            "external checks config {} returned 404 Not Found after {} attempts",
+                            url,
+                            EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS
+                        );
+                    }
+                    tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let response_error =
+                        format!("external checks config {} returned {}", url, status);
+                    if is_retryable_http_status(status) {
+                        last_retryable_error = Some(response_error);
+                        if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+                            break;
+                        }
+                        tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
+                        continue;
+                    }
+                    bail!("{response_error}");
+                }
+
+                let contents = match response.text().await {
+                    Ok(contents) => contents,
+                    Err(error) => {
+                        last_retryable_error = Some(format!(
+                            "failed to read external checks config {} response body: {error}",
+                            url
+                        ));
+                        if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+                            break;
+                        }
+                        tokio::time::sleep(external_checks_retry_delay(attempt, status)).await;
+                        continue;
+                    }
+                };
+                let extension = Path::new(url.path())
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("");
+                let parsed = parse_checks_contents(&contents, extension, url.as_str())
+                    .with_context(|| format!("failed to parse external checks config {url}"))?;
+                return Ok(LoadedChecksFile {
+                    source_label: url.to_string(),
+                    source_path: PathBuf::from(url.as_str()),
+                    parsed,
+                });
+            }
+            Err(error) => {
+                last_retryable_error = Some(format!(
+                    "failed to retrieve external checks config {}: {error}",
+                    url
+                ));
+                if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(external_checks_retry_delay(
+                    attempt,
+                    StatusCode::REQUEST_TIMEOUT,
+                ))
+                .await;
+            }
+        }
+    }
+
+    let message = last_retryable_error
+        .unwrap_or_else(|| format!("failed to retrieve external checks config {}", url));
+    bail!(
+        "{message} after {} attempts",
+        EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS
+    )
+}
+
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn external_checks_retry_delay(attempt: u32, status: StatusCode) -> Duration {
+    let base_delay = if status == StatusCode::NOT_FOUND {
+        EXTERNAL_CHECKS_FETCH_404_BASE_DELAY
+    } else {
+        EXTERNAL_CHECKS_FETCH_BASE_DELAY
+    };
+    base_delay.saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
 }
 
 fn root_to_leaf_dirs(path: &Path) -> Result<Vec<PathBuf>> {

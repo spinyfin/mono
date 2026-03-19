@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
-use checkleft::config::ConfigResolver;
+use checkleft::config::{ConfigResolver, ConfigResolverOptions};
 use checkleft::external::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
     ExternalCheckExecutor, ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
@@ -19,7 +19,7 @@ use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{Vcs, github_pull_request_description};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
@@ -32,6 +32,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run {
+        #[command(flatten)]
+        config: ConfigArgs,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -40,11 +42,19 @@ enum Commands {
         format: OutputFormat,
     },
     List {
+        #[command(flatten)]
+        config: ConfigArgs,
         #[arg(long)]
         all: bool,
         #[arg(long)]
         base_ref: Option<String>,
     },
+}
+
+#[derive(Debug, Args, Clone, Default)]
+struct ConfigArgs {
+    #[arg(long)]
+    external_checks_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -87,11 +97,19 @@ async fn run_cli() -> Result<ExitCode> {
     let vcs = Vcs::detect(&root)?;
     match cli.command {
         Commands::Run {
+            config,
             all,
             base_ref,
             format,
         } => {
-            let runner = build_runner(&root, &vcs, all, base_ref.as_deref())?;
+            let runner = build_runner(
+                &root,
+                &vcs,
+                all,
+                base_ref.as_deref(),
+                config.external_checks_url,
+            )
+            .await?;
             let changeset = attach_description_context(
                 resolve_changeset(&vcs, all, base_ref.as_deref())?,
                 &vcs,
@@ -119,8 +137,19 @@ async fn run_cli() -> Result<ExitCode> {
                 ExitCode::SUCCESS
             })
         }
-        Commands::List { all, base_ref } => {
-            let runner = build_runner(&root, &vcs, all, base_ref.as_deref())?;
+        Commands::List {
+            config,
+            all,
+            base_ref,
+        } => {
+            let runner = build_runner(
+                &root,
+                &vcs,
+                all,
+                base_ref.as_deref(),
+                config.external_checks_url,
+            )
+            .await?;
             let changeset = resolve_changeset(&vcs, all, base_ref.as_deref())?;
             let checks = runner.list_configured_checks(&changeset)?;
             if checks.is_empty() {
@@ -135,10 +164,24 @@ async fn run_cli() -> Result<ExitCode> {
     }
 }
 
-fn build_runner(root: &Path, vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<Runner> {
+async fn build_runner(
+    root: &Path,
+    vcs: &Vcs,
+    all: bool,
+    base_ref: Option<&str>,
+    external_checks_url: Option<String>,
+) -> Result<Runner> {
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry)?;
-    let resolver = Arc::new(ConfigResolver::new(root)?);
+    let resolver = Arc::new(
+        ConfigResolver::new_with_options(
+            root,
+            ConfigResolverOptions {
+                external_checks_url,
+            },
+        )
+        .await?,
+    );
     let source_tree = Arc::new(LocalSourceTree::with_base_revision(
         root,
         vcs.base_revision(all, base_ref)?,

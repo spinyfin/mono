@@ -15,7 +15,7 @@ The wrapper builds and runs the checks binary (preferring Bazel, falling back to
 Run configured checks for a computed change set.
 
 ```bash
-./tools/checks run [--all] [--base-ref <ref>] [--format <human|json>]
+./tools/checks run [--all] [--base-ref <ref>] [--format <human|json>] [--external-checks-url <url>]
 ```
 
 Flags:
@@ -23,6 +23,7 @@ Flags:
 - `--all`: run checks for all tracked files.
 - `--base-ref <ref>`: run checks against changes since `<ref>`.
 - `--format human|json`: output format (`human` default).
+- `--external-checks-url <url>`: fetch an external root `CHECKS.yaml` or `CHECKS.toml` and merge it before local config resolution.
 
 Behavior:
 
@@ -34,7 +35,7 @@ Behavior:
 List check IDs configured for the computed change set.
 
 ```bash
-./tools/checks list [--all] [--base-ref <ref>]
+./tools/checks list [--all] [--base-ref <ref>] [--external-checks-url <url>]
 ```
 
 If no checks apply, output is:
