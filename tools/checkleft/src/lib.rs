@@ -1,3 +1,8 @@
+//! Experimental crate under active development.
+//!
+//! `checkleft` is not yet recommended for general use. The library API, CLI
+//! behavior, and built-in checks may change without notice.
+
 pub mod bypass;
 pub mod check;
 pub mod checks;
