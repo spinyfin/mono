@@ -3,6 +3,7 @@
 
 # Rust
 target/
+/dist/
 
 # Node
 node_modules/

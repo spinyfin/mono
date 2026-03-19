@@ -4,6 +4,7 @@ members = [
   "tools/hood",
   "tools/boss/engine",
   "tools/checkleft",
+  "tools/checkleft_package",
   "tools/cube",
 ]
 resolver = "2"
@@ -16,6 +17,7 @@ edition = "2024"
 anyhow = "1.0.97"
 async-trait = "0.1.86"
 clap = "4.5.39"
+flate2 = "1.1.5"
 comfy-table = "7.2.2"
 console = "0.15.11"
 globset = "0.4.18"
@@ -34,6 +36,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 sha2 = "0.10.9"
 tempfile = "3.25.0"
 thiserror = "1.0"
+tar = "0.4.44"
 tokio = "1.45.0"
 toml = "1.0.7"
 tracing = "0.1.41"
