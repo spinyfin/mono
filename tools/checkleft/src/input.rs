@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::bypass::parse_bypass_directives_from_descriptions;
@@ -11,6 +11,8 @@ pub struct ChangeSet {
     pub changed_files: Vec<ChangedFile>,
     #[serde(default)]
     pub file_line_deltas: HashMap<PathBuf, FileLineDelta>,
+    #[serde(default)]
+    pub file_diffs: HashMap<PathBuf, FileDiff>,
     #[serde(default)]
     pub commit_description: Option<String>,
     #[serde(default)]
@@ -26,6 +28,7 @@ impl ChangeSet {
         Self {
             changed_files,
             file_line_deltas: HashMap::new(),
+            file_diffs: HashMap::new(),
             commit_description: None,
             pr_description: None,
             change_id: None,
@@ -62,6 +65,13 @@ impl ChangeSet {
         self
     }
 
+    pub fn with_file_diff(mut self, path: PathBuf, diff: FileDiff) -> Self {
+        self.file_line_deltas
+            .insert(path.clone(), diff.line_delta());
+        self.file_diffs.insert(path, diff);
+        self
+    }
+
     pub fn bypass_reason(&self, bypass_name: &str) -> Option<String> {
         parse_bypass_directives_from_descriptions(
             self.commit_description.as_deref(),
@@ -74,6 +84,33 @@ impl ChangeSet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FileLineDelta {
+    pub added_lines: usize,
+    pub removed_lines: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FileDiff {
+    #[serde(default)]
+    pub hunks: Vec<DiffHunk>,
+}
+
+impl FileDiff {
+    pub fn line_delta(&self) -> FileLineDelta {
+        let mut delta = FileLineDelta::default();
+        for hunk in &self.hunks {
+            delta.added_lines = delta.added_lines.saturating_add(hunk.added_lines);
+            delta.removed_lines = delta.removed_lines.saturating_add(hunk.removed_lines);
+        }
+        delta
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_lines: usize,
+    pub new_start: usize,
+    pub new_lines: usize,
     pub added_lines: usize,
     pub removed_lines: usize,
 }
@@ -94,8 +131,21 @@ pub enum ChangeKind {
     Renamed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeVersion {
+    Current,
+    Base,
+}
+
 pub trait SourceTree: Send + Sync {
     fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+
+    fn read_file_versioned(&self, path: &Path, version: TreeVersion) -> Result<Vec<u8>> {
+        match version {
+            TreeVersion::Current => self.read_file(path),
+            TreeVersion::Base => bail!("base revision reads are not supported by this source tree"),
+        }
+    }
 
     fn exists(&self, path: &Path) -> bool;
 

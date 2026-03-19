@@ -85,28 +85,13 @@ async fn run_cli() -> Result<ExitCode> {
     let root = std::env::current_dir()?;
 
     let vcs = Vcs::detect(&root)?;
-    let resolver = Arc::new(ConfigResolver::new(&root)?);
-    let source_tree = Arc::new(LocalSourceTree::new(&root)?);
-    let external_provider = build_external_package_provider(&root)?;
-    let external_executor = build_external_check_executor(&root)?;
-
-    let mut registry = CheckRegistry::new();
-    register_builtin_checks(&mut registry)?;
-
-    let runner = Runner::with_external(
-        Arc::new(registry),
-        resolver,
-        source_tree,
-        external_provider,
-        external_executor,
-    );
-
     match cli.command {
         Commands::Run {
             all,
             base_ref,
             format,
         } => {
+            let runner = build_runner(&root, &vcs, all, base_ref.as_deref())?;
             let changeset = attach_description_context(
                 resolve_changeset(&vcs, all, base_ref.as_deref())?,
                 &vcs,
@@ -135,6 +120,7 @@ async fn run_cli() -> Result<ExitCode> {
             })
         }
         Commands::List { all, base_ref } => {
+            let runner = build_runner(&root, &vcs, all, base_ref.as_deref())?;
             let changeset = resolve_changeset(&vcs, all, base_ref.as_deref())?;
             let checks = runner.list_configured_checks(&changeset)?;
             if checks.is_empty() {
@@ -147,6 +133,26 @@ async fn run_cli() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn build_runner(root: &Path, vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<Runner> {
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry)?;
+    let resolver = Arc::new(ConfigResolver::new(root)?);
+    let source_tree = Arc::new(LocalSourceTree::with_base_revision(
+        root,
+        vcs.base_revision(all, base_ref)?,
+    )?);
+    let external_provider = build_external_package_provider(root)?;
+    let external_executor = build_external_check_executor(root)?;
+
+    Ok(Runner::with_external(
+        Arc::new(registry),
+        resolver,
+        source_tree,
+        external_provider,
+        external_executor,
+    ))
 }
 
 fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckPackageProvider>> {
