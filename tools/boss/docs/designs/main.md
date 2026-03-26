@@ -166,3 +166,8 @@ approval defaults, and audit logging.
   appropriate, reducing the need for human routing.
 - **Protocol hardening**: versioned/stable engine-frontend schema for
   multi-client compatibility.
+
+## Related Designs
+
+- [`work-taxonomy`](work-taxonomy.md)
+- [`work-kanban`](work-kanban.md)

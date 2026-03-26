@@ -17,6 +17,10 @@ work entities that sits above agents:
 - **Chore**: a small standalone task that belongs to a product but does not
   need to sit inside a project.
 
+The taxonomy in this document defines the domain model. The preferred kanban
+presentation for the Work tab is described separately in
+[`work-kanban`](work-kanban.md).
+
 In the near term, these concepts should be stored persistently in the Boss
 backend and made visible in the UI. They should remain orthogonal to agents for
 now: work entities exist in their own navigator, and no agent-assignment model
@@ -290,34 +294,17 @@ them feel like primary Boss concepts.
 
 ### Work Navigator
 
-The first version of the work navigator should be tree-oriented rather than
-board-oriented.
+This document does not prescribe the main Work tab layout. The current
+preferred presentation is the kanban board described in
+[`work-kanban`](work-kanban.md).
 
-Suggested layout:
+The important taxonomy constraint is that the UI should preserve these
+relationships:
 
-```text
-┌───────────────────┬─────────────────────────────────────┐
-│ Products / Work   │ Details                             │
-│───────────────────│─────────────────────────────────────│
-│ Boss              │ Product: Boss                       │
-│   Work taxonomy   │ Repo: .../tools/boss               │
-│     Phase 1       │                                     │
-│     Phase 2       │ Project summary, tasks, chores     │
-│   Agent polish    │                                     │
-│   Chores          │                                     │
-│     Fix login     │                                     │
-│ Flunge            │                                     │
-└───────────────────┴─────────────────────────────────────┘
-```
-
-Behavior:
-
-- The navigator is rooted by product.
-- Expanding a product shows its projects and a dedicated chores group.
-- Expanding a project shows its tasks/phases in ordinal order.
-- Selecting any node shows an inspector/detail view for that entity.
-- The model should support reordering phases/tasks even if the first UI uses a
-  simple edit flow rather than drag-and-drop.
+- products are the top-level scope,
+- projects contain ordered project tasks,
+- chores belong directly to products,
+- tasks and chores remain distinct from projects in presentation and behavior.
 
 ### Detail Views
 
@@ -335,7 +322,7 @@ inline forms are enough.
 
 ## Frontend State Model
 
-Add a parallel work state tree to the macOS app:
+Add a parallel work state model to the macOS app:
 
 - `products: [Product]`
 - `projectsByProductID: [String: [Project]]`
@@ -343,6 +330,9 @@ Add a parallel work state tree to the macOS app:
 - `choresByProductID: [String: [Task]]`
 - `selectedWorkNode: WorkNodeID?`
 - `navigationMode: .agents | .work`
+
+Additional board-specific state such as selected product, project filters, and
+grouping mode is covered in [`work-kanban`](work-kanban.md).
 
 This should be separate from the current `agents` array and transcript state.
 
