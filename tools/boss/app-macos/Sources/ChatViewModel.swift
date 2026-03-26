@@ -22,6 +22,7 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedWorkProjectFilterID: String?
     @Published var selectedWorkCardID: String?
     @Published var includeWorkChores = true
+    @Published var workShowBlockedOnly = false
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
@@ -78,6 +79,10 @@ final class ChatViewModel: ObservableObject {
         }
         if includeWorkChores && selectedProjectID == nil {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
+        }
+
+        if workShowBlockedOnly {
+            items = items.filter { $0.status == "blocked" }
         }
 
         guard !query.isEmpty else {
@@ -180,6 +185,20 @@ final class ChatViewModel: ObservableObject {
         selectedWorkCardID = taskID
         guard let taskID, let task = task(withID: taskID) else { return }
         selectedWorkProductID = task.productID
+    }
+
+    func setIncludeWorkChores(_ include: Bool) {
+        includeWorkChores = include
+        if let selectedTask, !isTaskVisible(selectedTask) {
+            selectedWorkCardID = nil
+        }
+    }
+
+    func setWorkShowBlockedOnly(_ show: Bool) {
+        workShowBlockedOnly = show
+        if let selectedTask, !isTaskVisible(selectedTask) {
+            selectedWorkCardID = nil
+        }
     }
 
     func presentCreateProduct() {
@@ -321,6 +340,27 @@ final class ChatViewModel: ObservableObject {
 
         tasks.swapAt(currentIndex, destination)
         engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
+    }
+
+    func moveTask(_ taskID: String, to column: WorkBoardColumnKey) {
+        guard let task = task(withID: taskID) else { return }
+        let targetStatus = column.targetStatus
+        guard task.status != targetStatus else { return }
+        engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
+    }
+
+    func toggleBlocked(for taskID: String) {
+        guard let task = task(withID: taskID) else { return }
+        let nextStatus: String
+        switch task.status {
+        case "blocked":
+            nextStatus = "active"
+        case "active":
+            nextStatus = "blocked"
+        default:
+            return
+        }
+        engine.sendUpdateWorkItem(id: task.id, patch: ["status": nextStatus])
     }
 
     func startIfNeeded() {
@@ -691,7 +731,9 @@ final class ChatViewModel: ObservableObject {
     }
 
     func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
-        visibleWorkItems.filter { $0.boardColumn == column }
+        visibleWorkItems
+            .filter { $0.boardColumn == column }
+            .sorted(by: boardTaskSort)
     }
 
     func isTaskVisible(_ task: WorkTask) -> Bool {
@@ -780,4 +822,16 @@ private func taskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
         }
         return lhs.createdAt < rhs.createdAt
     }
+}
+
+private func boardTaskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
+    if lhs.status != rhs.status {
+        if lhs.status == "blocked" {
+            return true
+        }
+        if rhs.status == "blocked" {
+            return false
+        }
+    }
+    return taskSort(lhs, rhs)
 }
