@@ -239,17 +239,33 @@ struct ContentView: View {
 
                     if !(model.choresByProductID[product.id] ?? []).isEmpty {
                         Divider()
+                    }
 
-                        VStack(alignment: .leading, spacing: 10) {
-                            workSidebarSectionTitle("Options")
-                            Toggle("Show Chores", isOn: $model.includeWorkChores)
-                                .toggleStyle(.switch)
-                                .disabled(model.selectedProject != nil)
-                            if model.selectedProject != nil {
-                                Text("Chores are product-level work, so they appear only in the all-projects view.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                    VStack(alignment: .leading, spacing: 10) {
+                        workSidebarSectionTitle("Options")
+                        Toggle(
+                            "Show Chores",
+                            isOn: Binding(
+                                get: { model.includeWorkChores },
+                                set: { model.setIncludeWorkChores($0) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .disabled(model.selectedProject != nil)
+
+                        Toggle(
+                            "Blocked Only",
+                            isOn: Binding(
+                                get: { model.workShowBlockedOnly },
+                                set: { model.setWorkShowBlockedOnly($0) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+
+                        if model.selectedProject != nil {
+                            Text("Chores are product-level work, so they appear only in the all-projects view.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -486,6 +502,21 @@ struct ContentView: View {
                     .clipShape(Capsule())
             }
 
+            if column == .backlog {
+                HStack(spacing: 8) {
+                    Button("New Task") {
+                        model.presentCreateTask()
+                    }
+                    .disabled(model.selectedProject == nil || !model.isConnected)
+
+                    Button("New Chore") {
+                        model.presentCreateChore()
+                    }
+                    .disabled(model.selectedProduct == nil || !model.isConnected)
+                }
+                .font(.caption)
+            }
+
             Divider()
 
             if items.isEmpty {
@@ -518,6 +549,11 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
+        .dropDestination(for: String.self) { items, _ in
+            guard let taskID = items.first else { return false }
+            model.moveTask(taskID, to: column)
+            return true
+        }
     }
 
     private var workInspector: some View {
@@ -540,7 +576,25 @@ struct ContentView: View {
                         workMetadataRow("Phase", value: "\(ordinal)")
                     }
                     workMetadataRow("PR", value: task.prURL ?? "Not set")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Move")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        HStack {
+                            ForEach(WorkBoardColumnKey.allCases) { column in
+                                Button(column.title) {
+                                    model.moveTask(task.id, to: column)
+                                }
+                                .disabled(task.boardColumn == column && task.status != "blocked")
+                            }
+                        }
+                    }
                     HStack {
+                        if task.status == "active" || task.status == "blocked" {
+                            Button(task.status == "blocked" ? "Unblock" : "Mark Blocked") {
+                                model.toggleBlocked(for: task.id)
+                            }
+                        }
                         if !task.isChore {
                             Button("Move Up") {
                                 model.moveSelectedTask(offset: -1)
@@ -697,6 +751,9 @@ private struct WorkBoardCardView: View {
                 } else {
                     WorkStatusBadge(text: "Chore")
                 }
+                if task.status == "blocked" {
+                    WorkStatusBadge(text: "Blocked")
+                }
                 Spacer()
                 Text(task.status.replacingOccurrences(of: "_", with: " ").capitalized)
                     .font(.caption)
@@ -716,15 +773,29 @@ private struct WorkBoardCardView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
+                .stroke(borderColor, lineWidth: isSelected ? 2 : 1)
         )
+        .draggable(task.id)
     }
 
     private var cardBackground: Color {
         if isSelected {
             return Color.accentColor.opacity(0.08)
         }
+        if task.status == "blocked" {
+            return Color.orange.opacity(0.08)
+        }
         return Color(nsColor: .windowBackgroundColor)
+    }
+
+    private var borderColor: Color {
+        if isSelected {
+            return .accentColor
+        }
+        if task.status == "blocked" {
+            return .orange
+        }
+        return Color(nsColor: .separatorColor)
     }
 }
 
