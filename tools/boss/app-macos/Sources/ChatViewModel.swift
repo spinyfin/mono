@@ -18,6 +18,10 @@ final class ChatViewModel: ObservableObject {
     @Published var projectsByProductID: [String: [WorkProject]] = [:]
     @Published var tasksByProjectID: [String: [WorkTask]] = [:]
     @Published var choresByProductID: [String: [WorkTask]] = [:]
+    @Published var selectedWorkProductID: String?
+    @Published var selectedWorkProjectFilterID: String?
+    @Published var selectedWorkCardID: String?
+    @Published var includeWorkChores = true
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
@@ -42,91 +46,50 @@ final class ChatViewModel: ObservableObject {
     }
 
     var selectedProduct: WorkProduct? {
-        if case .product(let productID) = selectedWorkNodeID {
-            return product(withID: productID)
-        }
-        if let productID = currentSelectedProductID {
-            return product(withID: productID)
-        }
-        return nil
+        guard let productID = currentSelectedProductID else { return nil }
+        return product(withID: productID)
     }
 
     var selectedProject: WorkProject? {
-        guard case .project(let projectID) = selectedWorkNodeID else { return nil }
+        guard let projectID = selectedWorkProjectFilterID else { return nil }
         return project(withID: projectID)
     }
 
     var selectedTask: WorkTask? {
-        switch selectedWorkNodeID {
-        case .task(let taskID), .chore(let taskID):
-            return task(withID: taskID)
-        default:
-            return nil
-        }
+        guard let taskID = selectedWorkCardID else { return nil }
+        return task(withID: taskID)
     }
 
-    var workSidebarRows: [WorkSidebarRow] {
-        var rows: [WorkSidebarRow] = []
+    var projectsForSelectedProduct: [WorkProject] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return (projectsByProductID[productID] ?? []).sorted(by: projectSort)
+    }
 
-        for product in products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) {
-            rows.append(
-                WorkSidebarRow(
-                    id: .product(product.id),
-                    title: product.name,
-                    subtitle: product.repoRemoteURL,
-                    statusBadge: product.status.capitalized,
-                    systemImage: "shippingbox",
-                    depth: 0
-                )
-            )
-
-            for project in (projectsByProductID[product.id] ?? []).sorted(by: projectSort) {
-                rows.append(
-                    WorkSidebarRow(
-                        id: .project(project.id),
-                        title: project.name,
-                        subtitle: project.priority.capitalized,
-                        statusBadge: project.status.capitalized,
-                        systemImage: "folder",
-                        depth: 1
-                    )
-                )
-
-                for task in (tasksByProjectID[project.id] ?? []).sorted(by: taskSort) {
-                    rows.append(
-                        WorkSidebarRow(
-                            id: .task(task.id),
-                            title: task.name,
-                            subtitle: task.ordinal.map { "Phase \($0)" },
-                            statusBadge: task.status.capitalized,
-                            systemImage: "circle.hexagongrid",
-                            depth: 2
-                        )
-                    )
-                }
-            }
-
-            for chore in (choresByProductID[product.id] ?? []).sorted(by: taskSort) {
-                rows.append(
-                    WorkSidebarRow(
-                        id: .chore(chore.id),
-                        title: chore.name,
-                        subtitle: "Chore",
-                        statusBadge: chore.status.capitalized,
-                        systemImage: "wrench.and.screwdriver",
-                        depth: 1
-                    )
-                )
-            }
-        }
+    var visibleWorkItems: [WorkTask] {
+        guard let productID = currentSelectedProductID else { return [] }
 
         let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return rows }
+        let selectedProjectID = selectedWorkProjectFilterID
 
-        return rows.filter { row in
-            row.title.localizedCaseInsensitiveContains(query)
-                || (row.subtitle?.localizedCaseInsensitiveContains(query) ?? false)
-                || (row.statusBadge?.localizedCaseInsensitiveContains(query) ?? false)
+        var items: [WorkTask] = []
+        for project in projectsForSelectedProduct {
+            guard selectedProjectID == nil || selectedProjectID == project.id else { continue }
+            items.append(contentsOf: (tasksByProjectID[project.id] ?? []).sorted(by: taskSort))
+        }
+        if includeWorkChores && selectedProjectID == nil {
+            items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
+        }
+
+        guard !query.isEmpty else {
+            return items
+        }
+
+        return items.filter { item in
+            item.name.localizedCaseInsensitiveContains(query)
+                || item.description.localizedCaseInsensitiveContains(query)
+                || (item.prURL?.localizedCaseInsensitiveContains(query) ?? false)
+                || (projectName(for: item.projectID)?.localizedCaseInsensitiveContains(query) ?? false)
+                || item.status.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -142,7 +105,6 @@ final class ChatViewModel: ObservableObject {
 
     private let maxTerminalOutputChars = 200_000
     private let navigationModeDefaultsKey = "boss.navigationMode"
-    private let selectedWorkNodeDefaultsKey = "boss.selectedWorkNode"
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -156,9 +118,6 @@ final class ChatViewModel: ObservableObject {
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
             navigationMode = persistedMode
-        }
-        if let storedNode = defaults.string(forKey: selectedWorkNodeDefaultsKey) {
-            selectedWorkNodeID = deserializeWorkNode(storedNode)
         }
 
         processController.onOutputLine = { [weak self] line in
@@ -199,11 +158,28 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    func selectWorkNode(_ nodeID: WorkNodeID?) {
-        setSelectedWorkNode(nodeID)
-        if let productID = productID(for: nodeID) {
+    func selectWorkProduct(_ productID: String) {
+        guard selectedWorkProductID != productID else { return }
+        selectedWorkProductID = productID
+        selectedWorkProjectFilterID = nil
+        selectedWorkCardID = nil
+        workErrorMessage = nil
+        if isConnected {
             engine.sendGetWorkTree(productId: productID)
         }
+    }
+
+    func selectWorkProjectFilter(_ projectID: String?) {
+        selectedWorkProjectFilterID = projectID
+        if let selectedTask, !isTaskVisible(selectedTask) {
+            selectedWorkCardID = nil
+        }
+    }
+
+    func selectWorkCard(_ taskID: String?) {
+        selectedWorkCardID = taskID
+        guard let taskID, let task = task(withID: taskID) else { return }
+        selectedWorkProductID = task.productID
     }
 
     func presentCreateProduct() {
@@ -216,7 +192,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func presentCreateTask() {
-        guard let project = selectedProject else { return }
+        guard let project = taskCreationProject else { return }
         pendingWorkCreateRequest = WorkCreateRequest(
             kind: .task(productID: project.productID, projectID: project.id)
         )
@@ -232,12 +208,12 @@ final class ChatViewModel: ObservableObject {
     }
 
     func presentEditSelectedWorkItem() {
-        if let product = selectedProduct, selectedProject == nil, selectedTask == nil {
-            pendingWorkEditRequest = WorkEditRequest(item: .product(product))
+        if let task = selectedTask {
+            pendingWorkEditRequest = WorkEditRequest(item: task.isChore ? .chore(task) : .task(task))
         } else if let project = selectedProject {
             pendingWorkEditRequest = WorkEditRequest(item: .project(project))
-        } else if let task = selectedTask {
-            pendingWorkEditRequest = WorkEditRequest(item: task.isChore ? .chore(task) : .task(task))
+        } else if let product = selectedProduct {
+            pendingWorkEditRequest = WorkEditRequest(item: .product(product))
         }
     }
 
@@ -416,8 +392,14 @@ final class ChatViewModel: ObservableObject {
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
-            if selectedWorkNodeID == nil, let first = self.products.first {
-                setSelectedWorkNode(.product(first.id))
+            if let selectedWorkProductID,
+               !self.products.contains(where: { $0.id == selectedWorkProductID }) {
+                self.selectedWorkProductID = nil
+                self.selectedWorkProjectFilterID = nil
+                self.selectedWorkCardID = nil
+            }
+            if currentSelectedProductID == nil, let first = self.products.first {
+                self.selectedWorkProductID = first.id
                 engine.sendGetWorkTree(productId: first.id)
             } else if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
@@ -426,6 +408,9 @@ final class ChatViewModel: ObservableObject {
             projectsByProductID[productId] = projects.sorted(by: projectSort)
         case .workTree(let product, let projects, let tasks, let chores):
             upsertProduct(product)
+            if currentSelectedProductID == nil {
+                selectedWorkProductID = product.id
+            }
             projectsByProductID[product.id] = projects.sorted(by: projectSort)
             tasksByProjectID = tasksByProjectID.filter { _, existingTasks in
                 existingTasks.first?.productID != product.id
@@ -439,6 +424,7 @@ final class ChatViewModel: ObservableObject {
                 tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
+            reconcileWorkSelection()
             workErrorMessage = nil
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -450,12 +436,8 @@ final class ChatViewModel: ObservableObject {
             }
         case .workItemDeleted(let id):
             let deletedTask = task(withID: id)
-            if selectedTask?.id == id, let deletedTask {
-                if let projectID = deletedTask.projectID {
-                    setSelectedWorkNode(.project(projectID))
-                } else {
-                    setSelectedWorkNode(.product(deletedTask.productID))
-                }
+            if selectedTask?.id == id {
+                selectedWorkCardID = nil
             }
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
@@ -516,16 +498,17 @@ final class ChatViewModel: ObservableObject {
     // MARK: - Private Helpers
 
     private var currentSelectedProductID: String? {
-        productID(for: selectedWorkNodeID)
+        selectedWorkProductID
     }
 
-    private func setSelectedWorkNode(_ nodeID: WorkNodeID?) {
-        selectedWorkNodeID = nodeID
-        if let nodeID {
-            defaults.set(serializeWorkNode(nodeID), forKey: selectedWorkNodeDefaultsKey)
-        } else {
-            defaults.removeObject(forKey: selectedWorkNodeDefaultsKey)
+    private var taskCreationProject: WorkProject? {
+        if let selectedProject {
+            return selectedProject
         }
+        if let selectedTask, let projectID = selectedTask.projectID {
+            return project(withID: projectID)
+        }
+        return nil
     }
 
     private func startEngineIfNeeded() {
@@ -702,6 +685,19 @@ final class ChatViewModel: ObservableObject {
         project(withID: projectID)?.productID
     }
 
+    func projectName(for projectID: String?) -> String? {
+        guard let projectID else { return nil }
+        return project(withID: projectID)?.name
+    }
+
+    func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
+        visibleWorkItems.filter { $0.boardColumn == column }
+    }
+
+    func isTaskVisible(_ task: WorkTask) -> Bool {
+        workItems(in: task.boardColumn).contains(where: { $0.id == task.id })
+    }
+
     private func upsertProduct(_ product: WorkProduct) {
         if let index = products.firstIndex(where: { $0.id == product.id }) {
             products[index] = product
@@ -716,16 +712,23 @@ final class ChatViewModel: ObservableObject {
         switch item {
         case .product(let product):
             upsertProduct(product)
-            setSelectedWorkNode(.product(product.id))
+            selectedWorkProductID = product.id
+            selectedWorkProjectFilterID = nil
+            selectedWorkCardID = nil
             engine.sendGetWorkTree(productId: product.id)
         case .project(let project):
-            setSelectedWorkNode(.project(project.id))
+            selectedWorkProductID = project.productID
+            selectedWorkProjectFilterID = project.id
+            selectedWorkCardID = nil
             engine.sendGetWorkTree(productId: project.productID)
         case .task(let task):
-            setSelectedWorkNode(.task(task.id))
+            selectedWorkProductID = task.productID
+            selectedWorkProjectFilterID = task.projectID
+            selectedWorkCardID = task.id
             engine.sendGetWorkTree(productId: task.productID)
         case .chore(let task):
-            setSelectedWorkNode(.chore(task.id))
+            selectedWorkProductID = task.productID
+            selectedWorkCardID = task.id
             engine.sendGetWorkTree(productId: task.productID)
         }
     }
@@ -740,6 +743,23 @@ final class ChatViewModel: ObservableObject {
             engine.sendGetWorkTree(productId: task.productID)
         }
         workErrorMessage = nil
+    }
+
+    private func reconcileWorkSelection() {
+        guard let selectedWorkProductID else { return }
+
+        if !products.contains(where: { $0.id == selectedWorkProductID }) {
+            self.selectedWorkProductID = products.first?.id
+        }
+
+        if let selectedWorkProjectFilterID,
+           project(withID: selectedWorkProjectFilterID)?.productID != selectedWorkProductID {
+            self.selectedWorkProjectFilterID = nil
+        }
+
+        if let selectedTask, !isTaskVisible(selectedTask) {
+            selectedWorkCardID = nil
+        }
     }
 }
 
@@ -759,36 +779,5 @@ private func taskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
         return lhs.createdAt < rhs.createdAt
-    }
-}
-
-private func serializeWorkNode(_ node: WorkNodeID) -> String {
-    switch node {
-    case .product(let id):
-        return "product:\(id)"
-    case .project(let id):
-        return "project:\(id)"
-    case .task(let id):
-        return "task:\(id)"
-    case .chore(let id):
-        return "chore:\(id)"
-    }
-}
-
-private func deserializeWorkNode(_ rawValue: String) -> WorkNodeID? {
-    let parts = rawValue.split(separator: ":", maxSplits: 1).map(String.init)
-    guard parts.count == 2 else { return nil }
-
-    switch parts[0] {
-    case "product":
-        return .product(parts[1])
-    case "project":
-        return .project(parts[1])
-    case "task":
-        return .task(parts[1])
-    case "chore":
-        return .chore(parts[1])
-    default:
-        return nil
     }
 }

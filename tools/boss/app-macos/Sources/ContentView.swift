@@ -192,35 +192,71 @@ struct ContentView: View {
     }
 
     private var workSidebar: some View {
-        List(selection: Binding(
-            get: { model.selectedWorkNodeID },
-            set: { model.selectWorkNode($0) }
-        )) {
-            ForEach(model.workSidebarRows) { row in
-                HStack(spacing: 8) {
-                    Color.clear
-                        .frame(width: CGFloat(row.depth * 14), height: 1)
-                    Image(systemName: row.systemImage)
-                        .foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(row.title)
-                            .font(.body)
-                        if let subtitle = row.subtitle {
-                            Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    workSidebarSectionTitle("Products")
+                    ForEach(model.products) { product in
+                        WorkSidebarFilterRow(
+                            title: product.name,
+                            subtitle: product.repoRemoteURL,
+                            systemImage: "shippingbox",
+                            isSelected: model.selectedProduct?.id == product.id,
+                            trailing: product.status.capitalized
+                        ) {
+                            model.selectWorkProduct(product.id)
                         }
                     }
-                    Spacer(minLength: 8)
-                    if let status = row.statusBadge {
-                        WorkStatusBadge(text: status)
+                }
+
+                if let product = model.selectedProduct {
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        workSidebarSectionTitle("Projects")
+                        WorkSidebarFilterRow(
+                            title: "All Projects",
+                            subtitle: "Show the full product board",
+                            systemImage: "square.stack.3d.up",
+                            isSelected: model.selectedProject == nil,
+                            trailing: nil
+                        ) {
+                            model.selectWorkProjectFilter(nil)
+                        }
+
+                        ForEach(model.projectsForSelectedProduct) { project in
+                            WorkSidebarFilterRow(
+                                title: project.name,
+                                subtitle: project.goal.isEmpty ? project.priority.capitalized : project.goal,
+                                systemImage: "folder",
+                                isSelected: model.selectedProject?.id == project.id,
+                                trailing: project.status.capitalized
+                            ) {
+                                model.selectWorkProjectFilter(project.id)
+                            }
+                        }
+                    }
+
+                    if !(model.choresByProductID[product.id] ?? []).isEmpty {
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            workSidebarSectionTitle("Options")
+                            Toggle("Show Chores", isOn: $model.includeWorkChores)
+                                .toggleStyle(.switch)
+                                .disabled(model.selectedProject != nil)
+                            if model.selectedProject != nil {
+                                Text("Chores are product-level work, so they appear only in the all-projects view.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
-                .tag(row.id)
             }
         }
-        .listStyle(.sidebar)
-        .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter work")
+        .padding(12)
+        .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter board")
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
@@ -249,128 +285,34 @@ struct ContentView: View {
     }
 
     private var workDetail: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if let product = model.selectedProduct, model.selectedProject == nil, model.selectedTask == nil {
-                    workSectionHeader(
-                        title: product.name,
-                        subtitle: "Product",
-                        actions: [
-                            ("Edit", model.presentEditSelectedWorkItem),
-                            ("New Project", model.presentCreateProject),
-                            ("New Chore", model.presentCreateChore),
-                        ]
-                    )
-                    if !product.description.isEmpty {
-                        Text(product.description)
+        Group {
+            if model.products.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("No work items yet")
+                        .font(.title2.weight(.semibold))
+                    Text("Create a product to start organizing projects, tasks, and chores.")
+                        .foregroundStyle(.secondary)
+                    Button("New Product") {
+                        model.presentCreateProduct()
                     }
-                    workMetadataRow("Status", value: product.status.capitalized)
-                    workMetadataRow("Remote", value: product.repoRemoteURL ?? "Not set")
-                    workMetadataRow(
-                        "Projects",
-                        value: "\(model.projectsByProductID[product.id]?.count ?? 0)"
-                    )
-                    workMetadataRow(
-                        "Chores",
-                        value: "\(model.choresByProductID[product.id]?.count ?? 0)"
-                    )
-                } else if let project = model.selectedProject {
-                    workSectionHeader(
-                        title: project.name,
-                        subtitle: "Project",
-                        actions: [
-                            ("Edit", model.presentEditSelectedWorkItem),
-                            ("New Task", model.presentCreateTask),
-                        ]
-                    )
-                    if !project.description.isEmpty {
-                        Text(project.description)
-                    }
-                    workMetadataRow("Status", value: project.status.capitalized)
-                    workMetadataRow("Priority", value: project.priority.capitalized)
-                    workMetadataRow("Goal", value: project.goal.isEmpty ? "Not set" : project.goal)
-                    let tasks = model.tasksByProjectID[project.id] ?? []
-                    if !tasks.isEmpty {
-                        Divider()
-                        Text("Phases")
-                            .font(.headline)
-                        ForEach(
-                            tasks.sorted { lhs, rhs in
-                                switch (lhs.ordinal, rhs.ordinal) {
-                                case let (left?, right?) where left != right:
-                                    return left < right
-                                default:
-                                    if lhs.createdAt == rhs.createdAt {
-                                        return lhs.name.localizedCaseInsensitiveCompare(rhs.name)
-                                            == .orderedAscending
-                                    }
-                                    return lhs.createdAt < rhs.createdAt
-                                }
-                            }
-                        ) { task in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(task.name)
-                                    .font(.body.weight(.medium))
-                                Text(task.status.capitalized)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 4)
-                        }
-                    }
-                } else if let task = model.selectedTask {
-                    workSectionHeader(
-                        title: task.name,
-                        subtitle: task.isChore ? "Chore" : "Task",
-                        actions: [("Edit", model.presentEditSelectedWorkItem)]
-                    )
-                    if !task.description.isEmpty {
-                        Text(task.description)
-                    }
-                    workMetadataRow("Status", value: task.status.capitalized)
-                    if let ordinal = task.ordinal, !task.isChore {
-                        workMetadataRow("Phase", value: "\(ordinal)")
-                    }
-                    workMetadataRow("PR", value: task.prURL ?? "Not set")
-                    HStack {
-                        if !task.isChore {
-                            Button("Move Up") {
-                                model.moveSelectedTask(offset: -1)
-                            }
-                            Button("Move Down") {
-                                model.moveSelectedTask(offset: 1)
-                            }
-                        }
-                        Button("Delete", role: .destructive) {
-                            model.deleteSelectedWorkItem()
-                        }
-                    }
-                } else if model.products.isEmpty {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("No work items yet")
-                            .font(.title2.weight(.semibold))
-                        Text("Create a product to start organizing projects, phases, and chores.")
-                            .foregroundStyle(.secondary)
-                        Button("New Product") {
-                            model.presentCreateProduct()
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(24)
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Select a work item")
-                            .font(.title3.weight(.semibold))
-                        Text("Choose a product, project, phase, or chore from the sidebar.")
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(24)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .padding(24)
+            } else if let product = model.selectedProduct {
+                VSplitView {
+                    workBoard(product: product)
+                    workInspector
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Select a product")
+                        .font(.title3.weight(.semibold))
+                    Text("Choose a product from the sidebar to open its board.")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .padding(24)
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -492,6 +434,297 @@ struct ContentView: View {
             Text(value)
                 .font(.body)
         }
+    }
+
+    private func workBoard(product: WorkProduct) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(product.name)
+                        .font(.title2.weight(.semibold))
+                    Text(model.selectedProject?.name ?? "All projects")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let remote = product.repoRemoteURL, !remote.isEmpty {
+                    Text(remote)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 16) {
+                    ForEach(WorkBoardColumnKey.allCases) { column in
+                        workColumn(column)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
+            }
+        }
+    }
+
+    private func workColumn(_ column: WorkBoardColumnKey) -> some View {
+        let items = model.workItems(in: column)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(column.title)
+                    .font(.headline)
+                Spacer()
+                Text("\(items.count)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color(nsColor: .quaternaryLabelColor).opacity(0.12))
+                    .clipShape(Capsule())
+            }
+
+            Divider()
+
+            if items.isEmpty {
+                Text("No items")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(items) { task in
+                        Button {
+                            model.selectWorkCard(task.id)
+                        } label: {
+                            WorkBoardCardView(
+                                task: task,
+                                projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                                isSelected: model.selectedTask?.id == task.id
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .frame(width: 260, alignment: .topLeading)
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        )
+    }
+
+    private var workInspector: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let task = model.selectedTask {
+                    workSectionHeader(
+                        title: task.name,
+                        subtitle: task.isChore ? "Chore" : "Task",
+                        actions: [("Edit", model.presentEditSelectedWorkItem)]
+                    )
+                    if !task.description.isEmpty {
+                        Text(task.description)
+                    }
+                    if let projectName = model.projectName(for: task.projectID) {
+                        workMetadataRow("Project", value: projectName)
+                    }
+                    workMetadataRow("Status", value: task.status.capitalized)
+                    if let ordinal = task.ordinal, !task.isChore {
+                        workMetadataRow("Phase", value: "\(ordinal)")
+                    }
+                    workMetadataRow("PR", value: task.prURL ?? "Not set")
+                    HStack {
+                        if !task.isChore {
+                            Button("Move Up") {
+                                model.moveSelectedTask(offset: -1)
+                            }
+                            Button("Move Down") {
+                                model.moveSelectedTask(offset: 1)
+                            }
+                        }
+                        Button("Delete", role: .destructive) {
+                            model.deleteSelectedWorkItem()
+                        }
+                    }
+                } else if let project = model.selectedProject {
+                    workSectionHeader(
+                        title: project.name,
+                        subtitle: "Project",
+                        actions: [
+                            ("Edit", model.presentEditSelectedWorkItem),
+                            ("New Task", model.presentCreateTask),
+                        ]
+                    )
+                    if !project.description.isEmpty {
+                        Text(project.description)
+                    }
+                    workMetadataRow("Status", value: project.status.capitalized)
+                    workMetadataRow("Priority", value: project.priority.capitalized)
+                    workMetadataRow("Goal", value: project.goal.isEmpty ? "Not set" : project.goal)
+                    let tasks = model.tasksByProjectID[project.id] ?? []
+                    if !tasks.isEmpty {
+                        Divider()
+                        Text("Phases")
+                            .font(.headline)
+                        ForEach(
+                            tasks.sorted { lhs, rhs in
+                                switch (lhs.ordinal, rhs.ordinal) {
+                                case let (left?, right?) where left != right:
+                                    return left < right
+                                default:
+                                    if lhs.createdAt == rhs.createdAt {
+                                        return lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+                                            == .orderedAscending
+                                    }
+                                    return lhs.createdAt < rhs.createdAt
+                                }
+                            }
+                        ) { task in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(task.name)
+                                    .font(.body.weight(.medium))
+                                Text(task.status.capitalized)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4)
+                        }
+                    }
+                } else if let product = model.selectedProduct {
+                    workSectionHeader(
+                        title: product.name,
+                        subtitle: "Product",
+                        actions: [
+                            ("Edit", model.presentEditSelectedWorkItem),
+                            ("New Project", model.presentCreateProject),
+                            ("New Chore", model.presentCreateChore),
+                        ]
+                    )
+                    if !product.description.isEmpty {
+                        Text(product.description)
+                    }
+                    workMetadataRow("Status", value: product.status.capitalized)
+                    workMetadataRow("Remote", value: product.repoRemoteURL ?? "Not set")
+                    workMetadataRow("Projects", value: "\(model.projectsForSelectedProduct.count)")
+                    workMetadataRow("Visible Cards", value: "\(model.visibleWorkItems.count)")
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(minHeight: 220)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    private func workSidebarSectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .textCase(.uppercase)
+    }
+}
+
+private struct WorkSidebarFilterRow: View {
+    let title: String
+    let subtitle: String?
+    let systemImage: String
+    let isSelected: Bool
+    let trailing: String?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.body.weight(isSelected ? .semibold : .regular))
+                        .foregroundStyle(.primary)
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 8)
+                if let trailing {
+                    WorkStatusBadge(text: trailing)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct WorkBoardCardView: View {
+    let task: WorkTask
+    let projectName: String?
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                Text(task.name)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 8)
+                Image(systemName: task.isChore ? "wrench.and.screwdriver" : "circle.hexagongrid")
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                if let projectName, !projectName.isEmpty {
+                    WorkStatusBadge(text: projectName)
+                } else {
+                    WorkStatusBadge(text: "Chore")
+                }
+                Spacer()
+                Text(task.status.replacingOccurrences(of: "_", with: " ").capitalized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let prURL = task.prURL, !prURL.isEmpty {
+                Text(prURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
+        )
+    }
+
+    private var cardBackground: Color {
+        if isSelected {
+            return Color.accentColor.opacity(0.08)
+        }
+        return Color(nsColor: .windowBackgroundColor)
     }
 }
 
