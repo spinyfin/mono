@@ -143,6 +143,22 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
     }
 }
 
+enum WorkBoardGrouping: String, CaseIterable, Identifiable {
+    case none
+    case project
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .none:
+            return "Ungrouped"
+        case .project:
+            return "Project"
+        }
+    }
+}
+
 enum WorkItemPayload {
     case product(WorkProduct)
     case project(WorkProject)
@@ -185,6 +201,12 @@ struct WorkCreateRequest: Identifiable {
 struct WorkEditRequest: Identifiable {
     let id = UUID()
     let item: WorkItemPayload
+}
+
+struct WorkBoardSection: Identifiable {
+    let id: String
+    let title: String
+    let items: [WorkTask]
 }
 
 extension WorkTask {

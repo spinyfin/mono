@@ -23,6 +23,7 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedWorkCardID: String?
     @Published var includeWorkChores = true
     @Published var workShowBlockedOnly = false
+    @Published var workBoardGrouping: WorkBoardGrouping = .none
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
@@ -110,6 +111,11 @@ final class ChatViewModel: ObservableObject {
 
     private let maxTerminalOutputChars = 200_000
     private let navigationModeDefaultsKey = "boss.navigationMode"
+    private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
+    private let selectedWorkProjectFilterDefaultsKey = "boss.work.selectedProjectFilterID"
+    private let includeWorkChoresDefaultsKey = "boss.work.includeChores"
+    private let workShowBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
+    private let workBoardGroupingDefaultsKey = "boss.work.grouping"
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -123,6 +129,14 @@ final class ChatViewModel: ObservableObject {
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
             navigationMode = persistedMode
+        }
+        selectedWorkProductID = defaults.string(forKey: selectedWorkProductDefaultsKey)
+        selectedWorkProjectFilterID = defaults.string(forKey: selectedWorkProjectFilterDefaultsKey)
+        includeWorkChores = defaults.object(forKey: includeWorkChoresDefaultsKey) as? Bool ?? true
+        workShowBlockedOnly = defaults.object(forKey: workShowBlockedOnlyDefaultsKey) as? Bool ?? false
+        if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
+           let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
+            workBoardGrouping = grouping
         }
 
         processController.onOutputLine = { [weak self] line in
@@ -169,6 +183,8 @@ final class ChatViewModel: ObservableObject {
         selectedWorkProjectFilterID = nil
         selectedWorkCardID = nil
         workErrorMessage = nil
+        defaults.set(productID, forKey: selectedWorkProductDefaultsKey)
+        defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
         if isConnected {
             engine.sendGetWorkTree(productId: productID)
         }
@@ -176,6 +192,11 @@ final class ChatViewModel: ObservableObject {
 
     func selectWorkProjectFilter(_ projectID: String?) {
         selectedWorkProjectFilterID = projectID
+        if let projectID {
+            defaults.set(projectID, forKey: selectedWorkProjectFilterDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
+        }
         if let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
@@ -189,6 +210,7 @@ final class ChatViewModel: ObservableObject {
 
     func setIncludeWorkChores(_ include: Bool) {
         includeWorkChores = include
+        defaults.set(include, forKey: includeWorkChoresDefaultsKey)
         if let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
@@ -196,9 +218,15 @@ final class ChatViewModel: ObservableObject {
 
     func setWorkShowBlockedOnly(_ show: Bool) {
         workShowBlockedOnly = show
+        defaults.set(show, forKey: workShowBlockedOnlyDefaultsKey)
         if let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
+    }
+
+    func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {
+        workBoardGrouping = grouping
+        defaults.set(grouping.rawValue, forKey: workBoardGroupingDefaultsKey)
     }
 
     func presentCreateProduct() {
@@ -437,9 +465,12 @@ final class ChatViewModel: ObservableObject {
                 self.selectedWorkProductID = nil
                 self.selectedWorkProjectFilterID = nil
                 self.selectedWorkCardID = nil
+                defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
+                defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
             }
             if currentSelectedProductID == nil, let first = self.products.first {
                 self.selectedWorkProductID = first.id
+                defaults.set(first.id, forKey: selectedWorkProductDefaultsKey)
                 engine.sendGetWorkTree(productId: first.id)
             } else if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
@@ -736,6 +767,22 @@ final class ChatViewModel: ObservableObject {
             .sorted(by: boardTaskSort)
     }
 
+    func workSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
+        let items = workItems(in: column)
+        guard workBoardGrouping == .project else {
+            return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
+        }
+
+        let grouped = Dictionary(grouping: items) { task in
+            task.isChore ? "Chores" : (projectName(for: task.projectID) ?? "No Project")
+        }
+
+        return grouped.keys.sorted().compactMap { key in
+            guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
+            return WorkBoardSection(id: "\(column.rawValue)-\(key)", title: key, items: sectionItems)
+        }
+    }
+
     func isTaskVisible(_ task: WorkTask) -> Bool {
         workItems(in: task.boardColumn).contains(where: { $0.id == task.id })
     }
@@ -757,20 +804,31 @@ final class ChatViewModel: ObservableObject {
             selectedWorkProductID = product.id
             selectedWorkProjectFilterID = nil
             selectedWorkCardID = nil
+            defaults.set(product.id, forKey: selectedWorkProductDefaultsKey)
+            defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
             engine.sendGetWorkTree(productId: product.id)
         case .project(let project):
             selectedWorkProductID = project.productID
             selectedWorkProjectFilterID = project.id
             selectedWorkCardID = nil
+            defaults.set(project.productID, forKey: selectedWorkProductDefaultsKey)
+            defaults.set(project.id, forKey: selectedWorkProjectFilterDefaultsKey)
             engine.sendGetWorkTree(productId: project.productID)
         case .task(let task):
             selectedWorkProductID = task.productID
             selectedWorkProjectFilterID = task.projectID
             selectedWorkCardID = task.id
+            defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
+            if let projectID = task.projectID {
+                defaults.set(projectID, forKey: selectedWorkProjectFilterDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
+            }
             engine.sendGetWorkTree(productId: task.productID)
         case .chore(let task):
             selectedWorkProductID = task.productID
             selectedWorkCardID = task.id
+            defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
             engine.sendGetWorkTree(productId: task.productID)
         }
     }
@@ -792,11 +850,17 @@ final class ChatViewModel: ObservableObject {
 
         if !products.contains(where: { $0.id == selectedWorkProductID }) {
             self.selectedWorkProductID = products.first?.id
+            if let firstProductID = products.first?.id {
+                defaults.set(firstProductID, forKey: selectedWorkProductDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
+            }
         }
 
         if let selectedWorkProjectFilterID,
            project(withID: selectedWorkProjectFilterID)?.productID != selectedWorkProductID {
             self.selectedWorkProjectFilterID = nil
+            defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
         }
 
         if let selectedTask, !isTaskVisible(selectedTask) {
