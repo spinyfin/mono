@@ -32,6 +32,15 @@ By default the app launches:
 bazel run //tools/boss/engine:engine -- --mode=server --socket-path /tmp/boss-engine.sock
 ```
 
+By default, the engine uses:
+
+```bash
+npx -y @zed-industries/claude-code-acp@0.16.1
+```
+
+The engine runs from the workspace root and prefers `NVM_BIN` on `PATH` when
+spawning the ACP adapter.
+
 When auto-start is enabled, the app will:
 
 - reuse an existing engine process from the PID file when available,
