@@ -463,6 +463,19 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Picker(
+                    "Group",
+                    selection: Binding(
+                        get: { model.workBoardGrouping },
+                        set: { model.setWorkBoardGrouping($0) }
+                    )
+                ) {
+                    ForEach(WorkBoardGrouping.allCases) { grouping in
+                        Text(grouping.title).tag(grouping)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
                 if let remote = product.repoRemoteURL, !remote.isEmpty {
                     Text(remote)
                         .font(.caption)
@@ -473,27 +486,40 @@ struct ContentView: View {
             .padding(.horizontal, 24)
             .padding(.top, 20)
 
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 16) {
-                    ForEach(WorkBoardColumnKey.allCases) { column in
-                        workColumn(column)
-                    }
+            if model.visibleWorkItems.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("No cards match this board view")
+                        .font(.title3.weight(.semibold))
+                    Text(emptyBoardMessage)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 16) {
+                        ForEach(WorkBoardColumnKey.allCases) { column in
+                            workColumn(column)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
+                }
             }
         }
     }
 
     private func workColumn(_ column: WorkBoardColumnKey) -> some View {
-        let items = model.workItems(in: column)
+        let sections = model.workSections(in: column)
+        let itemCount = sections.reduce(0) { $0 + $1.items.count }
 
         return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(column.title)
                     .font(.headline)
                 Spacer()
-                Text("\(items.count)")
+                Text("\(itemCount)")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
@@ -519,24 +545,33 @@ struct ContentView: View {
 
             Divider()
 
-            if items.isEmpty {
+            if itemCount == 0 {
                 Text("No items")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
             } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(items) { task in
-                        Button {
-                            model.selectWorkCard(task.id)
-                        } label: {
-                            WorkBoardCardView(
-                                task: task,
-                                projectName: task.isChore ? nil : model.projectName(for: task.projectID),
-                                isSelected: model.selectedTask?.id == task.id
-                            )
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(sections) { section in
+                        if model.workBoardGrouping == .project {
+                            Text(section.title)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.plain)
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(section.items) { task in
+                                Button {
+                                    model.selectWorkCard(task.id)
+                                } label: {
+                                    WorkBoardCardView(
+                                        task: task,
+                                        projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                                        isSelected: model.selectedTask?.id == task.id
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
                     }
                 }
             }
@@ -684,6 +719,19 @@ struct ContentView: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .textCase(.uppercase)
+    }
+
+    private var emptyBoardMessage: String {
+        if !model.workSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Try a broader search or clear the search field."
+        }
+        if model.workShowBlockedOnly {
+            return "There are no blocked items in the current product and project scope."
+        }
+        if model.selectedProject != nil {
+            return "This project does not have any tasks in the current board view."
+        }
+        return "Create a task or chore to start filling the board."
     }
 }
 
