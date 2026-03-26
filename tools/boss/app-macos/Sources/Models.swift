@@ -108,6 +108,41 @@ enum WorkNodeID: Hashable {
     case chore(String)
 }
 
+enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
+    case backlog
+    case doing
+    case review
+    case done
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .backlog:
+            return "Backlog"
+        case .doing:
+            return "Doing"
+        case .review:
+            return "Review"
+        case .done:
+            return "Done"
+        }
+    }
+
+    var targetStatus: String {
+        switch self {
+        case .backlog:
+            return "todo"
+        case .doing:
+            return "active"
+        case .review:
+            return "in_review"
+        case .done:
+            return "done"
+        }
+    }
+}
+
 enum WorkItemPayload {
     case product(WorkProduct)
     case project(WorkProject)
@@ -150,4 +185,19 @@ struct WorkCreateRequest: Identifiable {
 struct WorkEditRequest: Identifiable {
     let id = UUID()
     let item: WorkItemPayload
+}
+
+extension WorkTask {
+    var boardColumn: WorkBoardColumnKey {
+        switch status {
+        case "active", "blocked":
+            return .doing
+        case "in_review":
+            return .review
+        case "done":
+            return .done
+        default:
+            return .backlog
+        }
+    }
 }
