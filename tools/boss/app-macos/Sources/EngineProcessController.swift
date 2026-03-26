@@ -4,6 +4,7 @@ import Foundation
 final class EngineProcessController: @unchecked Sendable {
     private let pidFilePath: String
     private let lockFilePath: String
+    private let launchDirectory: String
     private let forceRestart: Bool
     private let stopOnExit: Bool
 
@@ -12,11 +13,14 @@ final class EngineProcessController: @unchecked Sendable {
     init(
         pidFilePath: String = ProcessInfo.processInfo.environment["BOSS_ENGINE_PID_PATH"]
             ?? "/tmp/boss-engine.pid",
+        launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
+            ?? FileManager.default.currentDirectoryPath,
         forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
         stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1"
     ) {
         self.pidFilePath = pidFilePath
         self.lockFilePath = "\(pidFilePath).lock"
+        self.launchDirectory = launchDirectory
         self.forceRestart = forceRestart
         self.stopOnExit = stopOnExit
     }
@@ -64,6 +68,7 @@ final class EngineProcessController: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-c", "nohup \(command) >/dev/null 2>&1 &"]
+        proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
         proc.environment = ProcessInfo.processInfo.environment
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()

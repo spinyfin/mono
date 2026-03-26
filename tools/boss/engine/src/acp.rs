@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -99,8 +100,11 @@ impl AcpClient {
 
     async fn connect_internal(cfg: &RuntimeConfig, interactive_permissions: bool) -> Result<Self> {
         let mut command = Command::new(&cfg.acp_command);
+        let path = preferred_child_path();
         command
             .args(&cfg.acp_args)
+            .current_dir(&cfg.cwd)
+            .env("PATH", path)
             .env("ANTHROPIC_API_KEY", &cfg.anthropic_api_key)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -284,6 +288,19 @@ impl AcpClient {
 
         Ok(())
     }
+}
+
+fn preferred_child_path() -> OsString {
+    let Some(nvm_bin) = std::env::var_os("NVM_BIN") else {
+        return std::env::var_os("PATH").unwrap_or_default();
+    };
+
+    let mut paths = vec![nvm_bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path).map(|path| path.into_os_string()));
+    }
+
+    std::env::join_paths(paths).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::Receiver<Value>) {

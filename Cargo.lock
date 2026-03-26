@@ -175,6 +175,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

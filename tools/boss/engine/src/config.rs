@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-const DEFAULT_ACP_COMMAND: &str = "bazel run //tools/boss/js/claude-code-acp:claude-code-acp --";
+const DEFAULT_ACP_COMMAND: &str = "npx -y @zed-industries/claude-code-acp@0.16.1";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -27,7 +27,7 @@ impl RuntimeConfig {
             bail!("BOSS_ACP_CMD resolved to an empty command");
         };
 
-        let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+        let cwd = resolve_runtime_cwd()?;
         let db_path = match std::env::var_os("BOSS_DB_PATH") {
             Some(path) => PathBuf::from(path),
             None => default_db_path()?,
@@ -62,10 +62,48 @@ impl RuntimeConfig {
     }
 }
 
+fn resolve_runtime_cwd() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BUILD_WORKSPACE_DIRECTORY") {
+        let candidate = PathBuf::from(path);
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+
+    std::env::current_dir().context("failed to resolve current working directory")
+}
+
 fn default_db_path() -> Result<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         bail!("HOME must be set to derive the default Boss database path");
     };
 
     Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_runtime_cwd;
+    use std::path::PathBuf;
+
+    #[test]
+    fn prefers_bazel_workspace_directory_when_present() {
+        let original = std::env::var_os("BUILD_WORKSPACE_DIRECTORY");
+        let tempdir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("BUILD_WORKSPACE_DIRECTORY", tempdir.path());
+        }
+
+        let cwd = resolve_runtime_cwd().unwrap();
+        assert_eq!(cwd, PathBuf::from(tempdir.path()));
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("BUILD_WORKSPACE_DIRECTORY", value);
+            },
+            None => unsafe {
+                std::env::remove_var("BUILD_WORKSPACE_DIRECTORY");
+            },
+        }
+    }
 }

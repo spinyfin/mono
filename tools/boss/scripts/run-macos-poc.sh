@@ -55,7 +55,11 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
-export BOSS_ACP_CMD="${BOSS_ACP_CMD:-bazel run //tools/boss/js/claude-code-acp:claude-code-acp --}"
+if [[ -n "${NVM_BIN:-}" ]]; then
+  export PATH="${NVM_BIN}:$PATH"
+fi
+
+export BOSS_ACP_CMD="${BOSS_ACP_CMD:-npx -y @zed-industries/claude-code-acp@0.16.1}"
 export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-/tmp/boss-engine.pid}"
 export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-/tmp/boss-engine.log}"
 export BOSS_ENGINE_FORCE_RESTART="${BOSS_ENGINE_FORCE_RESTART:-0}"
