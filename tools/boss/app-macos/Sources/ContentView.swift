@@ -2,6 +2,10 @@ import AppKit
 import SwiftUI
 import Textual
 
+private let workBoardColumnWidth: CGFloat = 280
+private let workBoardColumnSpacing: CGFloat = 12
+private let workBoardHorizontalPadding: CGFloat = 20
+
 struct ContentView: View {
     @StateObject private var model = ChatViewModel()
 
@@ -209,7 +213,7 @@ struct ContentView: View {
                     }
                 }
 
-                if let product = model.selectedProduct {
+                if model.selectedProduct != nil {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 10) {
@@ -237,39 +241,9 @@ struct ContentView: View {
                         }
                     }
 
-                    if !(model.choresByProductID[product.id] ?? []).isEmpty {
-                        Divider()
-                    }
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        workSidebarSectionTitle("Options")
-                        Toggle(
-                            "Show Chores",
-                            isOn: Binding(
-                                get: { model.includeWorkChores },
-                                set: { model.setIncludeWorkChores($0) }
-                            )
-                        )
-                        .toggleStyle(.switch)
-                        .disabled(model.selectedProject != nil)
-
-                        Toggle(
-                            "Blocked Only",
-                            isOn: Binding(
-                                get: { model.workShowBlockedOnly },
-                                set: { model.setWorkShowBlockedOnly($0) }
-                            )
-                        )
-                        .toggleStyle(.switch)
-
-                        if model.selectedProject != nil {
-                            Text("Chores are product-level work, so they appear only in the all-projects view.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .padding(12)
         .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter board")
@@ -315,10 +289,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .padding(24)
             } else if let product = model.selectedProduct {
-                VSplitView {
-                    workBoard(product: product)
-                    workInspector
-                }
+                workBoard(product: product)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Select a product")
@@ -418,40 +389,6 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func workSectionHeader(
-        title: String,
-        subtitle: String,
-        actions: [(String, () -> Void)]
-    ) -> some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                Text(subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            HStack {
-                ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
-                    Button(action.0, action: action.1)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func workMetadataRow(_ label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.body)
-        }
-    }
-
     private func workBoard(product: WorkProduct) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top) {
@@ -476,14 +413,8 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 220)
-                if let remote = product.repoRemoteURL, !remote.isEmpty {
-                    Text(remote)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, workBoardHorizontalPadding)
             .padding(.top, 20)
 
             if model.visibleWorkItems.isEmpty {
@@ -493,21 +424,22 @@ struct ContentView: View {
                     Text(emptyBoardMessage)
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 24)
+                .padding(.horizontal, workBoardHorizontalPadding)
                 .padding(.bottom, 24)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             } else {
-                ScrollView(.horizontal) {
-                    HStack(alignment: .top, spacing: 16) {
-                        ForEach(WorkBoardColumnKey.allCases) { column in
-                            workColumn(column)
-                        }
+                NativeWorkBoardScrollView(
+                    columns: WorkBoardColumnKey.allCases.map { column in
+                        NativeWorkBoardColumn(
+                            id: column.id,
+                            view: AnyView(workColumn(column))
+                        )
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 24)
-                }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func workColumn(_ column: WorkBoardColumnKey) -> some View {
@@ -561,7 +493,9 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             ForEach(section.items) { task in
                                 Button {
-                                    model.selectWorkCard(task.id)
+                                    model.selectWorkCard(
+                                        model.selectedTask?.id == task.id ? nil : task.id
+                                    )
                                 } label: {
                                     WorkBoardCardView(
                                         task: task,
@@ -570,14 +504,29 @@ struct ContentView: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
+                                .popover(
+                                    isPresented: Binding(
+                                        get: { model.selectedTask?.id == task.id },
+                                        set: { isPresented in
+                                            if !isPresented, model.selectedTask?.id == task.id {
+                                                model.selectWorkCard(nil)
+                                            }
+                                        }
+                                    ),
+                                    arrowEdge: .trailing
+                                ) {
+                                    WorkCardPopoverView(model: model, task: task)
+                                }
                             }
                         }
                     }
                 }
             }
+            Spacer(minLength: 0)
         }
-        .frame(width: 260, alignment: .topLeading)
         .padding(14)
+        .frame(width: workBoardColumnWidth, alignment: .topLeading)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
@@ -591,128 +540,6 @@ struct ContentView: View {
         }
     }
 
-    private var workInspector: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if let task = model.selectedTask {
-                    workSectionHeader(
-                        title: task.name,
-                        subtitle: task.isChore ? "Chore" : "Task",
-                        actions: [("Edit", model.presentEditSelectedWorkItem)]
-                    )
-                    if !task.description.isEmpty {
-                        Text(task.description)
-                    }
-                    if let projectName = model.projectName(for: task.projectID) {
-                        workMetadataRow("Project", value: projectName)
-                    }
-                    workMetadataRow("Status", value: task.status.capitalized)
-                    if let ordinal = task.ordinal, !task.isChore {
-                        workMetadataRow("Phase", value: "\(ordinal)")
-                    }
-                    workMetadataRow("PR", value: task.prURL ?? "Not set")
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Move")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        HStack {
-                            ForEach(WorkBoardColumnKey.allCases) { column in
-                                Button(column.title) {
-                                    model.moveTask(task.id, to: column)
-                                }
-                                .disabled(task.boardColumn == column && task.status != "blocked")
-                            }
-                        }
-                    }
-                    HStack {
-                        if task.status == "active" || task.status == "blocked" {
-                            Button(task.status == "blocked" ? "Unblock" : "Mark Blocked") {
-                                model.toggleBlocked(for: task.id)
-                            }
-                        }
-                        if !task.isChore {
-                            Button("Move Up") {
-                                model.moveSelectedTask(offset: -1)
-                            }
-                            Button("Move Down") {
-                                model.moveSelectedTask(offset: 1)
-                            }
-                        }
-                        Button("Delete", role: .destructive) {
-                            model.deleteSelectedWorkItem()
-                        }
-                    }
-                } else if let project = model.selectedProject {
-                    workSectionHeader(
-                        title: project.name,
-                        subtitle: "Project",
-                        actions: [
-                            ("Edit", model.presentEditSelectedWorkItem),
-                            ("New Task", model.presentCreateTask),
-                        ]
-                    )
-                    if !project.description.isEmpty {
-                        Text(project.description)
-                    }
-                    workMetadataRow("Status", value: project.status.capitalized)
-                    workMetadataRow("Priority", value: project.priority.capitalized)
-                    workMetadataRow("Goal", value: project.goal.isEmpty ? "Not set" : project.goal)
-                    let tasks = model.tasksByProjectID[project.id] ?? []
-                    if !tasks.isEmpty {
-                        Divider()
-                        Text("Phases")
-                            .font(.headline)
-                        ForEach(
-                            tasks.sorted { lhs, rhs in
-                                switch (lhs.ordinal, rhs.ordinal) {
-                                case let (left?, right?) where left != right:
-                                    return left < right
-                                default:
-                                    if lhs.createdAt == rhs.createdAt {
-                                        return lhs.name.localizedCaseInsensitiveCompare(rhs.name)
-                                            == .orderedAscending
-                                    }
-                                    return lhs.createdAt < rhs.createdAt
-                                }
-                            }
-                        ) { task in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(task.name)
-                                    .font(.body.weight(.medium))
-                                Text(task.status.capitalized)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 4)
-                        }
-                    }
-                } else if let product = model.selectedProduct {
-                    workSectionHeader(
-                        title: product.name,
-                        subtitle: "Product",
-                        actions: [
-                            ("Edit", model.presentEditSelectedWorkItem),
-                            ("New Project", model.presentCreateProject),
-                            ("New Chore", model.presentCreateChore),
-                        ]
-                    )
-                    if !product.description.isEmpty {
-                        Text(product.description)
-                    }
-                    workMetadataRow("Status", value: product.status.capitalized)
-                    workMetadataRow("Remote", value: product.repoRemoteURL ?? "Not set")
-                    workMetadataRow("Projects", value: "\(model.projectsForSelectedProduct.count)")
-                    workMetadataRow("Visible Cards", value: "\(model.visibleWorkItems.count)")
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(minHeight: 220)
-        .background(Color(nsColor: .controlBackgroundColor))
-    }
-
     @ViewBuilder
     private func workSidebarSectionTitle(_ title: String) -> some View {
         Text(title)
@@ -724,9 +551,6 @@ struct ContentView: View {
     private var emptyBoardMessage: String {
         if !model.workSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "Try a broader search or clear the search field."
-        }
-        if model.workShowBlockedOnly {
-            return "There are no blocked items in the current product and project scope."
         }
         if model.selectedProject != nil {
             return "This project does not have any tasks in the current board view."
@@ -844,6 +668,101 @@ private struct WorkBoardCardView: View {
             return .orange
         }
         return Color(nsColor: .separatorColor)
+    }
+}
+
+private struct WorkCardPopoverView: View {
+    @ObservedObject var model: ChatViewModel
+    let task: WorkTask
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(task.name)
+                        .font(.title3.weight(.semibold))
+                    Text(task.isChore ? "Chore" : "Task")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 12)
+                Button("Edit") {
+                    model.selectWorkCard(task.id)
+                    model.presentEditSelectedWorkItem()
+                }
+            }
+
+            if !task.description.isEmpty {
+                Text(task.description)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                if let projectName = model.projectName(for: task.projectID) {
+                    metadataRow("Project", value: projectName)
+                }
+                metadataRow(
+                    "Status",
+                    value: task.status.replacingOccurrences(of: "_", with: " ").capitalized
+                )
+                if let ordinal = task.ordinal, !task.isChore {
+                    metadataRow("Phase", value: "\(ordinal)")
+                }
+                metadataRow("PR", value: task.prURL ?? "Not set")
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Move")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    ForEach(WorkBoardColumnKey.allCases) { column in
+                        Button(column.title) {
+                            model.selectWorkCard(task.id)
+                            model.moveTask(task.id, to: column)
+                        }
+                        .disabled(task.boardColumn == column && task.status != "blocked")
+                    }
+                }
+            }
+
+            HStack {
+                if task.status == "active" || task.status == "blocked" {
+                    Button(task.status == "blocked" ? "Unblock" : "Mark Blocked") {
+                        model.selectWorkCard(task.id)
+                        model.toggleBlocked(for: task.id)
+                    }
+                }
+                if !task.isChore {
+                    Button("Move Up") {
+                        model.selectWorkCard(task.id)
+                        model.moveSelectedTask(offset: -1)
+                    }
+                    Button("Move Down") {
+                        model.selectWorkCard(task.id)
+                        model.moveSelectedTask(offset: 1)
+                    }
+                }
+                Spacer()
+                Button("Delete", role: .destructive) {
+                    model.selectWorkCard(task.id)
+                    model.deleteSelectedWorkItem()
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 360, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func metadataRow(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.body)
+        }
     }
 }
 
@@ -1135,6 +1054,104 @@ private struct ComposerTextView: NSViewRepresentable {
             textView.needsDisplay = true
         }
     }
+}
+
+private struct NativeWorkBoardColumn: Identifiable {
+    let id: String
+    let view: AnyView
+}
+
+private struct NativeWorkBoardScrollView: NSViewRepresentable {
+    let columns: [NativeWorkBoardColumn]
+    private let columnWidth: CGFloat = workBoardColumnWidth
+    private let spacing: CGFloat = workBoardColumnSpacing
+    private let horizontalPadding: CGFloat = workBoardHorizontalPadding
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasHorizontalScroller = true
+        scrollView.hasVerticalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.horizontalScrollElasticity = .automatic
+        scrollView.verticalScrollElasticity = .none
+        scrollView.documentView = context.coordinator.documentView
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        let coordinator = context.coordinator
+        if nsView.documentView !== coordinator.documentView {
+            nsView.documentView = coordinator.documentView
+        }
+
+        coordinator.sync(columns: columns)
+
+        var clipWidth = nsView.contentView.bounds.width
+        var clipHeight = nsView.contentView.bounds.height
+        let contentWidth = totalContentWidth(for: columns.count)
+        let hasOverflow = contentWidth > clipWidth + 0.5
+        if nsView.hasHorizontalScroller != hasOverflow {
+            nsView.hasHorizontalScroller = hasOverflow
+            nsView.tile()
+            clipWidth = nsView.contentView.bounds.width
+            clipHeight = nsView.contentView.bounds.height
+        }
+
+        coordinator.documentView.frame = NSRect(
+            origin: .zero,
+            size: NSSize(width: max(contentWidth, clipWidth), height: clipHeight)
+        )
+
+        var x = horizontalPadding
+        for hostingView in coordinator.hostingViews {
+            hostingView.frame = NSRect(
+                x: x,
+                y: 0,
+                width: columnWidth,
+                height: clipHeight
+            )
+            x += columnWidth + spacing
+        }
+    }
+
+    private func totalContentWidth(for columnCount: Int) -> CGFloat {
+        guard columnCount > 0 else { return 0 }
+        return horizontalPadding
+            + (CGFloat(columnCount) * columnWidth)
+            + (CGFloat(max(columnCount - 1, 0)) * spacing)
+            + horizontalPadding
+    }
+
+    final class Coordinator {
+        let documentView = FlippedContentView()
+        var hostingViews: [NSHostingView<AnyView>] = []
+
+        func sync(columns: [NativeWorkBoardColumn]) {
+            while hostingViews.count > columns.count {
+                hostingViews.removeLast().removeFromSuperview()
+            }
+
+            while hostingViews.count < columns.count {
+                let hostingView = NSHostingView(rootView: AnyView(EmptyView()))
+                documentView.addSubview(hostingView)
+                hostingViews.append(hostingView)
+            }
+
+            for (hostingView, column) in zip(hostingViews, columns) {
+                hostingView.rootView = column.view
+            }
+        }
+    }
+}
+
+private final class FlippedContentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 private final class ComposerNSTextView: NSTextView {
