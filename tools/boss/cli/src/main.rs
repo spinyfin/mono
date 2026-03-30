@@ -12,7 +12,7 @@ use boss_engine::work::{
     CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
     Task, WorkItem, WorkItemPatch,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -54,6 +54,8 @@ struct GlobalFlags {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Print authoritative Boss CLI reference documentation.
+    Reference,
     Product {
         #[command(subcommand)]
         command: ProductCommand,
@@ -420,6 +422,22 @@ enum OutputMode {
     Json,
 }
 
+#[derive(Debug, Serialize)]
+struct CliReferenceDocument {
+    cli: &'static str,
+    usage_rules: Vec<&'static str>,
+    selector_semantics: Vec<&'static str>,
+    status_semantics: Vec<&'static str>,
+    workflow_guidance: Vec<&'static str>,
+    commands: Vec<CliReferenceSection>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliReferenceSection {
+    path: String,
+    help: String,
+}
+
 #[derive(Debug)]
 enum CliError {
     Usage(String),
@@ -558,14 +576,148 @@ async fn main() -> ExitCode {
 }
 
 async fn run_cli(cli: Cli) -> Result<(), CliError> {
-    let ctx = RunContext::from_flags(&cli.global)?;
     match cli.command {
-        Commands::Product { command } => run_product_command(command, &ctx).await,
-        Commands::Project { command } => run_project_command(command, &ctx).await,
-        Commands::Task { command } => run_task_command(command, &ctx).await,
-        Commands::Chore { command } => run_chore_command(command, &ctx).await,
-        Commands::Engine { command } => run_engine_command(command, &ctx).await,
+        Commands::Reference => run_reference_command(&cli.global),
+        Commands::Product { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_product_command(command, &ctx).await
+        }
+        Commands::Project { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_project_command(command, &ctx).await
+        }
+        Commands::Task { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_task_command(command, &ctx).await
+        }
+        Commands::Chore { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_chore_command(command, &ctx).await
+        }
+        Commands::Engine { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_engine_command(command, &ctx).await
+        }
     }
+}
+
+fn run_reference_command(flags: &GlobalFlags) -> Result<(), CliError> {
+    let output_mode = if flags.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    };
+    let reference = build_cli_reference()?;
+
+    match output_mode {
+        OutputMode::Human => print_cli_reference_human(&reference).map_err(CliError::internal)?,
+        OutputMode::Json => {
+            serde_json::to_writer_pretty(io::stdout().lock(), &reference)
+                .map_err(CliError::internal)?;
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
+    let command = Cli::command().color(clap::ColorChoice::Never);
+    let mut commands = Vec::new();
+    collect_cli_reference_sections(command, Vec::new(), &mut commands)?;
+
+    Ok(CliReferenceDocument {
+        cli: "boss",
+        usage_rules: vec![
+            "For agent use, prefer non-interactive commands with --json --no-input.",
+            "Treat this reference output as the authoritative current CLI surface for this build.",
+            "Do not use boss ... --help for syntax discovery when this reference is available.",
+            "Omit --socket-path unless you explicitly need a non-default socket.",
+            "Omit --no-autostart unless you explicitly need to forbid engine startup.",
+        ],
+        selector_semantics: vec![
+            "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
+            "Project selectors accept a project id, slug, or 1-based interactive index within the selected product. For agent use, prefer slug or id, not numeric indexes.",
+            "Task and chore commands that operate on an existing item use the item id, not slug.",
+        ],
+        status_semantics: vec![
+            "CLI status values use in-review on the command line.",
+            "Internally, in-review maps to in_review.",
+            "Move targets map as follows: backlog|todo -> todo, doing|active -> active, review|in-review -> in_review, blocked -> blocked, done -> done.",
+        ],
+        workflow_guidance: vec![
+            "Use the current UI or conversational context first when deciding where new work belongs.",
+            "If you need to compare against existing projects in a product, use boss project list --product <product-selector> --json --no-input.",
+            "If the work fits an existing project, create a task in that project.",
+            "If it does not fit an existing project and is small and self-contained, create a chore.",
+            "If it does not fit an existing project and is broad, ambiguous, investigative, or multi-stage, create a project.",
+        ],
+        commands,
+    })
+}
+
+fn collect_cli_reference_sections(
+    command: clap::Command,
+    path: Vec<String>,
+    sections: &mut Vec<CliReferenceSection>,
+) -> Result<(), CliError> {
+    let mut current_path = path;
+    current_path.push(command.get_name().to_owned());
+
+    sections.push(CliReferenceSection {
+        path: current_path.join(" "),
+        help: render_command_help(command.clone())?,
+    });
+
+    for subcommand in command.get_subcommands() {
+        collect_cli_reference_sections(subcommand.clone(), current_path.clone(), sections)?;
+    }
+
+    Ok(())
+}
+
+fn render_command_help(mut command: clap::Command) -> Result<String, CliError> {
+    command = command.color(clap::ColorChoice::Never);
+    let mut buffer = Vec::new();
+    command
+        .write_long_help(&mut buffer)
+        .map_err(CliError::internal)?;
+    let help = String::from_utf8(buffer).map_err(CliError::internal)?;
+    Ok(help.trim().to_owned())
+}
+
+fn print_cli_reference_human(reference: &CliReferenceDocument) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Boss CLI reference:")?;
+    writeln!(stdout)?;
+    print_reference_list(&mut stdout, "General rules", &reference.usage_rules)?;
+    print_reference_list(
+        &mut stdout,
+        "Selector semantics",
+        &reference.selector_semantics,
+    )?;
+    print_reference_list(&mut stdout, "Status semantics", &reference.status_semantics)?;
+    print_reference_list(
+        &mut stdout,
+        "Workflow guidance",
+        &reference.workflow_guidance,
+    )?;
+    writeln!(stdout, "Command help:")?;
+    for section in &reference.commands {
+        writeln!(stdout, "[{}]", section.path)?;
+        writeln!(stdout, "{}", section.help)?;
+        writeln!(stdout)?;
+    }
+    Ok(())
+}
+
+fn print_reference_list(writer: &mut impl Write, title: &str, items: &[&str]) -> io::Result<()> {
+    writeln!(writer, "{title}:")?;
+    for item in items {
+        writeln!(writer, "- {item}")?;
+    }
+    writeln!(writer)?;
+    Ok(())
 }
 
 impl RunContext {

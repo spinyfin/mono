@@ -1,13 +1,41 @@
 import Foundation
 
+enum AgentRole: String {
+    case standard
+    case boss
+
+    var title: String {
+        switch self {
+        case .standard:
+            return "Agent"
+        case .boss:
+            return "The Boss"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .standard:
+            return "person.circle"
+        case .boss:
+            return "person.crop.circle.badge.checkmark"
+        }
+    }
+}
+
 struct Agent: Identifiable {
     let id: String
     var name: String
+    var role: AgentRole = .standard
     var isReady: Bool = false
     var timeline: [TranscriptItem] = []
     var isSending: Bool = false
     var activeAssistantMessageID: UUID?
     var terminalEntryIndexByID: [String: Int] = [:]
+
+    var isBoss: Bool {
+        role == .boss
+    }
 }
 
 enum ChatRole {

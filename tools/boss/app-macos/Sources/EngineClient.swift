@@ -13,8 +13,8 @@ enum EngineEvent {
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String)
-    case agentCreated(agentId: String, name: String)
-    case agentList(agents: [(id: String, name: String)])
+    case agentCreated(agent: Agent)
+    case agentList(agents: [Agent])
     case agentRemoved(agentId: String)
     case chunk(agentId: String, text: String)
     case done(agentId: String, stopReason: String)
@@ -91,8 +91,11 @@ final class EngineClient: @unchecked Sendable {
         connection.start(queue: queue)
     }
 
-    func sendCreateAgent(name: String?) {
-        var payload: [String: Any] = ["type": "create_agent"]
+    func sendCreateAgent(name: String?, role: AgentRole = .standard) {
+        var payload: [String: Any] = [
+            "type": "create_agent",
+            "role": role.rawValue,
+        ]
         if let name {
             payload["name"] = name
         }
@@ -347,19 +350,16 @@ final class EngineClient: @unchecked Sendable {
                 let message = payload["message"] as? String ?? "unknown work error"
                 emit(.workError(message: message))
             case "agent_created":
-                let aid = agentId ?? ""
-                let name = payload["name"] as? String ?? ""
-                emit(.agentCreated(agentId: aid, name: name))
+                guard let agent = parseAgent(payload) else {
+                    emit(.error(agentId: nil, message: "received invalid agent payload from engine"))
+                    break
+                }
+                emit(.agentCreated(agent: agent))
             case "agent_ready":
                 emit(.agentReady(agentId: agentId ?? ""))
             case "agent_list":
-                var agents: [(id: String, name: String)] = []
-                if let list = payload["agents"] as? [[String: Any]] {
-                    for entry in list {
-                        let aid = entry["agent_id"] as? String ?? ""
-                        let name = entry["name"] as? String ?? ""
-                        agents.append((id: aid, name: name))
-                    }
+                let agents = (payload["agents"] as? [[String: Any]] ?? []).compactMap {
+                    parseAgent($0, isReady: true)
                 }
                 emit(.agentList(agents: agents))
             case "agent_removed":
@@ -510,6 +510,18 @@ final class EngineClient: @unchecked Sendable {
             createdAt: createdAt,
             updatedAt: updatedAt
         )
+    }
+
+    private func parseAgent(_ payload: [String: Any], isReady: Bool = false) -> Agent? {
+        guard let id = payload["agent_id"] as? String,
+              let name = payload["name"] as? String
+        else {
+            return nil
+        }
+
+        let rawRole = payload["role"] as? String ?? AgentRole.standard.rawValue
+        let role = AgentRole(rawValue: rawRole) ?? .standard
+        return Agent(id: id, name: name, role: role, isReady: isReady)
     }
 
     private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
