@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
@@ -13,10 +12,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
-use crate::work::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
-    Task, WorkDb, WorkItem, WorkItemPatch,
-};
+use crate::protocol::{AgentInfo, FrontendEvent, FrontendRequest};
+use crate::work::{WorkDb, WorkItem};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
@@ -38,154 +35,6 @@ impl Drop for PidFileGuard {
             let _ = std::fs::remove_file(&self.path);
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum FrontendRequest {
-    CreateProduct {
-        #[serde(flatten)]
-        input: CreateProductInput,
-    },
-    ListProducts,
-    ListProjects {
-        product_id: String,
-    },
-    CreateProject {
-        #[serde(flatten)]
-        input: CreateProjectInput,
-    },
-    CreateTask {
-        #[serde(flatten)]
-        input: CreateTaskInput,
-    },
-    CreateChore {
-        #[serde(flatten)]
-        input: CreateChoreInput,
-    },
-    UpdateWorkItem {
-        id: String,
-        patch: WorkItemPatch,
-    },
-    DeleteWorkItem {
-        id: String,
-    },
-    GetWorkTree {
-        product_id: String,
-    },
-    ReorderProjectTasks {
-        project_id: String,
-        task_ids: Vec<String>,
-    },
-    CreateAgent {
-        name: Option<String>,
-    },
-    ListAgents,
-    RemoveAgent {
-        agent_id: String,
-    },
-    Prompt {
-        agent_id: String,
-        text: String,
-    },
-    PermissionResponse {
-        agent_id: String,
-        id: String,
-        granted: bool,
-    },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum FrontendEvent {
-    ProductsList {
-        products: Vec<Product>,
-    },
-    ProjectsList {
-        product_id: String,
-        projects: Vec<Project>,
-    },
-    WorkTree {
-        product: Product,
-        projects: Vec<Project>,
-        tasks: Vec<Task>,
-        chores: Vec<Task>,
-    },
-    WorkItemCreated {
-        item: WorkItem,
-    },
-    WorkItemUpdated {
-        item: WorkItem,
-    },
-    ProjectTasksReordered {
-        project_id: String,
-        task_ids: Vec<String>,
-    },
-    WorkItemDeleted {
-        id: String,
-    },
-    WorkError {
-        message: String,
-    },
-    AgentCreated {
-        agent_id: String,
-        name: String,
-    },
-    AgentReady {
-        agent_id: String,
-    },
-    AgentList {
-        agents: Vec<AgentInfo>,
-    },
-    AgentRemoved {
-        agent_id: String,
-    },
-    Chunk {
-        agent_id: String,
-        text: String,
-    },
-    Done {
-        agent_id: String,
-        stop_reason: String,
-    },
-    ToolCall {
-        agent_id: String,
-        name: String,
-        status: String,
-    },
-    TerminalStarted {
-        agent_id: String,
-        id: String,
-        title: String,
-        command: String,
-        cwd: Option<String>,
-    },
-    TerminalOutput {
-        agent_id: String,
-        id: String,
-        text: String,
-    },
-    TerminalDone {
-        agent_id: String,
-        id: String,
-        exit_code: Option<i64>,
-        signal: Option<String>,
-    },
-    PermissionRequest {
-        agent_id: String,
-        id: String,
-        title: String,
-    },
-    Error {
-        agent_id: Option<String>,
-        message: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct AgentInfo {
-    agent_id: String,
-    name: String,
 }
 
 struct Agent {
@@ -276,10 +125,9 @@ impl AgentRegistry {
 
 pub async fn run(cli: Cli) -> Result<()> {
     let cfg = RuntimeConfig::load_from_env()?;
-    cfg.preflight()?;
     tracing::info!(
-        acp_command = %cfg.acp_command,
-        acp_args = ?cfg.acp_args,
+        acp_command = %cfg.acp.command,
+        acp_args = ?cfg.acp.args,
         cwd = %cfg.cwd.display(),
         db_path = %cfg.db_path.display(),
         "starting boss-engine runtime",
@@ -292,6 +140,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_cli(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
+    cfg.preflight_acp()?;
     let acp = AcpClient::connect(cfg).await?;
     acp.initialize().await?;
     let session_id = acp.new_session(&cfg.cwd).await?;
@@ -356,9 +205,13 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
-        if let Err(err) = handle_frontend_connection(stream, cfg, work_db.clone()).await {
-            tracing::error!(?err, "frontend connection failed");
-        }
+        let cfg = cfg.clone();
+        let work_db = work_db.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_frontend_connection(stream, &cfg, work_db).await {
+                tracing::error!(?err, "frontend connection failed");
+            }
+        });
     }
 }
 
@@ -454,6 +307,43 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::ListTasks {
+                product_id,
+                project_id,
+            } => match work_db.list_tasks(&product_id, project_id.as_deref()) {
+                Ok(tasks) => {
+                    let _ = event_tx.send(FrontendEvent::TasksList {
+                        product_id,
+                        project_id,
+                        tasks,
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::ListChores { product_id } => match work_db.list_chores(&product_id) {
+                Ok(chores) => {
+                    let _ = event_tx.send(FrontendEvent::ChoresList { product_id, chores });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            FrontendRequest::GetWorkItem { id } => match work_db.get_work_item(&id) {
+                Ok(item) => {
+                    let _ = event_tx.send(FrontendEvent::WorkItemResult { item });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    });
+                }
+            },
             FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
                 Ok(project) => {
                     let _ = event_tx.send(FrontendEvent::WorkItemCreated {

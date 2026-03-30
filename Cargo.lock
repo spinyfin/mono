@@ -166,6 +166,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine",
+ "clap",
+ "comfy-table",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tokio",
+]
+
+[[package]]
 name = "boss-engine"
 version = "0.1.0"
 dependencies = [

@@ -13,7 +13,7 @@ pub struct WorkDb {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Product {
     pub id: String,
     pub name: String,
@@ -25,7 +25,7 @@ pub struct Product {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub product_id: String,
@@ -39,7 +39,7 @@ pub struct Project {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub product_id: String,
@@ -55,7 +55,7 @@ pub struct Task {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkTree {
     pub product: Product,
     pub projects: Vec<Project>,
@@ -63,7 +63,7 @@ pub struct WorkTree {
     pub chores: Vec<Task>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "item_type", rename_all = "snake_case")]
 pub enum WorkItem {
     Product(Product),
@@ -72,14 +72,14 @@ pub enum WorkItem {
     Chore(Task),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProductInput {
     pub name: String,
     pub description: Option<String>,
     pub repo_remote_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProjectInput {
     pub product_id: String,
     pub name: String,
@@ -87,7 +87,7 @@ pub struct CreateProjectInput {
     pub goal: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskInput {
     pub product_id: String,
     pub project_id: String,
@@ -95,14 +95,14 @@ pub struct CreateTaskInput {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateChoreInput {
     pub product_id: String,
     pub name: String,
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkItemPatch {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -352,6 +352,62 @@ impl WorkDb {
 
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_work_item(&self, id: &str) -> Result<WorkItem> {
+        let conn = self.connect()?;
+        match classify_id(id)? {
+            ItemKind::Product => query_product(&conn, id)?
+                .map(WorkItem::Product)
+                .with_context(|| format!("unknown product: {id}")),
+            ItemKind::Project => query_project(&conn, id)?
+                .map(WorkItem::Project)
+                .with_context(|| format!("unknown project: {id}")),
+            ItemKind::Task => query_task(&conn, id)?
+                .filter(|task| task.deleted_at.is_none())
+                .map(task_to_item)
+                .with_context(|| format!("unknown task: {id}")),
+        }
+    }
+
+    pub fn list_tasks(&self, product_id: &str, project_id: Option<&str>) -> Result<Vec<Task>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        if let Some(project_id) = project_id {
+            ensure_project_belongs_to_product(&conn, project_id, product_id)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+                 FROM tasks
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind = 'project_task' AND deleted_at IS NULL
+                 ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![product_id, project_id], map_task)?;
+            return collect_rows(rows);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+             FROM tasks
+             WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
+             ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([product_id], map_task)?;
+        collect_rows(rows)
+    }
+
+    pub fn list_chores(&self, product_id: &str) -> Result<Vec<Task>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+             FROM tasks
+             WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([product_id], map_task)?;
+        collect_rows(rows)
     }
 
     fn init(&self) -> Result<()> {

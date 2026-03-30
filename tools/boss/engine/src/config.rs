@@ -5,18 +5,22 @@ use anyhow::{Context, Result, bail};
 const DEFAULT_ACP_COMMAND: &str = "npx -y @zed-industries/claude-code-acp@0.16.1";
 
 #[derive(Debug, Clone)]
+pub struct AcpConfig {
+    pub anthropic_api_key: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    pub anthropic_api_key: String,
-    pub acp_command: String,
-    pub acp_args: Vec<String>,
+    pub acp: AcpConfig,
     pub cwd: PathBuf,
     pub db_path: PathBuf,
 }
 
 impl RuntimeConfig {
     pub fn load_from_env() -> Result<Self> {
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY")
-            .context("ANTHROPIC_API_KEY must be set before starting boss-engine")?;
+        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
         let acp_command_line =
             std::env::var("BOSS_ACP_CMD").unwrap_or_else(|_| DEFAULT_ACP_COMMAND.to_owned());
@@ -34,27 +38,29 @@ impl RuntimeConfig {
         };
 
         Ok(Self {
-            anthropic_api_key,
-            acp_command: acp_command.clone(),
-            acp_args: acp_args.to_vec(),
+            acp: AcpConfig {
+                anthropic_api_key,
+                command: acp_command.clone(),
+                args: acp_args.to_vec(),
+            },
             cwd,
             db_path,
         })
     }
 
-    pub fn preflight(&self) -> Result<()> {
-        if self.acp_command.contains('/') {
-            let candidate = PathBuf::from(&self.acp_command);
+    pub fn preflight_acp(&self) -> Result<()> {
+        if self.acp.command.contains('/') {
+            let candidate = PathBuf::from(&self.acp.command);
             if !candidate.exists() {
                 bail!("ACP command does not exist: {}", candidate.display());
             }
             return Ok(());
         }
 
-        which::which(&self.acp_command).with_context(|| {
+        which::which(&self.acp.command).with_context(|| {
             format!(
                 "ACP command not found on PATH: {} (set BOSS_ACP_CMD to override)",
-                self.acp_command
+                self.acp.command
             )
         })?;
 
