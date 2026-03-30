@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, mpsc};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
-use crate::protocol::{AgentInfo, FrontendEvent, FrontendRequest};
+use crate::protocol::{
+    AgentInfo, FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
+};
 use crate::work::{WorkDb, WorkItem};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
@@ -123,6 +125,153 @@ impl AgentRegistry {
     }
 }
 
+struct ServerState {
+    work_db: Arc<WorkDb>,
+    agent_registry: Arc<AgentRegistry>,
+    topic_broker: Arc<TopicBroker>,
+    next_session_id: AtomicU64,
+    work_revision: AtomicU64,
+}
+
+impl ServerState {
+    fn new(cfg: &RuntimeConfig) -> Result<Self> {
+        Ok(Self {
+            work_db: Arc::new(WorkDb::open(cfg.db_path.clone())?),
+            agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
+            topic_broker: Arc::new(TopicBroker::default()),
+            next_session_id: AtomicU64::new(1),
+            work_revision: AtomicU64::new(0),
+        })
+    }
+
+    fn allocate_session_id(&self) -> String {
+        format!(
+            "session-{}",
+            self.next_session_id.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn current_work_revision(&self) -> u64 {
+        self.work_revision.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Default)]
+struct TopicBroker {
+    inner: Mutex<TopicBrokerInner>,
+}
+
+#[derive(Default)]
+struct TopicBrokerInner {
+    senders: HashMap<String, mpsc::UnboundedSender<FrontendEventEnvelope>>,
+    topics_by_session: HashMap<String, HashSet<String>>,
+    sessions_by_topic: HashMap<String, HashSet<String>>,
+}
+
+impl TopicBroker {
+    async fn register_session(
+        &self,
+        session_id: &str,
+        sender: mpsc::UnboundedSender<FrontendEventEnvelope>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner.senders.insert(session_id.to_owned(), sender);
+    }
+
+    async fn remove_session(&self, session_id: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.senders.remove(session_id);
+        if let Some(topics) = inner.topics_by_session.remove(session_id) {
+            for topic in topics {
+                if let Some(sessions) = inner.sessions_by_topic.get_mut(&topic) {
+                    sessions.remove(session_id);
+                    if sessions.is_empty() {
+                        inner.sessions_by_topic.remove(&topic);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn subscribe(&self, session_id: &str, topics: &[String]) -> Vec<String> {
+        let mut inner = self.inner.lock().await;
+        let mut added = Vec::new();
+        for topic in topics {
+            let topic = topic.trim();
+            if topic.is_empty() {
+                continue;
+            }
+            let inserted = inner
+                .topics_by_session
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(topic.to_owned());
+            inner
+                .sessions_by_topic
+                .entry(topic.to_owned())
+                .or_default()
+                .insert(session_id.to_owned());
+            if inserted {
+                added.push(topic.to_owned());
+            }
+        }
+        added
+    }
+
+    async fn unsubscribe(&self, session_id: &str, topics: &[String]) -> Vec<String> {
+        let mut inner = self.inner.lock().await;
+        let mut removed = Vec::new();
+        for topic in topics {
+            let topic = topic.trim();
+            if topic.is_empty() {
+                continue;
+            }
+            let session_removed = inner
+                .topics_by_session
+                .get_mut(session_id)
+                .map(|session_topics| session_topics.remove(topic))
+                .unwrap_or(false);
+            if !session_removed {
+                continue;
+            }
+            if let Some(sessions) = inner.sessions_by_topic.get_mut(topic) {
+                sessions.remove(session_id);
+                if sessions.is_empty() {
+                    inner.sessions_by_topic.remove(topic);
+                }
+            }
+            removed.push(topic.to_owned());
+        }
+
+        if matches!(
+            inner.topics_by_session.get(session_id),
+            Some(topics) if topics.is_empty()
+        ) {
+            inner.topics_by_session.remove(session_id);
+        }
+
+        removed
+    }
+
+    #[allow(dead_code)]
+    async fn publish(&self, topic: &str, envelope: FrontendEventEnvelope) {
+        let senders = {
+            let inner = self.inner.lock().await;
+            inner
+                .sessions_by_topic
+                .get(topic)
+                .into_iter()
+                .flat_map(|sessions| sessions.iter())
+                .filter_map(|session_id| inner.senders.get(session_id).cloned())
+                .collect::<Vec<_>>()
+        };
+
+        for sender in senders {
+            let _ = sender.send(envelope.clone());
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     let cfg = RuntimeConfig::load_from_env()?;
     tracing::info!(
@@ -175,7 +324,7 @@ async fn run_cli(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 }
 
 async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
-    let work_db = Arc::new(WorkDb::open(cfg.db_path.clone())?);
+    let server_state = Arc::new(ServerState::new(cfg)?);
     let socket_path = cli
         .socket_path
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
@@ -206,9 +355,9 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
         let cfg = cfg.clone();
-        let work_db = work_db.clone();
+        let server_state = server_state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_frontend_connection(stream, &cfg, work_db).await {
+            if let Err(err) = handle_frontend_connection(stream, &cfg, server_state).await {
                 tracing::error!(?err, "frontend connection failed");
             }
         });
@@ -217,17 +366,26 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 
 async fn handle_frontend_connection(
     stream: UnixStream,
-    cfg: &RuntimeConfig,
-    work_db: Arc<WorkDb>,
+    _cfg: &RuntimeConfig,
+    server_state: Arc<ServerState>,
 ) -> Result<()> {
     tracing::info!("frontend connected");
-
-    let registry = Arc::new(AgentRegistry::new(cfg.clone()));
+    let registry = server_state.agent_registry.clone();
+    let work_db = server_state.work_db.clone();
+    let session_id = server_state.allocate_session_id();
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<FrontendEvent>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<FrontendEventEnvelope>();
+    server_state
+        .topic_broker
+        .register_session(&session_id, event_tx.clone())
+        .await;
+    let _ = event_tx.send(FrontendEventEnvelope::push(FrontendEvent::Hello {
+        session_id: session_id.clone(),
+    }));
+
     let writer_task = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             let line = match serde_json::to_string(&event) {
@@ -258,164 +416,282 @@ async fn handle_frontend_connection(
             continue;
         }
 
-        let request: FrontendRequest = match serde_json::from_str(&line) {
+        let envelope: FrontendRequestEnvelope = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(err) => {
-                let _ = event_tx.send(FrontendEvent::Error {
+                let _ = event_tx.send(FrontendEventEnvelope::push(FrontendEvent::Error {
                     agent_id: None,
                     message: format!("invalid request payload: {err}"),
-                });
+                }));
                 continue;
             }
         };
+        let request_id = envelope.request_id.clone();
+        let request = envelope.payload;
 
         match request {
+            FrontendRequest::Subscribe { topics } => {
+                let topics = server_state.topic_broker.subscribe(&session_id, &topics).await;
+                send_response(
+                    &event_tx,
+                    &request_id,
+                    FrontendEvent::Subscribed {
+                        topics,
+                        current_revision: server_state.current_work_revision(),
+                    },
+                );
+            }
+            FrontendRequest::Unsubscribe { topics } => {
+                let topics = server_state
+                    .topic_broker
+                    .unsubscribe(&session_id, &topics)
+                    .await;
+                send_response(
+                    &event_tx,
+                    &request_id,
+                    FrontendEvent::Unsubscribed { topics },
+                );
+            }
             FrontendRequest::CreateProduct { input } => match work_db.create_product(input) {
                 Ok(product) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
-                        item: WorkItem::Product(product),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemCreated {
+                            item: WorkItem::Product(product),
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::ListProducts => match work_db.list_products() {
                 Ok(products) => {
-                    let _ = event_tx.send(FrontendEvent::ProductsList { products });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ProductsList { products },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
-            FrontendRequest::ListProjects { product_id } => {
-                match work_db.list_projects(&product_id) {
-                    Ok(projects) => {
-                        let _ = event_tx.send(FrontendEvent::ProjectsList {
+            FrontendRequest::ListProjects { product_id } => match work_db.list_projects(&product_id)
+            {
+                Ok(projects) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ProjectsList {
                             product_id,
                             projects,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = event_tx.send(FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        });
-                    }
+                        },
+                    );
                 }
-            }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
             FrontendRequest::ListTasks {
                 product_id,
                 project_id,
             } => match work_db.list_tasks(&product_id, project_id.as_deref()) {
                 Ok(tasks) => {
-                    let _ = event_tx.send(FrontendEvent::TasksList {
-                        product_id,
-                        project_id,
-                        tasks,
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::TasksList {
+                            product_id,
+                            project_id,
+                            tasks,
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::ListChores { product_id } => match work_db.list_chores(&product_id) {
                 Ok(chores) => {
-                    let _ = event_tx.send(FrontendEvent::ChoresList { product_id, chores });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ChoresList { product_id, chores },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::GetWorkItem { id } => match work_db.get_work_item(&id) {
                 Ok(item) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemResult { item });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemResult { item },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
                 Ok(project) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
-                        item: WorkItem::Project(project),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemCreated {
+                            item: WorkItem::Project(project),
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::CreateTask { input } => match work_db.create_task(input) {
                 Ok(task) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
-                        item: WorkItem::Task(task),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemCreated {
+                            item: WorkItem::Task(task),
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::CreateChore { input } => match work_db.create_chore(input) {
                 Ok(task) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemCreated {
-                        item: WorkItem::Chore(task),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemCreated {
+                            item: WorkItem::Chore(task),
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
-            FrontendRequest::UpdateWorkItem { id, patch } => {
-                match work_db.update_work_item(&id, patch) {
-                    Ok(item) => {
-                        let _ = event_tx.send(FrontendEvent::WorkItemUpdated { item });
-                    }
-                    Err(err) => {
-                        let _ = event_tx.send(FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        });
-                    }
-                }
-            }
-            FrontendRequest::DeleteWorkItem { id } => match work_db.delete_work_item(&id) {
-                Ok(()) => {
-                    let _ = event_tx.send(FrontendEvent::WorkItemDeleted { id });
+            FrontendRequest::UpdateWorkItem { id, patch } => match work_db.update_work_item(&id, patch)
+            {
+                Ok(item) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemUpdated { item },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::DeleteWorkItem { id } => match work_db.delete_work_item(&id) {
+                Ok(()) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkItemDeleted { id },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::GetWorkTree { product_id } => match work_db.get_work_tree(&product_id)
             {
                 Ok(tree) => {
-                    let _ = event_tx.send(FrontendEvent::WorkTree {
-                        product: tree.product,
-                        projects: tree.projects,
-                        tasks: tree.tasks,
-                        chores: tree.chores,
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkTree {
+                            product: tree.product,
+                            projects: tree.projects,
+                            tasks: tree.tasks,
+                            chores: tree.chores,
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::ReorderProjectTasks {
@@ -423,56 +699,79 @@ async fn handle_frontend_connection(
                 task_ids,
             } => match work_db.reorder_project_tasks(&project_id, &task_ids) {
                 Ok(()) => {
-                    let _ = event_tx.send(FrontendEvent::ProjectTasksReordered {
-                        project_id,
-                        task_ids,
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ProjectTasksReordered {
+                            project_id,
+                            task_ids,
+                        },
+                    );
                 }
                 Err(err) => {
-                    let _ = event_tx.send(FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
                 }
             },
             FrontendRequest::CreateAgent { name } => {
                 let (agent_id, agent_name) = registry.allocate_agent(name);
-                let _ = event_tx.send(FrontendEvent::AgentCreated {
-                    agent_id: agent_id.clone(),
-                    name: agent_name.clone(),
-                });
+                send_response(
+                    &event_tx,
+                    &request_id,
+                    FrontendEvent::AgentCreated {
+                        agent_id: agent_id.clone(),
+                        name: agent_name.clone(),
+                    },
+                );
 
                 let event_tx = event_tx.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
                     match registry.initialize_agent(&agent_id, &agent_name).await {
                         Ok(()) => {
-                            let _ = event_tx.send(FrontendEvent::AgentReady { agent_id });
+                            send_push(&event_tx, FrontendEvent::AgentReady { agent_id });
                         }
                         Err(err) => {
                             tracing::error!(?err, agent_id = %agent_id, "failed to initialize agent");
-                            let _ = event_tx.send(FrontendEvent::Error {
-                                agent_id: Some(agent_id),
-                                message: format!("failed to initialize agent: {err}"),
-                            });
+                            send_push(
+                                &event_tx,
+                                FrontendEvent::Error {
+                                    agent_id: Some(agent_id),
+                                    message: format!("failed to initialize agent: {err}"),
+                                },
+                            );
                         }
                     }
                 });
             }
             FrontendRequest::ListAgents => {
                 let agents = registry.list_agents().await;
-                let _ = event_tx.send(FrontendEvent::AgentList { agents });
+                send_response(&event_tx, &request_id, FrontendEvent::AgentList { agents });
             }
             FrontendRequest::RemoveAgent { agent_id } => {
                 match registry.remove_agent(&agent_id).await {
                     Ok(()) => {
-                        let _ = event_tx.send(FrontendEvent::AgentRemoved { agent_id });
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::AgentRemoved { agent_id },
+                        );
                     }
                     Err(err) => {
                         tracing::error!(?err, agent_id = %agent_id, "failed to remove agent");
-                        let _ = event_tx.send(FrontendEvent::Error {
-                            agent_id: Some(agent_id),
-                            message: err.to_string(),
-                        });
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::Error {
+                                agent_id: Some(agent_id),
+                                message: err.to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -487,10 +786,14 @@ async fn handle_frontend_connection(
                     match registry.get_acp_and_session(&agent_id).await {
                         Ok(tuple) => tuple,
                         Err(err) => {
-                            let _ = event_tx.send(FrontendEvent::Error {
-                                agent_id: Some(agent_id),
-                                message: err.to_string(),
-                            });
+                            send_response(
+                                &event_tx,
+                                &request_id,
+                                FrontendEvent::Error {
+                                    agent_id: Some(agent_id),
+                                    message: err.to_string(),
+                                },
+                            );
                             continue;
                         }
                     };
@@ -505,17 +808,23 @@ async fn handle_frontend_connection(
                     let result = acp
                         .prompt_streaming(&session_id, &text, |event| match event {
                             AcpEvent::AgentMessageChunk { text, .. } => {
-                                let _ = event_tx.send(FrontendEvent::Chunk {
-                                    agent_id: aid.clone(),
-                                    text,
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::Chunk {
+                                        agent_id: aid.clone(),
+                                        text,
+                                    },
+                                );
                             }
                             AcpEvent::ToolCall { title, status, .. } => {
-                                let _ = event_tx.send(FrontendEvent::ToolCall {
-                                    agent_id: aid.clone(),
-                                    name: title,
-                                    status: status.unwrap_or_else(|| "started".to_owned()),
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::ToolCall {
+                                        agent_id: aid.clone(),
+                                        name: title,
+                                        status: status.unwrap_or_else(|| "started".to_owned()),
+                                    },
+                                );
                             }
                             AcpEvent::ToolCallUpdate {
                                 tool_call_id,
@@ -526,22 +835,28 @@ async fn handle_frontend_connection(
                                 let label = title.unwrap_or_else(|| {
                                     tool_call_id.unwrap_or_else(|| "tool".to_owned())
                                 });
-                                let _ = event_tx.send(FrontendEvent::ToolCall {
-                                    agent_id: aid.clone(),
-                                    name: label,
-                                    status: status.unwrap_or_else(|| "update".to_owned()),
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::ToolCall {
+                                        agent_id: aid.clone(),
+                                        name: label,
+                                        status: status.unwrap_or_else(|| "update".to_owned()),
+                                    },
+                                );
                             }
                             AcpEvent::PermissionRequest {
                                 permission_id,
                                 title,
                                 ..
                             } => {
-                                let _ = event_tx.send(FrontendEvent::PermissionRequest {
-                                    agent_id: aid.clone(),
-                                    id: permission_id,
-                                    title,
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::PermissionRequest {
+                                        agent_id: aid.clone(),
+                                        id: permission_id,
+                                        title,
+                                    },
+                                );
                             }
                             AcpEvent::TerminalStarted {
                                 id,
@@ -550,20 +865,26 @@ async fn handle_frontend_connection(
                                 cwd,
                                 ..
                             } => {
-                                let _ = event_tx.send(FrontendEvent::TerminalStarted {
-                                    agent_id: aid.clone(),
-                                    id,
-                                    title,
-                                    command,
-                                    cwd,
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::TerminalStarted {
+                                        agent_id: aid.clone(),
+                                        id,
+                                        title,
+                                        command,
+                                        cwd,
+                                    },
+                                );
                             }
                             AcpEvent::TerminalOutput { id, text, .. } => {
-                                let _ = event_tx.send(FrontendEvent::TerminalOutput {
-                                    agent_id: aid.clone(),
-                                    id,
-                                    text,
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::TerminalOutput {
+                                        agent_id: aid.clone(),
+                                        id,
+                                        text,
+                                    },
+                                );
                             }
                             AcpEvent::TerminalDone {
                                 id,
@@ -571,12 +892,15 @@ async fn handle_frontend_connection(
                                 signal,
                                 ..
                             } => {
-                                let _ = event_tx.send(FrontendEvent::TerminalDone {
-                                    agent_id: aid.clone(),
-                                    id,
-                                    exit_code,
-                                    signal,
-                                });
+                                send_push(
+                                    &event_tx,
+                                    FrontendEvent::TerminalDone {
+                                        agent_id: aid.clone(),
+                                        id,
+                                        exit_code,
+                                        signal,
+                                    },
+                                );
                             }
                         })
                         .await;
@@ -588,17 +912,23 @@ async fn handle_frontend_connection(
                                 stop_reason = %response.stop_reason,
                                 "prompt completed"
                             );
-                            let _ = event_tx.send(FrontendEvent::Done {
-                                agent_id: agent_id_owned,
-                                stop_reason: response.stop_reason,
-                            });
+                            send_push(
+                                &event_tx,
+                                FrontendEvent::Done {
+                                    agent_id: agent_id_owned,
+                                    stop_reason: response.stop_reason,
+                                },
+                            );
                         }
                         Err(err) => {
                             tracing::error!(?err, agent_id = %agent_id_owned, "prompt failed");
-                            let _ = event_tx.send(FrontendEvent::Error {
-                                agent_id: Some(agent_id_owned),
-                                message: err.to_string(),
-                            });
+                            send_push(
+                                &event_tx,
+                                FrontendEvent::Error {
+                                    agent_id: Some(agent_id_owned),
+                                    message: err.to_string(),
+                                },
+                            );
                         }
                     }
                 });
@@ -618,28 +948,49 @@ async fn handle_frontend_connection(
                 let acp = match registry.get_acp_and_session(&agent_id).await {
                     Ok((acp, _, _)) => acp,
                     Err(err) => {
-                        let _ = event_tx.send(FrontendEvent::Error {
-                            agent_id: Some(agent_id),
-                            message: err.to_string(),
-                        });
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::Error {
+                                agent_id: Some(agent_id),
+                                message: err.to_string(),
+                            },
+                        );
                         continue;
                     }
                 };
 
                 if let Err(err) = acp.respond_permission(&id, granted).await {
                     tracing::error!(?err, permission_id = %id, "failed to apply permission response");
-                    let _ = event_tx.send(FrontendEvent::Error {
-                        agent_id: Some(agent_id),
-                        message: err.to_string(),
-                    });
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: Some(agent_id),
+                            message: err.to_string(),
+                        },
+                    );
                 }
             }
         }
     }
 
+    server_state.topic_broker.remove_session(&session_id).await;
     drop(event_tx);
     let _ = writer_task.await;
     Ok(())
+}
+
+fn send_response(
+    event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>,
+    request_id: &str,
+    payload: FrontendEvent,
+) {
+    let _ = event_tx.send(FrontendEventEnvelope::response(request_id.to_owned(), payload));
+}
+
+fn send_push(event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>, payload: FrontendEvent) {
+    let _ = event_tx.send(FrontendEventEnvelope::push(payload));
 }
 
 async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<()> {

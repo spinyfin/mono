@@ -5,9 +5,50 @@ use crate::work::{
     Task, WorkItem, WorkItemPatch,
 };
 
+pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
+
+pub fn work_product_topic(product_id: &str) -> String {
+    format!("work.product.{product_id}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendRequestEnvelope {
+    pub request_id: String,
+    pub payload: FrontendRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendEventEnvelope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub payload: FrontendEvent,
+}
+
+impl FrontendEventEnvelope {
+    pub fn response(request_id: impl Into<String>, payload: FrontendEvent) -> Self {
+        Self {
+            request_id: Some(request_id.into()),
+            payload,
+        }
+    }
+
+    pub fn push(payload: FrontendEvent) -> Self {
+        Self {
+            request_id: None,
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
+    Subscribe {
+        topics: Vec<String>,
+    },
+    Unsubscribe {
+        topics: Vec<String>,
+    },
     CreateProduct {
         #[serde(flatten)]
         input: CreateProductInput,
@@ -73,6 +114,23 @@ pub enum FrontendRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendEvent {
+    Hello {
+        session_id: String,
+    },
+    Subscribed {
+        topics: Vec<String>,
+        current_revision: u64,
+    },
+    Unsubscribed {
+        topics: Vec<String>,
+    },
+    TopicEvent {
+        topic: String,
+        revision: u64,
+        origin_session_id: String,
+        origin_request_id: Option<String>,
+        event: TopicEventPayload,
+    },
     ProductsList {
         products: Vec<Product>,
     },
@@ -173,4 +231,14 @@ pub enum FrontendEvent {
 pub struct AgentInfo {
     pub agent_id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TopicEventPayload {
+    WorkInvalidated {
+        reason: String,
+        product_id: Option<String>,
+        item_ids: Vec<String>,
+    },
 }

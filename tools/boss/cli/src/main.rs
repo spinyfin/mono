@@ -1,10 +1,13 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use boss_engine::protocol::{FrontendEvent, FrontendRequest};
+use boss_engine::protocol::{
+    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
+};
 use boss_engine::work::{
     CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
     Task, WorkItem, WorkItemPatch,
@@ -498,6 +501,7 @@ struct EngineCommandSpec {
 struct BossClient {
     reader: Lines<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
+    next_request_id: AtomicU64,
 }
 
 impl BossClient {
@@ -509,11 +513,19 @@ impl BossClient {
         Ok(Self {
             reader: BufReader::new(read_half).lines(),
             writer: write_half,
+            next_request_id: AtomicU64::new(1),
         })
     }
 
     async fn send_request(&mut self, request: &FrontendRequest) -> Result<FrontendEvent> {
-        let payload = serde_json::to_string(request)?;
+        let request_id = format!(
+            "cli-{}",
+            self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let payload = serde_json::to_string(&FrontendRequestEnvelope {
+            request_id: request_id.clone(),
+            payload: request.clone(),
+        })?;
         self.writer.write_all(payload.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
@@ -522,8 +534,11 @@ impl BossClient {
             if line.trim().is_empty() {
                 continue;
             }
-            return serde_json::from_str(&line)
-                .with_context(|| format!("failed to decode engine event: {line}"));
+            let envelope: FrontendEventEnvelope = serde_json::from_str(&line)
+                .with_context(|| format!("failed to decode engine event: {line}"))?;
+            if envelope.request_id.as_deref() == Some(request_id.as_str()) {
+                return Ok(envelope.payload);
+            }
         }
 
         bail!("engine closed the socket before returning a response")
