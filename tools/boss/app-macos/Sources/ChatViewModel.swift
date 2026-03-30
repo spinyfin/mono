@@ -21,8 +21,6 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedWorkProductID: String?
     @Published var selectedWorkProjectFilterID: String?
     @Published var selectedWorkCardID: String?
-    @Published var includeWorkChores = true
-    @Published var workShowBlockedOnly = false
     @Published var workBoardGrouping: WorkBoardGrouping = .none
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
@@ -78,12 +76,8 @@ final class ChatViewModel: ObservableObject {
             guard selectedProjectID == nil || selectedProjectID == project.id else { continue }
             items.append(contentsOf: (tasksByProjectID[project.id] ?? []).sorted(by: taskSort))
         }
-        if includeWorkChores && selectedProjectID == nil {
+        if selectedProjectID == nil {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
-        }
-
-        if workShowBlockedOnly {
-            items = items.filter { $0.status == "blocked" }
         }
 
         guard !query.isEmpty else {
@@ -113,8 +107,6 @@ final class ChatViewModel: ObservableObject {
     private let navigationModeDefaultsKey = "boss.navigationMode"
     private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
     private let selectedWorkProjectFilterDefaultsKey = "boss.work.selectedProjectFilterID"
-    private let includeWorkChoresDefaultsKey = "boss.work.includeChores"
-    private let workShowBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     private let workBoardGroupingDefaultsKey = "boss.work.grouping"
 
     init(
@@ -132,8 +124,6 @@ final class ChatViewModel: ObservableObject {
         }
         selectedWorkProductID = defaults.string(forKey: selectedWorkProductDefaultsKey)
         selectedWorkProjectFilterID = defaults.string(forKey: selectedWorkProjectFilterDefaultsKey)
-        includeWorkChores = defaults.object(forKey: includeWorkChoresDefaultsKey) as? Bool ?? true
-        workShowBlockedOnly = defaults.object(forKey: workShowBlockedOnlyDefaultsKey) as? Bool ?? false
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
@@ -145,6 +135,13 @@ final class ChatViewModel: ObservableObject {
 
         engine.onEvent = { [weak self] event in
             self?.handle(event)
+        }
+
+        // In the AppKit-hosted macOS shell, the root SwiftUI `.task` can be
+        // missed on some launches. Schedule the normal startup path here too so
+        // the engine connection still comes up reliably.
+        DispatchQueue.main.async { [weak self] in
+            self?.startIfNeeded()
         }
     }
 
@@ -206,22 +203,6 @@ final class ChatViewModel: ObservableObject {
         selectedWorkCardID = taskID
         guard let taskID, let task = task(withID: taskID) else { return }
         selectedWorkProductID = task.productID
-    }
-
-    func setIncludeWorkChores(_ include: Bool) {
-        includeWorkChores = include
-        defaults.set(include, forKey: includeWorkChoresDefaultsKey)
-        if let selectedTask, !isTaskVisible(selectedTask) {
-            selectedWorkCardID = nil
-        }
-    }
-
-    func setWorkShowBlockedOnly(_ show: Bool) {
-        workShowBlockedOnly = show
-        defaults.set(show, forKey: workShowBlockedOnlyDefaultsKey)
-        if let selectedTask, !isTaskVisible(selectedTask) {
-            selectedWorkCardID = nil
-        }
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {

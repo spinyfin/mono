@@ -19,8 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
 
-        let content = ContentView()
-        let host = NSHostingView(rootView: content)
+        let host = NSHostingView(rootView: ContentView())
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1060, height: 680),
@@ -31,7 +30,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.title = "Boss"
         window.titleVisibility = .hidden
-
         let toolbar = NSToolbar(identifier: "BossToolbar")
         window.toolbar = toolbar
         window.toolbarStyle = .unified
