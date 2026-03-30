@@ -14,6 +14,7 @@ use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
 use crate::protocol::{
     AgentInfo, FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
+    TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
 };
 use crate::work::{WorkDb, WorkItem};
 
@@ -153,6 +154,10 @@ impl ServerState {
 
     fn current_work_revision(&self) -> u64 {
         self.work_revision.load(Ordering::SeqCst)
+    }
+
+    fn bump_work_revision(&self) -> u64 {
+        self.work_revision.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -454,12 +459,25 @@ async fn handle_frontend_connection(
             }
             FrontendRequest::CreateProduct { input } => match work_db.create_product(input) {
                 Ok(product) => {
-                    send_response(
+                    let item = WorkItem::Product(product);
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        vec![
+                            TOPIC_WORK_PRODUCTS.to_owned(),
+                            work_product_topic(&work_item_id(&item)),
+                        ],
+                        "product_created",
+                        Some(work_item_product_id(&item)),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
-                        FrontendEvent::WorkItemCreated {
-                            item: WorkItem::Product(product),
-                        },
+                        revision,
+                        FrontendEvent::WorkItemCreated { item },
                     );
                 }
                 Err(err) => {
@@ -474,9 +492,10 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::ListProducts => match work_db.list_products() {
                 Ok(products) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::ProductsList { products },
                     );
                 }
@@ -493,9 +512,10 @@ async fn handle_frontend_connection(
             FrontendRequest::ListProjects { product_id } => match work_db.list_projects(&product_id)
             {
                 Ok(projects) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::ProjectsList {
                             product_id,
                             projects,
@@ -517,9 +537,10 @@ async fn handle_frontend_connection(
                 project_id,
             } => match work_db.list_tasks(&product_id, project_id.as_deref()) {
                 Ok(tasks) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::TasksList {
                             product_id,
                             project_id,
@@ -539,9 +560,10 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::ListChores { product_id } => match work_db.list_chores(&product_id) {
                 Ok(chores) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::ChoresList { product_id, chores },
                     );
                 }
@@ -557,9 +579,10 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::GetWorkItem { id } => match work_db.get_work_item(&id) {
                 Ok(item) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::WorkItemResult { item },
                     );
                 }
@@ -575,12 +598,23 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
                 Ok(project) => {
-                    send_response(
+                    let item = WorkItem::Project(project);
+                    let product_id = work_item_product_id(&item);
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        vec![work_product_topic(&product_id)],
+                        "project_created",
+                        Some(product_id),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
-                        FrontendEvent::WorkItemCreated {
-                            item: WorkItem::Project(project),
-                        },
+                        revision,
+                        FrontendEvent::WorkItemCreated { item },
                     );
                 }
                 Err(err) => {
@@ -595,12 +629,23 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::CreateTask { input } => match work_db.create_task(input) {
                 Ok(task) => {
-                    send_response(
+                    let item = WorkItem::Task(task);
+                    let product_id = work_item_product_id(&item);
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        vec![work_product_topic(&product_id)],
+                        "task_created",
+                        Some(product_id),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
-                        FrontendEvent::WorkItemCreated {
-                            item: WorkItem::Task(task),
-                        },
+                        revision,
+                        FrontendEvent::WorkItemCreated { item },
                     );
                 }
                 Err(err) => {
@@ -615,12 +660,23 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::CreateChore { input } => match work_db.create_chore(input) {
                 Ok(task) => {
-                    send_response(
+                    let item = WorkItem::Chore(task);
+                    let product_id = work_item_product_id(&item);
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        vec![work_product_topic(&product_id)],
+                        "chore_created",
+                        Some(product_id),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
-                        FrontendEvent::WorkItemCreated {
-                            item: WorkItem::Chore(task),
-                        },
+                        revision,
+                        FrontendEvent::WorkItemCreated { item },
                     );
                 }
                 Err(err) => {
@@ -636,9 +692,25 @@ async fn handle_frontend_connection(
             FrontendRequest::UpdateWorkItem { id, patch } => match work_db.update_work_item(&id, patch)
             {
                 Ok(item) => {
-                    send_response(
+                    let product_id = work_item_product_id(&item);
+                    let mut topics = vec![work_product_topic(&product_id)];
+                    if matches!(item, WorkItem::Product(_)) {
+                        topics.push(TOPIC_WORK_PRODUCTS.to_owned());
+                    }
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        topics,
+                        "work_item_updated",
+                        Some(product_id),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        revision,
                         FrontendEvent::WorkItemUpdated { item },
                     );
                 }
@@ -652,14 +724,37 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::DeleteWorkItem { id } => match work_db.delete_work_item(&id) {
-                Ok(()) => {
-                    send_response(
-                        &event_tx,
-                        &request_id,
-                        FrontendEvent::WorkItemDeleted { id },
-                    );
-                }
+            FrontendRequest::DeleteWorkItem { id } => match work_db.get_work_item(&id) {
+                Ok(item) => match work_db.delete_work_item(&id) {
+                    Ok(()) => {
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "work_item_deleted",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &event_tx,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemDeleted { id },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                },
                 Err(err) => {
                     send_response(
                         &event_tx,
@@ -673,9 +768,10 @@ async fn handle_frontend_connection(
             FrontendRequest::GetWorkTree { product_id } => match work_db.get_work_tree(&product_id)
             {
                 Ok(tree) => {
-                    send_response(
+                    send_response_with_revision(
                         &event_tx,
                         &request_id,
+                        server_state.current_work_revision(),
                         FrontendEvent::WorkTree {
                             product: tree.product,
                             projects: tree.projects,
@@ -697,17 +793,40 @@ async fn handle_frontend_connection(
             FrontendRequest::ReorderProjectTasks {
                 project_id,
                 task_ids,
-            } => match work_db.reorder_project_tasks(&project_id, &task_ids) {
-                Ok(()) => {
-                    send_response(
-                        &event_tx,
-                        &request_id,
-                        FrontendEvent::ProjectTasksReordered {
-                            project_id,
-                            task_ids,
-                        },
-                    );
-                }
+            } => match work_db.get_work_item(&project_id) {
+                Ok(project_item) => match work_db.reorder_project_tasks(&project_id, &task_ids) {
+                    Ok(()) => {
+                        let product_id = work_item_product_id(&project_item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "project_tasks_reordered",
+                            Some(product_id),
+                            task_ids.clone(),
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &event_tx,
+                            &request_id,
+                            revision,
+                            FrontendEvent::ProjectTasksReordered {
+                                project_id,
+                                task_ids,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                },
                 Err(err) => {
                     send_response(
                         &event_tx,
@@ -989,8 +1108,80 @@ fn send_response(
     let _ = event_tx.send(FrontendEventEnvelope::response(request_id.to_owned(), payload));
 }
 
+fn send_response_with_revision(
+    event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>,
+    request_id: &str,
+    revision: u64,
+    payload: FrontendEvent,
+) {
+    let _ = event_tx.send(FrontendEventEnvelope::response_with_revision(
+        request_id.to_owned(),
+        revision,
+        payload,
+    ));
+}
+
 fn send_push(event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>, payload: FrontendEvent) {
     let _ = event_tx.send(FrontendEventEnvelope::push(payload));
+}
+
+async fn publish_work_invalidation(
+    server_state: &ServerState,
+    origin_session_id: &str,
+    origin_request_id: &str,
+    topics: Vec<String>,
+    reason: &str,
+    product_id: Option<String>,
+    item_ids: Vec<String>,
+) -> u64 {
+    let revision = server_state.bump_work_revision();
+    let event = FrontendEvent::TopicEvent {
+        topic: String::new(),
+        revision,
+        origin_session_id: origin_session_id.to_owned(),
+        origin_request_id: Some(origin_request_id.to_owned()),
+        event: TopicEventPayload::WorkInvalidated {
+            reason: reason.to_owned(),
+            product_id,
+            item_ids,
+        },
+    };
+
+    let mut unique_topics = HashSet::new();
+    for topic in topics {
+        if !unique_topics.insert(topic.clone()) {
+            continue;
+        }
+        let mut event = event.clone();
+        if let FrontendEvent::TopicEvent {
+            topic: event_topic, ..
+        } = &mut event
+        {
+            *event_topic = topic.clone();
+        }
+        server_state
+            .topic_broker
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+            .await;
+    }
+
+    revision
+}
+
+fn work_item_id(item: &WorkItem) -> String {
+    match item {
+        WorkItem::Product(product) => product.id.clone(),
+        WorkItem::Project(project) => project.id.clone(),
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.id.clone(),
+    }
+}
+
+fn work_item_product_id(item: &WorkItem) -> String {
+    match item {
+        WorkItem::Product(product) => product.id.clone(),
+        WorkItem::Project(project) => project.product_id.clone(),
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
+    }
 }
 
 async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<()> {
