@@ -417,27 +417,15 @@ struct ContentView: View {
             .padding(.horizontal, workBoardHorizontalPadding)
             .padding(.top, 20)
 
-            if model.visibleWorkItems.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("No cards match this board view")
-                        .font(.title3.weight(.semibold))
-                    Text(emptyBoardMessage)
-                        .foregroundStyle(.secondary)
+            NativeWorkBoardScrollView(
+                columns: WorkBoardColumnKey.allCases.map { column in
+                    NativeWorkBoardColumn(
+                        id: column.id,
+                        view: AnyView(workColumn(column))
+                    )
                 }
-                .padding(.horizontal, workBoardHorizontalPadding)
-                .padding(.bottom, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            } else {
-                NativeWorkBoardScrollView(
-                    columns: WorkBoardColumnKey.allCases.map { column in
-                        NativeWorkBoardColumn(
-                            id: column.id,
-                            view: AnyView(workColumn(column))
-                        )
-                    }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -546,16 +534,6 @@ struct ContentView: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .textCase(.uppercase)
-    }
-
-    private var emptyBoardMessage: String {
-        if !model.workSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Try a broader search or clear the search field."
-        }
-        if model.selectedProject != nil {
-            return "This project does not have any tasks in the current board view."
-        }
-        return "Create a task or chore to start filling the board."
     }
 }
 
@@ -1128,6 +1106,7 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
             + horizontalPadding
     }
 
+    @MainActor
     final class Coordinator {
         let documentView = FlippedContentView()
         var hostingViews: [NSHostingView<AnyView>] = []
