@@ -1054,6 +1054,9 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
+        let clipView = HorizontalOnlyClipView()
+        clipView.drawsBackground = false
+
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasHorizontalScroller = true
@@ -1061,6 +1064,7 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.horizontalScrollElasticity = .automatic
         scrollView.verticalScrollElasticity = .none
+        scrollView.contentView = clipView
         scrollView.documentView = context.coordinator.documentView
         return scrollView
     }
@@ -1099,6 +1103,21 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
             )
             x += columnWidth + spacing
         }
+
+        // The board only scrolls horizontally. Clamp any stale vertical offset
+        // back to zero so project/filter changes can't hide the column headers.
+        let currentOrigin = nsView.contentView.bounds.origin
+        let maxHorizontalOffset = max(0, coordinator.documentView.frame.width - clipWidth)
+        let clampedOrigin = NSPoint(
+            x: min(max(currentOrigin.x, 0), maxHorizontalOffset),
+            y: 0
+        )
+        if abs(currentOrigin.x - clampedOrigin.x) > 0.5
+            || abs(currentOrigin.y - clampedOrigin.y) > 0.5
+        {
+            nsView.contentView.scroll(to: clampedOrigin)
+            nsView.reflectScrolledClipView(nsView.contentView)
+        }
     }
 
     private func totalContentWidth(for columnCount: Int) -> CGFloat {
@@ -1134,6 +1153,14 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
 
 private final class FlippedContentView: NSView {
     override var isFlipped: Bool { true }
+}
+
+private final class HorizontalOnlyClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var constrained = super.constrainBoundsRect(proposedBounds)
+        constrained.origin.y = 0
+        return constrained
+    }
 }
 
 private final class ComposerNSTextView: NSTextView {
