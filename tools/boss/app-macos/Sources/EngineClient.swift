@@ -130,6 +130,20 @@ final class EngineClient: @unchecked Sendable {
         sendLine(["type": "list_products"])
     }
 
+    func sendSubscribe(topics: [String]) {
+        sendLine([
+            "type": "subscribe",
+            "topics": topics,
+        ])
+    }
+
+    func sendUnsubscribe(topics: [String]) {
+        sendLine([
+            "type": "unsubscribe",
+            "topics": topics,
+        ])
+    }
+
     func sendGetWorkTree(productId: String) {
         sendLine([
             "type": "get_work_tree",
@@ -205,7 +219,11 @@ final class EngineClient: @unchecked Sendable {
         }
 
         do {
-            var data = try JSONSerialization.data(withJSONObject: payload, options: [])
+            let envelope: [String: Any] = [
+                "request_id": UUID().uuidString,
+                "payload": payload,
+            ]
+            var data = try JSONSerialization.data(withJSONObject: envelope, options: [])
             data.append(0x0A)
 
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
@@ -257,7 +275,8 @@ final class EngineClient: @unchecked Sendable {
                 continue
             }
 
-            guard let payload = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
+            guard let envelope = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
+                let payload = envelope["payload"] as? [String: Any],
                 let type = payload["type"] as? String
             else {
                 emit(.error(agentId: nil, message: "received invalid JSON message from engine"))
