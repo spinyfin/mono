@@ -101,6 +101,7 @@ final class ChatViewModel: ObservableObject {
     private var didStartEngine = false
     private var hasConnectedOnce = false
     private var permissionQueue: [PendingPermission] = []
+    private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
     private let maxTerminalOutputChars = 200_000
@@ -182,6 +183,7 @@ final class ChatViewModel: ObservableObject {
         workErrorMessage = nil
         defaults.set(productID, forKey: selectedWorkProductDefaultsKey)
         defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
+        refreshWorkSubscriptions()
         if isConnected {
             engine.sendGetWorkTree(productId: productID)
         }
@@ -429,15 +431,29 @@ final class ChatViewModel: ObservableObject {
             if agents.isEmpty {
                 createAgent()
             }
+            refreshWorkSubscriptions()
             engine.sendListProducts()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
         case .disconnected:
             isConnected = false
+            subscribedWorkTopics.removeAll()
             for i in agents.indices {
                 agents[i].isSending = false
                 agents[i].activeAssistantMessageID = nil
+            }
+        case .workInvalidated(let topic, let productId, _):
+            if topic == "work.products" {
+                engine.sendListProducts()
+            }
+            if let selectedProductID = currentSelectedProductID,
+               topic == workTopic(forProductID: selectedProductID)
+            {
+                engine.sendGetWorkTree(productId: selectedProductID)
+            } else if let productId,
+                      productId == currentSelectedProductID {
+                engine.sendGetWorkTree(productId: productId)
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
@@ -456,6 +472,7 @@ final class ChatViewModel: ObservableObject {
             } else if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
+            refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
         case .workTree(let product, let projects, let tasks, let chores):
@@ -477,6 +494,7 @@ final class ChatViewModel: ObservableObject {
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
             reconcileWorkSelection()
+            refreshWorkSubscriptions()
             workErrorMessage = nil
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -561,6 +579,34 @@ final class ChatViewModel: ObservableObject {
             return project(withID: projectID)
         }
         return nil
+    }
+
+    private func workTopic(forProductID productID: String) -> String {
+        "work.product.\(productID)"
+    }
+
+    private var desiredWorkTopics: Set<String> {
+        var topics: Set<String> = ["work.products"]
+        if let productID = currentSelectedProductID {
+            topics.insert(workTopic(forProductID: productID))
+        }
+        return topics
+    }
+
+    private func refreshWorkSubscriptions() {
+        guard isConnected else { return }
+        let desired = desiredWorkTopics
+        let toSubscribe = desired.subtracting(subscribedWorkTopics)
+        let toUnsubscribe = subscribedWorkTopics.subtracting(desired)
+
+        if !toUnsubscribe.isEmpty {
+            engine.sendUnsubscribe(topics: Array(toUnsubscribe).sorted())
+        }
+        if !toSubscribe.isEmpty {
+            engine.sendSubscribe(topics: Array(toSubscribe).sorted())
+        }
+
+        subscribedWorkTopics = desired
     }
 
     private func startEngineIfNeeded() {
@@ -812,6 +858,7 @@ final class ChatViewModel: ObservableObject {
             defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
             engine.sendGetWorkTree(productId: task.productID)
         }
+        refreshWorkSubscriptions()
     }
 
     private func handleUpdatedWorkItem(_ item: WorkItemPayload) {
@@ -847,6 +894,8 @@ final class ChatViewModel: ObservableObject {
         if let selectedTask, !isTaskVisible(selectedTask) {
             selectedWorkCardID = nil
         }
+
+        refreshWorkSubscriptions()
     }
 }
 
