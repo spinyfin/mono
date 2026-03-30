@@ -172,3 +172,4 @@ approval defaults, and audit logging.
 - [`work-taxonomy`](work-taxonomy.md)
 - [`work-kanban`](work-kanban.md)
 - [`work-cli`](work-cli.md)
+- [`work-subscriptions`](work-subscriptions.md)
