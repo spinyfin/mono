@@ -589,6 +589,7 @@ private struct WorkSidebarFilterRow: View {
                     WorkStatusBadge(text: trailing)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background(
@@ -597,6 +598,8 @@ private struct WorkSidebarFilterRow: View {
             )
         }
         .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
