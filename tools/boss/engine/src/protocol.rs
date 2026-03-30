@@ -21,6 +21,8 @@ pub struct FrontendRequestEnvelope {
 pub struct FrontendEventEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
     pub payload: FrontendEvent,
 }
 
@@ -28,6 +30,7 @@ impl FrontendEventEnvelope {
     pub fn response(request_id: impl Into<String>, payload: FrontendEvent) -> Self {
         Self {
             request_id: Some(request_id.into()),
+            revision: None,
             payload,
         }
     }
@@ -35,6 +38,27 @@ impl FrontendEventEnvelope {
     pub fn push(payload: FrontendEvent) -> Self {
         Self {
             request_id: None,
+            revision: None,
+            payload,
+        }
+    }
+
+    pub fn response_with_revision(
+        request_id: impl Into<String>,
+        revision: u64,
+        payload: FrontendEvent,
+    ) -> Self {
+        Self {
+            request_id: Some(request_id.into()),
+            revision: Some(revision),
+            payload,
+        }
+    }
+
+    pub fn push_with_revision(revision: u64, payload: FrontendEvent) -> Self {
+        Self {
+            request_id: None,
+            revision: Some(revision),
             payload,
         }
     }
