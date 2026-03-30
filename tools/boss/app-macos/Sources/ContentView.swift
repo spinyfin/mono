@@ -196,56 +196,54 @@ struct ContentView: View {
     }
 
     private var workSidebar: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 10) {
-                    workSidebarSectionTitle("Products")
-                    ForEach(model.products) { product in
-                        WorkSidebarFilterRow(
-                            title: product.name,
-                            subtitle: product.repoRemoteURL,
-                            systemImage: "shippingbox",
-                            isSelected: model.selectedProduct?.id == product.id,
-                            trailing: product.status.capitalized
-                        ) {
-                            model.selectWorkProduct(product.id)
+        List(selection: workSidebarSelection) {
+            if !model.products.isEmpty {
+                Section {
+                    Picker("Product", selection: workProductSelection) {
+                        ForEach(model.products) { product in
+                            Text(product.name).tag(Optional(product.id))
                         }
                     }
-                }
-
-                if model.selectedProduct != nil {
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        workSidebarSectionTitle("Projects")
-                        WorkSidebarFilterRow(
-                            title: "All Projects",
-                            subtitle: "Show the full product board",
-                            systemImage: "square.stack.3d.up",
-                            isSelected: model.selectedProject == nil,
-                            trailing: nil
-                        ) {
-                            model.selectWorkProjectFilter(nil)
-                        }
-
-                        ForEach(model.projectsForSelectedProduct) { project in
-                            WorkSidebarFilterRow(
-                                title: project.name,
-                                subtitle: project.goal.isEmpty ? project.priority.capitalized : project.goal,
-                                systemImage: "folder",
-                                isSelected: model.selectedProject?.id == project.id,
-                                trailing: project.status.capitalized
-                            ) {
-                                model.selectWorkProjectFilter(project.id)
-                            }
-                        }
-                    }
-
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                } header: {
+                    workSidebarSectionTitle("Product")
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            if let selectedProduct = model.selectedProduct {
+                Section {
+                    WorkSidebarFilterRow(
+                        title: "All Projects",
+                        subtitle: "Show the full product board",
+                        systemImage: "square.stack.3d.up",
+                        isSelected: model.selectedProject == nil,
+                        trailing: nil
+                    )
+                    .tag(WorkNodeID.product(selectedProduct.id))
+                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                    .listRowBackground(Color.clear)
+
+                    ForEach(model.projectsForSelectedProduct) { project in
+                        WorkSidebarFilterRow(
+                            title: project.name,
+                            subtitle: project.goal.isEmpty ? project.priority.capitalized : project.goal,
+                            systemImage: "folder",
+                            isSelected: model.selectedProject?.id == project.id,
+                            trailing: project.status.capitalized
+                        )
+                        .tag(WorkNodeID.project(project.id))
+                        .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                        .listRowBackground(Color.clear)
+                    }
+                } header: {
+                    workSidebarSectionTitle("Projects")
+                }
+            }
         }
-        .padding(12)
+        .listStyle(.sidebar)
         .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter board")
         .safeAreaInset(edge: .bottom) {
             HStack {
@@ -265,6 +263,29 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
+    }
+
+    private var workProductSelection: Binding<String?> {
+        Binding(
+            get: {
+                model.selectedProduct?.id ?? model.products.first?.id
+            },
+            set: { newValue in
+                guard let productID = newValue else { return }
+                model.selectWorkProduct(productID)
+            }
+        )
+    }
+
+    private var workSidebarSelection: Binding<WorkNodeID?> {
+        Binding(
+            get: {
+                model.selectedWorkSidebarNodeID
+            },
+            set: { newValue in
+                model.selectWorkSidebarNode(newValue)
+            }
+        )
     }
 
     private var agentDetail: some View {
@@ -543,39 +564,31 @@ private struct WorkSidebarFilterRow: View {
     let systemImage: String
     let isSelected: Bool
     let trailing: String?
-    let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: systemImage)
-                    .foregroundStyle(isSelected ? .primary : .secondary)
-                    .frame(width: 16)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.body.weight(isSelected ? .semibold : .regular))
-                        .foregroundStyle(.primary)
-                    if let subtitle, !subtitle.isEmpty {
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-                Spacer(minLength: 8)
-                if let trailing {
-                    WorkStatusBadge(text: trailing)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: systemImage)
+                .foregroundStyle(isSelected ? .primary : .secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.body.weight(isSelected ? .semibold : .regular))
+                    .foregroundStyle(.primary)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
-            )
+            Spacer(minLength: 8)
+            if let trailing {
+                WorkStatusBadge(text: trailing, emphasized: isSelected)
+            }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -920,15 +933,30 @@ private struct WorkEditSheet: View {
 
 private struct WorkStatusBadge: View {
     let text: String
+    var emphasized: Bool = false
 
     var body: some View {
         Text(text)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(foregroundColor)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(Color(nsColor: .controlBackgroundColor))
+            .background(backgroundColor)
             .clipShape(Capsule())
+    }
+
+    private var foregroundColor: Color {
+        if emphasized {
+            return .accentColor
+        }
+        return Color(nsColor: .secondaryLabelColor)
+    }
+
+    private var backgroundColor: Color {
+        if emphasized {
+            return Color.white.opacity(0.96)
+        }
+        return Color(nsColor: .controlBackgroundColor)
     }
 }
 

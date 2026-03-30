@@ -176,7 +176,11 @@ final class ChatViewModel: ObservableObject {
     }
 
     func selectWorkProduct(_ productID: String) {
-        guard selectedWorkProductID != productID else { return }
+        let isAlreadyShowingProductBoard =
+            selectedWorkProductID == productID
+            && selectedWorkProjectFilterID == nil
+            && selectedWorkCardID == nil
+        guard !isAlreadyShowingProductBoard else { return }
         selectedWorkProductID = productID
         selectedWorkProjectFilterID = nil
         selectedWorkCardID = nil
@@ -190,15 +194,39 @@ final class ChatViewModel: ObservableObject {
     }
 
     func selectWorkProjectFilter(_ projectID: String?) {
+        let isAlreadyShowingProject =
+            selectedWorkProjectFilterID == projectID
+            && selectedWorkCardID == nil
+        guard !isAlreadyShowingProject else { return }
         selectedWorkProjectFilterID = projectID
+        selectedWorkCardID = nil
         if let projectID {
             defaults.set(projectID, forKey: selectedWorkProjectFilterDefaultsKey)
         } else {
             defaults.removeObject(forKey: selectedWorkProjectFilterDefaultsKey)
         }
-        if let selectedTask, !isTaskVisible(selectedTask) {
-            selectedWorkCardID = nil
+    }
+
+    func selectWorkSidebarNode(_ nodeID: WorkNodeID?) {
+        guard let nodeID else { return }
+        switch nodeID {
+        case .product(let productID):
+            selectWorkProduct(productID)
+        case .project(let projectID):
+            selectWorkProjectFilter(projectID)
+        case .task(let taskID), .chore(let taskID):
+            selectWorkCard(taskID)
         }
+    }
+
+    var selectedWorkSidebarNodeID: WorkNodeID? {
+        if let projectID = selectedWorkProjectFilterID {
+            return .project(projectID)
+        }
+        if let productID = selectedWorkProductID {
+            return .product(productID)
+        }
+        return nil
     }
 
     func selectWorkCard(_ taskID: String?) {
