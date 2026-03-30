@@ -4,6 +4,7 @@ import Network
 enum EngineEvent {
     case connected
     case disconnected
+    case workInvalidated(topic: String, productId: String?, itemIds: [String])
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
     case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask])
@@ -286,6 +287,18 @@ final class EngineClient: @unchecked Sendable {
             let agentId = payload["agent_id"] as? String
 
             switch type {
+            case "topic_event":
+                let topic = payload["topic"] as? String ?? ""
+                guard let eventPayload = payload["event"] as? [String: Any],
+                      let eventType = eventPayload["type"] as? String
+                else {
+                    break
+                }
+                if eventType == "work_invalidated" {
+                    let productId = eventPayload["product_id"] as? String
+                    let itemIds = eventPayload["item_ids"] as? [String] ?? []
+                    emit(.workInvalidated(topic: topic, productId: productId, itemIds: itemIds))
+                }
             case "products_list":
                 let products = (payload["products"] as? [[String: Any]] ?? []).compactMap(parseProduct)
                 emit(.productsList(products: products))
