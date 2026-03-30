@@ -99,23 +99,28 @@ impl AcpClient {
     }
 
     async fn connect_internal(cfg: &RuntimeConfig, interactive_permissions: bool) -> Result<Self> {
-        let mut command = Command::new(&cfg.acp_command);
+        cfg.preflight_acp()?;
+
+        let mut command = Command::new(&cfg.acp.command);
         let path = preferred_child_path();
         command
-            .args(&cfg.acp_args)
+            .args(&cfg.acp.args)
             .current_dir(&cfg.cwd)
             .env("PATH", path)
-            .env("ANTHROPIC_API_KEY", &cfg.anthropic_api_key)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        if let Some(api_key) = &cfg.acp.anthropic_api_key {
+            command.env("ANTHROPIC_API_KEY", api_key);
+        }
+
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to spawn ACP adapter command: {} {}",
-                cfg.acp_command,
-                cfg.acp_args.join(" ")
+                cfg.acp.command,
+                cfg.acp.args.join(" ")
             )
         })?;
 

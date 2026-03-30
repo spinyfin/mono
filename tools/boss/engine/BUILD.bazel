@@ -10,10 +10,15 @@ rust_library(
         "src/cli.rs",
         "src/config.rs",
         "src/lib.rs",
+        "src/protocol.rs",
         "src/work.rs",
     ],
     crate_root = "src/lib.rs",
     edition = "2024",
+    visibility = [
+        "//tools/boss/cli:__pkg__",
+        "//tools/boss/engine:__pkg__",
+    ],
     deps = all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
