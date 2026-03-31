@@ -1,0 +1,16 @@
+version = 1
+
+[tools.boss]
+target = "//tools/boss/cli:boss"
+
+[tools.checkleft]
+target = "//tools/checkleft:checkleft"
+
+[tools.checks]
+target = "//tools/checkleft:checkleft"
+
+[tools.cube]
+target = "//tools/cube:cube"
+
+[tools.hood]
+target = "//tools/hood:hood"
