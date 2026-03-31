@@ -1,30 +1,30 @@
-# Runshim: Repo-Local Bazel Command Shims
+# Repobin: Repo-Local Bazel Command Shims
 
 ## Overview
 
-Runshim is a small launcher that makes Bazel-built repo tools feel like normal
+Repobin is a small launcher that makes Bazel-built repo tools feel like normal
 commands on the user's `PATH`.
 
 The intended workflow is:
 
 1. a repo declares command names and Bazel executable labels in a root config
    file,
-2. the user installs one global `runshim` binary plus symlinks for those
+2. the user installs one global `repobin` binary plus symlinks for those
    command names into a directory such as `~/bin`,
 3. invoking one of those symlinked commands from inside the repo causes
-   Runshim to find the current repo, `bazel build` the configured target, and
+   Repobin to find the current repo, `bazel build` the configured target, and
    `exec` the built binary with the original args.
 
 This is similar in spirit to `dotslash` because a checked-in file defines a
-portable command entry point. The important difference is that Runshim does not
+portable command entry point. The important difference is that Repobin does not
 download or verify prebuilt artifacts. It delegates execution to the local
 repo's Bazel graph and toolchains.
 
 Example:
 
 ```text
-~/bin/boss -> ~/bin/runshim
-~/bin/cube -> ~/bin/runshim
+~/bin/boss -> ~/bin/repobin
+~/bin/cube -> ~/bin/repobin
 ```
 
 With this repo config:
@@ -41,11 +41,11 @@ target = "//tools/cube:cube"
 
 Running `boss task list` from `/path/to/repo/subdir` should:
 
-1. locate `/path/to/repo/RUNSHIM.toml`,
+1. locate `/path/to/repo/REPOBIN.toml`,
 2. resolve `boss -> //tools/boss/cli:boss`,
 3. run `bazel build //tools/boss/cli:boss` from the repo root,
 4. resolve the built executable path from Bazel metadata,
-5. replace the Runshim process with that built binary,
+5. replace the Repobin process with that built binary,
 6. preserve the original `cwd` (`/path/to/repo/subdir`) and args.
 
 ## Goals
@@ -73,7 +73,7 @@ Running `boss task list` from `/path/to/repo/subdir` should:
 - Adding a large wrapper language around Bazel. Bazel remains the source of
   truth for how the tool is built.
 - Inventing repo-global package management or cross-repo version negotiation
-  for the `runshim` binary itself.
+  for the `repobin` binary itself.
 
 ## Why This Exists
 
@@ -83,7 +83,7 @@ Today repo-local tools often fall into one of three awkward shapes:
 - long Bazel commands such as `bazel run //tools/boss/cli:boss -- ...`,
 - globally installed binaries that can drift away from the repo's version.
 
-Runshim aims for a narrower model:
+Repobin aims for a narrower model:
 
 - the repo owns the mapping from command name to Bazel target,
 - the user gets a short command on their `PATH`,
@@ -103,9 +103,9 @@ provides a `boss` entry in its own config.
 
 ### Bazel Owns Executable Resolution
 
-Runshim should not guess the executable path by string manipulation on the
+Repobin should not guess the executable path by string manipulation on the
 label. Configuration transitions, launcher scripts, and rule-specific output
-shapes make that brittle. Instead, Runshim should ask Bazel for the target's
+shapes make that brittle. Instead, Repobin should ask Bazel for the target's
 executable through `FilesToRunProvider`.
 
 ### Preserve The User's Shell Semantics
@@ -122,31 +122,31 @@ work to do, users should see the tool's output, not Bazel chatter.
 
 ## User Model
 
-Runshim has two modes:
+Repobin has two modes:
 
-1. `runshim` command mode for installation and diagnostics.
+1. `repobin` command mode for installation and diagnostics.
 2. tool mode when invoked through a symlink such as `boss` or `cube`.
 
 Recommended commands:
 
 ```bash
-bazel run //tools/runshim -- install
-runshim install
-runshim doctor
-runshim list
+bazel run //tools/repobin:repobin -- install
+repobin install
+repobin doctor
+repobin list
 ```
 
 Recommended tool-mode usage:
 
 ```bash
 boss task list
-cube workspace lease mono --task "write runshim design doc"
+cube workspace lease mono --task "write repobin design doc"
 ```
 
-For debugging or scripts, Runshim may also support:
+For debugging or scripts, Repobin may also support:
 
 ```bash
-runshim exec boss -- task list
+repobin exec boss -- task list
 ```
 
 The symlinked path remains the main UX. The explicit `exec` form is useful for
@@ -159,7 +159,7 @@ testing without creating or repairing symlinks.
 The v1 design should standardize on a single repo-root file:
 
 ```text
-RUNSHIM.toml
+REPOBIN.toml
 ```
 
 TOML is the better initial choice than YAML because:
@@ -216,42 +216,42 @@ That keeps install behavior predictable and avoids surprising link targets.
 The bootstrap command should be:
 
 ```bash
-bazel run //tools/runshim -- install
+bazel run //tools/repobin:repobin -- install
 ```
 
-That works even before `runshim` is globally installed.
+That works even before `repobin` is globally installed.
 
 Once installed, the user can rerun:
 
 ```bash
-runshim install
-runshim install --bin-dir ~/.local/bin
+repobin install
+repobin install --bin-dir ~/.local/bin
 ```
 
-from any repo that contains `RUNSHIM.toml`.
+from any repo that contains `REPOBIN.toml`.
 
 ### Install Behavior
 
-`runshim install` should:
+`repobin install` should:
 
 1. locate the repo root from the current working directory,
-2. parse `RUNSHIM.toml`,
+2. parse `REPOBIN.toml`,
 3. determine the target bin directory from `--bin-dir` or default `~/bin`,
-4. install or refresh the global `runshim` binary in that directory,
+4. install or refresh the global `repobin` binary in that directory,
 5. create symlinks for every configured tool name pointing at that binary.
 
 Example result:
 
 ```text
-~/bin/runshim
-~/bin/boss -> runshim
-~/bin/cube -> runshim
+~/bin/repobin
+~/bin/boss -> repobin
+~/bin/cube -> repobin
 ```
 
 The install should be idempotent:
 
-- if `<bin-dir>/boss` already points at `runshim`, leave it alone,
-- if the global `runshim` binary already matches the installed path, replace it
+- if `<bin-dir>/boss` already points at `repobin`, leave it alone,
+- if the global `repobin` binary already matches the installed path, replace it
   atomically only when needed,
 - rerunning install after adding new tools only adds the missing symlinks.
 
@@ -267,10 +267,10 @@ intended user model. The installer should:
 - print a copy-pasteable shell-config fragment that adds that directory to
   `PATH`.
 
-V1 does not need persistent user-local Runshim config. If we later add one, it
-should live outside the repo, for example under `~/.config/runshim/`.
+V1 does not need persistent user-local Repobin config. If we later add one, it
+should live outside the repo, for example under `~/.config/repobin/`.
 
-When warning about a missing `PATH` entry, Runshim should tailor the suggested
+When warning about a missing `PATH` entry, Repobin should tailor the suggested
 fragment to the user's shell when it can:
 
 - for `zsh` and `bash`, print `export PATH="/path/to/bin:$PATH"`,
@@ -284,7 +284,7 @@ shell config next.
 ### Removal And Pruning
 
 V1 should not try to implement a full repo-aware uninstall story. Because the
-same generic `~/bin/boss -> runshim` symlink can serve many repos, aggressive
+same generic `~/bin/boss -> repobin` symlink can serve many repos, aggressive
 pruning would be more surprising than helpful.
 
 The simplest v1 behavior is:
@@ -298,7 +298,7 @@ The simplest v1 behavior is:
 
 ### 1. Determine Invocation Mode
 
-If `argv[0]` basename is `runshim`, parse subcommands.
+If `argv[0]` basename is `repobin`, parse subcommands.
 
 Otherwise:
 
@@ -308,7 +308,7 @@ Otherwise:
 ### 2. Discover Repo Root
 
 Walk upward from the caller's current working directory looking for
-`RUNSHIM.toml`. The first match wins.
+`REPOBIN.toml`. The first match wins.
 
 This gives the right behavior for:
 
@@ -319,7 +319,7 @@ This gives the right behavior for:
 If no config is found, exit with a clear error such as:
 
 ```text
-runshim: no RUNSHIM.toml found from /current/path upward
+repobin: no REPOBIN.toml found from /current/path upward
 ```
 
 ### 3. Resolve Tool Entry
@@ -329,7 +329,7 @@ Parse the config and look up the tool-name key under `[tools]`.
 If the symlinked name is not configured in the current repo, fail clearly:
 
 ```text
-runshim: tool "boss" is not configured in /path/to/repo/RUNSHIM.toml
+repobin: tool "boss" is not configured in /path/to/repo/REPOBIN.toml
 ```
 
 ### 4. Build The Target
@@ -342,13 +342,13 @@ bazel build <target>
 
 from the discovered repo root.
 
-Runshim should use the user's normal Bazel entry point from `PATH`, typically
+Repobin should use the user's normal Bazel entry point from `PATH`, typically
 `bazel` or a `bazel` symlink to Bazelisk. It should not bypass the repo's
 normal `.bazelrc`, module resolution, or toolchain setup.
 
 ### 5. Resolve The Built Executable
 
-After a successful build, Runshim should ask Bazel for the executable file via
+After a successful build, Repobin should ask Bazel for the executable file via
 the target's `FilesToRunProvider.executable` rather than constructing a
 `bazel-bin/...` path manually.
 
@@ -364,7 +364,7 @@ is not runnable.
 
 ### 6. `exec` The Built Binary
 
-Runshim should `exec` the resolved path with:
+Repobin should `exec` the resolved path with:
 
 - the original argument vector,
 - the original process environment,
@@ -396,7 +396,7 @@ still making failures and slow builds understandable.
 Suggested behavior:
 
 - before 3 seconds: fully silent,
-- after 3 seconds: print `runshim: building //tools/boss/cli:boss...`,
+- after 3 seconds: print `repobin: building //tools/boss/cli:boss...`,
 - after 10 seconds: attach live Bazel output to stderr until the build
   completes.
 
@@ -405,7 +405,7 @@ them immediately.
 
 ### Quiet Build Flags
 
-When Runshim drives `bazel build`, it should pass quiet UI flags so that any
+When Repobin drives `bazel build`, it should pass quiet UI flags so that any
 attached output is still readable:
 
 ```text
@@ -423,10 +423,10 @@ fast path free of transient progress noise.
 For debugging, support an escape hatch such as:
 
 ```bash
-RUNSHIM_VERBOSE=1 boss task list
+REPOBIN_VERBOSE=1 boss task list
 ```
 
-In verbose mode, Runshim should stream Bazel output immediately and skip the
+In verbose mode, Repobin should stream Bazel output immediately and skip the
 suppression logic.
 
 ## Executable Resolution Details
@@ -436,7 +436,7 @@ The design should explicitly distinguish "build target" from "path to launch".
 Why not infer `bazel-bin` paths directly:
 
 - the target may produce a launcher script rather than the underlying binary,
-- output directories encode configuration details that Runshim should not have
+- output directories encode configuration details that Repobin should not have
   to understand,
 - some executable rules require runfiles metadata that is easiest to honor by
   using Bazel's own executable metadata.
@@ -445,14 +445,14 @@ Using `FilesToRunProvider.executable` keeps the interface clean:
 
 - config stores a normal Bazel label,
 - Bazel answers whether it is runnable,
-- Runshim launches exactly the path Bazel intends end users to execute.
+- Repobin launches exactly the path Bazel intends end users to execute.
 
 ## Diagnostics
 
 The v1 binary should make the common failures obvious:
 
 - repo config not found from the current directory,
-- malformed `RUNSHIM.toml`,
+- malformed `REPOBIN.toml`,
 - tool name not present in config,
 - invalid Bazel label syntax,
 - `bazel build` failure,
@@ -460,7 +460,7 @@ The v1 binary should make the common failures obvious:
 - resolved executable path missing after build,
 - install bin directory not writable.
 
-`runshim doctor` should validate the current repo and print:
+`repobin doctor` should validate the current repo and print:
 
 - discovered repo root,
 - discovered config path,
@@ -471,7 +471,7 @@ The v1 binary should make the common failures obvious:
 
 ## Trust And Security Model
 
-Runshim's trust boundary is the current repo plus the local Bazel toolchain.
+Repobin's trust boundary is the current repo plus the local Bazel toolchain.
 
 That means:
 
@@ -488,11 +488,11 @@ tools, not artifact distribution across untrusted environments.
 
 The smallest viable implementation is:
 
-1. Rust binary at `//tools/runshim:runshim`.
+1. Rust binary at `//tools/repobin:repobin`.
 2. `clap`-based CLI with `install`, `doctor`, `list`, and optional `exec`
    subcommands.
 3. TOML config parsing with a small typed schema.
-4. upward repo-root discovery based on `RUNSHIM.toml`.
+4. upward repo-root discovery based on `REPOBIN.toml`.
 5. Bazel command runner with buffered output and slow-build escalation.
 6. executable resolution through Bazel query metadata.
 7. Unix `exec` handoff to the built binary.
@@ -508,5 +508,5 @@ Useful follow-ups after the core design works:
 - explicit aliases for one target under multiple command names,
 - repo-local default env vars,
 - install metadata plus safe pruning,
-- shell completion for `runshim` subcommands,
+- shell completion for `repobin` subcommands,
 - optional YAML support if TOML becomes a real constraint.
