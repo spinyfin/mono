@@ -199,15 +199,27 @@ struct ContentView: View {
         List(selection: workSidebarSelection) {
             if !model.products.isEmpty {
                 Section {
-                    Picker("Product", selection: workProductSelection) {
-                        ForEach(model.products) { product in
-                            Text(product.name).tag(Optional(product.id))
+                    ZStack(alignment: .trailing) {
+                        SidebarProductPicker(
+                            selection: workProductSelection,
+                            products: model.products
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.trailing, 28)
+
+                        Button {
+                            model.presentEditSelectedProduct()
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                                .frame(width: 16, height: 16)
                         }
+                        .buttonStyle(.borderless)
+                        .padding(.trailing, -2)
+                        .help("Edit Product")
+                        .disabled(model.selectedProduct == nil || !model.isConnected)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                    .listRowInsets(EdgeInsets(top: 3, leading: -8, bottom: 3, trailing: 0))
                 } header: {
                     workSidebarSectionTitle("Product")
                 }
@@ -591,6 +603,60 @@ private struct WorkSidebarFilterRow: View {
         .padding(.vertical, 8)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct SidebarProductPicker: NSViewRepresentable {
+    @Binding var selection: String?
+    let products: [WorkProduct]
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(selection: $selection)
+    }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.bezelStyle = .rounded
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.selectionDidChange(_:))
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return button
+    }
+
+    func updateNSView(_ nsView: NSPopUpButton, context: Context) {
+        context.coordinator.selection = $selection
+        context.coordinator.productIDs = products.map(\.id)
+
+        nsView.removeAllItems()
+        nsView.addItems(withTitles: products.map(\.name))
+
+        for (index, productID) in context.coordinator.productIDs.enumerated() {
+            nsView.item(at: index)?.representedObject = productID
+        }
+
+        let selectedID = selection ?? context.coordinator.productIDs.first
+        if let selectedID,
+           let index = context.coordinator.productIDs.firstIndex(of: selectedID) {
+            nsView.selectItem(at: index)
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var selection: Binding<String?>
+        var productIDs: [String] = []
+
+        init(selection: Binding<String?>) {
+            self.selection = selection
+        }
+
+        @objc func selectionDidChange(_ sender: NSPopUpButton) {
+            let index = sender.indexOfSelectedItem
+            guard productIDs.indices.contains(index) else { return }
+            let selectedID = productIDs[index]
+            if selection.wrappedValue != selectedID {
+                selection.wrappedValue = selectedID
+            }
+        }
     }
 }
 
