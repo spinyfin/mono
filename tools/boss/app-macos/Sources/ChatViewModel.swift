@@ -670,7 +670,14 @@ final class ChatViewModel: ObservableObject {
             completeTerminalActivity(agentId: agentId, id: id, exitCode: exitCode, signal: signal)
         case .permissionRequest(let agentId, let id, let title):
             guard !isBossBootstrapping(agentId: agentId) else {
-                completeBossBootstrap(agentId: agentId, error: "Boss bootstrap unexpectedly requested permission.")
+                if isExpectedBossBootstrapPermission(title: title) {
+                    engine.sendPermissionResponse(agentId: agentId, id: id, granted: true)
+                } else {
+                    completeBossBootstrap(
+                        agentId: agentId,
+                        error: "Boss bootstrap unexpectedly requested permission."
+                    )
+                }
                 return
             }
             enqueuePermission(agentId: agentId, id: id, title: title)
@@ -820,6 +827,10 @@ final class ChatViewModel: ObservableObject {
 
     private func isBossBootstrapping(agentId: String) -> Bool {
         bootstrappingBossAgentIDs.contains(agentId)
+    }
+
+    private func isExpectedBossBootstrapPermission(title: String) -> Bool {
+        title.localizedCaseInsensitiveContains("boss reference")
     }
 
     private func bossPromptText(for userText: String) -> String {
