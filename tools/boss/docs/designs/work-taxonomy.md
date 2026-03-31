@@ -69,6 +69,8 @@ Notes:
 - The product model should not assume a single long-lived local checkout path.
   Multiple agents may work in separate local workspaces for the same product,
   and local path coordination belongs in a separate execution/workspace layer.
+  That execution layer is defined separately in
+  [`work-execution`](work-execution.md).
 - We should still leave space for future multi-repo support. A simple
   follow-up field like `related_repo_remote_urls_json` is enough for now; we do
   not need to optimize the first UI or API around it.

@@ -170,6 +170,7 @@ approval defaults, and audit logging.
 ## Related Designs
 
 - [`work-taxonomy`](work-taxonomy.md)
+- [`work-execution`](work-execution.md)
 - [`work-kanban`](work-kanban.md)
 - [`work-cli`](work-cli.md)
 - [`work-subscriptions`](work-subscriptions.md)
