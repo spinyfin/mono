@@ -217,6 +217,8 @@ fn ensure_repo(
     defaults: &RepoEnsureDefaults,
 ) -> Result<RepoRecord> {
     if let Some(record) = store.get_repo_by_origin(origin)? {
+        fs::create_dir_all(&record.workspace_root)?;
+        materialize_repo_source_if_missing(runner, &record)?;
         return Ok(record);
     }
 
@@ -368,6 +370,11 @@ fn run_workspace(
                 return Err(CubeError::NoAvailableWorkspace(repo));
             };
 
+            if !workspace_path_exists(&workspace) {
+                store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
+                return Err(CubeError::NoAvailableWorkspace(repo));
+            }
+
             if let Err(error) =
                 reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)
             {
@@ -394,6 +401,10 @@ fn run_workspace(
             let workspace = store
                 .get_workspace_by_lease(&lease)?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            if !workspace_path_exists(&workspace) {
+                store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
+                return Err(CubeError::LeaseNotFound(lease));
+            }
             let repo_record = store
                 .get_repo(&workspace.repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
@@ -473,6 +484,9 @@ fn run_doctor(_args: DoctorArgs) -> Result<RunResult> {
 
 fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::WorkspaceCandidate>> {
     let mut candidates = Vec::new();
+    if !repo.workspace_root.is_dir() {
+        return Ok(candidates);
+    }
     for entry in fs::read_dir(&repo.workspace_root)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -501,7 +515,10 @@ fn find_workspace_record(
     workspace_path: &Path,
 ) -> Result<Option<crate::metadata::WorkspaceRecord>> {
     if let Some(record) = store.get_workspace_by_path(workspace_path)? {
-        return Ok(Some(record));
+        if workspace_path_exists(&record) {
+            return Ok(Some(record));
+        }
+        store.forget_workspace(&record.repo, &record.workspace_id)?;
     }
 
     for repo in store.list_repos()? {
@@ -511,7 +528,14 @@ fn find_workspace_record(
         }
     }
 
-    store.get_workspace_by_path(workspace_path)
+    if let Some(record) = store.get_workspace_by_path(workspace_path)? {
+        if workspace_path_exists(&record) {
+            return Ok(Some(record));
+        }
+        store.forget_workspace(&record.repo, &record.workspace_id)?;
+    }
+
+    Ok(None)
 }
 
 fn reset_workspace(
@@ -544,6 +568,10 @@ fn current_workspace_commit(runner: &dyn CommandRunner, workspace_path: &Path) -
             "commit_id.short()".to_string(),
         ],
     })
+}
+
+fn workspace_path_exists(record: &crate::metadata::WorkspaceRecord) -> bool {
+    record.workspace_path.is_dir()
 }
 
 fn human_workspace_detail(record: &crate::metadata::WorkspaceRecord, jj_status: &str) -> String {
@@ -718,6 +746,7 @@ mod tests {
     fn repo_ensure_reuses_existing_repo_by_origin() {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("mono")).expect("source dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -760,6 +789,58 @@ mod tests {
             result.payload["repo"]["source"],
             defaults.repo_root.join("mono").display().to_string()
         );
+    }
+
+    #[test]
+    fn repo_ensure_materializes_missing_source_for_existing_repo() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+            "--source",
+            &source_path.display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            defaults.repo_root.clone(),
+            "jj",
+            &[
+                "git",
+                "clone",
+                "git@github.com:spinyfin/mono.git",
+                &source_path.display().to_string(),
+            ],
+            "",
+        )]);
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults))
+            .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(
+            result.payload["repo"]["source"],
+            source_path.display().to_string()
+        );
+        runner.assert_exhausted();
     }
 
     #[test]
@@ -998,6 +1079,63 @@ mod tests {
         );
         assert!(status_result.message.contains("jj_status:"));
         status_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_status_forgets_missing_workspace_rows() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "implement cube",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        lease_runner.assert_exhausted();
+
+        std::fs::remove_dir_all(&workspace_path).expect("remove workspace dir");
+
+        let status = Cli::parse_from([
+            "cube",
+            "workspace",
+            "status",
+            "--workspace",
+            &workspace_path.display().to_string(),
+        ]);
+        let error = run_with_dependencies(status, Some(&database_path), &FakeRunner::default())
+            .expect_err("status should forget missing workspace");
+
+        assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
     }
 
     #[derive(Default)]

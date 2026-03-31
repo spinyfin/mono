@@ -170,6 +170,10 @@ impl Store {
         candidates: &[WorkspaceCandidate],
     ) -> Result<(), CubeError> {
         let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
+        let candidate_ids = candidates
+            .iter()
+            .map(|candidate| candidate.workspace_id.as_str())
+            .collect::<Vec<_>>();
         for candidate in candidates {
             transaction
                 .execute(
@@ -189,6 +193,42 @@ impl Store {
                         candidate.workspace_path.display().to_string(),
                         WorkspaceState::Free.as_str(),
                     ],
+                )
+                .map_err(CubeError::Storage)?;
+        }
+
+        let mut statement = transaction
+            .prepare(
+                r#"
+                SELECT workspace_id
+                FROM workspaces
+                WHERE repo = ?1 AND state = ?2
+                "#,
+            )
+            .map_err(CubeError::Storage)?;
+        let existing = statement
+            .query_map(params![repo, WorkspaceState::Free.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(CubeError::Storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CubeError::Storage)?;
+        drop(statement);
+
+        for workspace_id in existing {
+            if candidate_ids
+                .iter()
+                .any(|candidate_id| *candidate_id == workspace_id)
+            {
+                continue;
+            }
+            transaction
+                .execute(
+                    r#"
+                    DELETE FROM workspaces
+                    WHERE repo = ?1 AND workspace_id = ?2 AND state = ?3
+                    "#,
+                    params![repo, workspace_id, WorkspaceState::Free.as_str()],
                 )
                 .map_err(CubeError::Storage)?;
         }
@@ -348,6 +388,19 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
+    pub fn forget_workspace(&self, repo: &str, workspace_id: &str) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                r#"
+                DELETE FROM workspaces
+                WHERE repo = ?1 AND workspace_id = ?2
+                "#,
+                params![repo, workspace_id],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
     pub fn release_workspace(&self, lease_id: &str) -> Result<Option<WorkspaceRecord>, CubeError> {
         let before = self.get_workspace_by_lease(lease_id)?;
         let Some(record) = before else {
@@ -464,7 +517,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
 mod tests {
     use tempfile::TempDir;
 
-    use crate::metadata::RepoRecord;
+    use crate::metadata::{RepoRecord, WorkspaceCandidate};
 
     use super::Store;
 
@@ -489,5 +542,50 @@ mod tests {
 
         let workspaces = store.list_workspaces("mono").expect("workspaces");
         assert!(workspaces.is_empty());
+    }
+
+    #[test]
+    fn sync_workspaces_prunes_deleted_free_rows() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        let config = RepoRecord {
+            repo: "mono".to_string(),
+            origin: "git@github.com:spinyfin/mono.git".to_string(),
+            main_branch: "main".to_string(),
+            workspace_root: workspace_root.clone(),
+            workspace_prefix: "mono-agent-".to_string(),
+            source: None,
+        };
+        store.upsert_repo(&config).expect("repo");
+
+        store
+            .sync_workspaces(
+                "mono",
+                &[
+                    WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_root.join("mono-agent-001"),
+                    },
+                    WorkspaceCandidate {
+                        workspace_id: "mono-agent-002".to_string(),
+                        workspace_path: workspace_root.join("mono-agent-002"),
+                    },
+                ],
+            )
+            .expect("initial sync");
+
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-002".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-002"),
+                }],
+            )
+            .expect("prune sync");
+
+        let workspaces = store.list_workspaces("mono").expect("workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_id, "mono-agent-002");
     }
 }
