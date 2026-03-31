@@ -178,9 +178,6 @@ little benefit.
 ```toml
 version = 1
 
-[install]
-link_dir = "~/bin"
-
 [tools.boss]
 target = "//tools/boss/cli:boss"
 
@@ -191,12 +188,16 @@ target = "//tools/cube:cube"
 Field rules:
 
 - `version` is required for forward compatibility.
-- `[install].link_dir` is optional. If absent, Runshim uses `~/bin`.
 - each key under `[tools]` is the installed command name.
 - each tool entry must provide exactly one executable Bazel `target`.
 
 V1 intentionally omits per-tool default args, environment overrides, and custom
 bazel flags. Those can be added later without changing the core model.
+
+The checked-in repo config must not contain user-machine install preferences
+such as the destination link directory. Those values vary by user and host and
+therefore belong in CLI flags, environment variables, or later user-local
+config outside the repo.
 
 ### Naming Rules
 
@@ -235,7 +236,7 @@ from any repo that contains `RUNSHIM.toml`.
 
 1. locate the repo root from the current working directory,
 2. parse `RUNSHIM.toml`,
-3. ensure the target link directory exists,
+3. determine the target link directory from installer-local inputs,
 4. install or refresh the global `runshim` binary in that directory,
 5. create symlinks for every configured tool name pointing at that binary.
 
@@ -259,9 +260,13 @@ The install should be idempotent:
 `~/bin` is the default because it is short, conventional, and matches the
 intended user model. The installer should:
 
+- treat the install destination as user-local state, not repo config,
 - create it if it does not exist,
 - warn if it is not on `PATH`,
-- allow `--link-dir` to override the default.
+- accept it from `--link-dir`, then `RUNSHIM_LINK_DIR`, then default `~/bin`.
+
+V1 does not need persistent user-local Runshim config. If we later add one, it
+should live outside the repo, for example under `~/.config/runshim/`.
 
 ### Removal And Pruning
 
@@ -448,7 +453,7 @@ The v1 binary should make the common failures obvious:
 - discovered config path,
 - configured tools,
 - whether each target appears executable,
-- installed link directory,
+- effective install link directory,
 - whether that directory is currently on `PATH`.
 
 ## Trust And Security Model
