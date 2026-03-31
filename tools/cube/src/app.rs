@@ -14,6 +14,7 @@ use crate::cli::{
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::metadata::RepoRecord;
+use crate::paths;
 use crate::store::Store;
 
 type Result<T> = std::result::Result<T, CubeError>;
@@ -22,6 +23,12 @@ type Result<T> = std::result::Result<T, CubeError>;
 pub struct RunResult {
     pub message: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct RepoEnsureDefaults {
+    repo_root: PathBuf,
+    workspace_root: PathBuf,
 }
 
 impl RunResult {
@@ -35,6 +42,8 @@ impl RunResult {
 
 #[derive(Debug, Error)]
 pub enum CubeError {
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error("{0}")]
     NotImplemented(String),
     #[error("repo `{0}` is not configured")]
@@ -74,7 +83,7 @@ pub enum CubeError {
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::NotImplemented(_) => ExitCode::from(2),
+            Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
             Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) => ExitCode::from(5),
@@ -95,8 +104,17 @@ fn run_with_dependencies(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
 ) -> Result<RunResult> {
+    run_with_context(cli, database_path, runner, None)
+}
+
+fn run_with_context(
+    cli: Cli,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    repo_ensure_defaults: Option<&RepoEnsureDefaults>,
+) -> Result<RunResult> {
     match cli.command {
-        Command::Repo { command } => run_repo(command, database_path),
+        Command::Repo { command } => run_repo(command, database_path, runner, repo_ensure_defaults),
         Command::Workspace { command } => run_workspace(command, database_path, runner),
         Command::Change { command } => run_change(command),
         Command::Stack { command } => run_stack(command),
@@ -106,7 +124,12 @@ fn run_with_dependencies(
     }
 }
 
-fn run_repo(command: RepoCommand, database_path: Option<&Path>) -> Result<RunResult> {
+fn run_repo(
+    command: RepoCommand,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    repo_ensure_defaults: Option<&RepoEnsureDefaults>,
+) -> Result<RunResult> {
     let store = if let Some(path) = database_path {
         Store::open_at(path)?
     } else {
@@ -114,6 +137,23 @@ fn run_repo(command: RepoCommand, database_path: Option<&Path>) -> Result<RunRes
     };
 
     match command {
+        RepoCommand::Ensure { origin } => {
+            let origin = normalize_origin(&origin)?;
+            let defaults = if let Some(defaults) = repo_ensure_defaults {
+                defaults.clone()
+            } else {
+                default_repo_ensure_defaults()?
+            };
+            let record = ensure_repo(&store, runner, &origin, &defaults)?;
+            let repo_id = record.repo.clone();
+            RunResult::new(
+                format!("Ensured repo `{repo_id}`."),
+                json!({
+                    "repo_id": repo_id,
+                    "repo": record,
+                }),
+            )
+        }
         RepoCommand::Add {
             repo,
             origin,
@@ -168,6 +208,136 @@ fn run_repo(command: RepoCommand, database_path: Option<&Path>) -> Result<RunRes
             )
         }
     }
+}
+
+fn ensure_repo(
+    store: &Store,
+    runner: &dyn CommandRunner,
+    origin: &str,
+    defaults: &RepoEnsureDefaults,
+) -> Result<RepoRecord> {
+    if let Some(record) = store.get_repo_by_origin(origin)? {
+        return Ok(record);
+    }
+
+    let record = infer_repo_record_from_origin(origin, defaults)?;
+    if let Some(existing) = store.get_repo(&record.repo)? {
+        return Err(CubeError::InvalidArgument(format!(
+            "repo `{}` is already configured for origin `{}`; cannot ensure `{origin}`",
+            existing.repo, existing.origin
+        )));
+    }
+
+    fs::create_dir_all(&record.workspace_root)?;
+    materialize_repo_source_if_missing(runner, &record)?;
+    store.upsert_repo(&record)
+}
+
+fn normalize_origin(origin: &str) -> Result<String> {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() {
+        return Err(CubeError::InvalidArgument(
+            "origin must not be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn default_repo_ensure_defaults() -> Result<RepoEnsureDefaults> {
+    let cube_root = paths::data_dir()?;
+    let repo_root = cube_root.join("repos");
+    Ok(RepoEnsureDefaults {
+        workspace_root: cube_root.join("workspaces"),
+        repo_root,
+    })
+}
+
+fn infer_repo_record_from_origin(
+    origin: &str,
+    defaults: &RepoEnsureDefaults,
+) -> Result<RepoRecord> {
+    let repo = repo_id_from_origin(origin)?;
+    Ok(RepoRecord {
+        repo: repo.clone(),
+        origin: origin.to_string(),
+        main_branch: "main".to_string(),
+        workspace_root: defaults.workspace_root.clone(),
+        workspace_prefix: format!("{repo}-agent-"),
+        source: Some(defaults.repo_root.join(&repo)),
+    })
+}
+
+fn materialize_repo_source_if_missing(
+    runner: &dyn CommandRunner,
+    record: &RepoRecord,
+) -> Result<()> {
+    let Some(source) = &record.source else {
+        return Ok(());
+    };
+
+    if source.exists() {
+        if source.is_dir() {
+            return Ok(());
+        }
+        return Err(CubeError::InvalidArgument(format!(
+            "source path {} exists and is not a directory",
+            source.display()
+        )));
+    }
+
+    let parent = source.parent().ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "cannot infer parent directory for source path {}",
+            source.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    runner.run(&CommandInvocation {
+        cwd: parent.to_path_buf(),
+        program: "jj".to_string(),
+        args: vec![
+            "git".to_string(),
+            "clone".to_string(),
+            record.origin.clone(),
+            source.display().to_string(),
+        ],
+    })?;
+    Ok(())
+}
+
+fn repo_id_from_origin(origin: &str) -> Result<String> {
+    let trimmed = origin.trim().trim_end_matches('/');
+    let tail = trimmed
+        .rsplit(|ch| ['/', ':'].contains(&ch))
+        .next()
+        .unwrap_or("");
+    let tail = tail.strip_suffix(".git").unwrap_or(tail);
+    let repo = sanitize_repo_id(tail);
+    if repo.is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "could not infer repo id from origin `{origin}`"
+        )));
+    }
+    Ok(repo)
+}
+
+fn sanitize_repo_id(raw: &str) -> String {
+    let mut repo = String::new();
+    let mut previous_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            repo.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+            continue;
+        }
+
+        if matches!(ch, '-' | '_' | '.') && !previous_dash {
+            repo.push('-');
+            previous_dash = true;
+        }
+    }
+
+    repo.trim_matches('-').to_string()
 }
 
 fn run_workspace(
@@ -472,12 +642,19 @@ mod tests {
     use crate::cli::{Cli, Command};
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
-    use super::{CubeError, Result, run_with_dependencies};
+    use super::{CubeError, RepoEnsureDefaults, Result, run_with_context, run_with_dependencies};
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let database_path = tempdir.path().join("state.db");
         (tempdir, database_path)
+    }
+
+    fn repo_ensure_defaults(tempdir: &TempDir) -> RepoEnsureDefaults {
+        RepoEnsureDefaults {
+            repo_root: tempdir.path().join("repos"),
+            workspace_root: tempdir.path().join("workspaces"),
+        }
     }
 
     #[test]
@@ -535,6 +712,96 @@ mod tests {
 
         assert!(matches!(error, CubeError::RepoNotFound(_)));
         assert_eq!(error.exit_code(), ExitCode::from(3));
+    }
+
+    #[test]
+    fn repo_ensure_reuses_existing_repo_by_origin() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+            "--source",
+            &defaults.repo_root.join("mono").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(result.payload["repo_id"], "mono");
+        assert_eq!(
+            result.payload["repo"]["workspace_root"],
+            defaults.workspace_root.display().to_string()
+        );
+        assert_eq!(
+            result.payload["repo"]["source"],
+            defaults.repo_root.join("mono").display().to_string()
+        );
+    }
+
+    #[test]
+    fn repo_ensure_infers_repo_and_materializes_missing_source() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            defaults.repo_root.clone(),
+            "jj",
+            &[
+                "git",
+                "clone",
+                "git@github.com:spinyfin/mono.git",
+                &source_path.display().to_string(),
+            ],
+            "",
+        )]);
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults))
+            .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(result.payload["repo_id"], "mono");
+        assert_eq!(result.payload["repo"]["workspace_prefix"], "mono-agent-");
+        assert_eq!(
+            result.payload["repo"]["workspace_root"],
+            defaults.workspace_root.display().to_string()
+        );
+        assert_eq!(
+            result.payload["repo"]["source"],
+            source_path.display().to_string()
+        );
+        assert!(defaults.workspace_root.is_dir());
+        runner.assert_exhausted();
     }
 
     #[test]

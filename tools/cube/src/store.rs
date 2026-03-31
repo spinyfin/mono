@@ -72,16 +72,24 @@ impl Store {
                 WHERE repo = ?1
                 "#,
                 params![repo],
-                |row| {
-                    Ok(RepoRecord {
-                        repo: row.get(0)?,
-                        origin: row.get(1)?,
-                        main_branch: row.get(2)?,
-                        workspace_root: row.get::<_, String>(3)?.into(),
-                        workspace_prefix: row.get(4)?,
-                        source: row.get::<_, Option<String>>(5)?.map(Into::into),
-                    })
-                },
+                row_to_repo_record,
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn get_repo_by_origin(&self, origin: &str) -> Result<Option<RepoRecord>, CubeError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path
+                FROM repos
+                WHERE origin = ?1
+                ORDER BY repo
+                LIMIT 1
+                "#,
+                params![origin],
+                row_to_repo_record,
             )
             .optional()
             .map_err(CubeError::Storage)
@@ -99,16 +107,7 @@ impl Store {
             )
             .map_err(CubeError::Storage)?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(RepoRecord {
-                    repo: row.get(0)?,
-                    origin: row.get(1)?,
-                    main_branch: row.get(2)?,
-                    workspace_root: row.get::<_, String>(3)?.into(),
-                    workspace_prefix: row.get(4)?,
-                    source: row.get::<_, Option<String>>(5)?.map(Into::into),
-                })
-            })
+            .query_map([], row_to_repo_record)
             .map_err(CubeError::Storage)?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -398,6 +397,9 @@ impl Store {
                     source_path TEXT
                 );
 
+                CREATE INDEX IF NOT EXISTS repos_origin_idx
+                    ON repos(origin);
+
                 CREATE TABLE IF NOT EXISTS workspaces (
                     repo TEXT NOT NULL,
                     workspace_id TEXT NOT NULL,
@@ -422,6 +424,17 @@ impl Store {
 
 fn path_to_string(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn row_to_repo_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRecord> {
+    Ok(RepoRecord {
+        repo: row.get(0)?,
+        origin: row.get(1)?,
+        main_branch: row.get(2)?,
+        workspace_root: row.get::<_, String>(3)?.into(),
+        workspace_prefix: row.get(4)?,
+        source: row.get::<_, Option<String>>(5)?.map(Into::into),
+    })
 }
 
 fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
