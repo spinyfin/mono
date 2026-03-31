@@ -5,6 +5,8 @@ import Textual
 private let workBoardColumnWidth: CGFloat = 280
 private let workBoardColumnSpacing: CGFloat = 12
 private let workBoardHorizontalPadding: CGFloat = 20
+private let workBossPanelExpandedWidth: CGFloat = 380
+private let workBossPanelCollapsedWidth: CGFloat = 88
 
 struct ContentView: View {
     @StateObject private var model = ChatViewModel()
@@ -139,7 +141,7 @@ struct ContentView: View {
                 workSidebar
             }
         }
-        .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
     }
 
     private var detail: some View {
@@ -156,12 +158,16 @@ struct ContentView: View {
     private var agentSidebar: some View {
         List(model.agents, selection: $model.selectedAgentID) { agent in
             HStack {
-                Image(systemName: "person.circle")
+                Image(systemName: agent.role.systemImage)
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(agent.name)
                         .font(.body)
-                    if !agent.isReady {
+                    if agent.isBoss {
+                        Text("Coordinator")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if !agent.isReady {
                         Text("Starting…")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -217,7 +223,7 @@ struct ContentView: View {
                 Section {
                     WorkSidebarFilterRow(
                         title: "All Projects",
-                        subtitle: "Show the full product board",
+                        subtitle: nil,
                         systemImage: "square.stack.3d.up",
                         isSelected: model.selectedProject == nil,
                         trailing: nil
@@ -229,7 +235,7 @@ struct ContentView: View {
                     ForEach(model.projectsForSelectedProduct) { project in
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: project.goal.isEmpty ? project.priority.capitalized : project.goal,
+                            subtitle: nil,
                             systemImage: "folder",
                             isSelected: model.selectedProject?.id == project.id,
                             trailing: project.status.capitalized
@@ -290,12 +296,28 @@ struct ContentView: View {
 
     private var agentDetail: some View {
         VStack(spacing: 0) {
-            messageList
-            composer
+            messageList(items: model.selectedAgentTimeline)
+            composer(
+                draft: $model.draft,
+                agentID: model.selectedAgentID,
+                isReady: model.isSelectedAgentReady,
+                isSending: model.isSelectedAgentSending,
+                autoFocus: true,
+                focusTrigger: model.selectedAgentID,
+                onSend: model.sendDraft
+            )
         }
     }
 
     private var workDetail: some View {
+        HStack(spacing: 0) {
+            workMainContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            workBossPanel
+        }
+    }
+
+    private var workMainContent: some View {
         Group {
             if model.products.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
@@ -324,25 +346,35 @@ struct ContentView: View {
         }
     }
 
-    private var messageList: some View {
+    private func messageList(items: [TranscriptItem], emptyState: String? = nil) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(model.selectedAgentTimeline) { item in
-                        switch item {
-                        case .message(let message):
-                            MessageBubble(message: message)
-                                .id(item.id)
-                        case .terminal(let terminal):
-                            TerminalActivityCard(activity: terminal)
-                                .id(item.id)
+                if items.isEmpty, let emptyState {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(emptyState)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(items) { item in
+                            switch item {
+                            case .message(let message):
+                                MessageBubble(message: message)
+                                    .id(item.id)
+                            case .terminal(let terminal):
+                                TerminalActivityCard(activity: terminal)
+                                    .id(item.id)
+                            }
                         }
                     }
+                    .padding(16)
                 }
-                .padding(16)
             }
-            .onChange(of: model.selectedAgentTimeline.count) {
-                if let last = model.selectedAgentTimeline.last {
+            .onChange(of: items.count) {
+                if let last = items.last {
                     DispatchQueue.main.async {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -351,28 +383,31 @@ struct ContentView: View {
         }
     }
 
-    private var composer: some View {
-        let isDraftEmpty = model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let canSend =
-            model.selectedAgentID != nil && !isDraftEmpty && !model.isSelectedAgentSending
-            && model.isSelectedAgentReady
+    private func composer(
+        draft: Binding<String>,
+        agentID: String?,
+        isReady: Bool,
+        isSending: Bool,
+        autoFocus: Bool,
+        focusTrigger: String?,
+        onSend: @escaping () -> Void
+    ) -> some View {
+        let isDraftEmpty = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let canSend = agentID != nil && !isDraftEmpty && !isSending && isReady
 
         return VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
                 ComposerTextView(
-                    text: $model.draft,
-                    placeholder: model.isSelectedAgentReady ? "Type a message…" : "Agent starting…",
-                    autoFocus: true,
-                    focusTrigger: model.selectedAgentID
-                ) {
-                    model.sendDraft()
-                }
+                    text: draft,
+                    placeholder: isReady ? "Type a message…" : "Agent starting…",
+                    autoFocus: autoFocus,
+                    focusTrigger: focusTrigger,
+                    onSubmit: onSend
+                )
                 .frame(height: 36)
                 .frame(maxWidth: .infinity)
 
-                Button {
-                    model.sendDraft()
-                } label: {
+                Button(action: onSend) {
                     Image(systemName: "paperplane.fill")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(canSend ? .primary : .secondary)
@@ -395,7 +430,7 @@ struct ContentView: View {
             .padding(.bottom, 12)
             .padding(.top, 4)
 
-            if model.isSelectedAgentSending {
+            if isSending {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.mini)
@@ -408,6 +443,97 @@ struct ContentView: View {
                 .padding(.bottom, 8)
             }
         }
+    }
+
+    private var workBossPanel: some View {
+        let isCollapsed = model.isBossPanelCollapsed
+
+        return VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: AgentRole.boss.systemImage)
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 16, weight: .medium))
+
+                if !isCollapsed {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(AgentRole.boss.title)
+                            .font(.headline)
+                        Text(bossStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    model.toggleBossPanelCollapsed()
+                } label: {
+                    Image(systemName: isCollapsed ? "chevron.left" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+
+            if isCollapsed {
+                Spacer(minLength: 0)
+                Text("Boss")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(-90))
+                Spacer(minLength: 0)
+            } else {
+                Divider()
+                messageList(
+                    items: model.bossTimeline,
+                    emptyState: "Ask The Boss to coordinate work or create and update Boss work items."
+                )
+                composer(
+                    draft: $model.bossDraft,
+                    agentID: model.bossAgentID,
+                    isReady: model.isBossAgentReady,
+                    isSending: model.isBossAgentSending,
+                    autoFocus: false,
+                    focusTrigger: model.bossAgentID,
+                    onSend: model.sendBossDraft
+                )
+            }
+        }
+        .frame(width: isCollapsed ? workBossPanelCollapsedWidth : workBossPanelExpandedWidth)
+        .frame(maxHeight: .infinity)
+        .background(Color(nsColor: .underPageBackgroundColor))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+        }
+        .animation(.snappy(duration: 0.18), value: model.isBossPanelCollapsed)
+    }
+
+    private var bossStatusText: String {
+        if !model.isConnected {
+            return "Disconnected"
+        }
+        if model.bossAgent == nil {
+            return "Starting coordinator…"
+        }
+        if !model.isBossAgentReady {
+            return "Starting coordinator…"
+        }
+        if model.isBossAgentBootstrapping {
+            return "Loading Boss CLI reference…"
+        }
+        if model.bossBootstrapErrorMessage != nil {
+            return "Boss CLI reference failed to load"
+        }
+        if model.isBossAgentSending {
+            return "Coordinating…"
+        }
+        return "Coordinates work through Boss"
     }
 
     private func workBoard(product: WorkProduct) -> some View {
@@ -568,29 +694,44 @@ private struct WorkSidebarFilterRow: View {
     let trailing: String?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: systemImage)
                 .foregroundStyle(isSelected ? .primary : .secondary)
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.body.weight(isSelected ? .semibold : .regular))
-                    .foregroundStyle(.primary)
+                .font(.system(size: 14, weight: .medium))
+                .frame(width: 15, alignment: .center)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 2) {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(title)
+                        .font(.body.weight(isSelected ? .semibold : .regular))
+                        .foregroundStyle(.primary)
+                        .lineLimit(isSelected ? 2 : 1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
+
+                    Spacer(minLength: 6)
+
+                    if let trailing, !trailing.isEmpty {
+                        WorkStatusBadge(text: trailing, emphasized: isSelected)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(2)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .lineLimit(1)
                 }
             }
-            Spacer(minLength: 8)
-            if let trailing {
-                WorkStatusBadge(text: trailing, emphasized: isSelected)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.leading, 8)
+        .padding(.trailing, 4)
+        .padding(.vertical, subtitle == nil ? 6 : 7)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -941,8 +1082,10 @@ private struct WorkStatusBadge: View {
         Text(text)
             .font(.caption2.weight(.semibold))
             .foregroundStyle(foregroundColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
+            .lineLimit(1)
+            .minimumScaleFactor(0.95)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
             .background(backgroundColor)
             .clipShape(Capsule())
     }

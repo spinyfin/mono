@@ -13,13 +13,50 @@ use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
 use crate::protocol::{
-    AgentInfo, FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
-    TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
+    AgentInfo, AgentRole, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
+    FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
 };
 use crate::work::{WorkDb, WorkItem};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+const BOSS_AGENT_NAME: &str = "The Boss";
+const BOSS_AGENT_SYSTEM_PROMPT: &str = r#"You are The Boss, the overall coordinator and primary interface with the user inside Boss.
+
+Your role is to coordinate work and keep Boss's representation of work accurate.
+
+You may use the `boss` CLI to create and update products, projects, tasks, and chores when the user explicitly asks for that work or when it is strongly implied by the request. Prefer non-interactive CLI usage when possible. Infer the most likely work item shape yourself. Ask a concise clarifying question only when you truly cannot infer a usable product or the request is impossible to place without more information.
+
+If a user request looks like implementation work, bug fixing, feature work, cleanup, follow-up work, or investigation that might turn into a task or project, do not inspect the repository or perform detailed technical analysis before capturing it in Boss. Queue the work first.
+
+Treat investigation, scoping, and discovery as work items for another agent. If the user asks to investigate something, or if investigation is the obvious next step, create an investigation task or project instead of doing the investigation yourself.
+
+When work is strongly implied, bias toward creating the appropriate Boss work item quickly, even if some implementation details are still unknown. If you are uncertain, make the best inference and create the item anyway rather than asking the user to choose the type.
+
+Use the current Boss UI context, especially the current product and its existing projects, when deciding how to represent work.
+
+When you need authoritative Boss CLI syntax or selector/status rules, use `boss reference --json --no-input`. Treat that output as the current source of truth for this build. Do not use `boss ... --help` for syntax discovery unless `boss reference` is unavailable.
+
+Routing rules:
+- If there is a current selected product, use that product by default unless the user clearly names a different product.
+- If the request clearly fits an existing project, create a task in that project instead of creating a new project or a chore.
+- If the request does not fit an existing project and seems small, self-contained, operational, or maintenance-oriented, create a chore.
+- If the request does not fit an existing project and seems broad, ambiguous, exploratory, or likely to require multiple stages or multiple tasks, create a project.
+- If the request is to investigate something and that investigation belongs under an existing project, create an investigation task in that project. Otherwise, prefer a new project when the investigation is broad or likely to branch into multiple follow-up tasks.
+- If you are deciding between chore and project and both seem plausible, default to chore unless the work clearly looks multi-stage, broad, or exploratory.
+- If you are deciding whether a small fix belongs in an existing project and there is no obvious fit, default to chore.
+- Do not ask the user whether something should be a task, chore, or project when a reasonable inference is available. It is acceptable to be wrong because the work can be moved later.
+
+Do not make direct implementation changes yourself. Do not edit code, modify files, or carry out the underlying work directly unless the user explicitly overrides this rule. Instead, act as the coordinator of the work and the steward of its representation in Boss.
+
+Default behavior:
+- clarify goals and scope,
+- queue likely work immediately, including investigation work,
+- ask only when you cannot reasonably infer the destination product or representation,
+- use the current product and existing project context before choosing task, chore, or project,
+- avoid repo inspection and detailed technical analysis before the work is queued,
+- keep status and structure accurate,
+- suggest or assign implementation and investigation work rather than doing it yourself."#;
 
 struct PidFileGuard {
     path: String,
@@ -43,9 +80,11 @@ impl Drop for PidFileGuard {
 struct Agent {
     id: String,
     name: String,
+    role: AgentRole,
     acp_client: Arc<AcpClient>,
     session_id: String,
     prompt_lock: Arc<Mutex<()>>,
+    system_prompt: Option<String>,
 }
 
 struct AgentRegistry {
@@ -63,26 +102,38 @@ impl AgentRegistry {
         }
     }
 
-    fn allocate_agent(&self, name: Option<String>) -> (String, String) {
+    fn allocate_agent(&self, name: Option<String>, role: AgentRole) -> (String, String, AgentRole) {
         let id = format!("agent-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let name =
-            name.unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id)));
-        (id, name)
+        let name = match role {
+            AgentRole::Boss => name.unwrap_or_else(|| BOSS_AGENT_NAME.to_owned()),
+            AgentRole::Standard => name
+                .unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id))),
+        };
+        (id, name, role)
     }
 
-    async fn initialize_agent(&self, id: &str, name: &str) -> Result<()> {
+    async fn initialize_agent(&self, id: &str, name: &str, role: AgentRole) -> Result<()> {
         let acp_client = Arc::new(AcpClient::connect_with_external_permissions(&self.cfg).await?);
         acp_client.initialize().await?;
         let session_id = acp_client.new_session(&self.cfg.cwd).await?;
+        let system_prompt = system_prompt_for_role(role);
 
-        tracing::info!(agent_id = %id, name = %name, session_id = %session_id, "agent ready");
+        tracing::info!(
+            agent_id = %id,
+            name = %name,
+            ?role,
+            session_id = %session_id,
+            "agent ready"
+        );
 
         let agent = Agent {
             id: id.to_owned(),
             name: name.to_owned(),
+            role,
             acp_client,
             session_id,
             prompt_lock: Arc::new(Mutex::new(())),
+            system_prompt,
         };
 
         self.agents.lock().await.insert(id.to_owned(), agent);
@@ -106,6 +157,7 @@ impl AgentRegistry {
             .map(|agent| AgentInfo {
                 agent_id: agent.id.clone(),
                 name: agent.name.clone(),
+                role: agent.role,
             })
             .collect()
     }
@@ -113,7 +165,7 @@ impl AgentRegistry {
     async fn get_acp_and_session(
         &self,
         agent_id: &str,
-    ) -> Result<(Arc<AcpClient>, String, Arc<Mutex<()>>)> {
+    ) -> Result<(Arc<AcpClient>, String, Arc<Mutex<()>>, Option<String>)> {
         let agents = self.agents.lock().await;
         let agent = agents
             .get(agent_id)
@@ -122,7 +174,27 @@ impl AgentRegistry {
             agent.acp_client.clone(),
             agent.session_id.clone(),
             agent.prompt_lock.clone(),
+            agent.system_prompt.clone(),
         ))
+    }
+}
+
+fn system_prompt_for_role(role: AgentRole) -> Option<String> {
+    match role {
+        AgentRole::Standard => None,
+        AgentRole::Boss => Some(BOSS_AGENT_SYSTEM_PROMPT.to_owned()),
+    }
+}
+
+fn compose_agent_prompt(system_prompt: Option<&str>, user_text: &str) -> String {
+    match system_prompt {
+        // The current ACP prompt surface is plain text only, so role-specific
+        // instructions are wrapped into each prompt instead of being sent over
+        // a dedicated system channel.
+        Some(system_prompt) => {
+            format!("<system>\n{system_prompt}\n</system>\n\n<user>\n{user_text}\n</user>")
+        }
+        None => user_text.to_owned(),
     }
 }
 
@@ -436,7 +508,10 @@ async fn handle_frontend_connection(
 
         match request {
             FrontendRequest::Subscribe { topics } => {
-                let topics = server_state.topic_broker.subscribe(&session_id, &topics).await;
+                let topics = server_state
+                    .topic_broker
+                    .subscribe(&session_id, &topics)
+                    .await;
                 send_response(
                     &event_tx,
                     &request_id,
@@ -509,29 +584,30 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::ListProjects { product_id } => match work_db.list_projects(&product_id)
-            {
-                Ok(projects) => {
-                    send_response_with_revision(
-                        &event_tx,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::ProjectsList {
-                            product_id,
-                            projects,
-                        },
-                    );
+            FrontendRequest::ListProjects { product_id } => {
+                match work_db.list_projects(&product_id) {
+                    Ok(projects) => {
+                        send_response_with_revision(
+                            &event_tx,
+                            &request_id,
+                            server_state.current_work_revision(),
+                            FrontendEvent::ProjectsList {
+                                product_id,
+                                projects,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
                 }
-                Err(err) => {
-                    send_response(
-                        &event_tx,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
+            }
             FrontendRequest::ListTasks {
                 product_id,
                 project_id,
@@ -689,41 +765,42 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::UpdateWorkItem { id, patch } => match work_db.update_work_item(&id, patch)
-            {
-                Ok(item) => {
-                    let product_id = work_item_product_id(&item);
-                    let mut topics = vec![work_product_topic(&product_id)];
-                    if matches!(item, WorkItem::Product(_)) {
-                        topics.push(TOPIC_WORK_PRODUCTS.to_owned());
+            FrontendRequest::UpdateWorkItem { id, patch } => {
+                match work_db.update_work_item(&id, patch) {
+                    Ok(item) => {
+                        let product_id = work_item_product_id(&item);
+                        let mut topics = vec![work_product_topic(&product_id)];
+                        if matches!(item, WorkItem::Product(_)) {
+                            topics.push(TOPIC_WORK_PRODUCTS.to_owned());
+                        }
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            topics,
+                            "work_item_updated",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &event_tx,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
                     }
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        topics,
-                        "work_item_updated",
-                        Some(product_id),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &event_tx,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemUpdated { item },
-                    );
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
                 }
-                Err(err) => {
-                    send_response(
-                        &event_tx,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
+            }
             FrontendRequest::DeleteWorkItem { id } => match work_db.get_work_item(&id) {
                 Ok(item) => match work_db.delete_work_item(&id) {
                     Ok(()) => {
@@ -837,21 +914,25 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::CreateAgent { name } => {
-                let (agent_id, agent_name) = registry.allocate_agent(name);
+            FrontendRequest::CreateAgent { name, role } => {
+                let (agent_id, agent_name, role) = registry.allocate_agent(name, role);
                 send_response(
                     &event_tx,
                     &request_id,
                     FrontendEvent::AgentCreated {
                         agent_id: agent_id.clone(),
                         name: agent_name.clone(),
+                        role,
                     },
                 );
 
                 let event_tx = event_tx.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
-                    match registry.initialize_agent(&agent_id, &agent_name).await {
+                    match registry
+                        .initialize_agent(&agent_id, &agent_name, role)
+                        .await
+                    {
                         Ok(()) => {
                             send_push(&event_tx, FrontendEvent::AgentReady { agent_id });
                         }
@@ -901,7 +982,7 @@ async fn handle_frontend_connection(
                     "received prompt from frontend"
                 );
 
-                let (acp, session_id, prompt_lock) =
+                let (acp, session_id, prompt_lock, system_prompt) =
                     match registry.get_acp_and_session(&agent_id).await {
                         Ok(tuple) => tuple,
                         Err(err) => {
@@ -919,13 +1000,14 @@ async fn handle_frontend_connection(
 
                 let event_tx = event_tx.clone();
                 let agent_id_owned = agent_id.clone();
+                let prompt_text = compose_agent_prompt(system_prompt.as_deref(), &text);
 
                 tokio::spawn(async move {
                     let _guard = prompt_lock.lock().await;
                     let aid = agent_id_owned.clone();
 
                     let result = acp
-                        .prompt_streaming(&session_id, &text, |event| match event {
+                        .prompt_streaming(&session_id, &prompt_text, |event| match event {
                             AcpEvent::AgentMessageChunk { text, .. } => {
                                 send_push(
                                     &event_tx,
@@ -1065,7 +1147,7 @@ async fn handle_frontend_connection(
                 );
 
                 let acp = match registry.get_acp_and_session(&agent_id).await {
-                    Ok((acp, _, _)) => acp,
+                    Ok((acp, _, _, _)) => acp,
                     Err(err) => {
                         send_response(
                             &event_tx,
@@ -1105,7 +1187,10 @@ fn send_response(
     request_id: &str,
     payload: FrontendEvent,
 ) {
-    let _ = event_tx.send(FrontendEventEnvelope::response(request_id.to_owned(), payload));
+    let _ = event_tx.send(FrontendEventEnvelope::response(
+        request_id.to_owned(),
+        payload,
+    ));
 }
 
 fn send_response_with_revision(
@@ -1161,7 +1246,10 @@ async fn publish_work_invalidation(
         }
         server_state
             .topic_broker
-            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+            .publish(
+                &topic,
+                FrontendEventEnvelope::push_with_revision(revision, event),
+            )
             .await;
     }
 

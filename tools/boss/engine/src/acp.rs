@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -102,7 +102,7 @@ impl AcpClient {
         cfg.preflight_acp()?;
 
         let mut command = Command::new(&cfg.acp.command);
-        let path = preferred_child_path();
+        let path = preferred_child_path(&cfg.cwd);
         command
             .args(&cfg.acp.args)
             .current_dir(&cfg.cwd)
@@ -144,6 +144,7 @@ impl AcpClient {
         let permission_coordinator = PermissionCoordinator::default();
 
         let client_host = Arc::new(ClientHost::new(
+            cfg.cwd.clone(),
             interactive_permissions,
             permission_coordinator.clone(),
         ));
@@ -295,17 +296,37 @@ impl AcpClient {
     }
 }
 
-fn preferred_child_path() -> OsString {
-    let Some(nvm_bin) = std::env::var_os("NVM_BIN") else {
-        return std::env::var_os("PATH").unwrap_or_default();
-    };
-
-    let mut paths = vec![nvm_bin];
+fn preferred_child_path(cwd: &Path) -> OsString {
+    let mut paths = Vec::new();
+    if let Some(boss_cli_dir) = boss_cli_shim_dir(cwd) {
+        paths.push(boss_cli_dir.into_os_string());
+    }
+    if let Some(nvm_bin) = std::env::var_os("NVM_BIN") {
+        paths.push(nvm_bin);
+    }
     if let Some(path) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&path).map(|path| path.into_os_string()));
     }
 
     std::env::join_paths(paths).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+fn boss_cli_shim_dir(cwd: &Path) -> Option<PathBuf> {
+    let candidate = cwd.join("tools/boss/bin");
+    candidate.is_dir().then_some(candidate)
+}
+
+fn merged_child_path(preferred_path: &OsString, requested_path: Option<&str>) -> OsString {
+    let Some(requested_path) = requested_path else {
+        return preferred_path.clone();
+    };
+
+    let mut paths = std::env::split_paths(preferred_path)
+        .map(|path| path.into_os_string())
+        .collect::<Vec<_>>();
+    paths.extend(std::env::split_paths(requested_path).map(|path| path.into_os_string()));
+
+    std::env::join_paths(paths).unwrap_or_else(|_| preferred_path.clone())
 }
 
 async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::Receiver<Value>) {
@@ -590,7 +611,6 @@ impl PermissionCoordinator {
     }
 }
 
-#[derive(Default)]
 struct ClientHost {
     terminals: TerminalManager,
     interactive_permissions: bool,
@@ -598,9 +618,13 @@ struct ClientHost {
 }
 
 impl ClientHost {
-    fn new(interactive_permissions: bool, permission_coordinator: PermissionCoordinator) -> Self {
+    fn new(
+        cwd: PathBuf,
+        interactive_permissions: bool,
+        permission_coordinator: PermissionCoordinator,
+    ) -> Self {
         Self {
-            terminals: TerminalManager::default(),
+            terminals: TerminalManager::new(preferred_child_path(&cwd)),
             interactive_permissions,
             permission_coordinator,
         }
@@ -787,13 +811,21 @@ impl ClientHost {
     }
 }
 
-#[derive(Default)]
 struct TerminalManager {
     terminals: Mutex<HashMap<String, Arc<TerminalProcess>>>,
     next_id: AtomicU64,
+    child_path: OsString,
 }
 
 impl TerminalManager {
+    fn new(child_path: OsString) -> Self {
+        Self {
+            terminals: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            child_path,
+        }
+    }
+
     async fn create(
         &self,
         params: Value,
@@ -858,7 +890,8 @@ impl TerminalManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .env("PATH", &self.child_path);
 
         if let Some(cwd) = &cwd {
             let cwd_path = Path::new(&cwd);
@@ -870,7 +903,14 @@ impl TerminalManager {
 
         if let Some(env_vars) = env {
             for env_var in env_vars {
-                command.env(env_var.name, env_var.value);
+                if env_var.name == "PATH" {
+                    command.env(
+                        "PATH",
+                        merged_child_path(&self.child_path, Some(&env_var.value)),
+                    );
+                } else {
+                    command.env(env_var.name, env_var.value);
+                }
             }
         }
 
@@ -1006,7 +1046,11 @@ fn command_uses_shell_operators(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_terminal_command;
+    use std::path::PathBuf;
+
+    use super::{
+        boss_cli_shim_dir, merged_child_path, normalize_terminal_command, preferred_child_path,
+    };
 
     #[test]
     fn normalize_terminal_command_uses_structured_args() {
@@ -1034,6 +1078,39 @@ mod tests {
         assert_eq!(program, "/bin/bash");
         assert_eq!(args, vec!["-lc", "cd /tmp && ls"]);
         assert_eq!(mode, "shell");
+    }
+
+    #[test]
+    fn preferred_child_path_includes_boss_cli_shim_dir() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let shim_dir = tempdir.path().join("tools/boss/bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+
+        let path = preferred_child_path(tempdir.path());
+        let paths = std::env::split_paths(&path).collect::<Vec<_>>();
+
+        assert_eq!(paths.first(), Some(&shim_dir));
+    }
+
+    #[test]
+    fn boss_cli_shim_dir_returns_none_when_missing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        assert_eq!(boss_cli_shim_dir(tempdir.path()), None);
+    }
+
+    #[test]
+    fn merged_child_path_prepends_preferred_entries() {
+        let preferred =
+            std::env::join_paths([PathBuf::from("/preferred/bin"), PathBuf::from("/usr/bin")])
+                .unwrap();
+
+        let merged = merged_child_path(&preferred, Some("/custom/bin:/bin"));
+        let paths = std::env::split_paths(&merged).collect::<Vec<_>>();
+
+        assert_eq!(paths[0], PathBuf::from("/preferred/bin"));
+        assert_eq!(paths[1], PathBuf::from("/usr/bin"));
+        assert_eq!(paths[2], PathBuf::from("/custom/bin"));
+        assert_eq!(paths[3], PathBuf::from("/bin"));
     }
 }
 

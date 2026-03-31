@@ -11,6 +11,14 @@ pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    #[default]
+    Standard,
+    Boss,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendRequestEnvelope {
     pub request_id: String,
@@ -119,6 +127,8 @@ pub enum FrontendRequest {
     },
     CreateAgent {
         name: Option<String>,
+        #[serde(default)]
+        role: AgentRole,
     },
     ListAgents,
     RemoveAgent {
@@ -199,6 +209,7 @@ pub enum FrontendEvent {
     AgentCreated {
         agent_id: String,
         name: String,
+        role: AgentRole,
     },
     AgentReady {
         agent_id: String,
@@ -255,6 +266,8 @@ pub enum FrontendEvent {
 pub struct AgentInfo {
     pub agent_id: String,
     pub name: String,
+    #[serde(default)]
+    pub role: AgentRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

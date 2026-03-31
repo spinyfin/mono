@@ -12,6 +12,7 @@ final class ChatViewModel: ObservableObject {
     @Published var agents: [Agent] = []
     @Published var selectedAgentID: String?
     @Published var draft: String = ""
+    @Published var bossDraft: String = ""
     @Published var isConnected: Bool = false
     @Published var pendingPermission: PendingPermission?
     @Published var products: [WorkProduct] = []
@@ -27,10 +28,41 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
     @Published var workSearchText: String = ""
+    @Published var isBossPanelCollapsed: Bool = false
 
     var selectedAgent: Agent? {
         guard let id = selectedAgentID else { return nil }
         return agents.first { $0.id == id }
+    }
+
+    var bossAgent: Agent? {
+        agents.first { $0.isBoss }
+    }
+
+    var bossAgentID: String? {
+        bossAgent?.id
+    }
+
+    var bossTimeline: [TranscriptItem] {
+        bossAgent?.timeline ?? []
+    }
+
+    var isBossAgentSending: Bool {
+        bossAgent?.isSending ?? false
+    }
+
+    var isBossAgentBootstrapping: Bool {
+        guard let agentId = bossAgentID else { return false }
+        return bootstrappingBossAgentIDs.contains(agentId)
+    }
+
+    var bossBootstrapErrorMessage: String? {
+        guard let agentId = bossAgentID else { return nil }
+        return bossBootstrapErrorsByAgentID[agentId]
+    }
+
+    var isBossAgentReady: Bool {
+        bossAgent?.isReady ?? false
     }
 
     var selectedAgentTimeline: [TranscriptItem] {
@@ -100,6 +132,10 @@ final class ChatViewModel: ObservableObject {
     private var didStart = false
     private var didStartEngine = false
     private var hasConnectedOnce = false
+    private var pendingBossCreation = false
+    private var bootstrappingBossAgentIDs: Set<String> = []
+    private var bootstrappedBossAgentIDs: Set<String> = []
+    private var bossBootstrapErrorsByAgentID: [String: String] = [:]
     private var permissionQueue: [PendingPermission] = []
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
@@ -109,6 +145,7 @@ final class ChatViewModel: ObservableObject {
     private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
     private let selectedWorkProjectFilterDefaultsKey = "boss.work.selectedProjectFilterID"
     private let workBoardGroupingDefaultsKey = "boss.work.grouping"
+    private let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -129,6 +166,7 @@ final class ChatViewModel: ObservableObject {
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
         }
+        isBossPanelCollapsed = defaults.bool(forKey: bossPanelCollapsedDefaultsKey)
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
@@ -151,8 +189,16 @@ final class ChatViewModel: ObservableObject {
         engine.stop()
     }
 
-    func createAgent(name: String? = nil) {
-        engine.sendCreateAgent(name: name)
+    func createAgent(name: String? = nil, role: AgentRole = .standard) {
+        if role == .boss {
+            pendingBossCreation = true
+        }
+        engine.sendCreateAgent(name: name, role: role)
+    }
+
+    func ensureBossAgent() {
+        guard bossAgent == nil, !pendingBossCreation else { return }
+        createAgent(name: AgentRole.boss.title, role: .boss)
     }
 
     func sendDraft() {
@@ -165,6 +211,23 @@ final class ChatViewModel: ObservableObject {
         mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
         engine.sendPrompt(agentId: agentId, text: trimmed)
         draft = ""
+    }
+
+    func sendBossDraft() {
+        guard let agentId = bossAgentID else { return }
+        guard isBossAgentReady else { return }
+        let trimmed = bossDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        appendMessage(agentId: agentId, role: .user, text: trimmed)
+        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
+        engine.sendPrompt(agentId: agentId, text: bossPromptText(for: trimmed))
+        bossDraft = ""
+    }
+
+    func toggleBossPanelCollapsed() {
+        isBossPanelCollapsed.toggle()
+        defaults.set(isBossPanelCollapsed, forKey: bossPanelCollapsedDefaultsKey)
     }
 
     func setNavigationMode(_ mode: NavigationMode) {
@@ -456,9 +519,8 @@ final class ChatViewModel: ObservableObject {
         case .connected:
             isConnected = true
             hasConnectedOnce = true
-            if agents.isEmpty {
-                createAgent()
-            }
+            pendingBossCreation = false
+            engine.sendListAgents()
             refreshWorkSubscriptions()
             engine.sendListProducts()
             if let productID = currentSelectedProductID {
@@ -467,6 +529,9 @@ final class ChatViewModel: ObservableObject {
         case .disconnected:
             isConnected = false
             subscribedWorkTopics.removeAll()
+            bootstrappingBossAgentIDs.removeAll()
+            bootstrappedBossAgentIDs.removeAll()
+            bossBootstrapErrorsByAgentID.removeAll()
             for i in agents.indices {
                 agents[i].isSending = false
                 agents[i].activeAssistantMessageID = nil
@@ -542,45 +607,73 @@ final class ChatViewModel: ObservableObject {
             }
         case .workError(let message):
             workErrorMessage = message
-        case .agentCreated(let agentId, let name):
-            let agent = Agent(id: agentId, name: name, isReady: false)
-            agents.append(agent)
+        case .agentCreated(let agent):
+            pendingBossCreation = pendingBossCreation && !agent.isBoss
+            if agent.isBoss {
+                bossBootstrapErrorsByAgentID[agent.id] = nil
+            }
+            upsertAgent(agent)
             if selectedAgentID == nil {
-                selectedAgentID = agentId
+                selectedAgentID = preferredDefaultAgentID()
             }
         case .agentReady(let agentId):
             mutateAgent(agentId) { $0.isReady = true }
+            startBossBootstrapIfNeeded(agentId: agentId)
         case .agentList(let list):
-            for entry in list {
-                if !agents.contains(where: { $0.id == entry.id }) {
-                    agents.append(Agent(id: entry.id, name: entry.name, isReady: true))
+            pendingBossCreation = false
+            synchronizeAgents(with: list)
+            for agent in list {
+                mutateAgent(agent.id) { $0.isReady = true }
+                if agent.isBoss {
+                    startBossBootstrapIfNeeded(agentId: agent.id)
                 }
             }
-            if selectedAgentID == nil, let first = agents.first {
-                selectedAgentID = first.id
+            ensureBossAgent()
+            if selectedAgentID == nil {
+                selectedAgentID = preferredDefaultAgentID()
             }
         case .agentRemoved(let agentId):
             agents.removeAll { $0.id == agentId }
+            bootstrappingBossAgentIDs.remove(agentId)
+            bootstrappedBossAgentIDs.remove(agentId)
+            bossBootstrapErrorsByAgentID[agentId] = nil
             if selectedAgentID == agentId {
-                selectedAgentID = agents.first?.id
+                selectedAgentID = preferredDefaultAgentID()
             }
         case .chunk(let agentId, let text):
+            guard !isBossBootstrapping(agentId: agentId) else { return }
             appendAssistantChunk(agentId: agentId, text: text)
         case .done(let agentId, let stopReason):
+            if isBossBootstrapping(agentId: agentId) {
+                completeBossBootstrap(agentId: agentId)
+                return
+            }
             mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
             appendSystemMessage("[done] \(stopReason)", agentId: agentId)
         case .toolCall(let agentId, let name, let status):
+            guard !isBossBootstrapping(agentId: agentId) else { return }
             appendSystemMessage("[tool] \(name) (\(status))", agentId: agentId)
         case .terminalStarted(let agentId, let id, let title, let command, let cwd):
+            guard !isBossBootstrapping(agentId: agentId) else { return }
             mutateAgent(agentId) { $0.activeAssistantMessageID = nil }
             upsertTerminalActivity(agentId: agentId, id: id, title: title, command: command, cwd: cwd)
         case .terminalOutput(let agentId, let id, let text):
+            guard !isBossBootstrapping(agentId: agentId) else { return }
             appendTerminalOutput(agentId: agentId, id: id, text: text)
         case .terminalDone(let agentId, let id, let exitCode, let signal):
+            guard !isBossBootstrapping(agentId: agentId) else { return }
             completeTerminalActivity(agentId: agentId, id: id, exitCode: exitCode, signal: signal)
         case .permissionRequest(let agentId, let id, let title):
+            guard !isBossBootstrapping(agentId: agentId) else {
+                completeBossBootstrap(agentId: agentId, error: "Boss bootstrap unexpectedly requested permission.")
+                return
+            }
             enqueuePermission(agentId: agentId, id: id, title: title)
         case .error(let agentId, let message):
+            if let agentId, isBossBootstrapping(agentId: agentId) {
+                completeBossBootstrap(agentId: agentId, error: message)
+                return
+            }
             if let agentId {
                 mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
             }
@@ -652,6 +745,39 @@ final class ChatViewModel: ObservableObject {
         agents.firstIndex { $0.id == agentId }
     }
 
+    private func preferredDefaultAgentID() -> String? {
+        bossAgentID ?? agents.first?.id
+    }
+
+    private func upsertAgent(_ agent: Agent) {
+        if let index = agentIndex(agent.id) {
+            let existing = agents[index]
+            agents[index].name = agent.name
+            agents[index].role = agent.role
+            agents[index].isReady = existing.isReady || agent.isReady
+            return
+        }
+
+        agents.append(agent)
+        agents.sort { lhs, rhs in
+            if lhs.role != rhs.role {
+                return lhs.role == .boss
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private func synchronizeAgents(with incoming: [Agent]) {
+        let incomingIDs = Set(incoming.map(\.id))
+        agents.removeAll { !incomingIDs.contains($0.id) }
+        for agent in incoming {
+            upsertAgent(agent)
+        }
+        if let selectedAgentID, !agents.contains(where: { $0.id == selectedAgentID }) {
+            self.selectedAgentID = nil
+        }
+    }
+
     private func mutateAgent(_ agentId: String, _ body: (inout Agent) -> Void) {
         guard let index = agentIndex(agentId) else { return }
         body(&agents[index])
@@ -661,6 +787,141 @@ final class ChatViewModel: ObservableObject {
         mutateAgent(agentId) {
             $0.timeline.append(.message(ChatMessage(role: role, text: text)))
         }
+    }
+
+    private func startBossBootstrapIfNeeded(agentId: String) {
+        guard bossAgentID == agentId || agents.contains(where: { $0.id == agentId && $0.isBoss }) else {
+            return
+        }
+        guard !bootstrappedBossAgentIDs.contains(agentId) else { return }
+        guard !bootstrappingBossAgentIDs.contains(agentId) else { return }
+
+        bootstrappingBossAgentIDs.insert(agentId)
+        bossBootstrapErrorsByAgentID[agentId] = nil
+        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
+        engine.sendPrompt(agentId: agentId, text: bossBootstrapPrompt())
+    }
+
+    private func completeBossBootstrap(agentId: String, error: String? = nil) {
+        bootstrappingBossAgentIDs.remove(agentId)
+        if let error {
+            bossBootstrapErrorsByAgentID[agentId] = error
+        } else {
+            bootstrappedBossAgentIDs.insert(agentId)
+            bossBootstrapErrorsByAgentID[agentId] = nil
+        }
+        mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
+    }
+
+    private func isBossBootstrapping(agentId: String) -> Bool {
+        bootstrappingBossAgentIDs.contains(agentId)
+    }
+
+    private func bossPromptText(for userText: String) -> String {
+        """
+        <boss_ui_context>
+        \(bossRuntimeContext())
+        </boss_ui_context>
+
+        <user_request>
+        \(userText)
+        </user_request>
+        """
+    }
+
+    private func bossBootstrapPrompt() -> String {
+        """
+        This is hidden session bootstrap work for The Boss.
+
+        Before interacting with the user, run `boss reference --json --no-input` once and read it carefully. Treat that output as the authoritative Boss CLI reference for this session.
+
+        Rules:
+        - Do not use `boss ... --help` for syntax discovery during this bootstrap.
+        - Do not ask the user anything.
+        - Do not create or update any Boss work items.
+        - Do not inspect the repository.
+        - Your task is not complete until you have actually run the command and read its output.
+
+        After you have loaded the reference, reply with a very short acknowledgement.
+        """
+    }
+
+    private func bossRuntimeContext() -> String {
+        var lines: [String] = []
+
+        if let selectedProduct {
+            lines.append("current_product_id: \(selectedProduct.id)")
+            lines.append("current_product_name: \(selectedProduct.name)")
+            lines.append("current_product_slug: \(selectedProduct.slug)")
+            lines.append("current_product_status: \(selectedProduct.status)")
+            if let repoRemoteURL = selectedProduct.repoRemoteURL, !repoRemoteURL.isEmpty {
+                lines.append("current_product_repo: \(repoRemoteURL)")
+            }
+            if !selectedProduct.description.isEmpty {
+                lines.append(
+                    "current_product_description: \(bossContextSnippet(selectedProduct.description))"
+                )
+            }
+        } else {
+            lines.append("current_product: none_selected")
+            if !products.isEmpty {
+                lines.append("available_products:")
+                for product in products.prefix(8) {
+                    lines.append(
+                        "- \(product.name) [slug=\(product.slug), status=\(product.status)]"
+                    )
+                }
+                if products.count > 8 {
+                    lines.append("- ... and \(products.count - 8) more products")
+                }
+            }
+        }
+
+        if let selectedProject {
+            lines.append("current_project_filter: \(selectedProject.name)")
+            lines.append("current_project_filter_id: \(selectedProject.id)")
+        } else {
+            lines.append("current_project_filter: all_projects")
+        }
+
+        let projects = projectsForSelectedProduct
+        if projects.isEmpty {
+            lines.append("existing_projects: none")
+        } else {
+            lines.append("existing_projects:")
+            for project in projects.prefix(12) {
+                let taskCount = (tasksByProjectID[project.id] ?? []).count
+                var summary = "- \(project.name) [id=\(project.id), status=\(project.status), priority=\(project.priority), tasks=\(taskCount)]"
+                if !project.goal.isEmpty {
+                    summary += " goal=\(bossContextSnippet(project.goal))"
+                }
+                lines.append(summary)
+            }
+            if projects.count > 12 {
+                lines.append("- ... and \(projects.count - 12) more projects")
+            }
+        }
+
+        if let chores = currentSelectedProductID.flatMap({ choresByProductID[$0] }) {
+            lines.append("current_product_chore_count: \(chores.count)")
+        }
+
+        if let selectedTask {
+            lines.append("selected_work_item: \(selectedTask.name) [kind=\(selectedTask.kind), status=\(selectedTask.status)]")
+        }
+
+        lines.append("instruction: use this context when deciding whether work belongs in an existing project, should be represented as a chore, or should become a new project.")
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func bossContextSnippet(_ text: String, limit: Int = 140) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        let end = normalized.index(normalized.startIndex, offsetBy: limit)
+        return normalized[..<end].trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
     private func appendSystemMessage(_ text: String, agentId: String? = nil, alwaysShow: Bool = false) {

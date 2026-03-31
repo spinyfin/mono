@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/../../.." && pwd)"
+boss_bin="${repo_root}/bazel-bin/tools/boss/cli/boss"
+
+cd "${repo_root}"
+
+if [[ ! -x "${boss_bin}" ]]; then
+  bazel build \
+    --color=no \
+    --curses=no \
+    --noshow_progress \
+    --ui_event_filters=-info \
+    //tools/boss/cli:boss \
+    >/dev/null
+fi
+
+exec "${boss_bin}" "$@"
