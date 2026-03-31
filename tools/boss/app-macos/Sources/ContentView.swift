@@ -413,12 +413,14 @@ struct ContentView: View {
     private func workBoard(product: WorkProduct) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(product.name)
                         .font(.title2.weight(.semibold))
                     Text(model.selectedProject?.name ?? "All projects")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 Spacer()
                 Picker(
