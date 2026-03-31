@@ -195,9 +195,8 @@ V1 intentionally omits per-tool default args, environment overrides, and custom
 bazel flags. Those can be added later without changing the core model.
 
 The checked-in repo config must not contain user-machine install preferences
-such as the destination link directory. Those values vary by user and host and
-therefore belong in CLI flags, environment variables, or later user-local
-config outside the repo.
+such as the destination bin directory. Those values vary by user and host and
+therefore belong in CLI flags or later user-local config outside the repo.
 
 ### Naming Rules
 
@@ -226,6 +225,7 @@ Once installed, the user can rerun:
 
 ```bash
 runshim install
+runshim install --bin-dir ~/.local/bin
 ```
 
 from any repo that contains `RUNSHIM.toml`.
@@ -236,7 +236,7 @@ from any repo that contains `RUNSHIM.toml`.
 
 1. locate the repo root from the current working directory,
 2. parse `RUNSHIM.toml`,
-3. determine the target link directory from installer-local inputs,
+3. determine the target bin directory from `--bin-dir` or default `~/bin`,
 4. install or refresh the global `runshim` binary in that directory,
 5. create symlinks for every configured tool name pointing at that binary.
 
@@ -250,23 +250,36 @@ Example result:
 
 The install should be idempotent:
 
-- if `~/bin/boss` already points at `runshim`, leave it alone,
+- if `<bin-dir>/boss` already points at `runshim`, leave it alone,
 - if the global `runshim` binary already matches the installed path, replace it
   atomically only when needed,
 - rerunning install after adding new tools only adds the missing symlinks.
 
-### Link Directory
+### Bin Directory
 
 `~/bin` is the default because it is short, conventional, and matches the
 intended user model. The installer should:
 
 - treat the install destination as user-local state, not repo config,
 - create it if it does not exist,
-- warn if it is not on `PATH`,
-- accept it from `--link-dir`, then `RUNSHIM_LINK_DIR`, then default `~/bin`.
+- accept it from `--bin-dir`, otherwise default to `~/bin`,
+- warn, but still succeed, if the effective bin directory is not on `PATH`,
+- print a copy-pasteable shell-config fragment that adds that directory to
+  `PATH`.
 
 V1 does not need persistent user-local Runshim config. If we later add one, it
 should live outside the repo, for example under `~/.config/runshim/`.
+
+When warning about a missing `PATH` entry, Runshim should tailor the suggested
+fragment to the user's shell when it can:
+
+- for `zsh` and `bash`, print `export PATH="/path/to/bin:$PATH"`,
+- for `fish`, print `fish_add_path /path/to/bin`,
+- otherwise, fall back to the POSIX-style `export PATH=...` fragment.
+
+The warning is guidance, not a hard error. Installing into a directory that is
+not yet on `PATH` is still a valid workflow if the user plans to update their
+shell config next.
 
 ### Removal And Pruning
 
@@ -445,7 +458,7 @@ The v1 binary should make the common failures obvious:
 - `bazel build` failure,
 - configured target is not executable,
 - resolved executable path missing after build,
-- install link directory not writable.
+- install bin directory not writable.
 
 `runshim doctor` should validate the current repo and print:
 
@@ -453,7 +466,7 @@ The v1 binary should make the common failures obvious:
 - discovered config path,
 - configured tools,
 - whether each target appears executable,
-- effective install link directory,
+- effective install bin directory,
 - whether that directory is currently on `PATH`.
 
 ## Trust And Security Model
