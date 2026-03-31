@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::app::RunshimError;
+use crate::app::RepobinError;
 use crate::bazel::BazelAdapter;
 use crate::config::{RepoConfig, load_repo_config};
 
@@ -20,7 +20,7 @@ pub fn prepare_dispatch<B: BazelAdapter>(
     cwd: &Path,
     tool_name: &str,
     forwarded_args: &[OsString],
-) -> Result<DispatchPlan, RunshimError> {
+) -> Result<DispatchPlan, RepobinError> {
     let repo_config = load_repo_config(cwd)?;
     prepare_dispatch_from_repo_config(bazel, repo_config, cwd, tool_name, forwarded_args)
 }
@@ -31,13 +31,13 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
     cwd: &Path,
     tool_name: &str,
     forwarded_args: &[OsString],
-) -> Result<DispatchPlan, RunshimError> {
+) -> Result<DispatchPlan, RepobinError> {
     let tool =
         repo_config
             .config
             .tools
             .get(tool_name)
-            .ok_or_else(|| RunshimError::ToolNotConfigured {
+            .ok_or_else(|| RepobinError::ToolNotConfigured {
                 tool: tool_name.to_string(),
                 config_path: repo_config.config_path.clone(),
             })?;
@@ -74,7 +74,7 @@ mod tests {
     }
 
     impl BazelAdapter for FakeBazel {
-        fn build(&self, repo_root: &Path, target: &str) -> Result<(), crate::app::RunshimError> {
+        fn build(&self, repo_root: &Path, target: &str) -> Result<(), crate::app::RepobinError> {
             self.builds
                 .borrow_mut()
                 .push((repo_root.to_path_buf(), target.to_string()));
@@ -85,7 +85,7 @@ mod tests {
             &self,
             repo_root: &Path,
             target: &str,
-        ) -> Result<PathBuf, crate::app::RunshimError> {
+        ) -> Result<PathBuf, crate::app::RepobinError> {
             self.queries
                 .borrow_mut()
                 .push((repo_root.to_path_buf(), target.to_string()));
@@ -96,7 +96,7 @@ mod tests {
     fn sample_repo_config() -> RepoConfig {
         RepoConfig {
             repo_root: PathBuf::from("/repo"),
-            config_path: PathBuf::from("/repo/RUNSHIM.toml"),
+            config_path: PathBuf::from("/repo/REPOBIN.toml"),
             config: Config {
                 version: 1,
                 tools: BTreeMap::from([(

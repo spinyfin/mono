@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "runshim",
+    name = "repobin",
     about = "Install and dispatch repo-local Bazel tools"
 )]
 pub struct Cli {
@@ -15,9 +15,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Install runshim and repo-configured tool symlinks into a user bin directory.
+    /// Install repobin and repo-configured tool symlinks into a user bin directory.
     Install(InstallArgs),
-    /// Inspect the current repo's runshim configuration.
+    /// Inspect the current repo's repobin configuration.
     Doctor(DoctorArgs),
     /// List configured tool names for the current repo.
     List,
@@ -27,7 +27,7 @@ pub enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct BinDirArgs {
-    /// Directory that should receive the installed `runshim` binary and tool links.
+    /// Directory that should receive the installed `repobin` binary and tool links.
     #[arg(long, value_name = "DIR")]
     pub bin_dir: Option<PathBuf>,
 }
@@ -46,7 +46,7 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ExecArgs {
-    /// Tool name to resolve from RUNSHIM.toml.
+    /// Tool name to resolve from REPOBIN.toml.
     pub tool: String,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn install_accepts_bin_dir_override() {
-        let cli = Cli::parse_from(["runshim", "install", "--bin-dir", "~/.local/bin"]);
+        let cli = Cli::parse_from(["repobin", "install", "--bin-dir", "~/.local/bin"]);
 
         match cli.command {
             Command::Install(args) => {
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn exec_preserves_trailing_args() {
-        let cli = Cli::parse_from(["runshim", "exec", "boss", "--", "task", "list", "--json"]);
+        let cli = Cli::parse_from(["repobin", "exec", "boss", "--", "task", "list", "--json"]);
 
         match cli.command {
             Command::Exec(args) => {

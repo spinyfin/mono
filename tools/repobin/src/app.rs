@@ -12,10 +12,10 @@ use crate::config::{CONFIG_FILE_NAME, load_repo_config};
 use crate::dispatch::{DispatchPlan, prepare_dispatch};
 use crate::install::{current_home_dir, install, resolve_bin_dir};
 
-const RUNSHIM_BINARY_NAME: &str = "runshim";
+const REPOBIN_BINARY_NAME: &str = "repobin";
 
 #[derive(Debug, Error)]
-pub enum RunshimError {
+pub enum RepobinError {
     #[error("no {CONFIG_FILE_NAME} found from `{}` upward", start_dir.display())]
     ConfigNotFound { start_dir: PathBuf },
     #[error("failed to read config `{}`", path.display())]
@@ -44,20 +44,20 @@ pub enum RunshimError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to read runshim binary `{}`", path.display())]
+    #[error("failed to read repobin binary `{}`", path.display())]
     ReadInstalledBinary {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to copy runshim binary from `{}` to `{}`", from.display(), to.display())]
+    #[error("failed to copy repobin binary from `{}` to `{}`", from.display(), to.display())]
     CopyInstalledBinary {
         from: PathBuf,
         to: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to write installed runshim binary `{}`", path.display())]
+    #[error("failed to write installed repobin binary `{}`", path.display())]
     WriteInstalledBinary {
         path: PathBuf,
         #[source]
@@ -108,7 +108,7 @@ pub enum RunshimError {
     Io(#[from] std::io::Error),
 }
 
-impl RunshimError {
+impl RepobinError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::ConfigNotFound { .. }
@@ -122,16 +122,16 @@ impl RunshimError {
     }
 }
 
-pub fn run_from_env() -> Result<ExitCode, RunshimError> {
+pub fn run_from_env() -> Result<ExitCode, RepobinError> {
     let args = env::args_os().collect::<Vec<_>>();
     let argv0 = args
         .first()
         .cloned()
-        .unwrap_or_else(|| OsString::from(RUNSHIM_BINARY_NAME));
+        .unwrap_or_else(|| OsString::from(REPOBIN_BINARY_NAME));
     let invocation_name = invocation_name(&argv0);
     let cwd = env::current_dir()?;
 
-    if invocation_name != RUNSHIM_BINARY_NAME {
+    if invocation_name != REPOBIN_BINARY_NAME {
         let forwarded_args = args.get(1..).unwrap_or(&[]).to_vec();
         dispatch_tool(&cwd, &invocation_name, &forwarded_args)?;
         return Ok(ExitCode::SUCCESS);
@@ -142,7 +142,7 @@ pub fn run_from_env() -> Result<ExitCode, RunshimError> {
     run_cli(&cwd, &current_executable, cli)
 }
 
-fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, RunshimError> {
+fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, RepobinError> {
     match cli.command {
         CliCommand::Install(args) => {
             let repo_config = load_repo_config(cwd)?;
@@ -158,10 +158,10 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
                 home_dir.as_deref(),
             )?;
 
-            println!("Installed runshim to {}", report.installed_binary.display());
+            println!("Installed repobin to {}", report.installed_binary.display());
             for tool in &report.installed_tools {
                 println!(
-                    "Installed {} -> runshim",
+                    "Installed {} -> repobin",
                     report.bin_dir.join(tool).display()
                 );
             }
@@ -226,13 +226,13 @@ fn dispatch_tool(
     cwd: &Path,
     tool_name: &str,
     forwarded_args: &[OsString],
-) -> Result<(), RunshimError> {
-    let bazel = RealBazel::new(env::var_os("RUNSHIM_VERBOSE").is_some());
+) -> Result<(), RepobinError> {
+    let bazel = RealBazel::new(env::var_os("REPOBIN_VERBOSE").is_some());
     let plan = prepare_dispatch(&bazel, cwd, tool_name, forwarded_args)?;
     exec_dispatch(plan)
 }
 
-fn exec_dispatch(plan: DispatchPlan) -> Result<(), RunshimError> {
+fn exec_dispatch(plan: DispatchPlan) -> Result<(), RepobinError> {
     use std::os::unix::process::CommandExt;
 
     let error = Command::new(&plan.executable_path)
@@ -240,7 +240,7 @@ fn exec_dispatch(plan: DispatchPlan) -> Result<(), RunshimError> {
         .args(&plan.forwarded_args)
         .current_dir(&plan.original_cwd)
         .exec();
-    Err(RunshimError::ExecTool {
+    Err(RepobinError::ExecTool {
         path: plan.executable_path,
         source: error,
     })
@@ -251,7 +251,7 @@ fn invocation_name(argv0: &OsString) -> String {
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| RUNSHIM_BINARY_NAME.to_string())
+        .unwrap_or_else(|| REPOBIN_BINARY_NAME.to_string())
 }
 
 #[cfg(test)]
@@ -267,10 +267,10 @@ mod tests {
             invocation_name(&OsString::from("/Users/test/bin/boss")),
             "boss"
         );
-        assert_eq!(invocation_name(&OsString::from("runshim")), "runshim");
+        assert_eq!(invocation_name(&OsString::from("repobin")), "repobin");
         assert_eq!(
             invocation_name(&OsString::from(Path::new("").as_os_str())),
-            "runshim"
+            "repobin"
         );
     }
 }

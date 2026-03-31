@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Component, Path, PathBuf};
 
-use crate::app::RunshimError;
+use crate::app::RepobinError;
 use crate::config::RepoConfig;
 use crate::shell::{ShellFragment, bin_dir_on_path, path_update_fragment};
 
@@ -26,8 +26,8 @@ pub fn install(
     path_var: Option<&std::ffi::OsStr>,
     shell_var: Option<&std::ffi::OsStr>,
     home_dir: Option<&Path>,
-) -> Result<InstallReport, RunshimError> {
-    std::fs::create_dir_all(bin_dir).map_err(|source| RunshimError::CreateBinDir {
+) -> Result<InstallReport, RepobinError> {
+    std::fs::create_dir_all(bin_dir).map_err(|source| RepobinError::CreateBinDir {
         path: bin_dir.to_path_buf(),
         source,
     })?;
@@ -61,7 +61,7 @@ pub fn resolve_bin_dir(
     requested: Option<&Path>,
     cwd: &Path,
     home_dir: Option<&Path>,
-) -> Result<PathBuf, RunshimError> {
+) -> Result<PathBuf, RepobinError> {
     let path = if let Some(requested) = requested {
         expand_user_path(requested, home_dir)?
     } else {
@@ -75,14 +75,14 @@ pub fn resolve_bin_dir(
     }
 }
 
-fn default_bin_dir(home_dir: Option<&Path>) -> Result<PathBuf, RunshimError> {
+fn default_bin_dir(home_dir: Option<&Path>) -> Result<PathBuf, RepobinError> {
     let Some(home_dir) = home_dir else {
-        return Err(RunshimError::MissingHomeDirectory);
+        return Err(RepobinError::MissingHomeDirectory);
     };
     Ok(home_dir.join("bin"))
 }
 
-fn expand_user_path(path: &Path, home_dir: Option<&Path>) -> Result<PathBuf, RunshimError> {
+fn expand_user_path(path: &Path, home_dir: Option<&Path>) -> Result<PathBuf, RepobinError> {
     let mut components = path.components();
     let Some(first) = components.next() else {
         return Ok(path.to_path_buf());
@@ -92,7 +92,7 @@ fn expand_user_path(path: &Path, home_dir: Option<&Path>) -> Result<PathBuf, Run
     }
 
     let Some(home_dir) = home_dir else {
-        return Err(RunshimError::MissingHomeDirectory);
+        return Err(RepobinError::MissingHomeDirectory);
     };
 
     let mut expanded = home_dir.to_path_buf();
@@ -102,12 +102,12 @@ fn expand_user_path(path: &Path, home_dir: Option<&Path>) -> Result<PathBuf, Run
     Ok(expanded)
 }
 
-fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, RunshimError> {
-    let destination = bin_dir.join("runshim");
-    let temp_destination = temporary_path(bin_dir, ".runshim");
+fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, RepobinError> {
+    let destination = bin_dir.join("repobin");
+    let temp_destination = temporary_path(bin_dir, ".repobin");
 
     std::fs::copy(current_executable, &temp_destination).map_err(|source| {
-        RunshimError::CopyInstalledBinary {
+        RepobinError::CopyInstalledBinary {
             from: current_executable.to_path_buf(),
             to: destination.clone(),
             source,
@@ -115,20 +115,20 @@ fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, 
     })?;
 
     let permissions = std::fs::metadata(current_executable).map_err(|source| {
-        RunshimError::ReadInstalledBinary {
+        RepobinError::ReadInstalledBinary {
             path: current_executable.to_path_buf(),
             source,
         }
     })?;
     std::fs::set_permissions(&temp_destination, permissions.permissions()).map_err(|source| {
-        RunshimError::WriteInstalledBinary {
+        RepobinError::WriteInstalledBinary {
             path: temp_destination.clone(),
             source,
         }
     })?;
 
     std::fs::rename(&temp_destination, &destination).map_err(|source| {
-        RunshimError::WriteInstalledBinary {
+        RepobinError::WriteInstalledBinary {
             path: destination.clone(),
             source,
         }
@@ -137,20 +137,20 @@ fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, 
     Ok(destination)
 }
 
-fn install_tool_link(bin_dir: &Path, tool_name: &str) -> Result<(), RunshimError> {
+fn install_tool_link(bin_dir: &Path, tool_name: &str) -> Result<(), RepobinError> {
     let destination = bin_dir.join(tool_name);
     let temp_destination = temporary_path(bin_dir, &format!(".{tool_name}"));
 
     let _ = std::fs::remove_file(&temp_destination);
-    std::os::unix::fs::symlink("runshim", &temp_destination).map_err(|source| {
-        RunshimError::CreateToolSymlink {
+    std::os::unix::fs::symlink("repobin", &temp_destination).map_err(|source| {
+        RepobinError::CreateToolSymlink {
             path: destination.clone(),
             source,
         }
     })?;
 
     std::fs::rename(&temp_destination, &destination).map_err(|source| {
-        RunshimError::CreateToolSymlink {
+        RepobinError::CreateToolSymlink {
             path: destination.clone(),
             source,
         }
@@ -183,7 +183,7 @@ mod tests {
     fn sample_repo_config(root: &std::path::Path) -> RepoConfig {
         RepoConfig {
             repo_root: root.to_path_buf(),
-            config_path: root.join("RUNSHIM.toml"),
+            config_path: root.join("REPOBIN.toml"),
             config: Config {
                 version: 1,
                 tools: std::collections::BTreeMap::from([
@@ -232,7 +232,7 @@ mod tests {
     fn install_copies_binary_and_creates_tool_links() {
         let temp = TempDir::new().expect("tempdir");
         let repo = sample_repo_config(temp.path());
-        let source_binary = temp.path().join("runshim-source");
+        let source_binary = temp.path().join("repobin-source");
         fs::write(&source_binary, b"#!/bin/sh\nexit 0\n").expect("write source binary");
         fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755))
             .expect("chmod source binary");
@@ -255,12 +255,12 @@ mod tests {
             vec!["boss".to_string(), "cube".to_string()]
         );
         assert_eq!(
-            fs::read(bin_dir.join("runshim")).expect("read installed binary"),
+            fs::read(bin_dir.join("repobin")).expect("read installed binary"),
             b"#!/bin/sh\nexit 0\n"
         );
         assert_eq!(
             std::fs::read_link(bin_dir.join("boss")).expect("boss symlink"),
-            Path::new("runshim")
+            Path::new("repobin")
         );
         assert!(report.path_warning.is_some());
     }

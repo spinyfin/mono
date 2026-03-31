@@ -5,14 +5,14 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::app::RunshimError;
+use crate::app::RepobinError;
 
 const SLOW_BUILD_NOTICE: Duration = Duration::from_secs(3);
 const STREAM_BUILD_OUTPUT: Duration = Duration::from_secs(10);
 
 pub trait BazelAdapter {
-    fn build(&self, repo_root: &Path, target: &str) -> Result<(), RunshimError>;
-    fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, RunshimError>;
+    fn build(&self, repo_root: &Path, target: &str) -> Result<(), RepobinError>;
+    fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, RepobinError>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +27,7 @@ impl RealBazel {
 }
 
 impl BazelAdapter for RealBazel {
-    fn build(&self, repo_root: &Path, target: &str) -> Result<(), RunshimError> {
+    fn build(&self, repo_root: &Path, target: &str) -> Result<(), RepobinError> {
         let mut command = Command::new("bazel");
         command
             .arg("build")
@@ -41,7 +41,7 @@ impl BazelAdapter for RealBazel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|source| RunshimError::SpawnBazel {
+        let mut child = command.spawn().map_err(|source| RepobinError::SpawnBazel {
             action: "build".to_string(),
             source,
         })?;
@@ -49,14 +49,14 @@ impl BazelAdapter for RealBazel {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| RunshimError::SpawnBazel {
+            .ok_or_else(|| RepobinError::SpawnBazel {
                 action: "build".to_string(),
                 source: io::Error::other("missing stdout pipe"),
             })?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| RunshimError::SpawnBazel {
+            .ok_or_else(|| RepobinError::SpawnBazel {
                 action: "build".to_string(),
                 source: io::Error::other("missing stderr pipe"),
             })?;
@@ -71,7 +71,7 @@ impl BazelAdapter for RealBazel {
         let mut stderr_writer = io::stderr().lock();
 
         if self.verbose {
-            writeln!(stderr_writer, "runshim: building {target}...").ok();
+            writeln!(stderr_writer, "repobin: building {target}...").ok();
         }
 
         let status = loop {
@@ -86,7 +86,7 @@ impl BazelAdapter for RealBazel {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if let Some(status) =
-                        child.try_wait().map_err(|source| RunshimError::WaitBazel {
+                        child.try_wait().map_err(|source| RepobinError::WaitBazel {
                             action: "build".to_string(),
                             source,
                         })?
@@ -97,7 +97,7 @@ impl BazelAdapter for RealBazel {
             }
 
             if !printed_notice && started_at.elapsed() >= SLOW_BUILD_NOTICE {
-                writeln!(stderr_writer, "runshim: building {target}...").ok();
+                writeln!(stderr_writer, "repobin: building {target}...").ok();
                 stderr_writer.flush().ok();
                 printed_notice = true;
             }
@@ -105,7 +105,7 @@ impl BazelAdapter for RealBazel {
             if !streaming && started_at.elapsed() >= STREAM_BUILD_OUTPUT {
                 writeln!(
                     stderr_writer,
-                    "runshim: build still running; streaming Bazel output..."
+                    "repobin: build still running; streaming Bazel output..."
                 )
                 .ok();
                 if !combined_output.is_empty() {
@@ -115,7 +115,7 @@ impl BazelAdapter for RealBazel {
                 streaming = true;
             }
 
-            if let Some(status) = child.try_wait().map_err(|source| RunshimError::WaitBazel {
+            if let Some(status) = child.try_wait().map_err(|source| RepobinError::WaitBazel {
                 action: "build".to_string(),
                 source,
             })? {
@@ -133,14 +133,14 @@ impl BazelAdapter for RealBazel {
         stdout_handle
             .join()
             .expect("stdout reader thread")
-            .map_err(|source| RunshimError::ReadBazelOutput {
+            .map_err(|source| RepobinError::ReadBazelOutput {
                 action: "build".to_string(),
                 source,
             })?;
         stderr_handle
             .join()
             .expect("stderr reader thread")
-            .map_err(|source| RunshimError::ReadBazelOutput {
+            .map_err(|source| RepobinError::ReadBazelOutput {
                 action: "build".to_string(),
                 source,
             })?;
@@ -154,13 +154,13 @@ impl BazelAdapter for RealBazel {
             stderr_writer.flush().ok();
         }
 
-        Err(RunshimError::BazelBuildFailed {
+        Err(RepobinError::BazelBuildFailed {
             target: target.to_string(),
             status: status.code(),
         })
     }
 
-    fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, RunshimError> {
+    fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, RepobinError> {
         let output = Command::new("bazel")
             .arg("cquery")
             .arg("--color=no")
@@ -170,13 +170,13 @@ impl BazelAdapter for RealBazel {
             .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
             .current_dir(repo_root)
             .output()
-            .map_err(|source| RunshimError::SpawnBazel {
+            .map_err(|source| RepobinError::SpawnBazel {
                 action: "cquery".to_string(),
                 source,
             })?;
 
         if !output.status.success() {
-            return Err(RunshimError::BazelQueryFailed {
+            return Err(RepobinError::BazelQueryFailed {
                 target: target.to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
@@ -187,7 +187,7 @@ impl BazelAdapter for RealBazel {
             .trim_matches('"')
             .to_string();
         if raw.is_empty() {
-            return Err(RunshimError::TargetNotExecutable {
+            return Err(RepobinError::TargetNotExecutable {
                 target: target.to_string(),
             });
         }

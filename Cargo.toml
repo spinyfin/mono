@@ -7,7 +7,7 @@ members = [
   "tools/checkleft",
   "tools/checkleft_package",
   "tools/cube",
-  "tools/runshim",
+  "tools/repobin",
 ]
 resolver = "2"
 

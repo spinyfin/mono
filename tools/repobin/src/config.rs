@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::app::RunshimError;
+use crate::app::RepobinError;
 
-pub const CONFIG_FILE_NAME: &str = "RUNSHIM.toml";
+pub const CONFIG_FILE_NAME: &str = "REPOBIN.toml";
 const SUPPORTED_VERSION: u32 = 1;
-const RESERVED_TOOL_NAME: &str = "runshim";
+const RESERVED_TOOL_NAME: &str = "repobin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoConfig {
@@ -28,23 +28,23 @@ pub struct ToolConfig {
 }
 
 impl Config {
-    pub fn validate(&self) -> Result<(), RunshimError> {
+    pub fn validate(&self) -> Result<(), RepobinError> {
         if self.version != SUPPORTED_VERSION {
-            return Err(RunshimError::UnsupportedConfigVersion {
+            return Err(RepobinError::UnsupportedConfigVersion {
                 version: self.version,
             });
         }
 
         if self.tools.is_empty() {
-            return Err(RunshimError::InvalidConfig(
-                "RUNSHIM.toml must define at least one tool".to_string(),
+            return Err(RepobinError::InvalidConfig(
+                "REPOBIN.toml must define at least one tool".to_string(),
             ));
         }
 
         for (name, tool) in &self.tools {
             validate_tool_name(name)?;
             if tool.target.trim().is_empty() {
-                return Err(RunshimError::InvalidConfig(format!(
+                return Err(RepobinError::InvalidConfig(format!(
                     "tool `{name}` must declare a non-empty Bazel target"
                 )));
             }
@@ -54,21 +54,21 @@ impl Config {
     }
 }
 
-pub fn load_repo_config(start_dir: &Path) -> Result<RepoConfig, RunshimError> {
-    let config_path = find_config_path(start_dir).ok_or_else(|| RunshimError::ConfigNotFound {
+pub fn load_repo_config(start_dir: &Path) -> Result<RepoConfig, RepobinError> {
+    let config_path = find_config_path(start_dir).ok_or_else(|| RepobinError::ConfigNotFound {
         start_dir: start_dir.to_path_buf(),
     })?;
     let repo_root = config_path.parent().map(PathBuf::from).ok_or_else(|| {
-        RunshimError::InvalidConfig(format!(
+        RepobinError::InvalidConfig(format!(
             "config path `{}` has no parent directory",
             config_path.display()
         ))
     })?;
-    let raw = std::fs::read_to_string(&config_path).map_err(|source| RunshimError::ReadConfig {
+    let raw = std::fs::read_to_string(&config_path).map_err(|source| RepobinError::ReadConfig {
         path: config_path.clone(),
         source,
     })?;
-    let config: Config = toml::from_str(&raw).map_err(|source| RunshimError::ParseConfig {
+    let config: Config = toml::from_str(&raw).map_err(|source| RepobinError::ParseConfig {
         path: config_path.clone(),
         source,
     })?;
@@ -92,24 +92,24 @@ pub fn find_config_path(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn validate_tool_name(name: &str) -> Result<(), RunshimError> {
+fn validate_tool_name(name: &str) -> Result<(), RepobinError> {
     if name.is_empty() {
-        return Err(RunshimError::InvalidConfig(
+        return Err(RepobinError::InvalidConfig(
             "tool names must not be empty".to_string(),
         ));
     }
     if name == "." || name == ".." {
-        return Err(RunshimError::InvalidConfig(format!(
+        return Err(RepobinError::InvalidConfig(format!(
             "tool name `{name}` is not allowed"
         )));
     }
     if name == RESERVED_TOOL_NAME {
-        return Err(RunshimError::InvalidConfig(format!(
+        return Err(RepobinError::InvalidConfig(format!(
             "tool name `{RESERVED_TOOL_NAME}` is reserved"
         )));
     }
     if name.contains('/') {
-        return Err(RunshimError::InvalidConfig(format!(
+        return Err(RepobinError::InvalidConfig(format!(
             "tool name `{name}` must not contain path separators"
         )));
     }
@@ -117,7 +117,7 @@ fn validate_tool_name(name: &str) -> Result<(), RunshimError> {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(RunshimError::InvalidConfig(format!(
+        return Err(RepobinError::InvalidConfig(format!(
             "tool name `{name}` may only contain ASCII letters, digits, '.', '_' or '-'"
         )));
     }
@@ -160,7 +160,7 @@ mod tests {
         let path = temp.path().join(CONFIG_FILE_NAME);
         fs::write(
             &path,
-            "version = 1\n[tools.runshim]\ntarget = \"//:tool\"\n",
+            "version = 1\n[tools.repobin]\ntarget = \"//:tool\"\n",
         )
         .expect("write config");
 
@@ -168,7 +168,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("tool name `runshim` is reserved")
+                .contains("tool name `repobin` is reserved")
         );
     }
 }

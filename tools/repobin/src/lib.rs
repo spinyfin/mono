@@ -6,4 +6,4 @@ mod dispatch;
 mod install;
 mod shell;
 
-pub use app::{RunshimError, run_from_env};
+pub use app::{RepobinError, run_from_env};

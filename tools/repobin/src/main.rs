@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use runshim::run_from_env;
+use repobin::run_from_env;
 
 fn main() -> ExitCode {
     match run_from_env() {
