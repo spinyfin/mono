@@ -77,7 +77,7 @@ Example:
 repo: mono
 origin: git@github.com:spinyfin/mono.git
 main_branch: main
-workspace_root: ~/Documents/dev/workspaces
+workspace_root: ~/.local/share/cube/workspaces
 workspace_prefix: mono-agent-
 pr_provider: github
 setup_steps:
@@ -85,6 +85,15 @@ setup_steps:
     command: ./tools/dev/decode-secrets.sh
   - id: deps
     command: pnpm install --frozen-lockfile
+```
+
+When Cube materializes repo pools by convention, it should use Cube-managed
+roots rather than an existing human-managed workspace pool. A reasonable
+default is:
+
+```text
+repos: ~/.local/share/cube/repos
+workspaces: ~/.local/share/cube/workspaces
 ```
 
 ### Workspace Lease

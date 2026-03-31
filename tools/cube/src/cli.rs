@@ -39,6 +39,12 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum RepoCommand {
+    /// Resolve or materialize a repo pool from its origin URL.
+    Ensure {
+        /// Origin URL for the repo.
+        #[arg(long)]
+        origin: String,
+    },
     /// Add or update repo pool configuration.
     Add {
         /// Stable repo identifier such as `mono`.
@@ -194,7 +200,27 @@ pub struct DoctorArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{ChangeCommand, Cli, Command, PrCommand, WorkspaceCommand};
+    use super::{ChangeCommand, Cli, Command, PrCommand, RepoCommand, WorkspaceCommand};
+
+    #[test]
+    fn repo_ensure_matches_phase_a_shape() {
+        let cli = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+
+        match cli.command {
+            Command::Repo {
+                command: RepoCommand::Ensure { origin },
+            } => {
+                assert_eq!(origin, "git@github.com:spinyfin/mono.git");
+            }
+            _ => panic!("expected repo ensure command"),
+        }
+    }
 
     #[test]
     fn workspace_lease_matches_docs_shape() {
