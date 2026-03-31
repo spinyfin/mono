@@ -338,6 +338,11 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    func presentEditSelectedProduct() {
+        guard let product = selectedProduct else { return }
+        pendingWorkEditRequest = WorkEditRequest(item: .product(product))
+    }
+
     func dismissWorkEditRequest() {
         pendingWorkEditRequest = nil
     }
