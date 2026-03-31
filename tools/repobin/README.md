@@ -34,6 +34,17 @@ repobin install
 repobin install --bin-dir ~/.local/bin
 ```
 
+If you use `direnv`, a lightweight setup is to make sure the same install
+directory is on `PATH` while you are in the repo:
+
+```bash
+export REPOBIN_BIN_DIR="${REPOBIN_BIN_DIR:-$HOME/bin}"
+PATH_add "$REPOBIN_BIN_DIR"
+```
+
+That keeps `boss`, `cube`, and other configured commands available without
+having `.envrc` mutate global install state on directory entry.
+
 Once installed, invoking a configured tool from inside that repo will:
 
 1. find the nearest `REPOBIN.toml`,
@@ -57,3 +68,5 @@ repobin exec boss -- task list
 - It expects a working `bazel` entry point on `PATH`.
 - `repobin install` defaults to `~/bin` and warns if the chosen directory is
   not on `PATH`.
+- If you use `direnv`, prefer adding the chosen `repobin` bin dir to `PATH`
+  rather than running `repobin install` from `.envrc`.

@@ -281,6 +281,11 @@ The warning is guidance, not a hard error. Installing into a directory that is
 not yet on `PATH` is still a valid workflow if the user plans to update their
 shell config next.
 
+For users who already rely on `direnv`, a lightweight integration is to add the
+chosen `repobin` bin directory to `PATH` from `.envrc`. V1 does not need deeper
+`direnv` coupling than that, and should avoid running `repobin install` during
+directory entry.
+
 ### Removal And Pruning
 
 V1 should not try to implement a full repo-aware uninstall story. Because the
