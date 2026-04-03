@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::work::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
-    Task, WorkItem, WorkItemPatch,
+    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
+    CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project, Task, WorkAttentionItem,
+    WorkExecution, WorkItem, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -125,6 +126,36 @@ pub enum FrontendRequest {
         project_id: String,
         task_ids: Vec<String>,
     },
+    CreateExecution {
+        #[serde(flatten)]
+        input: CreateExecutionInput,
+    },
+    ListExecutions {
+        work_item_id: Option<String>,
+    },
+    GetExecution {
+        id: String,
+    },
+    CreateRun {
+        #[serde(flatten)]
+        input: CreateRunInput,
+    },
+    ListRuns {
+        execution_id: String,
+    },
+    GetRun {
+        id: String,
+    },
+    CreateAttentionItem {
+        #[serde(flatten)]
+        input: CreateAttentionItemInput,
+    },
+    ListAttentionItems {
+        execution_id: String,
+    },
+    GetAttentionItem {
+        id: String,
+    },
     CreateAgent {
         name: Option<String>,
         #[serde(default)]
@@ -199,6 +230,36 @@ pub enum FrontendEvent {
     ProjectTasksReordered {
         project_id: String,
         task_ids: Vec<String>,
+    },
+    ExecutionsList {
+        work_item_id: Option<String>,
+        executions: Vec<WorkExecution>,
+    },
+    ExecutionResult {
+        execution: WorkExecution,
+    },
+    ExecutionCreated {
+        execution: WorkExecution,
+    },
+    RunsList {
+        execution_id: String,
+        runs: Vec<WorkRun>,
+    },
+    RunResult {
+        run: WorkRun,
+    },
+    RunCreated {
+        run: WorkRun,
+    },
+    AttentionItemsList {
+        execution_id: String,
+        items: Vec<WorkAttentionItem>,
+    },
+    AttentionItemResult {
+        item: WorkAttentionItem,
+    },
+    AttentionItemCreated {
+        item: WorkAttentionItem,
     },
     WorkItemDeleted {
         id: String,
