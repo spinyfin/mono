@@ -56,6 +56,48 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkExecution {
+    pub id: String,
+    pub work_item_id: String,
+    pub kind: String,
+    pub status: String,
+    pub repo_remote_url: String,
+    pub cube_repo_id: Option<String>,
+    pub cube_lease_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkRun {
+    pub id: String,
+    pub execution_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub error_text: Option<String>,
+    pub result_summary: Option<String>,
+    pub transcript_path: Option<String>,
+    pub artifacts_path: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkAttentionItem {
+    pub id: String,
+    pub execution_id: String,
+    pub kind: String,
+    pub status: String,
+    pub title: String,
+    pub body_markdown: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkTree {
     pub product: Product,
     pub projects: Vec<Project>,
@@ -100,6 +142,42 @@ pub struct CreateChoreInput {
     pub product_id: String,
     pub name: String,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateExecutionInput {
+    pub work_item_id: String,
+    pub kind: String,
+    pub status: Option<String>,
+    pub repo_remote_url: Option<String>,
+    pub cube_repo_id: Option<String>,
+    pub cube_lease_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateRunInput {
+    pub execution_id: String,
+    pub agent_id: String,
+    pub status: Option<String>,
+    pub error_text: Option<String>,
+    pub result_summary: Option<String>,
+    pub transcript_path: Option<String>,
+    pub artifacts_path: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateAttentionItemInput {
+    pub execution_id: String,
+    pub kind: String,
+    pub status: Option<String>,
+    pub title: String,
+    pub body_markdown: String,
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +321,195 @@ impl WorkDb {
             query_task(&tx, &id)?.with_context(|| format!("missing chore after insert: {id}"))?;
         tx.commit()?;
         Ok(task)
+    }
+
+    pub fn create_execution(&self, input: CreateExecutionInput) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let repo_remote_url = resolve_execution_repo_remote_url(
+            &tx,
+            &input.work_item_id,
+            normalize_optional_text(input.repo_remote_url),
+        )?;
+        let id = next_id("exec");
+        let now = now_string();
+        let status = input.status.unwrap_or_else(|| "queued".to_owned());
+        let cube_repo_id = normalize_optional_text(input.cube_repo_id);
+        let cube_lease_id = normalize_optional_text(input.cube_lease_id);
+        let workspace_path = normalize_optional_text(input.workspace_path);
+        let started_at = normalize_optional_text(input.started_at);
+        let finished_at = normalize_optional_text(input.finished_at);
+
+        tx.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                workspace_path, created_at, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                input.work_item_id,
+                input.kind,
+                status,
+                repo_remote_url,
+                cube_repo_id,
+                cube_lease_id,
+                workspace_path,
+                now,
+                started_at,
+                finished_at,
+            ],
+        )?;
+
+        let execution = query_execution(&tx, &id)?
+            .with_context(|| format!("missing execution after insert: {id}"))?;
+        tx.commit()?;
+        Ok(execution)
+    }
+
+    pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        if let Some(work_item_id) = work_item_id {
+            let _ = product_id_for_work_item(&conn, work_item_id)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                        workspace_path, created_at, started_at, finished_at
+                 FROM work_executions
+                 WHERE work_item_id = ?1
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([work_item_id], map_execution)?;
+            return collect_rows(rows);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    workspace_path, created_at, started_at, finished_at
+             FROM work_executions
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_execution(&self, id: &str) -> Result<WorkExecution> {
+        let conn = self.connect()?;
+        query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
+    }
+
+    pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        ensure_execution_exists(&tx, &input.execution_id)?;
+
+        let id = next_id("run");
+        let now = now_string();
+        let status = input.status.unwrap_or_else(|| "starting".to_owned());
+        let error_text = normalize_optional_text(input.error_text);
+        let result_summary = normalize_optional_text(input.result_summary);
+        let transcript_path = normalize_optional_text(input.transcript_path);
+        let artifacts_path = normalize_optional_text(input.artifacts_path);
+        let started_at = normalize_optional_text(input.started_at);
+        let finished_at = normalize_optional_text(input.finished_at);
+
+        tx.execute(
+            "INSERT INTO work_runs (
+                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                input.execution_id,
+                input.agent_id,
+                status,
+                error_text,
+                result_summary,
+                transcript_path,
+                artifacts_path,
+                now,
+                started_at,
+                finished_at,
+            ],
+        )?;
+
+        let run =
+            query_run(&tx, &id)?.with_context(|| format!("missing run after insert: {id}"))?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn list_runs(&self, execution_id: &str) -> Result<Vec<WorkRun>> {
+        let conn = self.connect()?;
+        ensure_execution_exists(&conn, execution_id)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                    artifacts_path, created_at, started_at, finished_at
+             FROM work_runs
+             WHERE execution_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([execution_id], map_run)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_run(&self, id: &str) -> Result<WorkRun> {
+        let conn = self.connect()?;
+        query_run(&conn, id)?.with_context(|| format!("unknown run: {id}"))
+    }
+
+    pub fn create_attention_item(
+        &self,
+        input: CreateAttentionItemInput,
+    ) -> Result<WorkAttentionItem> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        ensure_execution_exists(&tx, &input.execution_id)?;
+
+        let id = next_id("attn");
+        let now = now_string();
+        let status = input.status.unwrap_or_else(|| "open".to_owned());
+        let resolved_at = normalize_optional_text(input.resolved_at);
+
+        tx.execute(
+            "INSERT INTO work_attention_items (
+                id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                input.execution_id,
+                input.kind,
+                status,
+                input.title,
+                input.body_markdown,
+                now,
+                resolved_at,
+            ],
+        )?;
+
+        let item = query_attention_item(&tx, &id)?
+            .with_context(|| format!("missing attention item after insert: {id}"))?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    pub fn list_attention_items(&self, execution_id: &str) -> Result<Vec<WorkAttentionItem>> {
+        let conn = self.connect()?;
+        ensure_execution_exists(&conn, execution_id)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+             FROM work_attention_items
+             WHERE execution_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([execution_id], map_attention_item)?;
+        collect_rows(rows)
+    }
+
+    pub fn get_attention_item(&self, id: &str) -> Result<WorkAttentionItem> {
+        let conn = self.connect()?;
+        query_attention_item(&conn, id)?.with_context(|| format!("unknown attention item: {id}"))
     }
 
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
@@ -468,10 +735,58 @@ impl WorkDb {
 
             CREATE INDEX IF NOT EXISTS tasks_project_idx
                 ON tasks(project_id, deleted_at, ordinal);
+
+            CREATE TABLE IF NOT EXISTS work_executions (
+                id TEXT PRIMARY KEY,
+                work_item_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                repo_remote_url TEXT NOT NULL,
+                cube_repo_id TEXT,
+                cube_lease_id TEXT,
+                workspace_path TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
+                ON work_executions(work_item_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS work_runs (
+                id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_text TEXT,
+                result_summary TEXT,
+                transcript_path TEXT,
+                artifacts_path TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS work_runs_execution_idx
+                ON work_runs(execution_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS work_attention_items (
+                id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body_markdown TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
+                ON work_attention_items(execution_id, created_at);
             ",
         )?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '1')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '2')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -647,6 +962,51 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
+    Ok(WorkExecution {
+        id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        kind: row.get(2)?,
+        status: row.get(3)?,
+        repo_remote_url: row.get(4)?,
+        cube_repo_id: row.get(5)?,
+        cube_lease_id: row.get(6)?,
+        workspace_path: row.get(7)?,
+        created_at: row.get(8)?,
+        started_at: row.get(9)?,
+        finished_at: row.get(10)?,
+    })
+}
+
+fn map_run(row: &Row<'_>) -> rusqlite::Result<WorkRun> {
+    Ok(WorkRun {
+        id: row.get(0)?,
+        execution_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        status: row.get(3)?,
+        error_text: row.get(4)?,
+        result_summary: row.get(5)?,
+        transcript_path: row.get(6)?,
+        artifacts_path: row.get(7)?,
+        created_at: row.get(8)?,
+        started_at: row.get(9)?,
+        finished_at: row.get(10)?,
+    })
+}
+
+fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
+    Ok(WorkAttentionItem {
+        id: row.get(0)?,
+        execution_id: row.get(1)?,
+        kind: row.get(2)?,
+        status: row.get(3)?,
+        title: row.get(4)?,
+        body_markdown: row.get(5)?,
+        created_at: row.get(6)?,
+        resolved_at: row.get(7)?,
+    })
+}
+
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
         "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at
@@ -678,6 +1038,44 @@ fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
          WHERE id = ?1",
         [id],
         map_task,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>> {
+    conn.query_row(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                workspace_path, created_at, started_at, finished_at
+         FROM work_executions
+         WHERE id = ?1",
+        [id],
+        map_execution,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
+    conn.query_row(
+        "SELECT id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at
+         FROM work_runs
+         WHERE id = ?1",
+        [id],
+        map_run,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttentionItem>> {
+    conn.query_row(
+        "SELECT id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+         FROM work_attention_items
+         WHERE id = ?1",
+        [id],
+        map_attention_item,
     )
     .optional()
     .map_err(Into::into)
@@ -721,6 +1119,53 @@ fn ensure_project_belongs_to_product(
         bail!("project {project_id} does not belong to product {product_id}");
     }
     Ok(())
+}
+
+fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
+        [execution_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if exists == 0 {
+        bail!("unknown execution: {execution_id}");
+    }
+    Ok(())
+}
+
+fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
+    match classify_id(work_item_id)? {
+        ItemKind::Product => query_product(conn, work_item_id)?
+            .map(|product| product.id)
+            .with_context(|| format!("unknown product: {work_item_id}")),
+        ItemKind::Project => query_project(conn, work_item_id)?
+            .map(|project| project.product_id)
+            .with_context(|| format!("unknown project: {work_item_id}")),
+        ItemKind::Task => query_task(conn, work_item_id)?
+            .filter(|task| task.deleted_at.is_none())
+            .map(|task| task.product_id)
+            .with_context(|| format!("unknown task: {work_item_id}")),
+    }
+}
+
+fn resolve_execution_repo_remote_url(
+    conn: &Connection,
+    work_item_id: &str,
+    explicit_repo_remote_url: Option<String>,
+) -> Result<String> {
+    if let Some(repo_remote_url) = explicit_repo_remote_url {
+        let _ = product_id_for_work_item(conn, work_item_id)?;
+        return Ok(repo_remote_url);
+    }
+
+    let product_id = product_id_for_work_item(conn, work_item_id)?;
+    let product = query_product(conn, &product_id)?
+        .with_context(|| format!("unknown product: {product_id}"))?;
+    product.repo_remote_url.with_context(|| {
+        format!(
+            "work item {work_item_id} does not resolve to a product repo_remote_url; provide one explicitly"
+        )
+    })
 }
 
 fn next_task_ordinal(conn: &Connection, project_id: &str) -> Result<i64> {
@@ -996,6 +1441,153 @@ mod tests {
         let tree = db.get_work_tree(&product.id).unwrap();
         assert_eq!(tree.tasks[0].id, second.id);
         assert_eq!(tree.tasks[1].id, first.id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn creates_and_lists_execution_entities() {
+        let path = temp_db_path("executions");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Execution foundation".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Schema".to_owned(),
+                description: None,
+            })
+            .unwrap();
+
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: task.id.clone(),
+                kind: "task_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: Some("cube_repo_mono".to_owned()),
+                cube_lease_id: None,
+                workspace_path: Some("/tmp/mono-agent-001".to_owned()),
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        assert_eq!(
+            execution.repo_remote_url,
+            "git@github.com:spinyfin/mono.git"
+        );
+
+        let run = db
+            .create_run(CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent_1".to_owned(),
+                status: Some("active".to_owned()),
+                error_text: None,
+                result_summary: Some("started work".to_owned()),
+                transcript_path: Some("/tmp/transcript.jsonl".to_owned()),
+                artifacts_path: Some("/tmp/artifacts".to_owned()),
+                started_at: Some("100".to_owned()),
+                finished_at: None,
+            })
+            .unwrap();
+        let attention = db
+            .create_attention_item(CreateAttentionItemInput {
+                execution_id: execution.id.clone(),
+                kind: "decision_required".to_owned(),
+                status: Some("open".to_owned()),
+                title: "Need product call".to_owned(),
+                body_markdown: "Please decide.".to_owned(),
+                resolved_at: None,
+            })
+            .unwrap();
+
+        let executions = db.list_executions(Some(&task.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].id, execution.id);
+        assert_eq!(db.get_execution(&execution.id).unwrap().id, execution.id);
+
+        let runs = db.list_runs(&execution.id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+        assert_eq!(
+            db.get_run(&run.id).unwrap().transcript_path.as_deref(),
+            Some("/tmp/transcript.jsonl")
+        );
+
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, attention.id);
+        assert_eq!(
+            db.get_attention_item(&attention.id).unwrap().title,
+            "Need product call"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn execution_requires_repo_remote_url_snapshot() {
+        let path = temp_db_path("execution-repo");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let err = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: product.id.clone(),
+                kind: "project_design".to_owned(),
+                status: None,
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not resolve to a product repo_remote_url")
+        );
+
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: product.id.clone(),
+                kind: "project_design".to_owned(),
+                status: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        assert_eq!(
+            execution.repo_remote_url,
+            "git@github.com:spinyfin/mono.git"
+        );
 
         let _ = std::fs::remove_file(path);
     }

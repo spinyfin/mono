@@ -914,6 +914,172 @@ async fn handle_frontend_connection(
                     );
                 }
             },
+            FrontendRequest::CreateExecution { input } => match work_db.create_execution(input) {
+                Ok(execution) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ExecutionCreated { execution },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::ListExecutions { work_item_id } => {
+                match work_db.list_executions(work_item_id.as_deref()) {
+                    Ok(executions) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::ExecutionsList {
+                                work_item_id,
+                                executions,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::GetExecution { id } => match work_db.get_execution(&id) {
+                Ok(execution) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::ExecutionResult { execution },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::CreateRun { input } => match work_db.create_run(input) {
+                Ok(run) => {
+                    send_response(&event_tx, &request_id, FrontendEvent::RunCreated { run });
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::ListRuns { execution_id } => match work_db.list_runs(&execution_id) {
+                Ok(runs) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::RunsList { execution_id, runs },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::GetRun { id } => match work_db.get_run(&id) {
+                Ok(run) => {
+                    send_response(&event_tx, &request_id, FrontendEvent::RunResult { run });
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::CreateAttentionItem { input } => {
+                match work_db.create_attention_item(input) {
+                    Ok(item) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::AttentionItemCreated { item },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::ListAttentionItems { execution_id } => {
+                match work_db.list_attention_items(&execution_id) {
+                    Ok(items) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::AttentionItemsList {
+                                execution_id,
+                                items,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &event_tx,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::GetAttentionItem { id } => match work_db.get_attention_item(&id) {
+                Ok(item) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::AttentionItemResult { item },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &event_tx,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
             FrontendRequest::CreateAgent { name, role } => {
                 let (agent_id, agent_name, role) = registry.allocate_agent(name, role);
                 send_response(
