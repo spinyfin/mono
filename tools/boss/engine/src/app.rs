@@ -1385,6 +1385,31 @@ async fn publish_work_invalidation(
     product_id: Option<String>,
     item_ids: Vec<String>,
 ) -> u64 {
+    if let Some(product_id) = product_id.as_deref() {
+        match server_state
+            .work_db
+            .reconcile_product_executions(product_id)
+        {
+            Ok(result) => {
+                if !result.created.is_empty() || !result.updated.is_empty() {
+                    tracing::info!(
+                        product_id,
+                        created = result.created.len(),
+                        updated = result.updated.len(),
+                        "reconciled product executions"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    product_id,
+                    "failed to reconcile product executions after work invalidation"
+                );
+            }
+        }
+    }
+
     let revision = server_state.bump_work_revision();
     let event = FrontendEvent::TopicEvent {
         topic: String::new(),

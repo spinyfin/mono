@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,6 +96,12 @@ pub struct WorkAttentionItem {
     pub body_markdown: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionReconcileResult {
+    pub created: Vec<WorkExecution>,
+    pub updated: Vec<WorkExecution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,43 +333,7 @@ impl WorkDb {
     pub fn create_execution(&self, input: CreateExecutionInput) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-
-        let repo_remote_url = resolve_execution_repo_remote_url(
-            &tx,
-            &input.work_item_id,
-            normalize_optional_text(input.repo_remote_url),
-        )?;
-        let id = next_id("exec");
-        let now = now_string();
-        let status = input.status.unwrap_or_else(|| "queued".to_owned());
-        let cube_repo_id = normalize_optional_text(input.cube_repo_id);
-        let cube_lease_id = normalize_optional_text(input.cube_lease_id);
-        let workspace_path = normalize_optional_text(input.workspace_path);
-        let started_at = normalize_optional_text(input.started_at);
-        let finished_at = normalize_optional_text(input.finished_at);
-
-        tx.execute(
-            "INSERT INTO work_executions (
-                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                workspace_path, created_at, started_at, finished_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                id,
-                input.work_item_id,
-                input.kind,
-                status,
-                repo_remote_url,
-                cube_repo_id,
-                cube_lease_id,
-                workspace_path,
-                now,
-                started_at,
-                finished_at,
-            ],
-        )?;
-
-        let execution = query_execution(&tx, &id)?
-            .with_context(|| format!("missing execution after insert: {id}"))?;
+        let execution = insert_execution(&tx, input)?;
         tx.commit()?;
         Ok(execution)
     }
@@ -395,6 +366,96 @@ impl WorkDb {
     pub fn get_execution(&self, id: &str) -> Result<WorkExecution> {
         let conn = self.connect()?;
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
+    }
+
+    pub fn reconcile_product_executions(
+        &self,
+        product_id: &str,
+    ) -> Result<ExecutionReconcileResult> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let product = query_product(&tx, product_id)?
+            .with_context(|| format!("unknown product: {product_id}"))?;
+        let projects = list_projects_for_product(&tx, product_id)?;
+        let tasks = list_tasks_for_product(&tx, product_id)?;
+        let mut result = ExecutionReconcileResult::default();
+
+        let repo_remote_url = product.repo_remote_url.clone();
+
+        for project in &projects {
+            if !project_accepts_execution(project) {
+                continue;
+            }
+            reconcile_work_item_execution(
+                &tx,
+                &mut result,
+                &project.id,
+                "project_design",
+                "ready",
+                repo_remote_url.as_deref(),
+            )?;
+        }
+
+        let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
+        for task in tasks {
+            match task.kind.as_str() {
+                "chore" => {
+                    if task_accepts_execution(&task) {
+                        reconcile_work_item_execution(
+                            &tx,
+                            &mut result,
+                            &task.id,
+                            "chore_implementation",
+                            "ready",
+                            repo_remote_url.as_deref(),
+                        )?;
+                    }
+                }
+                "project_task" => {
+                    if let Some(project_id) = &task.project_id {
+                        project_tasks
+                            .entry(project_id.clone())
+                            .or_default()
+                            .push(task);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for tasks in project_tasks.values_mut() {
+            tasks.sort_by(|left, right| {
+                left.ordinal
+                    .unwrap_or(i64::MAX)
+                    .cmp(&right.ordinal.unwrap_or(i64::MAX))
+                    .then_with(|| left.created_at.cmp(&right.created_at))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+
+            let first_incomplete = tasks.iter().position(|task| task_accepts_execution(task));
+
+            for (index, task) in tasks.iter().enumerate() {
+                if !task_accepts_execution(task) {
+                    continue;
+                }
+                let desired_status = if Some(index) == first_incomplete {
+                    "ready"
+                } else {
+                    "waiting_dependency"
+                };
+                reconcile_work_item_execution(
+                    &tx,
+                    &mut result,
+                    &task.id,
+                    "task_implementation",
+                    desired_status,
+                    repo_remote_url.as_deref(),
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
@@ -1007,6 +1068,44 @@ fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
     })
 }
 
+fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<WorkExecution> {
+    let repo_remote_url = resolve_execution_repo_remote_url(
+        conn,
+        &input.work_item_id,
+        normalize_optional_text(input.repo_remote_url),
+    )?;
+    let id = next_id("exec");
+    let now = now_string();
+    let status = input.status.unwrap_or_else(|| "queued".to_owned());
+    let cube_repo_id = normalize_optional_text(input.cube_repo_id);
+    let cube_lease_id = normalize_optional_text(input.cube_lease_id);
+    let workspace_path = normalize_optional_text(input.workspace_path);
+    let started_at = normalize_optional_text(input.started_at);
+    let finished_at = normalize_optional_text(input.finished_at);
+
+    conn.execute(
+        "INSERT INTO work_executions (
+            id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+            workspace_path, created_at, started_at, finished_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            input.work_item_id,
+            input.kind,
+            status,
+            repo_remote_url,
+            cube_repo_id,
+            cube_lease_id,
+            workspace_path,
+            now,
+            started_at,
+            finished_at,
+        ],
+    )?;
+
+    query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))
+}
+
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
         "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at
@@ -1081,6 +1180,28 @@ fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttent
     .map_err(Into::into)
 }
 
+fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at
+         FROM projects
+         WHERE product_id = ?1
+         ORDER BY created_at ASC, name COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt.query_map([product_id], map_project)?;
+    collect_rows(rows)
+}
+
+fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+         FROM tasks
+         WHERE product_id = ?1 AND deleted_at IS NULL
+         ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([product_id], map_task)?;
+    collect_rows(rows)
+}
+
 fn ensure_product_exists(conn: &Connection, product_id: &str) -> Result<()> {
     let exists = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM products WHERE id = ?1)",
@@ -1131,6 +1252,96 @@ fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> 
         bail!("unknown execution: {execution_id}");
     }
     Ok(())
+}
+
+fn query_latest_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.query_row(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                workspace_path, created_at, started_at, finished_at
+         FROM work_executions
+         WHERE work_item_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        [work_item_id],
+        map_execution,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn reconcile_work_item_execution(
+    conn: &Connection,
+    result: &mut ExecutionReconcileResult,
+    work_item_id: &str,
+    kind: &str,
+    desired_status: &str,
+    repo_remote_url: Option<&str>,
+) -> Result<()> {
+    match query_latest_execution_for_work_item(conn, work_item_id)? {
+        Some(execution) => {
+            if execution.kind == kind
+                && can_reconcile_execution_status(&execution.status)
+                && execution.status != desired_status
+            {
+                let updated = update_execution_status(conn, &execution.id, desired_status)?;
+                result.updated.push(updated);
+            }
+        }
+        None => {
+            let Some(repo_remote_url) = repo_remote_url else {
+                return Ok(());
+            };
+            let created = insert_execution(
+                conn,
+                CreateExecutionInput {
+                    work_item_id: work_item_id.to_owned(),
+                    kind: kind.to_owned(),
+                    status: Some(desired_status.to_owned()),
+                    repo_remote_url: Some(repo_remote_url.to_owned()),
+                    cube_repo_id: None,
+                    cube_lease_id: None,
+                    workspace_path: None,
+                    started_at: None,
+                    finished_at: None,
+                },
+            )?;
+            result.created.push(created);
+        }
+    }
+
+    Ok(())
+}
+
+fn update_execution_status(
+    conn: &Connection,
+    execution_id: &str,
+    status: &str,
+) -> Result<WorkExecution> {
+    let updated = conn.execute(
+        "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+        params![execution_id, status],
+    )?;
+    if updated == 0 {
+        bail!("unknown execution: {execution_id}");
+    }
+
+    query_execution(conn, execution_id)?
+        .with_context(|| format!("unknown execution: {execution_id}"))
+}
+
+fn can_reconcile_execution_status(status: &str) -> bool {
+    matches!(status, "queued" | "ready" | "waiting_dependency")
+}
+
+fn project_accepts_execution(project: &Project) -> bool {
+    !matches!(project.status.as_str(), "done" | "archived")
+}
+
+fn task_accepts_execution(task: &Task) -> bool {
+    task.deleted_at.is_none() && task.status != "done"
 }
 
 fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
@@ -1588,6 +1799,185 @@ mod tests {
             execution.repo_remote_url,
             "git@github.com:spinyfin/mono.git"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconciles_missing_executions_for_product_tree() {
+        let path = temp_db_path("reconcile-tree");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Execution coordinator".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+        let first_task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "First".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let second_task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Second".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(result.created.len(), 4);
+        assert!(result.updated.is_empty());
+
+        let first_execution = db.list_executions(Some(&first_task.id)).unwrap();
+        assert_eq!(first_execution.len(), 1);
+        assert_eq!(first_execution[0].kind, "task_implementation");
+        assert_eq!(first_execution[0].status, "ready");
+
+        let second_execution = db.list_executions(Some(&second_task.id)).unwrap();
+        assert_eq!(second_execution.len(), 1);
+        assert_eq!(second_execution[0].status, "waiting_dependency");
+
+        let chore_execution = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(chore_execution.len(), 1);
+        assert_eq!(chore_execution[0].kind, "chore_implementation");
+        assert_eq!(chore_execution[0].status, "ready");
+
+        let second_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(second_pass.created.is_empty());
+        assert!(second_pass.updated.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconcile_promotes_next_project_task_when_previous_done() {
+        let path = temp_db_path("reconcile-promote");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Execution coordinator".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+        let first_task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "First".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let second_task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Second".to_owned(),
+                description: None,
+            })
+            .unwrap();
+
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.update_work_item(
+            &first_task.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(result.created.is_empty());
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].work_item_id, second_task.id);
+        assert_eq!(result.updated[0].status, "ready");
+
+        let second_execution = db.list_executions(Some(&second_task.id)).unwrap();
+        assert_eq!(second_execution[0].status, "ready");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconcile_waits_for_product_repo_remote_url() {
+        let path = temp_db_path("reconcile-repo");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Execution coordinator".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "First".to_owned(),
+                description: None,
+            })
+            .unwrap();
+
+        let first_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(first_pass.created.is_empty());
+        assert!(db.list_executions(None).unwrap().is_empty());
+
+        db.update_work_item(
+            &product.id,
+            WorkItemPatch {
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let second_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(second_pass.created.len(), 2);
+
+        let task_execution = db.list_executions(Some(&task.id)).unwrap();
+        assert_eq!(task_execution.len(), 1);
+        assert_eq!(task_execution[0].status, "ready");
 
         let _ = std::fs::remove_file(path);
     }
