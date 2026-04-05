@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
+use crate::coordinator::{CommandCubeClient, ExecutionCoordinator, WorkerPool};
 use crate::protocol::{
     AgentInfo, AgentRole, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
     FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
@@ -201,6 +202,7 @@ fn compose_agent_prompt(system_prompt: Option<&str>, user_text: &str) -> String 
 struct ServerState {
     work_db: Arc<WorkDb>,
     agent_registry: Arc<AgentRegistry>,
+    execution_coordinator: Arc<ExecutionCoordinator>,
     topic_broker: Arc<TopicBroker>,
     next_session_id: AtomicU64,
     work_revision: AtomicU64,
@@ -208,9 +210,17 @@ struct ServerState {
 
 impl ServerState {
     fn new(cfg: &RuntimeConfig) -> Result<Self> {
+        let work_db = Arc::new(WorkDb::open(cfg.db_path.clone())?);
+        let worker_pool = WorkerPool::new(cfg.worker_pool_size);
+        let execution_coordinator = Arc::new(ExecutionCoordinator::new(
+            work_db.clone(),
+            worker_pool,
+            Arc::new(CommandCubeClient::new(cfg.clone())),
+        ));
         Ok(Self {
-            work_db: Arc::new(WorkDb::open(cfg.db_path.clone())?),
+            work_db,
             agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
+            execution_coordinator,
             topic_broker: Arc::new(TopicBroker::default()),
             next_session_id: AtomicU64::new(1),
             work_revision: AtomicU64::new(0),
@@ -428,6 +438,11 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
     tracing::info!(socket_path = %socket_path, "frontend socket is ready");
     tracing::info!(pid, pid_file = %pid_path, "engine pid file is ready");
     println!("boss-engine listening on {socket_path}");
+
+    let coordinator = server_state.execution_coordinator.clone();
+    tokio::spawn(async move {
+        coordinator.kick().await;
+    });
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
@@ -1408,6 +1423,11 @@ async fn publish_work_invalidation(
                 );
             }
         }
+
+        let coordinator = server_state.execution_coordinator.clone();
+        tokio::spawn(async move {
+            coordinator.kick().await;
+        });
     }
 
     let revision = server_state.bump_work_revision();

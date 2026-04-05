@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 const DEFAULT_ACP_COMMAND: &str = "npx -y @zed-industries/claude-code-acp@0.16.1";
+const DEFAULT_CUBE_COMMAND: &str = "bazel run //tools/cube:cube --";
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -12,8 +13,16 @@ pub struct AcpConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct CubeConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub acp: AcpConfig,
+    pub cube: CubeConfig,
+    pub worker_pool_size: usize,
     pub cwd: PathBuf,
     pub db_path: PathBuf,
 }
@@ -22,14 +31,22 @@ impl RuntimeConfig {
     pub fn load_from_env() -> Result<Self> {
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
-        let acp_command_line =
-            std::env::var("BOSS_ACP_CMD").unwrap_or_else(|_| DEFAULT_ACP_COMMAND.to_owned());
-        let parts = shlex::split(&acp_command_line)
-            .with_context(|| format!("could not parse BOSS_ACP_CMD: {acp_command_line}"))?;
-
-        let Some((acp_command, acp_args)) = parts.split_first() else {
-            bail!("BOSS_ACP_CMD resolved to an empty command");
-        };
+        let (acp_command, acp_args) = parse_command_line(
+            "BOSS_ACP_CMD",
+            std::env::var("BOSS_ACP_CMD").unwrap_or_else(|_| DEFAULT_ACP_COMMAND.to_owned()),
+        )?;
+        let (cube_command, cube_args) = parse_command_line(
+            "BOSS_CUBE_CMD",
+            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| DEFAULT_CUBE_COMMAND.to_owned()),
+        )?;
+        let worker_pool_size = std::env::var("BOSS_WORKER_POOL_SIZE")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| format!("could not parse BOSS_WORKER_POOL_SIZE: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(1);
 
         let cwd = resolve_runtime_cwd()?;
         let db_path = match std::env::var_os("BOSS_DB_PATH") {
@@ -40,9 +57,14 @@ impl RuntimeConfig {
         Ok(Self {
             acp: AcpConfig {
                 anthropic_api_key,
-                command: acp_command.clone(),
-                args: acp_args.to_vec(),
+                command: acp_command,
+                args: acp_args,
             },
+            cube: CubeConfig {
+                command: cube_command,
+                args: cube_args,
+            },
+            worker_pool_size,
             cwd,
             db_path,
         })
@@ -66,6 +88,17 @@ impl RuntimeConfig {
 
         Ok(())
     }
+}
+
+fn parse_command_line(env_var: &str, command_line: String) -> Result<(String, Vec<String>)> {
+    let parts = shlex::split(&command_line)
+        .with_context(|| format!("could not parse {env_var}: {command_line}"))?;
+
+    let Some((command, args)) = parts.split_first() else {
+        bail!("{env_var} resolved to an empty command");
+    };
+
+    Ok((command.clone(), args.to_vec()))
 }
 
 fn resolve_runtime_cwd() -> Result<PathBuf> {

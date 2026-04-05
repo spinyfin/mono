@@ -9,6 +9,7 @@ rust_library(
         "src/app.rs",
         "src/cli.rs",
         "src/config.rs",
+        "src/coordinator.rs",
         "src/lib.rs",
         "src/protocol.rs",
         "src/work.rs",
