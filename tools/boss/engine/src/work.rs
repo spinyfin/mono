@@ -368,6 +368,19 @@ impl WorkDb {
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
     }
 
+    pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    workspace_path, created_at, started_at, finished_at
+             FROM work_executions
+             WHERE status = 'ready'
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
     pub fn reconcile_product_executions(
         &self,
         product_id: &str,
@@ -456,6 +469,109 @@ impl WorkDb {
 
         tx.commit()?;
         Ok(result)
+    }
+
+    pub fn start_execution_run(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: &str,
+        cube_lease_id: &str,
+        workspace_path: &str,
+    ) -> Result<(WorkExecution, WorkRun)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution.status != "ready" {
+            bail!(
+                "execution {execution_id} is not ready and cannot start a run from status `{}`",
+                execution.status
+            );
+        }
+
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'running',
+                 cube_repo_id = ?2,
+                 cube_lease_id = ?3,
+                 workspace_path = ?4,
+                 started_at = COALESCE(started_at, ?5),
+                 finished_at = NULL
+             WHERE id = ?1",
+            params![
+                execution_id,
+                cube_repo_id,
+                cube_lease_id,
+                workspace_path,
+                now
+            ],
+        )?;
+
+        let run_id = next_id("run");
+        tx.execute(
+            "INSERT INTO work_runs (
+                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL)",
+            params![run_id, execution_id, agent_id, now],
+        )?;
+
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let run = query_run(&tx, &run_id)?
+            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        tx.commit()?;
+        Ok((execution, run))
+    }
+
+    pub fn fail_execution_start(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: Option<&str>,
+        error_text: &str,
+    ) -> Result<(WorkExecution, WorkRun)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution.status != "ready" {
+            bail!(
+                "execution {execution_id} is not ready and cannot fail startup from status `{}`",
+                execution.status
+            );
+        }
+
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'failed',
+                 cube_repo_id = COALESCE(?2, cube_repo_id),
+                 cube_lease_id = NULL,
+                 workspace_path = NULL,
+                 started_at = COALESCE(started_at, ?3),
+                 finished_at = ?3
+             WHERE id = ?1",
+            params![execution_id, cube_repo_id, now],
+        )?;
+
+        let run_id = next_id("run");
+        tx.execute(
+            "INSERT INTO work_runs (
+                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, 'failed', ?4, NULL, NULL, NULL, ?5, ?5, ?5)",
+            params![run_id, execution_id, agent_id, error_text, now],
+        )?;
+
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let run = query_run(&tx, &run_id)?
+            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        tx.commit()?;
+        Ok((execution, run))
     }
 
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
@@ -1978,6 +2094,121 @@ mod tests {
         let task_execution = db.list_executions(Some(&task.id)).unwrap();
         assert_eq!(task_execution.len(), 1);
         assert_eq!(task_execution[0].status, "ready");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn starts_ready_execution_run_and_attaches_workspace() {
+        let path = temp_db_path("start-run");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+        assert_eq!(execution.status, "running");
+        assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+        assert_eq!(
+            execution.workspace_path.as_deref(),
+            Some("/tmp/mono-agent-001")
+        );
+        assert!(execution.started_at.is_some());
+        assert_eq!(run.execution_id, execution.id);
+        assert_eq!(run.agent_id, "worker-1");
+        assert_eq!(run.status, "active");
+        assert!(run.started_at.is_some());
+        assert!(run.finished_at.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn records_failed_execution_start_attempt() {
+        let path = temp_db_path("fail-run");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let (execution, run) = db
+            .fail_execution_start(
+                &execution.id,
+                "worker-1",
+                Some("mono"),
+                "cube workspace lease failed",
+            )
+            .unwrap();
+        assert_eq!(execution.status, "failed");
+        assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
+        assert!(execution.cube_lease_id.is_none());
+        assert!(execution.workspace_path.is_none());
+        assert!(execution.finished_at.is_some());
+        assert_eq!(run.status, "failed");
+        assert_eq!(
+            run.error_text.as_deref(),
+            Some("cube workspace lease failed")
+        );
+        assert!(run.finished_at.is_some());
 
         let _ = std::fs::remove_file(path);
     }
