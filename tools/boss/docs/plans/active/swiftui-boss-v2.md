@@ -20,8 +20,11 @@ itself. Its job is planning, delegation, monitoring, and aggregation.
 ### Core experience
 
 - The main macOS app remains the primary surface.
+- The `Work` mode remains the main place the human interacts with Boss.
+- The Boss terminal/panel in `Work` is special and remains the primary command
+  surface.
 - The `Agents` mode becomes a live control room built out of embedded Ghostty
-  panes.
+  panes, but it is secondary and mostly operational.
 - There is one dedicated Boss Claude terminal and eight worker Claude
   terminals.
 - Workers are shown in a fixed `2 x 4` tiled grid.
@@ -36,6 +39,7 @@ itself. Its job is planning, delegation, monitoring, and aggregation.
   the Boss control room needs its own top-level tab.
 - Boss-specific framing in the UI, including status chips, selection state,
   and room for future work-management integration.
+- The special Boss panel in `Work` as the main human-facing interaction point.
 - The current project and task tracking model.
 - The ability for Boss to create and manage work items.
 - The existing `boss` work CLI direction and engine-backed persistence model.
@@ -58,6 +62,8 @@ Adopt a hybrid architecture:
 - make the Boss terminal capable of both:
   - managing work items through the existing `boss` CLI surface
   - coordinating worker terminals through a new control surface
+- keep the human mostly interacting through the `Work` mode Boss panel rather
+  than through the raw agent panes
 
 ## Proposed V2 Architecture
 
@@ -89,6 +95,7 @@ Adopt a hybrid architecture:
 The recommended split is:
 
 - SwiftUI app + Ghostty:
+  - special Boss panel in `Work`
   - pane layout
   - embedded terminals
   - launch/focus/interrupt/send-to-pane controls
@@ -111,16 +118,34 @@ The recommended split is:
 
 ### Initial UI layout
 
-Use the current Boss app shell, but change the `Agents` detail area to a
-control-room layout:
+Use the current Boss app shell with two distinct interaction layers:
+
+- `Work` remains the primary planning and command surface
+- `Agents` remains the lower-level live execution surface
+
+#### Work mode
+
+Keep the current high-level structure:
+
+- work board / product + project + task UI
+- special Boss panel docked in the work experience
+- Boss status, execution summary, and selected-work context visible near the
+  Boss panel
+
+The Boss panel in `Work` is where the human normally asks for work to be
+planned, decomposed, started, or monitored.
+
+#### Agents mode
+
+Change the `Agents` detail area to a control-room layout:
 
 - top section: large Boss terminal
 - secondary header: Boss status, worker summary, control status
 - main section: fixed `2 x 4` grid of worker terminals
 - optional side strip: selected worker details, alerts, or command results
 
-This keeps the "main window interaction is with the Boss" requirement while
-still making workers directly visible.
+This keeps raw worker terminals available for inspection and intervention
+without making them the primary day-to-day interaction surface.
 
 ## Command and Control Surface
 
@@ -132,6 +157,10 @@ inside its terminal session, without depending on custom MCP installation.
 It also needs continued access to the work-management surface so it can create,
 update, inspect, and organize products/projects/tasks/chores the way Boss does
 today.
+
+The control surface also needs to support "start this work item now if an agent
+is available" semantics, because some tasks should move directly from planning
+to execution.
 
 ### Preferred approach
 
@@ -157,6 +186,8 @@ Capabilities should include:
 - `bossctl agents launch <id>`
 - `bossctl agents stop <id>`
 - `bossctl workspace summary`
+- `bossctl work start <work-item-id>`
+- `bossctl work status <work-item-id>`
 
 The Boss session should be able to use both command families:
 
@@ -208,6 +239,83 @@ This should be enforced in two places:
 1. launch/bootstrap prompt for the Boss session
 2. command-surface design that makes delegation easier than direct work
 
+## Intent Inference and Execution Policy
+
+The Boss should infer whether a user request is ready for immediate execution
+or should only become planned work.
+
+### Immediate execution case
+
+If a request appears:
+
+- self-contained
+- small enough to fit a normal agent task
+- concrete enough to execute without a larger planning pass
+
+then Boss should:
+
+1. create the necessary project/task structure if needed
+2. start execution immediately if an agent is available
+3. otherwise leave the task queued / ready-to-start
+
+Examples:
+
+- a bounded bug fix
+- a small feature with clear acceptance criteria
+- a contained refactor
+
+### Planning-first case
+
+If a request appears to be part of a broader planning effort, scoping exercise,
+or multi-part initiative, Boss should:
+
+1. create or update the relevant project and task items
+2. avoid starting execution automatically
+3. present the planned work for review or later manual start
+
+Examples:
+
+- "let's scope this feature"
+- "here are five things we probably need to do"
+- early decomposition of a larger initiative
+
+### Capacity rule
+
+If all worker agents are busy:
+
+- Boss may still create projects/tasks/chores
+- Boss must not start new execution immediately
+- Boss should mark the work as queued or ready and explain that execution is
+  waiting on capacity
+
+### Manual start rule
+
+The human must also be able to start work items directly from the project/work
+UI, subject to the same capacity constraints.
+
+Manual start should:
+
+- create an execution if one does not exist
+- assign an available worker if one is free
+- otherwise leave the work in a queued/ready state
+
+### Suggested decision model
+
+The first implementation does not need a perfect planner. A practical policy is
+enough:
+
+- Boss decides between:
+  - `plan_only`
+  - `plan_and_start`
+- that decision is based on:
+  - request size
+  - whether the request is singular vs multi-part
+  - whether required context already exists
+  - current worker availability
+
+This can start as explicit prompt/policy logic in Boss and later become a more
+structured scheduler decision in the backend.
+
 ## State Model
 
 ### Per terminal session
@@ -235,6 +343,9 @@ This should be enforced in two places:
 - app bootstrap state
 - current product/project/task context
 - work data synchronization state
+- available worker count
+- queued/runnable work items
+- active execution assignments
 
 ## Monitoring Strategy
 
@@ -257,6 +368,13 @@ state should increasingly come from app-owned models.
 For work items and execution metadata, the source of truth should remain the
 durable backend rather than screen scraping.
 
+That backend should be able to answer:
+
+- which work items are merely planned
+- which are runnable
+- which are queued waiting on capacity
+- which are actively assigned to agents
+
 ## Migration Strategy
 
 ### Phase 1: shell-preserving rewrite
@@ -275,6 +393,7 @@ durable backend rather than screen scraping.
 - support list/status/send/interrupt/focus operations
 - log command activity in app state
 - keep `boss` available for work-item management
+- support `start work item` operations gated by worker availability
 
 ### Phase 3: Boss bootstrap contract
 
@@ -284,6 +403,7 @@ durable backend rather than screen scraping.
   - the worker-control reference
 - verify Boss uses workers instead of doing work locally
 - verify Boss can still create and update work items correctly
+- verify Boss chooses reasonably between `plan_only` and `plan_and_start`
 
 ### Phase 4: Work-mode reintegration
 
@@ -291,6 +411,7 @@ durable backend rather than screen scraping.
 - preserve the existing work persistence model unless there is a strong reason
   to change it
 - unify agent execution status with work-item status in the UI where useful
+- add manual "start task/project work now" affordances in the Work UI
 
 ## Open Design Questions
 
@@ -298,8 +419,10 @@ durable backend rather than screen scraping.
 
 Current recommendation:
 
-- Boss gets the dominant area in `Agents`
-- workers live below it in the `2 x 4` grid
+- Boss remains special in `Work`
+- `Agents` exposes the lower-level terminal control room
+- the Boss terminal may still appear in `Agents`, but that is secondary to its
+  role in `Work`
 
 Alternative:
 
@@ -342,17 +465,20 @@ You asked for a fixed initial shape. Current recommendation:
 The first slice should prove the new architecture with the least moving parts:
 
 1. keep the current Boss app shell
-2. replace `Agents` detail with one Boss Ghostty pane plus an `8`-worker grid
-3. auto-launch Claude in all panes
-4. preserve the existing work model and `boss` CLI availability
-5. provide a minimal `bossctl` with:
+2. preserve the Boss panel in `Work` as the primary human interaction surface
+3. replace `Agents` detail with one Boss Ghostty pane plus an `8`-worker grid
+4. auto-launch Claude in all panes
+5. preserve the existing work model and `boss` CLI availability
+6. provide a minimal `bossctl` with:
    - `agents list`
    - `agents status`
    - `agents send`
-6. give `bossctl` only to the Boss pane
-7. bootstrap Boss with:
+   - `work start`
+7. give `bossctl` only to the Boss pane
+8. bootstrap Boss with:
    - "coordinate only; never do implementation work directly"
    - "you may create and manage work items through `boss`"
+   - "start bounded work immediately when appropriate and capacity allows"
 
 If that works, we can decide how much of the orchestration path belongs in
 Swift versus Rust, without disturbing the existing work model.
