@@ -239,6 +239,10 @@ This should be enforced in two places:
 1. launch/bootstrap prompt for the Boss session
 2. command-surface design that makes delegation easier than direct work
 
+The Boss is also allowed to actively probe workers when it needs better
+confidence about execution state. It does not have to treat worker status as
+purely passive telemetry.
+
 ## Intent Inference and Execution Policy
 
 The Boss should infer whether a user request is ready for immediate execution
@@ -316,6 +320,61 @@ enough:
 This can start as explicit prompt/policy logic in Boss and later become a more
 structured scheduler decision in the backend.
 
+## Agent Probing and State Verification
+
+Boss should be able to query workers before making important workflow
+transitions.
+
+### Why probing matters
+
+Terminal liveness and heuristic Claude-state detection are useful, but they are
+not enough to answer questions like:
+
+- is this task actually complete?
+- is the agent blocked but has not surfaced it clearly yet?
+- is the work ready for review, or is the agent still cleaning things up?
+- does the agent need another instruction before yielding?
+
+For those cases, Boss should be able to ask the assigned agent directly.
+
+### Probe model
+
+Boss may issue a lightweight follow-up request to a worker such as:
+
+- summarize current status
+- report whether the task is complete
+- report whether tests have run
+- report whether a PR is ready
+- report blockers or next steps
+
+This should be treated as normal orchestration work, not as a special escape
+hatch.
+
+### Transition rule
+
+Boss should avoid marking a work item as a more-advanced state such as:
+
+- ready for review
+- waiting human
+- completed
+
+unless one of the following is true:
+
+1. the state is directly evidenced by structured app/backend state
+2. the agent has explicitly reported that status
+3. Boss has probed the agent and received a satisfactory response
+
+### Initial implementation policy
+
+The first implementation can keep this simple:
+
+- Boss decides when confidence is low
+- if confidence is low, Boss probes the assigned worker before changing state
+- probe responses are visible in app state and optionally in the work history
+
+This does not require a fully formal verification protocol on day one, but it
+does require that Boss be able to interrogate workers on demand.
+
 ## State Model
 
 ### Per terminal session
@@ -346,6 +405,8 @@ structured scheduler decision in the backend.
 - available worker count
 - queued/runnable work items
 - active execution assignments
+- last probe result by worker
+- probe-required execution states, if we decide to track them explicitly
 
 ## Monitoring Strategy
 
@@ -361,6 +422,7 @@ But V2 should add a stronger side channel where possible:
 - worker launch / interrupt / prompt-submit actions are recorded by the app
 - the Boss control surface can return structured status independent of screen
   scraping
+- Boss-issued probes and their responses are recorded as first-class events
 
 This means Ghostty observation remains useful for UI liveness, but operational
 state should increasingly come from app-owned models.
@@ -374,6 +436,12 @@ That backend should be able to answer:
 - which are runnable
 - which are queued waiting on capacity
 - which are actively assigned to agents
+
+It is also useful for the system to answer:
+
+- when Boss last probed a given agent
+- what status the agent last explicitly reported
+- whether a transition like `ready for review` was inferred or confirmed
 
 ## Migration Strategy
 
@@ -394,6 +462,7 @@ That backend should be able to answer:
 - log command activity in app state
 - keep `boss` available for work-item management
 - support `start work item` operations gated by worker availability
+- support targeted worker probes from Boss
 
 ### Phase 3: Boss bootstrap contract
 
@@ -404,6 +473,7 @@ That backend should be able to answer:
 - verify Boss uses workers instead of doing work locally
 - verify Boss can still create and update work items correctly
 - verify Boss chooses reasonably between `plan_only` and `plan_and_start`
+- verify Boss probes agents before making uncertain workflow-state transitions
 
 ### Phase 4: Work-mode reintegration
 
@@ -479,6 +549,7 @@ The first slice should prove the new architecture with the least moving parts:
    - "coordinate only; never do implementation work directly"
    - "you may create and manage work items through `boss`"
    - "start bounded work immediately when appropriate and capacity allows"
+   - "probe agents when you need confidence before changing task state"
 
 If that works, we can decide how much of the orchestration path belongs in
 Swift versus Rust, without disturbing the existing work model.
