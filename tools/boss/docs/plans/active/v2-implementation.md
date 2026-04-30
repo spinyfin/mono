@@ -131,29 +131,45 @@ connected clients in real time.
 
 ---
 
-### Phase 3: Kanban Work tab
+### Phase 3: Kanban Work tab — remaining filters
 
-**Goal.** Replace the tree-first Work tab with a kanban board.
+**Goal.** Finish the kanban Work tab by adding the two filter
+toggles and upgrading project filtering to multi-select.
 
-**Deliverables.**
+**Status.** The board itself has shipped. Already in place in
+`tools/boss/app-macos/Sources/{Models.swift, ChatViewModel.swift,
+ContentView.swift}`: `selectedProductID`, `boardGrouping`,
+`selectedCardID` state; four fixed columns with status mapping;
+task/chore cards with project label, blocked badge, PR link;
+drag-and-drop and menu-based move actions; quick-add in Backlog;
+project-grouping toggle; card inspector for create/edit; real-time
+updates via subscriptions; UserDefaults persistence.
 
-- Frontend state: `selectedProductID`, `selectedProjectFilterIDs`,
-  `includeChores`, `showBlockedOnly`, `boardGrouping`,
-  `selectedCardID`.
-- Four fixed columns (Backlog / Doing / Review / Done) with status
-  mapping per the design.
-- Card primitives for tasks and chores; project label, blocked
-  badge, PR link.
-- Move actions between columns (menu first, drag-and-drop second).
-- Quick-add affordance at top of Backlog.
-- Project filters and project-grouping toggle in left sidebar.
-- Inspector for create/edit on a selected card.
+**Deliverables (delta only).**
+
+- Frontend state additions:
+  - `includeChores: Bool` (default true) — when false, hide chore
+    cards from the board.
+  - `showBlockedOnly: Bool` (default false) — when true, show only
+    items with `blocked == true`.
+  - Replace single-select `selectedWorkProjectFilterID: String?`
+    with `selectedProjectFilterIDs: Set<String>` to allow
+    multi-project filtering.
+- Sidebar UI:
+  - "Include chores" and "Show blocked only" toggles in the left
+    sidebar Options section.
+  - Project filter list switches from radio-style (All / one
+    project) to multi-select checkboxes; "All Projects" clears the
+    set.
+- Persistence: add the three new state fields to UserDefaults
+  alongside the existing board state.
 
 **Done when.**
 
-- Human can manage all current work-taxonomy CRUD through the kanban
-  board without dropping to the tree view.
-- Status changes from `boss` CLI propagate live to the board.
+- The two toggles correctly filter board contents in real time.
+- Multiple projects can be selected simultaneously and the board
+  reflects the union.
+- The three new selections survive an app restart.
 
 **Depends on.** Phase 2.
 
