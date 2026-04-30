@@ -35,10 +35,10 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | Phase | Title                                          | Status                       |
 |-------|------------------------------------------------|------------------------------|
 | 1     | Engine and CLI foundations                     | 🟡 deliverables in `main`, work still in flight (see `mono-agent-001` lease) |
-| 2     | Multi-client subscriptions                     | ✅ shipped (verify back-pressure) |
+| 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
 | 3     | Kanban Work tab                                | 🟡 board done, three filters left |
-| 4     | Execution layer + cube V2 prereqs              | ✅ shipped                   |
-| 5     | ExecutionCoordinator                           | 🟡 mostly shipped — `request_execution` RPC + waiting-state semantics gap |
+| 4     | Execution layer + cube V2 prereqs              | 🟡 mostly shipped — cube driver missing `status` subcommand |
+| 5     | ExecutionCoordinator                           | 🟡 partially shipped — multiple gaps (worker affinity/LRU, `executions.<id>` topic, `request_execution` RPC, waiting-state semantics) |
 | 6     | libghostty embedding and worker spawn          | ❌ not started               |
 | 7     | Boss session and bossctl                       | ❌ not started               |
 | 8     | Review and attention                           | 🟡 attention-item schema only |
@@ -145,33 +145,43 @@ public-facing `boss` CLI for work-taxonomy CRUD.
 
 ---
 
-### Phase 2: Multi-client subscriptions — ✅ shipped (verify slow-client policy)
+### Phase 2: Multi-client subscriptions — 🟡 mostly shipped
 
 **Goal.** Make work mutations from any client propagate to all
 connected clients in real time.
 
-**Status.** Substantially complete. Evidence:
+**Status (done).**
 
 - `ServerState` with `WorkDb`, `TopicBroker`, `AtomicU64`
   `work_revision` (`engine/src/app.rs:207-244`).
-- `subscribe` / `unsubscribe` RPCs and `Subscribed` / `Unsubscribed`
-  responses (`engine/src/protocol.rs:79-84`).
+- `subscribe` / `unsubscribe` RPCs (`protocol.rs:79-84`) and
+  `Subscribed` / `Unsubscribed` responses (`protocol.rs:185-190`)
+  — both directions wired.
 - Topics `work.products` and `work.product.<id>` defined and
-  published (`engine/src/protocol.rs:9-12`; publish sites at
-  `engine/src/app.rs:346, 558, 694, 725, 756, 789, 823, 892`).
+  published (`protocol.rs:9-12`; publish sites at `app.rs:346,
+  558, 694, 725, 756, 789, 823, 892`).
 - `publish_work_invalidation()` fires after DB writes commit
-  (`engine/src/app.rs:1394-1458`).
+  (`app.rs:1394-1458`).
 - macOS app subscribes on connect and refetches on invalidation
   (`app-macos/Sources/ChatViewModel.swift`,
   `app-macos/Sources/EngineClient.swift`).
 
 **Pending.**
 
-- Verify the bounded outbound queue + same-topic coalescing + slow-
-  client disconnect policy is actually enforced end-to-end. The
-  `TopicBroker` infrastructure is there, but I have not confirmed
-  the back-pressure tests cover a deliberately-slow consumer. If
-  the policy is missing or weak, add it.
+- **Outbound queue is unbounded.** `TopicBroker` uses
+  `mpsc::unbounded_channel()` (`app.rs:255`); the publish path is
+  `let _ = sender.send(envelope.clone())` (`app.rs:359`) with no
+  back-pressure. The deliverable calls for a bounded queue —
+  pick a sensible bound and enforce it.
+- **No same-topic coalescing.** `grep` for "coalesce" /
+  "coalesc" in engine source returns nothing. Two rapid mutations
+  on the same product currently emit two invalidations.
+- **No slow-client disconnect policy.** Nothing closes the
+  session when the per-session queue fills. Once the queue is
+  bounded this becomes a hard requirement.
+- Confirm `work_revision` is exposed on **read** responses too,
+  not just subscribe responses. The deliverable calls for both;
+  I verified subscribe but not the read side.
 
 **Done when (acceptance, kept for the record).**
 
@@ -232,12 +242,12 @@ updates via subscriptions; UserDefaults persistence.
 
 ---
 
-### Phase 4: Execution layer plumbing + cube V2 prereqs — ✅ shipped
+### Phase 4: Execution layer plumbing + cube V2 prereqs — 🟡 mostly shipped
 
 **Goal.** Add durable execution / run / attention state and land the
 cube features Boss will hard-depend on.
 
-**Status.** Complete. Evidence:
+**Status (done).**
 
 - Cube V2 prerequisites all landed
   ([cube remaining-work "All V2 prerequisites have landed"](../../../../cube/docs/remaining-work.md)):
@@ -250,12 +260,22 @@ cube features Boss will hard-depend on.
   `work.rs:333-820`).
 - `WorkRun` carries `transcript_path` and `artifacts_path`
   (`engine/src/work.rs:75-87`); transcript path indexing wired.
-- Cube driver subsystem: `CubeClient` trait + `CommandCubeClient`
-  shells out to `cube repo ensure / workspace lease / release /
-  status` (`engine/src/coordinator.rs:33-180`).
+- Cube driver `CubeClient` trait + `CommandCubeClient` for
+  `ensure_repo` (`coordinator.rs:99`), `lease_workspace`
+  (`coordinator.rs:121`), `release_workspace`
+  (`coordinator.rs:170`).
 
 **Pending.**
 
+- Cube driver does **not** currently invoke `cube workspace status`
+  even though the original deliverable named it. No `status` method
+  on `CubeClient`, no shell-out site (`grep` for "workspace.*status"
+  in `coordinator.rs` returns nothing). Either add it or drop it
+  from the deliverable.
+- Cube driver also does not invoke `cube workspace heartbeat` or
+  `cube workspace force-release`. The cube CLI supports both;
+  engine-side callers are missing. Heartbeat is needed by Phase 9;
+  force-release is needed by reconcile.
 - Per-execution on-disk dir layout under
   `~/Library/Application Support/Boss/executions/<id>/` is modelled
   (path stored on `WorkRun`) but not yet populated by anything that
@@ -279,46 +299,65 @@ Phase B; [cube remaining-work](../../../../cube/docs/remaining-work.md).
 
 ---
 
-### Phase 5: ExecutionCoordinator — 🟡 mostly shipped, one RPC + one semantics gap
+### Phase 5: ExecutionCoordinator — 🟡 partially shipped
 
 **Goal.** Add the server-global scheduler that turns work-item
 events into runs.
 
 **Status (done).**
 
-- `ExecutionCoordinator` struct with `coordinate()`
-  (`engine/src/coordinator.rs:177-260`).
+- `ExecutionCoordinator` struct exists (`coordinator.rs:231-237`)
+  with `new()`, `worker_pool()`, `kick()`, and an internal
+  `run_scheduler` driving the loop.
 - Auto-creation of execution stubs by work-item kind (project →
-  `project_design`, task → `task_implementation`, chore →
-  `chore_implementation`) (`engine/src/work.rs:1520-1580`,
-  `create_missing_executions`).
-- Capacity enforcement via `WorkerPool::new(cfg.worker_pool_size)`
-  with configurable hard cap (`engine/src/config.rs:42-49`,
-  `engine/src/app.rs:215`).
-- Worker selection (affinity-first via `preferred_workspace_id`,
-  then LRU) inside `WorkerPool` (`engine/src/coordinator.rs:177+`).
-- Run lifecycle start → active → end with `RunOutcome`
-  (`engine/src/coordinator.rs:500-560`, `engine/src/runner.rs`).
-- Lease retain/release decisions driven by
-  `outcome.release_workspace`
-  (`engine/src/coordinator.rs:515-560`).
-- `executions.<id>` topic published on state changes via
-  `TopicBroker`.
+  `project_design`, chore → `chore_implementation`, task →
+  `task_implementation`) via `reconcile_work_item_execution()`
+  (`work.rs:400-468`); integration site at `app.rs:1406`.
+- `WorkerPool` with a configurable size cap
+  (`coordinator.rs:187-198`; `config.rs:42-49`,
+  env `BOSS_WORKER_POOL_SIZE`, default 1).
+- `RunOutcome` struct and run lifecycle start → active → end
+  (`runner.rs:21-26`, scheduler at `coordinator.rs:500-560`).
+- Single boolean `release_workspace` on `RunOutcome` drives the
+  retain/release decision (`runner.rs:25`,
+  `coordinator.rs:515-560`).
 
 **Pending.**
 
-- `request_execution(work_item_id, opts)` RPC is not in the
-  protocol. `grep -rn "request_execution\|RequestExecution"
-  engine/src cli/src` returned nothing. Today the only entry point
-  is `CreateExecution` driven manually. Either add the RPC or
-  rename the design to match what we shipped (decide which).
-- Lease retain/release is currently keyed off a single
-  `release_workspace: bool` on `RunOutcome`, not the four
-  `waiting_*` states the design calls for
+- **No `coordinate()` method** on `ExecutionCoordinator`. The
+  prior status block claimed one — wrong. The real entry point is
+  `kick()`; the loop is `run_scheduler` internally. Either rename
+  the contract in the design or add a method named to match.
+- **Worker selection is naive.** `claim_idle_worker()`
+  (`coordinator.rs:200-209`) picks the first idle worker. The
+  deliverable calls for affinity-first via
+  `preferred_workspace_id`, then LRU among free; neither is
+  implemented (`grep` for `preferred_workspace_id` / `affinity` /
+  `lru` in `coordinator.rs` → nothing). This needs to land before
+  Phase 6 spawns workers that benefit from affinity.
+- **Hard 8-worker cap is not asserted.** The pool size is
+  configurable and defaults to 1. The deliverable's "8-worker hard
+  cap" is a runtime config value, not a code-level invariant. If
+  the design wants it as a hard cap, enforce it in `WorkerPool`
+  construction.
+- **Priority + FIFO-within-priority queue** is not implemented.
+  The scheduler walks ready executions in DB-iteration order. No
+  priority field on executions; no ordered queue.
+- **`executions.<id>` topic publishing** is not wired. No topic
+  constant in `protocol.rs`; no publish call site in coordinator.
+  `TopicBroker` is only used for `work.*` topics today. Phase 8's
+  triage UI will need this.
+- **`request_execution(work_item_id, opts)` RPC** is not in the
+  protocol. The only entry point today is `CreateExecution` driven
+  manually. Either add the RPC or rename the design to match what
+  we shipped (decide which).
+- **Lease retain/release semantics** use a single
+  `release_workspace: bool` on `RunOutcome` — and inspection of
+  `runner.rs:181` shows the field is hardcoded `false` in the
+  current path. The design calls for four `waiting_*` states
   (`waiting_human` / `waiting_review` / `waiting_merge` retain,
-  `waiting_dependency` releases). Audit whether the boolean is
-  correct for every wait state we'll hit in Phase 8, or promote it
-  to the explicit enum then.
+  `waiting_dependency` releases); promote the boolean to an enum
+  before Phase 8 lights up review-driven releases.
 
 **Done when (acceptance, kept for the record).**
 
