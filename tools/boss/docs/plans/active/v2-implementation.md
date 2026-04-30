@@ -37,7 +37,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; CLI follow-ups (Product/Project delete+move) landed |
 | 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
-| 4     | Execution layer + cube V2 prereqs              | 🟡 mostly shipped — cube driver missing `status` subcommand |
+| 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers land in Phases 8-9 |
 | 5     | ExecutionCoordinator                           | 🟡 partially shipped — multiple gaps (worker affinity/LRU, `executions.<id>` topic, `request_execution` RPC, waiting-state semantics) |
 | 6     | libghostty embedding and worker spawn          | ❌ not started               |
 | 7     | Boss session and bossctl                       | ❌ not started               |
@@ -238,7 +238,7 @@ ContentView.swift}`:
 
 ---
 
-### Phase 4: Execution layer plumbing + cube V2 prereqs — 🟡 mostly shipped
+### Phase 4: Execution layer plumbing + cube V2 prereqs — 🟢 named deliverables shipped
 
 **Goal.** Add durable execution / run / attention state and land the
 cube features Boss will hard-depend on.
@@ -256,22 +256,23 @@ cube features Boss will hard-depend on.
   `work.rs:333-820`).
 - `WorkRun` carries `transcript_path` and `artifacts_path`
   (`engine/src/work.rs:75-87`); transcript path indexing wired.
-- Cube driver `CubeClient` trait + `CommandCubeClient` for
-  `ensure_repo` (`coordinator.rs:99`), `lease_workspace`
-  (`coordinator.rs:121`), `release_workspace`
-  (`coordinator.rs:170`).
+- Cube driver `CubeClient` trait + `CommandCubeClient` cover
+  `ensure_repo`, `lease_workspace`, `create_change`,
+  `release_workspace`, `workspace_status`, `heartbeat_lease`, and
+  `force_release_lease` (`engine/src/coordinator.rs`). Status returns
+  a typed `CubeWorkspaceStatus` struct (state + lease + holder + task
+  + lease epochs) so the Phase 9 reconcile can do a three-way compare
+  without reparsing JSON.
 
 **Pending.**
 
-- Cube driver does **not** currently invoke `cube workspace status`
-  even though the original deliverable named it. No `status` method
-  on `CubeClient`, no shell-out site (`grep` for "workspace.*status"
-  in `coordinator.rs` returns nothing). Either add it or drop it
-  from the deliverable.
-- Cube driver also does not invoke `cube workspace heartbeat` or
-  `cube workspace force-release`. The cube CLI supports both;
-  engine-side callers are missing. Heartbeat is needed by Phase 9;
-  force-release is needed by reconcile.
+- No live caller for `heartbeat_lease` yet — the timer that pings
+  every 5 minutes for held leases lands with Phase 9.
+- No live caller for `force_release_lease` yet — engine-side reconcile
+  on startup that releases orphan leases lands with Phase 9.
+- No live caller for `workspace_status` yet — used by the same Phase 9
+  reconcile loop. The driver method is available so Phase 9 doesn't
+  block on driver work.
 - Per-execution on-disk dir layout under
   `~/Library/Application Support/Boss/executions/<id>/` is modelled
   (path stored on `WorkRun`) but not yet populated by anything that

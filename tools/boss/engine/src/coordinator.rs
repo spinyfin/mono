@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +29,18 @@ pub struct CubeChangeHandle {
     pub change_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CubeWorkspaceStatus {
+    pub workspace_id: String,
+    pub workspace_path: PathBuf,
+    pub state: String,
+    pub lease_id: Option<String>,
+    pub holder: Option<String>,
+    pub task: Option<String>,
+    pub leased_at_epoch_s: Option<i64>,
+    pub lease_expires_at_epoch_s: Option<i64>,
+}
+
 #[async_trait]
 pub trait CubeClient: Send + Sync {
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
@@ -39,6 +51,9 @@ pub trait CubeClient: Send + Sync {
         title: &str,
     ) -> Result<CubeChangeHandle>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
+    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
+    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
+    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +185,61 @@ impl CubeClient for CommandCubeClient {
         let _ = self
             .run_json(&["--json", "workspace", "release", "--lease", lease_id])
             .await?;
+        Ok(())
+    }
+
+    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
+        #[derive(Deserialize)]
+        struct StatusPayload {
+            workspace: StatusWorkspace,
+        }
+
+        #[derive(Deserialize)]
+        struct StatusWorkspace {
+            workspace_id: String,
+            workspace_path: PathBuf,
+            state: String,
+            lease_id: Option<String>,
+            holder: Option<String>,
+            task: Option<String>,
+            leased_at_epoch_s: Option<i64>,
+            lease_expires_at_epoch_s: Option<i64>,
+        }
+
+        let workspace_arg = workspace_path.display().to_string();
+        let payload: StatusPayload = serde_json::from_value(
+            self.run_json(&["--json", "workspace", "status", "--workspace", &workspace_arg])
+                .await?,
+        )
+        .context("failed to decode `cube workspace status` payload")?;
+        Ok(CubeWorkspaceStatus {
+            workspace_id: payload.workspace.workspace_id,
+            workspace_path: payload.workspace.workspace_path,
+            state: payload.workspace.state,
+            lease_id: payload.workspace.lease_id,
+            holder: payload.workspace.holder,
+            task: payload.workspace.task,
+            leased_at_epoch_s: payload.workspace.leased_at_epoch_s,
+            lease_expires_at_epoch_s: payload.workspace.lease_expires_at_epoch_s,
+        })
+    }
+
+    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
+        let ttl_string = ttl_seconds.map(|ttl| ttl.to_string());
+        let mut args: Vec<&str> = vec!["--json", "workspace", "heartbeat", "--lease", lease_id];
+        if let Some(ttl) = ttl_string.as_deref() {
+            args.extend_from_slice(&["--ttl-seconds", ttl]);
+        }
+        let _ = self.run_json(&args).await?;
+        Ok(())
+    }
+
+    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
+        let mut args: Vec<&str> = vec!["--json", "workspace", "force-release", "--lease", lease_id];
+        if let Some(reason) = reason {
+            args.extend_from_slice(&["--reason", reason]);
+        }
+        let _ = self.run_json(&args).await?;
         Ok(())
     }
 }
@@ -607,8 +677,8 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, ExecutionCoordinator,
-        WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome};
     use crate::work::{
@@ -622,6 +692,9 @@ mod tests {
         lease_calls: Mutex<Vec<(String, String)>>,
         create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
+        status_calls: Mutex<Vec<PathBuf>>,
+        heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
+        force_release_calls: Mutex<Vec<(String, Option<String>)>>,
         fail_ensure: bool,
         fail_lease: bool,
         fail_create: bool,
@@ -672,6 +745,46 @@ mod tests {
 
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
             self.release_calls.lock().await.push(lease_id.to_owned());
+            Ok(())
+        }
+
+        async fn workspace_status(
+            &self,
+            workspace_path: &std::path::Path,
+        ) -> Result<CubeWorkspaceStatus> {
+            self.status_calls
+                .lock()
+                .await
+                .push(workspace_path.to_path_buf());
+            Ok(CubeWorkspaceStatus {
+                workspace_id: "mono-agent-001".to_owned(),
+                workspace_path: workspace_path.to_path_buf(),
+                state: "leased".to_owned(),
+                lease_id: Some("lease-1".to_owned()),
+                holder: Some("boss/0".to_owned()),
+                task: Some("test task".to_owned()),
+                leased_at_epoch_s: Some(1_700_000_000),
+                lease_expires_at_epoch_s: Some(1_700_001_800),
+            })
+        }
+
+        async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
+            self.heartbeat_calls
+                .lock()
+                .await
+                .push((lease_id.to_owned(), ttl_seconds));
+            Ok(())
+        }
+
+        async fn force_release_lease(
+            &self,
+            lease_id: &str,
+            reason: Option<&str>,
+        ) -> Result<()> {
+            self.force_release_calls
+                .lock()
+                .await
+                .push((lease_id.to_owned(), reason.map(str::to_owned)));
             Ok(())
         }
     }
