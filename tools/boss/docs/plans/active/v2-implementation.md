@@ -375,38 +375,58 @@ workers in libghostty panes, workers do work, events flow back.
 
 **Status (done).** Nothing on this phase has shipped to `main`.
 Substrate from earlier phases is in place: execution and run rows,
-cube driver, scheduler. The standalone embedding prototype lives at
-`tools/ghostty-proto/` but has not been folded into the macOS app.
-`grep -rn "ghostty\|libghostty\|TerminalSession"
-app-macos/Sources` returns nothing; `tools/boss/bin/` contains only
-the `boss` binary (no `boss-event` shim).
+cube driver, scheduler. The standalone embedding prototype lives on
+the `brianduff/ghostty-swiftui-prototype` feature branch (PR #115)
+but has not merged or been folded into the macOS app. `grep -rn
+"ghostty\|libghostty\|TerminalSession" app-macos/Sources` returns
+nothing; `tools/boss/bin/` contains only the `boss` binary (no
+`boss-event` shim).
 
-**Pending — full deliverables list.**
+**Sub-phases.** Phase 6 is large; the Phase 5 dependency is
+concentrated in the spawn/wiring sub-phase, so several pieces can
+land before Phase 5 finishes. Split into 6a–6f.
 
-- App: import the `tools/ghostty-proto` embedding pattern. Build a
-  1 + 8 pane layout in Agents mode. Each pane is a
-  `TerminalSessionModel` bound to one engine-managed session id.
-- Engine: spawn `claude` subprocess for each scheduled run,
-  attached to a libghostty pane via app coordination (engine asks
-  app to host a pane; app returns pane handle; engine wires stdio).
-- Engine: write per-lease `<workspace>/.claude/CLAUDE.md` (jj-first
-  rules, do-not-touch-siblings advisory) before spawn.
-- Engine: write per-lease `<workspace>/.claude/settings.json` with
-  hook config for SessionStart, UserPromptSubmit, PreToolUse,
-  PostToolUse, Stop, Notification, SessionEnd.
-- New `boss-event` shim binary: reads stdin, posts to engine events
-  socket. Bundled with engine; written into worker's PATH per
-  lease.
-- Engine: events socket bound at
-  `~/Library/Application Support/Boss/events.sock` (mode 0600).
-- Engine: hook event ingestion + `lease_id` injection via
-  LOCAL_PEERPID lookup.
-- Engine: `WorkerEvent` enum normalization from raw hook payloads;
-  derive `stop_reason`.
-- Engine: per-worker tail-watcher on `transcript_path` for richer
-  content.
-- App: cutover from PoC single-agent transcript model to
-  pane-per-worker. The old transcript code is removed.
+**Phase-5-independent — can land in parallel to Phase 5.**
+
+- **6a: libghostty embedding.** Port the `ghostty-proto` pattern
+  (Runtime, surface NSView, key/mouse forwarding, Claude monitor)
+  into `tools/boss/app-macos`. Build a 1 + 8 pane layout in a new
+  Workers mode. Each pane is a `TerminalSessionModel` placeholder;
+  panes launch `claude` directly via libghostty `initial_input`
+  pending the engine spawn integration in 6f. Includes
+  `bootstrap-ghosttykit.sh` and `Package.swift` wiring.
+- **6b: `boss-event` shim binary.** Standalone Rust binary that
+  reads stdin (claude hook payload) and posts JSON to the engine
+  events socket. Lives at `tools/boss/cli/boss-event/`. Testable
+  against a stub Unix socket.
+- **6c: events socket scaffold + `LOCAL_PEERPID`.** Engine binds
+  `~/Library/Application Support/Boss/events.sock` at mode 0600,
+  decodes incoming JSON envelopes, looks up `LOCAL_PEERPID`. No
+  lease correlation yet — `lease_id` injection ties into 6f.
+- **6d: `WorkerEvent` enum + hook normalization.** Pure data types
+  + parser converting raw claude hook payloads into typed
+  `WorkerEvent`s (SessionStart, UserPromptSubmit, PreToolUse,
+  PostToolUse, Stop, Notification, SessionEnd). Derive
+  `stop_reason`. Unit-tested against fixture payloads.
+- **6e: CLAUDE.md / settings.json templating.** Engine-side
+  templating that renders per-lease `CLAUDE.md` (jj-first rules,
+  do-not-touch-siblings advisory) and `settings.json` (hook
+  config). String generation; testable with golden files. Caller
+  in 6f writes them into the workspace before subprocess launch.
+- **6g: transcript tail-watcher.** File-watching plumbing on
+  `transcript_path` that streams new JSONL lines as they arrive.
+  Testable with fixture file appends; complements the hook-event
+  channel.
+
+**Phase-5-dependent — gated on Phase 5 ExecutionCoordinator.**
+
+- **6f: spawn integration + cutover.** Engine spawns `claude`
+  subprocess for each scheduled run. App ↔ engine pane-handshake
+  protocol: engine asks app to host a pane for run X; app returns
+  pane handle; engine wires stdio. `lease_id` injection via the
+  `LOCAL_PEERPID` lookup from 6c, correlated through cube
+  workspace pids. Cutover from PoC single-agent transcript model
+  to pane-per-worker; old transcript code removed.
 
 **Done when (acceptance).**
 
@@ -415,7 +435,8 @@ the `boss` binary (no `boss-event` shim).
   libghostty pane, the worker does the work and opens a PR. Engine
   observes the full lifecycle via WorkerEvents.
 
-**Depends on.** Phase 5. (Cube V2 prereqs already landed in Phase 4.)
+**Depends on.** Phase 5 for 6f only; 6a–6e and 6g do not depend on
+Phase 5. Cube V2 prereqs already landed in Phase 4.
 
 **References.** [`v2-design-risks`](../../designs/v2-design-risks.md)
 R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
