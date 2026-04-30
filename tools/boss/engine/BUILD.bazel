@@ -13,6 +13,7 @@ rust_library(
         "src/lib.rs",
         "src/protocol.rs",
         "src/runner.rs",
+        "src/transcript_tail.rs",
         "src/work.rs",
         "src/worker_setup.rs",
     ],
