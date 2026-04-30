@@ -5,5 +5,6 @@ pub mod config;
 pub mod coordinator;
 pub mod protocol;
 pub mod runner;
+pub mod transcript_tail;
 pub mod work;
 pub mod worker_setup;
