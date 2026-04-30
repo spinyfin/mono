@@ -1280,15 +1280,264 @@ manual Q3 check (does `Notification` fire in real interactive
 use?) is a follow-up that, if positive, lets us drop the
 screen-scrape backup.
 
+## R5: Scheduler ownership
+
+### Why it matters
+
+R4 picked cube as the workspace layer; R2 picked hooks-to-socket as
+the event channel. What's still missing is the policy layer that
+decides *which task gets a worker, when*. Two callers want to start
+work — Boss-Claude (autonomous decomposition + dispatch) and the
+human (clicking "start" in the Work mode UI) — and they compete for
+a fixed pool of 8 workers.
+
+Without R5: races (both dispatch on the last free slot), starvation
+(high-priority human work blocked behind Boss-Claude's auto-dispatched
+chores), or split-brain (two intent sources writing different states
+to the work-item store).
+
+### What prior risks settled
+
+- **R1**: 1 Boss + 8 workers, hard cap from the 2×4 grid.
+- **R2**: `WorkerEvent::SessionEnded` is the canonical "worker
+  freed" signal; the scheduler subscribes to it.
+- **R3**: `bossctl` and the SwiftUI app both authenticate to
+  Boss-engine via LOCAL_PEERPID.
+- **R4**: per-task cube lease with `preferred_workspace_id` for
+  warm-cache affinity; pool-exhausted error path is
+  `queued_waiting_workspace`.
+- **work-taxonomy.md**: task status currently
+  `todo / active / blocked / in_review / done`. R5 extends this
+  with `queued` and `cancelled`.
+
+R5 is therefore pure design — no new POC needed.
+
+### Options
+
+| Option | Where policy lives | Pros | Cons |
+|---|---|---|---|
+| A | **Boss-engine** (Rust). Both Boss-Claude and human UI submit intents to one RPC; engine arbitrates. | Single source of truth; deterministic; testable. | Boss-engine grows. |
+| B | **Boss-Claude** decides; engine just executes. | Lets the LLM be smart about priority. | Non-deterministic; capacity races; hard to audit. |
+| C | **Split**: Boss-Claude proposes, engine enforces capacity. | Best of both, in theory. | Two policies in two languages; debugging splits. |
+
+### Hard constraints
+
+- **Hard cap of 8 concurrent workers** (R1).
+- **Single intent API** for both callers — `bossctl` and the
+  SwiftUI app go through the same RPC. Otherwise the work-item
+  state machine forks.
+- **Capacity-blocked is `queued`, not "rejected"** (R4 working
+  decision used `queued_waiting_workspace`; R5 shortens to
+  `queued` for consistency with the task-status enum).
+- **Queue and active assignments must be durable** so engine
+  restart doesn't drop in-flight work. (R6 owns recovery
+  semantics; R5 commits to durability.)
+
+### Working decision
+
+**Option A: Boss-engine owns the scheduler.** A single Rust
+component:
+
+1. Receives intents via one RPC
+   `request_execution(work_item_id, opts) → {state, worker_id?}`
+   from `bossctl` and the SwiftUI app alike.
+2. Resolves `work_item.product_id → cube_pool_id` (R4 unknown 5).
+3. If a worker slot is free: lease workspace via cube, write the
+   per-lease `.claude/CLAUDE.md` (R4 unknown 4) and
+   `.claude/settings.json` hook config (R2), spawn `claude`, mark
+   task `active` with `assigned_worker_id`. Return
+   `{state: "started", worker_id}`.
+4. If no slot is free: append to queue, mark task `queued`.
+   Return `{state: "queued"}`.
+5. On `WorkerEvent::SessionEnded`: pop the highest-priority queued
+   item, repeat step 3.
+
+Boss-Claude's role becomes: decide *which* task to dispatch
+(planning, decomposition, scope judgment). The engine owns *when*
+and *where*. LLMs plan; deterministic schedulers queue.
+
+### Decisive unknowns
+
+All resolved as part of the working decision below.
+
+#### 1. Sync vs async API
+
+**Async with state.** `request_execution` returns immediately with
+either `started` or `queued`. Boss-Claude doesn't sit in a tool
+call waiting; the human doesn't see a hung UI. Status follows
+through the same `WorkerEvent` stream R2 already exposes
+(`SessionStarted`, `SessionEnded`, …).
+
+#### 2. Queue ordering
+
+**Work-item `priority` field (low/medium/high) as primary key,
+FIFO within priority.** The `projects` table already has
+`priority`; tasks inherit. Two knobs:
+
+- Boss-Claude can pass `opts.priority` when dispatching (rare;
+  default is project's priority).
+- Human can adjust priority of any queued item from the Work UI.
+
+#### 3. Boss-Claude autonomy bounds
+
+**Auto-dispatch allowed only for tasks created during a
+`plan_and_start` decomposition** (per the V2 plan's intent-inference
+policy). Manual human dispatch is required for everything else;
+Boss-Claude can leave items in `todo` for later human review.
+
+This makes Boss's autonomy discoverable: "if I ask Boss to do X
+end-to-end, it will dispatch; if I ask Boss to plan Y, it will
+queue work and wait." Predictable behavior surface.
+
+#### 4. Worker selection
+
+**Affinity-first, then LRU among free.**
+
+- If `preferred_workspace_id` is set on the work item (recent
+  lease for the same task) and that workspace is currently free,
+  use it.
+- Otherwise pick the least-recently-used free workspace
+  (warmest non-affinity cache).
+- Round-robin and random rejected — they sacrifice cache warmth
+  for no real gain in fairness; workspaces are interchangeable
+  apart from cache.
+
+#### 5. Cancellation
+
+**Two modes through one RPC, distinguished by a `--force` flag:**
+
+- **Soft cancel** (default): mark intent on the task; on the
+  next `WorkerEvent::TurnCompleted`, decline to send another
+  prompt; release the worker. Non-disruptive; loses no
+  mid-turn progress.
+- **Hard cancel** (`--force`): SIGINT the worker's `claude`
+  process; release the worker; mark task `cancelled`. Mid-turn
+  work is discarded.
+
+#### 6. Pre-emption
+
+**Not in V2.** A high-priority task arriving while all workers
+are busy on lower-priority work queues ahead of other queued
+items but does not displace any active worker. Pre-emption can
+be added later (mark a running task for graceful handoff at
+next `Stop`); not worth the complexity day one.
+
+#### 7. Engine restart recovery
+
+**Queue + active assignments persist in Boss-engine's SQLite
+store** (alongside the work taxonomy). On startup, reconcile
+against cube's lease state
+(`cube workspace list --json --holder boss/*`) and actual
+`claude` worker process state. Detailed recovery semantics —
+reattaching to a still-running `claude --resume` vs declaring
+the run lost — are R6's responsibility; R5 commits only to
+durability.
+
+### State machine
+
+A work item under scheduler control transitions through:
+
+```text
+       todo
+        │  request_execution
+        ▼
+   ┌─ capacity? ─┐
+   │             │
+  yes            no
+   │             │
+   ▼             ▼
+active         queued
+   │             │  (worker frees + this is highest-priority eligible)
+   │             └──────────────► active
+   │
+   ├── PR opened ──────► in_review ── merged ────► done
+   │                         │       └ rework ──► active
+   │
+   ├── worker reports / probe says blocked ─► blocked
+   │
+   ├── soft cancel (next Stop) ──► cancelled
+   ├── hard cancel (SIGINT)    ──► cancelled
+   │
+   └── worker exits without PR ─► todo (retryable) | blocked
+```
+
+`queued` and `cancelled` extend the work-taxonomy enum.
+
+### Happy-path dispatch sequence
+
+```text
+caller            boss-engine               cube                claude
+  │ request_         │                       │                    │
+  │  execution(id)   │                       │                    │
+  ├─────────────────►│                       │                    │
+  │                  │ resolve cube_pool_id  │                    │
+  │                  │ check capacity → free │                    │
+  │                  │ workspace lease       │                    │
+  │                  ├──────────────────────►│                    │
+  │                  │◄── lease_id, path ────┤                    │
+  │                  │ write CLAUDE.md +     │                    │
+  │                  │ settings.json (hooks) │                    │
+  │                  │ spawn claude          │                    │
+  │                  ├──────────────────────────────────────────►│
+  │ {state:"started",│                       │                    │
+  │  worker_id}      │                       │                    │
+  │◄─────────────────┤                       │                    │
+  │                  │◄── WorkerEvent::SessionStarted ────────────┤
+  │                  │   …                                        │
+  │                  │◄── WorkerEvent::SessionEnded ──────────────┤
+  │                  │ workspace release     │                    │
+  │                  ├──────────────────────►│                    │
+  │                  │ pop next queued       │                    │
+  │                  │ (repeat)              │                    │
+```
+
+### Resolution criteria
+
+- One scheduler component picked, with rationale.
+- Intent API shape committed.
+- State machine for work items committed.
+- Queue ordering, worker selection, cancellation, pre-emption,
+  and restart-recovery policies committed.
+- Boss-Claude's autonomy bounds committed.
+
+### Decision
+
+**Adopt option A: Boss-engine owns the scheduler.** All seven
+decisive unknowns are answered above. The intent API is a single
+async RPC `request_execution(work_item_id, opts) → {state,
+worker_id?}` available to both `bossctl` and the SwiftUI app.
+
+Implementation work this implies for V2:
+
+- Boss-engine: scheduler component with priority queue + capacity
+  enforcement, persisted in SQLite.
+- Boss-engine: subscribe to `WorkerEvent::SessionEnded`; pop and
+  dispatch on each.
+- Boss-engine: implement the state-machine transitions and
+  associated work-item updates; extend the task-status enum with
+  `queued` and `cancelled`.
+- Boss-engine: cancellation (soft + hard) RPC.
+- Boss-engine: queue / active reconciliation on startup against
+  cube + `claude` process state. (Detailed recovery: R6.)
+- `bossctl`: `work start <id>`, `work cancel <id>`,
+  `work cancel --force <id>` map to the engine RPCs.
+- SwiftUI app: "Start" / "Cancel" affordances in the Work mode
+  detail view; "Adjust priority" on queued items.
+- Boss-Claude bootstrap prompt (per V2 plan phase 3): teach the
+  contract — auto-dispatch only inside a `plan_and_start`
+  decomposition; otherwise queue work in `todo` for human
+  review.
+
+These should be tracked as Boss V2 implementation tasks. R6
+inherits durable-recovery details; R8 inherits the `boss` vs
+`bossctl` CLI-surface decision.
+
 ## Risk backlog
 
 These risks have been identified but not yet worked through. They are
 listed here so we don't lose them; we'll write each one up properly when
 we get to it. Order is rough priority, not strict sequence.
 
-- **R5: Scheduler ownership.** Boss-Claude and the human can both start
-  work. Decide which component arbitrates capacity and assignment, and
-  what intent API both go through.
 - **R6: Crash and resume.** What persists across app restarts? How do we
   reattach to running `claude` sessions, and which state lives in the
   engine vs the app vs Claude Code itself?
