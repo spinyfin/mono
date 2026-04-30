@@ -170,13 +170,25 @@ name = "boss"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "boss-engine",
+ "boss-client",
+ "boss-protocol",
  "clap",
  "comfy-table",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "boss-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-protocol",
+ "serde_json",
  "shlex",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -185,6 +197,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "boss-client",
+ "boss-protocol",
  "clap",
  "rusqlite",
  "serde",
@@ -195,6 +209,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "which",
+]
+
+[[package]]
+name = "boss-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

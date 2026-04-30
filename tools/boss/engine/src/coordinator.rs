@@ -43,20 +43,21 @@ pub trait CubeClient: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct CommandCubeClient {
-    cfg: RuntimeConfig,
+    cfg: Arc<RuntimeConfig>,
 }
 
 impl CommandCubeClient {
-    pub fn new(cfg: RuntimeConfig) -> Self {
+    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
         Self { cfg }
     }
 
     async fn run_json(&self, args: &[&str]) -> Result<serde_json::Value> {
-        let mut command = Command::new(&self.cfg.cube.command);
+        let agent = self.cfg.agent()?;
+        let mut command = Command::new(&agent.cube.command);
         command
-            .args(&self.cfg.cube.args)
+            .args(&agent.cube.args)
             .args(args)
-            .current_dir(&self.cfg.cwd)
+            .current_dir(&self.cfg.work.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -65,8 +66,8 @@ impl CommandCubeClient {
         let output = command.output().await.with_context(|| {
             format!(
                 "failed to spawn Cube command: {} {}",
-                self.cfg.cube.command,
-                self.cfg.cube.args.join(" ")
+                agent.cube.command,
+                agent.cube.args.join(" ")
             )
         })?;
 

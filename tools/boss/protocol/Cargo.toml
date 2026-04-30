@@ -1,0 +1,8 @@
+[package]
+name = "boss-protocol"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }

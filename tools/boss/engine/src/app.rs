@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -92,11 +91,11 @@ struct Agent {
 struct AgentRegistry {
     agents: Mutex<HashMap<String, Agent>>,
     next_id: AtomicU64,
-    cfg: RuntimeConfig,
+    cfg: Arc<RuntimeConfig>,
 }
 
 impl AgentRegistry {
-    fn new(cfg: RuntimeConfig) -> Self {
+    fn new(cfg: Arc<RuntimeConfig>) -> Self {
         Self {
             agents: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -117,7 +116,7 @@ impl AgentRegistry {
     async fn initialize_agent(&self, id: &str, name: &str, role: AgentRole) -> Result<()> {
         let acp_client = Arc::new(AcpClient::connect_with_external_permissions(&self.cfg).await?);
         acp_client.initialize().await?;
-        let session_id = acp_client.new_session(&self.cfg.cwd).await?;
+        let session_id = acp_client.new_session(&self.cfg.work.cwd).await?;
         let system_prompt = system_prompt_for_role(role);
 
         tracing::info!(
@@ -210,9 +209,9 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(cfg: &RuntimeConfig) -> Result<Self> {
-        let work_db = Arc::new(WorkDb::open(cfg.db_path.clone())?);
-        let worker_pool = WorkerPool::new(cfg.worker_pool_size);
+    fn new(cfg: Arc<RuntimeConfig>) -> Result<Self> {
+        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
+        let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let execution_coordinator = Arc::new(ExecutionCoordinator::new(
             work_db.clone(),
             worker_pool,
@@ -362,26 +361,25 @@ impl TopicBroker {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let cfg = RuntimeConfig::load_from_env()?;
+    let cfg = Arc::new(RuntimeConfig::load_from_env()?);
     tracing::info!(
-        acp_command = %cfg.acp.command,
-        acp_args = ?cfg.acp.args,
-        cwd = %cfg.cwd.display(),
-        db_path = %cfg.db_path.display(),
+        cwd = %cfg.work.cwd.display(),
+        db_path = %cfg.work.db_path.display(),
         "starting boss-engine runtime",
     );
 
     match cli.mode {
-        Mode::Cli => run_cli(cli, &cfg).await,
-        Mode::Server => run_server(cli, &cfg).await,
+        Mode::Cli => run_cli(cli, cfg).await,
+        Mode::Server => run_server(cli, cfg).await,
     }
 }
 
-async fn run_cli(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
-    cfg.preflight_acp()?;
-    let acp = AcpClient::connect(cfg).await?;
+async fn run_cli(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
+    let agent = cfg.agent()?;
+    agent.preflight_acp()?;
+    let acp = AcpClient::connect(&cfg).await?;
     acp.initialize().await?;
-    let session_id = acp.new_session(&cfg.cwd).await?;
+    let session_id = acp.new_session(&cfg.work.cwd).await?;
 
     println!("Connected to ACP adapter. Session: {session_id}");
 
@@ -412,44 +410,60 @@ async fn run_cli(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
-    let server_state = Arc::new(ServerState::new(cfg)?);
+async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
     let socket_path = cli
         .socket_path
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
+    let pid_file_path =
+        std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
+    serve(cfg, socket_path.into(), Some(pid_file_path.into())).await
+}
 
-    if Path::new(&socket_path).exists() {
+/// Run the frontend server until the listener fails.
+///
+/// `socket_path` is bound exclusively (the file is removed first if it exists).
+/// When `pid_file_path` is `Some`, the engine writes its pid there and removes
+/// the file on shutdown — pass `None` from in-process tests to avoid touching
+/// shared filesystem state.
+pub async fn serve(
+    cfg: Arc<RuntimeConfig>,
+    socket_path: std::path::PathBuf,
+    pid_file_path: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let server_state = Arc::new(ServerState::new(cfg.clone())?);
+
+    if socket_path.exists() {
         tokio::fs::remove_file(&socket_path)
             .await
-            .with_context(|| format!("failed to remove existing socket {socket_path}"))?;
+            .with_context(|| format!("failed to remove existing socket {}", socket_path.display()))?;
     }
 
     let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind unix socket {socket_path}"))?;
+        .with_context(|| format!("failed to bind unix socket {}", socket_path.display()))?;
 
-    let pid_path =
-        std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
-    let pid = std::process::id();
-    std::fs::write(&pid_path, format!("{pid}\n"))
-        .with_context(|| format!("failed to write pid file {pid_path}"))?;
-    let _pid_guard = PidFileGuard {
-        path: pid_path.clone(),
-        pid,
+    let _pid_guard = match pid_file_path {
+        Some(path) => {
+            let path_str = path.to_string_lossy().into_owned();
+            let pid = std::process::id();
+            std::fs::write(&path, format!("{pid}\n"))
+                .with_context(|| format!("failed to write pid file {path_str}"))?;
+            tracing::info!(pid, pid_file = %path_str, "engine pid file is ready");
+            Some(PidFileGuard { path: path_str, pid })
+        }
+        None => None,
     };
 
-    tracing::info!(socket_path = %socket_path, "frontend socket is ready");
-    tracing::info!(pid, pid_file = %pid_path, "engine pid file is ready");
-    println!("boss-engine listening on {socket_path}");
+    tracing::info!(socket_path = %socket_path.display(), "frontend socket is ready");
+    println!("boss-engine listening on {}", socket_path.display());
 
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
-        let cfg = cfg.clone();
         let server_state = server_state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_frontend_connection(stream, &cfg, server_state).await {
+            if let Err(err) = handle_frontend_connection(stream, server_state).await {
                 tracing::error!(?err, "frontend connection failed");
             }
         });
@@ -458,7 +472,6 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
 
 async fn handle_frontend_connection(
     stream: UnixStream,
-    _cfg: &RuntimeConfig,
     server_state: Arc<ServerState>,
 ) -> Result<()> {
     tracing::info!("frontend connected");

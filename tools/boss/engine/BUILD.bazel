@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 
 rust_library(
@@ -19,9 +19,12 @@ rust_library(
     edition = "2024",
     visibility = [
         "//tools/boss/cli:__pkg__",
+        "//tools/boss/client:__pkg__",
         "//tools/boss/engine:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -33,4 +36,22 @@ rust_binary(
         ":engine_lib",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "work_crud_test",
+    srcs = ["tests/work_crud.rs"],
+    edition = "2024",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
 )

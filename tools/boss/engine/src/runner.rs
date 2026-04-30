@@ -38,7 +38,7 @@ pub trait ExecutionRunner: Send + Sync {
 }
 
 pub struct AcpExecutionRunner {
-    cfg: RuntimeConfig,
+    cfg: Arc<RuntimeConfig>,
     workers: Mutex<HashMap<String, Arc<WorkerClient>>>,
 }
 
@@ -48,7 +48,7 @@ struct WorkerClient {
 }
 
 impl AcpExecutionRunner {
-    pub fn new(cfg: RuntimeConfig) -> Self {
+    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
         Self {
             cfg,
             workers: Mutex::new(HashMap::new()),

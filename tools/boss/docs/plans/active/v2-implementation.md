@@ -34,7 +34,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 
 | Phase | Title                                          | Status                       |
 |-------|------------------------------------------------|------------------------------|
-| 1     | Engine and CLI foundations                     | 🟡 deliverables in `main`, work still in flight (see `mono-agent-001` lease) |
+| 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; small CLI follow-ups (Product/Project delete+move) tracked under Pending |
 | 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
 | 3     | Kanban Work tab                                | 🟡 board done, three filters left |
 | 4     | Execution layer + cube V2 prereqs              | 🟡 mostly shipped — cube driver missing `status` subcommand |
@@ -86,20 +86,30 @@ Each phase has: **Status (done)**, **Pending**, **Done when**
 
 ---
 
-### Phase 1: Engine and CLI foundations — 🟡 in flight (deliverables in `main`, see active lease)
+### Phase 1: Engine and CLI foundations — 🟢 named deliverables shipped
 
 **Goal.** Refactor the engine for multi-client use and ship the
 public-facing `boss` CLI for work-taxonomy CRUD.
 
 **Status (in `main`).**
 
-- Config split: `RuntimeConfig` separate from `AcpConfig`,
-  `anthropic_api_key` optional (`engine/src/config.rs:9-49`).
+- Config split: eager `WorkConfig` (cwd, db_path, worker_pool_size)
+  vs lazy `AgentConfig` (acp + cube), materialized via `OnceLock` on
+  first agent op. The engine in server mode boots without
+  `ANTHROPIC_API_KEY` or any agent env present
+  (`engine/src/config.rs`).
 - Request envelope with `request_id` correlation
-  (`engine/src/protocol.rs:24-65`).
-- Shared protocol module imported by engine and CLI; Swift client
-  marshals the same envelopes
+  (`protocol/src/wire.rs`).
+- Shared `boss-protocol` crate at `tools/boss/protocol/` consumed by
+  engine and CLI; carries both wire enums and the data shapes
+  (Product / Project / Task / WorkItem / `Create*Input` / patch /
+  execution rows). Swift client marshals the same envelopes
   (`app-macos/Sources/EngineClient.swift`).
+- Shared `boss-client` crate at `tools/boss/client/` owns socket
+  discovery (env + `--socket-path` override), engine autostart, and
+  request/response correlation. CLI consumes it via
+  `Discovery::from_env(...)` + `BossClient::connect(&discovery)`
+  (`cli/src/main.rs`).
 - `boss` CLI binary at `tools/boss/cli/` with subcommands shipped:
   - `product` — Create / List / Show / Update.
   - `project` — Create / List / Show / Update.
@@ -107,30 +117,27 @@ public-facing `boss` CLI for work-taxonomy CRUD.
     Reorder.
   - `chore` — Create / List / Show / Update / Move / Delete.
   - `engine` — Status / Start / Stop.
-  (`cli/src/main.rs:82-123`)
-- `--json`, `--quiet`, `--no-input`, `--no-autostart` global flags
-  (`cli/src/main.rs:38-52`); TTY prompts on interactive create
-  flows.
+- `--json`, `--quiet`, `--no-input`, `--no-autostart` global flags;
+  TTY prompts on interactive create flows.
+- Concurrent-client integration test: in-process engine on temp
+  socket + temp DB exercises full work CRUD round-trip and verifies
+  a second client receives `topic_event` invalidations from the
+  first (`engine/tests/work_crud.rs`). `app::serve` is the public
+  entry point used by tests, taking explicit socket + optional
+  pid-file paths so no env mutation is required.
 
-**In flight / pending.**
+**Pending (small CLI follow-ups, do not block downstream phases).**
 
-- Phase 1-tagged work is currently leased on `mono-agent-001`
-  ("boss v2 phase 1: engine refactor + boss CLI"). Do **not**
-  close this phase until that work lands. Coordinate with whoever
-  holds that lease before declaring Phase 1 done; deltas they ship
-  belong in this section.
-- Known gaps relative to the original deliverables list, in case
-  they're what the in-flight work is filling:
-  - `boss product delete` and `boss project delete` (deliverables
-    list called for full CRUD on every entity; `delete` is absent
-    on Product and Project today).
-  - `boss chore reorder` (chores aren't ordered within projects in
-    the schema, so this may be a no-op — confirm intent).
-  - Shared client crate (`boss-client`). The CLI talks to the
-    socket directly in `cli/src/main.rs` rather than going
-    through a separate `boss-client` library crate; this is fine
-    if intentional, but the deliverable as written named a crate.
-  - Concurrent-client smoke test as evidence for "Done when."
+- `boss product delete` and `boss project delete` — the original
+  deliverables listed full CRUD on every entity; Product and Project
+  currently lack `delete`. Track as a separate small CLI chore.
+- `boss product move` and `boss project move` — same; `move` was
+  named for every entity in the deliverables. Adding it depends on
+  what board semantics make sense for products/projects (likely
+  status transitions only).
+- `boss chore reorder` — chores aren't ordered within projects in
+  the schema, so this is a no-op until the schema introduces
+  ordering. No action needed unless the schema changes.
 
 **Done when (acceptance, kept for the record).**
 

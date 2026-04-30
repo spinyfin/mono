@@ -1,28 +1,18 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
-use boss_engine::protocol::{
-    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
+use anyhow::Result;
+use boss_client::{
+    BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid,
+    stop_engine,
 };
-use boss_engine::work::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, Product, Project,
-    Task, WorkItem, WorkItemPatch,
+use boss_protocol::{
+    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent,
+    FrontendRequest, Product, Project, Task, WorkItem, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::time::sleep;
-
-const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
-const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
-const ENGINE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
@@ -502,65 +492,7 @@ struct RunContext {
     output_mode: OutputMode,
     quiet: bool,
     allow_input: bool,
-    autostart: bool,
-    socket_path: String,
-    pid_file_path: String,
-    engine_program: String,
-    engine_args: Vec<String>,
-    launch_directory: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct EngineCommandSpec {
-    program: String,
-    args: Vec<String>,
-}
-
-struct BossClient {
-    reader: Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
-    next_request_id: AtomicU64,
-}
-
-impl BossClient {
-    async fn connect(socket_path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .with_context(|| format!("failed to connect to engine socket {socket_path}"))?;
-        let (read_half, write_half) = stream.into_split();
-        Ok(Self {
-            reader: BufReader::new(read_half).lines(),
-            writer: write_half,
-            next_request_id: AtomicU64::new(1),
-        })
-    }
-
-    async fn send_request(&mut self, request: &FrontendRequest) -> Result<FrontendEvent> {
-        let request_id = format!(
-            "cli-{}",
-            self.next_request_id.fetch_add(1, Ordering::Relaxed)
-        );
-        let payload = serde_json::to_string(&FrontendRequestEnvelope {
-            request_id: request_id.clone(),
-            payload: request.clone(),
-        })?;
-        self.writer.write_all(payload.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
-
-        while let Some(line) = self.reader.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let envelope: FrontendEventEnvelope = serde_json::from_str(&line)
-                .with_context(|| format!("failed to decode engine event: {line}"))?;
-            if envelope.request_id.as_deref() == Some(request_id.as_str()) {
-                return Ok(envelope.payload);
-            }
-        }
-
-        bail!("engine closed the socket before returning a response")
-    }
+    discovery: Discovery,
 }
 
 #[tokio::main]
@@ -724,16 +656,9 @@ impl RunContext {
     fn from_flags(flags: &GlobalFlags) -> Result<Self, CliError> {
         let allow_input =
             !flags.no_input && io::stdin().is_terminal() && io::stdout().is_terminal();
-        let socket_path = flags
-            .socket_path
-            .clone()
-            .or_else(|| std::env::var("BOSS_SOCKET_PATH").ok())
-            .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
-        let pid_file_path =
-            std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
-        let launch_directory = resolve_launch_directory().map_err(CliError::internal)?;
-        let engine =
-            resolve_engine_command(&launch_directory, &socket_path).map_err(CliError::internal)?;
+        let discovery = Discovery::from_env(flags.socket_path.as_deref())
+            .map_err(CliError::internal)?
+            .with_autostart(!flags.no_autostart);
 
         Ok(Self {
             output_mode: if flags.json {
@@ -743,12 +668,7 @@ impl RunContext {
             },
             quiet: flags.quiet,
             allow_input,
-            autostart: !flags.no_autostart,
-            socket_path: socket_path.clone(),
-            pid_file_path,
-            engine_program: engine.program,
-            engine_args: engine.args,
-            launch_directory,
+            discovery,
         })
     }
 }
@@ -1064,15 +984,15 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
 async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineCommand::Status => {
-            let running = can_connect_socket(&ctx.socket_path).await;
-            let pid = running_engine_pid(&ctx.pid_file_path);
+            let running = engine_socket_reachable(&ctx.discovery.socket_path).await;
+            let pid = running_engine_pid(&ctx.discovery.pid_file_path);
             print_entity(
                 ctx,
                 &serde_json::json!({
                     "running": running,
                     "pid": pid,
-                    "socket_path": ctx.socket_path,
-                    "pid_file_path": ctx.pid_file_path,
+                    "socket_path": ctx.discovery.socket_path,
+                    "pid_file_path": ctx.discovery.pid_file_path,
                 }),
                 || {
                     if running {
@@ -1080,8 +1000,8 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
                     } else {
                         println!("Boss engine is stopped.");
                     }
-                    println!("Socket: {}", ctx.socket_path);
-                    println!("PID file: {}", ctx.pid_file_path);
+                    println!("Socket: {}", ctx.discovery.socket_path);
+                    println!("PID file: {}", ctx.discovery.pid_file_path);
                     if let Some(pid) = pid {
                         println!("PID: {pid}");
                     }
@@ -1089,10 +1009,12 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
             )
         }
         EngineCommand::Start => {
-            ensure_engine_running(ctx).await?;
+            ensure_engine_running(&ctx.discovery)
+                .await
+                .map_err(|err| CliError::engine_unavailable(err.to_string()))?;
             print_entity(
                 ctx,
-                &serde_json::json!({ "running": true, "socket_path": ctx.socket_path }),
+                &serde_json::json!({ "running": true, "socket_path": ctx.discovery.socket_path }),
                 || {
                     if !ctx.quiet {
                         println!("Boss engine is running.");
@@ -1101,10 +1023,11 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
             )
         }
         EngineCommand::Stop => {
-            stop_engine(&ctx.pid_file_path)?;
+            stop_engine(&ctx.discovery.pid_file_path)
+                .map_err(|err| CliError::engine_unavailable(err.to_string()))?;
             print_entity(
                 ctx,
-                &serde_json::json!({ "running": false, "socket_path": ctx.socket_path }),
+                &serde_json::json!({ "running": false, "socket_path": ctx.discovery.socket_path }),
                 || {
                     if !ctx.quiet {
                         println!("Stopped Boss engine.");
@@ -1116,205 +1039,9 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
 }
 
 async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
-    if let Ok(client) = BossClient::connect(&ctx.socket_path).await {
-        return Ok(client);
-    }
-
-    if !ctx.autostart {
-        return Err(CliError::engine_unavailable(format!(
-            "boss engine is not reachable at {}",
-            ctx.socket_path
-        )));
-    }
-
-    ensure_engine_running(ctx).await?;
-    BossClient::connect(&ctx.socket_path)
+    BossClient::connect(&ctx.discovery)
         .await
         .map_err(|err| CliError::engine_unavailable(err.to_string()))
-}
-
-async fn ensure_engine_running(ctx: &RunContext) -> Result<(), CliError> {
-    if can_connect_socket(&ctx.socket_path).await {
-        return Ok(());
-    }
-
-    if let Some(pid) = running_engine_pid(&ctx.pid_file_path) {
-        if wait_for_socket(&ctx.socket_path, ENGINE_START_TIMEOUT).await {
-            return Ok(());
-        }
-        return Err(CliError::engine_unavailable(format!(
-            "boss engine pid file points to pid {pid}, but socket {} never became ready",
-            ctx.socket_path
-        )));
-    }
-
-    start_engine_process(ctx)?;
-    if wait_for_socket(&ctx.socket_path, ENGINE_START_TIMEOUT).await {
-        return Ok(());
-    }
-
-    Err(CliError::engine_unavailable(format!(
-        "boss engine did not become ready at {} within {} seconds",
-        ctx.socket_path,
-        ENGINE_START_TIMEOUT.as_secs()
-    )))
-}
-
-fn start_engine_process(ctx: &RunContext) -> Result<(), CliError> {
-    Command::new(&ctx.engine_program)
-        .args(&ctx.engine_args)
-        .current_dir(&ctx.launch_directory)
-        .env("BOSS_ENGINE_PID_PATH", &ctx.pid_file_path)
-        .env("BOSS_SOCKET_PATH", &ctx.socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start engine using `{}`",
-                format_engine_command(&ctx.engine_program, &ctx.engine_args)
-            )
-        })
-        .map(|_| ())
-        .map_err(CliError::internal)
-}
-
-fn stop_engine(pid_file_path: &str) -> Result<(), CliError> {
-    let Some(pid) = running_engine_pid(pid_file_path) else {
-        return Ok(());
-    };
-
-    let status = Command::new("/bin/kill")
-        .args(["-TERM", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(CliError::internal)?;
-    if !status.success() {
-        return Err(CliError::engine_unavailable(format!(
-            "failed to stop boss engine pid {pid}"
-        )));
-    }
-
-    if let Some(owner) = read_pid_file(pid_file_path) {
-        if owner == pid {
-            let _ = std::fs::remove_file(pid_file_path);
-        }
-    }
-
-    Ok(())
-}
-
-async fn can_connect_socket(socket_path: &str) -> bool {
-    UnixStream::connect(socket_path).await.is_ok()
-}
-
-async fn wait_for_socket(socket_path: &str, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if can_connect_socket(socket_path).await {
-            return true;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
-}
-
-fn running_engine_pid(pid_file_path: &str) -> Option<u32> {
-    let pid = read_pid_file(pid_file_path)?;
-    let status = Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if status.success() {
-        Some(pid)
-    } else {
-        let _ = std::fs::remove_file(pid_file_path);
-        None
-    }
-}
-
-fn read_pid_file(pid_file_path: &str) -> Option<u32> {
-    let content = std::fs::read_to_string(pid_file_path).ok()?;
-    content.trim().parse().ok()
-}
-
-fn resolve_launch_directory() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BUILD_WORKSPACE_DIRECTORY") {
-        let candidate = PathBuf::from(path);
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-    }
-    std::env::current_dir().context("failed to resolve current directory")
-}
-
-fn resolve_engine_command(
-    _launch_directory: &Path,
-    socket_path: &str,
-) -> Result<EngineCommandSpec> {
-    if let Ok(value) = std::env::var("BOSS_ENGINE_CMD") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            let parts = shlex::split(trimmed)
-                .with_context(|| format!("failed to parse BOSS_ENGINE_CMD: {trimmed}"))?;
-            let Some((program, args)) = parts.split_first() else {
-                bail!("BOSS_ENGINE_CMD resolved to an empty command");
-            };
-            return Ok(EngineCommandSpec {
-                program: program.clone(),
-                args: args.to_vec(),
-            });
-        }
-    }
-
-    if let Some(program) = resolve_sibling_engine_binary() {
-        return Ok(EngineCommandSpec {
-            program,
-            args: vec![
-                "--mode=server".to_owned(),
-                "--socket-path".to_owned(),
-                socket_path.to_owned(),
-            ],
-        });
-    }
-
-    Ok(EngineCommandSpec {
-        program: "boss-engine".to_owned(),
-        args: vec![
-            "--mode=server".to_owned(),
-            "--socket-path".to_owned(),
-            socket_path.to_owned(),
-        ],
-    })
-}
-
-fn resolve_sibling_engine_binary() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    let mut candidates = Vec::new();
-    if let Some(dir) = exe.parent() {
-        candidates.push(dir.join("boss-engine"));
-        if let Some(boss_dir) = dir.parent() {
-            candidates.push(boss_dir.join("engine").join("engine"));
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-}
-
-fn format_engine_command(program: &str, args: &[String]) -> String {
-    std::iter::once(program.to_owned())
-        .chain(args.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 async fn list_products(client: &mut BossClient) -> Result<Vec<Product>, CliError> {
