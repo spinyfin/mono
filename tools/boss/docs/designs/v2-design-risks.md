@@ -1784,15 +1784,210 @@ These should be tracked as Boss V2 implementation tasks. R7
 inherits the human-facing "review what was lost" affordance for
 the work-item review/approval flow.
 
+## R7: Review and approval flow
+
+### Why it matters
+
+Workers reach `in_review` when they open a PR; the human has to
+look at the work, decide whether it's good, leave feedback, and
+merge or send back for rework. Without a defined affordance, the
+state is dangling — "the work is done but you have to know to go
+look at GitHub."
+
+R7 is product-shaped, not architectural. The decision is mostly
+"how much rendering does Boss do natively vs delegate to GitHub."
+
+### What prior risks settled
+
+- **R4**: per-task lease released on PR-merged-or-abandoned;
+  rework on the same `task_id` re-leases with
+  `preferred_workspace_id`.
+- **R5**: state machine includes `in_review` (PR opened) and
+  `blocked`; transitions back to `active` on rework, forward to
+  `done` on merge.
+- **R6**: tasks declared lost on engine restart go to `queued` —
+  R7 is the natural triage surface for those too.
+
+### Options
+
+| Option | Native rendering | Approval | Cost |
+|---|---|---|---|
+| A | **Trampoline**: Boss surfaces PR URL + minimal status; human reviews and merges in browser. | All on GitHub. | Low. |
+| B | **Partial native**: Boss renders diff + PR description; comments + merge stay on GitHub. | GitHub. | Medium. |
+| C | **Full native**: Boss renders diff, comments, threading, CI; "Approve" auto-merges. | Inside Boss. | High. |
+
+### Hard constraints
+
+- Boss has no public-reachable endpoint, so **no GitHub webhooks
+  in V2**. Status flows from polling.
+- Re-engagement after review comments must reuse the worker's
+  cube workspace (per R4) — workspace must still be lease-able
+  even if the worker exited cleanly between rounds.
+
+### Working decision
+
+**Option A: trampoline to GitHub.** Boss V2 does not render
+diffs, comment threads, or CI status natively. It surfaces:
+
+- The PR URL with an "Open in browser" primary action.
+- A polled status ribbon (state: `OPEN / APPROVED / CHANGES_REQUESTED / MERGED`,
+  CI: `pending / success / failure`, comments-since-last-engagement
+  count).
+- A "Re-engage worker with comments" button that resumes the
+  worker's claude session and feeds in the unaddressed PR
+  comments as the next prompt.
+
+Native rendering (diff, comments, CI dashboards, in-app approve
+that auto-merges) is **explicitly v1.x**, not V2. Once basic
+end-to-end functionality is working we can revisit which pieces
+of GitHub UX are worth bringing in-app.
+
+### Decisive unknowns
+
+All resolved as part of the working decision. The trampoline
+shape collapses most of the complexity.
+
+#### 1. PR review surface
+
+**Open in browser.** Boss surfaces the PR URL prominently in the
+Work-mode detail view; the primary action is `open <pr_url>`
+(macOS launches the user's default browser). No native diff
+viewer, no in-app comment threading. Boss may use `gh pr view
+--json` periodically to refresh the status ribbon, but doesn't
+attempt to render PR content.
+
+#### 2. PR detection — when does a task transition to `in_review`?
+
+Two signals; whichever fires first wins:
+
+- **Worker reports it**: claude's last_assistant_text on a `Stop`
+  event mentions a PR URL (Boss-engine pattern-matches
+  `https://github.com/.*/pull/\d+`).
+- **`gh` discovery**: Boss-engine periodically runs
+  `gh pr list --head <expected-branch>` for active tasks (cube's
+  deterministic branch names from the design doc make this
+  clean).
+
+Engine records `task.pr_url` and transitions `active` →
+`in_review`.
+
+#### 3. Status polling cadence
+
+**Every 60 seconds** while at least one task is `in_review`, plus
+on-demand when the user clicks "refresh" in the UI. Polled fields
+per task:
+
+```text
+gh pr view <url> --json state,mergedAt,statusCheckRollup,reviews,comments
+```
+
+No webhook path in V2. Polling cost: at most ~9 PRs × 1 call/min
+= 9 calls/min, well under any rate limit.
+
+#### 4. Feedback loop — re-engagement
+
+When `gh pr view` shows new review comments since the last
+engagement (Boss-engine tracks "last comment ID surfaced to
+worker"), Work UI shows a "Re-engage worker" affordance with a
+count of unaddressed comments.
+
+On click:
+
+1. Boss-engine re-leases the workspace via cube
+   (`preferred_workspace_id` = the original lease's workspace,
+   per R4 finding 2).
+2. Resumes the claude session: `claude --resume <session_id>` in
+   that workspace.
+3. Sends a synthesized prompt as the next turn:
+   ```
+   The PR you opened (<pr_url>) has new review comments:
+   <bullet list of comments with author + body>
+   Please address them and update the PR.
+   ```
+4. Task moves `in_review` → `active` until the next `Stop`.
+5. Worker pushes; Boss re-detects PR state on next poll.
+
+The same flow applies if the human just types "ask the worker to
+do X to PR #N" in a hypothetical comment box. V2 is OK with the
+"click Re-engage to pull comments verbatim" version; richer
+free-text injection is v1.x.
+
+#### 5. Approval gating + merge
+
+**Merge stays on GitHub.** Boss does not auto-merge. The user
+clicks "Merge" on github.com (or runs `gh pr merge` themselves);
+Boss observes `state: MERGED` on the next poll and transitions
+the task to `done`, releases the cube lease.
+
+This avoids the V2 having to own merge-method preferences,
+branch-protection rule conflicts, or any of GitHub's merge-time
+edge cases. Cube's `pr merge` (per remaining-work doc) is
+unbuilt; even when it lands, V2 doesn't drive it from the human's
+"approve" action.
+
+#### 6. Triage surface
+
+Work mode gets a **"Needs attention"** section at the top of the
+navigator listing all tasks in `in_review`, `blocked`,
+`awaiting_input`, or recently-declared-lost (per R6). Each row
+shows:
+
+- task name + project context
+- state badge (`in_review` / `blocked` / `awaiting_input` /
+  `lost-on-restart`)
+- primary action: "Open PR" / "View blocker" /
+  "Focus pane" / "Re-dispatch"
+- secondary: dismiss, snooze, re-prioritize
+
+This is the human's at-a-glance "what does Boss need from me
+right now" view.
+
+### Resolution criteria
+
+- Native-vs-trampoline question committed.
+- PR detection mechanism committed.
+- Polling cadence + fields committed.
+- Re-engagement loop committed (workspace re-lease, resume,
+  comment forwarding).
+- Approval / merge ownership committed (stays on GitHub).
+- Triage surface defined.
+
+### Decision
+
+**Adopt Option A: trampoline to GitHub.** Boss V2 surfaces PR
+URLs and status; the human reviews, comments, and merges on
+github.com. Boss polls `gh pr view` to keep the status ribbon
+fresh and to detect comments + merges. Re-engagement re-leases
+the cube workspace, resumes the claude session, and feeds review
+comments as the next prompt.
+
+Implementation work this implies for V2:
+
+- Boss-engine: PR URL detection from worker `last_assistant_text`
+  + periodic `gh pr list` discovery.
+- Boss-engine: 60-second poll of `gh pr view` for each
+  `in_review` task; track `last_seen_comment_id` per PR.
+- Boss-engine: `request_re_engagement(work_item_id)` RPC that
+  re-leases workspace, resumes session, and constructs the
+  comments-as-prompt payload.
+- Boss-engine: detect `state: MERGED` on poll → transition to
+  `done`, release lease.
+- SwiftUI app: Work-mode detail view with PR URL, status
+  ribbon, "Open PR" + "Re-engage worker" buttons.
+- SwiftUI app: "Needs attention" section in Work navigator
+  surfacing in_review / blocked / awaiting_input / lost.
+
+These should be tracked as Boss V2 implementation tasks. Native
+rendering (diff viewer, in-app comments, in-app approve,
+auto-merge) is **explicitly out of scope for V2**; revisit after
+basic functionality is working.
+
 ## Risk backlog
 
 These risks have been identified but not yet worked through. They are
 listed here so we don't lose them; we'll write each one up properly when
 we get to it. Order is rough priority, not strict sequence.
 
-- **R7: Review and approval flow.** "Ready for review" is a state in the
-  plan but the human's review affordance is undefined. Decide where in
-  Work mode this lives.
 - **R8: `boss` vs `bossctl` boundary.** `work start` straddles durable
   state and live orchestration. Decide whether they're two CLI personas
   on one backend, or genuinely separate services.
