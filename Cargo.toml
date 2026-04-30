@@ -2,8 +2,10 @@
 members = [
   "lib/rust/broker-robinhood",
   "tools/boss/cli",
-  "tools/hood",
+  "tools/boss/client",
   "tools/boss/engine",
+  "tools/boss/protocol",
+  "tools/hood",
   "tools/checkleft",
   "tools/checkleft_package",
   "tools/cube",

@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::config::RuntimeConfig;
+use crate::config::{AgentConfig, RuntimeConfig};
 
 const PROTOCOL_VERSION: u64 = 1;
 const DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -93,14 +93,16 @@ pub struct AcpClient {
 
 impl AcpClient {
     pub async fn connect(cfg: &RuntimeConfig) -> Result<Self> {
-        Self::connect_internal(cfg, false).await
+        let agent = cfg.agent()?;
+        Self::connect_internal(&agent, false).await
     }
 
     pub async fn connect_with_external_permissions(cfg: &RuntimeConfig) -> Result<Self> {
-        Self::connect_internal(cfg, true).await
+        let agent = cfg.agent()?;
+        Self::connect_internal(&agent, true).await
     }
 
-    async fn connect_internal(cfg: &RuntimeConfig, interactive_permissions: bool) -> Result<Self> {
+    async fn connect_internal(cfg: &AgentConfig, interactive_permissions: bool) -> Result<Self> {
         cfg.preflight_acp()?;
 
         let mut command = Command::new(&cfg.acp.command);

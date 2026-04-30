@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,16 +20,44 @@ pub struct CubeConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuntimeConfig {
-    pub acp: AcpConfig,
-    pub cube: CubeConfig,
-    pub worker_pool_size: usize,
+pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
+    pub worker_pool_size: usize,
 }
 
-impl RuntimeConfig {
+impl WorkConfig {
     pub fn load_from_env() -> Result<Self> {
+        let cwd = resolve_runtime_cwd()?;
+        let db_path = match std::env::var_os("BOSS_DB_PATH") {
+            Some(path) => PathBuf::from(path),
+            None => default_db_path()?,
+        };
+        let worker_pool_size = std::env::var("BOSS_WORKER_POOL_SIZE")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| format!("could not parse BOSS_WORKER_POOL_SIZE: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        Ok(Self {
+            cwd,
+            db_path,
+            worker_pool_size,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub acp: AcpConfig,
+    pub cube: CubeConfig,
+    pub cwd: PathBuf,
+}
+
+impl AgentConfig {
+    pub fn load_from_env(work: &WorkConfig) -> Result<Self> {
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
         let (acp_command, acp_args) = parse_command_line(
@@ -39,20 +68,6 @@ impl RuntimeConfig {
             "BOSS_CUBE_CMD",
             std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| DEFAULT_CUBE_COMMAND.to_owned()),
         )?;
-        let worker_pool_size = std::env::var("BOSS_WORKER_POOL_SIZE")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .with_context(|| format!("could not parse BOSS_WORKER_POOL_SIZE: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(1);
-
-        let cwd = resolve_runtime_cwd()?;
-        let db_path = match std::env::var_os("BOSS_DB_PATH") {
-            Some(path) => PathBuf::from(path),
-            None => default_db_path()?,
-        };
 
         Ok(Self {
             acp: AcpConfig {
@@ -64,9 +79,7 @@ impl RuntimeConfig {
                 command: cube_command,
                 args: cube_args,
             },
-            worker_pool_size,
-            cwd,
-            db_path,
+            cwd: work.cwd.clone(),
         })
     }
 
@@ -87,6 +100,48 @@ impl RuntimeConfig {
         })?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct RuntimeConfig {
+    pub work: WorkConfig,
+    agent_cell: OnceLock<Arc<AgentConfig>>,
+}
+
+impl RuntimeConfig {
+    pub fn load_from_env() -> Result<Self> {
+        Ok(Self {
+            work: WorkConfig::load_from_env()?,
+            agent_cell: OnceLock::new(),
+        })
+    }
+
+    pub fn from_parts(work: WorkConfig, agent: Option<AgentConfig>) -> Self {
+        let cell = OnceLock::new();
+        if let Some(agent) = agent {
+            let _ = cell.set(Arc::new(agent));
+        }
+        Self {
+            work,
+            agent_cell: cell,
+        }
+    }
+
+    pub fn agent(&self) -> Result<Arc<AgentConfig>> {
+        if let Some(agent) = self.agent_cell.get() {
+            return Ok(agent.clone());
+        }
+        let loaded = AgentConfig::load_from_env(&self.work)?;
+        let arc = Arc::new(loaded);
+        match self.agent_cell.set(arc.clone()) {
+            Ok(()) => Ok(arc),
+            Err(_) => Ok(self
+                .agent_cell
+                .get()
+                .expect("OnceLock set after failed insert")
+                .clone()),
+        }
     }
 }
 

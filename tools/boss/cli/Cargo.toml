@@ -5,11 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
-boss-engine = { path = "../engine" }
+boss-client = { path = "../client" }
+boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-shlex = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
