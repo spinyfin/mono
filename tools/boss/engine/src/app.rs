@@ -67,6 +67,21 @@ Default behavior:
 - keep status and structure accurate,
 - suggest or assign implementation and investigation work rather than doing it yourself."#;
 
+#[async_trait]
+impl crate::spawn_flow::WorkerSpawner for ServerState {
+    async fn send_to_app_request(
+        &self,
+        request: EngineToAppRequest,
+        timeout: Duration,
+    ) -> Result<EngineToAppResponse, SendToAppError> {
+        self.send_to_app(request, timeout).await
+    }
+
+    fn worker_registry(&self) -> &WorkerRegistry {
+        &self.worker_registry
+    }
+}
+
 struct PidFileGuard {
     path: String,
     pid: u32,
@@ -252,7 +267,7 @@ impl AppSessionHandle {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SendToAppError {
     #[error("no app session is registered")]
     NotRegistered,
@@ -375,6 +390,10 @@ impl ServerState {
                 }
             }
         }
+    }
+
+    pub fn worker_registry_handle(&self) -> &WorkerRegistry {
+        &self.worker_registry
     }
 
     /// Route an `EngineResponse` from the app back to the waiting
