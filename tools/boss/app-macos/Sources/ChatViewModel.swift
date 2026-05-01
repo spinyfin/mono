@@ -550,17 +550,48 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Event Handling
 
+    var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
+    var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
+
     private func handle(_ event: EngineEvent) {
         switch event {
         case .connected:
             isConnected = true
             hasConnectedOnce = true
             pendingBossCreation = false
+            engine.sendRegisterAppSession()
             engine.sendListAgents()
             refreshWorkSubscriptions()
             engine.sendListProducts()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
+            }
+        case .appSessionRegistered:
+            // No additional state for now; the engine has confirmed
+            // this client is the registered app session.
+            break
+        case .engineRequest(let requestId, let request):
+            switch request {
+            case .spawnWorkerPane(let spawn):
+                let result: EngineSpawnResult
+                if let handler = paneSpawnHandler {
+                    result = handler(spawn)
+                } else {
+                    result = .failure(.internalFailure(
+                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
+                    ))
+                }
+                engine.sendSpawnWorkerPaneResponse(requestId: requestId, result: result)
+            case .releaseWorkerPane(let slotId, let killGrace):
+                let result: EngineReleaseResult
+                if let handler = paneReleaseHandler {
+                    result = handler(slotId, killGrace)
+                } else {
+                    result = .failure(.internalFailure(
+                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
+                    ))
+                }
+                engine.sendReleaseWorkerPaneResponse(requestId: requestId, result: result)
             }
         case .disconnected:
             isConnected = false

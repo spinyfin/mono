@@ -1,10 +1,44 @@
 import Foundation
 import Network
 
+struct EngineSpawnRequest: Sendable {
+    let runId: String
+    let workspacePath: String
+    let initialInput: String
+    let env: [(String, String)]
+}
+
+enum EngineSpawnError: Sendable {
+    case noAvailableSlot
+    case internalFailure(String)
+}
+
+enum EngineSpawnResult: Sendable {
+    case success(slotId: Int, shellPid: Int32)
+    case failure(EngineSpawnError)
+}
+
+enum EngineReleaseError: Sendable {
+    case unknownSlot
+    case internalFailure(String)
+}
+
+enum EngineReleaseResult: Sendable {
+    case success
+    case failure(EngineReleaseError)
+}
+
+enum EngineRequestKind: Sendable {
+    case spawnWorkerPane(EngineSpawnRequest)
+    case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
+}
+
 enum EngineEvent {
     case connected
     case disconnected
     case workInvalidated(topic: String, productId: String?, itemIds: [String])
+    case appSessionRegistered
+    case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
     case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask])
@@ -216,6 +250,71 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendRegisterAppSession() {
+        sendLine([
+            "type": "register_app_session",
+        ])
+    }
+
+    func sendSpawnWorkerPaneResponse(requestId: String, result: EngineSpawnResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success(let slotId, let shellPid):
+            resultPayload = [
+                "Ok": [
+                    "slot_id": slotId,
+                    "shell_pid": Int(shellPid),
+                ]
+            ]
+        case .failure(let error):
+            resultPayload = ["Err": engineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "spawn_worker_pane",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
+    func sendReleaseWorkerPaneResponse(requestId: String, result: EngineReleaseResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": releaseEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "release_worker_pane",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
+    private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
+        switch error {
+        case .noAvailableSlot:
+            return ["kind": "no_available_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func releaseEngineToAppErrorPayload(_ error: EngineReleaseError) -> [String: Any] {
+        switch error {
+        case .unknownSlot:
+            return ["kind": "unknown_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
     private func sendLine(_ payload: [String: Any]) {
         guard let connection else {
             emit(.error(agentId: nil, message: "engine connection is not established"))
@@ -403,6 +502,46 @@ final class EngineClient: @unchecked Sendable {
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
                 emit(.error(agentId: agentId, message: message))
+            case "app_session_registered":
+                emit(.appSessionRegistered)
+            case "engine_request":
+                guard
+                    let requestId = payload["request_id"] as? String,
+                    let request = payload["request"] as? [String: Any],
+                    let kind = request["kind"] as? String
+                else {
+                    emit(.error(agentId: nil, message: "engine_request missing required fields"))
+                    break
+                }
+                switch kind {
+                case "spawn_worker_pane":
+                    let runId = request["run_id"] as? String ?? ""
+                    let workspacePath = request["workspace_path"] as? String ?? ""
+                    let initialInput = request["initial_input"] as? String ?? ""
+                    let env = (request["env"] as? [[String: Any]] ?? []).compactMap {
+                        item -> (String, String)? in
+                        guard let k = item["key"] as? String, let v = item["value"] as? String else {
+                            return nil
+                        }
+                        return (k, v)
+                    }
+                    let spawn = EngineSpawnRequest(
+                        runId: runId,
+                        workspacePath: workspacePath,
+                        initialInput: initialInput,
+                        env: env
+                    )
+                    emit(.engineRequest(requestId: requestId, request: .spawnWorkerPane(spawn)))
+                case "release_worker_pane":
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                    let killGrace = (request["kill_grace_seconds"] as? NSNumber)?.uint32Value ?? 0
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
+                    ))
+                default:
+                    emit(.error(agentId: nil, message: "engine_request unknown kind: \(kind)"))
+                }
             default:
                 break
             }
