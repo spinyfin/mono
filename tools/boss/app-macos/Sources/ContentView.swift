@@ -32,6 +32,21 @@ struct ContentView: View {
                 .opacity(model.navigationMode == .agents ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .agents)
         }
+        #if canImport(GhosttyKit)
+        .task {
+            // Wire the SwiftPM-only pane allocator into ChatViewModel
+            // so EngineRequest events from the engine route through to
+            // WorkersWorkspaceModel. Bazel builds without GhosttyKit
+            // leave the handlers nil; ChatViewModel responds with
+            // EngineToAppError::Internal in that path.
+            model.paneSpawnHandler = { [workspace = workersWorkspace] request in
+                workspace.spawnWorkerPane(request)
+            }
+            model.paneReleaseHandler = { [workspace = workersWorkspace] slotId, killGrace in
+                workspace.releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
+            }
+        }
+        #endif
         .frame(minWidth: 860, minHeight: 560)
         .task {
             model.startIfNeeded()

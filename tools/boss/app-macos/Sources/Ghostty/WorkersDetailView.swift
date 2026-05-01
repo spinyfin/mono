@@ -5,7 +5,7 @@ struct WorkersDetailView: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
 
     var body: some View {
-        WorkerGrid(runtime: workspace.runtime, panes: workspace.workerPanes)
+        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .separatorColor))
     }
@@ -13,19 +13,19 @@ struct WorkersDetailView: View {
 
 private struct WorkerGrid: View {
     let runtime: GhosttyRuntime
-    let panes: [TerminalPaneSession]
+    let slots: [WorkerSlot]
 
     var body: some View {
         let columns = 4
-        let rows = stride(from: 0, to: panes.count, by: columns).map { start in
-            Array(panes[start..<min(start + columns, panes.count)])
+        let rows = stride(from: 0, to: slots.count, by: columns).map { start in
+            Array(slots[start..<min(start + columns, slots.count)])
         }
 
         VStack(spacing: 1) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 1) {
-                    ForEach(row) { pane in
-                        WorkerPaneView(runtime: runtime, session: pane)
+                    ForEach(row) { slot in
+                        WorkerSlotView(runtime: runtime, slot: slot)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -34,41 +34,65 @@ private struct WorkerGrid: View {
     }
 }
 
-private struct WorkerPaneView: View {
+private struct WorkerSlotView: View {
     let runtime: GhosttyRuntime
-    @ObservedObject var session: TerminalPaneSession
+    let slot: WorkerSlot
 
     var body: some View {
         VStack(spacing: 0) {
-            paneHeader
+            slotHeader
             Divider()
-            GhosttyTerminalView(
-                runtime: runtime,
-                session: session,
-                launchSpec: session.launchSpec
-            )
-            .background(Color(nsColor: .black))
+            slotBody
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var paneHeader: some View {
+    @ViewBuilder
+    private var slotBody: some View {
+        if let session = slot.session {
+            WorkerPaneTerminalView(runtime: runtime, session: session)
+        } else {
+            VStack {
+                Spacer()
+                Text("Slot \(slot.slotId)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Text("Free")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .black))
+        }
+    }
+
+    private var slotHeader: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(session.role.defaultTitle)
+                Text("Worker \(slot.slotId)")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                Text(session.displayTitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                if let runId = slot.runId {
+                    Text(runId)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("idle")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
 
             Spacer(minLength: 0)
 
-            statusPill(session.claudeState.label, color: claudeStateColor)
+            if let state = slot.session?.claudeState {
+                statusPill(state.label, color: claudeStateColor(state))
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -85,12 +109,26 @@ private struct WorkerPaneView: View {
             .clipShape(Capsule())
     }
 
-    private var claudeStateColor: Color {
-        switch session.claudeState {
+    private func claudeStateColor(_ state: ClaudeMonitorState) -> Color {
+        switch state {
         case .working: .blue
         case .ready: .green
         case .notDetected: .secondary
         case .unavailable: .orange
         }
+    }
+}
+
+private struct WorkerPaneTerminalView: View {
+    let runtime: GhosttyRuntime
+    @ObservedObject var session: TerminalPaneSession
+
+    var body: some View {
+        GhosttyTerminalView(
+            runtime: runtime,
+            session: session,
+            launchSpec: session.launchSpec
+        )
+        .background(Color(nsColor: .black))
     }
 }
