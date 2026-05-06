@@ -81,6 +81,16 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
            `--force`, no `jj file track .claude/...`) — those files\n\
            are per-worker plumbing, not part of the project.\n\
          \n\
+         ### Commit messages must be inline\n\
+         \n\
+         Never invoke `git commit`, `git rebase`, `jj commit`, or\n\
+         `jj describe` without an explicit `-m \"…\"` message. The same\n\
+         rule applies to amend and squash flows (`git commit --amend`,\n\
+         `jj squash`, `jj split`): pass `-m` inline. The worker\n\
+         environment intentionally has no usable `$EDITOR`, so any\n\
+         command that falls through to one will fail fast — fix it by\n\
+         re-running with `-m`, not by changing the editor.\n\
+         \n\
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
@@ -216,6 +226,19 @@ mod tests {
         assert!(rendered.contains(&input.lease_id));
         assert!(rendered.contains("`jj`"));
         assert!(rendered.contains("PR"));
+    }
+
+    #[test]
+    fn claude_md_forbids_editor_fallthrough_for_commit_messages() {
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        // The rule must explicitly call out `-m` and the editor
+        // fallthrough so a worker that grepped only for "commit" still
+        // hits the guidance.
+        assert!(rendered.contains("-m"));
+        assert!(rendered.contains("$EDITOR"));
+        assert!(rendered.contains("jj describe"));
+        assert!(rendered.contains("git commit"));
     }
 
     #[test]
