@@ -70,7 +70,7 @@ private struct WorkerSlotView: View {
     private var slotHeader: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text("Worker \(slot.slotId)")
+                Text(WorkerNames.name(forSlot: slot.slotId))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -96,6 +96,15 @@ private struct WorkerSlotView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+        .help(slotTooltip)
+    }
+
+    private var slotTooltip: String {
+        let base = "Worker \(slot.slotId)"
+        if let runId = slot.runId {
+            return "\(base) · run \(runId)"
+        }
+        return "\(base) · idle"
     }
 
     private func statusPill(_ text: String, color: Color) -> some View {
