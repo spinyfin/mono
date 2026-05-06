@@ -732,6 +732,31 @@ impl ExecutionCoordinator {
 
         match run_outcome {
             Ok(outcome) => {
+                // If the runner allocated a real pane slot for this
+                // run (the PaneSpawnRunner case), stamp it onto the
+                // run record's agent_id so `bossctl agents list` and
+                // related views show one entry per active pane. Pure
+                // in-process runners (e.g., AcpExecutionRunner) leave
+                // slot_id as None and the worker-pool placeholder
+                // (worker_id) stays as the agent_id.
+                let run = if let Some(slot_id) = outcome.slot_id {
+                    let agent_id = format!("worker-{}", slot_id);
+                    match self.work_db.set_run_agent_id(&run.id, &agent_id) {
+                        Ok(updated) => updated,
+                        Err(err) => {
+                            tracing::error!(
+                                ?err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                slot_id,
+                                "failed to stamp pane slot onto run record"
+                            );
+                            run
+                        }
+                    }
+                } else {
+                    run
+                };
                 if let Err(err) = self
                     .record_run_completion(&execution, &run, &lease, &worker_id, outcome)
                     .await
@@ -1083,6 +1108,12 @@ mod tests {
         calls: Mutex<Vec<(String, String, String, Option<String>)>>,
         fail: bool,
         pending: bool,
+        /// If `Some`, the runner reports this slot id back to the
+        /// coordinator in the `RunOutcome`, simulating a successful
+        /// `SpawnWorkerPane` round-trip. Used to verify that the
+        /// coordinator stamps the slot-based agent_id onto the run
+        /// record.
+        slot_id: Option<u8>,
     }
 
     impl Default for FakeExecutionRunner {
@@ -1091,6 +1122,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 fail: false,
                 pending: false,
+                slot_id: None,
             }
         }
     }
@@ -1126,6 +1158,7 @@ mod tests {
                     title: format!("Review {}", execution.kind),
                     body_markdown: format!("Review {}", test_work_item_name(work_item)),
                 }),
+                slot_id: self.slot_id,
             })
         }
     }
@@ -1238,6 +1271,98 @@ mod tests {
         assert_eq!(cube.create_calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
+    }
+
+    #[tokio::test]
+    async fn slot_id_from_outcome_is_stamped_onto_run_agent_id() {
+        // When the runner reports a real pane slot back via
+        // RunOutcome.slot_id, the coordinator must overwrite the run
+        // record's `agent_id` with `worker-{slot}` before recording
+        // completion. This is what makes `bossctl agents list` show
+        // one entry per active pane instead of collapsing every
+        // dispatched run into the worker-pool placeholder.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        // Pool has only one slot, so the worker-pool placeholder
+        // would otherwise be `worker-1`. The runner reports slot 5
+        // — the assertion below proves the slot value won, not the
+        // pool placeholder.
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_id: Some(5),
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            runner,
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.agent_id, "worker-5");
+    }
+
+    #[tokio::test]
+    async fn missing_slot_id_leaves_worker_pool_placeholder_in_agent_id() {
+        // Runners without a pane (e.g., AcpExecutionRunner) leave
+        // slot_id = None. The coordinator must not touch agent_id in
+        // that case — the worker-pool placeholder set at run-create
+        // time stays.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            runner,
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
+        assert_eq!(run.agent_id, "worker-1");
     }
 
     #[tokio::test]

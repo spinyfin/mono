@@ -614,6 +614,25 @@ impl WorkDb {
         query_run(&conn, id)?.with_context(|| format!("unknown run: {id}"))
     }
 
+    /// Stamp the actual pane-slot identity onto an existing run record.
+    /// The coordinator inserts the run with the worker-pool placeholder
+    /// (`worker-N` from capacity tracking), then calls this once the
+    /// app has reported the real slot allocation back from
+    /// `SpawnWorkerPane`. After this point `agent_id` is treated as
+    /// immutable for the run's lifetime — re-spawning into a different
+    /// slot would create a new run rather than mutate this one.
+    pub fn set_run_agent_id(&self, run_id: &str, agent_id: &str) -> Result<WorkRun> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs SET agent_id = ?2 WHERE id = ?1",
+            params![run_id, agent_id],
+        )?;
+        if updated == 0 {
+            bail!("unknown run: {run_id}");
+        }
+        query_run(&conn, run_id)?.with_context(|| format!("unknown run: {run_id}"))
+    }
+
     pub fn create_attention_item(
         &self,
         input: CreateAttentionItemInput,
@@ -2625,6 +2644,18 @@ mod tests {
             WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
             other => panic!("expected chore/task, got {other:?}"),
         }
+
+        // Stamping the real pane slot back onto agent_id: the
+        // coordinator calls this once SpawnWorkerPane responds with
+        // the slot the app actually allocated. Looking it up
+        // afterwards must reflect the new value.
+        let updated = db.set_run_agent_id(&run.id, "worker-3").unwrap();
+        assert_eq!(updated.agent_id, "worker-3");
+        let reread = db.get_run(&run.id).unwrap();
+        assert_eq!(reread.agent_id, "worker-3");
+
+        let unknown = db.set_run_agent_id("run-does-not-exist", "worker-1");
+        assert!(unknown.is_err());
 
         let _ = std::fs::remove_file(path);
     }

@@ -63,6 +63,14 @@ pub struct RunOutcome {
     pub wait_state: RunWaitState,
     pub result_summary: Option<String>,
     pub attention: Option<RunAttention>,
+    /// Pane slot the worker was actually allocated into, if this run
+    /// hosts a libghostty pane. The coordinator stamps this onto the
+    /// run record's `agent_id` (as `worker-{slot_id}`) so `bossctl
+    /// agents list` shows one entry per active pane instead of
+    /// collapsing every run into the worker-pool placeholder. `None`
+    /// means the runner doesn't have a pane (e.g., the in-process
+    /// `AcpExecutionRunner`); the coordinator leaves agent_id alone.
+    pub slot_id: Option<u8>,
 }
 
 #[async_trait]
@@ -218,6 +226,7 @@ impl ExecutionRunner for AcpExecutionRunner {
             wait_state: RunWaitState::WaitingHuman,
             result_summary,
             attention,
+            slot_id: None,
         })
     }
 }
@@ -420,6 +429,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 started.slot_id, started.shell_pid,
             )),
             attention: None,
+            slot_id: Some(started.slot_id),
         })
     }
 }
