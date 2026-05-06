@@ -263,9 +263,30 @@ impl PaneSpawnRunner {
         if let Ok(override_path) = std::env::var("BOSS_EVENT_BIN") {
             return override_path.into();
         }
-        // Fallback: assume bazel-built sibling binary in the runtime
-        // working directory layout. Not robust; the env override is
-        // the recommended path for production use.
+        // Try to resolve relative to the engine binary so workers
+        // get an absolute path that survives the sanitized PATH
+        // (which excludes ~/bin and other ambient dirs). Fall back
+        // candidates in order:
+        //   - sibling: <engine_dir>/boss-event (cargo / hand-built layouts)
+        //   - bazel sibling: <engine_dir>/../event-shim/boss-event
+        //     (`bazel-out/.../bin/tools/boss/{engine,event-shim}/`)
+        // If none resolve, fall back to the bare name and let the
+        // worker's PATH find it (today this fails — explicit
+        // `BOSS_EVENT_BIN` is the recommended override for prod).
+        if let Ok(engine_path) = std::env::current_exe() {
+            if let Some(engine_dir) = engine_path.parent() {
+                let sibling = engine_dir.join("boss-event");
+                if sibling.exists() {
+                    return sibling;
+                }
+                if let Some(parent_dir) = engine_dir.parent() {
+                    let bazel_layout = parent_dir.join("event-shim").join("boss-event");
+                    if bazel_layout.exists() {
+                        return bazel_layout;
+                    }
+                }
+            }
+        }
         PathBuf::from("boss-event")
     }
 }
@@ -276,9 +297,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         &self,
         worker_id: &str,
         execution: &WorkExecution,
-        _work_item: &WorkItem,
+        work_item: &WorkItem,
         workspace_path: &Path,
-        _cube_change_id: Option<&str>,
+        cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
         let weak = self
             .server_state
@@ -293,6 +314,29 @@ impl ExecutionRunner for PaneSpawnRunner {
             .clone()
             .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
 
+        // Compose the worker prompt and stash it on disk so the
+        // libghostty pane can `claude "$(cat .claude/initial-prompt.txt)"`
+        // — Claude Code's positional arg is treated as the first user
+        // message, which gets the worker working without us having to
+        // wait for a "Claude is ready" signal and then SendToPane.
+        // Going through a file (rather than embedding the prompt in
+        // the typed command) avoids shell quoting hell on multi-line,
+        // backtick-bearing markdown.
+        let prompt_text = compose_execution_prompt(
+            execution,
+            work_item,
+            workspace_path,
+            cube_change_id,
+        );
+        let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
+        if let Some(parent) = prompt_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&prompt_path, &prompt_text)
+            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        let initial_input = "claude \"$(cat .claude/initial-prompt.txt)\"\n".to_owned();
+
         let started = start_worker(
             spawner.as_ref(),
             StartWorkerInput {
@@ -301,7 +345,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 workspace_path: workspace_path.to_path_buf(),
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
-                initial_input: "claude\n".to_owned(),
+                initial_input,
                 extra_env: vec![],
             },
             StdDuration::from_secs(30),
