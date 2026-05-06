@@ -55,6 +55,14 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     "CUBE_REPO",
 ];
 
+/// Value forced into `EDITOR`/`VISUAL`/`GIT_EDITOR`/`JJ_EDITOR` for
+/// worker panes. `false` exits non-zero immediately, so any tool that
+/// falls through to `$EDITOR` aborts loudly instead of silently popping
+/// the user's vim/VS Code window. The CLAUDE.md template tells workers
+/// to always pass `-m` inline; this is the safety net that turns a
+/// forgotten `-m` into a fast, recoverable error.
+const WORKER_EDITOR_NOOP: &str = "false";
+
 #[derive(Debug, Clone)]
 pub struct StartWorkerInput {
     pub run_id: String,
@@ -132,6 +140,13 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    (no `bossctl`), the engine-injected `BOSS_EVENTS_SOCKET` and
     //    `BOSS_LEASE_ID`, and any caller-provided `extra_env` keys
     //    that survive the allowlist filter. Anything else is dropped.
+    //
+    //    Editor env vars are forced to `false` so a worker that runs
+    //    `git commit` / `jj describe` without `-m` doesn't pop the
+    //    user's vim/VS Code window — the command exits non-zero and
+    //    the worker corrects course by passing `-m` inline. The
+    //    matching CLAUDE.md guidance tells the worker the rule; this
+    //    is the belt that catches it when the suspenders slip.
     let mut env = vec![
         EnvVar {
             key: "PATH".into(),
@@ -144,6 +159,22 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         EnvVar {
             key: "BOSS_LEASE_ID".into(),
             value: input.lease_id.clone(),
+        },
+        EnvVar {
+            key: "EDITOR".into(),
+            value: WORKER_EDITOR_NOOP.into(),
+        },
+        EnvVar {
+            key: "VISUAL".into(),
+            value: WORKER_EDITOR_NOOP.into(),
+        },
+        EnvVar {
+            key: "GIT_EDITOR".into(),
+            value: WORKER_EDITOR_NOOP.into(),
+        },
+        EnvVar {
+            key: "JJ_EDITOR".into(),
+            value: WORKER_EDITOR_NOOP.into(),
         },
     ];
     for (k, v) in input.extra_env {
@@ -425,6 +456,34 @@ mod tests {
             env.iter().find(|(k, _)| k == "BOSS_LEASE_ID").map(|(_, v)| v.as_str()),
             Some("lease-test"),
         );
+    }
+
+    #[tokio::test]
+    async fn env_forces_editor_vars_to_noop() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let env = spawner.last_spawn_env();
+        // Every editor-resolution env that git/jj/$EDITOR-aware tools
+        // consult must be forced to a non-zero-exit no-op. `false`
+        // causes the editor invocation to fail fast so the worker
+        // notices and re-runs with `-m`.
+        for key in ["EDITOR", "VISUAL", "GIT_EDITOR", "JJ_EDITOR"] {
+            let value = env
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("expected env key {key} on worker spawn"))
+                .1
+                .as_str();
+            assert_eq!(
+                value, WORKER_EDITOR_NOOP,
+                "{key} should be forced to {WORKER_EDITOR_NOOP}, got {value}",
+            );
+        }
     }
 
     #[tokio::test]
