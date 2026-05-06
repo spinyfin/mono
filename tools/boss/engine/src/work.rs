@@ -896,9 +896,6 @@ impl WorkDb {
             CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
                 ON work_executions(work_item_id, created_at);
 
-            CREATE INDEX IF NOT EXISTS work_executions_ready_idx
-                ON work_executions(status, priority, created_at);
-
             CREATE TABLE IF NOT EXISTS work_runs (
                 id TEXT PRIMARY KEY,
                 execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
@@ -932,6 +929,16 @@ impl WorkDb {
             ",
         )?;
         migrate_work_executions_v3(&conn)?;
+        // Index creation must follow migration: pre-v3 databases don't
+        // have `priority` until `migrate_work_executions_v3` adds it,
+        // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
+        // columns rather than silently skipping. Keep this out of the
+        // schema-init batch so a pre-v3 database can still be opened.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS work_executions_ready_idx
+                ON work_executions(status, priority, created_at)",
+            [],
+        )?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '3')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1815,6 +1822,67 @@ mod tests {
         let tree = db.get_work_tree(&product.id).unwrap();
         assert!(tree.chores.is_empty());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pre-v3 database has `work_executions` without `priority`,
+    /// `cube_workspace_id`, or `preferred_workspace_id`. Opening the
+    /// db must apply the column migrations and the `priority`-keyed
+    /// index without erroring.
+    #[test]
+    fn opens_pre_v3_database_without_priority_column() {
+        let path = temp_db_path("pre-v3");
+        // Build a minimal pre-v3 schema: just the table the migration
+        // touches, missing the three v3 columns.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_executions (
+                id TEXT PRIMARY KEY,
+                work_item_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                repo_remote_url TEXT NOT NULL,
+                cube_repo_id TEXT,
+                cube_lease_id TEXT,
+                workspace_path TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        // This used to fail with `no such column: priority` because the
+        // index DDL was in the same batch as the table DDL, so the
+        // migration that adds the column never got a chance to run.
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        // Sanity-check that v3 columns are now present and the index
+        // exists.
+        let conn = db.connect().unwrap();
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(work_executions)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(cols.contains(&"priority".to_owned()));
+        assert!(cols.contains(&"cube_workspace_id".to_owned()));
+        assert!(cols.contains(&"preferred_workspace_id".to_owned()));
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'work_executions_ready_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
+        drop(conn);
         let _ = std::fs::remove_file(path);
     }
 
