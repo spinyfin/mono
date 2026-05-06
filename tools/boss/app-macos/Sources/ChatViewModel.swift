@@ -17,6 +17,7 @@ final class ChatViewModel: ObservableObject {
     @Published var projectsByProductID: [String: [WorkProject]] = [:]
     @Published var tasksByProjectID: [String: [WorkTask]] = [:]
     @Published var choresByProductID: [String: [WorkTask]] = [:]
+    @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
     @Published var selectedWorkProductID: String?
     @Published var selectedProjectFilterIDs: Set<String> = []
     @Published var includeChores: Bool = true
@@ -626,7 +627,7 @@ final class ChatViewModel: ObservableObject {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes):
             upsertProduct(product)
             if currentSelectedProductID == nil {
                 selectedWorkProductID = product.id
@@ -644,6 +645,7 @@ final class ChatViewModel: ObservableObject {
                 tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
+            mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             reconcileWorkSelection()
             refreshWorkSubscriptions()
             workErrorMessage = nil
@@ -1154,6 +1156,23 @@ final class ChatViewModel: ObservableObject {
 
     func isTaskVisible(_ task: WorkTask) -> Bool {
         workItems(in: task.boardColumn).contains(where: { $0.id == task.id })
+    }
+
+    private func mergeTaskRuntimes(
+        _ runtimes: [WorkTaskRuntime],
+        for productID: String,
+        tasks: [WorkTask],
+        chores: [WorkTask]
+    ) {
+        let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
+        taskRuntimesByID = taskRuntimesByID.filter { !productItemIDs.contains($0.key) }
+        for runtime in runtimes {
+            taskRuntimesByID[runtime.workItemID] = runtime
+        }
+    }
+
+    func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
+        taskRuntimesByID[taskID]
     }
 
     private func upsertProduct(_ product: WorkProduct) {

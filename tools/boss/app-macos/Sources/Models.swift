@@ -251,3 +251,57 @@ extension WorkTask {
         }
     }
 }
+
+struct WorkTaskRuntime: Hashable {
+    let workItemID: String
+    let executionStatus: String?
+    let runStatus: String?
+}
+
+enum AgentActivityState {
+    case active
+    case waiting(reason: String)
+    case none
+
+    init(runtime: WorkTaskRuntime?) {
+        guard let runtime, let executionStatus = runtime.executionStatus else {
+            self = .none
+            return
+        }
+        switch executionStatus {
+        case "running":
+            if runtime.runStatus == "active" {
+                self = .active
+            } else {
+                self = .waiting(reason: "Run \(runtime.runStatus ?? "in progress")")
+            }
+        case "ready":
+            self = .waiting(reason: "Queued for a worker")
+        case "waiting_human":
+            self = .waiting(reason: "Waiting on human input")
+        case "waiting_review":
+            self = .waiting(reason: "Waiting on review")
+        case "waiting_merge":
+            self = .waiting(reason: "Waiting on merge")
+        case "waiting_dependency":
+            self = .waiting(reason: "Waiting on dependency")
+        case "failed":
+            self = .waiting(reason: "Last run failed")
+        case "completed":
+            self = .none
+        default:
+            self = .waiting(reason: executionStatus.replacingOccurrences(of: "_", with: " "))
+        }
+    }
+
+    var tooltip: String {
+        switch self {
+        case .active:
+            return "Agent is actively working"
+        case .waiting(let reason):
+            return reason
+        case .none:
+            return "No agent attached"
+        }
+    }
+}

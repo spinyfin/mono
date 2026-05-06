@@ -94,12 +94,24 @@ pub struct ExecutionReconcileResult {
     pub updated: Vec<WorkExecution>,
 }
 
+/// Live runtime status for a single task/chore — the current execution
+/// and most recent run, summarized for the kanban view. `None` fields
+/// mean no execution (or no run) exists yet for the work item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRuntime {
+    pub work_item_id: String,
+    pub execution_status: Option<String>,
+    pub run_status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkTree {
     pub product: Product,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     pub chores: Vec<Task>,
+    #[serde(default)]
+    pub task_runtimes: Vec<TaskRuntime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

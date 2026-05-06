@@ -52,7 +52,7 @@ enum EngineEvent {
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
-    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime])
     case workItemCreated(item: WorkItemPayload)
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
@@ -456,7 +456,15 @@ final class EngineClient: @unchecked Sendable {
                 let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
                 let tasks = (payload["tasks"] as? [[String: Any]] ?? []).compactMap(parseTask)
                 let chores = (payload["chores"] as? [[String: Any]] ?? []).compactMap(parseTask)
-                emit(.workTree(product: product, projects: projects, tasks: tasks, chores: chores))
+                let taskRuntimes = (payload["task_runtimes"] as? [[String: Any]] ?? [])
+                    .compactMap(parseTaskRuntime)
+                emit(.workTree(
+                    product: product,
+                    projects: projects,
+                    tasks: tasks,
+                    chores: chores,
+                    taskRuntimes: taskRuntimes
+                ))
             case "work_item_created":
                 guard let itemPayload = payload["item"] as? [String: Any],
                       let item = parseWorkItem(itemPayload)
@@ -693,6 +701,17 @@ final class EngineClient: @unchecked Sendable {
             deletedAt: payload["deleted_at"] as? String,
             createdAt: createdAt,
             updatedAt: updatedAt
+        )
+    }
+
+    private func parseTaskRuntime(_ payload: [String: Any]) -> WorkTaskRuntime? {
+        guard let workItemID = payload["work_item_id"] as? String else {
+            return nil
+        }
+        return WorkTaskRuntime(
+            workItemID: workItemID,
+            executionStatus: payload["execution_status"] as? String,
+            runStatus: payload["run_status"] as? String
         )
     }
 

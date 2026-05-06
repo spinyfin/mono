@@ -632,14 +632,9 @@ impl ExecutionCoordinator {
                 // invalidation so kanban subscribers re-fetch and
                 // move the card to the Doing column.
                 if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = match &work_item {
-                        WorkItem::Product(p) => p.id.clone(),
-                        WorkItem::Project(p) => p.product_id.clone(),
-                        WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id.clone(),
-                    };
                     self.publisher
                         .publish_work_item_changed(
-                            &product_id,
+                            &work_item_product_id(&work_item),
                             &execution.work_item_id,
                             "execution_started_auto_advance",
                         )
@@ -691,10 +686,26 @@ impl ExecutionCoordinator {
         let execution_id = execution.id.clone();
         let work_item_id = execution.work_item_id.clone();
         let status = execution.status.clone();
+        let product_id = match self.work_db.get_work_item(&work_item_id) {
+            Ok(item) => Some(work_item_product_id(&item)),
+            Err(err) => {
+                tracing::warn!(?err, %work_item_id, "failed to resolve product for runtime broadcast");
+                None
+            }
+        };
         tokio::spawn(async move {
             publisher
                 .publish(&execution_id, &work_item_id, &status, "execution_start_failed")
                 .await;
+            if let Some(product_id) = product_id {
+                publisher
+                    .publish_work_item_changed(
+                        &product_id,
+                        &work_item_id,
+                        "execution_start_failed",
+                    )
+                    .await;
+            }
         });
         Ok(())
     }
@@ -777,6 +788,15 @@ impl ExecutionCoordinator {
                                 "execution_run_failed",
                             )
                             .await;
+                        if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+                            self.publisher
+                                .publish_work_item_changed(
+                                    &work_item_product_id(&item),
+                                    &execution.work_item_id,
+                                    "execution_run_failed",
+                                )
+                                .await;
+                        }
                     }
                     Err(record_err) => {
                         tracing::error!(
@@ -862,7 +882,24 @@ impl ExecutionCoordinator {
                 "execution_run_completed",
             )
             .await;
+        if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+            self.publisher
+                .publish_work_item_changed(
+                    &work_item_product_id(&item),
+                    &execution.work_item_id,
+                    "execution_run_completed",
+                )
+                .await;
+        }
         Ok(())
+    }
+}
+
+fn work_item_product_id(item: &WorkItem) -> String {
+    match item {
+        WorkItem::Product(p) => p.id.clone(),
+        WorkItem::Project(p) => p.product_id.clone(),
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id.clone(),
     }
 }
 
@@ -1558,6 +1595,20 @@ mod tests {
             .find(|(_, _, _, reason)| reason == "execution_run_completed")
             .map(|(_, _, status, _)| status.clone());
         assert_eq!(last_status.as_deref(), Some("waiting_human"));
+
+        // The kanban activity-icon depends on a work-tree invalidation
+        // on run completion, otherwise the card would stay stuck on
+        // "active" after the agent moved to waiting_human. Confirm the
+        // coordinator now fires the broadcast on the completion path
+        // too — not just on execution-start auto-advance.
+        let work_item_events = publisher.work_item_events.lock().await;
+        assert!(
+            work_item_events.iter().any(|(_, _, reason)| {
+                reason == "execution_run_completed"
+            }),
+            "expected execution_run_completed work-item invalidation, got: {:?}",
+            *work_item_events,
+        );
     }
 
     /// When `start_execution_run` auto-advances `tasks.status` to

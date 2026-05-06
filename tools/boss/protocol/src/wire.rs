@@ -4,8 +4,8 @@ use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::types::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
     CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project,
-    RequestExecutionInput, Task, WorkAttentionItem, WorkExecution, WorkItem, WorkItemPatch,
-    WorkRun,
+    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -253,6 +253,8 @@ pub enum FrontendEvent {
         projects: Vec<Project>,
         tasks: Vec<Task>,
         chores: Vec<Task>,
+        #[serde(default)]
+        task_runtimes: Vec<TaskRuntime>,
     },
     WorkItemResult {
         item: WorkItem,
