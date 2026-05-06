@@ -343,7 +343,10 @@ fn print_run(json: bool, run: &WorkRun) {
 
 fn print_run_short(run: &WorkRun) {
     let started = run.started_at.as_deref().unwrap_or("-");
-    println!("{}  {}  {}  exec={}", run.id, run.status, started, run.execution_id);
+    println!(
+        "{}  agent={}  {}  {}  exec={}",
+        run.id, run.agent_id, run.status, started, run.execution_id
+    );
 }
 
 fn print_execution(json: bool, execution: &WorkExecution) {
