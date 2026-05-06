@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 pub use boss_protocol::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
     CreateProjectInput, CreateRunInput, CreateTaskInput, ExecutionReconcileResult, Product,
-    Project, RequestExecutionInput, Task, WorkAttentionItem, WorkExecution, WorkItem,
+    Project, RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
     WorkItemPatch, WorkRun, WorkTree,
 };
 
@@ -736,11 +736,14 @@ impl WorkDb {
             collect_rows(rows)?
         };
 
+        let task_runtimes = collect_task_runtimes(&conn, &tasks, &chores)?;
+
         Ok(WorkTree {
             product,
             projects,
             tasks,
             chores,
+            task_runtimes,
         })
     }
 
@@ -1407,6 +1410,43 @@ fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> 
     Ok(())
 }
 
+fn collect_task_runtimes(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+) -> Result<Vec<TaskRuntime>> {
+    let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
+    for task in tasks.iter().chain(chores.iter()) {
+        let execution = query_latest_execution_for_work_item(conn, &task.id)?;
+        let (execution_status, run_status) = if let Some(execution) = execution {
+            let run_status = query_latest_run_status(conn, &execution.id)?;
+            (Some(execution.status), run_status)
+        } else {
+            (None, None)
+        };
+        runtimes.push(TaskRuntime {
+            work_item_id: task.id.clone(),
+            execution_status,
+            run_status,
+        });
+    }
+    Ok(runtimes)
+}
+
+fn query_latest_run_status(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT status
+         FROM work_runs
+         WHERE execution_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        [execution_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn query_latest_execution_for_work_item(
     conn: &Connection,
     work_item_id: &str,
@@ -1837,6 +1877,76 @@ mod tests {
         db.delete_work_item(&chore.id).unwrap();
         let tree = db.get_work_tree(&product.id).unwrap();
         assert!(tree.chores.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `get_work_tree` should return a `task_runtimes` entry for every
+    /// active task and chore, so the kanban can render an activity icon
+    /// per Doing-lane card. Tasks with no execution carry `None` for
+    /// both status fields; tasks mid-run carry the live execution +
+    /// run statuses.
+    #[test]
+    fn work_tree_includes_runtime_status_per_task() {
+        let path = temp_db_path("runtime");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore_idle = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Idle".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let chore_running = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Running".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Drive the second chore's execution into a running run.
+        let running_execution = db
+            .list_executions(Some(&chore_running.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        db.start_execution_run(
+            &running_execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        let tree = db.get_work_tree(&product.id).unwrap();
+        let runtime_idle = tree
+            .task_runtimes
+            .iter()
+            .find(|r| r.work_item_id == chore_idle.id)
+            .expect("missing idle runtime entry");
+        // The reconcile creates a `ready` execution before any run.
+        assert_eq!(runtime_idle.execution_status.as_deref(), Some("ready"));
+        assert_eq!(runtime_idle.run_status, None);
+
+        let runtime_running = tree
+            .task_runtimes
+            .iter()
+            .find(|r| r.work_item_id == chore_running.id)
+            .expect("missing running runtime entry");
+        assert_eq!(runtime_running.execution_status.as_deref(), Some("running"));
+        assert_eq!(runtime_running.run_status.as_deref(), Some("active"));
 
         let _ = std::fs::remove_file(path);
     }

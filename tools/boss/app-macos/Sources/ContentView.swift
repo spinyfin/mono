@@ -686,7 +686,10 @@ struct ContentView: View {
                                     WorkBoardCardView(
                                         task: task,
                                         projectName: task.isChore ? nil : model.projectName(for: task.projectID),
-                                        isSelected: model.selectedTask?.id == task.id
+                                        isSelected: model.selectedTask?.id == task.id,
+                                        activityState: column == .doing
+                                            ? AgentActivityState(runtime: model.taskRuntime(for: task.id))
+                                            : nil
                                     )
                                 }
                                 .buttonStyle(.plain)
@@ -854,10 +857,15 @@ private struct WorkBoardCardView: View {
     let task: WorkTask
     let projectName: String?
     let isSelected: Bool
+    let activityState: AgentActivityState?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top) {
+            HStack(alignment: .top, spacing: 6) {
+                if let activityState {
+                    AgentActivityDot(state: activityState)
+                        .padding(.top, 5)
+                }
                 Text(task.name)
                     .font(.body.weight(.medium))
                     .foregroundStyle(.primary)
@@ -918,6 +926,29 @@ private struct WorkBoardCardView: View {
             return .orange
         }
         return Color(nsColor: .separatorColor)
+    }
+}
+
+private struct AgentActivityDot: View {
+    let state: AgentActivityState
+
+    var body: some View {
+        Circle()
+            .fill(fillColor)
+            .frame(width: 7, height: 7)
+            .help(state.tooltip)
+            .accessibilityLabel(state.tooltip)
+    }
+
+    private var fillColor: Color {
+        switch state {
+        case .active:
+            return .green
+        case .waiting:
+            return .yellow
+        case .none:
+            return Color(nsColor: .tertiaryLabelColor)
+        }
     }
 }
 
