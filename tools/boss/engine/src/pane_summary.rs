@@ -5,16 +5,21 @@
 //! (`exec_18ad...`). That's stable for traceability but unreadable
 //! at a glance — eight panes on screen looked identical. We now ask
 //! Claude (Sonnet — fast and cheap) to compress the work item's name
-//! plus description into a 2–4 word summary like `"Fix fencer
-//! scraper"` and pass it across the engine→app RPC.
+//! plus description into a short label like `"Fix Fencer Scraper"`
+//! and pass it across the engine→app RPC. The target is 2–4 words,
+//! but the prompt allows up to ~6 when needed to keep the phrase
+//! complete — earlier versions of this code treated the word count
+//! as a hard cap, which produced garbage like `"Persist Slot ID On"`
+//! (cut off mid-preposition).
 //!
 //! Caching: results are stored in the `pane_summaries` table keyed
 //! by work_item_id, alongside a `basis_hash` derived from the inputs
-//! we fed to Claude (name + description). When the work item's name
-//! or description changes, the basis hash changes and we regenerate
-//! on the next spawn. Logs, APIs, and identifiers everywhere else
-//! still use the run id — this module only feeds the visual
-//! titlebar.
+//! we fed to Claude (name + description) and the prompt version.
+//! When the work item's name or description changes, *or* when we
+//! bump [`PROMPT_VERSION`] after editing the prompt, the basis hash
+//! changes and we regenerate on the next spawn. Logs, APIs, and
+//! identifiers everywhere else still use the run id — this module
+//! only feeds the visual titlebar.
 //!
 //! Failure modes are silent on purpose. If the API key is missing
 //! or the request fails (timeout, transport, 5xx), we fall back to
@@ -42,10 +47,19 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// design doc explicitly calls it out as the right speed/cost
 /// balance for this kind of micro-prompt.
 const SUMMARY_MODEL: &str = "claude-sonnet-4-6";
-/// 30 tokens is plenty for 2–4 words. Keeping the cap tight avoids
-/// the model rambling into a 20-word summary and keeps the API call
-/// cheap.
-const SUMMARY_MAX_TOKENS: u32 = 30;
+/// 50 tokens covers 2–6 words plus the rare case where Sonnet adds
+/// a stray article we'll strip back out. Tight enough that a runaway
+/// 20-word summary still gets cut off; loose enough that legitimate
+/// 5–6 word labels (the upper end of what the prompt now permits)
+/// don't get truncated mid-word.
+const SUMMARY_MAX_TOKENS: u32 = 50;
+/// Bump this whenever [`build_prompt`] changes in a way that would
+/// produce a different label for the same inputs. It feeds into
+/// [`compute_basis`], so bumping it invalidates every cached summary
+/// and forces regeneration on the next spawn — the only way to make
+/// previously-stored bad labels (e.g. `"Persist Slot ID On"` from
+/// the v1 hard-cap prompt) refresh themselves.
+const PROMPT_VERSION: &str = "v2";
 /// Hard timeout on the round-trip. Worker spawn is user-visible and
 /// we'd rather show the fallback than block the pane on a slow
 /// upstream. Sonnet on a tiny prompt typically returns in well
@@ -57,6 +71,8 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// in `pane_summaries`.
 pub fn compute_basis(name: &str, description: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(PROMPT_VERSION.as_bytes());
+    hasher.update([0u8]);
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
     hasher.update(description.as_bytes());
@@ -190,9 +206,27 @@ struct ClaudeContentBlock {
 fn build_prompt(name: &str, description: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(
-        "You compress engineering task titles into a 2-4 word label fit for a UI titlebar. \
+        "You compress engineering task titles into a short label fit for a UI titlebar.\n\
+         \n\
+         Aim for 2-4 words when a natural phrase fits in that range. The word count is \
+         GUIDANCE, not a hard cap: stretch to 5 or 6 words if a shorter version would \
+         truncate mid-thought, drop a key noun, or end on a dangling preposition or article. \
+         Coherence matters more than brevity. Never end the label on a preposition (\"on\", \
+         \"in\", \"to\", \"of\", \"for\", \"with\", \"by\", \"into\", \"onto\"), a conjunction, \
+         or an article (\"the\", \"a\", \"an\").\n\
+         \n\
+         Examples for the input \"Persist allocated slot id onto run record (fix agent_id \
+         always = worker-1)\":\n\
+         - GOOD: \"Persist Slot ID on Runs\"\n\
+         - GOOD: \"Persist Allocated Slot ID\"\n\
+         - GOOD: \"Fix Agent ID Slot Mapping\"\n\
+         - BAD:  \"Persist Slot ID On\"            (ends on preposition)\n\
+         - BAD:  \"Persist Slot\"                  (drops the key noun)\n\
+         - BAD:  \"Persist Allocated Slot Id Onto\" (ends on preposition)\n\
+         \n\
          Reply with the label only — no quotes, no trailing period, no explanation. \
-         Use Title Case. Drop articles (\"the\", \"a\") and filler verbs when possible.\n\n",
+         Use Title Case. Drop articles (\"the\", \"a\") and filler verbs when possible, \
+         but keep enough words for the phrase to stand on its own.\n\n",
     );
     prompt.push_str("Task name:\n");
     prompt.push_str(name);
@@ -279,16 +313,22 @@ pub async fn claude_short_summary(
 }
 
 /// Strip whitespace, surrounding quotes, and trailing punctuation
-/// from the model's reply, and clamp to 4 words. Sonnet reliably
-/// follows the format instruction but a stray quote or period
-/// shouldn't bleed into the titlebar.
+/// from the model's reply, and clamp to 6 words as a safety net
+/// against runaway output. Sonnet reliably follows the format
+/// instruction but a stray quote or period shouldn't bleed into the
+/// titlebar.
+///
+/// The 6-word ceiling matches the upper bound the prompt allows;
+/// hard-clamping lower (the v1 behavior was 4) re-introduces the
+/// truncation bug we're fixing — a coherent 5-word phrase chopped
+/// at 4 words can become incoherent again.
 fn clean_summary(raw: &str) -> String {
     let trimmed = raw.trim();
     let stripped = trimmed
         .trim_start_matches(|c: char| c == '"' || c == '\'' || c == '`')
         .trim_end_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '.')
         .trim();
-    let words: Vec<&str> = stripped.split_whitespace().take(4).collect();
+    let words: Vec<&str> = stripped.split_whitespace().take(6).collect();
     words.join(" ")
 }
 
@@ -375,10 +415,25 @@ mod tests {
     }
 
     #[test]
-    fn clean_summary_clamps_to_four_words() {
+    fn clean_summary_clamps_to_six_words() {
+        // The prompt allows up to 6 words for coherence, so the
+        // safety clamp matches that ceiling. Anything beyond 6 is a
+        // runaway response we'd rather truncate than display.
         assert_eq!(
-            clean_summary("One Two Three Four Five Six"),
-            "One Two Three Four",
+            clean_summary("One Two Three Four Five Six Seven Eight"),
+            "One Two Three Four Five Six",
+        );
+    }
+
+    #[test]
+    fn clean_summary_keeps_five_word_phrases_intact() {
+        // Regression: v1 hard-clamped to 4 words, which turned
+        // "Persist Slot ID On Runs" into "Persist Slot ID On" —
+        // exactly the dangling-preposition bug this module's prompt
+        // is now written to avoid. The clamp must not undo that.
+        assert_eq!(
+            clean_summary("Persist Slot ID on Runs"),
+            "Persist Slot ID on Runs",
         );
     }
 
