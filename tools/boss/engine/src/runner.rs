@@ -263,9 +263,30 @@ impl PaneSpawnRunner {
         if let Ok(override_path) = std::env::var("BOSS_EVENT_BIN") {
             return override_path.into();
         }
-        // Fallback: assume bazel-built sibling binary in the runtime
-        // working directory layout. Not robust; the env override is
-        // the recommended path for production use.
+        // Try to resolve relative to the engine binary so workers
+        // get an absolute path that survives the sanitized PATH
+        // (which excludes ~/bin and other ambient dirs). Fall back
+        // candidates in order:
+        //   - sibling: <engine_dir>/boss-event (cargo / hand-built layouts)
+        //   - bazel sibling: <engine_dir>/../event-shim/boss-event
+        //     (`bazel-out/.../bin/tools/boss/{engine,event-shim}/`)
+        // If none resolve, fall back to the bare name and let the
+        // worker's PATH find it (today this fails — explicit
+        // `BOSS_EVENT_BIN` is the recommended override for prod).
+        if let Ok(engine_path) = std::env::current_exe() {
+            if let Some(engine_dir) = engine_path.parent() {
+                let sibling = engine_dir.join("boss-event");
+                if sibling.exists() {
+                    return sibling;
+                }
+                if let Some(parent_dir) = engine_dir.parent() {
+                    let bazel_layout = parent_dir.join("event-shim").join("boss-event");
+                    if bazel_layout.exists() {
+                        return bazel_layout;
+                    }
+                }
+            }
+        }
         PathBuf::from("boss-event")
     }
 }
@@ -276,9 +297,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         &self,
         worker_id: &str,
         execution: &WorkExecution,
-        _work_item: &WorkItem,
+        work_item: &WorkItem,
         workspace_path: &Path,
-        _cube_change_id: Option<&str>,
+        cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
         let weak = self
             .server_state
@@ -293,6 +314,29 @@ impl ExecutionRunner for PaneSpawnRunner {
             .clone()
             .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
 
+        // Compose the worker prompt and stash it on disk so the
+        // libghostty pane can `claude "$(cat .claude/initial-prompt.txt)"`
+        // — Claude Code's positional arg is treated as the first user
+        // message, which gets the worker working without us having to
+        // wait for a "Claude is ready" signal and then SendToPane.
+        // Going through a file (rather than embedding the prompt in
+        // the typed command) avoids shell quoting hell on multi-line,
+        // backtick-bearing markdown.
+        let prompt_text = compose_execution_prompt(
+            execution,
+            work_item,
+            workspace_path,
+            cube_change_id,
+        );
+        let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
+        if let Some(parent) = prompt_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&prompt_path, &prompt_text)
+            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        let initial_input = "claude \"$(cat .claude/initial-prompt.txt)\"\n".to_owned();
+
         let started = start_worker(
             spawner.as_ref(),
             StartWorkerInput {
@@ -301,7 +345,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 workspace_path: workspace_path.to_path_buf(),
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
-                initial_input: "claude\n".to_owned(),
+                initial_input,
                 extra_env: vec![],
             },
             StdDuration::from_secs(30),
@@ -475,4 +519,265 @@ fn truncate_chars(text: &str, limit: usize) -> String {
         truncated.push(ch);
     }
     truncated
+}
+
+#[cfg(test)]
+mod pane_spawn_tests {
+    //! End-to-end-ish tests for `PaneSpawnRunner`: drive `run_execution`
+    //! against a stub `WorkerSpawner`, then assert on what was actually
+    //! sent to the app and what files were written into the workspace.
+    //! These tests would have caught the bugs surfaced manually:
+    //!   - missing prompt injection (worker idle at bash prompt),
+    //!   - boss-event resolved to bare relative path (hooks fail),
+    //!   - sanitized PATH not threaded through to the app.
+    //!
+    //! Anything reachable via `WorkerSpawner` is fair game without
+    //! standing up a full engine; the broadcast / coordinator side
+    //! lives in `coordinator.rs` tests.
+    use super::*;
+    use crate::app::SendToAppError;
+    use crate::protocol::{
+        EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
+        SpawnWorkerPaneResult,
+    };
+    use crate::work::{Task, WorkExecution, WorkItem};
+    use crate::worker_registry::WorkerRegistry;
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+
+    /// Records the spawn request the runner sent so tests can assert
+    /// on env, initial_input, etc.
+    struct CapturingSpawner {
+        registry: WorkerRegistry,
+        last: StdMutex<Option<SpawnWorkerPaneInput>>,
+    }
+
+    impl CapturingSpawner {
+        fn new() -> Self {
+            Self {
+                registry: WorkerRegistry::new(),
+                last: StdMutex::new(None),
+            }
+        }
+
+        fn spawn_input(&self) -> SpawnWorkerPaneInput {
+            self.last
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("expected SpawnWorkerPane to be sent")
+        }
+    }
+
+    #[async_trait]
+    impl crate::spawn_flow::WorkerSpawner for CapturingSpawner {
+        async fn send_to_app_request(
+            &self,
+            request: EngineToAppRequest,
+            _timeout: tokio::time::Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            match request {
+                EngineToAppRequest::SpawnWorkerPane(input) => {
+                    *self.last.lock().unwrap() = Some(input);
+                    Ok(EngineToAppResponse::SpawnWorkerPane {
+                        result: Ok(SpawnWorkerPaneResult {
+                            slot_id: 1,
+                            shell_pid: 0,
+                        }),
+                    })
+                }
+                other => panic!("unexpected request kind: {other:?}"),
+            }
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            &self.registry
+        }
+    }
+
+    fn sample_execution(workspace_path: &Path) -> WorkExecution {
+        WorkExecution {
+            id: "exec-test-1".into(),
+            work_item_id: "task-1".into(),
+            kind: "chore_implementation".into(),
+            status: "running".into(),
+            repo_remote_url: "git@example.com:foo.git".into(),
+            cube_repo_id: Some("foo".into()),
+            cube_lease_id: Some("lease-1".into()),
+            cube_workspace_id: Some("foo-agent-001".into()),
+            workspace_path: Some(workspace_path.display().to_string()),
+            priority: 0,
+            preferred_workspace_id: None,
+            created_at: "2026-05-06T20:00:00Z".into(),
+            started_at: Some("2026-05-06T20:00:00Z".into()),
+            finished_at: None,
+        }
+    }
+
+    fn sample_chore() -> WorkItem {
+        WorkItem::Chore(Task {
+            id: "task-1".into(),
+            product_id: "prod-1".into(),
+            project_id: None,
+            kind: "chore".into(),
+            name: "Improve top header (agent card) styling".into(),
+            description: "The gray header at the top is too cramped.".into(),
+            status: "todo".into(),
+            ordinal: None,
+            pr_url: None,
+            deleted_at: None,
+            created_at: "2026-05-06T20:00:00Z".into(),
+            updated_at: "2026-05-06T20:00:00Z".into(),
+        })
+    }
+
+    /// Build a runner already bound to a `CapturingSpawner` and drive a
+    /// run_execution against `workspace`. Returns the spawner so tests
+    /// can inspect the captured request.
+    async fn run_once(workspace: &TempDir) -> Result<Arc<CapturingSpawner>> {
+        // We need a Weak<dyn WorkerSpawner> the runner can upgrade.
+        // Box-leak the Arc so it lives for the test's duration; the
+        // tempdir guards the workspace lifetime.
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let runner = PaneSpawnRunner::new(cfg);
+        runner.set_server_state(weak);
+
+        runner
+            .run_execution(
+                "worker-1",
+                &sample_execution(workspace.path()),
+                &sample_chore(),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await?;
+
+        Ok(spawner)
+    }
+
+    #[tokio::test]
+    async fn writes_initial_prompt_to_workspace_dot_claude() {
+        let workspace = TempDir::new().unwrap();
+        let _spawner = run_once(&workspace).await.unwrap();
+
+        let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
+        assert!(
+            prompt_path.exists(),
+            "expected {} to exist",
+            prompt_path.display()
+        );
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        // Spot-check: the prompt should mention the work item title and
+        // execution id so the worker actually has its task in hand.
+        assert!(prompt.contains("Improve top header"), "prompt missing work item name");
+        assert!(prompt.contains("exec-test-1"), "prompt missing execution id");
+        assert!(
+            prompt.contains("## Summary"),
+            "prompt missing required output section header"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_input_reads_prompt_from_disk() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = run_once(&workspace).await.unwrap();
+        let input = spawner.spawn_input();
+
+        // The pane needs to type a `claude` invocation that picks up
+        // the rendered prompt as its first user message — going
+        // through a file avoids shell-quoting issues with multi-line
+        // markdown. Without this, the worker just sits at the bash
+        // prompt forever (as it did before #174).
+        assert!(
+            input.initial_input.contains(".claude/initial-prompt.txt"),
+            "expected initial_input to read from prompt file, got: {:?}",
+            input.initial_input
+        );
+        assert!(
+            input.initial_input.starts_with("claude"),
+            "expected initial_input to invoke claude, got: {:?}",
+            input.initial_input
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_env_carries_sanitized_path_and_engine_keys() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = run_once(&workspace).await.unwrap();
+        let input = spawner.spawn_input();
+
+        let path_var = input
+            .env
+            .iter()
+            .find(|EnvVar { key, .. }| key == "PATH")
+            .expect("PATH must be set on every worker spawn");
+        assert!(
+            !path_var.value.contains("/Users/"),
+            "PATH must not contain the user home (would expose ~/bin/bossctl), got: {}",
+            path_var.value
+        );
+        assert!(
+            path_var.value.contains("/usr/bin"),
+            "PATH must include system bins, got: {}",
+            path_var.value
+        );
+
+        assert!(
+            input
+                .env
+                .iter()
+                .any(|EnvVar { key, .. }| key == "BOSS_LEASE_ID"),
+            "expected BOSS_LEASE_ID to be set"
+        );
+        assert!(
+            input
+                .env
+                .iter()
+                .any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
+            "expected BOSS_EVENTS_SOCKET to be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_json_uses_absolute_boss_event_path() {
+        // BOSS_EVENT_BIN takes precedence — set it to a known absolute
+        // path so we don't depend on the test runner's binary layout.
+        // SAFETY: setting env in a Rust test process is racy with other
+        // tests but this one isolates by writing files into a temp
+        // workspace, so a stale env from a prior parallel test would
+        // only confuse this test, not affect production code.
+        unsafe { std::env::set_var("BOSS_EVENT_BIN", "/opt/boss/bin/boss-event") };
+
+        let workspace = TempDir::new().unwrap();
+        let _spawner = run_once(&workspace).await.unwrap();
+        let settings_path = workspace.path().join(".claude").join("settings.json");
+        let settings = std::fs::read_to_string(&settings_path).unwrap();
+
+        // Hooks must invoke an absolute path; the bare name
+        // `boss-event` is what produced the production
+        // `command not found` failures because the worker's sanitized
+        // PATH doesn't include the bazel-out directory.
+        assert!(
+            settings.contains("/opt/boss/bin/boss-event"),
+            "expected absolute boss-event path in settings.json, got: {}",
+            settings,
+        );
+        assert!(
+            !settings.contains("\"boss-event\"") || settings.contains("/opt/boss/bin/boss-event"),
+            "settings.json must not invoke `boss-event` as a bare name",
+        );
+
+        unsafe { std::env::remove_var("BOSS_EVENT_BIN") };
+    }
 }
