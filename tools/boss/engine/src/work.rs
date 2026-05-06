@@ -1230,6 +1230,59 @@ impl WorkDb {
             released_workspace_id: original_workspace_id,
         }))
     }
+
+    /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
+    /// `workspace_path` on `execution_id`. Returns the prior lease id
+    /// — `Some` means the caller is responsible for issuing the cube
+    /// `workspace release`, `None` means there was nothing to release
+    /// (already cleared by an earlier path or never leased).
+    ///
+    /// Used by the engine-side release path (manual chore-done update,
+    /// `bossctl agents stop`) to claim ownership of the cube release
+    /// before calling out to the cube CLI, so two concurrent callers
+    /// don't issue duplicate releases against the same lease.
+    pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let prior = execution.cube_lease_id.clone();
+        if prior.is_some() {
+            tx.execute(
+                "UPDATE work_executions
+                 SET cube_lease_id = NULL,
+                     cube_workspace_id = NULL,
+                     workspace_path = NULL
+                 WHERE id = ?1",
+                params![execution_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(prior)
+    }
+
+    /// Most-recent execution for `work_item_id`, ordered by creation.
+    /// `Ok(None)` when the work item has never had an execution.
+    pub fn latest_execution_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at
+             FROM work_executions
+             WHERE work_item_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([work_item_id], map_execution)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call.

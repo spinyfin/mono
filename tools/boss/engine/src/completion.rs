@@ -30,6 +30,26 @@ use tokio::process::Command;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::work::{WorkDb, WorkItem};
 
+/// Asks the registered app session to tear down the libghostty pane
+/// hosting `run_id`. Implementations must be idempotent: a duplicate
+/// call after the slot has been released is a no-op, not an error.
+/// The completion handler calls this after a successful cube lease
+/// release on PR detection so the Workers grid pane disappears.
+#[async_trait]
+pub trait WorkerPaneReleaser: Send + Sync {
+    async fn release_pane(&self, run_id: &str);
+}
+
+/// `WorkerPaneReleaser` that does nothing — used when no app session
+/// release is wired (tests, headless runs).
+#[derive(Debug, Default)]
+pub struct NoopWorkerPaneReleaser;
+
+#[async_trait]
+impl WorkerPaneReleaser for NoopWorkerPaneReleaser {
+    async fn release_pane(&self, _run_id: &str) {}
+}
+
 /// Probes a workspace for an open PR on its current branch.
 #[async_trait]
 pub trait PrDetector: Send + Sync {
@@ -109,6 +129,7 @@ pub struct WorkerCompletionHandler {
     pr_detector: Arc<dyn PrDetector>,
     cube_client: Arc<dyn CubeClient>,
     publisher: Arc<dyn ExecutionPublisher>,
+    pane_releaser: Arc<dyn WorkerPaneReleaser>,
 }
 
 impl WorkerCompletionHandler {
@@ -117,12 +138,14 @@ impl WorkerCompletionHandler {
         pr_detector: Arc<dyn PrDetector>,
         cube_client: Arc<dyn CubeClient>,
         publisher: Arc<dyn ExecutionPublisher>,
+        pane_releaser: Arc<dyn WorkerPaneReleaser>,
     ) -> Self {
         Self {
             work_db,
             pr_detector,
             cube_client,
             publisher,
+            pane_releaser,
         }
     }
 
@@ -213,6 +236,11 @@ impl WorkerCompletionHandler {
             }
         }
 
+        // Tear down the libghostty pane that was hosting the worker.
+        // Idempotent on the registry side, so a later manual stop /
+        // chore-done update for the same run is a no-op.
+        self.pane_releaser.release_pane(execution_id).await;
+
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
         self.publisher
@@ -234,6 +262,46 @@ impl WorkerCompletionHandler {
         );
 
         StopOutcome::PrDetected { pr_url }
+    }
+
+    /// Force-release the resources backing `execution_id`: tear down
+    /// the libghostty pane and release the cube workspace. Idempotent —
+    /// duplicate calls (e.g. completion-detection followed by a manual
+    /// stop, or two clients racing to mark a chore done) become no-ops
+    /// on the second pass via the registry's `take_slot_for_run`
+    /// invariant and the DB's lease-id ownership transfer.
+    ///
+    /// Does NOT change the execution's status field. Callers that need
+    /// the execution marked `completed` / `failed` should drive that
+    /// transition through the appropriate `WorkDb` method.
+    pub async fn force_release(&self, execution_id: &str) {
+        // Pane release first. Idempotent on the registry side; the
+        // implementation logs and skips when no slot is mapped.
+        self.pane_releaser.release_pane(execution_id).await;
+
+        // Cube release: claim ownership of the lease id atomically by
+        // clearing it from the DB row before calling the cube CLI.
+        // A concurrent caller will see `None` and skip.
+        let lease_id = match self.work_db.clear_execution_workspace(execution_id) {
+            Ok(Some(lease_id)) => lease_id,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "force_release: failed to clear execution workspace columns",
+                );
+                return;
+            }
+        };
+        if let Err(err) = self.cube_client.release_workspace(&lease_id).await {
+            tracing::warn!(
+                execution_id,
+                lease_id,
+                ?err,
+                "force_release: cube workspace release failed",
+            );
+        }
     }
 
     async fn publish_awaiting_input(&self, execution: &crate::work::WorkExecution) {
@@ -377,6 +445,18 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RecordingPaneReleaser {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl WorkerPaneReleaser for RecordingPaneReleaser {
+        async fn release_pane(&self, run_id: &str) {
+            self.calls.lock().await.push(run_id.to_owned());
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<(String, String, String, String)>>,
         work_events: Mutex<Vec<(String, String, String)>>,
@@ -483,12 +563,14 @@ mod tests {
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
             detector,
             cube.clone(),
             publisher.clone(),
+            pane.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -525,6 +607,11 @@ mod tests {
                     && reason == "worker_pr_completed"),
             "expected work-item invalidation for the chore, got {work_events:?}",
         );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "pane teardown must fire on PR completion so the libghostty slot returns to Free",
+        );
     }
 
     #[tokio::test]
@@ -534,12 +621,14 @@ mod tests {
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
             detector,
             cube.clone(),
             publisher.clone(),
+            pane.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -564,6 +653,10 @@ mod tests {
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_input"),
             "expected worker_awaiting_input event, got {events:?}",
         );
+        assert!(
+            pane.calls.lock().await.is_empty(),
+            "no PR must NOT release the pane",
+        );
     }
 
     #[tokio::test]
@@ -573,11 +666,19 @@ mod tests {
         let detector = StubPrDetector::err("gh broken");
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
 
-        let handler = WorkerCompletionHandler::new(db, detector, cube.clone(), publisher.clone());
+        let handler = WorkerCompletionHandler::new(
+            db,
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+        );
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(outcome, StopOutcome::DetectorFailed);
         assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
         let events = publisher.events.lock().await.clone();
         assert!(
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_input"),
@@ -590,14 +691,84 @@ mod tests {
         let detector = StubPrDetector::ok(Some("https://github.com/x/y/pull/1"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let handler =
-            WorkerCompletionHandler::new(db, detector, cube.clone(), publisher.clone());
+        let handler = WorkerCompletionHandler::new(
+            db,
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+        );
         let outcome = handler.on_stop("not-an-execution").await;
         assert_eq!(outcome, StopOutcome::UnknownExecution);
         assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
         assert!(publisher.events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+        );
+
+        handler.force_release(&execution_id).await;
+
+        // First call: pane fired, cube release fired exactly once.
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert!(execution.cube_lease_id.is_none());
+        assert!(execution.workspace_path.is_none());
+
+        // Second call: idempotent — no second cube release. The pane
+        // releaser is invoked again here (the registry-level
+        // idempotency lives in `WorkerRegistry::take_slot_for_run`),
+        // but no extra cube release happens because the lease columns
+        // are already cleared.
+        handler.force_release(&execution_id).await;
+        assert_eq!(
+            cube.release_calls.lock().await.len(),
+            1,
+            "cube release must fire only once across duplicate force_release calls",
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_no_lease_skips_cube_release() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+
+        // Pre-clear the lease so force_release can confirm it skips
+        // cube release when there's nothing to release.
+        db.clear_execution_workspace(&execution_id).unwrap();
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+        );
+
+        handler.force_release(&execution_id).await;
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        assert!(cube.release_calls.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -607,11 +778,13 @@ mod tests {
         let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
         let handler = WorkerCompletionHandler::new(
             db.clone(),
             detector,
             cube.clone(),
             publisher.clone(),
+            pane.clone(),
         );
 
         assert!(matches!(
@@ -620,7 +793,9 @@ mod tests {
         ));
         // A second Stop event for the same execution must NOT
         // duplicate work — release is called once, work item stays
-        // pinned at `in_review`.
+        // pinned at `in_review`. The pane releaser is invoked again
+        // here; production releasers must be idempotent on their own
+        // (see `WorkerRegistry::take_slot_for_run`).
         assert_eq!(
             handler.on_stop(&execution_id).await,
             StopOutcome::AlreadyTerminal,
