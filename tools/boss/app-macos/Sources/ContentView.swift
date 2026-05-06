@@ -775,9 +775,11 @@ private struct WorkSidebarFilterRow: View {
                     Text(title)
                         .font(.body.weight(isSelected ? .semibold : .regular))
                         .foregroundStyle(.primary)
-                        .lineLimit(isSelected ? 2 : 1)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
+                        .help(title)
 
                     Spacer(minLength: 6)
 
@@ -1276,21 +1278,22 @@ private struct WorkStatusBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.caption2.weight(.semibold))
+            .font(.caption.weight(.semibold))
             .foregroundStyle(foregroundColor)
             .lineLimit(1)
-            .minimumScaleFactor(0.95)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
+            .truncationMode(.tail)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
             .background(backgroundColor)
             .clipShape(Capsule())
+            .help(text)
     }
 
     private var foregroundColor: Color {
         if emphasized {
             return .accentColor
         }
-        return Color(nsColor: .secondaryLabelColor)
+        return Color(nsColor: .labelColor)
     }
 
     private var backgroundColor: Color {
