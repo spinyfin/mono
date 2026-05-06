@@ -139,7 +139,7 @@ enum PaneRole: Equatable {
     var defaultTitle: String {
         switch self {
         case .boss: "Boss"
-        case .worker(let slot): "Worker \(slot)"
+        case .worker(let slot): WorkerNames.name(forSlot: slot)
         }
     }
 }
