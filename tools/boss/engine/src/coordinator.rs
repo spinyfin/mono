@@ -406,6 +406,18 @@ pub trait ExecutionPublisher: Send + Sync {
         status: &str,
         reason: &str,
     );
+
+    /// Publish a work-tree invalidation on the work item's product
+    /// topic so subscribers (the kanban view) re-fetch and pick up
+    /// status changes the coordinator drove from a non-request path
+    /// — e.g., the auto-advance of `tasks.status` to `'active'` that
+    /// happens inside `start_execution_run`.
+    async fn publish_work_item_changed(
+        &self,
+        product_id: &str,
+        work_item_id: &str,
+        reason: &str,
+    );
 }
 
 #[derive(Default)]
@@ -414,6 +426,7 @@ pub struct NoopExecutionPublisher;
 #[async_trait]
 impl ExecutionPublisher for NoopExecutionPublisher {
     async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
+    async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {}
 }
 
 /// Tiny abstraction so the coordinator can bump the shared work-revision
@@ -614,6 +627,24 @@ impl ExecutionCoordinator {
                         "execution_started",
                     )
                     .await;
+                // Auto-advance bumped `tasks.status` to `'active'`
+                // inside the same transaction. Broadcast a work-tree
+                // invalidation so kanban subscribers re-fetch and
+                // move the card to the Doing column.
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = match &work_item {
+                        WorkItem::Product(p) => p.id.clone(),
+                        WorkItem::Project(p) => p.product_id.clone(),
+                        WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id.clone(),
+                    };
+                    self.publisher
+                        .publish_work_item_changed(
+                            &product_id,
+                            &execution.work_item_id,
+                            "execution_started_auto_advance",
+                        )
+                        .await;
+                }
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator
@@ -1065,6 +1096,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<(String, String, String, String)>>,
+        work_item_events: Mutex<Vec<(String, String, String)>>,
     }
 
     #[async_trait]
@@ -1080,6 +1112,19 @@ mod tests {
                 execution_id.to_owned(),
                 work_item_id.to_owned(),
                 status.to_owned(),
+                reason.to_owned(),
+            ));
+        }
+
+        async fn publish_work_item_changed(
+            &self,
+            product_id: &str,
+            work_item_id: &str,
+            reason: &str,
+        ) {
+            self.work_item_events.lock().await.push((
+                product_id.to_owned(),
+                work_item_id.to_owned(),
                 reason.to_owned(),
             ));
         }

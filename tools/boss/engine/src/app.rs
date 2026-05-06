@@ -609,6 +609,33 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             )
             .await;
     }
+
+    async fn publish_work_item_changed(
+        &self,
+        product_id: &str,
+        work_item_id: &str,
+        reason: &str,
+    ) {
+        let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let topic = work_product_topic(product_id);
+        let event = FrontendEvent::TopicEvent {
+            topic: topic.clone(),
+            revision,
+            origin_session_id: String::new(),
+            origin_request_id: None,
+            event: TopicEventPayload::WorkInvalidated {
+                reason: reason.to_owned(),
+                product_id: Some(product_id.to_owned()),
+                item_ids: vec![work_item_id.to_owned()],
+            },
+        };
+        self.topic_broker
+            .publish(
+                &topic,
+                FrontendEventEnvelope::push_with_revision(revision, event),
+            )
+            .await;
+    }
 }
 
 /// Maximum events that can be queued for one session before we treat the
