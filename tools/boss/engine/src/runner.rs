@@ -731,6 +731,7 @@ mod pane_spawn_tests {
             deleted_at: None,
             created_at: "2026-05-06T20:00:00Z".into(),
             updated_at: "2026-05-06T20:00:00Z".into(),
+            autostart: true,
         })
     }
 

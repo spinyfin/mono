@@ -739,6 +739,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Detect worker stop".into(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let execution = db

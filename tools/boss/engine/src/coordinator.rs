@@ -1278,6 +1278,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1338,6 +1339,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1387,6 +1389,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1424,6 +1427,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1466,6 +1470,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1515,6 +1520,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1624,6 +1630,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Old".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let late = db
@@ -1631,6 +1638,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "New".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1703,6 +1711,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1762,6 +1771,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1830,6 +1840,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1910,6 +1921,7 @@ mod tests {
             project_id: first_project.id.clone(),
             name: "A1".to_owned(),
             description: None,
+            autostart: true,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -1917,6 +1929,7 @@ mod tests {
             project_id: second_project.id.clone(),
             name: "B1".to_owned(),
             description: None,
+            autostart: true,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();

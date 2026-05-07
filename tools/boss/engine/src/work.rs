@@ -118,10 +118,11 @@ impl WorkDb {
         let ordinal = next_task_ordinal(&tx, &input.project_id)?;
         let description = input.description.unwrap_or_default();
 
+        let autostart_value: i64 = if input.autostart { 1 } else { 0 };
         tx.execute(
-            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7)",
-            params![id, input.product_id, input.project_id, input.name, description, ordinal, now],
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
+             VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8)",
+            params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value],
         )?;
 
         let task =
@@ -138,11 +139,12 @@ impl WorkDb {
         let id = next_id("task");
         let now = now_string();
         let description = input.description.unwrap_or_default();
+        let autostart_value: i64 = if input.autostart { 1 } else { 0 };
 
         tx.execute(
-            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at)
-             VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5)",
-            params![id, input.product_id, input.name, description, now],
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
+             VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6)",
+            params![id, input.product_id, input.name, description, now, autostart_value],
         )?;
 
         let task =
@@ -905,7 +907,7 @@ impl WorkDb {
 
         let tasks = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -916,7 +918,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -992,7 +994,7 @@ impl WorkDb {
         if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1002,7 +1004,7 @@ impl WorkDb {
         }
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
              FROM tasks
              WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
              ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1055,7 +1057,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -1114,7 +1116,8 @@ impl WorkDb {
                 pr_url TEXT,
                 deleted_at TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                autostart INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -1183,6 +1186,7 @@ impl WorkDb {
             ",
         )?;
         migrate_work_executions_v3(&conn)?;
+        migrate_tasks_autostart(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -1538,6 +1542,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         deleted_at: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        autostart: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -1660,7 +1665,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -1722,7 +1727,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -1895,7 +1900,11 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("PRAGMA table_info(work_executions)")?;
+    table_has_column(conn, "work_executions", column)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for row in rows {
         if row? == column {
@@ -1903,6 +1912,21 @@ fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Add the `autostart` column to `tasks` for older databases. New
+/// chores opt out of auto-dispatch by setting this column to 0;
+/// `task_accepts_execution` then keeps them out of the reconcile loop
+/// while their status is `todo`. Older rows default to 1 so the
+/// historical "create-and-dispatch" behaviour is preserved.
+fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "autostart")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
@@ -2148,7 +2172,19 @@ fn project_accepts_execution(project: &Project) -> bool {
 }
 
 fn task_accepts_execution(task: &Task) -> bool {
-    task.deleted_at.is_none() && task.status != "done"
+    if task.deleted_at.is_some() || task.status == "done" {
+        return false;
+    }
+    // Honour the per-task autostart opt-out while the chore/task is
+    // still parked in `todo`. Once a human (or `bossctl work start`)
+    // moves it to a non-`todo` status, reconcile resumes normal
+    // behaviour and creates the `ready` execution. The autostart flag
+    // is a one-way pause for the auto-dispatcher only — explicit
+    // RequestExecution still creates a ready execution.
+    if !task.autostart && task.status == "todo" {
+        return false;
+    }
+    true
 }
 
 fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
@@ -2392,6 +2428,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "Backend schema".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let chore = db
@@ -2399,6 +2436,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2438,6 +2476,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Idle".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let chore_running = db
@@ -2445,6 +2484,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Running".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2573,6 +2613,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "One".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let second = db
@@ -2581,6 +2622,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "Two".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2620,6 +2662,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "Schema".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2776,6 +2819,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "First".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let second_task = db
@@ -2784,6 +2828,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "Second".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let chore = db
@@ -2791,6 +2836,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2845,6 +2891,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "First".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let second_task = db
@@ -2853,6 +2900,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "Second".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2904,6 +2952,7 @@ mod tests {
                 project_id: project.id.clone(),
                 name: "First".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -2946,6 +2995,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let execution = db
@@ -3030,6 +3080,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Already done".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -3100,6 +3151,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Stranded chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -3143,6 +3195,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Bounced chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.update_work_item(
@@ -3191,6 +3244,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Live chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.update_work_item(
@@ -3242,6 +3296,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Stale chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.update_work_item(
@@ -3297,6 +3352,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Stale chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let stale = db
@@ -3349,6 +3405,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Live chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let live = db
@@ -3401,6 +3458,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Stays in backlog".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let done_chore = db
@@ -3408,6 +3466,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Already done".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         db.update_work_item(
@@ -3421,6 +3480,73 @@ mod tests {
 
         let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
         assert!(redispatched.is_empty());
+    }
+
+    /// `boss chore create --no-autostart` flips the
+    /// `CreateChoreInput::autostart` flag off. A chore created that way
+    /// is allowed to sit in `todo` without the engine spinning up a
+    /// `ready` execution. Once a human (or `bossctl work start`) flips
+    /// it to `active`, reconcile resumes normal behaviour and creates
+    /// the execution.
+    #[test]
+    fn reconcile_skips_no_autostart_chore_until_status_changes() {
+        let path = temp_db_path("no-autostart");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        assert!(!chore.autostart, "create_chore must persist autostart=false");
+
+        // First reconcile right after create — must not create a
+        // ready execution for the parked chore.
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(
+            result.created.is_empty(),
+            "no-autostart chore should not get a reconciled execution while it is in todo, got {:?}",
+            result.created,
+        );
+        assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
+
+        // A second chore created normally MUST still be picked up by
+        // reconcile (the no-autostart chore must not poison shared
+        // reconcile state).
+        let live = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Live".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.created[0].work_item_id, live.id);
+
+        // Drag-to-Doing path: status flips to `active`, reconcile
+        // resumes and creates the ready execution for the parked chore.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.created[0].work_item_id, chore.id);
     }
 
     #[test]
@@ -3440,6 +3566,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let execution = db
@@ -3499,6 +3626,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let execution = db
@@ -3587,6 +3715,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "Cleanup".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
         let execution = db
@@ -3686,6 +3815,7 @@ mod tests {
                 product_id: product.id.clone(),
                 name: "ISO chore".to_owned(),
                 description: None,
+                autostart: true,
             })
             .unwrap();
 

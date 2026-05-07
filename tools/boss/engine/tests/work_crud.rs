@@ -105,6 +105,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             project_id: project.id.clone(),
             name: "Wire socket client".to_owned(),
             description: Some("extract reusable BossClient".to_owned()),
+            autostart: true,
         },
     )
     .await?;
@@ -118,6 +119,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             product_id: product.id.clone(),
             name: "Trim stale work".to_owned(),
             description: None,
+            autostart: true,
         },
     )
     .await?;
@@ -274,6 +276,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             project_id: project.id.clone(),
             name: "Wire subscription".to_owned(),
             description: None,
+            autostart: true,
         },
     )
     .await?;
@@ -354,6 +357,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             product_id: product.id.clone(),
             name: "C".to_owned(),
             description: None,
+            autostart: true,
         },
     )
     .await?;

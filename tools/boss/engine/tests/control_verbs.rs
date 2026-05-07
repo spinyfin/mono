@@ -110,6 +110,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<String> {
                 product_id: product.id.clone(),
                 name: "test chore".to_owned(),
                 description: None,
+                autostart: true,
             },
         })
         .await?

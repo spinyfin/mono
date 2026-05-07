@@ -40,6 +40,16 @@ pub struct Task {
     pub deleted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// When `false`, the engine's auto-dispatcher will not turn this
+    /// work item into a `ready` execution while it sits in `todo`.
+    /// Existing rows from before this column was introduced default
+    /// to `true` so legacy callers keep their old auto-start behavior.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +161,12 @@ pub struct CreateTaskInput {
     pub project_id: String,
     pub name: String,
     pub description: Option<String>,
+    /// See `CreateChoreInput::autostart`. Project tasks honour the
+    /// same flag, but the kanban already serialises them via
+    /// `waiting_dependency` so only the first incomplete task is ever
+    /// `ready`. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +174,14 @@ pub struct CreateChoreInput {
     pub product_id: String,
     pub name: String,
     pub description: Option<String>,
+    /// When `false`, the engine creates the chore in `todo` but does
+    /// NOT spin up a `ready` execution for the auto-dispatcher to pick
+    /// up. The chore stays parked until something explicitly schedules
+    /// it (`bossctl work start <id>` or a kanban drag-to-Doing). Older
+    /// clients that omit this field get the historical behavior
+    /// (`autostart = true`).
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

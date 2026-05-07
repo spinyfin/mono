@@ -35,6 +35,16 @@ struct GlobalFlags {
     #[arg(long, global = true)]
     no_input: bool,
 
+    /// Suppress autostart side effects.
+    ///
+    /// Two effects, both off-by-default:
+    ///   1. The CLI will not transparently start the engine when
+    ///      its socket is unreachable.
+    ///   2. `boss task create` / `boss chore create` create the work
+    ///      item but the engine will NOT auto-dispatch a worker for
+    ///      it. The new chore/task stays in the `todo` column until
+    ///      something explicitly schedules it (`bossctl work start
+    ///      <id>` or a kanban drag-to-Doing).
     #[arg(long, global = true)]
     no_autostart: bool,
 
@@ -523,6 +533,11 @@ struct RunContext {
     quiet: bool,
     allow_input: bool,
     discovery: Discovery,
+    /// Mirror of the global `--no-autostart` flag. Today this also
+    /// gates per-work-item auto-dispatch (`boss chore create
+    /// --no-autostart` → engine creates the chore in `todo` but does
+    /// not spin up a worker for it).
+    no_autostart: bool,
 }
 
 #[tokio::main]
@@ -595,7 +610,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Treat this reference output as the authoritative current CLI surface for this build.",
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
-            "Omit --no-autostart unless you explicitly need to forbid engine startup.",
+            "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create`.",
         ],
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
@@ -701,6 +716,7 @@ impl RunContext {
             quiet: flags.quiet,
             allow_input,
             discovery,
+            no_autostart: flags.no_autostart,
         })
     }
 }
@@ -916,6 +932,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     project_id: project.id,
                     name,
                     description,
+                    autostart: !ctx.no_autostart,
                 },
             )
             .await?;
@@ -1024,6 +1041,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     product_id: product.id,
                     name,
                     description,
+                    autostart: !ctx.no_autostart,
                 },
             )
             .await?;
