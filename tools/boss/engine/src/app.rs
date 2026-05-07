@@ -361,11 +361,22 @@ struct ServerState {
 /// Authorization tier for a frontend RPC.
 ///
 /// - `User`: any local client (the human's `boss` CLI, the macOS app,
-///   read-only callers).
+///   read-only callers, and any documented `bossctl` verb that has no
+///   privileged side effect — e.g. `workspace summary`).
 /// - `AppOrBoss`: privileged operations the app and the Boss session
-///   may both invoke (e.g., engine→app pane RPC machinery).
-/// - `BossOnly`: control verbs only the Boss session may invoke
-///   (probe injection, agent send/interrupt, etc.).
+///   may both invoke. This is the right level for the imperative
+///   `bossctl` verbs (`probe`, `agents stop`, `agents transcript`,
+///   `work cancel`): the human runs them from wherever they happen
+///   to be — Boss pane, app shell, or *inside a worker pane* — and
+///   `AppOrBoss` admits all of those (workers are siblings under
+///   the app).
+/// - `BossOnly`: reserved for future control verbs that must reject
+///   worker-pane callers. No live verb uses this tier today; the
+///   `bossctl` verbs that previously gated on it (`probe_run`,
+///   `tail_run_transcript`, `stop_run`) were all downgraded after
+///   they kept locking the coordinator out of legitimate calls. Keep
+///   the tier so any future verb can opt into it explicitly rather
+///   than accidentally inheriting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcTier {
     User,
@@ -2590,18 +2601,27 @@ async fn handle_frontend_connection(
                 run_id,
                 text,
             } => {
-                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                // `bossctl probe` is a coordinator-essential verb (the
+                // coordinator contract names probing as the right tool
+                // for low-confidence handoffs). The earlier BossOnly
+                // gate rejected calls from worker (slot) panes, since
+                // BossOnly explicitly excludes callers descending from
+                // a registered worker shell pid. Same reasoning as the
+                // `stop_run` fix in PR #218: downgrade to AppOrBoss so
+                // any caller descending from the app or the Boss
+                // session is accepted, including worker panes.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         run_id = %run_id,
-                        "probe_run rejected: caller not in Boss subtree",
+                        "probe_run rejected: caller not in app/Boss subtree",
                     );
                     send_response(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "probe_run is BossOnly".to_owned(),
+                            message: "probe_run requires app or Boss authority".to_owned(),
                         },
                     );
                     continue;
@@ -2725,18 +2745,25 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::TailRunTranscript { run_id, lines } => {
-                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                // `bossctl agents transcript` is a documented
+                // coordinator verb. Same downgrade rationale as
+                // `probe_run` and `stop_run`: BossOnly excluded worker
+                // pane callers, so the coordinator couldn't tail a
+                // sibling worker's transcript when running from inside
+                // another worker. AppOrBoss admits worker descendants.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         run_id = %run_id,
-                        "tail_run_transcript rejected: caller not in Boss subtree",
+                        "tail_run_transcript rejected: caller not in app/Boss subtree",
                     );
                     send_response(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "tail_run_transcript is BossOnly".to_owned(),
+                            message: "tail_run_transcript requires app or Boss authority"
+                                .to_owned(),
                         },
                     );
                     continue;
@@ -2793,17 +2820,26 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::WorkspacePoolSummary => {
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                // Read-only view of `cube workspace list` plus engine
+                // annotations. The coordinator contract documents this
+                // as a bossctl verb, and any user who can run `cube
+                // workspace list` directly already has the same view
+                // — so an extra subtree gate buys no security and just
+                // breaks legitimate calls (the live coordinator
+                // session repro: bossctl invoked from a shell that's
+                // neither an app nor a Boss descendant fell through
+                // AppOrBoss). User tier is the right level.
+                if !server_state.authorize_rpc(RpcTier::User, peer_pid) {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
-                        "workspace_pool_summary rejected: caller not in app/Boss subtree",
+                        "workspace_pool_summary rejected: caller failed user tier",
                     );
                     send_response(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "workspace_pool_summary requires app or Boss authority"
+                            message: "workspace_pool_summary failed user-tier check"
                                 .to_owned(),
                         },
                     );
@@ -3752,6 +3788,27 @@ mod tests {
         assert!(
             server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
             "BossOnly must accept boss_pid descendants",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn user_tier_admits_caller_outside_app_and_boss_subtrees() {
+        // `bossctl workspace summary` is User-tier (read-only proxy of
+        // `cube workspace list`). Locks in that authorize_rpc(User, …)
+        // accepts a caller even when both trust roots are set and the
+        // caller descends from neither — the live-coordinator-session
+        // failure mode for AppOrBoss.
+        let server_state = server_state_with_app_pid(1);
+        server_state.set_boss_pid(2);
+        let self_pid = std::process::id() as libc::pid_t;
+        assert!(
+            server_state.authorize_rpc(RpcTier::User, Some(self_pid)),
+            "User tier must accept callers outside both trust subtrees",
+        );
+        assert!(
+            !server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
+            "sanity: AppOrBoss must still reject the same caller, so the User-tier admission isn't an accidental hole",
         );
     }
 }
