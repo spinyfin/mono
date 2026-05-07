@@ -175,6 +175,20 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             value: input.lease_id.clone(),
         },
         EnvVar {
+            // Read by `boss-event` and embedded in every hook payload
+            // as `_boss_run_id`. The engine uses this to correlate
+            // hook events to runs without depending on a working
+            // shell-pid lookup. `proc_listpids` in the app side is
+            // still a TODO, and without it `WorkerRegistry`'s pid
+            // map stays empty, `lookup_with_ancestor_walk` returns
+            // None, and `dispatch_live_worker_state` silently skips
+            // every event — that's the bug that pinned every worker's
+            // activity at `Spawning` regardless of what the worker
+            // was actually doing.
+            key: "BOSS_RUN_ID".into(),
+            value: input.run_id.clone(),
+        },
+        EnvVar {
             key: "EDITOR".into(),
             value: WORKER_EDITOR_NOOP.into(),
         },

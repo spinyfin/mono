@@ -116,24 +116,45 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// Captures `LOCAL_PEERPID` synchronously before any await; if the
 /// shim has already closed by then (its write is fast, then it
 /// exits), the pid lookup may fail with `ENOTCONN` and the event is
-/// returned with `peer_pid: None`. When the pid is available, we
-/// consult the worker registry (with ancestor walk) to set `run_id`.
+/// returned with `peer_pid: None`.
+///
+/// `run_id` correlation order:
+///   1. `_boss_run_id` field embedded in the payload by the
+///      `boss-event` shim (sourced from `BOSS_RUN_ID` in the worker's
+///      env). This is the reliable path — it doesn't depend on
+///      `proc_listpids` working in the app, which it currently
+///      doesn't.
+///   2. `peer_pid` ancestor walk against `WorkerRegistry`. Useful
+///      whenever the shim is invoked outside the BOSS_RUN_ID env (e.g.
+///      direct test fixtures) and when the worker registry actually
+///      has a real shell pid registered.
 pub async fn handle_connection(
     stream: UnixStream,
     registry: &WorkerRegistry,
 ) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
-    let run_id = peer_pid_value.and_then(|pid| registry.lookup_with_ancestor_walk(pid));
     let mut stream = stream;
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await?;
     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let payload_run_id = extract_run_id_from_payload(&raw);
+    let run_id = payload_run_id.or_else(|| {
+        peer_pid_value.and_then(|pid| registry.lookup_with_ancestor_walk(pid))
+    });
     let event = normalize_hook_event(&raw)?;
     Ok(IncomingHookEvent {
         peer_pid: peer_pid_value,
         run_id,
         event,
     })
+}
+
+/// Pull `_boss_run_id` out of the raw hook payload if the shim
+/// embedded it. Empty strings are treated as missing so a stray
+/// `BOSS_RUN_ID=` doesn't poison correlation with an empty id.
+fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
+    let s = raw.get("_boss_run_id")?.as_str()?;
+    if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
 #[cfg(test)]
@@ -206,6 +227,93 @@ mod tests {
         }
         // Empty registry: no run_id correlation.
         assert_eq!(incoming.run_id, None);
+    }
+
+    #[tokio::test]
+    async fn run_id_extracted_from_payload_field() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        // Empty registry — pid lookup will return None. The
+        // `_boss_run_id` field embedded by the shim is the only path
+        // by which the engine should resolve a run id today.
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"run-from-payload"}"#,
+            ).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        client.await.unwrap();
+
+        assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
+    }
+
+    #[tokio::test]
+    async fn payload_run_id_wins_over_pid_lookup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        // Register our pid against a *different* run id than the
+        // payload carries; the payload field must take precedence.
+        let registry = WorkerRegistry::new();
+        registry.register(std::process::id() as libc::pid_t, "run-from-pid");
+
+        let path_owned = path.clone();
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"run-from-payload"}"#,
+            ).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = close_rx.recv();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry).await.unwrap();
+        assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
+
+        close_tx.send(()).ok();
+        client.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_payload_run_id_falls_back_to_pid_lookup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let registry = WorkerRegistry::new();
+        registry.register(std::process::id() as libc::pid_t, "run-from-pid");
+
+        let path_owned = path.clone();
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":""}"#,
+            ).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = close_rx.recv();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry).await.unwrap();
+        // Empty `_boss_run_id` is treated as missing; pid lookup wins.
+        assert_eq!(incoming.run_id.as_deref(), Some("run-from-pid"));
+
+        close_tx.send(()).ok();
+        client.join().unwrap();
     }
 
     #[tokio::test]
