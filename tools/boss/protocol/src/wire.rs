@@ -20,6 +20,15 @@ pub fn execution_topic(execution_id: &str) -> String {
     format!("executions.{execution_id}")
 }
 
+/// Per-run topic that carries probe lifecycle pushes for `run_id`.
+/// Subscribers (e.g. a `bossctl probe` invocation that wants to wait
+/// for the worker's reply) join this topic on the run they care about
+/// and observe [`FrontendEvent::ProbeReplied`] when the engine pops a
+/// queued probe and watches the next Stop boundary land.
+pub fn probe_topic(run_id: &str) -> String {
+    format!("probes.{run_id}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -220,8 +229,10 @@ pub enum FrontendRequest {
     /// Boss-tier RPC: queue a probe prompt for `run_id`. The engine
     /// holds the text until the next `Stop` hook event for that run,
     /// then writes it into the worker's pty as if it were typed by
-    /// the user. Returns immediately with a `ProbeQueued` event;
-    /// observation of the worker's reply is via the transcript.
+    /// the user. Returns immediately with a `ProbeQueued` event
+    /// carrying the engine-minted `probe_id`; the worker's reply is
+    /// surfaced asynchronously via [`FrontendEvent::ProbeReplied`] on
+    /// the [`probe_topic`] for `run_id`.
     ProbeRun {
         run_id: String,
         text: String,
@@ -478,9 +489,27 @@ pub enum FrontendEvent {
     AppSessionRegistered,
     /// Engine confirms the Boss session pid was registered.
     BossSessionRegistered,
-    /// Engine confirms a probe was queued for the given run.
+    /// Engine confirms a probe was queued for the given run. The
+    /// engine-minted `probe_id` lets callers correlate a queued probe
+    /// with the eventual [`FrontendEvent::ProbeReplied`] push, which
+    /// arrives on the [`probe_topic`] for `run_id` once the worker's
+    /// follow-up Stop boundary lands.
     ProbeQueued {
         run_id: String,
+        probe_id: String,
+    },
+    /// Push: the worker for `run_id` has replied to a previously
+    /// dispatched probe. Emitted on the Stop boundary that follows
+    /// the dispatch (so callers can correlate "probe goes in" with
+    /// "next assistant turn comes out"). `text` is the assistant
+    /// turn the engine extracted from the worker's transcript;
+    /// `probe_id` matches the value [`FrontendEvent::ProbeQueued`]
+    /// returned for the originating [`FrontendRequest::ProbeRun`]
+    /// call. Pushed on the [`probe_topic`] for `run_id`.
+    ProbeReplied {
+        run_id: String,
+        probe_id: String,
+        text: String,
     },
     /// Engine acknowledges a stop request — the pane release has
     /// been kicked off and (if applicable) the cube workspace lease

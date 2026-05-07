@@ -541,14 +541,18 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   `app_pid` discovery refinement (the app reports its pid via
   `BOSS_APP_PID`; engine accepts any ancestor of the connecting
   peer) landed in PRs #172, #173.
-- **Probe model — Stop-boundary injection.**
-  `pending_probes: HashMap<String, VecDeque<String>>` keyed by
-  run id (`app.rs:295-298`) holds queued probe text.
-  `queue_probe` (`:608-623`) appends; the consumer pops on the
-  next `Stop` hook boundary. `FrontendEvent::ProbeQueued
-  { run_id }` fires on enqueue (`:2455`). Distinct
-  `ProbeReplied` event is not yet wired (the reply lands in
-  transcript like any other turn).
+- **Probe model — Stop-boundary injection + reply emission.**
+  `pending_probes: HashMap<String, VecDeque<PendingProbe>>` keyed
+  by run id holds queued `(probe_id, text)` entries; `queue_probe`
+  mints a fresh `probe-{n}` id and returns it so the
+  `FrontendEvent::ProbeQueued { run_id, probe_id }` response
+  threads through to `bossctl probe`. The events-socket consumer
+  pops one entry per `Stop` hook boundary, captures the current
+  transcript byte offset on successful `SendToPane`, and tracks
+  the dispatched probe in `in_flight_probes`. The follow-up Stop
+  reads the assistant turn written after that offset and emits
+  `FrontendEvent::ProbeReplied { run_id, probe_id, text }` on
+  the per-run [`probe_topic`].
 - **Coordinator system prompt** at `app.rs:38-75` —
   `BOSS_AGENT_SYSTEM_PROMPT` teaches "do not make direct
   implementation changes," "queue the work first," and
@@ -606,9 +610,16 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   the Boss pane.
 - `bossctl workspace summary` — needs an engine surface that
   reports cube workspace pool state.
-- `ProbeReplied` event on the follow-up `Stop` — queue+inject
-  side is in, but emitting a distinct event when the probe's
-  reply lands is not yet wired.
+- ~~`ProbeReplied` event on the follow-up `Stop`~~ — landed.
+  `dispatch_probe_reply_on_stop` runs ahead of the dispatcher,
+  consumes the in-flight entry recorded by the previous Stop's
+  successful `SendToPane`, reads the new transcript region, and
+  publishes `FrontendEvent::ProbeReplied { run_id, probe_id,
+  text }` on the per-run [`probe_topic`]. Idempotent on
+  duplicate Stops (the in-flight entry is taken on first emit).
+  Coverage:
+  `app::tests::dispatch_probe_reply_emits_probe_replied_after_followup_stop`,
+  plus the `probe_run_returns_unique_probe_ids` wire-shape smoke.
 
 **Done when (acceptance, kept for the record).**
 
