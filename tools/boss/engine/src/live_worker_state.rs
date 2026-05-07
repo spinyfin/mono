@@ -86,6 +86,24 @@ impl LiveWorkerStateRegistry {
             .cloned()
     }
 
+    /// True iff a live state entry exists for `run_id` whose activity
+    /// indicates the worker is still attached to the slot. Used by
+    /// `RequestExecution` to detect "the latest execution is
+    /// non-terminal on paper but the worker is gone" — that's the
+    /// stale-`waiting_human` shape that would otherwise make a
+    /// kanban-driven re-dispatch a silent no-op.
+    ///
+    /// `Terminated` and `Errored` count as **not** live: the slot is
+    /// no longer holding the run open. Everything else
+    /// (`Spawning`/`Working`/`WaitingForInput`/`Idle`) does.
+    pub fn is_run_live(&self, run_id: &str) -> bool {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .by_slot
+            .values()
+            .any(|state| state.run_id == run_id && !is_terminal_activity(state.activity))
+    }
+
     /// Apply a hook event to the state for `slot_id`. Returns `true`
     /// if the entry actually changed, so callers can suppress no-op
     /// topic pushes. Returns `false` if no entry exists for the slot
@@ -182,6 +200,18 @@ impl LiveWorkerStateRegistry {
         state.last_event_at = Some(current_iso8601());
         true
     }
+}
+
+/// True iff `activity` indicates the worker is no longer attached
+/// to its slot — `Terminated` because it exited, `Errored` because
+/// the events socket gave up on it. The remaining activity values
+/// (`Spawning`, `Working`, `WaitingForInput`, `Idle`) all describe
+/// a live, slot-holding worker.
+fn is_terminal_activity(activity: WorkerActivity) -> bool {
+    matches!(
+        activity,
+        WorkerActivity::Terminated | WorkerActivity::Errored
+    )
 }
 
 fn current_iso8601() -> String {

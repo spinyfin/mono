@@ -170,9 +170,37 @@ impl WorkDb {
         &self,
         input: RequestExecutionInput,
     ) -> Result<WorkExecution> {
+        // No live-worker oracle → assume every non-terminal execution
+        // is genuinely live (the historical behaviour, kept for tests
+        // that don't stand up the live registry).
+        self.request_execution_with_live_check(input, |_| true)
+    }
+
+    /// Same as `request_execution`, but the caller supplies a
+    /// predicate that says whether the execution id named by an
+    /// existing non-terminal row corresponds to a worker that is
+    /// **actually live** in the engine's slot registry. When the
+    /// predicate returns `false` we treat the existing execution as
+    /// stale (mark it `abandoned`, finished now) and create a fresh
+    /// `ready` execution. This is what lets a kanban drag-to-Doing
+    /// re-dispatch a chore whose previous worker died with the app
+    /// before reaching `done`.
+    ///
+    /// Idempotency contract:
+    /// - existing execution terminal or absent → insert new `ready`,
+    /// - existing non-terminal AND predicate returns `true` → no-op
+    ///   (just refresh priority / preferred_workspace_id, same as
+    ///   before),
+    /// - existing non-terminal AND predicate returns `false` → mark
+    ///   existing `abandoned`, insert new `ready`.
+    pub fn request_execution_with_live_check<F: FnOnce(&str) -> bool>(
+        &self,
+        input: RequestExecutionInput,
+        is_live: F,
+    ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = request_execution_in_tx(&tx, input)?;
+        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
         tx.commit()?;
         Ok(execution)
     }
@@ -186,7 +214,18 @@ impl WorkDb {
     /// only remaining signal of "this was supposed to be running" is
     /// `tasks.status = 'active'`. Returns the work item ids that were
     /// re-dispatched so the caller can log them.
-    pub fn reconcile_active_dispatch(&self) -> Result<Vec<String>> {
+    ///
+    /// `is_live` is the same predicate `request_execution_with_live_check`
+    /// uses. Engine startup runs reconcile *before* any worker spawn
+    /// could have happened, so the natural caller passes a closure that
+    /// returns `false` for everything — every existing non-terminal
+    /// execution is treated as stale and re-dispatched. Tests that
+    /// don't stand up a live registry can pass `|_| true` to keep the
+    /// pre-live-check semantics.
+    pub fn reconcile_active_dispatch<F: Fn(&str) -> bool>(
+        &self,
+        is_live: F,
+    ) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         // Active, non-deleted task/chore rows are the candidate set.
@@ -200,22 +239,29 @@ impl WorkDb {
         };
         let mut redispatched = Vec::new();
         for work_item_id in candidate_ids {
-            // Skip if a non-terminal execution already exists — that's
-            // a worker the engine is already tracking.
+            // Decide whether this work item needs a fresh ready
+            // execution. The candidate cases are:
+            //   - no execution at all → yes,
+            //   - latest execution terminal → yes,
+            //   - latest execution non-terminal but `is_live`
+            //     reports the slot is gone → yes (stale row).
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
-                Some(existing) => execution_status_is_terminal(&existing.status),
+                Some(existing) => {
+                    execution_status_is_terminal(&existing.status) || !is_live(&existing.id)
+                }
                 None => true,
             };
             if !needs_dispatch {
                 continue;
             }
-            request_execution_in_tx(
+            request_execution_in_tx_with_live_check(
                 &tx,
                 RequestExecutionInput {
                     work_item_id: work_item_id.clone(),
                     priority: None,
                     preferred_workspace_id: None,
                 },
+                |run_id| is_live(run_id),
             )?;
             redispatched.push(work_item_id);
         }
@@ -1794,9 +1840,10 @@ fn reconcile_work_item_execution(
     Ok(())
 }
 
-fn request_execution_in_tx(
+fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     conn: &Connection,
     input: RequestExecutionInput,
+    is_live: F,
 ) -> Result<WorkExecution> {
     let RequestExecutionInput {
         work_item_id,
@@ -1809,23 +1856,49 @@ fn request_execution_in_tx(
 
     if let Some(existing) = query_latest_execution_for_work_item(conn, &work_item_id)? {
         if !execution_status_is_terminal(&existing.status) {
-            let next_status = if existing.status == "waiting_dependency" {
-                "ready".to_owned()
+            // Existing non-terminal row. Two cases:
+            //   - is_live=true: a worker is genuinely attached to the
+            //     slot. Keep the row, refresh priority / preferred
+            //     workspace, return the same execution. (Idempotent —
+            //     this is what bossctl `work start` and a kanban
+            //     drag both depend on for "don't double-spawn.")
+            //   - is_live=false: the row is stale (waiting_human
+            //     leftover from a worker that died with the app, or a
+            //     run that exited without us seeing the SessionEnd
+            //     hook). Mark it abandoned so future scans don't
+            //     trip on it again, then fall through to insert a
+            //     fresh ready row. This is what makes the kanban
+            //     re-dispatch path work after a crash.
+            if is_live(&existing.id) {
+                let next_status = if existing.status == "waiting_dependency" {
+                    "ready".to_owned()
+                } else {
+                    existing.status.clone()
+                };
+                let next_priority = priority.unwrap_or(existing.priority);
+                let next_preferred = preferred_workspace_id
+                    .clone()
+                    .or(existing.preferred_workspace_id);
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status = ?2,
+                         priority = ?3,
+                         preferred_workspace_id = ?4
+                     WHERE id = ?1",
+                    params![existing.id, next_status, next_priority, next_preferred],
+                )?;
+                return query_execution(conn, &existing.id)?
+                    .with_context(|| format!("unknown execution: {}", existing.id));
             } else {
-                existing.status.clone()
-            };
-            let next_priority = priority.unwrap_or(existing.priority);
-            let next_preferred = preferred_workspace_id.or(existing.preferred_workspace_id);
-            conn.execute(
-                "UPDATE work_executions
-                 SET status = ?2,
-                     priority = ?3,
-                     preferred_workspace_id = ?4
-                 WHERE id = ?1",
-                params![existing.id, next_status, next_priority, next_preferred],
-            )?;
-            return query_execution(conn, &existing.id)?
-                .with_context(|| format!("unknown execution: {}", existing.id));
+                let now = now_string();
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status = 'abandoned',
+                         finished_at = COALESCE(finished_at, ?2)
+                     WHERE id = ?1",
+                    params![existing.id, now],
+                )?;
+            }
         }
     }
 
@@ -2860,7 +2933,7 @@ mod tests {
         )
         .unwrap();
 
-        let redispatched = db.reconcile_active_dispatch().unwrap();
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
         assert_eq!(redispatched, vec![chore.id.clone()]);
 
         // A ready execution should now exist for the chore.
@@ -2910,7 +2983,7 @@ mod tests {
         })
         .unwrap();
 
-        let redispatched = db.reconcile_active_dispatch().unwrap();
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
         assert_eq!(redispatched, vec![chore.id.clone()]);
 
         let executions = db.list_executions(Some(&chore.id)).unwrap();
@@ -2958,13 +3031,175 @@ mod tests {
         })
         .unwrap();
 
-        let redispatched = db.reconcile_active_dispatch().unwrap();
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
         assert!(
             redispatched.is_empty(),
             "should not redispatch when a non-terminal execution exists, got {redispatched:?}",
         );
         let executions = db.list_executions(Some(&chore.id)).unwrap();
         assert_eq!(executions.len(), 1, "no fresh execution should be inserted");
+    }
+
+    /// Reconcile must redispatch when the latest execution is
+    /// non-terminal on paper but the live-worker oracle reports the
+    /// slot is gone. This is the "stale waiting_human after a crash"
+    /// shape the design's §3 calls out — the row is non-terminal, no
+    /// worker is actually attached, and a kanban drag would silently
+    /// no-op without this carve-out.
+    #[test]
+    fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
+        let path = temp_db_path("reconcile-stale");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stale chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stale = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("waiting_human".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // is_live=false → reconcile should treat the waiting_human
+        // row as stale, mark it abandoned, and insert a fresh ready.
+        let redispatched = db.reconcile_active_dispatch(|_| false).unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 2);
+        let stale_after = executions
+            .iter()
+            .find(|e| e.id == stale.id)
+            .expect("original stale exec should still be visible");
+        assert_eq!(stale_after.status, "abandoned");
+        let latest = executions.last().unwrap();
+        assert_ne!(latest.id, stale.id);
+        assert_eq!(latest.status, "ready");
+    }
+
+    /// Direct API test for the per-call live-aware path the kanban
+    /// drag uses. Same shape as the reconcile-stale test but driven
+    /// through `request_execution_with_live_check`.
+    #[test]
+    fn request_execution_marks_existing_stale_when_no_live_worker() {
+        let path = temp_db_path("request-stale");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stale chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let stale = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("waiting_human".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let new_exec = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_ne!(new_exec.id, stale.id, "expected a brand new execution row");
+        assert_eq!(new_exec.status, "ready");
+
+        let stale_after = db
+            .list_executions(Some(&chore.id))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == stale.id)
+            .unwrap();
+        assert_eq!(stale_after.status, "abandoned");
+        assert!(stale_after.finished_at.is_some());
+    }
+
+    /// And the inverse: live-worker → idempotent.
+    #[test]
+    fn request_execution_is_idempotent_when_existing_run_is_live() {
+        let path = temp_db_path("request-live");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Live chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let live = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("waiting_human".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let returned = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                },
+                |_| true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            returned.id, live.id,
+            "live worker → reuse existing execution",
+        );
+        assert_eq!(
+            db.list_executions(Some(&chore.id)).unwrap().len(),
+            1,
+            "no duplicate execution should be inserted",
+        );
     }
 
     /// Reconcile must NOT touch chores that aren't `active`. A
@@ -3004,7 +3239,7 @@ mod tests {
         )
         .unwrap();
 
-        let redispatched = db.reconcile_active_dispatch().unwrap();
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
         assert!(redispatched.is_empty());
     }
 

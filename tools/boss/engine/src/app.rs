@@ -1228,7 +1228,16 @@ pub async fn serve(
     // is supposed to mirror "running or queued," and on startup we
     // re-issue RequestExecution for items that no longer satisfy
     // either half of that contract.
-    match server_state.work_db.reconcile_active_dispatch() {
+    // On startup the live-worker registry is empty (no worker has
+    // spawned yet), so passing `is_run_live` here treats every
+    // existing non-terminal execution as stale — exactly what we want
+    // after a crash, where every recorded `waiting_human` row is by
+    // definition orphaned.
+    let live_states_for_reconcile = server_state.live_worker_states.clone();
+    match server_state
+        .work_db
+        .reconcile_active_dispatch(|run_id| live_states_for_reconcile.is_run_live(run_id))
+    {
         Ok(redispatched) if !redispatched.is_empty() => {
             tracing::info!(
                 count = redispatched.len(),
@@ -1962,25 +1971,39 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::RequestExecution { input } => match work_db.request_execution(input) {
-                Ok(execution) => {
-                    server_state.execution_coordinator.kick();
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ExecutionRequested { execution },
-                    );
+            FrontendRequest::RequestExecution { input } => {
+                // Live-worker awareness: when the work item already has
+                // a non-terminal execution, the engine reuses it only
+                // when the slot registry actually still has a live
+                // worker for that run id. Without this check, a chore
+                // whose previous worker died with the app gets stuck
+                // — the kanban drag fires RequestExecution, the engine
+                // says "still running," coordinator polls for `ready`
+                // and sees nothing, no new spawn ever happens.
+                let live_states = server_state.live_worker_states.clone();
+                let result = work_db.request_execution_with_live_check(input, |run_id| {
+                    live_states.is_run_live(run_id)
+                });
+                match result {
+                    Ok(execution) => {
+                        server_state.execution_coordinator.kick();
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ExecutionRequested { execution },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
                 }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
+            }
             FrontendRequest::ListExecutions { work_item_id } => {
                 match work_db.list_executions(work_item_id.as_deref()) {
                     Ok(executions) => {
