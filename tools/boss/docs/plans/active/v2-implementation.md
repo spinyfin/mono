@@ -39,29 +39,36 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
 | 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers land in Phases 8-9 |
 | 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
-| 6     | libghostty embedding and worker spawn          | 🟡 mostly shipped — 6a–6g (Phase-5-independent) + 6f-1..3 done; 6f-4..8 (engine→app RPC + spawn flow + cutover) remain |
+| 6     | libghostty embedding and worker spawn          | 🟢 named deliverables shipped — 6a–6g + 6f-1..8 all in main; PR #197 closed the BOSS_RUN_ID hook-correlation gap that the 6f-6 shell_pid TODO had left |
 | 7     | Boss session and bossctl                       | ❌ not started               |
 | 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
 | 11    | Bazel `GhosttyKit` integration                 | ❌ not started — hard prereq for shipping the post-6f Bazel `.app` |
 
-The remaining piece in Phase 6 is **6f-7** — wiring `PaneSpawnRunner`
-as the production `ExecutionRunner` in `ServerState::new_arc`. The
-spawn-flow helper (`spawn_flow::start_worker`), engine→app dispatch,
-and app-side pane allocator are all in main; what's missing is the
-coordinator routing run starts through them instead of the legacy
-`AcpExecutionRunner`. Until that lands, `boss task create` still
-routes via ACP and no claude pane gets spawned by the coordinator.
-Phases 7 and 9 still effectively wait on Phase 6 closing. Phase 8
-has the data model but none of the live PR / poller / triage logic.
-Phase 10 hardening is essentially untouched. **Phase 11** is a build-system gap exposed
-by Phase 6a: the SwiftPM build includes the libghostty-driven Agents
-grid, but the Bazel build (the documented `bazel run //tools/boss/
-app-macos:BossMacApp` production path) excludes `Sources/Ghostty/`
-and falls through to a placeholder. Must land before — or as part of
-— the 6f cutover, otherwise the Bazel-built app loses Agents-mode
-functionality post-cutover.
+Phase 6 is closed: 6f-7 wiring (PaneSpawnRunner as production
+`ExecutionRunner`) shipped in PR #171, the BOSS_RUN_ID hook
+correlation fix shipped in PR #197, and the spawn path has been
+through several rounds of operational fix-ups (PRs #172-176,
+#187-196). `boss task create` now routes through the coordinator
+to a real claude pane and hook events drive live worker state.
+
+Phase 7 has also seen substantial work outside this plan's tracking
+— the `bossctl` binary, two-trust-root auth, probe model, and
+worker spawn env hygiene have all landed (see Phase 7 below for the
+audit). Phase 8 has the data model and a working `PrDetector` that
+shells out to `gh pr view`; what's missing is the GitHub poller,
+the re-engagement RPC, and the Triage UI. Phase 9 is still
+untouched. Phase 10 hardening is essentially untouched.
+
+**Phase 11** remains the lone build-system gap. The SwiftPM build
+includes the libghostty-driven Agents grid; the Bazel build
+(`bazel run //tools/boss/app-macos:BossMacApp`) excludes
+`Sources/Ghostty/` via a single-level glob and falls through to a
+placeholder. Phase 6f shipped without Phase 11, so the Bazel-built
+`.app` currently has no working Agents mode. SwiftPM is the dev
+path; Phase 11 must land before Bazel can be the production path
+again.
 
 Each phase below carries its own **Status (done)** and **Pending**
 sections with file references so they can be ticked off
@@ -375,7 +382,7 @@ Phase C; [`v2-design-risks`](../../designs/v2-design-risks.md) R5.
 
 ---
 
-### Phase 6: libghostty embedding and worker spawn — 🟡 mostly shipped
+### Phase 6: libghostty embedding and worker spawn — 🟢 named deliverables shipped
 
 **Goal.** End-to-end vertical slice: engine spawns real `claude`
 workers in libghostty panes, workers do work, events flow back.
@@ -394,57 +401,70 @@ workers in libghostty panes, workers do work, events flow back.
   - 6e: CLAUDE.md / settings.json templating in `boss-engine`
     (PR #141).
   - 6g: transcript tail-watcher in `boss-engine` (PR #142).
-- Phase-5-dependent slices (6f-1..6 and 6f-8) shipped:
+- All Phase-5-dependent slices (6f-1..8) shipped:
   - 6f-1: `WorkerRegistry` with `proc_pidinfo` ancestor walk
     (PR #146).
   - 6f-2: events socket annotates `IncomingHookEvent.run_id` via
-    the registry (PR #150, originally #147 — re-cut after the 6f-1
-    base branch was deleted on merge).
+    the registry (PR #150).
   - 6f-3: engine `serve()` binds the events socket and runs the
-    accept loop on startup (PR #151, originally #148 — same
-    re-cut reason).
+    accept loop on startup (PR #151).
   - 6f-4: protocol additions for the engine→app pane RPC —
     `RegisterAppSession`, `EngineRequest` event variant,
     `EngineResponse` request variant, `EngineToAppRequest /
     Response / Error` enums in `boss-protocol` (PR #152).
   - 6f-5: engine-side dispatch — `ServerState::send_to_app`,
     `register_app_session`, `deliver_app_response`, app-disconnect
-    cleanup, `app_pid` trust check (PR #157, originally #153 —
-    re-cut after 6f-4 base deleted).
+    cleanup, `app_pid` trust check (PR #157).
   - 6f-6: app-side pane allocator — `WorkersWorkspaceModel`
     refactored to slot allocation, Swift `EngineClient` parses
     `engine_request` / `app_session_registered`, `ChatViewModel`
-    sends `RegisterAppSession` on connect (PR #158, originally
-    #154 — re-cut).
-  - 6f-7 helper only: `engine/src/spawn_flow.rs` with
-    `start_worker` (PR #159, originally #155 — re-cut). The
-    helper landed but the production-runner replacement was
-    deferred — see "Pending" below.
+    sends `RegisterAppSession` on connect (PR #158).
+  - 6f-7 helper: `engine/src/spawn_flow.rs` with `start_worker`
+    (PR #159).
+  - 6f-7 wiring: `PaneSpawnRunner` replaces `AcpExecutionRunner`
+    in `ServerState::new_arc` (PR #171). Coordinator now routes
+    run starts through the engine→app pane RPC. Returns
+    `WaitingHuman` immediately on a successful spawn; real
+    completion (Stop hook → run completes, lease released) is
+    Phase 8 work alongside the events-socket sequencer.
   - 6f-8: PoC chat-code cutover — `selectedAgentID`, `draft`,
     `sendDraft`, the `selectedAgent*` accessors, and
     `preferredDefaultAgentID` removed from `ChatViewModel`
     (PR #160).
+- BOSS_RUN_ID hook-correlation fix (PR #197). The Swift pane
+  allocator returns `shell_pid: 0` (the `proc_listpids` lookup
+  is still TODO at
+  `app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift:42-47`),
+  which used to mean hook events couldn't correlate to runs via
+  the `LOCAL_PEERPID` ancestor walk. PR #197 sidesteps that by
+  setting `BOSS_RUN_ID` in the worker spawn env, having the
+  `boss-event` shim splice `_boss_run_id` into the JSON payload,
+  and having the events socket prefer the payload field over the
+  pid lookup. The pid path is kept as a fallback so direct-socket
+  fixtures still work and so wiring `proc_listpids` later remains
+  additive.
+- Operational follow-ups from running the spawn path end-to-end:
+  - `RegisterAppSession` accepts any engine ancestor as the app;
+    app sets `BOSS_APP_PID` (PRs #172, #173).
+  - Worker prompt injection, hook PATH, kanban auto-advance
+    broadcast (PR #174 + regression tests in PR #175).
+  - `boss-event` resolved via Bazel runfiles with workspace
+    fallback (PR #176).
+  - Pane slot persisted onto run record (PR #190); pane teardown
+    on chore-done / stop / completion (PR #192); engine gitignores
+    `.claude/` in worker workspaces (PRs #187, #188, #196);
+    pane summary / titlebar polish (PRs #181, #185, #189, #191).
+  - Live worker state surfaced to bossctl + UI
+    (PRs #190, #193, #194).
 - Engine→app pane RPC design landed in
   [`designs/engine-app-rpc`](../../designs/engine-app-rpc.md)
   (PR #149).
 
-**Pending.** Only 6f-7 remains, plus the deferred shell-pid
-follow-up that 6f-6 left as a TODO.
-
-- **6f-7: spawn-flow wiring (in review as PR #161).** Replace
-  `AcpExecutionRunner` with `PaneSpawnRunner` in
-  `ServerState::new_arc` so the coordinator routes run starts
-  through the engine→app pane RPC. Returns `WaitingHuman`
-  immediately on a successful spawn — the run record stays in
-  `waiting_human` until a follow-up flow concludes it. Real
-  completion (`Stop` hook → run completes, lease released) is
-  Phase 8 work alongside the events-socket sequencer.
-- **6f-6 follow-up: shell-pid via `proc_listpids`.** The Swift
-  pane allocator currently returns `shell_pid: 0`, which means
-  `WorkerRegistry` skips registration with a warning and hook
-  events from spawned panes don't correlate to runs. Unblocks
-  the visible spawn-into-pane (which is what 6f-7 needs); hook
-  correlation to live run state is the missing piece.
+**Pending.** Nothing load-bearing. The
+`WorkersWorkspaceModel.spawnWorkerPane` still has a TODO for
+`proc_listpids` to compute the real shell pid, but PR #197 made
+hook correlation independent of it; the TODO is now a
+nice-to-have rather than a Phase 6 blocker.
 
 **Done when (acceptance).**
 
@@ -453,14 +473,16 @@ follow-up that 6f-6 left as a TODO.
   libghostty pane, the worker does the work and opens a PR. Engine
   observes the full lifecycle via WorkerEvents.
 
-**Build-system gap (tracked as Phase 11).** The 6a SwiftPM build
-links `GhosttyKit` and ships the live grid, but the Bazel build
-(the documented `bazel run //tools/boss/app-macos:BossMacApp`
-production path) excludes `Sources/Ghostty/*.swift` via a
-single-level glob and falls through to a placeholder via
-`#if canImport(GhosttyKit)`. After 6f cutover, the Bazel-built
-`.app` would have a non-functional Agents tab. Phase 11 closes
-this gap and must land before — or as part of — 6f.
+**Build-system gap (still tracked as Phase 11).** Phase 6f shipped
+without Phase 11. The SwiftPM build (`swift run BossMacApp`) links
+`GhosttyKit` and runs the live Workers grid. The Bazel build
+(`bazel run //tools/boss/app-macos:BossMacApp`) still excludes
+`Sources/Ghostty/*.swift` via a single-level glob in
+`tools/boss/app-macos/BUILD.bazel` and falls through to a
+`#if canImport(GhosttyKit)` placeholder — meaning the Bazel-built
+`.app` has no working Agents mode. Day-to-day development uses
+SwiftPM so this hasn't blocked Phase 6/7 work, but it remains an
+open prereq before the Bazel build can be the production path.
 
 **Depends on.** Phase 5 for 6f only; 6a–6e and 6g do not depend on
 Phase 5. Cube V2 prereqs already landed in Phase 4. 6f also depends
