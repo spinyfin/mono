@@ -330,7 +330,13 @@ struct TaskUpdateArgs {
     #[arg(long)]
     ordinal: Option<i64>,
 
-    #[arg(long = "pr-url")]
+    /// Escape hatch for backfilling `pr_url` when the engine's
+    /// auto-detection couldn't pick it up. With the on-Stop +
+    /// merge-poller pair installed in the engine you should rarely
+    /// need this; hidden from `-h` short help to keep the common
+    /// path clean while still surfacing it in `--help` and via
+    /// `boss chore update --help`.
+    #[arg(long = "pr-url", hide_short_help = true)]
     pr_url: Option<String>,
 }
 

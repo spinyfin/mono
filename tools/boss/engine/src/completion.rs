@@ -9,15 +9,25 @@
 //! forever — that is the bug this module exists to close.
 //!
 //! The completion signal we listen for is the worker's `Stop` hook
-//! event. On every Stop, we look up the workspace path for the run
-//! and ask `gh` whether a PR exists for the workspace's current
-//! branch. If it does, the work item moves to `in_review`, the
-//! execution finalises (status `completed`, lease cleared, finished_at
-//! stamped), and the cube workspace is released so the next
-//! dispatch can take it over. If there is no PR, we surface an
-//! "awaiting input" signal on the execution topic so the
-//! coordinator / pane indicator can show the worker is idle without
-//! moving the work item to review.
+//! event. On every Stop, we resolve the worker's local commit shas
+//! via `jj log` (cube workspaces are non-colocated, so a top-level
+//! `git` invocation has no repo to point at — we cannot rely on
+//! `gh pr view` to figure out the branch), then ask the GitHub API
+//! `repos/{owner}/{repo}/commits/{sha}/pulls` whether any PR
+//! contains those commits. If a fresh open PR exists, the work item
+//! moves to `in_review`, the execution finalises (status `completed`,
+//! lease cleared, finished_at stamped), and the cube workspace is
+//! released so the next dispatch can take it over. If the PR is
+//! already merged by the time the Stop fires, the work item moves
+//! straight to `done`. If there is no PR, we surface an
+//! "awaiting input" signal on the execution topic so the coordinator
+//! / pane indicator can show the worker is idle without moving the
+//! work item to review.
+//!
+//! Merges that happen *after* the worker exited are detected by a
+//! periodic poller wired in `app.rs`, which calls
+//! [`WorkDb::mark_chore_pr_merged`] for any chore in `in_review`
+//! whose `pr_url` is now in a merged GitHub state.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,7 +38,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
-use crate::work::{WorkDb, WorkItem};
+use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
 
 /// Asks the registered app session to tear down the libghostty pane
 /// hosting `run_id`. Implementations must be idempotent: a duplicate
@@ -50,48 +60,79 @@ impl WorkerPaneReleaser for NoopWorkerPaneReleaser {
     async fn release_pane(&self, _run_id: &str) {}
 }
 
-/// What `gh` reports about the current branch's PR.
+/// What GitHub reports about a PR associated with the worker's
+/// local commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrStatus {
-    /// No PR exists for the current branch.
+    /// No PR is associated with any of the worker's local commits.
     None,
-    /// PR exists and the local branch matches the PR's head commit —
-    /// nothing local is unpushed.
+    /// PR exists and at least one of the worker's local commit shas
+    /// matches the PR's head — nothing local is unpushed.
     Fresh { url: String },
-    /// PR exists, but the local branch is ahead of the PR's pushed
-    /// head sha. The PR is stale until the worker pushes; treat as
-    /// "no PR yet" for completion purposes.
+    /// PR exists, but the worker's local commits are ahead of the
+    /// PR's pushed head sha. Treat as "no PR yet" for completion
+    /// purposes; the worker is probed to push.
     Stale { url: String, reason: String },
+    /// PR exists and is already merged. Move the work item straight
+    /// to `done`.
+    Merged { url: String },
+    /// PR exists but was closed without merging. The work item
+    /// should not advance — surface like "no PR" so the worker can
+    /// decide whether to reopen / open a new one.
+    Closed { url: String },
 }
 
 impl PrStatus {
-    /// PR url, regardless of whether it is fresh or stale.
+    /// PR url, regardless of state.
     pub fn url(&self) -> Option<&str> {
         match self {
             PrStatus::None => None,
-            PrStatus::Fresh { url } | PrStatus::Stale { url, .. } => Some(url),
+            PrStatus::Fresh { url }
+            | PrStatus::Stale { url, .. }
+            | PrStatus::Merged { url }
+            | PrStatus::Closed { url } => Some(url),
         }
     }
 }
 
-/// Probes a workspace for an open PR on its current branch and
-/// reports whether it reflects the local commit history.
+/// Probes a workspace for any PR associated with its local commits
+/// and reports whether the PR is open / merged / stale / absent.
+///
+/// `repo_remote_url` is the product's `git@github.com:owner/repo.git`
+/// (or `https://...`) URL — the detector parses it into an
+/// `owner/repo` slug to query the GitHub API directly. Cube
+/// workspaces are non-colocated, so passing a workspace path to
+/// `gh pr view` doesn't work (no top-level `.git`); the detector
+/// must reach the API some other way, and the slug is the most
+/// reliable signal we have.
 #[async_trait]
 pub trait PrDetector: Send + Sync {
-    /// Returns the workspace's PR status, or `Err(_)` only if `gh`
-    /// itself failed in a way distinct from "no PR".
-    /// Implementations must treat "no PR" as `Ok(PrStatus::None)` to
-    /// keep the caller's idle-vs-completed logic clean.
-    async fn detect_pr(&self, workspace_path: &Path) -> Result<PrStatus>;
+    /// Returns the workspace's PR status. Implementations must treat
+    /// "no PR" as `Ok(PrStatus::None)` to keep the caller's
+    /// idle-vs-completed logic clean. Errors are reserved for tool
+    /// failures (jj missing, `gh` auth broken, etc.).
+    async fn detect_pr(
+        &self,
+        workspace_path: &Path,
+        repo_remote_url: &str,
+    ) -> Result<PrStatus>;
 }
 
-/// `PrDetector` that shells out to `gh pr view` plus `git rev-parse`.
-/// The CLI's "no PR for branch" exit is treated as `Ok(PrStatus::None)`;
-/// any other non-success exit is propagated as an error so the caller
-/// can log it. When a PR exists, the local `HEAD` sha is compared
-/// against the PR's `headRefOid`; a mismatch yields
-/// `PrStatus::Stale` so the engine can re-probe the worker to push
-/// instead of marking the run complete with a stale PR.
+/// `PrDetector` that shells out to `jj log` plus `gh api`. We can't
+/// use `gh pr view` from the workspace because cube workspaces are
+/// non-colocated jj checkouts (no `.git` at the workspace root, so
+/// `gh`'s implicit `git rev-parse --abbrev-ref HEAD` fails). Instead:
+///
+/// 1. Ask `jj log` for the worker's working-copy commit and its
+///    parent (covers both "@ has the work" and "squashed into @-,
+///    @ is empty" patterns).
+/// 2. Parse `repo_remote_url` into an `owner/repo` slug.
+/// 3. Hit `repos/{owner}/{repo}/commits/{sha}/pulls` for each
+///    candidate sha — GitHub returns the PR that contains the
+///    commit (open PRs while the branch lives, merged PRs when the
+///    commit landed in `main`).
+/// 4. Map the response (state, merged_at, head_sha) onto
+///    [`PrStatus`].
 #[derive(Debug, Default)]
 pub struct CommandPrDetector;
 
@@ -103,104 +144,101 @@ impl CommandPrDetector {
 
 #[async_trait]
 impl PrDetector for CommandPrDetector {
-    async fn detect_pr(&self, workspace_path: &Path) -> Result<PrStatus> {
-        // Single `gh pr view` call gets us both the URL and the PR's
-        // head sha so we can compare against the local rev without a
-        // second round-trip.
-        let output = Command::new("gh")
-            .args([
-                "pr", "view", "--json", "url,headRefOid", "--jq",
-                "[.url, .headRefOid] | @tsv",
-            ])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to spawn `gh pr view` in {}",
-                    workspace_path.display()
-                )
-            })?;
-
-        if !output.status.success() {
-            // `gh` exits non-zero when there is no PR for the current
-            // branch — that is the dominant case and must surface as
-            // `Ok(PrStatus::None)`, not an error. Heuristic: stderr
-            // mentions "no pull requests" or "no open pull requests".
-            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-            if stderr.contains("no pull requests")
-                || stderr.contains("no open pull requests")
-                || stderr.contains("no pr found")
-            {
-                return Ok(PrStatus::None);
-            }
-            return Err(anyhow!(
-                "`gh pr view` failed in {}: {}",
-                workspace_path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
+    async fn detect_pr(
+        &self,
+        workspace_path: &Path,
+        repo_remote_url: &str,
+    ) -> Result<PrStatus> {
+        let repo_slug = parse_repo_slug(repo_remote_url).with_context(|| {
+            format!("failed to parse repo slug from `{repo_remote_url}`")
+        })?;
+        let mut candidates = jj_candidate_commit_shas(workspace_path).await?;
+        // `@` and `@-` resolve to the same commit on a fresh,
+        // single-commit workspace; skip the duplicate API call.
+        candidates.dedup();
+        if candidates.is_empty() {
+            // No commits to search — workspace is empty / brand new.
             return Ok(PrStatus::None);
         }
 
-        // `@tsv` joins fields with `\t` and emits a single line per row.
-        let mut parts = trimmed.split('\t');
-        let url = parts.next().unwrap_or("").trim().to_owned();
-        let pr_head = parts.next().unwrap_or("").trim().to_owned();
-        if url.is_empty() {
-            return Ok(PrStatus::None);
+        // Walk the candidates newest-first (`@` before `@-`). The
+        // first sha that resolves to a PR wins. We hold onto the
+        // most recent transient `gh` error so detector failures still
+        // surface if every candidate failed.
+        let mut last_err: Option<anyhow::Error> = None;
+        for sha in &candidates {
+            match query_pr_for_commit(&repo_slug, sha).await {
+                Ok(Some(api_pr)) => return Ok(classify_pr(api_pr, &candidates)),
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::debug!(
+                        sha,
+                        repo = %repo_slug,
+                        ?err,
+                        "gh api commits/{sha}/pulls failed; trying next candidate",
+                    );
+                    last_err = Some(err);
+                }
+            }
         }
 
-        // `gh pr view` resolves the PR for the current branch, so
-        // `git rev-parse HEAD` gives us the right local rev to compare.
-        // We deliberately use `git` directly here even though the
-        // workspace is jj-managed: jj keeps a real git ref under the
-        // hood (the engine's leases sit on git remotes), and this is
-        // a read-only query.
-        let local_head = match local_head_sha(workspace_path).await {
-            Ok(sha) => sha,
-            Err(err) => {
-                // Couldn't read the local rev — fall back to "fresh"
-                // rather than blocking the worker on a bookkeeping
-                // glitch. The detector test boundary keeps the
-                // caller's contract (Fresh/Stale/None) clean.
-                tracing::debug!(
-                    workspace = %workspace_path.display(),
-                    ?err,
-                    "stale-PR check: could not read local HEAD; assuming fresh",
-                );
-                return Ok(PrStatus::Fresh { url });
-            }
-        };
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(PrStatus::None)
+    }
+}
 
-        if pr_head.is_empty() || local_head.eq_ignore_ascii_case(&pr_head) {
-            Ok(PrStatus::Fresh { url })
-        } else {
-            Ok(PrStatus::Stale {
-                url,
-                reason: format!(
-                    "local HEAD {local} is ahead of PR head {pr}",
-                    local = short_sha(&local_head),
-                    pr = short_sha(&pr_head),
-                ),
-            })
+/// Single PR row returned from `gh api repos/{owner}/{repo}/commits/{sha}/pulls`.
+#[derive(Debug, Clone)]
+struct ApiPr {
+    url: String,
+    state: String,
+    merged_at: Option<String>,
+    head_sha: String,
+}
+
+fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
+    if pr.merged_at.is_some() {
+        return PrStatus::Merged { url: pr.url };
+    }
+    if pr.state.eq_ignore_ascii_case("closed") {
+        return PrStatus::Closed { url: pr.url };
+    }
+    let head_match = local_shas
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&pr.head_sha));
+    if head_match {
+        PrStatus::Fresh { url: pr.url }
+    } else {
+        PrStatus::Stale {
+            url: pr.url,
+            reason: format!(
+                "local commits do not match PR head {pr_head}",
+                pr_head = short_sha(&pr.head_sha),
+            ),
         }
     }
 }
 
-/// Read `git rev-parse HEAD` from `workspace_path`. Errors propagate;
-/// the caller decides whether to treat that as "fresh" or surface it.
-async fn local_head_sha(workspace_path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+/// `jj log -r '@ | @-' --no-graph -T 'commit_id ++ "\n"'` — read the
+/// worker's working-copy commit and its parent. The two-rev fallback
+/// covers the two normal end-states for a worker run:
+///   - they did `jj squash` and the work lives on `@-` (with `@`
+///     left as an empty change), or
+///   - they edited `@` directly so the work lives there.
+/// Either way, querying both shas catches the PR.
+async fn jj_candidate_commit_shas(workspace_path: &Path) -> Result<Vec<String>> {
+    let output = Command::new("jj")
+        .args([
+            "log",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-r",
+            "@ | @-",
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ])
         .current_dir(workspace_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -210,18 +248,110 @@ async fn local_head_sha(workspace_path: &Path) -> Result<String> {
         .await
         .with_context(|| {
             format!(
-                "failed to spawn `git rev-parse HEAD` in {}",
+                "failed to spawn `jj log` in {}",
                 workspace_path.display()
             )
         })?;
     if !output.status.success() {
         return Err(anyhow!(
-            "`git rev-parse HEAD` failed in {}: {}",
+            "`jj log` failed in {}: {}",
             workspace_path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `gh api repos/{owner}/{repo}/commits/{sha}/pulls` — return the
+/// first PR associated with `sha`, or `Ok(None)` if there isn't one.
+/// `Err(_)` is reserved for tool / network failures.
+async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>> {
+    let endpoint = format!("repos/{repo_slug}/commits/{sha}/pulls");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // "")] | @tsv"#,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
+    if !output.status.success() {
+        let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        // 422 is what GitHub returns for "no commit found" on this
+        // endpoint when the sha isn't in the repo (e.g. the worker
+        // never pushed). Treat as "no PR" rather than an error so
+        // the caller's idle-vs-completed branch stays clean.
+        if stderr_lower.contains("404")
+            || stderr_lower.contains("422")
+            || stderr_lower.contains("not found")
+        {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "`gh api {endpoint}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = trimmed.split('\t');
+    let url = parts.next().unwrap_or("").trim().to_owned();
+    let state = parts.next().unwrap_or("").trim().to_owned();
+    let merged_at_raw = parts.next().unwrap_or("").trim();
+    let head_sha = parts.next().unwrap_or("").trim().to_owned();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(merged_at_raw.to_owned())
+    };
+    Ok(Some(ApiPr {
+        url,
+        state,
+        merged_at,
+        head_sha,
+    }))
+}
+
+/// Pull `owner/repo` out of a remote URL. Handles both SSH
+/// (`git@github.com:owner/repo.git`) and HTTPS
+/// (`https://github.com/owner/repo[.git]`) shapes.
+pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
+    let trimmed = remote_url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let (_, after_host) = trimmed
+        .split_once("github.com")
+        .ok_or_else(|| anyhow!("not a github.com URL: {remote_url}"))?;
+    let after_host = after_host.trim_start_matches([':', '/']);
+    let mut slash_iter = after_host.splitn(3, '/');
+    let owner = slash_iter
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("missing owner segment: {remote_url}"))?;
+    let repo = slash_iter
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("missing repo segment: {remote_url}"))?;
+    Ok(format!("{owner}/{repo}"))
 }
 
 fn short_sha(sha: &str) -> String {
@@ -313,7 +443,11 @@ impl WorkerCompletionHandler {
             }
         };
 
-        let pr_status = match self.pr_detector.detect_pr(&workspace_path).await {
+        let pr_status = match self
+            .pr_detector
+            .detect_pr(&workspace_path, &execution.repo_remote_url)
+            .await
+        {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(
@@ -329,12 +463,12 @@ impl WorkerCompletionHandler {
             }
         };
 
-        let pr_url = match pr_status {
-            PrStatus::None => {
+        let (pr_url, target) = match pr_status {
+            PrStatus::None | PrStatus::Closed { .. } => {
                 tracing::info!(
                     execution_id,
                     workspace = %workspace_path.display(),
-                    "stop event: worker idle without a PR — probing to push and open one"
+                    "stop event: worker idle without an active PR — probing to push and open one"
                 );
                 self.publish_awaiting_pr(&execution).await;
                 self.probe_queuer
@@ -354,13 +488,16 @@ impl WorkerCompletionHandler {
                     .queue_probe(execution_id, PROBE_STALE_PR);
                 return StopOutcome::StalePr { pr_url: url, reason };
             }
-            PrStatus::Fresh { url } => url,
+            PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
+            PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
+        let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
         let completion = match self.work_db.record_worker_pr_completion(
             execution_id,
             &pr_url,
             None,
+            target,
         ) {
             Ok(Some(completion)) => completion,
             Ok(None) => {
@@ -396,25 +533,39 @@ impl WorkerCompletionHandler {
 
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
+        let publish_reason = if merged {
+            "worker_pr_merged"
+        } else {
+            "worker_pr_completed"
+        };
         self.publisher
             .publish(
                 &completion.execution.id,
                 &completion.execution.work_item_id,
                 &completion.execution.status,
-                "worker_pr_completed",
+                publish_reason,
             )
             .await;
         self.publisher
-            .publish_work_item_changed(&product_id, &work_item_id, "worker_pr_completed")
+            .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
             .await;
-        tracing::info!(
-            execution_id,
-            work_item_id = %work_item_id,
-            pr_url = %pr_url,
-            "stop event: worker PR detected; moved work item to in_review"
-        );
-
-        StopOutcome::PrDetected { pr_url }
+        if merged {
+            tracing::info!(
+                execution_id,
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                "stop event: worker PR already merged; moved work item to done"
+            );
+            StopOutcome::PrMerged { pr_url }
+        } else {
+            tracing::info!(
+                execution_id,
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                "stop event: worker PR detected; moved work item to in_review"
+            );
+            StopOutcome::PrDetected { pr_url }
+        }
     }
 
     /// Force-release the resources backing `execution_id`: tear down
@@ -527,6 +678,9 @@ pub enum StopOutcome {
     AwaitingInput,
     /// PR detected; work item moved to `in_review` and execution finalised.
     PrDetected { pr_url: String },
+    /// PR detected and already merged at Stop time; work item moved
+    /// straight to `done` and execution finalised.
+    PrMerged { pr_url: String },
     /// PR exists but local commits are ahead of its head sha. The
     /// worker is probed to push the missing commits; the work item
     /// stays in its current state until the next Stop reports a fresh PR.
@@ -599,7 +753,11 @@ mod tests {
 
     #[async_trait]
     impl PrDetector for StubPrDetector {
-        async fn detect_pr(&self, _workspace_path: &Path) -> Result<PrStatus> {
+        async fn detect_pr(
+            &self,
+            _workspace_path: &Path,
+            _repo_remote_url: &str,
+        ) -> Result<PrStatus> {
             let guard = self.result.lock().await;
             match &*guard {
                 Ok(value) => Ok(value.clone()),
@@ -1130,5 +1288,139 @@ mod tests {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn merged_pr_skips_in_review_and_moves_chore_to_done() {
+        // The Stop arrives after the worker pushed AND the PR was
+        // merged (e.g. fast-merge during the run). The detector
+        // reports `Merged`; the chore must move directly to `done`
+        // instead of `in_review`, the cube lease is released, and
+        // the publish reason is `worker_pr_merged` so the frontend
+        // can paint the right activity.
+        let workspace = tempdir().unwrap();
+        let (db, product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok_status(PrStatus::Merged {
+            url: "https://github.com/foo/bar/pull/42".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+        match outcome {
+            StopOutcome::PrMerged { pr_url } => {
+                assert_eq!(pr_url, "https://github.com/foo/bar/pull/42");
+            }
+            other => panic!("expected PrMerged, got {other:?}"),
+        }
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "done", "merged-at-stop must skip in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/foo/bar/pull/42"),
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert!(execution.cube_lease_id.is_none());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "merged-at-stop must still release the cube lease",
+        );
+        let publisher_events = publisher.events.lock().await.clone();
+        assert!(
+            publisher_events
+                .iter()
+                .any(|(_, _, _, reason)| reason == "worker_pr_merged"),
+            "expected worker_pr_merged execution event, got {publisher_events:?}",
+        );
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(p, w, reason)| p == &product_id
+                && w == &chore_id
+                && reason == "worker_pr_merged"),
+            "expected work-item invalidation tagged worker_pr_merged, got {work_events:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "merged-at-stop must NOT queue a probe — the worker is done",
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_unmerged_pr_treated_as_no_pr() {
+        // PR was closed without merging — work shouldn't advance to
+        // `in_review` or `done`. Behave like the no-PR case so the
+        // worker is asked to confirm what they want.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok_status(PrStatus::Closed {
+            url: "https://github.com/foo/bar/pull/9".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput);
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(cube.release_calls.lock().await.is_empty());
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    #[test]
+    fn parse_repo_slug_handles_ssh_https_and_trailing_dotgit() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:spinyfin/mono.git").unwrap(),
+            "spinyfin/mono",
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/spinyfin/mono.git").unwrap(),
+            "spinyfin/mono",
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/spinyfin/mono").unwrap(),
+            "spinyfin/mono",
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/spinyfin/mono/").unwrap(),
+            "spinyfin/mono",
+        );
+        // Anything not on github.com is rejected — we don't have a
+        // generic resolver for self-hosted GitHub Enterprise yet, so
+        // surfacing an explicit error keeps the failure mode obvious.
+        assert!(parse_repo_slug("git@gitlab.com:foo/bar.git").is_err());
+        assert!(parse_repo_slug("https://github.com/spinyfin").is_err());
     }
 }
