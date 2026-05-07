@@ -29,6 +29,14 @@ use std::path::{Path, PathBuf};
 /// allowlisted tools) lives in higher layers and is rendered separately.
 #[derive(Debug, Clone)]
 pub struct WorkerSetupInput {
+    /// Run id this spawn corresponds to. Baked into the hook command
+    /// in `settings.json` as a `BOSS_RUN_ID=<run_id>` inline-assignment
+    /// prefix so the `boss-event` shim always sees it on stdin's env,
+    /// regardless of whether claude propagates the worker pane's env
+    /// to its hook subprocess. The shim splices this into every hook
+    /// payload as `_boss_run_id`, which is how the engine correlates
+    /// hook events to live-worker-state slots.
+    pub run_id: String,
     /// Cube lease id for this worker. Surfaced to claude via the
     /// `BOSS_LEASE_ID` env var (set elsewhere); referenced in CLAUDE.md
     /// so a confused worker can describe its own lease.
@@ -122,10 +130,20 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 }
 
 fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
+    // Inline-prefix all three env vars the shim needs. `BOSS_RUN_ID`
+    // is the load-bearing one for live-worker-state correlation: if
+    // it's missing from the shim's env, the splice that adds
+    // `_boss_run_id` to the payload silently fails and the engine
+    // drops the hook event, pinning the worker's activity at
+    // `Spawning`. Setting it here (rather than relying on env
+    // inheritance from the worker pane through claude into the hook
+    // subprocess) guarantees the shim sees it regardless of how
+    // claude handles env propagation.
     let command = format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} {shim}",
+        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} {shim}",
         socket = shell_escape(&input.events_socket_path.display().to_string()),
         lease = shell_escape(&input.lease_id),
+        run_id = shell_escape(&input.run_id),
         shim = shell_escape(&input.boss_event_path.display().to_string()),
     );
 
@@ -207,6 +225,7 @@ mod tests {
 
     fn sample_input() -> WorkerSetupInput {
         WorkerSetupInput {
+            run_id: "run-sample".into(),
             lease_id: "lease-uuid-abc".into(),
             workspace_path: PathBuf::from("/Users/brianduff/Documents/dev/workspaces/mono-agent-007"),
             events_socket_path: PathBuf::from(
@@ -278,6 +297,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_json_inlines_run_id_into_every_hook_command() {
+        // BOSS_RUN_ID must be inline-prefixed on every hook command so
+        // the `boss-event` shim can splice `_boss_run_id` into the
+        // payload regardless of whether claude propagates env from the
+        // worker pane to its hook subprocess. Without this, the engine
+        // can't correlate hook events to runs and the live worker
+        // state stays pinned at `Spawning` for the worker's lifetime.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        for hook_name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SessionEnd",
+        ] {
+            let command = parsed["hooks"][hook_name][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing command for {hook_name}"));
+            assert!(
+                command.contains("BOSS_RUN_ID='run-sample'"),
+                "{hook_name} command missing BOSS_RUN_ID=<run_id>: {command}",
+            );
+        }
+    }
+
+    #[test]
     fn shell_escape_quotes_paths_with_spaces() {
         let input = sample_input();
         let parsed: serde_json::Value =
@@ -303,6 +352,7 @@ mod tests {
     fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
         let dir = TempDir::new().unwrap();
         let input = WorkerSetupInput {
+            run_id: "run-1".into(),
             lease_id: "test-lease".into(),
             workspace_path: dir.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
@@ -357,6 +407,7 @@ mod tests {
         std::fs::write(claude_dir.join("CLAUDE.md"), "stale content").unwrap();
 
         let input = WorkerSetupInput {
+            run_id: "run-overwrite".into(),
             lease_id: "new-lease".into(),
             workspace_path: dir.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
