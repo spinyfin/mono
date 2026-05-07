@@ -108,6 +108,15 @@ final class GhosttyTerminalHostView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    // Isolated to MainActor so Swift 6.3 strict concurrency lets us
+    // touch `pendingGeometrySync` (a non-Sendable `DispatchWorkItem?`)
+    // from deinit. The host view is always created and torn down on
+    // the main thread (NSView lifecycle), so MainActor isolation is
+    // accurate, not just convenient. Without this annotation Swift
+    // 6.3 errors with "cannot access property 'pendingGeometrySync'
+    // with a non-Sendable type 'DispatchWorkItem?' from nonisolated
+    // deinit" — the build break PR #215 left on main.
+    @MainActor
     deinit {
         pendingGeometrySync?.cancel()
     }
