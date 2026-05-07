@@ -1986,4 +1986,79 @@ mod tests {
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
     }
+
+    /// Regression coverage for PR #228. Default-sized pool
+    /// (`MAX_WORKER_POOL_SIZE` = 8) must dispatch all five chores when
+    /// they autostart back-to-back — the original bug was a pool that
+    /// silently capped at 1 (and an earlier-still incarnation that
+    /// capped at 4), so `kick()` broke out of `run_scheduler` after
+    /// claiming the first few workers and the rest stayed `ready`.
+    /// This test would have caught that: it asserts every one of the
+    /// five executions reaches `running`, and that the pool consumed
+    /// five distinct worker slots (so dispatch fanned out into the
+    /// 5..=8 range that the original bug had unreachable).
+    #[tokio::test]
+    async fn default_pool_dispatches_five_concurrent_autostart_chores() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // Five autostart chores — the same shape `boss chore create`
+        // produces when `--no-autostart` is omitted. Reconcile then
+        // promotes each to a `ready` execution row.
+        for index in 0..5 {
+            db.create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: format!("Chore {index}"),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Use the default pool size so this test pins the contract
+        // `WorkConfig::load_from_env` exposes to production.
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAX_WORKER_POOL_SIZE),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+
+        for _ in 0..200 {
+            let executions = db.list_executions(None).unwrap();
+            if executions
+                .iter()
+                .filter(|execution| execution.status == "running")
+                .count()
+                == 5
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let executions = db.list_executions(None).unwrap();
+        let running = executions
+            .iter()
+            .filter(|execution| execution.status == "running")
+            .count();
+        assert_eq!(
+            running, 5,
+            "expected all 5 autostart chores to be dispatched concurrently, got {running} running",
+        );
+        assert_eq!(coordinator.worker_pool().idle_count().await, 3);
+    }
 }
