@@ -632,21 +632,6 @@ struct ContentView: View {
                     .clipShape(Capsule())
             }
 
-            if column == .backlog {
-                HStack(spacing: 8) {
-                    Button("New Task") {
-                        model.presentCreateTask()
-                    }
-                    .disabled(model.selectedProject == nil || !model.isConnected)
-
-                    Button("New Chore") {
-                        model.presentCreateChore()
-                    }
-                    .disabled(model.selectedProduct == nil || !model.isConnected)
-                }
-                .font(.caption)
-            }
-
             Divider()
 
             if itemCount == 0 {
