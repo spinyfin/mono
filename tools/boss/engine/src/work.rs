@@ -1321,8 +1321,12 @@ impl WorkDb {
 
     /// Record that a worker produced a PR for `execution_id`. In a single
     /// transaction:
-    ///   - the linked task/chore moves to `in_review` and gets `pr_url`
-    ///     populated (no-ops if it's already in a terminal state),
+    ///   - the linked task/chore moves to the column dictated by
+    ///     `target` (`in_review` for an open PR, `done` for a PR that
+    ///     was already merged at Stop time) and gets `pr_url`
+    ///     populated. If the task is already past the target column
+    ///     (`done`, `archived`), its status is left alone — the
+    ///     `pr_url` update still applies.
     ///   - the execution transitions from `waiting_human` (or `running`)
     ///     to `completed`, the cube workspace lease columns are
     ///     cleared, `finished_at` is stamped,
@@ -1337,6 +1341,7 @@ impl WorkDb {
         execution_id: &str,
         pr_url: &str,
         result_summary: Option<&str>,
+        target: WorkerPrCompletionTarget,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1363,12 +1368,16 @@ impl WorkDb {
         }
 
         let now = now_string();
-        let task_already_review =
-            task.status == "in_review" || task.status == "done" || task.status == "archived";
-        let new_status = if task_already_review {
-            task.status.clone()
-        } else {
-            "in_review".to_owned()
+        // Compute the new status. The chore can only advance — if it
+        // is already past the target column (`done` / `archived`), we
+        // keep the existing status.
+        let new_status = match target {
+            _ if task.status == "done" || task.status == "archived" => task.status.clone(),
+            WorkerPrCompletionTarget::InReview if task.status == "in_review" => {
+                task.status.clone()
+            }
+            WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
+            WorkerPrCompletionTarget::Done => "done".to_owned(),
         };
         tx.execute(
             "UPDATE tasks
@@ -1425,6 +1434,68 @@ impl WorkDb {
         }))
     }
 
+    /// Chores currently in `in_review` whose `pr_url` is set. The
+    /// merge poller iterates this list, asks GitHub whether each PR
+    /// is merged, and calls [`mark_chore_pr_merged`] for the ones
+    /// that are.
+    pub fn list_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, pr_url
+             FROM tasks
+             WHERE kind = 'chore'
+               AND status = 'in_review'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+             ORDER BY updated_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingMergeCheck {
+                work_item_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Move the chore identified by `work_item_id` from `in_review`
+    /// to `done`, recording `pr_url` (no-op if it was already set to
+    /// the same value). Returns the updated task if a transition
+    /// happened; `Ok(None)` if the chore was already past `in_review`
+    /// (idempotent for late-arriving merge events).
+    pub fn mark_chore_pr_merged(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let Some(task) = query_task(&tx, work_item_id)? else {
+            return Ok(None);
+        };
+        if task.deleted_at.is_some() {
+            return Ok(None);
+        }
+        if task.status == "done" || task.status == "archived" {
+            return Ok(None);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'done',
+                 pr_url = ?2,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![task.id, pr_url, now],
+        )?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after update: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id
     /// — `Some` means the caller is responsible for issuing the cube
@@ -1479,6 +1550,16 @@ impl WorkDb {
     }
 }
 
+/// Where the chore should land after [`WorkDb::record_worker_pr_completion`].
+/// `InReview` is the typical case (open PR, ready for human review);
+/// `Done` is used when the PR was already merged at the time the
+/// worker's Stop event fired, so we skip the review column entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPrCompletionTarget {
+    InReview,
+    Done,
+}
+
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
 /// Carries the cube lease/workspace ids that were attached to the
 /// execution so the caller can drive cube release out-of-band.
@@ -1488,6 +1569,15 @@ pub struct WorkerPrCompletion {
     pub work_item: WorkItem,
     pub released_lease_id: Option<String>,
     pub released_workspace_id: Option<String>,
+}
+
+/// One row from [`WorkDb::list_chores_pending_merge_check`]: a chore
+/// the merge poller still needs to ask GitHub about.
+#[derive(Debug, Clone)]
+pub struct PendingMergeCheck {
+    pub work_item_id: String,
+    pub product_id: String,
+    pub pr_url: String,
 }
 
 fn collect_rows<T>(

@@ -17,6 +17,7 @@ use crate::completion::{
 use crate::config::RuntimeConfig;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
@@ -321,6 +322,12 @@ struct ServerState {
     /// don't otherwise go through the execution coordinator (e.g.
     /// `WorkspacePoolSummary`).
     cube_client: Arc<dyn CubeClient>,
+    /// Shared event publisher. The execution coordinator and
+    /// completion handler each hold their own `Arc` clones; this
+    /// field exists so background tasks spawned out of `Self::new`
+    /// (the merge poller, etc.) can publish work-item invalidations
+    /// without standing up a second broker.
+    publisher: Arc<dyn ExecutionPublisher>,
     topic_broker: Arc<TopicBroker>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
@@ -458,6 +465,7 @@ impl ServerState {
         ));
         let runner_for_coordinator = pane_runner.clone();
         let cube_client_for_state = cube_client.clone();
+        let publisher_for_state = publisher.clone();
 
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
@@ -474,6 +482,7 @@ impl ServerState {
                 execution_coordinator,
                 completion_handler,
                 cube_client: cube_client_for_state,
+                publisher: publisher_for_state,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
@@ -1342,6 +1351,22 @@ pub async fn serve(
             tracing::error!(?err, "active-dispatch reconcile failed; continuing");
         }
     }
+
+    // Spawn the merge-detection poller. Workers can land their PRs
+    // long after their Stop event has fired (and lease has been
+    // released), so the on-Stop completion path can't catch every
+    // merge. The poller fills that gap by periodically asking GitHub
+    // about every chore that's currently in_review with a pr_url and
+    // promoting the merged ones to `done`. Polling cadence is
+    // deliberately conservative — chores rarely sit in review for
+    // long, and we don't want to spam `gh` from the engine process.
+    let merge_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
+    let _merge_handle = spawn_merge_poller(
+        server_state.work_db.clone(),
+        merge_probe,
+        server_state.publisher.clone(),
+        Duration::from_secs(60),
+    );
 
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();

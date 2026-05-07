@@ -14,6 +14,7 @@ rust_library(
         "src/events_socket.rs",
         "src/lib.rs",
         "src/live_worker_state.rs",
+        "src/merge_poller.rs",
         "src/pane_summary.rs",
         "src/protocol.rs",
         "src/runner.rs",
