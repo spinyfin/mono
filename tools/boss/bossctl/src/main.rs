@@ -353,17 +353,18 @@ async fn probe_run(
         .await
         .context("sending ProbeRun")?;
     match response {
-        FrontendEvent::ProbeQueued { run_id: returned } => {
+        FrontendEvent::ProbeQueued { run_id: returned, probe_id } => {
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "status": "queued",
                         "run_id": returned,
+                        "probe_id": probe_id,
                     })
                 );
             } else {
-                println!("probe queued for run {returned}");
+                println!("probe queued for run {returned} (probe_id={probe_id})");
             }
             Ok(())
         }

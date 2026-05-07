@@ -491,6 +491,42 @@ async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
 }
 
 #[tokio::test]
+async fn probe_run_returns_unique_probe_ids() -> Result<()> {
+    // Wire-shape smoke: `ProbeRun` must surface the engine-minted
+    // `probe_id` so callers can correlate the queued probe with the
+    // eventual `ProbeReplied` push (deeper end-to-end coverage of
+    // that flow lives in the `dispatch_probe_reply_emits_…` unit
+    // test). Two back-to-back probes for the same run must mint
+    // distinct ids.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let first = client
+        .send_request(&FrontendRequest::ProbeRun {
+            run_id: "run-xyz".to_owned(),
+            text: "first".to_owned(),
+        })
+        .await?;
+    let second = client
+        .send_request(&FrontendRequest::ProbeRun {
+            run_id: "run-xyz".to_owned(),
+            text: "second".to_owned(),
+        })
+        .await?;
+    let id_first = match first {
+        FrontendEvent::ProbeQueued { probe_id, .. } => probe_id,
+        other => return Err(anyhow!("unexpected response to first probe: {other:?}")),
+    };
+    let id_second = match second {
+        FrontendEvent::ProbeQueued { probe_id, .. } => probe_id,
+        other => return Err(anyhow!("unexpected response to second probe: {other:?}")),
+    };
+    assert!(!id_first.is_empty(), "probe_id must be populated");
+    assert!(!id_second.is_empty(), "probe_id must be populated");
+    assert_ne!(id_first, id_second, "back-to-back probes must mint distinct ids");
+    Ok(())
+}
+
+#[tokio::test]
 async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // `bossctl agents transcript` shares the BossOnly→AppOrBoss
     // downgrade with `bossctl probe` and `bossctl agents stop`. This

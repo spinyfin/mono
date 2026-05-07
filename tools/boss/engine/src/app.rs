@@ -26,7 +26,7 @@ use crate::protocol::{
     FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
     FrontendRequestEnvelope, InterruptWorkerPaneInput, ReleaseWorkerPaneInput, SendToPaneInput,
     TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
-    work_product_topic,
+    probe_topic, work_product_topic,
 };
 use crate::runner::AcpExecutionRunner;
 use crate::work::{Task, WorkDb, WorkItem};
@@ -170,8 +170,38 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             tracing::debug!(run_id, "probe queuer: server state already dropped");
             return;
         };
-        server.queue_probe(run_id.to_owned(), text.to_owned());
+        // Completion-driven probes don't need the minted id — only
+        // the human-driven `ProbeRun` RPC surfaces it back to the
+        // caller. Discard it here.
+        let _ = server.queue_probe(run_id.to_owned(), text.to_owned());
     }
+}
+
+/// One queued probe that has not yet been dispatched into the worker.
+#[derive(Debug, Clone)]
+struct PendingProbe {
+    probe_id: String,
+    text: String,
+}
+
+/// One probe that has been written into the worker's pane and is
+/// waiting for the next `Stop` boundary so we can emit
+/// `FrontendEvent::ProbeReplied` with the assistant turn that
+/// landed in the transcript afterwards.
+#[derive(Debug, Clone)]
+struct InFlightProbe {
+    probe_id: String,
+    /// Transcript path captured at dispatch time. Stashing it here
+    /// (rather than re-querying `WorkRun` on the follow-up Stop)
+    /// keeps reply extraction tied to the file the worker was
+    /// actually writing when the probe landed, even if the run row
+    /// is later updated to point elsewhere.
+    transcript_path: Option<String>,
+    /// Bytes-on-disk size of the transcript at dispatch time. The
+    /// follow-up Stop reads `[offset_bytes..len]` and parses each
+    /// new JSONL line — anything earlier already pre-dated the probe
+    /// and isn't part of the reply.
+    offset_bytes: u64,
 }
 
 struct PidFileGuard {
@@ -349,10 +379,25 @@ struct ServerState {
     /// includes this pid as an ancestor is treated as the Boss tier
     /// for RPC authorization.
     boss_pid: StdMutex<Option<libc::pid_t>>,
-    /// Pending probe text per run, FIFO. The events-socket consumer
-    /// pops one entry per `Stop` hook event for the matching run and
-    /// dispatches it as `SendToPane` to the app.
-    pending_probes: StdMutex<HashMap<String, VecDeque<String>>>,
+    /// Pending probes per run, FIFO. Each entry is the engine-minted
+    /// `probe_id` paired with the verbatim text the caller queued.
+    /// The events-socket consumer pops one entry per `Stop` hook event
+    /// for the matching run and dispatches it as `SendToPane` to the
+    /// app.
+    pending_probes: StdMutex<HashMap<String, VecDeque<PendingProbe>>>,
+    /// Probes that have been dispatched into a worker pane and are
+    /// awaiting the *next* `Stop` boundary so the engine can extract
+    /// the worker's reply from its transcript and emit
+    /// `FrontendEvent::ProbeReplied`. One entry per run at most — the
+    /// next Stop after dispatch consumes it. The transcript byte
+    /// offset captured at dispatch time bounds the read, so we don't
+    /// re-emit text that pre-dated the probe.
+    in_flight_probes: StdMutex<HashMap<String, InFlightProbe>>,
+    /// Monotonic counter used to mint probe ids (`probe-{n}`). Probe
+    /// ids only need to be unique for the lifetime of one engine
+    /// process — they correlate a `ProbeRun` request with its
+    /// follow-up `ProbeReplied` push, and clients don't persist them.
+    next_probe_id: AtomicU64,
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
@@ -550,6 +595,8 @@ impl ServerState {
                 app_pid,
                 boss_pid: StdMutex::new(None),
                 pending_probes: StdMutex::new(HashMap::new()),
+                in_flight_probes: StdMutex::new(HashMap::new()),
+                next_probe_id: AtomicU64::new(1),
                 app_session: Arc::new(Mutex::new(None)),
                 spawn_pane_lock: Arc::new(Mutex::new(())),
                 _self_weak: weak_self.clone(),
@@ -810,31 +857,97 @@ impl ServerState {
         *self.boss_pid.lock().expect("boss_pid mutex poisoned")
     }
 
-    /// Push probe text onto the FIFO for `run_id`. Multiple probes for
-    /// the same run queue in order; the events-socket consumer pops
-    /// one per `Stop` hook event.
-    pub fn queue_probe(&self, run_id: String, text: String) {
+    /// Push probe text onto the FIFO for `run_id`, mint a fresh
+    /// `probe_id`, and return it so the caller can correlate the
+    /// queued probe with the eventual `FrontendEvent::ProbeReplied`
+    /// push. Multiple probes for the same run queue in order; the
+    /// events-socket consumer pops one per `Stop` hook event.
+    pub fn queue_probe(&self, run_id: String, text: String) -> String {
+        let probe_id = self.allocate_probe_id();
         self.pending_probes
             .lock()
             .expect("pending_probes mutex poisoned")
             .entry(run_id)
             .or_default()
-            .push_back(text);
+            .push_back(PendingProbe {
+                probe_id: probe_id.clone(),
+                text,
+            });
+        probe_id
+    }
+
+    /// Push a pre-minted `PendingProbe` back onto the front of the
+    /// queue for `run_id`. Used when `SendToPane` fails after we've
+    /// already popped the probe — the next Stop will retry, and the
+    /// caller's `probe_id` stays stable across the retry.
+    fn requeue_probe_front(&self, run_id: String, probe: PendingProbe) {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .entry(run_id)
+            .or_default()
+            .push_front(probe);
+    }
+
+    fn allocate_probe_id(&self) -> String {
+        format!(
+            "probe-{}",
+            self.next_probe_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// Pop the next pending probe for `run_id`, if any. Called from
     /// the events-socket consumer when a `Stop` event arrives.
-    pub fn pop_pending_probe(&self, run_id: &str) -> Option<String> {
+    fn pop_pending_probe(&self, run_id: &str) -> Option<PendingProbe> {
         let mut guard = self
             .pending_probes
             .lock()
             .expect("pending_probes mutex poisoned");
         let queue = guard.get_mut(run_id)?;
-        let text = queue.pop_front();
+        let probe = queue.pop_front();
         if queue.is_empty() {
             guard.remove(run_id);
         }
-        text
+        probe
+    }
+
+    /// Note that `probe_id` was just dispatched into the worker's
+    /// pane for `run_id`. The next `Stop` boundary on this run will
+    /// look for an in-flight entry, read the transcript bytes
+    /// written after `offset_bytes`, and emit
+    /// `FrontendEvent::ProbeReplied`. Any prior in-flight probe for
+    /// the same run is overwritten — we only track one outstanding
+    /// reply at a time per run, since dispatch is serialized on
+    /// `Stop` events.
+    fn note_probe_dispatched(
+        &self,
+        run_id: String,
+        probe_id: String,
+        transcript_path: Option<String>,
+        offset_bytes: u64,
+    ) {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .insert(
+                run_id,
+                InFlightProbe {
+                    probe_id,
+                    transcript_path,
+                    offset_bytes,
+                },
+            );
+    }
+
+    /// Take and return the in-flight probe for `run_id`, if any.
+    /// Idempotent on the second pop: a duplicate Stop firing for
+    /// the same run gets `None` and the engine emits no second
+    /// `ProbeReplied` for the same probe id.
+    fn take_in_flight_probe(&self, run_id: &str) -> Option<InFlightProbe> {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .remove(run_id)
     }
 
     /// Authorize a peer-pid against an RPC tier. Walks up the peer's
@@ -1586,6 +1699,14 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 "events socket: hook event received",
                             );
                             dispatch_live_worker_state(&server_state, &incoming).await;
+                            // ProbeReplied runs *before* dispatch so a
+                            // single Stop never both fires the reply
+                            // for the prior probe and the dispatch of
+                            // the next one — without the ordering, the
+                            // probe-just-dispatched would be picked up
+                            // for emission immediately, with no reply
+                            // text actually written yet.
+                            dispatch_probe_reply_on_stop(&server_state, &incoming).await;
                             dispatch_probe_on_stop(&server_state, &incoming).await;
                             dispatch_completion_on_stop(&server_state, &incoming).await;
                         }
@@ -1629,7 +1750,10 @@ async fn dispatch_live_worker_state(
 /// On `Stop` hook events, pop a pending probe for the run (if any)
 /// and `SendToPane` the text to the worker's slot. The injection
 /// arrives at the pane just as the worker becomes idle, so claude
-/// treats it as the next user prompt.
+/// treats it as the next user prompt. After a successful dispatch,
+/// records an in-flight entry (with the transcript path and current
+/// byte offset) so `dispatch_probe_reply_on_stop` can emit the
+/// matching `FrontendEvent::ProbeReplied` when the next Stop lands.
 async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -1641,7 +1765,7 @@ async fn dispatch_probe_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    let Some(text) = server_state.pop_pending_probe(run_id) else {
+    let Some(probe) = server_state.pop_pending_probe(run_id) else {
         return;
     };
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
@@ -1651,28 +1775,227 @@ async fn dispatch_probe_on_stop(
         );
         return;
     };
+    // Capture the transcript path + current byte length *before* the
+    // dispatch round-trip so we don't accidentally include any
+    // assistant content the worker happened to flush while we were
+    // still in this code path.
+    let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
     let request = EngineToAppRequest::SendToPane(SendToPaneInput {
         slot_id,
-        text: text.clone(),
+        text: probe.text.clone(),
     });
     match server_state
         .send_to_app(request, Duration::from_secs(5))
         .await
     {
         Ok(_) => {
-            tracing::info!(run_id, slot_id, "probe injected into pane");
+            tracing::info!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "probe injected into pane",
+            );
+            server_state.note_probe_dispatched(
+                run_id.to_owned(),
+                probe.probe_id,
+                transcript_path,
+                offset_bytes,
+            );
         }
         Err(err) => {
             tracing::warn!(
                 ?err,
                 run_id,
                 slot_id,
+                probe_id = %probe.probe_id,
                 "probe injection failed; pushing text back onto queue",
             );
-            // Push back on the front so the next Stop retries.
-            server_state.queue_probe(run_id.to_owned(), text);
+            // Push back on the front so the next Stop retries with
+            // the same probe id — callers waiting on the matching
+            // `ProbeReplied` event must not see their id silently
+            // reissued.
+            server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
+}
+
+/// Look up the transcript path the run is currently writing to (via
+/// `WorkRun`), and stat its current byte size so we can use that as
+/// the lower bound for the next reply-extraction read. Returns
+/// `(None, 0)` when the run has no transcript path recorded yet —
+/// the in-flight bookkeeping still tracks the dispatched probe, but
+/// `dispatch_probe_reply_on_stop` will skip emission with a warning
+/// rather than fabricate empty reply text.
+async fn transcript_offset_for_run(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+) -> (Option<String>, u64) {
+    let path = match server_state.work_db.get_run(run_id) {
+        Ok(run) => run.transcript_path,
+        Err(err) => {
+            tracing::debug!(
+                run_id,
+                ?err,
+                "transcript path lookup failed for probe dispatch",
+            );
+            None
+        }
+    };
+    let Some(path_str) = path else {
+        return (None, 0);
+    };
+    let offset = match tokio::fs::metadata(&path_str).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            tracing::warn!(
+                run_id,
+                path = %path_str,
+                ?err,
+                "failed to stat transcript at probe dispatch; treating offset as 0",
+            );
+            0
+        }
+    };
+    (Some(path_str), offset)
+}
+
+/// On the `Stop` boundary that follows a probe dispatch, take the
+/// in-flight entry for `run_id`, read transcript bytes written since
+/// dispatch, and emit `FrontendEvent::ProbeReplied` on the per-run
+/// probe topic. Idempotent: a duplicate Stop with no in-flight
+/// probe is a no-op, so observers never see the same `probe_id`
+/// reported twice.
+async fn dispatch_probe_reply_on_stop(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::WorkerEvent;
+    let WorkerEvent::Stop { .. } = incoming.event else {
+        return;
+    };
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    let Some(in_flight) = server_state.take_in_flight_probe(run_id) else {
+        return;
+    };
+    let Some(transcript_path) = in_flight.transcript_path.as_deref() else {
+        tracing::warn!(
+            run_id,
+            probe_id = %in_flight.probe_id,
+            "probe reply skipped: no transcript path was recorded at dispatch",
+        );
+        return;
+    };
+    let text = match read_assistant_reply(transcript_path, in_flight.offset_bytes).await {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            tracing::warn!(
+                run_id,
+                probe_id = %in_flight.probe_id,
+                transcript_path,
+                "probe reply skipped: transcript had no assistant turn after dispatch offset",
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                run_id,
+                probe_id = %in_flight.probe_id,
+                transcript_path,
+                ?err,
+                "probe reply skipped: transcript read failed",
+            );
+            return;
+        }
+    };
+    let envelope = FrontendEventEnvelope::push(FrontendEvent::ProbeReplied {
+        run_id: run_id.to_owned(),
+        probe_id: in_flight.probe_id.clone(),
+        text,
+    });
+    server_state
+        .topic_broker
+        .publish(&probe_topic(run_id), envelope)
+        .await;
+    tracing::info!(
+        run_id,
+        probe_id = %in_flight.probe_id,
+        "probe reply emitted",
+    );
+}
+
+/// Read transcript bytes from `offset_bytes` to the end of the file
+/// at `transcript_path`, parse each new JSONL line, and return the
+/// last assistant-turn text found. Returns `Ok(None)` when no
+/// assistant turn appears in the new region (e.g. the worker
+/// errored out before producing one).
+async fn read_assistant_reply(
+    transcript_path: &str,
+    offset_bytes: u64,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    let mut file = tokio::fs::File::open(transcript_path).await?;
+    let metadata = file.metadata().await?;
+    if metadata.len() <= offset_bytes {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(offset_bytes)).await?;
+    let mut buf = Vec::with_capacity((metadata.len() - offset_bytes) as usize);
+    file.read_to_end(&mut buf).await?;
+    let chunk = match String::from_utf8(buf) {
+        Ok(chunk) => chunk,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transcript bytes are not valid utf-8",
+            ));
+        }
+    };
+    Ok(extract_last_assistant_text(&chunk))
+}
+
+/// Walk JSONL `chunk` and return the most recent assistant turn's
+/// text content, concatenating all `text` blocks inside its message.
+/// Tolerates the two shapes claude transcripts use today —
+/// `message.content[*].text` (current) and `message.text` (older
+/// snapshots) — and skips lines that aren't valid JSON rather than
+/// rejecting the whole chunk.
+fn extract_last_assistant_text(chunk: &str) -> Option<String> {
+    let mut latest: Option<String> = None;
+    for line in chunk.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let mut buf = String::new();
+        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+            for block in content {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    buf.push_str(text);
+                }
+            }
+        }
+        if buf.is_empty() {
+            if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
+                buf.push_str(text);
+            }
+        }
+        if !buf.is_empty() {
+            latest = Some(buf);
+        }
+    }
+    latest
 }
 
 /// On `Stop` hook events, ask the completion handler whether the
@@ -2841,9 +3164,9 @@ async fn handle_frontend_connection(
                     );
                     continue;
                 }
-                server_state.queue_probe(run_id.clone(), text);
-                tracing::info!(run_id = %run_id, "probe queued");
-                send_response(&sink, &request_id, FrontendEvent::ProbeQueued { run_id });
+                let probe_id = server_state.queue_probe(run_id.clone(), text);
+                tracing::info!(run_id = %run_id, probe_id = %probe_id, "probe queued");
+                send_response(&sink, &request_id, FrontendEvent::ProbeQueued { run_id, probe_id });
             }
             FrontendRequest::StopRun { run_id } => {
                 // `bossctl agents stop` is the coordinator superset's
@@ -4704,6 +5027,253 @@ mod tests {
         assert!(
             !server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
             "sanity: AppOrBoss must still reject the same caller, so the User-tier admission isn't an accidental hole",
+        );
+    }
+
+    #[test]
+    fn queue_probe_mints_unique_probe_ids() {
+        let server_state = test_server_state();
+        let id_one = server_state.queue_probe("run-x".into(), "first".into());
+        let id_two = server_state.queue_probe("run-x".into(), "second".into());
+        assert_ne!(id_one, id_two, "probe ids must be unique per call");
+        assert!(id_one.starts_with("probe-"));
+        assert!(id_two.starts_with("probe-"));
+        let popped_one = server_state
+            .pop_pending_probe("run-x")
+            .expect("first probe present");
+        let popped_two = server_state
+            .pop_pending_probe("run-x")
+            .expect("second probe present");
+        assert_eq!(popped_one.probe_id, id_one);
+        assert_eq!(popped_one.text, "first");
+        assert_eq!(popped_two.probe_id, id_two);
+        assert_eq!(popped_two.text, "second");
+        assert!(
+            server_state.pop_pending_probe("run-x").is_none(),
+            "queue must be empty after both probes pop",
+        );
+    }
+
+    #[test]
+    fn extract_last_assistant_text_handles_modern_content_blocks() {
+        let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"prompt"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"alpha "},{"type":"text","text":"beta"}]}}
+{"type":"system","subtype":"ping"}
+"#;
+        let result = extract_last_assistant_text(chunk);
+        assert_eq!(result.as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn extract_last_assistant_text_picks_most_recent_when_multiple() {
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"old"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"new"}]}}
+"#;
+        let result = extract_last_assistant_text(chunk);
+        assert_eq!(result.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn extract_last_assistant_text_returns_none_when_no_assistant_turn() {
+        let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+{"type":"system","subtype":"compact"}
+"#;
+        assert_eq!(extract_last_assistant_text(chunk), None);
+    }
+
+    #[test]
+    fn extract_last_assistant_text_skips_unparseable_lines() {
+        let chunk = "this is not json\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"survived\"}]}}\n";
+        assert_eq!(
+            extract_last_assistant_text(chunk).as_deref(),
+            Some("survived"),
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
+        // End-to-end smoke for the ProbeReplied flow: call queue_probe,
+        // dispatch the probe via the events-socket Stop hook, append an
+        // assistant turn to the transcript, fire the follow-up Stop,
+        // and observe ProbeReplied land on the per-run probe topic.
+        // This locks in the wire shape a `bossctl probe --wait` (or
+        // any other observer) would consume.
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+
+        // Seed: product → chore → execution → run with a real
+        // transcript path on disk. Without the run row the engine's
+        // dispatch can't resolve a transcript path and would skip
+        // emission — that's the production behaviour we want covered.
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript_path = transcript_dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript_path,
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        // Map the run to slot 1 so dispatch_probe_on_stop has a target
+        // for `SendToPane`.
+        server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+
+        // Subscribe a session to the per-run probe topic and pin the
+        // ServerState so probe pushes have somewhere to land.
+        let session_id = "session-probe-observer".to_owned();
+        let sink = make_session_sink();
+        server_state
+            .topic_broker
+            .register_session(&session_id, sink.clone())
+            .await;
+        server_state
+            .topic_broker
+            .subscribe(&session_id, &[probe_topic(&run.id)])
+            .await;
+
+        // Register a fake "app session" to receive the SendToPane that
+        // dispatch_probe_on_stop emits, and reply success to it on a
+        // background task. Without this round-trip the dispatch errors
+        // out, the probe text gets requeued, and no in-flight entry
+        // is recorded.
+        let app_sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), app_sink.clone())
+            .await;
+        let server_for_app = server_state.clone();
+        let app_responder = tokio::spawn(async move {
+            let envelope = app_sink
+                .next()
+                .await
+                .expect("SendToPane EngineRequest should be enqueued");
+            let request_id = match &envelope.payload {
+                FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+                other => panic!("expected EngineRequest, got {other:?}"),
+            };
+            server_for_app
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::SendToPane {
+                        result: Ok(crate::protocol::SendToPaneResult {}),
+                    },
+                )
+                .await;
+        });
+
+        // Queue a probe and pull the minted probe_id back out of the
+        // queue head so we can assert it threads through to ProbeReplied.
+        let probe_id = server_state.queue_probe(run.id.clone(), "what now?".into());
+
+        // Fire the first Stop boundary. This dispatches the probe to
+        // the (fake) app session and records the in-flight entry.
+        let first_stop = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            event: WorkerEvent::Stop {
+                session_id: "claude-sess-1".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            },
+        };
+        dispatch_probe_reply_on_stop(&server_state, &first_stop).await;
+        dispatch_probe_on_stop(&server_state, &first_stop).await;
+        app_responder.await.expect("app responder task");
+
+        // Append an assistant turn — the worker has now "replied".
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript_path)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}",
+            )
+            .unwrap();
+        }
+
+        // Second Stop: the engine should see the in-flight probe,
+        // read the new transcript bytes, and publish ProbeReplied on
+        // the per-run probe topic.
+        let second_stop = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            event: WorkerEvent::Stop {
+                session_id: "claude-sess-1".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            },
+        };
+        dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("ProbeReplied envelope should be published");
+        match envelope.payload {
+            FrontendEvent::ProbeReplied {
+                run_id: emitted_run,
+                probe_id: emitted_probe,
+                text,
+            } => {
+                assert_eq!(emitted_run, run.id);
+                assert_eq!(emitted_probe, probe_id);
+                assert_eq!(text, "the answer");
+            }
+            other => panic!("expected ProbeReplied, got {other:?}"),
+        }
+
+        // Idempotency: a duplicate Stop with no in-flight entry must
+        // not re-emit the same probe id.
+        dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
+        let drain = tokio::time::timeout(Duration::from_millis(50), sink.next()).await;
+        assert!(
+            drain.is_err(),
+            "duplicate Stop must not produce a second ProbeReplied for the same probe id",
         );
     }
 }
