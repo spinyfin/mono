@@ -356,3 +356,99 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
+    // Same regression class as `agents_stop` (PR #218): the BossOnly
+    // gate rejected `bossctl probe` calls from worker-pane shells
+    // because the gate explicitly excludes descendants of any
+    // registered worker pid. The verb is now AppOrBoss — worker
+    // descendants are admitted (workers are siblings under the app).
+    // The macOS unit test `app_or_boss_admits_worker_descendant`
+    // locks in the worker-descendant admission; this test is the
+    // wire-shape smoke that asserts probe is reachable at all.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::ProbeRun {
+            run_id: "run-does-not-exist".to_owned(),
+            text: "ping".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::ProbeQueued { .. } => {}
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            assert!(
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority"),
+                "probe_run must not reject local callers on auth grounds: {message}"
+            );
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result<()> {
+    // `bossctl agents transcript` shares the BossOnly→AppOrBoss
+    // downgrade with `bossctl probe` and `bossctl agents stop`. This
+    // smoke test guards against the verb regressing back to BossOnly
+    // and silently locking the coordinator out of worker transcripts.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::TailRunTranscript {
+            run_id: "run-does-not-exist".to_owned(),
+            lines: 5,
+        })
+        .await?;
+    match response {
+        // Auth passed; the verb went on to fail the run lookup
+        // (expected — we did not seed a run).
+        FrontendEvent::WorkError { .. } => {}
+        FrontendEvent::Error { message, .. } => {
+            assert!(
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority"),
+                "tail_run_transcript must not reject local callers on auth grounds: {message}"
+            );
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
+    // Live-coordinator-session repro: `bossctl workspace summary` was
+    // failing AppOrBoss when invoked from a shell that descended from
+    // neither the app nor the registered Boss session (e.g., a plain
+    // terminal). The verb is read-only and proxies a view that any
+    // local user can already get from `cube workspace list`, so it's
+    // now User-tier. This smoke asserts no auth rejection fires.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::WorkspacePoolSummary)
+        .await?;
+    match response {
+        FrontendEvent::WorkspacePoolSummaryResult { .. } => {}
+        // The in-process engine builds a CommandCubeClient which
+        // shells out; the cube binary may not be on PATH in the
+        // sandbox, so a `WorkError` from the cube layer is acceptable.
+        // What we're guarding against is an `Error` carrying an auth
+        // rejection.
+        FrontendEvent::WorkError { .. } => {}
+        FrontendEvent::Error { message, .. } => {
+            assert!(
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority")
+                    && !message.contains("user-tier check"),
+                "workspace_pool_summary must not reject callers on auth grounds: {message}"
+            );
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
