@@ -12,10 +12,10 @@ use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, FrontendEvent,
-    FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput, Task,
-    TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch,
-    work_product_topic,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
+    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput,
+    Task, TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, work_product_topic,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -641,9 +641,18 @@ async fn list_products(client: &mut BossClient) -> Result<Vec<Product>> {
 }
 
 async fn list_projects(client: &mut BossClient, product_id: &str) -> Result<Vec<Project>> {
+    list_projects_filtered(client, product_id, None).await
+}
+
+async fn list_projects_filtered(
+    client: &mut BossClient,
+    product_id: &str,
+    dep_filter: Option<DependencyFilter>,
+) -> Result<Vec<Project>> {
     match client
         .send_request(&FrontendRequest::ListProjects {
             product_id: product_id.to_owned(),
+            dep_filter,
         })
         .await?
     {
@@ -657,10 +666,20 @@ async fn list_tasks(
     product_id: &str,
     project_id: Option<&str>,
 ) -> Result<Vec<Task>> {
+    list_tasks_filtered(client, product_id, project_id, None).await
+}
+
+async fn list_tasks_filtered(
+    client: &mut BossClient,
+    product_id: &str,
+    project_id: Option<&str>,
+    dep_filter: Option<DependencyFilter>,
+) -> Result<Vec<Task>> {
     match client
         .send_request(&FrontendRequest::ListTasks {
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
+            dep_filter,
         })
         .await?
     {
@@ -670,9 +689,18 @@ async fn list_tasks(
 }
 
 async fn list_chores(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>> {
+    list_chores_filtered(client, product_id, None).await
+}
+
+async fn list_chores_filtered(
+    client: &mut BossClient,
+    product_id: &str,
+    dep_filter: Option<DependencyFilter>,
+) -> Result<Vec<Task>> {
     match client
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
+            dep_filter,
         })
         .await?
     {
@@ -751,6 +779,19 @@ async fn list_dependencies(
     {
         FrontendEvent::DependencyList { view } => Ok(view),
         other => Err(unexpected_event("list dependencies", other)),
+    }
+}
+
+async fn list_dependencies_detailed(
+    client: &mut BossClient,
+    input: ListDependenciesInput,
+) -> Result<WorkItemDependencyDetail> {
+    match client
+        .send_request(&FrontendRequest::ListDependenciesDetailed { input })
+        .await?
+    {
+        FrontendEvent::DependencyDetail { detail } => Ok(detail),
+        other => Err(unexpected_event("list dependencies detailed", other)),
     }
 }
 
@@ -867,6 +908,229 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     )
     .await?;
     assert!(!removed_again);
+
+    Ok(())
+}
+
+/// Phase 3 fixture from design Q6: a target task with 2 prerequisites
+/// and 1 dependent. Exercises the resolved `ListDependenciesDetailed`
+/// surface (used by `boss <kind> show`) and the four list filters
+/// (`--prerequisites-of`, `--dependents-of`, `--unblocked`,
+/// `--blocked-by-deps`). The dependent is a chore so we can also
+/// confirm the filters honour the kind-of-list they were applied to.
+#[tokio::test]
+async fn dependency_show_detail_and_list_filters() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "DepTest".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 3".to_owned(),
+            description: None,
+            goal: None,
+        },
+    )
+    .await?;
+    let prereq1 = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Land migration".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    )
+    .await?;
+    let prereq2 = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Tune retries".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    )
+    .await?;
+    let target = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Roll out feature".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    )
+    .await?;
+    let dependent_chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Update docs".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    )
+    .await?;
+
+    add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: target.id.clone(),
+            prerequisite: prereq1.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: target.id.clone(),
+            prerequisite: prereq2.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: dependent_chore.id.clone(),
+            prerequisite: target.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+
+    // `boss <kind> show` body — resolved edges with peer status / name.
+    let detail = list_dependencies_detailed(
+        &mut client,
+        ListDependenciesInput {
+            work_item: target.id.clone(),
+            direction: Some(DependencyDirection::Both),
+        },
+    )
+    .await?;
+    assert_eq!(detail.work_item_id, target.id);
+    assert_eq!(detail.prerequisites.len(), 2, "fixture has 2 prereqs");
+    let prereq_ids: Vec<&str> = detail
+        .prerequisites
+        .iter()
+        .map(|edge| edge.id.as_str())
+        .collect();
+    assert!(
+        prereq_ids.contains(&prereq1.id.as_str()) && prereq_ids.contains(&prereq2.id.as_str()),
+        "prereqs must surface both ids, got {prereq_ids:?}"
+    );
+    for edge in &detail.prerequisites {
+        assert_eq!(edge.relation, "blocks");
+        assert_eq!(edge.kind, "task");
+        assert_eq!(edge.status, "todo");
+        assert!(!edge.name.is_empty(), "peer name must be joined in");
+    }
+    assert_eq!(detail.dependents.len(), 1, "fixture has 1 dependent");
+    let dep_edge = &detail.dependents[0];
+    assert_eq!(dep_edge.id, dependent_chore.id);
+    assert_eq!(dep_edge.kind, "chore");
+    assert_eq!(dep_edge.name, "Update docs");
+    // The chore is auto-blocked because `target` (its prereq) is itself
+    // gated; phase 2 owns that transition. We just check the status is
+    // a non-empty value resolved from the row.
+    assert!(!dep_edge.status.is_empty());
+
+    // `boss task list --prerequisites-of <target>` → both prereq tasks.
+    let prereqs_listed = list_tasks_filtered(
+        &mut client,
+        &product.id,
+        None,
+        Some(DependencyFilter::PrerequisitesOf {
+            id: target.id.clone(),
+        }),
+    )
+    .await?;
+    let listed_ids: Vec<String> = prereqs_listed.iter().map(|t| t.id.clone()).collect();
+    assert_eq!(prereqs_listed.len(), 2, "got {listed_ids:?}");
+    assert!(listed_ids.contains(&prereq1.id) && listed_ids.contains(&prereq2.id));
+
+    // `boss task list --dependents-of <target>` → no project_tasks
+    // (the only dependent is a chore).
+    let dep_tasks = list_tasks_filtered(
+        &mut client,
+        &product.id,
+        None,
+        Some(DependencyFilter::DependentsOf {
+            id: target.id.clone(),
+        }),
+    )
+    .await?;
+    assert!(
+        dep_tasks.is_empty(),
+        "no project_task dependents in fixture, got {:?}",
+        dep_tasks.iter().map(|t| &t.id).collect::<Vec<_>>()
+    );
+
+    // `boss chore list --dependents-of <target>` → the chore.
+    let dep_chores = list_chores_filtered(
+        &mut client,
+        &product.id,
+        Some(DependencyFilter::DependentsOf {
+            id: target.id.clone(),
+        }),
+    )
+    .await?;
+    assert_eq!(dep_chores.len(), 1);
+    assert_eq!(dep_chores[0].id, dependent_chore.id);
+
+    // `boss task list --blocked-by-deps` → the target (its prereqs are
+    // both incomplete). Prereqs themselves and the chore are excluded.
+    let blocked = list_tasks_filtered(
+        &mut client,
+        &product.id,
+        None,
+        Some(DependencyFilter::BlockedByDeps),
+    )
+    .await?;
+    let blocked_ids: Vec<String> = blocked.iter().map(|t| t.id.clone()).collect();
+    assert!(
+        blocked_ids.contains(&target.id),
+        "target must be flagged blocked-by-deps, got {blocked_ids:?}"
+    );
+    assert!(
+        !blocked_ids.contains(&prereq1.id) && !blocked_ids.contains(&prereq2.id),
+        "prereqs have no deps and must not be flagged"
+    );
+
+    // `boss task list --unblocked` → tasks in `todo` with no incomplete
+    // prereq. Both prereqs qualify; target is in `blocked` (auto-flip
+    // from phase 2) so does not.
+    let unblocked = list_tasks_filtered(
+        &mut client,
+        &product.id,
+        None,
+        Some(DependencyFilter::Unblocked),
+    )
+    .await?;
+    let unblocked_ids: Vec<String> = unblocked.iter().map(|t| t.id.clone()).collect();
+    assert!(
+        unblocked_ids.contains(&prereq1.id) && unblocked_ids.contains(&prereq2.id),
+        "todo prereqs must surface in --unblocked, got {unblocked_ids:?}"
+    );
+    assert!(
+        !unblocked_ids.contains(&target.id),
+        "target is gated; --unblocked must exclude it"
+    );
 
     Ok(())
 }

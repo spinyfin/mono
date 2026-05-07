@@ -352,3 +352,55 @@ pub struct WorkItemDependencyView {
     pub prerequisites: Vec<WorkItemDependency>,
     pub dependents: Vec<WorkItemDependency>,
 }
+
+/// One enriched dependency edge as displayed by `boss <kind> show`.
+/// Unlike [`WorkItemDependency`] (a raw storage row with both
+/// endpoints), this struct collapses the edge into "the peer + the
+/// fact that this is a `relation` edge." `id` / `kind` / `name` /
+/// `status` describe the peer (the prerequisite when this edge sits
+/// in `prerequisites`, the dependent when it sits in `dependents`),
+/// so the human / JSON renderer doesn't need a second lookup.
+///
+/// `kind` is `task`, `chore`, or `project` — derived from the id
+/// prefix and the row's `tasks.kind`. UI surfaces use it to choose
+/// the right icon / link.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyEdge {
+    pub id: String,
+    pub relation: String,
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+}
+
+/// Resolved dependency listing for a single work item. Each side
+/// carries [`DependencyEdge`] entries with the peer's status and
+/// name already joined in. Used by `boss <kind> show` and (in time)
+/// the macOS dep section. Distinct from [`WorkItemDependencyView`]
+/// because that one returns raw edge rows for the depend-list verb.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkItemDependencyDetail {
+    pub work_item_id: String,
+    pub prerequisites: Vec<DependencyEdge>,
+    pub dependents: Vec<DependencyEdge>,
+}
+
+/// Predicate applied to `boss <kind> list` requests to surface only
+/// the rows that match a dependency-graph question. Q6 spells out
+/// four flags; this enum is the one-flag-per-variant projection.
+/// CLI parsing rejects combinations (the four flags are mutually
+/// exclusive at the surface) so the engine never sees an
+/// over-constrained request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DependencyFilter {
+    /// Only items that the named row depends on (its incoming edges).
+    PrerequisitesOf { id: String },
+    /// Only items that depend on the named row (its outgoing edges).
+    DependentsOf { id: String },
+    /// Only items in `todo` with no gating prerequisite — i.e. the
+    /// rows the dispatcher could pick up next.
+    Unblocked,
+    /// Only items currently gated by at least one incomplete prereq.
+    BlockedByDeps,
+}
