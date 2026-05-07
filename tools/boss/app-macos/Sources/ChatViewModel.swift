@@ -14,21 +14,39 @@ final class ChatViewModel: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var pendingPermission: PendingPermission?
     @Published var products: [WorkProduct] = []
-    @Published var projectsByProductID: [String: [WorkProject]] = [:]
-    @Published var tasksByProjectID: [String: [WorkTask]] = [:]
-    @Published var choresByProductID: [String: [WorkTask]] = [:]
+    @Published var projectsByProductID: [String: [WorkProject]] = [:] {
+        didSet { invalidateWorkCache() }
+    }
+    @Published var tasksByProjectID: [String: [WorkTask]] = [:] {
+        didSet { invalidateWorkCache() }
+    }
+    @Published var choresByProductID: [String: [WorkTask]] = [:] {
+        didSet { invalidateWorkCache() }
+    }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
-    @Published var selectedWorkProductID: String?
-    @Published var selectedProjectFilterIDs: Set<String> = []
-    @Published var includeChores: Bool = true
-    @Published var showBlockedOnly: Bool = false
+    @Published var selectedWorkProductID: String? {
+        didSet { invalidateWorkCache() }
+    }
+    @Published var selectedProjectFilterIDs: Set<String> = [] {
+        didSet { invalidateWorkCache() }
+    }
+    @Published var includeChores: Bool = true {
+        didSet { invalidateWorkCache() }
+    }
+    @Published var showBlockedOnly: Bool = false {
+        didSet { invalidateWorkCache() }
+    }
     @Published var selectedWorkCardID: String?
-    @Published var workBoardGrouping: WorkBoardGrouping = .none
+    @Published var workBoardGrouping: WorkBoardGrouping = .none {
+        didSet { invalidateWorkCache() }
+    }
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
-    @Published var workSearchText: String = ""
+    @Published var workSearchText: String = "" {
+        didSet { invalidateWorkCache() }
+    }
     @Published var isBossPanelCollapsed: Bool = false
     @Published var bossPanelWidth: CGFloat = 380
     /// Live runtime state for every active worker, keyed by run id.
@@ -110,6 +128,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     var visibleWorkItems: [WorkTask] {
+        if let cached = cachedVisibleItems {
+            return cached
+        }
+        let computed = computeVisibleWorkItems()
+        cachedVisibleItems = computed
+        return computed
+    }
+
+    private func computeVisibleWorkItems() -> [WorkTask] {
         guard let productID = currentSelectedProductID else { return [] }
 
         let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1227,12 +1254,26 @@ final class ChatViewModel: ObservableObject {
     }
 
     func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
-        visibleWorkItems
+        if let cached = cachedItemsByColumn[column] {
+            return cached
+        }
+        let items = visibleWorkItems
             .filter { $0.boardColumn == column }
             .sorted(by: boardTaskSort)
+        cachedItemsByColumn[column] = items
+        return items
     }
 
     func workSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
+        if let cached = cachedSectionsByColumn[column] {
+            return cached
+        }
+        let sections = computeWorkSections(in: column)
+        cachedSectionsByColumn[column] = sections
+        return sections
+    }
+
+    private func computeWorkSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
         let items = workItems(in: column)
         if column == .done {
             return Self.doneSections(items: items)
@@ -1249,6 +1290,20 @@ final class ChatViewModel: ObservableObject {
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
             return WorkBoardSection(id: "\(column.rawValue)-\(key)", title: key, items: sectionItems)
         }
+    }
+
+    /// Cached output of `visibleWorkItems`. Filled lazily on read; reset to
+    /// `nil` whenever a published input changes (see `invalidateWorkCache`).
+    /// Keeps engine pushes that don't touch the work tree (e.g.
+    /// `worker.live_states`) from re-walking the projects/tasks/chores trees.
+    private var cachedVisibleItems: [WorkTask]?
+    private var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
+    private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
+
+    private func invalidateWorkCache() {
+        cachedVisibleItems = nil
+        cachedItemsByColumn.removeAll(keepingCapacity: true)
+        cachedSectionsByColumn.removeAll(keepingCapacity: true)
     }
 
     /// Bucket completed tasks by recency for the Done lane:
