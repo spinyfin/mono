@@ -11,7 +11,9 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
-use crate::completion::{CommandPrDetector, PrDetector, WorkerCompletionHandler};
+use crate::completion::{
+    CommandPrDetector, PrDetector, WorkerCompletionHandler, WorkerPaneReleaser,
+};
 use crate::config::RuntimeConfig;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::worker_registry::WorkerRegistry;
@@ -20,8 +22,8 @@ use crate::coordinator::{
 };
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS,
-    TopicEventPayload, execution_topic, work_product_topic,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, ReleaseWorkerPaneInput,
+    TOPIC_WORK_PRODUCTS, TopicEventPayload, execution_topic, work_product_topic,
 };
 use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
@@ -82,6 +84,36 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 
     fn worker_registry(&self) -> &WorkerRegistry {
         &self.worker_registry
+    }
+}
+
+/// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
+/// Late-bound via `set_server_state` to break the ownership cycle:
+/// ServerState owns the completion handler, which owns the releaser,
+/// which calls back into ServerState.
+#[derive(Default)]
+struct ServerStatePaneReleaser {
+    server: std::sync::OnceLock<Weak<ServerState>>,
+}
+
+impl ServerStatePaneReleaser {
+    fn set_server_state(&self, weak: Weak<ServerState>) {
+        let _ = self.server.set(weak);
+    }
+}
+
+#[async_trait]
+impl WorkerPaneReleaser for ServerStatePaneReleaser {
+    async fn release_pane(&self, run_id: &str) {
+        let Some(weak) = self.server.get() else {
+            tracing::warn!(run_id, "pane releaser called before server state was bound");
+            return;
+        };
+        let Some(server) = weak.upgrade() else {
+            tracing::debug!(run_id, "pane releaser: server state already dropped");
+            return;
+        };
+        server.release_worker_pane(run_id).await;
     }
 }
 
@@ -332,11 +364,16 @@ impl ServerState {
         });
         let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
         let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
+        // The pane releaser needs a Weak<ServerState> to call back into
+        // `release_worker_pane`, so it's late-bound after the Arc<ServerState>
+        // exists. Same pattern as `PaneSpawnRunner` below.
+        let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let completion_handler = Arc::new(WorkerCompletionHandler::new(
             work_db.clone(),
             pr_detector,
             cube_client.clone(),
             publisher.clone(),
+            pane_releaser.clone(),
         ));
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -382,6 +419,7 @@ impl ServerState {
         let weak_spawner: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&server_state) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         pane_runner.set_server_state(weak_spawner);
+        pane_releaser.set_server_state(Arc::downgrade(&server_state));
 
         Ok(server_state)
     }
@@ -427,6 +465,59 @@ impl ServerState {
     async fn drop_pending(&self, request_id: &str) {
         if let Some(handle) = self.app_session.lock().await.as_mut() {
             handle.pending.remove(request_id);
+        }
+    }
+
+    /// Tear down the libghostty pane allocated for `run_id`.
+    /// Idempotent: `take_slot_for_run` returns `None` after the first
+    /// call so duplicate releases (completion-detection followed by a
+    /// chore-done update or `bossctl agents stop`) don't error out.
+    /// Errors talking to the app are logged and swallowed — the slot
+    /// mapping has already been removed, so a future release can't
+    /// retry without a fresh registration.
+    pub async fn release_worker_pane(&self, run_id: &str) {
+        let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
+            tracing::debug!(
+                run_id,
+                "release_worker_pane: no slot mapped (already released or never spawned)",
+            );
+            return;
+        };
+        let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
+            slot_id,
+            kill_grace_seconds: 5,
+        });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
+                tracing::info!(run_id, slot_id, "released worker pane");
+            }
+            Ok(EngineToAppResponse::ReleaseWorkerPane {
+                result: Err(EngineToAppError::UnknownSlot),
+            }) => {
+                tracing::debug!(
+                    run_id,
+                    slot_id,
+                    "release_worker_pane: app reports unknown slot — already released",
+                );
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    ?other,
+                    "release_worker_pane: app returned unexpected response",
+                );
+            }
+            Err(SendToAppError::NotRegistered) => {
+                tracing::debug!(
+                    run_id,
+                    slot_id,
+                    "release_worker_pane: no app session registered; skipping",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
+            }
         }
     }
 
@@ -1597,6 +1688,22 @@ async fn handle_frontend_connection(
                         if matches!(item, WorkItem::Product(_)) {
                             topics.push(TOPIC_WORK_PRODUCTS.to_owned());
                         }
+                        // If the patch moved a task/chore into a
+                        // terminal status (`done`, `archived`, or
+                        // `cancelled`), tear down whatever resources
+                        // its latest execution still holds: the
+                        // libghostty pane and the cube workspace.
+                        // Idempotent — duplicate or no-op cases
+                        // (already released, never spawned, not a
+                        // task/chore) collapse inside force_release.
+                        if let Some(execution_id) =
+                            terminal_chore_execution(&work_db, &item)
+                        {
+                            let handler = server_state.completion_handler.clone();
+                            tokio::spawn(async move {
+                                handler.force_release(&execution_id).await;
+                            });
+                        }
                         let revision = publish_work_invalidation(
                             &server_state,
                             &session_id,
@@ -2296,6 +2403,35 @@ async fn handle_frontend_connection(
                     FrontendEvent::ProbeQueued { run_id },
                 );
             }
+            FrontendRequest::StopRun { run_id } => {
+                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "stop_run rejected: caller not in Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "stop_run is BossOnly".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                tracing::info!(run_id = %run_id, "stop_run requested");
+                let handler = server_state.completion_handler.clone();
+                let run_id_for_release = run_id.clone();
+                tokio::spawn(async move {
+                    handler.force_release(&run_id_for_release).await;
+                });
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::RunStopped { run_id },
+                );
+            }
         }
     }
 
@@ -2417,6 +2553,33 @@ fn work_item_product_id(item: &WorkItem) -> String {
         WorkItem::Product(product) => product.id.clone(),
         WorkItem::Project(project) => project.product_id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
+    }
+}
+
+/// If `item` is a task or chore that has just landed in a terminal
+/// status (`done`, `archived`, `cancelled`), return the id of its
+/// most recent execution so the caller can tear down its worker pane
+/// and cube workspace. Returns `None` for non-task work items, for
+/// non-terminal statuses, and when the work item has no executions.
+fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return None,
+    };
+    if !matches!(task.status.as_str(), "done" | "archived" | "cancelled") {
+        return None;
+    }
+    match work_db.latest_execution_for_work_item(&task.id) {
+        Ok(Some(execution)) => Some(execution.id),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %task.id,
+                ?err,
+                "terminal_chore_execution: failed to look up latest execution",
+            );
+            None
+        }
     }
 }
 

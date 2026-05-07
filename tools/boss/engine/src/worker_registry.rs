@@ -71,6 +71,18 @@ impl WorkerRegistry {
             .copied()
     }
 
+    /// Atomically remove and return the slot id for `run_id`. The
+    /// release-pane flow uses this for idempotency — duplicate release
+    /// attempts (e.g. completion-detection plus a manual stop firing
+    /// for the same run) see `None` on the second call and skip.
+    pub fn take_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .run_to_slot
+            .remove(run_id)
+    }
+
     /// Drop the entry for `pid`. Called when a run terminates and the
     /// worker process exits.
     pub fn unregister(&self, pid: libc::pid_t) -> Option<String> {
@@ -242,6 +254,18 @@ mod tests {
         assert_eq!(reg.len(), 2);
         reg.unregister(1);
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn take_slot_for_run_is_idempotent() {
+        let reg = WorkerRegistry::new();
+        reg.register_run_slot("run-x", 4);
+        assert_eq!(reg.take_slot_for_run("run-x"), Some(4));
+        // Second call returns None — that's the idempotency guard the
+        // release path leans on.
+        assert_eq!(reg.take_slot_for_run("run-x"), None);
+        // Unregistered run is also None.
+        assert_eq!(reg.take_slot_for_run("never-registered"), None);
     }
 
     #[test]

@@ -210,6 +210,14 @@ pub enum FrontendRequest {
         run_id: String,
         text: String,
     },
+    /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
+    /// and release the cube workspace its execution still holds.
+    /// Used by `bossctl agents stop`. Idempotent — duplicate requests
+    /// (or one racing with completion-detection) collapse to a no-op
+    /// on the second pass.
+    StopRun {
+        run_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +377,13 @@ pub enum FrontendEvent {
     BossSessionRegistered,
     /// Engine confirms a probe was queued for the given run.
     ProbeQueued {
+        run_id: String,
+    },
+    /// Engine acknowledges a stop request — the pane release has
+    /// been kicked off and (if applicable) the cube workspace lease
+    /// released. The reply does not wait for the libghostty pane to
+    /// fully drain; teardown is asynchronous.
+    RunStopped {
         run_id: String,
     },
     /// Engine asks the registered app session to perform a pane

@@ -147,6 +147,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::List,
         } => agents_list(&cli.socket_path, cli.json).await,
+        Command::Agents {
+            action: AgentsAction::Stop { run_id },
+        } => agents_stop(&cli.socket_path, cli.json, run_id).await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -284,6 +287,36 @@ async fn agents_list(socket_path: &Option<String>, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn agents_stop(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::StopRun {
+            run_id: run_id.clone(),
+        })
+        .await
+        .context("sending StopRun")?;
+    match response {
+        FrontendEvent::RunStopped { run_id: returned } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "stopped",
+                        "run_id": returned,
+                    })
+                );
+            } else {
+                println!("stopped run {returned}");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected stop: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
 }
 
 async fn work_start(
