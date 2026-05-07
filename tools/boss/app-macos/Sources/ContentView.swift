@@ -528,11 +528,18 @@ struct ContentView: View {
                 Circle()
                     .fill(Color.accentColor.opacity(0.14))
                 if let portrait = TrekIconAssets.image(.picard, size: .small) {
+                    // The sprite is taller than it is wide (head + torso),
+                    // so an aspect-fill into a square frame overflows
+                    // vertically. Anchor the overflow to the top edge so
+                    // the head is preserved and only the lower body — which
+                    // the Circle mask would hide anyway — gets clipped.
+                    // Without `.top`, SwiftUI centers the overflow and
+                    // slices the bald crown off Picard.
                     Image(nsImage: portrait)
                         .resizable()
                         .interpolation(.high)
                         .aspectRatio(contentMode: .fill)
-                        .frame(width: 26, height: 26)
+                        .frame(width: 26, height: 26, alignment: .top)
                         .clipShape(Circle())
                 } else {
                     Image(systemName: AgentRole.boss.systemImage)
