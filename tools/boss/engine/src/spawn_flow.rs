@@ -142,6 +142,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 ) -> Result<StartedWorker, StartWorkerError> {
     // 1. Write CLAUDE.md and settings.json into the workspace.
     let setup = WorkerSetupInput {
+        run_id: input.run_id.clone(),
         lease_id: input.lease_id.clone(),
         workspace_path: input.workspace_path.clone(),
         events_socket_path: input.events_socket_path.clone(),
