@@ -392,6 +392,18 @@ fn run_workspace(
             // Sweep any leases that have already exceeded their TTL so they
             // become claimable again.
             store.expire_stale_leases(&repo, leased_at_epoch_s)?;
+            // Self-heal any rows whose on-disk directory has been deleted
+            // out from under cube. The repo lock is already held by this
+            // lease call, so use the `_in_repo` variant that skips its own
+            // locking. After expire_stale_leases above, any leased rows
+            // whose lease has aged out are now `free`, and reconcile will
+            // forget them too if their directory is also missing.
+            reconcile_missing_workspaces_in_repo(
+                &mut store,
+                database_path,
+                &repo,
+                leased_at_epoch_s,
+            )?;
 
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
@@ -425,6 +437,26 @@ fn run_workspace(
             };
 
             if !workspace_path_exists(&workspace) {
+                // Reconcile above should have caught this on the pre-claim
+                // pass, but a concurrent `rm -rf` between reconcile and
+                // claim can still land here. Drop the row and surface a
+                // warning so the operator sees what happened.
+                eprintln!(
+                    "warning: cube workspace `{}/{}` directory disappeared between reconcile \
+                     and claim at {}; dropping the dangling registry row",
+                    workspace.repo,
+                    workspace.workspace_id,
+                    workspace.workspace_path.display(),
+                );
+                audit!(
+                    database_path,
+                    "workspace.dir_missing_reconciled",
+                    repo = workspace.repo,
+                    workspace_id = workspace.workspace_id,
+                    workspace_path = workspace.workspace_path.display().to_string(),
+                    prior_state = workspace.state.as_str(),
+                    lease_id = lease_id,
+                );
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::NoAvailableWorkspace(repo));
             }
@@ -499,6 +531,22 @@ fn run_workspace(
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
             let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
             if !workspace_path_exists(&workspace) {
+                eprintln!(
+                    "warning: cube workspace `{}/{}` directory is missing at {}; \
+                     removing the dangling registry row instead of running release reset",
+                    workspace.repo,
+                    workspace.workspace_id,
+                    workspace.workspace_path.display(),
+                );
+                audit!(
+                    database_path,
+                    "workspace.dir_missing_reconciled",
+                    repo = workspace.repo,
+                    workspace_id = workspace.workspace_id,
+                    workspace_path = workspace.workspace_path.display().to_string(),
+                    prior_state = workspace.state.as_str(),
+                    lease_id = lease,
+                );
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::LeaseNotFound(lease));
             }
@@ -646,6 +694,16 @@ fn run_workspace(
                 })?),
                 None => None,
             };
+            // Reconcile rows whose on-disk directory has been wiped before
+            // we materialize the listing — otherwise `list` would surface
+            // a row that the next `lease` is going to fail on. Scope the
+            // reconcile to the same repo filter the user asked for.
+            let reconciled = reconcile_missing_workspaces(
+                &mut store,
+                database_path,
+                repo.as_deref(),
+                current_epoch_s()?,
+            )?;
             let filter = WorkspaceListFilter {
                 repo: repo.as_deref(),
                 state: parsed_state,
@@ -658,6 +716,7 @@ fn run_workspace(
                 message,
                 json!({
                     "workspaces": records,
+                    "reconciled": reconciled,
                 }),
             )
         }
@@ -1157,6 +1216,199 @@ fn current_change_identity(
 
 fn workspace_path_exists(record: &crate::metadata::WorkspaceRecord) -> bool {
     record.workspace_path.is_dir()
+}
+
+/// Summary of a workspace row touched by the missing-directory reconciler.
+/// Surfaced through `cube workspace list --json` and also fed to per-row
+/// audit events so the operator has a paper trail.
+#[derive(Debug, Clone, Serialize)]
+struct ReconciledRow {
+    repo: String,
+    workspace_id: String,
+    workspace_path: PathBuf,
+    prior_state: WorkspaceState,
+    lease_id: Option<String>,
+    holder: Option<String>,
+    lease_expires_at_epoch_s: Option<i64>,
+}
+
+impl ReconciledRow {
+    fn from_record(record: &WorkspaceRecord) -> Self {
+        Self {
+            repo: record.repo.clone(),
+            workspace_id: record.workspace_id.clone(),
+            workspace_path: record.workspace_path.clone(),
+            prior_state: record.state,
+            lease_id: record.lease_id.clone(),
+            holder: record.holder.clone(),
+            lease_expires_at_epoch_s: record.lease_expires_at_epoch_s,
+        }
+    }
+}
+
+/// What `reconcile_missing_workspaces` did in one pass. `removed` is rows
+/// that were actually evicted from the registry (free-and-missing, plus
+/// leased-and-missing rows whose lease had already expired). `held` is
+/// leased rows whose directory is gone but whose lease is still within
+/// its TTL — surfaced with a stderr warning and an audit event, but left
+/// in place so the operator can decide whether to `force-release`.
+#[derive(Debug, Default, Clone, Serialize)]
+struct ReconcileReport {
+    removed: Vec<ReconciledRow>,
+    held: Vec<ReconciledRow>,
+}
+
+impl ReconcileReport {
+    fn merge(&mut self, other: ReconcileReport) {
+        self.removed.extend(other.removed);
+        self.held.extend(other.held);
+    }
+}
+
+/// Reconcile dangling registry rows whose on-disk workspace directory has
+/// been deleted out from under cube — for one specific repo.
+///
+/// **The caller must already hold the per-repo `RepoLock`.** Use the
+/// public [`reconcile_missing_workspaces`] wrapper from call sites that
+/// don't already own the lock.
+///
+/// Decision matrix per row:
+/// - `state=free`, dir missing → forget the row (a stray directory was
+///   deleted manually; the registry entry is just stale).
+/// - `state=leased`, dir missing, lease TTL elapsed → force-release the
+///   lease and forget the row. The worker that held it presumably
+///   crashed or had its workspace wiped; the lease has already aged out.
+/// - `state=leased`, dir missing, lease still active → leave the row
+///   alone but warn loudly. We can't know whether the holder is mid-setup
+///   or genuinely dead, so we defer to the operator (who can then
+///   `cube workspace force-release <id>` and re-run).
+fn reconcile_missing_workspaces_in_repo(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    repo: &str,
+    now_epoch_s: i64,
+) -> Result<ReconcileReport> {
+    let workspaces = store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: Some(repo),
+        ..Default::default()
+    })?;
+    let mut report = ReconcileReport::default();
+    for row in workspaces {
+        if workspace_path_exists(&row) {
+            continue;
+        }
+        match row.state {
+            WorkspaceState::Free => {
+                let summary = ReconciledRow::from_record(&row);
+                store.forget_workspace(&row.repo, &row.workspace_id)?;
+                eprintln!(
+                    "warning: cube workspace `{}/{}` directory is missing at {}; \
+                     removing the dangling registry row",
+                    row.repo,
+                    row.workspace_id,
+                    row.workspace_path.display(),
+                );
+                audit!(
+                    database_path,
+                    "workspace.dir_missing_reconciled",
+                    repo = row.repo,
+                    workspace_id = row.workspace_id,
+                    workspace_path = row.workspace_path.display().to_string(),
+                    prior_state = row.state.as_str(),
+                );
+                report.removed.push(summary);
+            }
+            WorkspaceState::Leased => {
+                // No expiry recorded → treat as still active; we have no
+                // basis to evict a lease that pre-dates the TTL field.
+                let lease_active = row
+                    .lease_expires_at_epoch_s
+                    .map(|exp| exp > now_epoch_s)
+                    .unwrap_or(true);
+                if lease_active {
+                    eprintln!(
+                        "warning: cube workspace `{}/{}` directory is missing at {} but its \
+                         lease is still active (held by {}); run `cube workspace force-release \
+                         {}` to reclaim",
+                        row.repo,
+                        row.workspace_id,
+                        row.workspace_path.display(),
+                        row.holder.as_deref().unwrap_or("<unknown>"),
+                        row.workspace_id,
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.dir_missing_held",
+                        repo = row.repo,
+                        workspace_id = row.workspace_id,
+                        workspace_path = row.workspace_path.display().to_string(),
+                        lease_id = row.lease_id,
+                        holder = row.holder,
+                        lease_expires_at_epoch_s = row.lease_expires_at_epoch_s,
+                    );
+                    report.held.push(ReconciledRow::from_record(&row));
+                } else {
+                    let summary = ReconciledRow::from_record(&row);
+                    if let Some(lease_id) = row.lease_id.clone() {
+                        let _ = store.force_release_lease(&lease_id, Some("dir_missing"))?;
+                    }
+                    store.forget_workspace(&row.repo, &row.workspace_id)?;
+                    eprintln!(
+                        "warning: cube workspace `{}/{}` directory is missing at {} and its \
+                         lease has expired (was held by {}); force-releasing and removing the \
+                         dangling registry row",
+                        row.repo,
+                        row.workspace_id,
+                        row.workspace_path.display(),
+                        row.holder.as_deref().unwrap_or("<unknown>"),
+                    );
+                    audit!(
+                        database_path,
+                        "workspace.dir_missing_reconciled",
+                        repo = row.repo,
+                        workspace_id = row.workspace_id,
+                        workspace_path = row.workspace_path.display().to_string(),
+                        prior_state = row.state.as_str(),
+                        lease_id = row.lease_id,
+                        holder = row.holder,
+                    );
+                    report.removed.push(summary);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Reconcile dangling registry rows across all repos (or a single repo
+/// when `repo_filter` is set). Acquires the per-repo `RepoLock` for each
+/// repo that has at least one drifted row, so this is safe to call from
+/// commands that don't already hold a lock.
+fn reconcile_missing_workspaces(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    repo_filter: Option<&str>,
+    now_epoch_s: i64,
+) -> Result<ReconcileReport> {
+    let workspaces = store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: repo_filter,
+        ..Default::default()
+    })?;
+    let mut repos: Vec<String> = workspaces
+        .iter()
+        .filter(|ws| !workspace_path_exists(ws))
+        .map(|ws| ws.repo.clone())
+        .collect();
+    repos.sort();
+    repos.dedup();
+
+    let mut report = ReconcileReport::default();
+    for repo in repos {
+        let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
+        let sub = reconcile_missing_workspaces_in_repo(store, database_path, &repo, now_epoch_s)?;
+        report.merge(sub);
+    }
+    Ok(report)
 }
 
 fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
@@ -4326,6 +4578,499 @@ steps:
             }
             other => panic!("expected StaleRecoveryFailed, got {other:?}"),
         }
+    }
+
+    /// Sets `lease_expires_at_epoch_s` directly in the SQLite store.
+    /// Used by reconcile tests to age a lease past its TTL without having
+    /// to wait wall-clock seconds.
+    fn force_lease_expiry(database_path: &std::path::Path, lease_id: &str, epoch_s: i64) {
+        let conn = rusqlite::Connection::open(database_path).expect("sqlite open");
+        let updated = conn
+            .execute(
+                "UPDATE workspaces SET lease_expires_at_epoch_s = ?1 WHERE lease_id = ?2",
+                rusqlite::params![epoch_s, lease_id],
+            )
+            .expect("force expiry");
+        assert_eq!(updated, 1, "expected exactly one row updated by force_lease_expiry");
+    }
+
+    fn audit_events(tempdir: &TempDir) -> Vec<serde_json::Value> {
+        let audit_dir = tempdir.path().join("audit");
+        let Ok(read) = std::fs::read_dir(&audit_dir) else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        for entry in read.flatten() {
+            let contents = std::fs::read_to_string(entry.path()).expect("audit content");
+            for line in contents.lines() {
+                events.push(serde_json::from_str(line).expect("audit line"));
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn workspace_list_reconciles_free_row_whose_directory_is_missing() {
+        // Canonical scenario from the chore: an operator wiped the
+        // workspace directory by hand and the row remained in cube's
+        // registry. `cube workspace list` must notice and self-heal
+        // rather than handing out the stale row to the next caller.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Seed a free row, then yank the directory out from under cube.
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&workspace_path).expect("wipe workspace dir");
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        assert_eq!(
+            result.payload["reconciled"]["removed"][0]["workspace_id"],
+            "mono-agent-007"
+        );
+        assert_eq!(
+            result.payload["reconciled"]["removed"][0]["prior_state"],
+            "free"
+        );
+        assert_eq!(result.payload["reconciled"]["held"], json!([]));
+        assert_eq!(result.payload["workspaces"], json!([]));
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert!(remaining.is_empty(), "row must be deleted by reconcile");
+
+        let events = audit_events(&tempdir);
+        let reconciled: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.dir_missing_reconciled")
+            .collect();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0]["repo"], "mono");
+        assert_eq!(reconciled[0]["workspace_id"], "mono-agent-007");
+        assert_eq!(reconciled[0]["prior_state"], "free");
+    }
+
+    #[test]
+    fn workspace_list_reconciles_leased_row_with_expired_lease() {
+        // A worker leased a workspace, then was rm-rf'd along with its
+        // directory and never released. The lease has aged past its TTL,
+        // so reconcile is allowed to force-release and forget the row.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        // Age the lease into the past, then wipe the directory.
+        force_lease_expiry(&database_path, &lease_id, 1);
+        std::fs::remove_dir_all(&workspace_path).expect("wipe workspace dir");
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        assert_eq!(
+            result.payload["reconciled"]["removed"][0]["workspace_id"],
+            "mono-agent-001"
+        );
+        assert_eq!(
+            result.payload["reconciled"]["removed"][0]["prior_state"],
+            "leased"
+        );
+        assert_eq!(result.payload["reconciled"]["held"], json!([]));
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "expired+missing row must be force-released and deleted"
+        );
+
+        let events = audit_events(&tempdir);
+        let reconciled: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.dir_missing_reconciled")
+            .collect();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0]["prior_state"], "leased");
+        assert_eq!(reconciled[0]["lease_id"], lease_id);
+    }
+
+    #[test]
+    fn workspace_list_holds_leased_row_when_lease_still_active() {
+        // The lease is still within its TTL, so we can't know whether
+        // the holder is mid-setup or genuinely dead. Defer to the
+        // operator: warn + audit but leave the row untouched.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        // Push the expiry far into the future so reconcile sees it as
+        // active even after we wipe the directory.
+        let far_future = current_epoch_s().expect("now") + 86_400;
+        force_lease_expiry(&database_path, &lease_id, far_future);
+        std::fs::remove_dir_all(&workspace_path).expect("wipe workspace dir");
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        assert_eq!(result.payload["reconciled"]["removed"], json!([]));
+        assert_eq!(
+            result.payload["reconciled"]["held"][0]["workspace_id"],
+            "mono-agent-001"
+        );
+        assert_eq!(
+            result.payload["reconciled"]["held"][0]["prior_state"],
+            "leased"
+        );
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "active-lease+missing row must be left in place"
+        );
+        assert_eq!(remaining[0].state, crate::metadata::WorkspaceState::Leased);
+
+        let events = audit_events(&tempdir);
+        let held: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.dir_missing_held")
+            .collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0]["lease_id"], lease_id);
+        assert_eq!(held[0]["lease_expires_at_epoch_s"], far_future);
+    }
+
+    #[test]
+    fn workspace_list_reconcile_is_noop_when_directories_exist() {
+        // When nothing has drifted, reconcile must not emit any audit
+        // events or surface any reconciled/held rows.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        assert_eq!(result.payload["reconciled"]["removed"], json!([]));
+        assert_eq!(result.payload["reconciled"]["held"], json!([]));
+        assert!(audit_events(&tempdir).is_empty());
+    }
+
+    #[test]
+    fn workspace_list_reconciler_respects_repo_filter() {
+        // With --repo set, only that repo's drifted rows should be
+        // reconciled. Other repos' dangling rows must be left alone so a
+        // narrow query doesn't quietly mutate state across the registry.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root_a = tempdir.path().join("repos-a/workspaces");
+        let workspace_root_b = tempdir.path().join("repos-b/workspaces");
+        std::fs::create_dir_all(workspace_root_a.join("mono-agent-001"))
+            .expect("workspace dir a");
+        std::fs::create_dir_all(workspace_root_b.join("other-agent-001"))
+            .expect("workspace dir b");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root_a.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo a");
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "other",
+                "--origin",
+                "git@github.com:spinyfin/other.git",
+                "--workspace-root",
+                &workspace_root_b.display().to_string(),
+                "--workspace-prefix",
+                "other-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo b");
+
+        // Seed both repos with one free row each, then wipe both dirs.
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_root_a.join("mono-agent-001"),
+                    }],
+                )
+                .unwrap();
+            store
+                .sync_workspaces(
+                    "other",
+                    &[WorkspaceCandidate {
+                        workspace_id: "other-agent-001".to_string(),
+                        workspace_path: workspace_root_b.join("other-agent-001"),
+                    }],
+                )
+                .unwrap();
+        }
+        std::fs::remove_dir_all(workspace_root_a.join("mono-agent-001"))
+            .expect("wipe a");
+        std::fs::remove_dir_all(workspace_root_b.join("other-agent-001"))
+            .expect("wipe b");
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list", "--repo", "mono"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        // Only the `mono` row should appear in the reconcile report.
+        let removed = result.payload["reconciled"]["removed"]
+            .as_array()
+            .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0]["repo"], "mono");
+
+        // The `other` repo's dangling row must still be there.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let other = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("other"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].workspace_id, "other-agent-001");
+    }
+
+    #[test]
+    fn workspace_lease_reconciles_expired_missing_row_before_claiming() {
+        // A previously leased workspace's directory was wiped while the
+        // lease aged out. Lease must reconcile the dangling row before
+        // claiming so it doesn't hand out the stale slot.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let first = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        let lease_id = first.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        force_lease_expiry(&database_path, &lease_id, 1);
+        std::fs::remove_dir_all(&workspace_path).expect("wipe workspace dir");
+
+        // The next lease should reconcile the phantom row, then auto-create
+        // a fresh workspace via `jj git clone --colocate`. The runner needs
+        // the clone command plus the standard reset/log triple for the
+        // newly-created workspace. After reconcile deletes mono-agent-001,
+        // `next_workspace_id` reuses the freed slot rather than skipping
+        // ahead to mono-agent-002.
+        let new_path = workspace_root.join("mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        let second = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "fresh"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("second lease");
+        runner.assert_exhausted();
+
+        assert_eq!(
+            second.payload["workspace"]["workspace_id"],
+            "mono-agent-001"
+        );
+
+        // Only the freshly-claimed (re-provisioned) row remains; the
+        // phantom row was forgotten before the new clone created the
+        // replacement.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workspace_id, "mono-agent-001");
+        assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Leased);
+
+        let events = audit_events(&tempdir);
+        let reconciled: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e["event"] == "workspace.dir_missing_reconciled"
+                    && e["workspace_id"] == "mono-agent-001"
+            })
+            .collect();
+        assert_eq!(reconciled.len(), 1);
     }
 
     #[test]
