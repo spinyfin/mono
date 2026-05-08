@@ -113,6 +113,19 @@ enum ProjectCommand {
     },
 }
 
+/// Subcommands under `boss task ...`.
+///
+/// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
+/// `depend`, `bind-pr`) operate on any leaf work item by id. A chore
+/// *is* a kind of task — the engine already knows the kind from the
+/// id, so the noun is permissive. The same verbs are mirrored under
+/// `boss chore ...` for back-compat and for callers who prefer to
+/// name the kind explicitly.
+///
+/// Kind-specific verbs (`create`, `create-many`, `list`, `reorder`)
+/// stay split because their inputs / filters genuinely differ by
+/// kind (e.g. tasks have a project, chores don't; reorder is only
+/// meaningful for project tasks).
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     Create(TaskCreateArgs),
@@ -123,9 +136,13 @@ enum TaskCommand {
     #[command(name = "create-many")]
     CreateMany(TaskCreateManyArgs),
     List(TaskListArgs),
+    /// Show any leaf work item (task or chore) by id.
     Show(TaskIdArg),
+    /// Update any leaf work item (task or chore) by id.
     Update(TaskUpdateArgs),
+    /// Move any leaf work item (task or chore) into a different status.
     Move(TaskMoveArgs),
+    /// Delete any leaf work item (task or chore) by id.
     Delete(TaskDeleteArgs),
     Reorder(TaskReorderArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
@@ -133,21 +150,25 @@ enum TaskCommand {
         #[command(subcommand)]
         command: DependCommand,
     },
-    /// Attach a GitHub PR URL to an existing task.
+    /// Attach a GitHub PR URL to an existing leaf work item (task or chore).
     ///
     /// Use this when the engine's auto-detection (worker stop hook
     /// or merge poller) didn't pick up a PR — for example, if the
-    /// PR was opened before its task existed, the work was started
-    /// outside the worker spawn path, or a multi-phase task was
-    /// split into per-phase tasks after the original PR was open.
+    /// PR was opened before its work item existed, the work was
+    /// started outside the worker spawn path, or a multi-phase task
+    /// was split into per-phase tasks after the original PR was open.
     /// Idempotent: re-binding the same URL is a no-op. Re-binding to
     /// a different URL overwrites with a stderr warning. Status is
-    /// not changed; move the task explicitly with `boss task move`
+    /// not changed; move the item explicitly with `boss task move`
     /// if needed.
     #[command(name = "bind-pr")]
     BindPr(BindPrArgs),
 }
 
+/// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
+/// thin aliases for `boss task <verb>` — they accept any leaf work
+/// item id and route through the same handlers. Kept for back-compat
+/// and for callers who prefer to name the kind explicitly.
 #[derive(Debug, Subcommand)]
 enum ChoreCommand {
     Create(ChoreCreateArgs),
@@ -156,17 +177,20 @@ enum ChoreCommand {
     #[command(name = "create-many")]
     CreateMany(ChoreCreateManyArgs),
     List(ChoreListArgs),
+    /// Alias for `boss task show`. Accepts any leaf work item id.
     Show(TaskIdArg),
+    /// Alias for `boss task update`. Accepts any leaf work item id.
     Update(TaskUpdateArgs),
+    /// Alias for `boss task move`. Accepts any leaf work item id.
     Move(TaskMoveArgs),
+    /// Alias for `boss task delete`. Accepts any leaf work item id.
     Delete(TaskDeleteArgs),
-    /// Manage dependency edges (`A depends on B` ⇒ B gates A).
+    /// Alias for `boss task depend`. The engine doesn't care about kind.
     Depend {
         #[command(subcommand)]
         command: DependCommand,
     },
-    /// Attach a GitHub PR URL to an existing chore. See `boss task
-    /// bind-pr --help` for behaviour and rationale.
+    /// Alias for `boss task bind-pr`. Accepts any leaf work item id.
     #[command(name = "bind-pr")]
     BindPr(BindPrArgs),
 }
@@ -915,11 +939,13 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
             "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create`.",
+            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, or 1-based interactive index within the selected product. For agent use, prefer slug or id, not numeric indexes.",
-            "Task and chore commands that operate on an existing item use the item id, not slug.",
+            "Task and chore commands that operate on an existing item use the item id, not slug. The id alone disambiguates kind, so `boss task move <chore-id>` and `boss chore move <task-id>` are accepted equivalents of `boss task move <task-id>` / `boss chore move <chore-id>`.",
         ],
         status_semantics: vec![
             "CLI status values use in-review on the command line.",
@@ -1297,66 +1323,10 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 print_tasks_table(&tasks)
             })
         }
-        TaskCommand::Show(args) => {
-            let task = expect_task(get_work_item(&mut client, &args.id).await?)?;
-            let detail = list_dependencies_detailed(
-                &mut client,
-                ListDependenciesInput {
-                    work_item: task.id.clone(),
-                    direction: Some(DependencyDirection::Both),
-                },
-            )
-            .await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "task": task, "dependencies": detail }),
-                || {
-                    print_task_details("Task", &task);
-                    print_dependency_section(&detail);
-                },
-            )
-        }
-        TaskCommand::Update(args) => {
-            let patch = WorkItemPatch {
-                name: args.name,
-                description: args.description,
-                status: args.status.map(|status| status.as_str().to_owned()),
-                priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                ordinal: args.ordinal,
-                pr_url: args.pr_url,
-                ..WorkItemPatch::default()
-            };
-            ensure_patch_present(
-                &patch,
-                "provide at least one field to update, such as --status, --priority, or --pr-url",
-            )?;
-            let task = expect_task(update_work_item(&mut client, &args.id, patch).await?)?;
-            print_entity(ctx, &serde_json::json!({ "task": task }), || {
-                print_task_details("Updated task", &task);
-            })
-        }
-        TaskCommand::Move(args) => {
-            let patch = WorkItemPatch {
-                status: Some(args.target.as_status().to_owned()),
-                ..WorkItemPatch::default()
-            };
-            let task = expect_task(update_work_item(&mut client, &args.id, patch).await?)?;
-            print_entity(ctx, &serde_json::json!({ "task": task }), || {
-                print_task_details("Moved task", &task);
-            })
-        }
-        TaskCommand::Delete(args) => {
-            delete_work_item(&mut client, &args.id).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "id": args.id, "deleted": true }),
-                || {
-                    if !ctx.quiet {
-                        println!("Deleted task {}", args.id);
-                    }
-                },
-            )
-        }
+        TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args).await,
+        TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
+        TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
@@ -1379,7 +1349,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             )
         }
         TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
-        TaskCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args, BindPrKind::Task).await,
+        TaskCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
     }
 }
@@ -1422,69 +1392,116 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 print_tasks_table(&chores)
             })
         }
-        ChoreCommand::Show(args) => {
-            let chore = expect_chore(get_work_item(&mut client, &args.id).await?)?;
-            let detail = list_dependencies_detailed(
-                &mut client,
-                ListDependenciesInput {
-                    work_item: chore.id.clone(),
-                    direction: Some(DependencyDirection::Both),
-                },
-            )
-            .await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "chore": chore, "dependencies": detail }),
-                || {
-                    print_task_details("Chore", &chore);
-                    print_dependency_section(&detail);
-                },
-            )
-        }
-        ChoreCommand::Update(args) => {
-            let patch = WorkItemPatch {
-                name: args.name,
-                description: args.description,
-                status: args.status.map(|status| status.as_str().to_owned()),
-                priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                ordinal: args.ordinal,
-                pr_url: args.pr_url,
-                ..WorkItemPatch::default()
-            };
-            ensure_patch_present(
-                &patch,
-                "provide at least one field to update, such as --status, --priority, or --pr-url",
-            )?;
-            let chore = expect_chore(update_work_item(&mut client, &args.id, patch).await?)?;
-            print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
-                print_task_details("Updated chore", &chore);
-            })
-        }
-        ChoreCommand::Move(args) => {
-            let patch = WorkItemPatch {
-                status: Some(args.target.as_status().to_owned()),
-                ..WorkItemPatch::default()
-            };
-            let chore = expect_chore(update_work_item(&mut client, &args.id, patch).await?)?;
-            print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
-                print_task_details("Moved chore", &chore);
-            })
-        }
-        ChoreCommand::Delete(args) => {
-            delete_work_item(&mut client, &args.id).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "id": args.id, "deleted": true }),
-                || {
-                    if !ctx.quiet {
-                        println!("Deleted chore {}", args.id);
-                    }
-                },
-            )
-        }
+        ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
-        ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args, BindPrKind::Chore).await,
+        ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
         ChoreCommand::CreateMany(args) => run_chore_create_many(&mut client, ctx, args).await,
+    }
+}
+
+/// Shared handler for `boss task show <id>` and `boss chore show <id>`.
+/// Routes any leaf work item id through the same path; the JSON key
+/// and human-mode label match the actual kind of the returned item.
+async fn run_show_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskIdArg,
+) -> Result<(), CliError> {
+    let (item, label) = expect_leaf_work_item(get_work_item(client, &args.id).await?)?;
+    let detail = list_dependencies_detailed(
+        client,
+        ListDependenciesInput {
+            work_item: item.id.clone(),
+            direction: Some(DependencyDirection::Both),
+        },
+    )
+    .await?;
+    print_entity(
+        ctx,
+        &serde_json::json!({ label: item, "dependencies": detail }),
+        || {
+            print_task_details(label_titlecase(label), &item);
+            print_dependency_section(&detail);
+        },
+    )
+}
+
+/// Shared handler for `boss task update` and `boss chore update`.
+async fn run_update_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskUpdateArgs,
+) -> Result<(), CliError> {
+    let patch = WorkItemPatch {
+        name: args.name,
+        description: args.description,
+        status: args.status.map(|status| status.as_str().to_owned()),
+        priority: args.priority.map(|priority| priority.as_str().to_owned()),
+        ordinal: args.ordinal,
+        pr_url: args.pr_url,
+        ..WorkItemPatch::default()
+    };
+    ensure_patch_present(
+        &patch,
+        "provide at least one field to update, such as --status, --priority, or --pr-url",
+    )?;
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
+    print_entity(ctx, &serde_json::json!({ label: item }), || {
+        print_task_details(&format!("Updated {label}"), &item);
+    })
+}
+
+/// Shared handler for `boss task move` and `boss chore move`.
+async fn run_move_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskMoveArgs,
+) -> Result<(), CliError> {
+    let patch = WorkItemPatch {
+        status: Some(args.target.as_status().to_owned()),
+        ..WorkItemPatch::default()
+    };
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
+    print_entity(ctx, &serde_json::json!({ label: item }), || {
+        print_task_details(&format!("Moved {label}"), &item);
+    })
+}
+
+/// Shared handler for `boss task delete` and `boss chore delete`. The
+/// engine doesn't need the kind to delete; we read it back from the
+/// pre-delete fetch only so the human-mode message names the right
+/// noun.
+async fn run_delete_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskDeleteArgs,
+) -> Result<(), CliError> {
+    let label = match get_work_item(client, &args.id).await {
+        Ok(item) => expect_leaf_work_item(item).map(|(_, l)| l).unwrap_or("item"),
+        Err(_) => "item",
+    };
+    delete_work_item(client, &args.id).await?;
+    print_entity(
+        ctx,
+        &serde_json::json!({ "id": args.id, "deleted": true }),
+        || {
+            if !ctx.quiet {
+                println!("Deleted {label} {}", args.id);
+            }
+        },
+    )
+}
+
+/// "task" -> "Task". The label set comes from
+/// [`expect_leaf_work_item`], so `&'static str` in / out is enough.
+fn label_titlecase(label: &str) -> &'static str {
+    match label {
+        "task" => "Task",
+        "chore" => "Chore",
+        _ => "Item",
     }
 }
 
@@ -1727,21 +1744,6 @@ async fn update_work_item(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BindPrKind {
-    Task,
-    Chore,
-}
-
-impl BindPrKind {
-    fn label(self) -> &'static str {
-        match self {
-            BindPrKind::Task => "task",
-            BindPrKind::Chore => "chore",
-        }
-    }
-}
-
 /// Decide what bind-pr should do given the prior `pr_url` value on
 /// the work item. Pure function so it can be unit-tested without an
 /// engine round-trip.
@@ -1766,22 +1768,19 @@ fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrAction<'a> {
     }
 }
 
+/// Shared handler for `boss task bind-pr` and `boss chore bind-pr`.
+/// The kind is read from the actual item, not the noun the user
+/// typed, so either invocation works against any leaf work item id.
 async fn run_bind_pr(
     client: &mut BossClient,
     ctx: &RunContext,
     args: BindPrArgs,
-    kind: BindPrKind,
 ) -> Result<(), CliError> {
     let new_url = validate_github_pr_url(&args.pr_url)?;
 
-    let existing_item = get_work_item(client, &args.id).await?;
-    let existing = match kind {
-        BindPrKind::Task => expect_task(existing_item)?,
-        BindPrKind::Chore => expect_chore(existing_item)?,
-    };
+    let (existing, label) = expect_leaf_work_item(get_work_item(client, &args.id).await?)?;
     let prior_url = existing.pr_url.clone();
 
-    let label = kind.label();
     match classify_bind_pr(prior_url.as_deref(), new_url) {
         BindPrAction::Idempotent => {
             let id_for_print = existing.id.clone();
@@ -1812,16 +1811,9 @@ async fn run_bind_pr(
         pr_url: Some(new_url.to_owned()),
         ..WorkItemPatch::default()
     };
-    let updated = update_work_item(client, &args.id, patch).await?;
-    let updated = match kind {
-        BindPrKind::Task => expect_task(updated)?,
-        BindPrKind::Chore => expect_chore(updated)?,
-    };
+    let (updated, _) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
 
-    let title = match kind {
-        BindPrKind::Task => "Bound PR to task",
-        BindPrKind::Chore => "Bound PR to chore",
-    };
+    let title = format!("Bound PR to {label}");
     print_entity(
         ctx,
         &serde_json::json!({
@@ -1829,7 +1821,7 @@ async fn run_bind_pr(
             "rebinding": prior_url.is_some(),
             "previous_pr_url": prior_url,
         }),
-        || print_task_details(title, &updated),
+        || print_task_details(&title, &updated),
     )
 }
 
@@ -2589,6 +2581,22 @@ fn expect_chore(item: WorkItem) -> Result<Task, CliError> {
     }
 }
 
+/// Permissive counterpart of [`expect_task`] / [`expect_chore`]: the
+/// kind-agnostic verbs (`show`, `update`, `move`, `delete`, `bind-pr`)
+/// accept any leaf work item, so they unwrap the inner [`Task`] and
+/// return the kind label (`"task"` or `"chore"`) for user-facing
+/// labelling. Products and projects still error — those have their
+/// own command surface.
+fn expect_leaf_work_item(item: WorkItem) -> Result<(Task, &'static str), CliError> {
+    match item {
+        WorkItem::Task(task) => Ok((task, "task")),
+        WorkItem::Chore(task) => Ok((task, "chore")),
+        WorkItem::Product(_) | WorkItem::Project(_) => Err(CliError::conflict(
+            "work item is not a task or chore (use `boss product`/`boss project` for those kinds)",
+        )),
+    }
+}
+
 fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError {
     CliError::internal(anyhow::anyhow!(
         "unexpected engine event for {context}: {}",
@@ -2801,9 +2809,10 @@ mod tests {
 
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, ProductCommand,
-        ProductStatus, ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr, pick_by_index,
-        validate_github_pr_url,
+        ProductStatus, ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr,
+        expect_leaf_work_item, pick_by_index, validate_github_pr_url,
     };
+    use boss_protocol::{Product, Project, Task, WorkItem};
 
     #[test]
     fn move_target_maps_review_to_in_review() {
@@ -2837,6 +2846,111 @@ mod tests {
             }
             _ => panic!("expected task move command"),
         }
+    }
+
+    /// `boss task move <chore-id>` is the case from the work item: the
+    /// CLI used to error with "work item is a chore, not a task" even
+    /// though the engine already knew the kind from the id. After the
+    /// consolidation the parser still accepts it (parsing was never
+    /// the issue) and the runtime hands it to the same handler as a
+    /// task id; this test pins the parser shape.
+    #[test]
+    fn parses_task_move_command_with_chore_shaped_id() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "move",
+            "task_18ad79226b0ca630_1a",
+            "--to",
+            "blocked",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Move(args),
+            } => {
+                assert_eq!(args.id, "task_18ad79226b0ca630_1a");
+                assert!(matches!(args.target, MoveTarget::Blocked));
+            }
+            _ => panic!("expected task move command"),
+        }
+    }
+
+    /// `boss chore move` is now a thin alias for the same handler.
+    #[test]
+    fn parses_chore_move_command() {
+        let cli = Cli::parse_from(["boss", "chore", "move", "task_xyz", "--to", "active"]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Move(args),
+            } => {
+                assert_eq!(args.id, "task_xyz");
+                assert!(matches!(args.target, MoveTarget::Active));
+            }
+            _ => panic!("expected chore move command"),
+        }
+    }
+
+    fn dummy_task(id: &str, kind: &str) -> Task {
+        Task {
+            id: id.to_owned(),
+            product_id: "prod_1".to_owned(),
+            project_id: None,
+            kind: kind.to_owned(),
+            name: "n".to_owned(),
+            description: String::new(),
+            status: "todo".to_owned(),
+            ordinal: None,
+            pr_url: None,
+            deleted_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            autostart: true,
+            last_status_actor: "human".to_owned(),
+            priority: "medium".to_owned(),
+        }
+    }
+
+    #[test]
+    fn expect_leaf_accepts_task_and_chore() {
+        let task = dummy_task("task_1", "task");
+        let (unwrapped, label) = expect_leaf_work_item(WorkItem::Task(task.clone())).unwrap();
+        assert_eq!(unwrapped.id, "task_1");
+        assert_eq!(label, "task");
+
+        let chore = dummy_task("task_2", "chore");
+        let (unwrapped, label) = expect_leaf_work_item(WorkItem::Chore(chore)).unwrap();
+        assert_eq!(unwrapped.id, "task_2");
+        assert_eq!(label, "chore");
+    }
+
+    #[test]
+    fn expect_leaf_rejects_product_and_project() {
+        let product = Product {
+            id: "prod_1".to_owned(),
+            name: "n".to_owned(),
+            slug: "n".to_owned(),
+            description: String::new(),
+            repo_remote_url: None,
+            status: "active".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert!(expect_leaf_work_item(WorkItem::Product(product)).is_err());
+
+        let project = Project {
+            id: "proj_1".to_owned(),
+            product_id: "prod_1".to_owned(),
+            name: "n".to_owned(),
+            slug: "n".to_owned(),
+            description: String::new(),
+            goal: String::new(),
+            status: "planned".to_owned(),
+            priority: "medium".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_status_actor: "human".to_owned(),
+        };
+        assert!(expect_leaf_work_item(WorkItem::Project(project)).is_err());
     }
 
     #[test]
