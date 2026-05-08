@@ -5,9 +5,10 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, ListDependenciesInput, Product, Project,
+    CreateRunInput, CreateTaskInput, DependencyFilter, ListDependenciesInput, Product, Project,
     RemoveDependencyInput, RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -106,13 +107,26 @@ pub enum FrontendRequest {
     ListProducts,
     ListProjects {
         product_id: String,
+        /// Phase 3 dep filter (Q6). Restricts the returned list to
+        /// rows that match a dependency-graph predicate before any
+        /// CLI-side filters (status / match / id). Backwards-
+        /// compatible: pre-Phase-3 callers omit the field and get the
+        /// historical behaviour.
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
     },
     ListTasks {
         product_id: String,
         project_id: Option<String>,
+        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
     },
     ListChores {
         product_id: String,
+        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
     },
     GetWorkItem {
         id: String,
@@ -319,6 +333,15 @@ pub enum FrontendRequest {
     /// Return the prerequisite and/or dependent edges for one work
     /// item. `direction` defaults to `both`.
     ListDependencies {
+        #[serde(flatten)]
+        input: ListDependenciesInput,
+    },
+    /// Resolved counterpart of [`Self::ListDependencies`]: returns
+    /// the same incoming / outgoing split, but each entry carries the
+    /// peer's status and name already joined in. Used by `boss
+    /// <kind> show` so the human / JSON renderer needs one round-trip
+    /// instead of N+1.
+    ListDependenciesDetailed {
         #[serde(flatten)]
         input: ListDependenciesInput,
     },
@@ -603,6 +626,12 @@ pub enum FrontendEvent {
     /// dependents in two parallel lists.
     DependencyList {
         view: WorkItemDependencyView,
+    },
+    /// Resolved edge listing — same shape as
+    /// [`Self::DependencyList`] but each side carries the peer's
+    /// status and name already joined in.
+    DependencyDetail {
+        detail: WorkItemDependencyDetail,
     },
 }
 

@@ -8,9 +8,10 @@ use boss_client::{
 };
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, FrontendEvent,
-    FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput, Task,
-    WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
+    DependencyFilter, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    RemoveDependencyInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -322,6 +323,9 @@ struct ProjectListArgs {
     /// Filter to specific id(s); repeatable.
     #[arg(long)]
     id: Vec<String>,
+
+    #[command(flatten)]
+    dep: DependencyFilterArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -377,6 +381,25 @@ struct TaskListArgs {
 
     #[arg(long)]
     project: Option<String>,
+
+    /// Filter by status. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<TaskStatus>,
+
+    /// Case-insensitive substring match against name and description.
+    #[arg(long = "match")]
+    match_term: Option<String>,
+
+    /// Cap the number of returned rows (applied after filtering).
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Filter to specific id(s); repeatable.
+    #[arg(long)]
+    id: Vec<String>,
+
+    #[command(flatten)]
+    dep: DependencyFilterArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -455,6 +478,52 @@ struct ChoreListArgs {
     /// Filter to specific id(s); repeatable.
     #[arg(long)]
     id: Vec<String>,
+
+    #[command(flatten)]
+    dep: DependencyFilterArgs,
+}
+
+/// The four dependency-graph filter flags from design Q6. They are
+/// mutually exclusive — clap enforces this so the engine never sees
+/// an over-constrained request. Flattened into each
+/// `*ListArgs` so every list verb gets the same surface.
+#[derive(Debug, Clone, Args)]
+#[group(multiple = false)]
+struct DependencyFilterArgs {
+    /// Items that the named work item depends on (its incoming edges).
+    #[arg(long = "prerequisites-of", value_name = "ID")]
+    prerequisites_of: Option<String>,
+
+    /// Items that depend on the named work item (its outgoing edges).
+    #[arg(long = "dependents-of", value_name = "ID")]
+    dependents_of: Option<String>,
+
+    /// Items in `todo` with no gating prerequisite — i.e. what the
+    /// dispatcher could pick up next.
+    #[arg(long = "unblocked")]
+    unblocked: bool,
+
+    /// Items currently gated by at least one incomplete prereq.
+    #[arg(long = "blocked-by-deps")]
+    blocked_by_deps: bool,
+}
+
+impl DependencyFilterArgs {
+    fn into_filter(self) -> Option<DependencyFilter> {
+        if let Some(id) = self.prerequisites_of {
+            return Some(DependencyFilter::PrerequisitesOf { id });
+        }
+        if let Some(id) = self.dependents_of {
+            return Some(DependencyFilter::DependentsOf { id });
+        }
+        if self.unblocked {
+            return Some(DependencyFilter::Unblocked);
+        }
+        if self.blocked_by_deps {
+            return Some(DependencyFilter::BlockedByDeps);
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1035,7 +1104,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
         }
         ProjectCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
-            let projects = list_projects(&mut client, &product.id).await?;
+            let dep_filter = args.dep.into_filter();
+            let projects = list_projects(&mut client, &product.id, dep_filter).await?;
             let projects = apply_project_list_filters(
                 projects,
                 &args.status,
@@ -1053,9 +1123,22 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
-            print_entity(ctx, &serde_json::json!({ "project": project }), || {
-                print_project_details("Project", &project);
-            })
+            let detail = list_dependencies_detailed(
+                &mut client,
+                ListDependenciesInput {
+                    work_item: project.id.clone(),
+                    direction: Some(DependencyDirection::Both),
+                },
+            )
+            .await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "project": project, "dependencies": detail }),
+                || {
+                    print_project_details("Project", &project);
+                    print_dependency_section(&detail);
+                },
+            )
         }
         ProjectCommand::Update(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
@@ -1154,21 +1237,43 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 }
                 None => None,
             };
+            let dep_filter = args.dep.into_filter();
             let tasks = list_tasks(
                 &mut client,
                 &product.id,
                 project.as_ref().map(|project| project.id.as_str()),
+                dep_filter,
             )
             .await?;
+            let tasks = apply_task_list_filters(
+                tasks,
+                &args.status,
+                args.match_term.as_deref(),
+                &args.id,
+                args.limit,
+            );
             print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
                 print_tasks_table(&tasks)
             })
         }
         TaskCommand::Show(args) => {
             let task = expect_task(get_work_item(&mut client, &args.id).await?)?;
-            print_entity(ctx, &serde_json::json!({ "task": task }), || {
-                print_task_details("Task", &task);
-            })
+            let detail = list_dependencies_detailed(
+                &mut client,
+                ListDependenciesInput {
+                    work_item: task.id.clone(),
+                    direction: Some(DependencyDirection::Both),
+                },
+            )
+            .await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "task": task, "dependencies": detail }),
+                || {
+                    print_task_details("Task", &task);
+                    print_dependency_section(&detail);
+                },
+            )
         }
         TaskCommand::Update(args) => {
             let patch = WorkItemPatch {
@@ -1260,7 +1365,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         }
         ChoreCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
-            let chores = list_chores(&mut client, &product.id).await?;
+            let dep_filter = args.dep.into_filter();
+            let chores = list_chores(&mut client, &product.id, dep_filter).await?;
             let chores = apply_task_list_filters(
                 chores,
                 &args.status,
@@ -1274,9 +1380,22 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         }
         ChoreCommand::Show(args) => {
             let chore = expect_chore(get_work_item(&mut client, &args.id).await?)?;
-            print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
-                print_task_details("Chore", &chore);
-            })
+            let detail = list_dependencies_detailed(
+                &mut client,
+                ListDependenciesInput {
+                    work_item: chore.id.clone(),
+                    direction: Some(DependencyDirection::Both),
+                },
+            )
+            .await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "chore": chore, "dependencies": detail }),
+                || {
+                    print_task_details("Chore", &chore);
+                    print_dependency_section(&detail);
+                },
+            )
         }
         ChoreCommand::Update(args) => {
             let patch = WorkItemPatch {
@@ -1404,10 +1523,12 @@ async fn list_products(client: &mut BossClient) -> Result<Vec<Product>, CliError
 async fn list_projects(
     client: &mut BossClient,
     product_id: &str,
+    dep_filter: Option<DependencyFilter>,
 ) -> Result<Vec<Project>, CliError> {
     match client
         .send_request(&FrontendRequest::ListProjects {
             product_id: product_id.to_owned(),
+            dep_filter,
         })
         .await
         .map_err(CliError::internal)?
@@ -1424,11 +1545,13 @@ async fn list_tasks(
     client: &mut BossClient,
     product_id: &str,
     project_id: Option<&str>,
+    dep_filter: Option<DependencyFilter>,
 ) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListTasks {
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
+            dep_filter,
         })
         .await
         .map_err(CliError::internal)?
@@ -1441,10 +1564,15 @@ async fn list_tasks(
     }
 }
 
-async fn list_chores(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>, CliError> {
+async fn list_chores(
+    client: &mut BossClient,
+    product_id: &str,
+    dep_filter: Option<DependencyFilter>,
+) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
+            dep_filter,
         })
         .await
         .map_err(CliError::internal)?
@@ -2039,6 +2167,23 @@ async fn list_dependencies(
     }
 }
 
+async fn list_dependencies_detailed(
+    client: &mut BossClient,
+    input: ListDependenciesInput,
+) -> Result<WorkItemDependencyDetail, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListDependenciesDetailed { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::DependencyDetail { detail } => Ok(detail),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("dependency detail", &other)),
+    }
+}
+
 fn print_dependency_view(view: &WorkItemDependencyView) {
     println!("Dependencies for {}:", view.work_item_id);
     if view.prerequisites.is_empty() && view.dependents.is_empty() {
@@ -2056,6 +2201,77 @@ fn print_dependency_view(view: &WorkItemDependencyView) {
         for edge in &view.dependents {
             println!("    {} ({})", edge.dependent_id, edge.relation);
         }
+    }
+}
+
+/// Print the Dependencies section appended by `boss <kind> show`
+/// (Q6). Empty input prints nothing — the surrounding `show` already
+/// rendered the rest of the row, and a noisy "Dependencies: (none)"
+/// every time would drown out the common case. The body is composed
+/// via [`format_dependency_section`] so unit tests can assert on the
+/// text without capturing stdout.
+fn print_dependency_section(detail: &WorkItemDependencyDetail) {
+    for line in format_dependency_section(detail) {
+        println!("{line}");
+    }
+}
+
+/// Pure-function renderer for the Dependencies section. Returns the
+/// human-mode lines that [`print_dependency_section`] would emit.
+/// Empty result when both sides are empty so the caller can detect
+/// "nothing to show" without parsing strings.
+fn format_dependency_section(detail: &WorkItemDependencyDetail) -> Vec<String> {
+    if detail.prerequisites.is_empty() && detail.dependents.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    lines.push("Dependencies:".to_owned());
+    if !detail.prerequisites.is_empty() {
+        lines.push(format!(
+            "  Prerequisites ({}):",
+            detail.prerequisites.len()
+        ));
+        for edge in &detail.prerequisites {
+            lines.push(format_dependency_edge_line(edge, true));
+        }
+    }
+    if !detail.dependents.is_empty() {
+        lines.push(format!("  Dependents ({}):", detail.dependents.len()));
+        for edge in &detail.dependents {
+            lines.push(format_dependency_edge_line(edge, false));
+        }
+    }
+    lines
+}
+
+fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete: bool) -> String {
+    let name = if edge.name.is_empty() {
+        String::new()
+    } else {
+        format!(" \"{}\"", edge.name)
+    };
+    let suffix = if mark_incomplete && !dependency_status_is_satisfied(&edge.id, &edge.status) {
+        "  ← INCOMPLETE"
+    } else {
+        ""
+    };
+    format!(
+        "    {id:<32}  {status:<10}{name}{suffix}",
+        id = edge.id,
+        status = edge.status,
+    )
+}
+
+/// Whether `status` counts as "this prereq is no longer gating its
+/// dependent." Mirrors the engine-side rule (Q4 / Q10): tasks /
+/// chores satisfy on `done`; projects also satisfy on `archived`.
+/// The dependent annotator uses the inverse to print
+/// `← INCOMPLETE`.
+fn dependency_status_is_satisfied(id: &str, status: &str) -> bool {
+    if id.starts_with("proj_") {
+        matches!(status, "done" | "archived")
+    } else {
+        status == "done"
     }
 }
 
@@ -2110,7 +2326,7 @@ async fn resolve_project(
     selector: Option<String>,
     ctx: &RunContext,
 ) -> Result<Project, CliError> {
-    let projects = list_projects(client, product_id).await?;
+    let projects = list_projects(client, product_id, None).await?;
     if projects.is_empty() {
         return Err(CliError::not_found(
             "no projects exist for the selected product",

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,10 +9,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 pub use boss_protocol::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, DependencyDirection, ExecutionReconcileResult,
-    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput, Task,
-    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
+    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
+    ExecutionReconcileResult, ListDependenciesInput, Product, Project, RemoveDependencyInput,
+    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkTree,
 };
 
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
@@ -74,7 +75,11 @@ impl WorkDb {
         Ok(product)
     }
 
-    pub fn list_projects(&self, product_id: &str) -> Result<Vec<Project>> {
+    pub fn list_projects(
+        &self,
+        product_id: &str,
+        dep_filter: Option<&DependencyFilter>,
+    ) -> Result<Vec<Project>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
@@ -85,7 +90,11 @@ impl WorkDb {
              ORDER BY created_at ASC, name COLLATE NOCASE ASC",
         )?;
         let rows = stmt.query_map([product_id], map_project)?;
-        collect_rows(rows)
+        let mut projects: Vec<Project> = collect_rows(rows)?;
+        if let Some(filter) = dep_filter {
+            apply_dep_filter(&conn, filter, |project: &Project| project.id.as_str(), |project: &Project| project.status.as_str(), &mut projects)?;
+        }
+        Ok(projects)
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
@@ -1117,11 +1126,16 @@ impl WorkDb {
         }
     }
 
-    pub fn list_tasks(&self, product_id: &str, project_id: Option<&str>) -> Result<Vec<Task>> {
+    pub fn list_tasks(
+        &self,
+        product_id: &str,
+        project_id: Option<&str>,
+        dep_filter: Option<&DependencyFilter>,
+    ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
-        if let Some(project_id) = project_id {
+        let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
@@ -1130,17 +1144,28 @@ impl WorkDb {
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map(params![product_id, project_id], map_task)?;
-            return collect_rows(rows);
-        }
+            collect_rows(rows)?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+                 FROM tasks
+                 WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
+                 ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([product_id], map_task)?;
+            collect_rows(rows)?
+        };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
-             FROM tasks
-             WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
-             ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
-        )?;
-        let rows = stmt.query_map([product_id], map_task)?;
-        collect_rows(rows)
+        if let Some(filter) = dep_filter {
+            apply_dep_filter(
+                &conn,
+                filter,
+                |task: &Task| task.id.as_str(),
+                |task: &Task| task.status.as_str(),
+                &mut tasks,
+            )?;
+        }
+        Ok(tasks)
     }
 
     /// Look up a cached pane-titlebar summary for a work item.
@@ -1182,7 +1207,11 @@ impl WorkDb {
         Ok(())
     }
 
-    pub fn list_chores(&self, product_id: &str) -> Result<Vec<Task>> {
+    pub fn list_chores(
+        &self,
+        product_id: &str,
+        dep_filter: Option<&DependencyFilter>,
+    ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
@@ -1193,7 +1222,17 @@ impl WorkDb {
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([product_id], map_task)?;
-        collect_rows(rows)
+        let mut chores: Vec<Task> = collect_rows(rows)?;
+        if let Some(filter) = dep_filter {
+            apply_dep_filter(
+                &conn,
+                filter,
+                |chore: &Task| chore.id.as_str(),
+                |chore: &Task| chore.status.as_str(),
+                &mut chores,
+            )?;
+        }
+        Ok(chores)
     }
 
     /// Read the unsatisfied prerequisites of `work_item_id` outside
@@ -1321,6 +1360,55 @@ impl WorkDb {
             }
         };
         Ok(WorkItemDependencyView {
+            work_item_id: work_item_id.to_owned(),
+            prerequisites,
+            dependents,
+        })
+    }
+
+    /// Resolved counterpart of [`Self::list_dependencies`]: each edge
+    /// is collapsed into the peer's id + status + name + kind so the
+    /// CLI / app shows the gate context without a second lookup.
+    /// Drives the `boss <kind> show` Dependencies section (Q6).
+    pub fn list_dependencies_detailed(
+        &self,
+        input: ListDependenciesInput,
+    ) -> Result<WorkItemDependencyDetail> {
+        let work_item_id = input.work_item.trim();
+        if work_item_id.is_empty() {
+            bail!("work_item id is required");
+        }
+        let conn = self.connect()?;
+        let _ = product_id_for_work_item(&conn, work_item_id)?;
+
+        let direction = input.direction.unwrap_or_default();
+        let prerequisites = match direction {
+            DependencyDirection::Dependents => Vec::new(),
+            DependencyDirection::Prereqs | DependencyDirection::Both => {
+                let edges = deps::prerequisites_of(&conn, work_item_id, None)?;
+                edges
+                    .into_iter()
+                    .map(|edge| {
+                        let peer_id = edge.prerequisite_id.clone();
+                        resolve_dependency_edge(&conn, &peer_id, &edge.relation)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let dependents = match direction {
+            DependencyDirection::Prereqs => Vec::new(),
+            DependencyDirection::Dependents | DependencyDirection::Both => {
+                let edges = deps::dependents_of(&conn, work_item_id, None)?;
+                edges
+                    .into_iter()
+                    .map(|edge| {
+                        let peer_id = edge.dependent_id.clone();
+                        resolve_dependency_edge(&conn, &peer_id, &edge.relation)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        Ok(WorkItemDependencyDetail {
             work_item_id: work_item_id.to_owned(),
             prerequisites,
             dependents,
@@ -2886,6 +2974,133 @@ fn classify_id(id: &str) -> Result<ItemKind> {
     bail!("unknown work item id format: {id}")
 }
 
+/// Resolve a single edge endpoint into its [`DependencyEdge`] view.
+/// `peer_id` is the *other* end of the edge (the prerequisite when
+/// the edge sits in the prerequisites list, the dependent when it
+/// sits in the dependents list). Looks up the row's status / name /
+/// kind so the view is fully self-contained. A peer that no longer
+/// resolves (soft-deleted task; concurrent delete) renders as
+/// `kind = "unknown"` with empty name and `status = "missing"` —
+/// the human renderer surfaces it instead of dropping the row, so
+/// the user can spot dangling edges and clean them up.
+fn resolve_dependency_edge(
+    conn: &Connection,
+    peer_id: &str,
+    relation: &str,
+) -> Result<DependencyEdge> {
+    if peer_id.starts_with("proj_") {
+        if let Some(project) = query_project(conn, peer_id)? {
+            return Ok(DependencyEdge {
+                id: project.id,
+                relation: relation.to_owned(),
+                kind: "project".to_owned(),
+                name: project.name,
+                status: project.status,
+            });
+        }
+    } else if peer_id.starts_with("task_") {
+        if let Some(task) = query_task(conn, peer_id)? {
+            let kind = match task.kind.as_str() {
+                "chore" => "chore",
+                _ => "task",
+            };
+            return Ok(DependencyEdge {
+                id: task.id,
+                relation: relation.to_owned(),
+                kind: kind.to_owned(),
+                name: task.name,
+                status: task.status,
+            });
+        }
+    }
+    Ok(DependencyEdge {
+        id: peer_id.to_owned(),
+        relation: relation.to_owned(),
+        kind: "unknown".to_owned(),
+        name: String::new(),
+        status: "missing".to_owned(),
+    })
+}
+
+/// Mutate `items` in place to retain only the rows that match
+/// `filter`. The closure pair lets the same helper drive task,
+/// chore, and project lists — they all key on `id` and `status`,
+/// just on different row types.
+///
+/// `Unblocked` and `BlockedByDeps` need the full set of gated ids
+/// for the open product, computed once via a pair of joins (see
+/// [`compute_gated_work_item_ids`]). `PrerequisitesOf` and
+/// `DependentsOf` need only the edge listing for the named row, so
+/// they walk the existing dep helpers directly.
+fn apply_dep_filter<T, F, G>(
+    conn: &Connection,
+    filter: &DependencyFilter,
+    id_of: F,
+    status_of: G,
+    items: &mut Vec<T>,
+) -> Result<()>
+where
+    F: Fn(&T) -> &str,
+    G: Fn(&T) -> &str,
+{
+    match filter {
+        DependencyFilter::PrerequisitesOf { id } => {
+            let edges = deps::prerequisites_of(conn, id, None)?;
+            let allowed: HashSet<String> =
+                edges.into_iter().map(|edge| edge.prerequisite_id).collect();
+            items.retain(|item| allowed.contains(id_of(item)));
+        }
+        DependencyFilter::DependentsOf { id } => {
+            let edges = deps::dependents_of(conn, id, None)?;
+            let allowed: HashSet<String> =
+                edges.into_iter().map(|edge| edge.dependent_id).collect();
+            items.retain(|item| allowed.contains(id_of(item)));
+        }
+        DependencyFilter::Unblocked => {
+            let gated = compute_gated_work_item_ids(conn)?;
+            items.retain(|item| status_of(item) == "todo" && !gated.contains(id_of(item)));
+        }
+        DependencyFilter::BlockedByDeps => {
+            let gated = compute_gated_work_item_ids(conn)?;
+            items.retain(|item| gated.contains(id_of(item)));
+        }
+    }
+    Ok(())
+}
+
+/// Set of work item ids that have at least one `blocks` edge to a
+/// prerequisite that has not reached a satisfied status. Tasks /
+/// chores satisfy on `status = 'done'`; projects also satisfy on
+/// `archived` (Q4 / Q10). Computed via two SQL joins so the helper
+/// does one round-trip regardless of the dependent count.
+fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut ids: HashSet<String> = HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT d.dependent_id
+         FROM work_item_dependencies d
+         JOIN tasks t ON t.id = d.prerequisite_id
+         WHERE d.relation = 'blocks'
+           AND t.deleted_at IS NULL
+           AND t.status != 'done'",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        ids.insert(row?);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT d.dependent_id
+         FROM work_item_dependencies d
+         JOIN projects p ON p.id = d.prerequisite_id
+         WHERE d.relation = 'blocks'
+           AND p.status NOT IN ('done', 'archived')",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
+}
+
 /// Stamp a dependent's status to `blocked` and `last_status_actor`
 /// to `'engine'` if (a) the dependent is currently in a status
 /// other than `blocked`, `done`, `archived`, and (b) it has at least
@@ -3149,7 +3364,9 @@ mod tests {
             assert_eq!(task.autostart, i % 2 == 0);
         }
 
-        let tasks = db.list_tasks(&product.id, Some(&project.id)).unwrap();
+        let tasks = db
+            .list_tasks(&product.id, Some(&project.id), None)
+            .unwrap();
         assert_eq!(tasks.len(), 5);
 
         let _ = std::fs::remove_file(path);
@@ -3203,7 +3420,9 @@ mod tests {
             "error must name failing index: {msg}"
         );
 
-        let tasks = db.list_tasks(&product.id, Some(&project.id)).unwrap();
+        let tasks = db
+            .list_tasks(&product.id, Some(&project.id), None)
+            .unwrap();
         assert!(tasks.is_empty(), "rollback must leave no rows");
 
         let _ = std::fs::remove_file(path);

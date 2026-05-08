@@ -2348,8 +2348,11 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::ListProjects { product_id } => {
-                match work_db.list_projects(&product_id) {
+            FrontendRequest::ListProjects {
+                product_id,
+                dep_filter,
+            } => {
+                match work_db.list_projects(&product_id, dep_filter.as_ref()) {
                     Ok(projects) => {
                         send_response_with_revision(
                             &sink,
@@ -2375,7 +2378,8 @@ async fn handle_frontend_connection(
             FrontendRequest::ListTasks {
                 product_id,
                 project_id,
-            } => match work_db.list_tasks(&product_id, project_id.as_deref()) {
+                dep_filter,
+            } => match work_db.list_tasks(&product_id, project_id.as_deref(), dep_filter.as_ref()) {
                 Ok(tasks) => {
                     send_response_with_revision(
                         &sink,
@@ -2398,7 +2402,10 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::ListChores { product_id } => match work_db.list_chores(&product_id) {
+            FrontendRequest::ListChores {
+                product_id,
+                dep_filter,
+            } => match work_db.list_chores(&product_id, dep_filter.as_ref()) {
                 Ok(chores) => {
                     send_response_with_revision(
                         &sink,
@@ -3848,6 +3855,22 @@ async fn handle_frontend_connection(
                     },
                 ),
             },
+            FrontendRequest::ListDependenciesDetailed { input } => {
+                match work_db.list_dependencies_detailed(input) {
+                    Ok(detail) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::DependencyDetail { detail },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
         }
     }
 
