@@ -1,10 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+
+/// How long sqlite will internally retry on `SQLITE_BUSY` before
+/// surfacing the error to the caller. We funnel concurrent CLI writes
+/// against the same `state.db` (multiple `boss chore bind-pr` etc.
+/// landing in the engine in parallel) — without this the second writer
+/// would fail with "database is locked" even though the first writer
+/// finishes in microseconds. Five seconds is overkill for the in-engine
+/// case (writes are tiny) but cheap when uncontended.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use boss_protocol::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
@@ -1685,9 +1694,29 @@ impl WorkDb {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)
+        let mut conn = Connection::open(&self.path)
             .with_context(|| format!("failed to open work db {}", self.path.display()))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // WAL lets readers and writers coexist (read-side concurrency
+        // is unaffected by an in-flight write) and `busy_timeout`
+        // turns lock contention into latency rather than an error
+        // returned to the caller. `synchronous = NORMAL` is the
+        // recommended pairing for WAL — durable across application
+        // crashes, only loses commits on OS/power loss, which is fine
+        // for engine state we can rebuild.
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;\n\
+             PRAGMA synchronous = NORMAL;\n\
+             PRAGMA foreign_keys = ON;",
+        )?;
+        // Default writes to `BEGIN IMMEDIATE`. With the previous
+        // `BEGIN DEFERRED`, two concurrent writers could each open a
+        // read-mode transaction, then both try to upgrade to write,
+        // and the loser fails with `SQLITE_BUSY_SNAPSHOT` — which the
+        // busy-timeout handler does NOT retry. `IMMEDIATE` acquires
+        // the write lock up front so the second caller waits inside
+        // the busy handler instead of racing.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
         Ok(conn)
     }
 
@@ -6577,5 +6606,101 @@ mod tests {
             .unwrap();
         assert_eq!(version, "4");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: previously, four `boss chore bind-pr` calls in
+    /// flight against the same engine would race on a single sqlite
+    /// connection-per-call with no busy-timeout, and one of them
+    /// would surface "database is locked" to the caller. With WAL +
+    /// busy_timeout + IMMEDIATE transactions, concurrent writes on
+    /// distinct rows must all succeed.
+    #[test]
+    fn concurrent_writes_do_not_return_database_locked() {
+        const WORKERS: usize = 8;
+
+        let path = temp_db_path("concurrent-writes");
+        let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // One chore per worker, so each write hits a distinct row —
+        // matching the real-world reconcile pattern where a script
+        // binds N PRs to N different chores in parallel.
+        let chore_ids: Vec<String> = (0..WORKERS)
+            .map(|i| {
+                db.create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: format!("Concurrent chore {i}"),
+                    description: None,
+                    autostart: false,
+                    priority: None,
+                })
+                .unwrap()
+                .id
+            })
+            .collect();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let handles: Vec<_> = chore_ids
+            .iter()
+            .enumerate()
+            .map(|(i, chore_id)| {
+                let db = db.clone();
+                let chore_id = chore_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    // Park every worker at the gate so the writes
+                    // truly land on the engine at the same instant.
+                    barrier.wait();
+                    db.update_work_item(
+                        &chore_id,
+                        WorkItemPatch {
+                            pr_url: Some(format!(
+                                "https://github.com/spinyfin/mono/pull/{}",
+                                100 + i
+                            )),
+                            ..WorkItemPatch::default()
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let mut failures: Vec<String> = Vec::new();
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.join().unwrap() {
+                Ok(_) => {}
+                Err(err) => failures.push(format!("worker {i}: {err:#}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "expected all {WORKERS} concurrent writes to succeed, got failures: {failures:?}",
+        );
+
+        // And the writes must have actually persisted, not silently
+        // been swallowed by a retry that lost its update.
+        for (i, chore_id) in chore_ids.iter().enumerate() {
+            let item = db.get_work_item(chore_id).unwrap();
+            let WorkItem::Chore(task) = item else {
+                panic!("expected chore {chore_id} to round-trip as a Chore");
+            };
+            assert_eq!(
+                task.pr_url.as_deref(),
+                Some(format!("https://github.com/spinyfin/mono/pull/{}", 100 + i).as_str()),
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        // WAL writes leave -wal / -shm sidecar files; clean them up
+        // so the temp dir doesn't leak.
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 }
