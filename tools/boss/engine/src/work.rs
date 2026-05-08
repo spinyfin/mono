@@ -352,6 +352,88 @@ impl WorkDb {
         Ok(redispatched)
     }
 
+    /// Steady-state counterpart of [`Self::reconcile_active_dispatch`]
+    /// used by the dispatcher when a worker frees up. Re-issues
+    /// `RequestExecution` for every active task/chore whose latest
+    /// execution is missing or terminal — i.e., the items the
+    /// create-time dispatch couldn't place because the pool was full
+    /// or whose worker died after the kanban moved them to `active`.
+    ///
+    /// Differs from `reconcile_active_dispatch` in three ways:
+    ///
+    /// 1. Honours the per-task `autostart` flag. Items with
+    ///    `autostart=false` are deliberately parked in `active` until
+    ///    a human resumes them — the on-free rescan must not
+    ///    auto-restart them silently. The startup reconcile rehydrates
+    ///    them once because everything is being brought back online,
+    ///    but a recurring rescan would loop on a chore that died for
+    ///    a reason the user already opted out of auto-handling.
+    /// 2. Skips items that are dependency-gated (a `blocks` prereq is
+    ///    still unmet) instead of bailing the whole transaction.
+    /// 3. Orders the candidate set by `tasks.updated_at ASC` so the
+    ///    rescan acts FIFO — the chore that has been waiting longest
+    ///    gets the freed worker first.
+    ///
+    /// Items whose latest execution is still non-terminal (`ready`,
+    /// `running`, `waiting_*`) are left alone — `kick()` already
+    /// consumes the `ready` queue, and the others are owned by a
+    /// live worker or the dependency engine. Returns the work item
+    /// ids that were freshly redispatched so the caller can log them.
+    pub fn rescan_active_dispatch(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        // FIFO by `updated_at` so the chore that has been waiting
+        // longest gets the freed worker. `id` is the deterministic
+        // tie-breaker for rows that share an updated_at second.
+        let candidates: Vec<(String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, autostart FROM tasks
+                 WHERE status = 'active' AND deleted_at IS NULL
+                 ORDER BY updated_at ASC, id ASC",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut redispatched = Vec::new();
+        for (work_item_id, autostart) in candidates {
+            if !autostart {
+                continue;
+            }
+            let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+                Some(existing) => execution_status_is_terminal(&existing.status),
+                None => true,
+            };
+            if !needs_dispatch {
+                continue;
+            }
+            // Silently skip gated items so the rescan keeps going.
+            // request_execution_in_tx_with_live_check would bail and
+            // roll back the entire transaction otherwise.
+            if !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty() {
+                continue;
+            }
+            request_execution_in_tx_with_live_check(
+                &tx,
+                RequestExecutionInput {
+                    work_item_id: work_item_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                // `|_| true` keeps any non-terminal execution intact —
+                // the on-free rescan only ever fires this branch when
+                // the latest execution is terminal anyway, so the
+                // closure is unreachable in the redispatch path.
+                |_| true,
+            )?;
+            redispatched.push(work_item_id);
+        }
+        tx.commit()?;
+        Ok(redispatched)
+    }
+
     /// Return the work item ids whose `tasks.status = 'active'` but
     /// whose latest execution is NOT in `running` (no live worker is
     /// currently driving the slot). Used by the dispatcher to surface
@@ -4701,6 +4783,314 @@ mod tests {
         let result = db.reconcile_product_executions(&product.id).unwrap();
         assert_eq!(result.created.len(), 1);
         assert_eq!(result.created[0].work_item_id, chore.id);
+    }
+
+    /// Steady-state on-free rescan: an `active` chore whose only
+    /// execution is terminal (worker died, cube lease errored, …)
+    /// gets a fresh `ready` row so the next `kick()` can land it on
+    /// the freed worker. This is the path the create-time dispatcher
+    /// alone can't reach — it only runs at chore creation, not on
+    /// release.
+    #[test]
+    fn rescan_redispatches_active_chore_with_terminal_execution() {
+        let path = temp_db_path("rescan-terminal");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stuck chore".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions.last().unwrap().status, "ready");
+    }
+
+    /// Same shape as the previous test, but the chore has no
+    /// execution at all — the create-time dispatcher never inserted
+    /// one, e.g. because a kanban drag set the status without going
+    /// through `request_execution`. Rescan must still produce a
+    /// `ready` row.
+    #[test]
+    fn rescan_redispatches_active_chore_with_no_execution() {
+        let path = temp_db_path("rescan-no-exec");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Pristine chore".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].status, "ready");
+    }
+
+    /// Rescan must NOT touch a chore whose latest execution is still
+    /// non-terminal — that's an in-flight or already-queued worker.
+    /// Re-dispatching would create a duplicate row that the scheduler
+    /// would race against.
+    #[test]
+    fn rescan_skips_active_chore_with_live_execution() {
+        let path = temp_db_path("rescan-live");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Live chore".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("ready".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert!(
+            redispatched.is_empty(),
+            "non-terminal execution should be left alone, got {redispatched:?}",
+        );
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1, "no duplicate ready row should be inserted");
+    }
+
+    /// `autostart=false` items live in `active` deliberately: the
+    /// human moved them there but explicitly opted out of the
+    /// auto-dispatcher. The on-free rescan must respect that flag —
+    /// otherwise a chore that died once would loop on every worker
+    /// release.
+    #[test]
+    fn rescan_skips_no_autostart_active_chore() {
+        let path = temp_db_path("rescan-no-autostart");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert!(
+            redispatched.is_empty(),
+            "autostart=false items must stay parked, got {redispatched:?}",
+        );
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1, "no fresh ready row for autostart=false");
+        assert_eq!(executions[0].status, "failed");
+    }
+
+    /// FIFO ordering: the active chore that was moved to `active`
+    /// first should be the first one redispatched. Later kanban
+    /// drags wait their turn.
+    #[test]
+    fn rescan_orders_candidates_by_updated_at_ascending() {
+        let path = temp_db_path("rescan-fifo");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let mut chore_ids = Vec::new();
+        for index in 0..3 {
+            let chore = db
+                .create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: format!("Chore {index}"),
+                    description: None,
+                    autostart: true,
+                })
+                .unwrap();
+            chore_ids.push(chore.id);
+        }
+
+        // Drive `updated_at` to a known order: chore[0] dragged first,
+        // chore[1] second, chore[2] last. The `updated_at` column has
+        // second-level resolution, so write distinct stamps directly
+        // to make the FIFO ordering deterministic without sleeping.
+        for (index, chore_id) in chore_ids.iter().enumerate() {
+            db.update_work_item(
+                chore_id,
+                WorkItemPatch {
+                    status: Some("active".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Stamp updated_at to force the ordering. Earlier index =
+            // earlier stamp = should rescan first.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![format!("2026-01-0{}T00:00:00Z", index + 1), chore_id],
+            )
+            .unwrap();
+        }
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert_eq!(
+            redispatched, chore_ids,
+            "rescan must redispatch in updated_at ASC order",
+        );
+    }
+
+    /// Gated items (an unmet `blocks` prereq) must be silently
+    /// skipped — bailing the transaction would drop redispatches
+    /// for every later candidate too.
+    #[test]
+    fn rescan_skips_gated_active_chore_silently() {
+        let path = temp_db_path("rescan-gated");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Prereq".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Dependent".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        // Add the blocks edge BEFORE flipping dependent to active so
+        // its kanban transition lands on the gated path. We then set
+        // status='active' directly via SQL to mimic state observed in
+        // the bug — a row stuck in active without a healthy execution.
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ?1",
+            rusqlite::params![dependent.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let redispatched = db.rescan_active_dispatch().unwrap();
+        assert!(
+            !redispatched.contains(&dependent.id),
+            "gated dependent must not be redispatched, got {redispatched:?}",
+        );
+        // The dependent has no fresh ready row — its only execution
+        // (if any) is the gated one, and rescan didn't insert another.
+        let dependent_execs = db.list_executions(Some(&dependent.id)).unwrap();
+        assert!(
+            dependent_execs
+                .iter()
+                .all(|exec| exec.status != "ready"),
+            "no ready exec should be created for the gated dependent, got {dependent_execs:?}",
+        );
     }
 
     #[test]

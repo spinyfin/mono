@@ -1023,7 +1023,41 @@ impl ExecutionCoordinator {
         self.worker_pool
             .release_worker(&worker_id, Some(lease.workspace_id.as_str()))
             .await;
+        self.rescan_active_dispatch_after_release();
         self.kick();
+    }
+
+    /// Steady-state rescan of `tasks.status = 'active'` work that
+    /// never made it onto a worker. The create-time path already
+    /// queues a `ready` execution and `kick()`s the scheduler, but a
+    /// chore whose dispatch failed (cube lease error, kanban drag
+    /// while the pool was full, worker died after starting) leaves
+    /// the kanban card in `active` with a *terminal* (or absent)
+    /// execution row — `list_ready_executions` skips it and `kick()`
+    /// alone is not enough to reanimate it. Running
+    /// [`WorkDb::rescan_active_dispatch`] before each kick fixes
+    /// that: items whose latest execution is terminal (or missing)
+    /// get a fresh `ready` row, and the scheduler picks them up on
+    /// the just-released worker. Errors are logged and swallowed —
+    /// the rescan is a best-effort opportunistic sweep, not a hard
+    /// invariant.
+    fn rescan_active_dispatch_after_release(&self) {
+        match self.work_db.rescan_active_dispatch() {
+            Ok(redispatched) if !redispatched.is_empty() => {
+                tracing::info!(
+                    count = redispatched.len(),
+                    ids = ?redispatched,
+                    "rescanned waiting active work after worker release",
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    "active-dispatch rescan failed after worker release; continuing",
+                );
+            }
+        }
     }
 
     async fn record_run_completion(
@@ -2740,6 +2774,195 @@ mod tests {
     /// because the macOS app only has eight panes. A force-launch
     /// request that arrives with every hard-cap slot busy must surface
     /// a real error instead of silently overcommitting.
+    /// On-free rescan regression: a chore whose `tasks.status` is
+    /// `active` but whose latest execution is terminal (worker died,
+    /// cube lease errored, kanban-drag-while-pool-was-full) must be
+    /// redispatched the next time a worker frees up. Without the
+    /// rescan, `kick()` only sees `ready` executions and the stuck
+    /// chore stays in Doing forever.
+    #[tokio::test]
+    async fn worker_release_redispatches_active_chore_with_terminal_execution() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // Warm-up chore: gets a normal `ready` execution so the
+        // dispatcher has something to consume the single pool slot.
+        // Its run completes via FakeExecutionRunner (WaitingHuman), at
+        // which point the pool worker is released and our rescan fires.
+        let warm = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Warm-up".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Stuck chore: `active` with a `failed` execution row,
+        // mimicking the bug — worker died, kanban card stayed in
+        // Doing, and the create-time dispatch path won't ever look
+        // at it again.
+        let stuck = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stuck".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &stuck.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(crate::work::CreateExecutionInput {
+            work_item_id: stuck.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: None,
+            priority: None,
+            preferred_workspace_id: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+
+        // Wait for the stuck chore to reach a non-failed execution
+        // — that means the rescan inserted a fresh `ready` row and
+        // the post-release `kick()` claimed it.
+        for _ in 0..400 {
+            let executions = db.list_executions(Some(&stuck.id)).unwrap();
+            if executions
+                .iter()
+                .any(|exec| matches!(exec.status.as_str(), "running" | "waiting_human"))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let warm_execs = db.list_executions(Some(&warm.id)).unwrap();
+        let stuck_execs = db.list_executions(Some(&stuck.id)).unwrap();
+        panic!(
+            "stuck chore was never redispatched after warm-up release;\nwarm executions: {warm_execs:?}\nstuck executions: {stuck_execs:?}",
+        );
+    }
+
+    /// Negative case for the rescan: an `autostart=false` chore that
+    /// is parked in `active` with a terminal execution must remain
+    /// untouched even after a worker frees up. The on-free rescan is
+    /// recurring; without the autostart filter it would loop on a
+    /// chore the user explicitly opted out of auto-handling.
+    #[tokio::test]
+    async fn worker_release_skips_no_autostart_active_chore() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        let warm = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Warm-up".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let parked = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &parked.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(crate::work::CreateExecutionInput {
+            work_item_id: parked.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: None,
+            priority: None,
+            preferred_workspace_id: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+
+        // Wait for the warm-up to settle (its run will finish on
+        // WaitingHuman). After that the rescan has had its chance to
+        // touch the parked chore — it must not have.
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&warm.id)).unwrap()[0].id,
+            "waiting_human",
+        )
+        .await;
+        // Give the post-release rescan a clear window in which to
+        // (incorrectly) redispatch the parked chore. 100ms is plenty
+        // — the rescan is synchronous on the release path.
+        sleep(Duration::from_millis(100)).await;
+
+        let parked_execs = db.list_executions(Some(&parked.id)).unwrap();
+        assert_eq!(
+            parked_execs.len(),
+            1,
+            "autostart=false parked chore must not be redispatched, got {parked_execs:?}",
+        );
+        assert_eq!(parked_execs[0].status, "failed");
+    }
+
     #[tokio::test]
     async fn force_dispatch_errors_at_hard_cap() {
         let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
