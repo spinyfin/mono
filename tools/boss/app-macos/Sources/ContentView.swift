@@ -388,9 +388,7 @@ struct ContentView: View {
             }
             .onChange(of: items.count) {
                 if let last = items.last {
-                    DispatchQueue.main.async {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
+                    proxy.scrollTo(last.id, anchor: .bottom)
                 }
             }
         }
@@ -1980,6 +1978,7 @@ private struct TerminalOutputPane: View {
     @State private var suppressOffsetTracking: Bool = false
     @State private var contentFrame: CGRect = .zero
     @State private var viewportHeight: CGFloat = 0
+    @State private var pinResetTask: Task<Void, Never>?
 
     private let bottomThreshold: CGFloat = 6
 
@@ -2036,10 +2035,17 @@ private struct TerminalOutputPane: View {
                 suppressOffsetTracking = true
                 scrollToBottom(proxy, animated: true)
 
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                pinResetTask?.cancel()
+                pinResetTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(120))
+                    guard !Task.isCancelled else { return }
                     isPinnedToBottom = true
                     suppressOffsetTracking = false
                 }
+            }
+            .onDisappear {
+                pinResetTask?.cancel()
+                pinResetTask = nil
             }
         }
     }
