@@ -420,9 +420,15 @@ struct ServerState {
 ///   may both invoke. This is the right level for the imperative
 ///   `bossctl` verbs (`probe`, `agents stop`, `agents transcript`,
 ///   `work cancel`): the human runs them from wherever they happen
-///   to be — Boss pane, app shell, or *inside a worker pane* — and
-///   `AppOrBoss` admits all of those (workers are siblings under
-///   the app).
+///   to be — Boss pane, app shell, *inside a worker pane*, or a
+///   plain terminal that descends from neither trust root. The
+///   admission rule is "descendant of app or Boss, OR not a
+///   descendant of any registered worker pane" — workers are the
+///   only sibling-process adversary in the V2 threat model, so
+///   excluding worker subtrees is sufficient. Earlier revisions
+///   gated strictly on app/Boss subtree membership and locked the
+///   coordinator out whenever it ran from a shell outside both
+///   (e.g. a tmux pane started before the app launched).
 /// - `BossOnly`: reserved for future control verbs that must reject
 ///   worker-pane callers. No live verb uses this tier today; the
 ///   `bossctl` verbs that previously gated on it (`probe_run`,
@@ -1003,11 +1009,24 @@ impl ServerState {
 
     /// Authorize a peer-pid against an RPC tier. Walks up the peer's
     /// process tree (bounded depth) looking for `app_pid` or
-    /// `boss_pid` registered as a trust root.
+    /// `boss_pid` registered as a trust root, with a worker-exclusion
+    /// fallback for the `AppOrBoss` and `BossOnly` tiers.
     ///
     /// Returns `true` when `tier == User`, when the trust root is
-    /// `None` (test mode), or when an ancestor of `peer_pid` matches
-    /// a relevant trust root.
+    /// `None` (test mode), when an ancestor of `peer_pid` matches a
+    /// relevant trust root, or — for `AppOrBoss` — when the peer is
+    /// not a descendant of any registered worker shell.
+    ///
+    /// `AppOrBoss` semantics: workers are the only sibling-process
+    /// adversary in the V2 threat model, so the gate is "trusted
+    /// subtree, OR not a worker descendant". This matters for the
+    /// live coordinator: the Boss session may run from a shell that
+    /// descends from neither the app nor the registered Boss pid
+    /// (e.g. a tmux pane started before the macOS app launched), and
+    /// the strict subtree-only check kept rejecting `bossctl agents
+    /// transcript`, `bossctl probe`, `bossctl agents stop`, etc. for
+    /// the case the work item names. Worker descendants stay rejected
+    /// by the fallback's worker-pid exclusion.
     ///
     /// `BossOnly` semantics: the design names the registered Boss
     /// session's shell pid as the canonical trust root. When that pid
@@ -1038,12 +1057,30 @@ impl ServerState {
         match tier {
             RpcTier::User => true,
             RpcTier::AppOrBoss => {
+                // Fast path: peer descends from a known trust root. Common
+                // case is the human running bossctl from the Boss pane
+                // (boss_pid descendant), the app shell (app_pid
+                // descendant), or a worker pane (also app_pid descendant
+                // — workers are siblings under the app).
                 let trust_set: Vec<libc::pid_t> =
                     [app_pid, boss_pid].into_iter().flatten().collect();
-                if trust_set.is_empty() {
-                    return false;
+                if !trust_set.is_empty() && is_descendant_of_any(peer_pid, &trust_set) {
+                    return true;
                 }
-                is_descendant_of_any(peer_pid, &trust_set)
+                // Fallback: the coordinator session may run from a shell
+                // that descends from neither trust root — e.g. a plain
+                // terminal, or a tmux pane started before the macOS app
+                // launched, or a separate Claude Code instance steering
+                // the engine. The earlier subtree-only gate rejected
+                // those legitimate calls. Admit any caller that is *not*
+                // a descendant of a registered worker pane shell.
+                // Workers are the only sibling-process adversary in the
+                // V2 threat model (`docs/designs/main.md` §"Worker
+                // isolation"), so excluding worker subtrees is enough to
+                // keep `bossctl agents transcript` and friends from
+                // leaking one worker's transcript to another worker.
+                let worker_pids = self.worker_registry.registered_pids();
+                !is_descendant_of_any(peer_pid, &worker_pids)
             }
             RpcTier::BossOnly => {
                 if let Some(boss_pid) = boss_pid {
@@ -3598,16 +3635,19 @@ async fn handle_frontend_connection(
             }
             FrontendRequest::TailRunTranscript { run_id, lines } => {
                 // `bossctl agents transcript` is a documented
-                // coordinator verb. Same downgrade rationale as
-                // `probe_run` and `stop_run`: BossOnly excluded worker
-                // pane callers, so the coordinator couldn't tail a
-                // sibling worker's transcript when running from inside
-                // another worker. AppOrBoss admits worker descendants.
+                // coordinator verb. The earlier strict subtree-only
+                // AppOrBoss check rejected the live coordinator when
+                // it ran from a shell that descended from neither the
+                // app nor the registered Boss session — see the
+                // `authorize_rpc` AppOrBoss docstring for the
+                // worker-exclusion fallback that fixed it. We still
+                // reject worker descendants so one worker can't
+                // tail another worker's transcript.
                 if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         run_id = %run_id,
-                        "tail_run_transcript rejected: caller not in app/Boss subtree",
+                        "tail_run_transcript rejected: caller is a worker descendant",
                     );
                     send_response(
                         &sink,
@@ -5207,7 +5247,15 @@ mod tests {
         // `cube workspace list`). Locks in that authorize_rpc(User, …)
         // accepts a caller even when both trust roots are set and the
         // caller descends from neither — the live-coordinator-session
-        // failure mode for AppOrBoss.
+        // failure mode that `AppOrBoss` used to share.
+        //
+        // Sanity: with no workers registered, AppOrBoss now admits the
+        // same caller too (the worker-exclusion fallback). The User
+        // tier's value isn't its strictness — it's that it skips the
+        // worker-exclusion walk entirely, so it stays correct even
+        // when the caller IS a worker descendant. We exercise that
+        // worker-rejection invariant in
+        // `app_or_boss_rejects_worker_descendant_outside_app_subtree`.
         let server_state = server_state_with_app_pid(1);
         server_state.set_boss_pid(2);
         let self_pid = std::process::id() as libc::pid_t;
@@ -5215,9 +5263,53 @@ mod tests {
             server_state.authorize_rpc(RpcTier::User, Some(self_pid)),
             "User tier must accept callers outside both trust subtrees",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_or_boss_admits_caller_outside_subtrees_when_not_a_worker() {
+        // Repro for the work item: `bossctl agents transcript` (and its
+        // AppOrBoss siblings — probe, stop, focus, send, interrupt,
+        // cancel) was rejecting the live coordinator session because
+        // the Boss session ran from a shell that descended from
+        // neither the registered app pid nor the registered Boss pid.
+        // The strict subtree-only gate failed and the engine returned
+        // "tail_run_transcript requires app or Boss authority". The
+        // fix admits any caller that isn't a registered worker
+        // descendant, which covers plain terminals, tmux panes
+        // pre-dating the app, separate Claude Code instances driving
+        // bossctl, etc. Workers are still excluded — locked in by the
+        // companion test below.
+        let server_state = server_state_with_app_pid(1);
+        server_state.set_boss_pid(2);
+        let self_pid = std::process::id() as libc::pid_t;
+        assert!(
+            server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
+            "AppOrBoss must accept callers outside both trust subtrees so the live coordinator can use bossctl",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_or_boss_rejects_worker_descendant_outside_app_subtree() {
+        // Defense-in-depth for the AppOrBoss fallback: a caller that
+        // is *not* under app/boss trust subtrees but IS a worker
+        // descendant must still be rejected. Workers are the only
+        // sibling-process adversary in the V2 threat model; the
+        // worker-pid exclusion is the only thing keeping
+        // `tail_run_transcript` from leaking one worker's transcript
+        // into another worker's hands. The test process registers
+        // itself as a worker so the ancestor walk hits on step zero;
+        // app_pid is set to a clearly bogus value (1) so the trust
+        // subtree check fails first.
+        let server_state = server_state_with_app_pid(1);
+        let self_pid = std::process::id() as libc::pid_t;
+        server_state
+            .worker_registry
+            .register(self_pid, "fake-run".to_owned());
         assert!(
             !server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
-            "sanity: AppOrBoss must still reject the same caller, so the User-tier admission isn't an accidental hole",
+            "AppOrBoss must reject worker descendants even when they sit outside the app/Boss subtrees",
         );
     }
 
