@@ -4,7 +4,22 @@ import Foundation
 final class ChatViewModel: ObservableObject {
     @Published var navigationMode: NavigationMode = .agents
     @Published var isConnected: Bool = false
+    /// Full product list as reported by the engine, including archived
+    /// rows. Keep the full set so id-based lookups (`product(withID:)`,
+    /// work-tree merges) still resolve when a product was archived in
+    /// another session; surfaces that let the user *select* a product
+    /// should read [[activeProducts]] instead.
     @Published var products: [WorkProduct] = []
+
+    /// Non-archived subset of [[products]], in the same sort order.
+    /// This is what the sidebar Product picker, the Designs picker, and
+    /// any other "products I work in actively" surface should bind to —
+    /// archived products are history, not selection targets. Mirrors the
+    /// CLI split: `boss product list` shows everything; the picker is
+    /// for live products only.
+    var activeProducts: [WorkProduct] {
+        products.filter { $0.status != "archived" }
+    }
     @Published var projectsByProductID: [String: [WorkProject]] = [:] {
         didSet { invalidateWorkCache() }
     }
@@ -720,15 +735,20 @@ final class ChatViewModel: ObservableObject {
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
+            let activeIDs = Set(activeProducts.map(\.id))
             if let selectedWorkProductID,
-               !self.products.contains(where: { $0.id == selectedWorkProductID }) {
+               !activeIDs.contains(selectedWorkProductID) {
+                let archivedName = self.products.first(where: { $0.id == selectedWorkProductID })?.name
                 self.selectedWorkProductID = nil
                 self.selectedProjectFilterIDs = []
                 self.selectedWorkCardID = nil
                 defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
                 persistProjectFilterIDs()
+                if let archivedName {
+                    workErrorMessage = "Product \"\(archivedName)\" was archived elsewhere; switching to the next active product."
+                }
             }
-            if currentSelectedProductID == nil, let first = self.products.first {
+            if currentSelectedProductID == nil, let first = activeProducts.first {
                 self.selectedWorkProductID = first.id
                 defaults.set(first.id, forKey: selectedWorkProductDefaultsKey)
                 engine.sendGetWorkTree(productId: first.id)
@@ -1356,7 +1376,17 @@ final class ChatViewModel: ObservableObject {
     private func handleUpdatedWorkItem(_ item: WorkItemPayload) {
         switch item {
         case .product(let product):
+            let wasSelected = selectedWorkProductID == product.id
             upsertProduct(product)
+            if wasSelected && product.status == "archived" {
+                workErrorMessage = "Product \"\(product.name)\" was archived; switching to the next active product."
+                reconcileWorkSelection()
+                if let nextID = selectedWorkProductID {
+                    engine.sendGetWorkTree(productId: nextID)
+                }
+                refreshWorkSubscriptions()
+                return
+            }
         case .project(let project):
             engine.sendGetWorkTree(productId: project.productID)
         case .task(let task), .chore(let task):
@@ -1368,9 +1398,10 @@ final class ChatViewModel: ObservableObject {
     private func reconcileWorkSelection() {
         guard let selectedWorkProductID else { return }
 
-        if !products.contains(where: { $0.id == selectedWorkProductID }) {
-            self.selectedWorkProductID = products.first?.id
-            if let firstProductID = products.first?.id {
+        let activeIDs = Set(activeProducts.map(\.id))
+        if !activeIDs.contains(selectedWorkProductID) {
+            self.selectedWorkProductID = activeProducts.first?.id
+            if let firstProductID = activeProducts.first?.id {
                 defaults.set(firstProductID, forKey: selectedWorkProductDefaultsKey)
             } else {
                 defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
@@ -1390,6 +1421,14 @@ final class ChatViewModel: ObservableObject {
         }
 
         refreshWorkSubscriptions()
+    }
+
+    /// Test-only entry point that funnels a synthetic engine event
+    /// through the same `handle` dispatch the live socket uses, so
+    /// picker-side reactions (selection fallback, archived-product
+    /// fan-out) can be asserted without booting a real engine.
+    func applyEventForTest(_ event: EngineEvent) {
+        handle(event)
     }
 }
 

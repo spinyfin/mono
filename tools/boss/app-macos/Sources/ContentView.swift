@@ -197,12 +197,12 @@ struct ContentView: View {
 
     private var workSidebar: some View {
         List {
-            if !model.products.isEmpty {
+            if !model.activeProducts.isEmpty {
                 Section {
                     ZStack(alignment: .trailing) {
                         SidebarProductPicker(
                             selection: workProductSelection,
-                            products: model.products
+                            products: model.activeProducts
                         )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.trailing, 28)
@@ -317,7 +317,7 @@ struct ContentView: View {
     private var workProductSelection: Binding<String?> {
         Binding(
             get: {
-                model.selectedProduct?.id ?? model.products.first?.id
+                model.selectedProduct?.id ?? model.activeProducts.first?.id
             },
             set: { newValue in
                 guard let productID = newValue else { return }
@@ -336,7 +336,7 @@ struct ContentView: View {
 
     private var workMainContent: some View {
         Group {
-            if model.products.isEmpty {
+            if model.activeProducts.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("No work items yet")
                         .font(.title2.weight(.semibold))
