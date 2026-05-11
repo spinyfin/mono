@@ -124,6 +124,24 @@ pub struct LiveWorkerState {
     /// callers compute "tool runtime" or detect a wedged tool.
     pub last_tool_ended_at: Option<String>,
     pub activity: WorkerActivity,
+    /// Free-text one-sentence description of what the worker is
+    /// doing right now, generated on the engine side from a tail of
+    /// the worker's transcript by a cheap summarizer model
+    /// (see `engine/src/live_status.rs`). `None` while a slot is
+    /// `Spawning`, has never been summarized, or has been idle long
+    /// enough that the prior text would be misleading. The string is
+    /// short (≤120 chars, single line) and intended for direct render
+    /// — Doing-card subtitle, Agents-tab worker header subtitle.
+    /// Sits alongside [`Self::activity`] rather than replacing it:
+    /// the enum is still load-bearing for the kanban dot and gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<String>,
+    /// ISO-8601 timestamp of the most recent successful update to
+    /// `live_status`. The UI uses this to dim/strike-through stale
+    /// values; the engine uses it to drive the timer-floor cadence
+    /// in `live_status::tick`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status_at: Option<String>,
     /// Work item this run was dispatched against. `None` for spawns
     /// that happen outside the work-item dispatch path (today: tests
     /// and any future direct-launch flow that bypasses the work
@@ -168,6 +186,8 @@ impl LiveWorkerState {
             current_tool: None,
             last_tool_ended_at: None,
             activity: WorkerActivity::Spawning,
+            live_status: None,
+            live_status_at: None,
             work_item_id,
             work_item_name,
             execution_id,
@@ -221,6 +241,8 @@ mod tests {
         assert!(state.work_item_id.is_none());
         assert!(state.work_item_name.is_none());
         assert!(state.execution_id.is_none());
+        assert!(state.live_status.is_none());
+        assert!(state.live_status_at.is_none());
     }
 
     #[test]
@@ -263,6 +285,8 @@ mod tests {
             current_tool: Some("Bash".into()),
             last_tool_ended_at: Some("2026-05-06T11:59:50Z".into()),
             activity: WorkerActivity::Working,
+            live_status: Some("investigating why the scroll handler doesn't fire".into()),
+            live_status_at: Some("2026-05-06T12:00:01Z".into()),
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
@@ -279,5 +303,50 @@ mod tests {
         assert!(!json.contains("work_item_id"), "json: {json}");
         assert!(!json.contains("work_item_name"), "json: {json}");
         assert!(!json.contains("execution_id"), "json: {json}");
+        assert!(!json.contains("live_status"), "json: {json}");
+    }
+
+    #[test]
+    fn live_worker_state_round_trip_includes_live_status_fields() {
+        let original = LiveWorkerState {
+            slot_id: 4,
+            name: "Worf".into(),
+            run_id: "run-9".into(),
+            model: "claude-opus-4-7".into(),
+            shell_pid: 0,
+            last_event_at: Some("2026-05-06T12:00:00Z".into()),
+            current_tool: None,
+            last_tool_ended_at: None,
+            activity: WorkerActivity::Working,
+            live_status: Some("running tests after the layout fix".into()),
+            live_status_at: Some("2026-05-06T12:00:30Z".into()),
+            work_item_id: None,
+            work_item_name: None,
+            execution_id: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+        // live_status_at travels alongside live_status. Sanity-check
+        // both keys are on the wire when set.
+        assert!(json.contains("\"live_status\":"), "json: {json}");
+        assert!(json.contains("\"live_status_at\":"), "json: {json}");
+    }
+
+    #[test]
+    fn live_worker_state_decodes_payload_without_live_status_fields() {
+        // Older engines (and snapshot fixtures) won't carry the new
+        // fields. Decoding must succeed with both options as `None`.
+        let json = r#"{
+            "slot_id": 1,
+            "name": "Riker",
+            "run_id": "exec-1",
+            "model": "claude-opus-4-7",
+            "shell_pid": 0,
+            "activity": "working"
+        }"#;
+        let parsed: LiveWorkerState = serde_json::from_str(json).unwrap();
+        assert!(parsed.live_status.is_none());
+        assert!(parsed.live_status_at.is_none());
     }
 }
