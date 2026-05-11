@@ -216,9 +216,9 @@ struct DesignsView: View {
                 .background(Color(nsColor: .windowBackgroundColor))
         }
         .task {
-            model.refresh(products: chat.products)
+            model.refresh(products: chat.activeProducts)
         }
-        .onChange(of: chat.products) { _, newProducts in
+        .onChange(of: chat.activeProducts) { _, newProducts in
             model.refresh(products: newProducts)
         }
     }
@@ -227,25 +227,25 @@ struct DesignsView: View {
     private var sidebar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                if chat.products.isEmpty {
+                if chat.activeProducts.isEmpty {
                     Text("No products")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {
                     SidebarProductPicker(
                         selection: Binding(
-                            get: { model.selectedProductID ?? chat.products.first?.id },
+                            get: { model.selectedProductID ?? chat.activeProducts.first?.id },
                             set: { newValue in
-                                model.selectProduct(newValue, products: chat.products)
+                                model.selectProduct(newValue, products: chat.activeProducts)
                             }
                         ),
-                        products: chat.products
+                        products: chat.activeProducts
                     )
                     .frame(maxWidth: .infinity)
                 }
 
                 Button {
-                    model.refresh(products: chat.products)
+                    model.refresh(products: chat.activeProducts)
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -257,7 +257,7 @@ struct DesignsView: View {
 
             Divider()
 
-            if chat.products.isEmpty {
+            if chat.activeProducts.isEmpty {
                 Spacer()
                 Text("Create a product to browse its design docs.")
                     .font(.callout)
