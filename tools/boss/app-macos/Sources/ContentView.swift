@@ -619,7 +619,7 @@ struct ContentView: View {
             ForEach(items) { task in
                 WorkBoardCardItem(
                     task: task,
-                    projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                    projectName: model.cardProjectBadge(for: task),
                     column: column,
                     runtime: column == .doing ? model.taskRuntime(for: task.id) : nil,
                     isSelected: model.selectedTask?.id == task.id,

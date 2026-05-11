@@ -904,6 +904,16 @@ final class ChatViewModel: ObservableObject {
         return project(withID: projectID)?.name
     }
 
+    /// Project-badge text for a kanban card, or `nil` when the badge
+    /// should be suppressed. Chores never have one; when the board is
+    /// grouped by project the lane header already names the project,
+    /// so the per-card badge would just duplicate the column header.
+    func cardProjectBadge(for task: WorkTask) -> String? {
+        if task.isChore { return nil }
+        if workBoardGrouping == .project { return nil }
+        return projectName(for: task.projectID)
+    }
+
     func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
         if let cached = cachedItemsByColumn[column] {
             return cached
