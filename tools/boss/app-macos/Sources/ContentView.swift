@@ -849,6 +849,8 @@ private struct WorkBoardCardItem: View {
                         ? AgentActivityState(runtime: runtime, liveState: liveState)
                         : nil,
                     assignedSlotId: column == .doing ? liveState?.slotId : nil,
+                    liveStatus: column == .doing ? liveState?.liveStatus : nil,
+                    liveStatusActivity: column == .doing ? liveState?.activity : nil,
                     blockedBy: blockedBy,
                     isAutoBlocked: isAutoBlocked,
                     gatingPrereqs: gatingPrereqs
@@ -926,6 +928,19 @@ struct WorkBoardCardView: View {
     /// in the title row so a glance at the board tells you which
     /// crew member is on which task.
     let assignedSlotId: Int?
+    /// Free-text one-sentence "what is the worker doing right now"
+    /// fed by the engine's live-status summarizer. Rendered as a
+    /// subtitle row between the title row and the footer when the
+    /// card is in the Doing lane and the string is non-empty.
+    /// `nil` collapses the row entirely so idle/blank states don't
+    /// leave awkward whitespace.
+    var liveStatus: String? = nil
+    /// Activity of the worker behind `liveStatus`, used to tint the
+    /// subtitle row per design Q4: `WaitingForInput` reads in the
+    /// accent colour to match the "needs human" pill, `Errored` reads
+    /// in red, `Idle` dims further than `.secondary`. The default
+    /// `nil` is treated as the plain `.secondary` colour.
+    var liveStatusActivity: WorkerActivity? = nil
     /// Comma-joined names of the prereqs currently gating this card.
     /// Non-nil only on `blocked` rows — the kanban surfaces these in
     /// the Backlog column with a lock + "Blocked by …" subtitle so the
@@ -982,6 +997,17 @@ struct WorkBoardCardView: View {
                     }
                 }
                 Spacer(minLength: 0)
+            }
+
+            if let liveStatus, !liveStatus.isEmpty {
+                Text(liveStatus)
+                    .font(.caption)
+                    .foregroundStyle(liveStatusColor)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(liveStatus)
+                    .accessibilityLabel("Live status: \(liveStatus)")
             }
 
             if hasFooterContent {
@@ -1042,6 +1068,24 @@ struct WorkBoardCardView: View {
             .map { "\($0.title) (\($0.status.replacingOccurrences(of: "_", with: " ")))" }
             .joined(separator: ", ")
         return "Gated by: \(summary)"
+    }
+
+    /// Tint for the live-status subtitle row. Q4 of the design pairs
+    /// the colour with the activity dot: red for errored runs, the
+    /// accent colour when the worker is waiting on a human, a dimmer
+    /// grey when the worker is idle, and the normal `.secondary` grey
+    /// while the worker is actively working.
+    private var liveStatusColor: Color {
+        switch liveStatusActivity {
+        case .errored:
+            return .red
+        case .waitingForInput:
+            return .accentColor
+        case .idle:
+            return Color(nsColor: .tertiaryLabelColor)
+        default:
+            return .secondary
+        }
     }
 
     private var cardBackground: Color {
