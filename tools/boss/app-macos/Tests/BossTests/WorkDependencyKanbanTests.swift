@@ -86,6 +86,58 @@ final class WorkDependencyKanbanTests: XCTestCase {
         )
     }
 
+    /// Default grouping (`.none`) renders the project badge on the
+    /// card so the reader can tell which project a task belongs to
+    /// without expanding it.
+    func testCardProjectBadgeShownWhenUngrouped() {
+        let model = makeFixture()
+        model.workBoardGrouping = .none
+        guard let task = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture"); return
+        }
+        XCTAssertEqual(model.cardProjectBadge(for: task), "Test Project")
+    }
+
+    /// Grouping by project promotes the project name to the lane
+    /// header, so the per-card badge would just duplicate it. The
+    /// helper must suppress it across every card in that mode.
+    func testCardProjectBadgeHiddenWhenGroupedByProject() {
+        let model = makeFixture()
+        model.workBoardGrouping = .project
+        guard let task = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture"); return
+        }
+        XCTAssertNil(model.cardProjectBadge(for: task))
+    }
+
+    /// Chores have no project so the badge was already absent; the
+    /// helper must hold that line regardless of grouping mode.
+    func testCardProjectBadgeAlwaysNilForChores() {
+        let model = makeFixture()
+        let productID = model.products.first?.id ?? "prod_test"
+        let chore = WorkTask(
+            id: "chore_test",
+            productID: productID,
+            projectID: nil,
+            kind: "chore",
+            name: "Tidy",
+            description: "",
+            status: "active",
+            priority: "medium",
+            ordinal: 1,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "human"
+        )
+        model.choresByProductID = [productID: [chore]]
+        model.workBoardGrouping = .none
+        XCTAssertNil(model.cardProjectBadge(for: chore))
+        model.workBoardGrouping = .project
+        XCTAssertNil(model.cardProjectBadge(for: chore))
+    }
+
     /// A manual-block row with no gating edges should still be
     /// movable — the engine accepts a manual unblock once the prereq
     /// set is empty, so the kanban must not pre-empt that.
