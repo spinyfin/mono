@@ -444,6 +444,34 @@ pub enum FrontendRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
     },
+    /// Heuristic feedback-loop audit (design §Q4 follow-up, PR #370).
+    /// Aggregates recorded escalation events for `product_id`
+    /// against the §Q4 marker corpus and returns a snapshot report
+    /// of under-classification rates per marker. Read-only; backs
+    /// the `boss product audit-effort` CLI verb. `window_days`
+    /// trims the event set to a rolling window (events older than
+    /// `now - window` are excluded); `None` means "all recorded
+    /// events." Replies with [`FrontendEvent::EffortAuditReport`].
+    AuditProductEffort {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_days: Option<u32>,
+    },
+    /// Append an effort-level escalation event (design §Q5, PR
+    /// #370 follow-up). Wire surface used by the sibling
+    /// escalation-handler task; this task ships the row format and
+    /// the read path. Engine assigns `id` and `created_at`; the
+    /// caller passes the row's original / new level and the §Q4
+    /// markers the heuristic recorded against the row at creation.
+    /// Replies with [`FrontendEvent::EffortEscalationRecorded`].
+    RecordEffortEscalation {
+        work_item_id: String,
+        original_level: crate::EffortLevel,
+        new_level: crate::EffortLevel,
+        markers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -795,6 +823,19 @@ pub enum FrontendEvent {
         attempt_id: String,
         pr_url: String,
         failure_reason: String,
+    },
+    /// Response to [`FrontendRequest::AuditProductEffort`]. Carries
+    /// the per-marker under-classification analysis for one
+    /// product. Read-only snapshot; the engine recomputes from
+    /// scratch each call.
+    EffortAuditReport {
+        report: crate::EffortAuditReport,
+    },
+    /// Response to [`FrontendRequest::RecordEffortEscalation`].
+    /// Carries the inserted row with engine-assigned `id` and
+    /// `created_at`.
+    EffortEscalationRecorded {
+        event: crate::EffortEscalation,
     },
 }
 

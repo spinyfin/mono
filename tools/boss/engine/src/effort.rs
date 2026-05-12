@@ -153,6 +153,171 @@ pub fn resolve_spawn_config(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Marker corpus + audit thresholds — design §Q4 + Q4 follow-up
+// ---------------------------------------------------------------------------
+//
+// The marker tables below are the §Q4 rules' string-match
+// vocabulary, lifted into code so the `boss product audit-effort`
+// report (PR #370 follow-up) can compute per-marker match counts
+// against the chore corpus without re-running the coordinator's
+// LLM-driven heuristic. They mirror the design exactly:
+//
+// - `INVESTIGATE_MARKERS`        ← §Q4 rule 2 (→ `large`)
+// - `MULTI_SUBSYSTEM_HINTS`      ← §Q4 rule 4 (→ `medium`)
+// - `MECHANICAL_EDIT_MARKERS`    ← §Q4 rule 5 (→ `trivial`)
+//
+// The audit thresholds live in the same module on purpose: the
+// dispatcher's effort table (above), the marker corpus, and the
+// rates that flag those markers for retune are the same family of
+// "knobs we expect to tune without a schema change" called out in
+// design §Q2 / Q4. Keeping them in one file means a retune is one
+// PR.
+
+/// §Q4 rule 2 marker list — "title or description matches an
+/// `investigate` family marker → `large`." Stored verbatim from the
+/// design; the matcher is case-insensitive whole-word.
+pub const INVESTIGATE_MARKERS: &[&str] = &[
+    "investigate",
+    "audit",
+    "instrument",
+    "diagnose",
+    "end-to-end",
+    "root cause",
+    "architect",
+    "redesign",
+    "migrate",
+    "rearchitect",
+];
+
+/// §Q4 rule 4 hint list — "title or description names a multi-file
+/// or multi-subsystem hint → `medium`." Subsystem names are
+/// the module-path vocabulary the design's "spans" / "across"
+/// callouts shorthand for; the literal connectors (`across`,
+/// `spans`) round out the list. Case-insensitive whole-word match.
+pub const MULTI_SUBSYSTEM_HINTS: &[&str] = &[
+    "across",
+    "spans",
+    "engine",
+    "cli",
+    "protocol",
+    "app-macos",
+    "cube",
+    "bossctl",
+];
+
+/// §Q4 rule 5 marker list — "title matches a mechanical-edit
+/// marker → `trivial`." Case-insensitive whole-word match against
+/// the title (the design specifies title-only; we widen to title +
+/// description for the audit so the denominator counts the same
+/// way the report's match-counter does — see Q4 follow-up §"What
+/// this is NOT" / the report-shape example which lists `cursor`
+/// matches by total appearance, not by title-only.).
+pub const MECHANICAL_EDIT_MARKERS: &[&str] = &[
+    "rename",
+    "apply",
+    "revert",
+    "bump",
+    "move",
+    "delete",
+    "remove",
+    "hide",
+    "show",
+    "pad",
+    "align",
+    "re-export",
+    "gap",
+    "cursor",
+    "badge",
+    "tooltip",
+];
+
+/// Above this fraction of `escalations / matches`, the audit report
+/// annotates the marker with "consider promoting" — i.e. the marker
+/// is firing for rows workers commonly judge bigger than the level
+/// it picks. 0.30 = 30%; tune here (one constants module per the
+/// design's open question 2) when retuning the marker lists.
+pub const UNDER_CLASS_PROMOTE_THRESHOLD: f64 = 0.30;
+
+/// Below this fraction AND above [`WELL_CLASSIFIED_VOLUME_FLOOR`]
+/// matches, the audit report annotates the marker as well-classified
+/// ("marker holds; level correct"). 0.05 = 5%.
+pub const WELL_CLASSIFIED_RATE_CEILING: f64 = 0.05;
+
+/// Minimum match volume for the "marker holds" callout. Below this
+/// floor the rate is too noisy to call. Five matches is a single
+/// sprint's worth of mono chores per the design's Appendix A
+/// frequency notes.
+pub const WELL_CLASSIFIED_VOLUME_FLOOR: u32 = 5;
+
+/// The original-level a marker maps to per §Q4. Used by the audit
+/// report to label each row with the level the heuristic *would*
+/// have picked when the marker fired in isolation. Returns `None`
+/// for unknown markers (e.g. a stale entry on a recorded event whose
+/// marker has since been removed from the design).
+pub fn original_level_for_marker(marker: &str) -> Option<EffortLevel> {
+    let m = marker.to_ascii_lowercase();
+    if INVESTIGATE_MARKERS.iter().any(|x| *x == m) {
+        Some(EffortLevel::Large)
+    } else if MULTI_SUBSYSTEM_HINTS.iter().any(|x| *x == m) {
+        Some(EffortLevel::Medium)
+    } else if MECHANICAL_EDIT_MARKERS.iter().any(|x| *x == m) {
+        Some(EffortLevel::Trivial)
+    } else {
+        None
+    }
+}
+
+/// Lowercase iterator over every marker in the §Q4 corpus, in
+/// rule-2 → rule-4 → rule-5 order. The audit report uses this to
+/// scan a chore's title + description and count which markers
+/// matched it.
+pub fn all_markers() -> impl Iterator<Item = &'static str> {
+    INVESTIGATE_MARKERS
+        .iter()
+        .chain(MULTI_SUBSYSTEM_HINTS.iter())
+        .chain(MECHANICAL_EDIT_MARKERS.iter())
+        .copied()
+}
+
+/// True iff `text` contains `marker` as a whole-word match,
+/// case-insensitive. "Whole word" follows the design's
+/// `\b<marker>\b` framing: marker characters bordered on each side
+/// by either start/end of string OR a non-alphanumeric, non-`-`
+/// character. The dash is preserved because §Q4's `end-to-end`,
+/// `re-export`, etc. would otherwise break on the internal hyphen.
+pub fn marker_matches_text(marker: &str, text: &str) -> bool {
+    if marker.is_empty() || text.len() < marker.len() {
+        return false;
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_marker = marker.to_ascii_lowercase();
+    let bytes = lower_text.as_bytes();
+    let needle = lower_marker.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = lower_text[start..].find(&lower_marker) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !is_marker_word_char(bytes[abs - 1]);
+        let after_idx = abs + needle.len();
+        let after_ok = after_idx >= bytes.len() || !is_marker_word_char(bytes[after_idx]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+fn is_marker_word_char(b: u8) -> bool {
+    // The markers themselves contain ASCII alphanumerics, dashes
+    // (`end-to-end`, `re-export`), and spaces (`root cause`). For
+    // the boundary test we treat alphanumerics and `-` as "inside a
+    // word"; space and punctuation count as boundaries. This keeps
+    // `rename` from matching `prerender` and `cursor` from matching
+    // `precursor`, but lets `cursor.` and `cursor,` match.
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 #[cfg(test)]
 mod tests {
     //! The cases below are the rows in the design's §Q3 precedence
@@ -275,5 +440,55 @@ mod tests {
             cfg.claude_invocation(),
             "claude --model opus --effort high \"$(cat .claude/initial-prompt.txt)\"\n",
         );
+    }
+
+    #[test]
+    fn marker_matches_text_is_case_insensitive_whole_word() {
+        assert!(marker_matches_text("rename", "Rename the auth middleware"));
+        assert!(marker_matches_text("rename", "RENAME everything"));
+        assert!(marker_matches_text("rename", "fix typo: rename, then commit"));
+        // Whole-word boundary: 'prerender' does not contain 'rename'.
+        assert!(!marker_matches_text("rename", "prerender the static pages"));
+        // Hyphenated markers from §Q4 stay intact.
+        assert!(marker_matches_text("end-to-end", "Instrument end-to-end traces"));
+        assert!(marker_matches_text("re-export", "re-export the public types"));
+        // Multi-word markers.
+        assert!(marker_matches_text("root cause", "Diagnose the root cause"));
+        // Avoid sub-word collisions in the cursor / precursor case.
+        assert!(marker_matches_text("cursor", "fix cursor flicker"));
+        assert!(!marker_matches_text("cursor", "the precursor design"));
+        // Empty haystack / needle.
+        assert!(!marker_matches_text("", "anything"));
+        assert!(!marker_matches_text("rename", ""));
+    }
+
+    #[test]
+    fn original_level_for_marker_partitions_q4_corpus() {
+        assert_eq!(
+            original_level_for_marker("investigate"),
+            Some(EffortLevel::Large)
+        );
+        assert_eq!(
+            original_level_for_marker("end-to-end"),
+            Some(EffortLevel::Large)
+        );
+        assert_eq!(
+            original_level_for_marker("engine"),
+            Some(EffortLevel::Medium)
+        );
+        assert_eq!(
+            original_level_for_marker("RENAME"),
+            Some(EffortLevel::Trivial)
+        );
+        // Stale-marker safety net.
+        assert_eq!(original_level_for_marker("not-a-marker"), None);
+    }
+
+    #[test]
+    fn all_markers_covers_every_q4_rule() {
+        let total = INVESTIGATE_MARKERS.len()
+            + MULTI_SUBSYSTEM_HINTS.len()
+            + MECHANICAL_EDIT_MARKERS.len();
+        assert_eq!(all_markers().count(), total);
     }
 }

@@ -318,6 +318,127 @@ pub struct WorkAttentionItem {
     pub resolved_at: Option<String>,
 }
 
+/// One recorded effort-level escalation event — the wire shape of
+/// an `effort_escalations` row. Written by the coordinator's
+/// escalation handler (design §Q5) when a worker raises an
+/// `[effort-escalation]` Stop-boundary marker; read by the
+/// heuristic feedback-loop audit report (`boss product
+/// audit-effort`).
+///
+/// Carries the row's `original_level` (what the heuristic chose at
+/// creation time), the `new_level` the worker requested, and the
+/// list of `markers` the heuristic recorded as having matched the
+/// row when it picked the original level. The audit report
+/// aggregates these by marker to surface "marker X under-classified
+/// Y% of the time" without changing the heuristic itself.
+///
+/// `markers` is the §Q4 marker corpus the heuristic uses; entries
+/// are the literal marker strings ("rename", "investigate", etc.)
+/// stored as a JSON array in SQLite. `rule_id` is optional and
+/// names the §Q4 rule that fired (`"rule-2"`, `"rule-5"`, etc.) for
+/// the heuristic's own bookkeeping; the audit report does not
+/// depend on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffortEscalation {
+    pub id: String,
+    pub product_id: String,
+    pub work_item_id: String,
+    pub original_level: EffortLevel,
+    pub new_level: EffortLevel,
+    pub markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Per-marker analysis row in the effort-audit report. One entry
+/// per marker in the §Q4 corpus that matched at least one chore in
+/// the product (markers with zero matches are filtered out so the
+/// table stays scannable).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffortAuditMarkerRow {
+    /// Marker string from the §Q4 corpus, e.g. `"rename"`,
+    /// `"investigate"`, `"engine"`, lowercased.
+    pub marker: String,
+    /// Heuristic level the marker maps to per §Q4 (`trivial` for
+    /// mechanical-edit markers, `medium` for multi-subsystem hints,
+    /// `large` for investigate-family markers).
+    pub original_level: EffortLevel,
+    /// Total chores (kind = `chore`) on the product whose title or
+    /// description matched this marker, regardless of whether they
+    /// escalated.
+    pub matches: u32,
+    /// Of those, the count that subsequently raised an
+    /// `[effort-escalation]` marker promoting the row to a higher
+    /// level (per [`EffortLevel`]'s natural ordering trivial < small
+    /// < medium < large < max).
+    pub escalations: u32,
+    /// `escalations / matches` as a 0.0-1.0 fraction. `0.0` when
+    /// `matches > 0 && escalations == 0`; absent (per
+    /// [`Option`]'s `None`) when `matches == 0` so callers don't
+    /// have to special-case divide-by-zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub under_class_rate: Option<f64>,
+    /// Human-readable callout produced when the rate / volume cross
+    /// the thresholds named in `engine/src/effort.rs`. Empty when
+    /// the marker is neither "consider promoting" nor "marker
+    /// holds."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+}
+
+/// Suggested action a human reviewer might take, encoded so JSON
+/// consumers can branch on it without parsing free text. Mirrors
+/// the annotation strings in [`EffortAuditMarkerRow::annotation`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortAuditAnnotation {
+    /// Rate exceeds the configured under-classification threshold:
+    /// the marker maps the row to a level workers commonly judge
+    /// too low. Surface as "consider promoting to <higher level>."
+    ConsiderPromoting,
+    /// Rate is below the well-classified ceiling AND match volume
+    /// is above the well-classified floor: the marker is doing its
+    /// job. Surface as "marker holds; level correct."
+    MarkerHolds,
+    /// Either threshold-eligible but on the over-class side, or
+    /// volume too low to call. No callout.
+    None,
+}
+
+/// Output shape for `boss product audit-effort <product>`. One
+/// snapshot of the marker corpus's under-classification rates
+/// against the recorded escalation events for a single product.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffortAuditReport {
+    pub product_id: String,
+    pub product_slug: String,
+    /// Window cap in days applied to escalation events
+    /// (`created_at` after now - window). `None` means "no window;
+    /// include all recorded escalations."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+    /// Total chores (kind = `chore`, `deleted_at IS NULL`) on the
+    /// product that the audit scanned for marker matches.
+    pub total_chores: u32,
+    /// Total escalation events the audit considered (after window
+    /// filter). Equal to the sum of per-marker `escalations` only
+    /// when every event carried exactly one marker — events can
+    /// match multiple markers and double-count by design.
+    pub total_escalations: u32,
+    /// Under-classification threshold (0.0-1.0) at which the audit
+    /// produces a "consider promoting" callout. Echoed back so
+    /// JSON consumers don't have to re-import the constant.
+    pub under_class_threshold: f64,
+    /// Per-marker analysis, sorted by `under_class_rate`
+    /// descending so the noisy markers are visible first. Markers
+    /// with zero matches are filtered out.
+    pub rows: Vec<EffortAuditMarkerRow>,
+    /// Epoch seconds when the audit was generated, for the
+    /// human-readable header.
+    pub generated_at: String,
+}
+
 /// One engine attempt to clear a merge conflict on an `in_review`
 /// PR — the wire shape of a `conflict_resolutions` row. Stored as a
 /// sibling to `WorkExecution` rather than as a `Task` because the

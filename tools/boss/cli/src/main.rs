@@ -10,8 +10,8 @@ use boss_client::{
 use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, ConflictResolution, CreateChoreInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortLevel,
-    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
+    EffortLevel, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProjectDesignDocInput, Task, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
@@ -111,6 +111,15 @@ enum ProductCommand {
     /// source of truth on which slugs resolve.
     #[command(name = "set-default-model")]
     SetDefaultModel(ProductSetDefaultModelArgs),
+    /// Heuristic feedback-loop audit (design §Q4 follow-up, PR
+    /// #370). Aggregates recorded effort-escalation events against
+    /// the §Q4 marker corpus and prints a per-marker
+    /// under-classification report. Read-only diagnostic — does
+    /// not retune anything. Use to spot markers that workers
+    /// commonly escalate past (candidates for promoting to a
+    /// higher level in the §Q4 rules).
+    #[command(name = "audit-effort")]
+    AuditEffort(ProductAuditEffortArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -412,6 +421,17 @@ struct ProductSetDefaultModelArgs {
     /// Mutually exclusive with `--model`.
     #[arg(long)]
     unset: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProductAuditEffortArgs {
+    /// Product id or slug to audit.
+    selector: String,
+
+    /// Restrict the report to escalation events recorded within
+    /// the last N days. Default: all recorded events.
+    #[arg(long, value_name = "DAYS")]
+    window_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1482,6 +1502,27 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 print_product_details("Updated product", &updated);
             })
         }
+        ProductCommand::AuditEffort(args) => {
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::AuditProductEffort {
+                    product_id: product.id.clone(),
+                    window_days: args.window_days,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::EffortAuditReport { report } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "report": report }),
+                    || print_effort_audit_report(&report),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("product audit-effort", &other)),
+            }
+        }
     }
 }
 
@@ -2326,6 +2367,64 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
         println!("conflict_diagnosis (raw):");
         println!("{diag}");
     }
+}
+
+/// Human-readable rendering for `boss product audit-effort`. The
+/// JSON shape (under `--json`) is the `EffortAuditReport` directly;
+/// this is the table the report-shape example in design §Q4
+/// follow-up shows.
+fn print_effort_audit_report(report: &EffortAuditReport) {
+    let window = match report.window_days {
+        Some(n) => format!("last {n} days"),
+        None => "all recorded escalations".to_owned(),
+    };
+    println!(
+        "Marker analysis ({window}, {n_esc} escalations across {n_chores} chores):",
+        n_esc = report.total_escalations,
+        n_chores = report.total_chores,
+    );
+    if report.rows.is_empty() {
+        println!();
+        println!(
+            "  No marker matches recorded yet. Either no chores have been filed against this \
+             product or no escalation events are recorded.",
+        );
+        return;
+    }
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "MARKER",
+            "ORIG LEVEL",
+            "MATCHES",
+            "ESCALATIONS",
+            "UNDER-CLASS RATE",
+            "NOTE",
+        ]);
+    for row in &report.rows {
+        let rate = match row.under_class_rate {
+            Some(r) => format!("{:.1}%", r * 100.0),
+            None => "—".to_owned(),
+        };
+        let annotation = row.annotation.clone().unwrap_or_default();
+        table.add_row(vec![
+            row.marker.as_str(),
+            row.original_level.as_str(),
+            &row.matches.to_string(),
+            &row.escalations.to_string(),
+            rate.as_str(),
+            annotation.as_str(),
+        ]);
+    }
+    println!("{table}");
+    println!();
+    println!(
+        "Threshold for the \"consider promoting\" callout: under-class rate > {:.0}%. \
+         Edit the §Q4 marker lists in code based on this report; v1 keeps the \
+         heuristic code-defined.",
+        report.under_class_threshold * 100.0,
+    );
 }
 
 async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
