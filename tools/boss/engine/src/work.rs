@@ -2588,12 +2588,19 @@ impl WorkDb {
             return Ok(None);
         }
         let now = now_string();
+        // Clearing blocked_reason / blocked_attempt_id is load-bearing
+        // for the case where the merge poller observes a force-merge
+        // (branch-protection override) of a PR currently in
+        // `blocked: merge_conflict`. The new state must be coherent —
+        // `done` rows never carry a blocked reason.
         tx.execute(
             "UPDATE tasks
-             SET status = 'done',
-                 pr_url = ?2,
-                 updated_at = ?3,
-                 last_status_actor = 'engine'
+             SET status             = 'done',
+                 pr_url             = ?2,
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL
              WHERE id = ?1",
             params![task.id, pr_url, now],
         )?;
@@ -2602,6 +2609,140 @@ impl WorkDb {
             .with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
+    }
+
+    /// Chores and project_tasks the engine previously flagged with
+    /// `blocked: merge_conflict`. The merge poller iterates this list
+    /// alongside [`Self::list_chores_pending_merge_check`] so that a
+    /// PR returning to a mergeable state can be detected and the
+    /// parent flipped back to `in_review` (design Q1's probe-pool
+    /// extension).
+    ///
+    /// Same `PendingMergeCheck` shape as the in-review list so the
+    /// poller can chain both iterators through one sweep loop.
+    pub fn list_chores_blocked_on_merge_conflict(&self) -> Result<Vec<PendingMergeCheck>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, pr_url
+             FROM tasks
+             WHERE kind IN ('chore', 'project_task', 'design')
+               AND status = 'blocked'
+               AND blocked_reason = 'merge_conflict'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+             ORDER BY updated_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingMergeCheck {
+                work_item_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// WHERE-guarded flip of a chore/project_task from `in_review`
+    /// to `blocked: merge_conflict`. Idempotent — a second call for
+    /// a row already in this state updates zero rows and returns
+    /// `Ok(None)`. Returns the updated task on the transition.
+    ///
+    /// The guard `status = 'in_review' AND pr_url = ?pr_url` is
+    /// load-bearing: it prevents the engine from clobbering a row a
+    /// human just moved elsewhere (e.g. manually back to `active`)
+    /// or a PR that has been re-pointed at a different URL.
+    pub fn mark_chore_blocked_merge_conflict(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status            = 'blocked',
+                    blocked_reason    = 'merge_conflict',
+                    last_status_actor = 'engine',
+                    updated_at        = ?3
+              WHERE id = ?1
+                AND status = 'in_review'
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after merge_conflict flip: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    /// Symmetric retire path: flip a chore/project_task currently
+    /// `blocked: merge_conflict` back to `in_review` and clear the
+    /// reason / attempt-id columns. Idempotent. Returns the updated
+    /// task on the transition; `Ok(None)` when the WHERE clause
+    /// missed (row already cleared, manually moved, or its PR url
+    /// changed underneath us).
+    pub fn clear_chore_blocked_merge_conflict(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'in_review',
+                    blocked_reason     = NULL,
+                    blocked_attempt_id = NULL,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_task(&tx, work_item_id)?.with_context(|| {
+            format!("unknown task after merge_conflict clear: {work_item_id}")
+        })?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    /// True iff there's a non-terminal `rebase_attempts` row covering
+    /// the given PR url. Used by `conflict_watch::on_conflict_detected`
+    /// to defer when the `auto-rebase-stacked-prs` flow already owns
+    /// the slot (design Q7).
+    ///
+    /// The `rebase_attempts` table ships with that flow, not this one.
+    /// Until it lands, this method short-circuits to `false` so the
+    /// dispatch site reads identically before and after auto-rebase
+    /// is wired up.
+    pub fn has_active_rebase_attempt_for_pr(&self, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        if !table_exists(&conn, "rebase_attempts")? {
+            return Ok(false);
+        }
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rebase_attempts
+              WHERE dependent_pr_url = ?1
+                AND status IN ('pending', 'running', 'escalated')",
+            params![pr_url],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
@@ -3238,6 +3379,15 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         }
     }
     Ok(false)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Add the `autostart` column to `tasks` for older databases. New

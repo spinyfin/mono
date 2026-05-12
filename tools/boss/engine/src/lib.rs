@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cli;
 pub mod completion;
 pub mod config;
+pub mod conflict_watch;
 pub mod coordinator;
 pub mod dispatch_events;
 pub mod events_socket;
