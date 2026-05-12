@@ -1,4 +1,4 @@
-//! Periodic merge detection.
+//! Periodic PR-lifecycle detection.
 //!
 //! The on-Stop completion path in [`crate::completion`] handles the
 //! create-and-merge case during a run, but most merges happen *after*
@@ -8,11 +8,22 @@
 //! the worker finished would sit in the kanban "Review" column
 //! forever waiting for a manual `boss chore update --status done`.
 //!
-//! The poller iterates [`WorkDb::list_chores_pending_merge_check`]
-//! (which covers both `kind='chore'` and `kind='project_task'`),
-//! asks `gh pr view <url> --json state,mergedAt` for each, and calls
-//! [`WorkDb::mark_chore_pr_merged`] when GitHub reports
-//! `state=MERGED` (or `state=CLOSED` with a non-null `mergedAt`).
+//! The poller also handles the second-most-common in_review fate: the
+//! PR develops a merge conflict against its base while waiting for
+//! review. The merge-conflict design (`tools/boss/docs/designs/
+//! merge-conflict-handling-in-review.md`, Q1) extends `gh pr view`'s
+//! projection with `mergeable` / `mergeStateStatus` / `baseRefOid` and
+//! flips conflicting parents to `blocked: merge_conflict` so a
+//! resolution worker can take over. The same sweep clears that flag
+//! when the PR is mergeable again.
+//!
+//! The poller iterates two candidate lists per sweep:
+//!   - [`WorkDb::list_chores_pending_merge_check`] — `in_review` rows
+//!     to watch for a clean merge or a fresh conflict.
+//!   - [`WorkDb::list_chores_blocked_on_merge_conflict`] — rows the
+//!     engine previously flagged as conflicting, to watch for the
+//!     resolution signal.
+//!
 //! Errors are logged but never propagate — a temporary network blip
 //! must not crash the engine.
 //!
@@ -28,30 +39,70 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::process::Command;
 
+use crate::conflict_watch;
 use crate::coordinator::ExecutionPublisher;
 use crate::work::{PendingMergeCheck, WorkDb};
 
-/// What `gh pr view` reports for one PR. The poller only needs the
-/// merged-or-not bit; we keep the URL for logging.
+/// One slice of GitHub-reported PR lifecycle state, captured by a
+/// single `gh pr view` round-trip. Carries everything the poller's
+/// sweep dispatch needs to route to merge/conflict/clear paths.
+///
+/// The "four-state" naming in the design doc refers to the leaf
+/// values of [`PrLifecycleState`] — `Open(Clean)`, `Open(Conflict)`,
+/// `Merged`, `ClosedUnmerged`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrMergeState {
+pub struct PrLifecycleProbe {
     pub url: String,
-    pub merged: bool,
+    pub state: PrLifecycleState,
+    /// Sha of the PR's base ref at probe time. Captured for the
+    /// conflict-resolution flow (`conflict_resolutions.base_sha_at_trigger`,
+    /// design Q3); currently informational for the merge poller.
+    /// `None` when GitHub didn't report one (rare; usually means the
+    /// PR has been force-detached from its base).
+    pub base_ref_oid: Option<String>,
 }
 
-/// Probe the merge state of a single PR. Implemented for production
-/// by shelling out to `gh`; test doubles can stub it directly.
+/// Lifecycle states the poller reacts to. The split between
+/// `Open(Clean)` and `Open(Conflict)` is the load-bearing addition
+/// for the merge-conflict design — they share `state='OPEN'` on the
+/// GitHub side and are disambiguated by `mergeable` /
+/// `mergeStateStatus`. `Merged` is what the original poller
+/// detected. `ClosedUnmerged` is captured for completeness (per the
+/// closed-unmerged design); the current sweep treats it as a no-op
+/// (a PR force-deleted out of review is the user's problem, not the
+/// poller's), preserving prior behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrLifecycleState {
+    Open(OpenPrMergeability),
+    Merged,
+    ClosedUnmerged,
+}
+
+/// Whether an open PR's head ref currently merges cleanly into its
+/// base. Derived from GitHub's `mergeable` + `mergeStateStatus`
+/// pair. Transient `UNKNOWN` (GitHub is mid-recompute) is mapped to
+/// `Clean` per design Q1 — we do not act on UNKNOWN; we wait for
+/// definitive `CONFLICTING` on the next sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPrMergeability {
+    Clean,
+    Conflict,
+}
+
+/// Probe the lifecycle state of a single PR. Implemented for
+/// production by shelling out to `gh`; test doubles can stub it
+/// directly.
 #[async_trait]
 pub trait MergeProbe: Send + Sync {
-    /// Returns the latest merge state for `pr_url`. Errors are
+    /// Returns the latest lifecycle state for `pr_url`. Errors are
     /// reserved for tool / network failures; "PR doesn't exist" is
-    /// reported as `Ok` with `merged=false` so the poller's
-    /// in-review-stays-in-review behavior is preserved (a deleted PR
-    /// is the user's problem, not the poller's).
-    async fn probe(&self, pr_url: &str) -> Result<PrMergeState>;
+    /// reported as `Ok` with `state=ClosedUnmerged` so the poller's
+    /// in-review-stays-in-review behaviour is preserved (a deleted
+    /// PR's row stays where it was).
+    async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe>;
 }
 
-/// `MergeProbe` that shells out to `gh pr view <url> --json state,mergedAt`.
+/// `MergeProbe` that shells out to `gh pr view <url> --json …`.
 #[derive(Debug, Default)]
 pub struct CommandMergeProbe;
 
@@ -63,16 +114,23 @@ impl CommandMergeProbe {
 
 #[async_trait]
 impl MergeProbe for CommandMergeProbe {
-    async fn probe(&self, pr_url: &str) -> Result<PrMergeState> {
+    async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
         let output = Command::new("gh")
             .args([
                 "pr",
                 "view",
                 pr_url,
                 "--json",
-                "state,mergedAt",
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid",
                 "--jq",
-                r#"[(.state // ""), (.mergedAt // "")] | @tsv"#,
+                r#"[
+                    (.state // ""),
+                    (.mergedAt // ""),
+                    (.closedAt // ""),
+                    (.mergeable // ""),
+                    (.mergeStateStatus // ""),
+                    (.baseRefOid // "")
+                ] | @tsv"#,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -86,14 +144,16 @@ impl MergeProbe for CommandMergeProbe {
             // "could not resolve to a Resource" / 404 means the PR
             // doesn't exist any more (force-deleted, transferred). We
             // can't decide it's merged just because we can't see it,
-            // so treat as not-merged and leave the chore in review.
+            // so treat as closed-unmerged (a no-op for the sweep) and
+            // leave the chore where it was.
             if stderr_lower.contains("could not resolve")
                 || stderr_lower.contains("404")
                 || stderr_lower.contains("not found")
             {
-                return Ok(PrMergeState {
+                return Ok(PrLifecycleProbe {
                     url: pr_url.to_owned(),
-                    merged: false,
+                    state: PrLifecycleState::ClosedUnmerged,
+                    base_ref_oid: None,
                 });
             }
             return Err(anyhow!(
@@ -103,42 +163,116 @@ impl MergeProbe for CommandMergeProbe {
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let trimmed = stdout.trim();
-        let mut parts = trimmed.split('\t');
-        let state = parts.next().unwrap_or("").trim();
-        let merged_at = parts.next().unwrap_or("").trim();
-        let merged = state.eq_ignore_ascii_case("MERGED")
-            || (!merged_at.is_empty() && !merged_at.eq_ignore_ascii_case("null"));
-        Ok(PrMergeState {
-            url: pr_url.to_owned(),
-            merged,
-        })
+        Ok(parse_probe(pr_url, trimmed))
     }
 }
 
-/// Run one full merge-detection sweep over every chore and
-/// project_task in `in_review` with a `pr_url`. Returns the number
-/// of work items that transitioned to `done` so callers can log a
-/// one-line summary.
+/// Map one tab-separated row produced by the `gh pr view --jq` clause
+/// into a [`PrLifecycleProbe`]. Pure function so the parsing rules can
+/// be unit-tested without shelling out.
+fn parse_probe(url: &str, line: &str) -> PrLifecycleProbe {
+    let mut parts = line.split('\t');
+    let raw_state = parts.next().unwrap_or("").trim();
+    let merged_at = parts.next().unwrap_or("").trim();
+    let _closed_at = parts.next().unwrap_or("").trim();
+    let mergeable = parts.next().unwrap_or("").trim();
+    let merge_state_status = parts.next().unwrap_or("").trim();
+    let base_ref_oid = parts.next().unwrap_or("").trim();
+    let state = classify_state(raw_state, merged_at, mergeable, merge_state_status);
+    let base_ref_oid = if base_ref_oid.is_empty() {
+        None
+    } else {
+        Some(base_ref_oid.to_owned())
+    };
+    PrLifecycleProbe {
+        url: url.to_owned(),
+        state,
+        base_ref_oid,
+    }
+}
+
+/// Classification rules (design Q1):
+///   - `state=MERGED` or non-empty `mergedAt` → `Merged`.
+///   - `state=CLOSED` (and not merged) → `ClosedUnmerged`.
+///   - `state=OPEN` (or unknown / empty, treated as still-open):
+///       * `mergeable=CONFLICTING` AND `mergeStateStatus=DIRTY` → `Conflict`
+///       * everything else (incl. `UNKNOWN`) → `Clean`.
+///
+/// The two-field agreement on `CONFLICTING` + `DIRTY` is deliberate —
+/// either alone is the precise signal, but requiring both protects
+/// against `mergeStateStatus` lagging behind `mergeable` immediately
+/// after a base move.
+fn classify_state(
+    raw_state: &str,
+    merged_at: &str,
+    mergeable: &str,
+    merge_state_status: &str,
+) -> PrLifecycleState {
+    let merged_at_present = !merged_at.is_empty() && !merged_at.eq_ignore_ascii_case("null");
+    if raw_state.eq_ignore_ascii_case("MERGED") || merged_at_present {
+        return PrLifecycleState::Merged;
+    }
+    if raw_state.eq_ignore_ascii_case("CLOSED") {
+        return PrLifecycleState::ClosedUnmerged;
+    }
+    let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING")
+        && merge_state_status.eq_ignore_ascii_case("DIRTY");
+    if conflicting {
+        PrLifecycleState::Open(OpenPrMergeability::Conflict)
+    } else {
+        PrLifecycleState::Open(OpenPrMergeability::Clean)
+    }
+}
+
+/// Outcome of one sweep. Used for logging and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub merged: usize,
+    pub conflict_flagged: usize,
+    pub conflict_cleared: usize,
+}
+
+impl SweepOutcome {
+    fn total_transitions(self) -> usize {
+        self.merged + self.conflict_flagged + self.conflict_cleared
+    }
+}
+
+/// Run one full lifecycle sweep over every chore and project_task
+/// the poller cares about (in_review with a PR, plus rows currently
+/// blocked on merge_conflict so we can detect resolution). Returns
+/// per-bucket counters so callers can log a one-line summary.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
-) -> usize {
-    let candidates = match work_db.list_chores_pending_merge_check() {
+) -> SweepOutcome {
+    let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
         Err(err) => {
             tracing::warn!(?err, "merge poller: failed to list pending merge checks");
-            return 0;
+            Vec::new()
         }
     };
-    if candidates.is_empty() {
-        return 0;
+    let blocked_conflict = match work_db.list_chores_blocked_on_merge_conflict() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list chores blocked on merge_conflict",
+            );
+            Vec::new()
+        }
+    };
+    let total = in_review.len() + blocked_conflict.len();
+    if total == 0 {
+        return SweepOutcome::default();
     }
-    let mut promoted = 0usize;
-    for candidate in candidates {
-        promoted += sweep_one(work_db, probe, publisher, &candidate).await as usize;
+    let mut outcome = SweepOutcome::default();
+    for candidate in in_review.iter().chain(blocked_conflict.iter()) {
+        sweep_one(work_db, probe, publisher, candidate, &mut outcome).await;
     }
-    promoted
+    outcome
 }
 
 async fn sweep_one(
@@ -146,8 +280,9 @@ async fn sweep_one(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
-) -> bool {
-    let state = match probe.probe(&candidate.pr_url).await {
+    outcome: &mut SweepOutcome,
+) {
+    let probe_result = match probe.probe(&candidate.pr_url).await {
         Ok(state) => state,
         Err(err) => {
             tracing::debug!(
@@ -156,12 +291,46 @@ async fn sweep_one(
                 ?err,
                 "merge poller: probe failed; will retry next pass",
             );
-            return false;
+            return;
         }
     };
-    if !state.merged {
-        return false;
+    match probe_result.state {
+        PrLifecycleState::Merged => {
+            if mark_merged(work_db, publisher, candidate).await {
+                outcome.merged += 1;
+            }
+        }
+        PrLifecycleState::Open(OpenPrMergeability::Conflict) => {
+            if conflict_watch::on_conflict_detected(work_db, publisher, candidate, &probe_result)
+                .await
+            {
+                outcome.conflict_flagged += 1;
+            }
+        }
+        PrLifecycleState::Open(OpenPrMergeability::Clean) => {
+            if conflict_watch::on_resolved(work_db, publisher, candidate).await {
+                outcome.conflict_cleared += 1;
+            }
+        }
+        PrLifecycleState::ClosedUnmerged => {
+            // Out-of-scope for this design — `chore-lifecycle-pr-closed-unmerged.md`
+            // owns the close-unmerged transition. The current sweep
+            // leaves the chore where it was, matching the prior
+            // poller's behaviour for a PR that has vanished.
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: PR closed without merge; leaving row in place",
+            );
+        }
     }
+}
+
+async fn mark_merged(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+) -> bool {
     let updated = match work_db.mark_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
         Ok(Some(task)) => task,
         Ok(None) => return false,
@@ -204,11 +373,14 @@ pub fn spawn_loop(
         // `gh`-per-chore on top of the engine's other startup work.
         tokio::time::sleep(interval).await;
         loop {
-            let promoted = run_one_pass(work_db.as_ref(), probe.as_ref(), publisher.as_ref()).await;
-            if promoted > 0 {
+            let outcome =
+                run_one_pass(work_db.as_ref(), probe.as_ref(), publisher.as_ref()).await;
+            if outcome.total_transitions() > 0 {
                 tracing::info!(
-                    promoted,
-                    "merge poller: work items moved to done in this pass",
+                    merged = outcome.merged,
+                    conflict_flagged = outcome.conflict_flagged,
+                    conflict_cleared = outcome.conflict_cleared,
+                    "merge poller: sweep transitions",
                 );
             }
             tokio::time::sleep(interval).await;
@@ -233,7 +405,7 @@ mod tests {
     };
 
     struct StubProbe {
-        states: std::sync::Mutex<std::collections::HashMap<String, Result<PrMergeState, String>>>,
+        states: std::sync::Mutex<std::collections::HashMap<String, Result<PrLifecycleProbe, String>>>,
     }
 
     impl StubProbe {
@@ -243,12 +415,17 @@ mod tests {
             })
         }
 
-        fn set_merged(&self, url: &str, merged: bool) {
+        fn set(&self, url: &str, state: PrLifecycleState) {
+            self.set_with_base(url, state, None);
+        }
+
+        fn set_with_base(&self, url: &str, state: PrLifecycleState, base_ref_oid: Option<&str>) {
             self.states.lock().unwrap().insert(
                 url.to_owned(),
-                Ok(PrMergeState {
+                Ok(PrLifecycleProbe {
                     url: url.to_owned(),
-                    merged,
+                    state,
+                    base_ref_oid: base_ref_oid.map(str::to_owned),
                 }),
             );
         }
@@ -263,14 +440,15 @@ mod tests {
 
     #[async_trait]
     impl MergeProbe for StubProbe {
-        async fn probe(&self, pr_url: &str) -> Result<PrMergeState> {
+        async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
             let map = self.states.lock().unwrap();
             match map.get(pr_url) {
                 Some(Ok(state)) => Ok(state.clone()),
                 Some(Err(msg)) => Err(anyhow!(msg.clone())),
-                None => Ok(PrMergeState {
+                None => Ok(PrLifecycleProbe {
                     url: pr_url.to_owned(),
-                    merged: false,
+                    state: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                    base_ref_oid: None,
                 }),
             }
         }
@@ -383,11 +561,11 @@ mod tests {
         let (product_id, chore_id) = make_chore_in_review(&db, "C1", pr);
 
         let probe = StubProbe::new();
-        probe.set_merged(pr, true);
+        probe.set(pr, PrLifecycleState::Merged);
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let promoted = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
-        assert_eq!(promoted, 1);
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.merged, 1);
 
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
@@ -407,19 +585,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmerged_pr_leaves_chore_in_review() {
+    async fn open_clean_pr_leaves_chore_in_review() {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/2";
         let (_pid, chore_id) = make_chore_in_review(&db, "C2", pr);
 
         let probe = StubProbe::new();
-        probe.set_merged(pr, false);
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        assert_eq!(run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await, 0);
-        let item = db.get_work_item(&chore_id).unwrap();
-        match item {
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.merged, 0);
+        assert_eq!(outcome.conflict_flagged, 0);
+        // No `blocked: merge_conflict` row in the corpus, so the clean
+        // signal hits nothing on the resolve side either.
+        assert_eq!(outcome.conflict_cleared, 0);
+        match db.get_work_item(&chore_id).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
@@ -437,11 +619,12 @@ mod tests {
 
         let probe = StubProbe::new();
         probe.set_err(pr_a, "auth broken");
-        probe.set_merged(pr_b, true);
+        probe.set(pr_b, PrLifecycleState::Merged);
         let publisher = Arc::new(RecordingPublisher::default());
 
         // The error on pr_a must not prevent pr_b from being promoted.
-        assert_eq!(run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await, 1);
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore_a).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
@@ -468,15 +651,15 @@ mod tests {
             make_project_task_in_review(&db, "PTmix", pr_proj);
 
         let probe = StubProbe::new();
-        probe.set_merged(pr_chore, true);
-        probe.set_merged(pr_proj, true);
+        probe.set(pr_chore, PrLifecycleState::Merged);
+        probe.set(pr_proj, PrLifecycleState::Merged);
         let publisher = Arc::new(RecordingPublisher::default());
 
         // Both kinds are mergeable, so a single sweep should promote
         // both rows — the project_task one being the regression case.
-        let promoted = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
         assert_eq!(
-            promoted, 2,
+            outcome.merged, 2,
             "merge poller must sweep both chore and project_task rows",
         );
 
@@ -503,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn unmerged_project_task_pr_stays_in_review() {
-        // The same negative path as `unmerged_pr_leaves_chore_in_review`,
+        // The same negative path as `open_clean_pr_leaves_chore_in_review`,
         // but for `kind = 'project_task'`. Guards against a future
         // change that filters back down to chores only.
         let dir = tempdir().unwrap();
@@ -512,10 +695,11 @@ mod tests {
         let (_pid, project_task_id) = make_project_task_in_review(&db, "PTopen", pr);
 
         let probe = StubProbe::new();
-        probe.set_merged(pr, false);
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        assert_eq!(run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await, 0);
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&project_task_id).unwrap() {
             WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected project_task, got {other:?}"),
@@ -524,13 +708,214 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_done_chore_is_skipped() {
+    async fn empty_corpus_is_skipped() {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         // No chores in review at all → no work, no errors, no events.
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
-        assert_eq!(run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await, 0);
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.total_transitions(), 0);
         assert!(publisher.work_events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_drives_full_conflict_resolve_cycle() {
+        // End-to-end through `run_one_pass`: in_review → conflict
+        // (probe says Conflict) → resolved (probe flips to Clean on
+        // next pass). The poller picks the row up from the
+        // in_review slice for the first pass and from the
+        // blocked-conflict slice for the second.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/500";
+        let (product, chore) = make_chore_in_review(&db, "Ccycle", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Pass 1: probe reports Conflict; row flips to blocked.
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.conflict_flagged, 1);
+        assert_eq!(outcome.conflict_cleared, 0);
+        assert_eq!(outcome.merged, 0);
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "blocked");
+                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Pass 2 with no change: idempotent — probe still reports
+        // Conflict, but row is already blocked, so the
+        // mark-conflict UPDATE matches zero rows.
+        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome2.total_transitions(), 0);
+
+        // Pass 3: probe flips to Clean; the blocked-conflict slice
+        // picks the row up and clears it back to in_review.
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
+        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome3.conflict_cleared, 1);
+        assert_eq!(outcome3.conflict_flagged, 0);
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
+                assert!(t.blocked_attempt_id.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Pass 4 with no change: the clear is also idempotent.
+        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome4.total_transitions(), 0);
+
+        // Event trail: blocked → resolved, plus the noop-passes
+        // emitted nothing.
+        let reasons: Vec<String> = publisher
+            .work_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(p, w, _)| p == &product && w == &chore)
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "blocked_merge_conflict".to_owned(),
+                "merge_conflict_resolved".to_owned(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_promotes_merged_pr_even_when_row_was_blocked() {
+        // A blocked-on-conflict row whose PR was force-merged via
+        // GitHub's branch-protection override should be promoted by
+        // the sweep, not left in `blocked`. The Merged branch of the
+        // dispatch runs regardless of which candidate list found the
+        // row.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/501";
+        let (_product, chore) = make_chore_in_review(&db, "C-force-merged", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // First pass: flip to blocked.
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Second pass: GitHub reports MERGED.
+        probe.set(pr, PrLifecycleState::Merged);
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        assert_eq!(outcome.merged, 1);
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "done");
+                assert_eq!(t.pr_url.as_deref(), Some(pr));
+                assert!(
+                    t.blocked_reason.is_none(),
+                    "merging out of blocked must clear blocked_reason",
+                );
+                assert!(t.blocked_attempt_id.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// Mapping table for the parser. The truth table here mirrors the
+    /// design doc's Q1 classification rules and guards against
+    /// future tweaks rewriting them silently.
+    #[test]
+    fn parse_probe_covers_state_mergeable_status_matrix() {
+        struct Case {
+            label: &'static str,
+            row: &'static str,
+            expect: PrLifecycleState,
+            expect_base: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                label: "MERGED carries through even if mergeable is empty",
+                row: "MERGED\t2026-05-09T12:00:00Z\t\t\t\tabc",
+                expect: PrLifecycleState::Merged,
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "non-empty mergedAt overrides state=OPEN (edge: GH lag)",
+                row: "OPEN\t2026-05-09T12:00:00Z\t\tMERGEABLE\tCLEAN\tabc",
+                expect: PrLifecycleState::Merged,
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "CLOSED without merged falls to ClosedUnmerged",
+                row: "CLOSED\t\t2026-05-09T12:00:00Z\t\t\tabc",
+                expect: PrLifecycleState::ClosedUnmerged,
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "OPEN + MERGEABLE/CLEAN is Clean",
+                row: "OPEN\t\t\tMERGEABLE\tCLEAN\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "OPEN + CONFLICTING/DIRTY is Conflict",
+                row: "OPEN\t\t\tCONFLICTING\tDIRTY\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Conflict),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "CONFLICTING without DIRTY status falls to Clean (lag protection)",
+                row: "OPEN\t\t\tCONFLICTING\tUNKNOWN\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "DIRTY without CONFLICTING falls to Clean (lag protection)",
+                row: "OPEN\t\t\tMERGEABLE\tDIRTY\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "UNKNOWN mergeable is treated as Clean (transient post-base-move)",
+                row: "OPEN\t\t\tUNKNOWN\tUNKNOWN\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "BEHIND is mergeable; not a conflict",
+                row: "OPEN\t\t\tMERGEABLE\tBEHIND\tabc",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: Some("abc"),
+            },
+            Case {
+                label: "empty base ref is None",
+                row: "OPEN\t\t\tMERGEABLE\tCLEAN\t",
+                expect: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                expect_base: None,
+            },
+        ];
+        for case in cases {
+            let probe = parse_probe("https://example.test/pr/1", case.row);
+            assert_eq!(
+                probe.state, case.expect,
+                "case `{}`: state mismatch (row: {:?})",
+                case.label, case.row,
+            );
+            assert_eq!(
+                probe.base_ref_oid.as_deref(),
+                case.expect_base,
+                "case `{}`: base_ref_oid mismatch",
+                case.label,
+            );
+        }
     }
 }
