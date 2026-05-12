@@ -1092,6 +1092,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -1621,6 +1623,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/77";

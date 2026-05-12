@@ -4538,6 +4538,37 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::SetProductDefaultModel { product_id, model } => {
+                match work_db.set_product_default_model(&product_id, model.as_deref()) {
+                    Ok(product) => {
+                        let item = WorkItem::Product(product);
+                        let pid = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&pid)],
+                            "product_default_model_set",
+                            Some(pid),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
         }
     }
 
@@ -6301,6 +6332,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
@@ -6492,6 +6525,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
@@ -6603,6 +6638,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
@@ -6723,6 +6760,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
@@ -6815,6 +6854,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
@@ -6991,6 +7032,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = server_state
