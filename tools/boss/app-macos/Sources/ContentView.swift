@@ -500,6 +500,13 @@ struct ContentView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(product.name)
                         .font(.title2.weight(.semibold))
+                    if case .singleRepo(let url) = model.workBoardRepoMode {
+                        RepoChipView(
+                            presentation: RepoChipPresentation.forProductHeader(
+                                productRepoURL: url
+                            )
+                        )
+                    }
                     Text(model.projectFilterDescription)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -847,6 +854,7 @@ private struct WorkBoardCardItem: View {
         let dragRefusal: String? = (model.dragRefusalNotice?.taskID == task.id)
             ? model.dragRefusalNotice?.message
             : nil
+        let repoChip = model.repoChip(for: task)
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -864,7 +872,8 @@ private struct WorkBoardCardItem: View {
                     liveStatusActivity: column == .doing ? liveState?.activity : nil,
                     blockedBy: blockedBy,
                     isAutoBlocked: isAutoBlocked,
-                    gatingPrereqs: gatingPrereqs
+                    gatingPrereqs: gatingPrereqs,
+                    repoChip: repoChip
                 )
             }
             .buttonStyle(.plain)
@@ -967,6 +976,12 @@ struct WorkBoardCardView: View {
     /// `isAutoBlocked` because the popover Dependencies subsection
     /// reuses this list to render hyperlinks.
     var gatingPrereqs: [WorkDependencyRow] = []
+    /// Per-card repo chip presentation, populated only when the
+    /// kanban is in multi-repo mode (any card override or mixed
+    /// resolved URLs across the visible board). `nil` in single-repo
+    /// mode, where the chip lives on the product header instead — see
+    /// `WorkBoardRepoMode` for the mode rule.
+    var repoChip: RepoChipPresentation? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -993,6 +1008,9 @@ struct WorkBoardCardView: View {
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                                 .accessibilityLabel("Blocked")
+                        }
+                        if let repoChip {
+                            RepoChipView(presentation: repoChip)
                         }
                         Text(task.name)
                             .font(.body.weight(.medium))
@@ -1814,6 +1832,66 @@ private struct WorkEditSheet: View {
             return "Edit Task"
         case .chore:
             return "Edit Chore"
+        }
+    }
+}
+
+/// Capsule chip surfacing a repo's short name on a kanban card or
+/// product header. Hover tooltip carries the full URL plus the
+/// provenance string ("Inherited from product" vs "Override on this
+/// card") so the reader can tell where the URL came from without
+/// digging into the popover. Pure view — all the mode/provenance
+/// logic lives on `RepoChipPresentation` so tests don't need a
+/// SwiftUI host.
+struct RepoChipView: View {
+    let presentation: RepoChipPresentation
+    var emphasized: Bool = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "folder")
+                .font(.caption2)
+            Text(presentation.shortName)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(foregroundColor)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(backgroundColor)
+        .clipShape(Capsule())
+        .overlay(
+            Capsule().strokeBorder(borderColor, lineWidth: 0.5)
+        )
+        .help(presentation.tooltip)
+        .accessibilityLabel(presentation.accessibilityLabel)
+    }
+
+    private var foregroundColor: Color {
+        switch presentation.provenance {
+        case .productDefault:
+            return Color(nsColor: .secondaryLabelColor)
+        case .taskOverride:
+            return .accentColor
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch presentation.provenance {
+        case .productDefault:
+            return Color(nsColor: .controlBackgroundColor)
+        case .taskOverride:
+            return Color.accentColor.opacity(0.12)
+        }
+    }
+
+    private var borderColor: Color {
+        switch presentation.provenance {
+        case .productDefault:
+            return Color(nsColor: .separatorColor)
+        case .taskOverride:
+            return Color.accentColor.opacity(0.4)
         }
     }
 }

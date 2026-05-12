@@ -997,6 +997,39 @@ final class ChatViewModel: ObservableObject {
         return projectName(for: task.projectID)
     }
 
+    /// Repo-chip mode for the kanban under the currently selected
+    /// product. Drives both the product-header chip (single-repo) and
+    /// the per-card chip (multi-repo) per design Q7. Computed off the
+    /// *visible* work items so a project filter that hides the
+    /// overriding card collapses the board back to single-repo
+    /// presentation, matching the rule "every visible card resolves
+    /// to the same URL".
+    var workBoardRepoMode: WorkBoardRepoMode {
+        guard let product = selectedProduct else { return .none }
+        return WorkBoardRepoMode.compute(
+            productRepoURL: product.repoRemoteURL,
+            cards: visibleWorkItems
+        )
+    }
+
+    /// Per-card chip presentation, returning `nil` whenever the chip
+    /// should not render: the board is in single-repo mode (chip
+    /// already lives on the product header), or the card has no
+    /// resolvable URL. Read by `WorkBoardCardView` to decide whether
+    /// to draw the chip in the card header.
+    func repoChip(for task: WorkTask) -> RepoChipPresentation? {
+        switch workBoardRepoMode {
+        case .singleRepo, .none:
+            return nil
+        case .multiRepo:
+            let product = product(withID: task.productID)
+            return RepoChipPresentation.forCard(
+                task: task,
+                productRepoURL: product?.repoRemoteURL
+            )
+        }
+    }
+
     func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
         if let cached = cachedItemsByColumn[column] {
             return cached
