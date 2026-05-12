@@ -488,30 +488,19 @@ struct ContentView: View {
     @ViewBuilder
     private func bossAgentHeader(isCollapsed: Bool) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            ZStack {
-                Circle()
-                    .fill(Color.accentColor.opacity(0.14))
-                if let portrait = TrekIconAssets.image(.picard, size: .small) {
-                    // The sprite is taller than it is wide (head + torso),
-                    // so an aspect-fill into a square frame overflows
-                    // vertically. Anchor the overflow to the top edge so
-                    // the head is preserved and only the lower body — which
-                    // the Circle mask would hide anyway — gets clipped.
-                    // Without `.top`, SwiftUI centers the overflow and
-                    // slices the bald crown off Picard.
-                    Image(nsImage: portrait)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 26, height: 26, alignment: .top)
-                        .clipShape(Circle())
-                } else {
-                    Image(systemName: "person.crop.circle.badge.checkmark")
-                        .foregroundStyle(Color.accentColor)
-                        .font(.system(size: 13, weight: .semibold))
-                }
+            if let portrait = TrekIconAssets.image(.picard, size: .small) {
+                Image(nsImage: portrait)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 22, height: 28)
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            } else {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .foregroundStyle(Color.accentColor)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 22, height: 28)
             }
-            .frame(width: 26, height: 26)
 
             if !isCollapsed {
                 Text("Picard")
