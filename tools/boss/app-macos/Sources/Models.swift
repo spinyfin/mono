@@ -400,6 +400,145 @@ struct WorkBoardSection: Identifiable {
     var projectID: String? = nil
 }
 
+/// Swift mirror of `boss_protocol::short_name_for(url)` from the
+/// multi-repo work modeling design (Q3). The canonical short name is
+/// the URL's path basename minus a trailing `.git`. Handles both
+/// `https://github.com/foo/bar.git` and SCP-style
+/// `git@github.com:foo/bar.git`. Falls back to the trimmed input when
+/// neither shape is recognisable so the chip never renders empty.
+func shortRepoName(for repoURL: String) -> String {
+    let trimmed = repoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return repoURL }
+    let lastSlash = trimmed.split(separator: "/", omittingEmptySubsequences: true).last
+        .map(String.init) ?? trimmed
+    let lastSegment = lastSlash.split(separator: ":", omittingEmptySubsequences: true).last
+        .map(String.init) ?? lastSlash
+    if lastSegment.hasSuffix(".git") {
+        return String(lastSegment.dropLast(4))
+    }
+    return lastSegment
+}
+
+/// How the kanban should surface the repo for a product, derived from
+/// the work item description for "macOS: kanban card repo chip" and
+/// design Q7. Single-repo mode lifts one chip to the product header;
+/// multi-repo mode prints a chip on every card. `none` collapses the
+/// affordance — the product has no default and no card overrides, so
+/// there is nothing repo-shaped to surface.
+enum WorkBoardRepoMode: Equatable {
+    case singleRepo(url: String)
+    case multiRepo
+    case none
+
+    /// Compute the mode from the product default and the visible card
+    /// set. The rule per the work item description:
+    /// - Multi-repo as soon as any card carries a per-task override OR
+    ///   resolved URLs differ across cards.
+    /// - Single-repo when no overrides exist and a product default is
+    ///   set; every card inherits the same URL.
+    /// - None when neither product nor any card carries a URL.
+    static func compute(
+        productRepoURL: String?,
+        cards: [WorkTask]
+    ) -> WorkBoardRepoMode {
+        let productURL = nonEmpty(productRepoURL)
+        let overrides = cards.compactMap { nonEmpty($0.repoRemoteURL) }
+        if overrides.isEmpty {
+            if let productURL { return .singleRepo(url: productURL) }
+            return .none
+        }
+        // Any override → multi-repo, even when overrides happen to all
+        // match the product default. A user who set an explicit
+        // override on a card has stated *I want this row's repo to be
+        // visible*; suppressing the chip would erase that signal.
+        return .multiRepo
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
+/// Pure-data presentation for the kanban repo chip — short name for
+/// the rendered text, full URL for the hover tooltip, and a
+/// provenance string ("Inherited from product" vs "Override on this
+/// card") that tells the reader where the URL came from. Lives outside
+/// the SwiftUI view so tests can pin chip text + tooltip without
+/// spinning up a host (mirrors `ProjectDesignDocAffordancePresentation`).
+struct RepoChipPresentation: Equatable {
+    let shortName: String
+    let fullURL: String
+    let provenance: Provenance
+
+    enum Provenance: Equatable {
+        case productDefault
+        case taskOverride
+    }
+
+    var tooltip: String {
+        switch provenance {
+        case .productDefault:
+            return "\(fullURL)\nInherited from product"
+        case .taskOverride:
+            return "\(fullURL)\nOverride on this card"
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch provenance {
+        case .productDefault:
+            return "Repo \(shortName), inherited from product"
+        case .taskOverride:
+            return "Repo \(shortName), override on this card"
+        }
+    }
+
+    /// Build a chip for one card given the parent product's default.
+    /// Returns `nil` when neither the card nor the product carries a
+    /// URL — there is nothing to chip.
+    static func forCard(
+        task: WorkTask,
+        productRepoURL: String?
+    ) -> RepoChipPresentation? {
+        if let override = nonEmpty(task.repoRemoteURL) {
+            return RepoChipPresentation(
+                shortName: shortRepoName(for: override),
+                fullURL: override,
+                provenance: .taskOverride
+            )
+        }
+        if let productURL = nonEmpty(productRepoURL) {
+            return RepoChipPresentation(
+                shortName: shortRepoName(for: productURL),
+                fullURL: productURL,
+                provenance: .productDefault
+            )
+        }
+        return nil
+    }
+
+    /// Build the chip carried on the product header in single-repo
+    /// mode. Always provenance `.productDefault` — single-repo mode
+    /// requires zero overrides by construction.
+    static func forProductHeader(productRepoURL: String) -> RepoChipPresentation {
+        RepoChipPresentation(
+            shortName: shortRepoName(for: productRepoURL),
+            fullURL: productRepoURL,
+            provenance: .productDefault
+        )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
 extension WorkTask {
     /// Canonical mapping from engine status → kanban column.
     ///
