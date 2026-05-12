@@ -1408,7 +1408,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::Show(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let detail = list_dependencies_detailed(
@@ -1437,7 +1439,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::Update(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
@@ -1459,7 +1463,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             })
         }
         ProjectCommand::Delete(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
@@ -1486,7 +1492,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::Move(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
@@ -1504,7 +1512,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     "provide --path <p> (with optional --repo/--branch) or --unset",
                 ));
             }
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let input = if args.unset {
@@ -1536,7 +1546,9 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::OpenDesign(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product =
+                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
+                    .await?;
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let resolved = resolve_project_design_doc(&mut client, &project.id).await?;
@@ -1567,7 +1579,13 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
     let mut client = connect_for_work(ctx).await?;
     match command {
         TaskCommand::Create(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product = resolve_product_inferable(
+                &mut client,
+                args.product,
+                args.project.as_deref(),
+                ctx,
+            )
+            .await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
             let name = required_text(args.name, "Task name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
@@ -1590,7 +1608,13 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             })
         }
         TaskCommand::List(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product = resolve_product_inferable(
+                &mut client,
+                args.product,
+                args.project.as_deref(),
+                ctx,
+            )
+            .await?;
             let project = match args.project {
                 Some(selector) => {
                     Some(resolve_project(&mut client, &product.id, Some(selector), ctx).await?)
@@ -1625,7 +1649,13 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
-            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let product = resolve_product_inferable(
+                &mut client,
+                args.product,
+                args.project.as_deref(),
+                ctx,
+            )
+            .await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
             if args.ids.is_empty() {
                 return Err(CliError::usage("provide at least one task id via --ids"));
@@ -2479,7 +2509,8 @@ async fn run_task_create_many(
     // Resolve --product / --project once; per-item project_id (if
     // present) is treated as an already-resolved engine id so we
     // don't pay an extra round-trip per row.
-    let product = resolve_product(client, args.product, ctx).await?;
+    let product =
+        resolve_product_inferable(client, args.product, args.project.as_deref(), ctx).await?;
     let default_project = match args.project {
         Some(selector) => Some(resolve_project(client, &product.id, Some(selector), ctx).await?),
         None => None,
@@ -2945,6 +2976,103 @@ async fn resolve_product(
     };
 
     match_products(&products, &selector)
+}
+
+/// True when `s` looks like a typed engine work-item id. The engine
+/// stamps `prod_…` on products, `proj_…` on projects, and `task_…` on
+/// both tasks and chores (chores share the task prefix at the row
+/// level, so we don't enumerate `chore_` separately). Slugs are short
+/// names like `boss` / `mono` and never collide with these prefixes
+/// in practice.
+fn is_typed_work_item_id(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("prod_") || s.starts_with("proj_") || s.starts_with("task_")
+}
+
+/// If `selector` is a typed engine work-item id, look it up and return
+/// its product id. Returns `Ok(None)` when the selector isn't shaped
+/// like a typed id; callers then fall back to slug / interactive
+/// resolution against the existing [`resolve_product`] path.
+async fn product_id_from_typed_selector(
+    client: &mut BossClient,
+    selector: &str,
+) -> Result<Option<String>, CliError> {
+    let trimmed = selector.trim();
+    if !is_typed_work_item_id(trimmed) {
+        return Ok(None);
+    }
+    let item = get_work_item(client, trimmed).await?;
+    let product_id = match item {
+        WorkItem::Product(p) => p.id,
+        WorkItem::Project(p) => p.product_id,
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id,
+    };
+    Ok(Some(product_id))
+}
+
+/// Pure validator extracted so the mismatch-handling can be unit-tested
+/// without an engine. When `explicit` is `Some`, it must resolve to the
+/// same product as `inferred_id`; on mismatch we return a usage error
+/// that names both sides so the user can drop the redundant flag.
+fn ensure_explicit_product_matches(
+    products: &[Product],
+    explicit: Option<&str>,
+    inferred_id: &str,
+    id_hint: &str,
+) -> Result<(), CliError> {
+    let Some(explicit) = explicit else {
+        return Ok(());
+    };
+    let chosen = match_products(products, explicit)?;
+    if chosen.id != inferred_id {
+        return Err(CliError::usage(format!(
+            "--product {explicit} resolves to {chosen} but {id_hint} belongs to {inferred_id} — drop the redundant --product flag",
+            chosen = chosen.id,
+        )));
+    }
+    Ok(())
+}
+
+/// Variant of [`resolve_product`] that infers the product from a
+/// globally-unique typed work-item id (`proj_…` / `task_…` / `prod_…`)
+/// already on the command line. When both an explicit `--product` and
+/// a typed-id hint are supplied, the resolved products must agree —
+/// mismatches surface as a usage error so the caller can drop the
+/// redundant flag.
+async fn resolve_product_inferable(
+    client: &mut BossClient,
+    explicit: Option<String>,
+    typed_id_hint: Option<&str>,
+    ctx: &RunContext,
+) -> Result<Product, CliError> {
+    let inferred_id = match typed_id_hint {
+        Some(id) => product_id_from_typed_selector(client, id).await?,
+        None => None,
+    };
+
+    let Some(inferred_id) = inferred_id else {
+        return resolve_product(client, explicit, ctx).await;
+    };
+
+    let products = list_products(client).await?;
+    let inferred = products
+        .iter()
+        .find(|p| p.id == inferred_id)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::not_found(format!(
+                "id {hint} references product {inferred_id}, but no such product exists",
+                hint = typed_id_hint.unwrap_or("(typed id)"),
+            ))
+        })?;
+
+    ensure_explicit_product_matches(
+        &products,
+        explicit.as_deref(),
+        &inferred.id,
+        typed_id_hint.unwrap_or("(typed id)"),
+    )?;
+    Ok(inferred)
 }
 
 async fn resolve_project(
@@ -3656,8 +3784,9 @@ mod tests {
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, OpenDesignAction,
         ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, TaskCommand,
-        classify_bind_pr, decide_open_design_action, expect_leaf_work_item, format_repo_line,
-        format_project_design_doc_line, pick_by_index, short_name_for, validate_github_pr_url,
+        classify_bind_pr, decide_open_design_action, ensure_explicit_product_matches,
+        expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
+        is_typed_work_item_id, pick_by_index, short_name_for, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -4559,5 +4688,113 @@ mod tests {
         // a different repo with the same short name does NOT match
         // when the selector is the URL form.
         assert!(!sel.matches(Some("git@github.com:other/nimbus.git")));
+    }
+
+    #[test]
+    fn typed_work_item_id_prefixes_are_recognized() {
+        assert!(is_typed_work_item_id("prod_18ae0000_1"));
+        assert!(is_typed_work_item_id("proj_18ae0000_1"));
+        assert!(is_typed_work_item_id("task_18ae0000_1"));
+        // whitespace is tolerated — the resolver trims before lookup.
+        assert!(is_typed_work_item_id("  proj_abc  "));
+        // slugs / arbitrary names are not typed ids.
+        assert!(!is_typed_work_item_id("boss"));
+        assert!(!is_typed_work_item_id("work-cli"));
+        assert!(!is_typed_work_item_id(""));
+        // chore_ is not used at the engine row level — chores share
+        // the task_ prefix.
+        assert!(!is_typed_work_item_id("chore_18ae0000_1"));
+    }
+
+    /// `boss project show proj_…` accepts a globally-unique typed id
+    /// without `--product`. The parser shape pin is the user-facing
+    /// half of the inference fix; the engine half is exercised by
+    /// the in-process integration test in `tests/infer_product.rs`.
+    #[test]
+    fn parses_project_show_with_typed_id_and_no_product() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "show",
+            "proj_18aeacce8acf9140_27",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::Show(args),
+            } => {
+                assert_eq!(args.selector, "proj_18aeacce8acf9140_27");
+                assert!(args.product.is_none());
+            }
+            _ => panic!("expected project show command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_list_with_project_typed_id_and_no_product() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "list",
+            "--project",
+            "proj_18aeacce8acf9140_27",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => {
+                assert_eq!(args.project.as_deref(), Some("proj_18aeacce8acf9140_27"));
+                assert!(args.product.is_none());
+            }
+            _ => panic!("expected task list command"),
+        }
+    }
+
+    fn product_with_id(id: &str, slug: &str) -> Product {
+        Product {
+            id: id.to_owned(),
+            name: slug.to_owned(),
+            slug: slug.to_owned(),
+            description: String::new(),
+            repo_remote_url: None,
+            status: "active".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_product_validator_accepts_omitted_explicit() {
+        let products = vec![product_with_id("prod_1", "boss")];
+        assert!(
+            ensure_explicit_product_matches(&products, None, "prod_1", "proj_x").is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_product_validator_accepts_matching_id_or_slug() {
+        let products = vec![product_with_id("prod_1", "boss")];
+        assert!(
+            ensure_explicit_product_matches(&products, Some("prod_1"), "prod_1", "proj_x").is_ok()
+        );
+        assert!(
+            ensure_explicit_product_matches(&products, Some("boss"), "prod_1", "proj_x").is_ok()
+        );
+    }
+
+    /// When the user passes `--product` AND a typed id whose product
+    /// disagrees, we surface a usage error naming both sides instead
+    /// of silently picking one. Same shape as the engine-side
+    /// "product/project disagree" check.
+    #[test]
+    fn explicit_product_validator_rejects_mismatch() {
+        let products = vec![
+            product_with_id("prod_1", "boss"),
+            product_with_id("prod_2", "mono"),
+        ];
+        let err = ensure_explicit_product_matches(&products, Some("mono"), "prod_1", "proj_x")
+            .expect_err("disagreement must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("mono"), "{msg}");
+        assert!(msg.contains("prod_1"), "{msg}");
     }
 }
