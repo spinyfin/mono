@@ -17,3 +17,5 @@ node_modules/
 # Per-lease worker session artifacts written by tools/boss/engine/src/worker_setup.rs.
 # These contain a specific lease id and worker config, regenerated each spawn.
 .claude/
+# Exception: CLAUDE.md is permanent project-level coordinator instructions.
+!.claude/CLAUDE.md
