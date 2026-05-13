@@ -14,10 +14,7 @@ struct BossMacApp: App {
         .commands {
             TextEditingCommands()
             CommandMenu("Debug") {
-                Button("Dispatch Events") {
-                    DispatchEventsWindowController.shared.toggle()
-                }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
+                DispatchEventsCommand()
             }
         }
 
@@ -27,6 +24,30 @@ struct BossMacApp: App {
             }
         }
         .defaultSize(width: 760, height: 640)
+
+        Window("Dispatch Events", id: "dispatch-events") {
+            DispatchEventsViewer()
+        }
+        .defaultSize(width: 1040, height: 620)
+    }
+}
+
+private struct DispatchEventsCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.dispatchEventsViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Dispatch Events") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "dispatch-events")
+            } else {
+                isOpen = true
+                openWindow(id: "dispatch-events")
+            }
+        }
+        .keyboardShortcut("d", modifiers: [.command, .shift])
     }
 }
 
@@ -41,7 +62,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // bringing back the manual NSWindow setup #417 removed.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchEventsWindowController.shared.restoreIfNeeded()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
