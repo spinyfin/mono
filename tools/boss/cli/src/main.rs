@@ -91,6 +91,19 @@ enum Commands {
         #[command(subcommand)]
         command: EngineCommand,
     },
+    /// Remove an installed Boss.app bundle.
+    ///
+    /// By default removes ~/Applications/Boss.app and leaves the state
+    /// directory (~/Library/Application Support/Boss/) intact. Pass
+    /// --purge-state to also remove state (requires confirmation unless
+    /// --yes is also provided).
+    ///
+    /// When BOSS_INSTALL_ROOT is set the uninstall operates on that
+    /// install root instead of ~/Applications. In that case the engine
+    /// stop is skipped — the caller is responsible for their own engine
+    /// lifecycle (stopping the default pid file would kill the host
+    /// engine instead of any sandbox engine).
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,6 +307,19 @@ impl From<DependDirectionArg> for DependencyDirection {
             DependDirectionArg::Both => DependencyDirection::Both,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    /// Also remove ~/Library/Application Support/Boss/ (state.db,
+    /// executions/, audit log). Requires interactive confirmation
+    /// unless --yes is also passed.
+    #[arg(long)]
+    purge_state: bool,
+
+    /// Skip interactive confirmation prompts.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1251,6 +1277,7 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_engine_command(command, &ctx).await
         }
+        Commands::Uninstall(args) => run_uninstall_command(args, &cli.global),
     }
 }
 
@@ -4144,6 +4171,140 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
     }
 }
 
+fn resolve_install_root() -> Result<PathBuf, CliError> {
+    if let Ok(root) = std::env::var("BOSS_INSTALL_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        CliError::internal(anyhow::anyhow!("HOME is not set; cannot resolve install root"))
+    })?;
+    Ok(PathBuf::from(home).join("Applications"))
+}
+
+fn resolve_state_root_for_uninstall() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/Boss"))
+}
+
+fn confirm_interactive(prompt: &str) -> bool {
+    eprint!("{prompt} [y/N] ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y")
+}
+
+fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Result<(), CliError> {
+    let install_root = resolve_install_root()?;
+    // True when no BOSS_INSTALL_ROOT override is in effect, meaning we are
+    // operating on the canonical ~/Applications install. Only in that case
+    // should we stop the engine — stopping the default pid file when the
+    // caller set a sandbox install root would kill the host engine instead.
+    let using_default_install_root = std::env::var("BOSS_INSTALL_ROOT").is_err();
+    let app_path = install_root.join("Boss.app");
+
+    if !app_path.exists() {
+        if flags.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "not_installed",
+                    "message": "no installed Boss found",
+                    "searched": app_path.display().to_string(),
+                })
+            );
+        } else {
+            eprintln!(
+                "boss uninstall: no installed Boss found at {}",
+                app_path.display()
+            );
+            eprintln!("If Boss is running from a dev build, uninstall is not applicable.");
+        }
+        return Err(CliError::internal(anyhow::anyhow!("no installed Boss to uninstall")));
+    }
+
+    let state_root = resolve_state_root_for_uninstall();
+
+    if !flags.json {
+        println!("This will remove:");
+        println!("  {}", app_path.display());
+        if args.purge_state {
+            if let Some(ref state) = state_root {
+                println!("  {} (--purge-state)", state.display());
+            }
+        }
+    }
+
+    if !args.yes {
+        let confirmed = if flags.json {
+            true
+        } else {
+            confirm_interactive("Proceed with uninstall?")
+        };
+        if !confirmed {
+            if flags.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "cancelled", "reason": "user declined"})
+                );
+            } else {
+                println!("uninstall cancelled");
+            }
+            return Ok(());
+        }
+    }
+
+    if using_default_install_root {
+        let pid_path = std::env::var("BOSS_ENGINE_PID_PATH")
+            .unwrap_or_else(|_| boss_client::DEFAULT_PID_PATH.to_owned());
+        let _ = stop_engine(&pid_path);
+    } else {
+        eprintln!(
+            "note: not stopping engine: BOSS_INSTALL_ROOT is set; \
+             assuming the caller manages their own engine lifecycle"
+        );
+    }
+
+    std::fs::remove_dir_all(&app_path).map_err(|e| {
+        CliError::internal(anyhow::anyhow!("failed to remove {}: {e}", app_path.display()))
+    })?;
+
+    let mut removed = vec![app_path.display().to_string()];
+
+    if args.purge_state {
+        if let Some(state) = state_root {
+            if state.exists() {
+                std::fs::remove_dir_all(&state).map_err(|e| {
+                    CliError::internal(anyhow::anyhow!(
+                        "failed to remove {}: {e}",
+                        state.display()
+                    ))
+                })?;
+                removed.push(state.display().to_string());
+            }
+        }
+    }
+
+    if flags.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "uninstalled",
+                "removed": removed,
+            })
+        );
+    } else {
+        println!("Uninstalled Boss.");
+        for path in &removed {
+            println!("  removed: {path}");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -4260,6 +4421,9 @@ mod tests {
             blocked_attempt_id: None,
             effort_level: None,
             model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            blocked_signals: vec![],
         }
     }
 

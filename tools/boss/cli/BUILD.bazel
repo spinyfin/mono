@@ -100,6 +100,23 @@ rust_test(
     ),
 )
 
+# Regression test: boss uninstall with BOSS_INSTALL_ROOT set must not kill
+# the host engine. Drives the boss binary as a subprocess; no engine needed.
+rust_test(
+    name = "uninstall_test",
+    srcs = ["tests/uninstall.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
 # End-to-end coverage for the heuristic feedback-loop audit report
 # (design §Q4 follow-up, PR #370). Drives `boss product
 # audit-effort` against an in-process engine with synthetic
