@@ -6199,6 +6199,34 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         );
     }
 
+    // Prereqs are all satisfied. If the task is stuck in `blocked` with
+    // blocked_reason='dependency' (stale state from a failed auto-unblock
+    // cascade — e.g. last_status_actor was reset to 'human' by a
+    // subsequent update, so the cascade skipped it), clear the block here
+    // so start_execution_run can advance kanban status to `active`.
+    // Only applies to task_ ids; projects don't carry blocked_reason.
+    if work_item_id.starts_with("task_") {
+        let now = now_string();
+        let rows_cleared = conn.execute(
+            "UPDATE tasks
+             SET status            = 'todo',
+                 blocked_reason    = NULL,
+                 last_status_actor = 'engine',
+                 updated_at        = ?2
+             WHERE id              = ?1
+               AND deleted_at      IS NULL
+               AND status          = 'blocked'
+               AND (blocked_reason = 'dependency' OR blocked_reason IS NULL)",
+            params![work_item_id, now],
+        )?;
+        if rows_cleared > 0 {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                "RequestExecution: cleared stale dependency block — all prereqs satisfied",
+            );
+        }
+    }
+
     // Multi-repo Q5: route through the single resolver so the
     // explicit `bossctl work start` path refuses with the same
     // message the reconciler would have surfaced. The matching
@@ -6989,6 +7017,17 @@ fn maybe_engine_block_dependent(
         return Ok(());
     }
     write_engine_status(conn, dependent_id, "blocked", now_epoch)?;
+    // Stamp blocked_reason so the user-override path in
+    // request_execution_in_tx_with_live_check can identify and clear
+    // stale dependency blocks consistently (the backfill migration
+    // covered pre-existing rows; this covers new auto-blocks).
+    if dependent_id.starts_with("task_") {
+        conn.execute(
+            "UPDATE tasks SET blocked_reason = 'dependency'
+             WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
+            [dependent_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -7024,6 +7063,14 @@ fn maybe_engine_unblock_dependent(
         return Ok(());
     }
     write_engine_status(conn, dependent_id, "todo", now_epoch)?;
+    // Clear blocked_reason so it doesn't linger on a todo row.
+    if dependent_id.starts_with("task_") {
+        conn.execute(
+            "UPDATE tasks SET blocked_reason = NULL
+             WHERE id = ?1 AND deleted_at IS NULL",
+            [dependent_id],
+        )?;
+    }
     tracing::info!(
         dependent_id,
         "engine: auto-unblocked dependent — all gating prereqs satisfied",
@@ -11616,6 +11663,122 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("gated by"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression: a task stuck in `blocked` with `blocked_reason='dependency'`
+    /// whose prereq is now `done` must be dispatchable via `RequestExecution`.
+    /// This covers the user-override path (kanban drag-to-Doing / bossctl
+    /// work start) when the auto-unblock cascade failed to fire — e.g. because
+    /// a subsequent update reset `last_status_actor` to `'human'`.
+    ///
+    /// The fix in `request_execution_in_tx_with_live_check` re-evaluates
+    /// prereqs on the verb, clears the stale block, and creates a `ready`
+    /// execution so the dispatcher can proceed.
+    #[test]
+    fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
+        let path = temp_db_path("deps-clear-stale-block");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "prereq".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "dependent".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        // Add the edge: dependent is gated by prereq.
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        // dependent is now auto-blocked by the engine.
+        let dep_after_add = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = dep_after_add else { panic!() };
+        assert_eq!(t.status, "blocked", "engine should have auto-blocked dependent");
+        assert_eq!(t.blocked_reason.as_deref(), Some("dependency"));
+
+        // Mark prereq done — the cascade should auto-unblock dependent.
+        // But simulate a scenario where the cascade failed: manually
+        // force last_status_actor back to 'human' on the dependent
+        // (mimicking a subsequent update_work_item call that reset it).
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET last_status_actor = 'human' WHERE id = ?1",
+                [&dependent.id],
+            )
+            .unwrap();
+
+        // Complete the prereq. The cascade fires but skips dependent
+        // because last_status_actor='human'.
+        db.update_work_item(
+            &prereq.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Verify the dependent is still stuck (cascade was skipped).
+        let still_stuck = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(stuck) = still_stuck else { panic!() };
+        assert_eq!(stuck.status, "blocked", "cascade skipped — still stuck");
+        assert_eq!(stuck.blocked_reason.as_deref(), Some("dependency"));
+
+        // RequestExecution (the user-override path) must succeed and
+        // clear the stale block.
+        let execution = db
+            .request_execution(RequestExecutionInput {
+                work_item_id: dependent.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .expect("RequestExecution should succeed when all prereqs are done");
+
+        assert_eq!(execution.status, "ready", "execution must be ready");
+
+        // The task's kanban status must be cleared to 'todo' so
+        // start_execution_run can advance it to 'active'.
+        let dep_final = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(final_task) = dep_final else { panic!() };
+        assert_eq!(
+            final_task.status, "todo",
+            "blocked_reason=dependency must be cleared to todo on RequestExecution"
+        );
+        assert!(
+            final_task.blocked_reason.is_none(),
+            "blocked_reason must be NULL after clearing"
+        );
         let _ = std::fs::remove_file(path);
     }
 
