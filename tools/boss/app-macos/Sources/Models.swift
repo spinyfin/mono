@@ -664,17 +664,20 @@ struct RepoChipPresentation: Equatable {
     }
 
     /// Build a chip for one card given the parent product's default.
-    /// Returns `nil` when the card has no per-row `repoRemoteURL` —
-    /// either it inherits the product default (chip would duplicate
-    /// the product header) or no URL is resolvable at all. The
-    /// `productRepoURL` argument is retained for future provenance
-    /// distinctions but does not currently change the result.
+    /// Returns `nil` when the card has no per-row `repoRemoteURL` or when
+    /// the task's repo matches the product default (case-insensitive,
+    /// trimming `.git` suffix). Returns non-nil only when the task has an
+    /// explicit repo that differs from the product default, or when the
+    /// product has no default but the task does.
     static func forCard(
         task: WorkTask,
         productRepoURL: String?
     ) -> RepoChipPresentation? {
-        _ = productRepoURL
         guard let override = nonEmpty(task.repoRemoteURL) else {
+            return nil
+        }
+        if let productDefault = nonEmpty(productRepoURL),
+           reposEqual(override, productDefault) {
             return nil
         }
         return RepoChipPresentation(
@@ -700,6 +703,17 @@ struct RepoChipPresentation: Equatable {
             return nil
         }
         return value
+    }
+
+    private static func reposEqual(_ url1: String, _ url2: String) -> Bool {
+        let normalize = { (url: String) in
+            var normalized = url.lowercased()
+            if normalized.hasSuffix(".git") {
+                normalized.removeLast(4)
+            }
+            return normalized
+        }
+        return normalize(url1) == normalize(url2)
     }
 }
 
