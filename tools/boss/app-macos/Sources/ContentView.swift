@@ -581,11 +581,7 @@ struct ContentView: View {
                     )
                 )
             }
-            Text(model.projectFilterDescription)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            ProjectFilterButton(model: model)
         }
 
         let groupPicker = Picker(
@@ -852,6 +848,85 @@ private struct WorkSidebarFilterRow: View {
         .padding(.vertical, subtitle == nil ? 6 : 7)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProjectFilterButton: View {
+    @ObservedObject var model: ChatViewModel
+    @State private var isShowingPopover = false
+
+    var body: some View {
+        Button {
+            isShowingPopover.toggle()
+        } label: {
+            HStack(spacing: 3) {
+                Text(model.projectFilterDescription)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
+            ProjectFilterPopover(model: model)
+        }
+    }
+}
+
+private struct ProjectFilterPopover: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            let allSelected = !model.hasProjectFilters
+            Button {
+                model.clearProjectFilters()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: allSelected ? "checkmark.square.fill" : "square")
+                        .foregroundStyle(allSelected ? Color.accentColor : .secondary)
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(width: 15)
+                    Text("All Projects")
+                        .font(.body.weight(allSelected ? .semibold : .regular))
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Divider()
+
+            ForEach(model.projectsForSelectedProduct) { project in
+                let isOn = model.selectedProjectFilterIDs.contains(project.id)
+                Button {
+                    model.toggleProjectFilter(project.id)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                            .foregroundStyle(isOn ? Color.accentColor : .secondary)
+                            .font(.system(size: 14, weight: .medium))
+                            .frame(width: 15)
+                        Text(project.name)
+                            .font(.body.weight(isOn ? .semibold : .regular))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(minWidth: 200, maxWidth: 280)
+        .padding(.vertical, 4)
     }
 }
 
