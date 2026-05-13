@@ -70,6 +70,18 @@ fn plan_from_target<B: BazelAdapter>(
     cwd: &Path,
     forwarded_args: &[OsString],
 ) -> Result<DispatchPlan, RepobinError> {
+    // Always build first. Bazel is fast when nothing changed, and delegating
+    // staleness detection to bazel is the only way to catch source-file changes
+    // that don't touch BUILD.bazel.
+    trace(format_args!(
+        "building target={target} repo_root={}",
+        repo_root.display()
+    ));
+    bazel.build(repo_root, target)?;
+
+    // After a successful build, check the cache to skip the cquery. The
+    // executable path for a given target is stable across builds, so a single
+    // cquery result is reusable indefinitely as long as the binary exists.
     if let Some(root) = cache_root {
         if let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target) {
             trace(format_args!(
@@ -88,10 +100,9 @@ fn plan_from_target<B: BazelAdapter>(
     }
 
     trace(format_args!(
-        "dispatch-cache miss target={target} repo_root={} (running bazel build + cquery)",
+        "dispatch-cache miss target={target} repo_root={} (running bazel cquery)",
         repo_root.display()
     ));
-    bazel.build(repo_root, target)?;
     let executable_path = bazel.resolve_executable(repo_root, target)?;
 
     if let Some(root) = cache_root {
@@ -216,18 +227,17 @@ mod tests {
     }
 
     #[test]
-    fn warm_dispatch_skips_bazel_calls() {
+    fn warm_dispatch_skips_cquery_but_always_builds() {
+        // The dispatch cache only skips the cquery (resolve_executable), not
+        // the build itself. Bazel handles staleness detection for build inputs.
         let temp = TempDir::new().unwrap();
         let cache_root = temp.path().join("cache");
         let repo_root = temp.path().join("repo");
         let target = "//tools/boss/cli:boss";
         let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
-        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
 
         fs::create_dir_all(exe.parent().unwrap()).unwrap();
         fs::write(&exe, b"#!/bin/sh\n").unwrap();
-        fs::create_dir_all(build.parent().unwrap()).unwrap();
-        fs::write(&build, b"rust_binary(...)\n").unwrap();
 
         let bazel = FakeBazel {
             executable: exe.clone(),
@@ -259,32 +269,35 @@ mod tests {
         )
         .expect("warm plan");
         assert_eq!(warm_plan.executable_path, exe);
-        // Counts must not increase on the warm hit.
         assert_eq!(
             bazel.builds.borrow().len(),
-            1,
-            "warm dispatch must not invoke bazel build"
+            2,
+            "warm dispatch must still invoke bazel build"
         );
         assert_eq!(
             bazel.queries.borrow().len(),
             1,
-            "warm dispatch must not invoke bazel cquery"
+            "warm dispatch must not invoke bazel cquery again"
         );
     }
 
     #[test]
-    fn build_mtime_advance_invalidates_dispatch_cache() {
+    fn source_file_change_does_not_short_circuit_build() {
+        // Regression: the previous dispatch cache tracked only BUILD.bazel as a
+        // witness, so source-only .rs changes were silently ignored and stale
+        // binaries were served. Now bazel build is always invoked so bazel's own
+        // incrementality decides whether a rebuild is needed.
         let temp = TempDir::new().unwrap();
         let cache_root = temp.path().join("cache");
         let repo_root = temp.path().join("repo");
         let target = "//tools/boss/cli:boss";
         let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
-        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+        let src = repo_root.join("tools/boss/cli/src/main.rs");
 
         fs::create_dir_all(exe.parent().unwrap()).unwrap();
         fs::write(&exe, b"#!/bin/sh\n").unwrap();
-        fs::create_dir_all(build.parent().unwrap()).unwrap();
-        fs::write(&build, b"rust_binary(...)\n").unwrap();
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"fn main() {}\n").unwrap();
 
         let bazel = FakeBazel {
             executable: exe.clone(),
@@ -300,13 +313,14 @@ mod tests {
             &repo_root,
             &[],
         )
-        .expect("first plan");
+        .expect("first dispatch");
         assert_eq!(bazel.builds.borrow().len(), 1);
 
+        // Modify a source file — only source changed, no BUILD.bazel touched.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&build)
+            .open(&src)
             .unwrap()
             .set_modified(later)
             .unwrap();
@@ -320,11 +334,11 @@ mod tests {
             &repo_root,
             &[],
         )
-        .expect("invalidated plan");
+        .expect("second dispatch after source change");
         assert_eq!(
             bazel.builds.borrow().len(),
             2,
-            "BUILD mtime advance should miss cache and re-run bazel"
+            "source-only change must not short-circuit bazel build"
         );
     }
 
