@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, oneshot};
 
+use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
     CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
@@ -4594,6 +4595,69 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::AuditProductEffort {
+                product_id,
+                window_days,
+            } => {
+                // Read-only diagnostic surface for `boss product
+                // audit-effort`. No auth gate — the rows are the
+                // chore corpus the caller can already enumerate
+                // via `boss chore list`, and the escalation events
+                // are coordinator-emitted facts about that corpus.
+                let result = build_effort_audit_report(
+                    &work_db,
+                    &product_id,
+                    window_days,
+                );
+                match result {
+                    Ok(report) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::EffortAuditReport { report },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::RecordEffortEscalation {
+                work_item_id,
+                original_level,
+                new_level,
+                markers,
+                rule_id,
+            } => {
+                // Coordinator-only RPC in practice (the sibling
+                // escalation-handler task is the only caller in
+                // v1), but the engine doesn't gate it — the row
+                // is opaque diagnostic data and a forged event is
+                // bounded to one false-positive in the audit
+                // report.
+                match work_db.record_effort_escalation(
+                    &work_item_id,
+                    original_level,
+                    new_level,
+                    &markers,
+                    rule_id.as_deref(),
+                ) {
+                    Ok(event) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::EffortEscalationRecorded { event },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
         }
     }
 
@@ -4602,6 +4666,42 @@ async fn handle_frontend_connection(
     sink.close();
     let _ = writer_task.await;
     Ok(())
+}
+
+/// Build the per-product effort-audit report. Handles the product
+/// lookup, window filter, and chore-corpus / event-log fan-in so
+/// the RPC handler stays a thin error-translation layer.
+fn build_effort_audit_report(
+    work_db: &WorkDb,
+    product_id: &str,
+    window_days: Option<u32>,
+) -> Result<boss_protocol::EffortAuditReport> {
+    let product = work_db
+        .get_product(product_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown product: {product_id}"))?;
+    let since_epoch_secs = window_days.and_then(|days| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        let span = (days as i64).saturating_mul(86_400);
+        Some(now - span)
+    });
+    let events =
+        work_db.list_effort_escalations_for_product(&product.id, since_epoch_secs)?;
+    let chores = work_db.list_chores_for_audit(&product.id)?;
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    Ok(audit_effort::build_report(
+        &product.id,
+        &product.slug,
+        window_days,
+        &chores,
+        &events,
+        generated_at,
+    ))
 }
 
 /// Metadata key used to persist the live-status disabled-slot list.

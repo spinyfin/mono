@@ -2473,6 +2473,7 @@ impl WorkDb {
         migrate_tasks_ci_attempt_columns(&conn)?;
         migrate_products_ci_attempt_budget(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
+        migrate_effort_escalations_table(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '8')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3512,6 +3513,126 @@ impl WorkDb {
         Ok(prior)
     }
 
+    /// Append an `effort_escalations` row recording a worker's
+    /// `[effort-escalation]` Stop-boundary signal (design §Q5). The
+    /// engine assigns `id` (prefix `esc_…`) and `created_at`.
+    /// `markers` is stored as a JSON array; the audit report
+    /// re-parses on read. Returns the inserted row wire-shape so
+    /// the RPC caller can echo it back without a re-query.
+    ///
+    /// Validates that `work_item_id` refers to a known leaf row
+    /// (chore / project_task / design) and resolves `product_id`
+    /// from it; the denormalised `product_id` column avoids a join
+    /// on every audit-report read.
+    pub fn record_effort_escalation(
+        &self,
+        work_item_id: &str,
+        original_level: boss_protocol::EffortLevel,
+        new_level: boss_protocol::EffortLevel,
+        markers: &[String],
+        rule_id: Option<&str>,
+    ) -> Result<boss_protocol::EffortEscalation> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let product_id = product_id_for_work_item(&tx, work_item_id)
+            .with_context(|| format!("unknown work item: {work_item_id}"))?;
+        let id = next_id("esc");
+        let now = now_string();
+        let markers_json = serde_json::to_string(markers)
+            .context("serialise effort escalation markers")?;
+        tx.execute(
+            "INSERT INTO effort_escalations
+                 (id, product_id, work_item_id, original_level, new_level, markers, rule_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                product_id,
+                work_item_id,
+                original_level.as_str(),
+                new_level.as_str(),
+                markers_json,
+                rule_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(boss_protocol::EffortEscalation {
+            id,
+            product_id,
+            work_item_id: work_item_id.to_owned(),
+            original_level,
+            new_level,
+            markers: markers.to_vec(),
+            rule_id: rule_id.map(|s| s.to_owned()),
+            created_at: now,
+        })
+    }
+
+    /// Load every `effort_escalations` row for `product_id`,
+    /// optionally filtered to events with `created_at >=
+    /// since_epoch_secs`. Order is newest-first by `created_at`.
+    /// Used by the audit report (design §Q4 follow-up).
+    pub fn list_effort_escalations_for_product(
+        &self,
+        product_id: &str,
+        since_epoch_secs: Option<i64>,
+    ) -> Result<Vec<boss_protocol::EffortEscalation>> {
+        let conn = self.connect()?;
+        let mut sql = String::from(
+            "SELECT id, product_id, work_item_id, original_level, new_level, markers, rule_id, created_at
+             FROM effort_escalations
+             WHERE product_id = ?1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(product_id.to_owned())];
+        if let Some(since) = since_epoch_secs {
+            sql.push_str(" AND CAST(created_at AS INTEGER) >= ?");
+            params_vec.push(Box::new(since));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(refs.as_slice(), map_effort_escalation)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Project `(name, description)` for every active chore on
+    /// `product_id`. Used by the audit report to compute the
+    /// per-marker `matches` denominator. Excludes deleted rows and
+    /// non-chore kinds — the audit is a per-product chore-corpus
+    /// snapshot, not a cross-kind scan.
+    pub fn list_chores_for_audit(
+        &self,
+        product_id: &str,
+    ) -> Result<Vec<crate::audit_effort::ChoreForAudit>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, description
+             FROM tasks
+             WHERE product_id = ?1
+               AND kind = 'chore'
+               AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([product_id], |row| {
+            Ok(crate::audit_effort::ChoreForAudit {
+                name: row.get(0)?,
+                description: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Most-recent execution for `work_item_id`, ordered by creation.
     /// `Ok(None)` when the work item has never had an execution.
     pub fn latest_execution_for_work_item(
@@ -3722,6 +3843,38 @@ fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
         body_markdown: row.get(6)?,
         created_at: row.get(7)?,
         resolved_at: row.get(8)?,
+    })
+}
+
+fn map_effort_escalation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::EffortEscalation> {
+    use std::str::FromStr;
+    let id: String = row.get(0)?;
+    let product_id: String = row.get(1)?;
+    let work_item_id: String = row.get(2)?;
+    let original_level_str: String = row.get(3)?;
+    let new_level_str: String = row.get(4)?;
+    let markers_json: String = row.get(5)?;
+    let rule_id: Option<String> = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    // Both level columns and the markers JSON were validated at
+    // insert time; on read we treat schema-level corruption as a
+    // row-level error so an unexpected value doesn't silently
+    // poison the audit.
+    let original_level = boss_protocol::EffortLevel::from_str(&original_level_str)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into()))?;
+    let new_level = boss_protocol::EffortLevel::from_str(&new_level_str)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into()))?;
+    let markers: Vec<String> = serde_json::from_str(&markers_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into()))?;
+    Ok(boss_protocol::EffortEscalation {
+        id,
+        product_id,
+        work_item_id,
+        original_level,
+        new_level,
+        markers,
+        rule_id,
+        created_at,
     })
 }
 
@@ -4773,6 +4926,41 @@ fn migrate_backfill_task_blocked_signals(conn: &Connection) -> Result<()> {
             AND status = 'blocked'
             AND deleted_at IS NULL",
         [],
+    )?;
+    Ok(())
+}
+
+/// Create the `effort_escalations` side table — one row per
+/// `[effort-escalation]` Stop-boundary signal the coordinator
+/// observed (design §Q5). The audit report (`boss product
+/// audit-effort`, design §Q4 follow-up) reads this table; the
+/// sibling escalation-handler task writes to it.
+///
+/// `original_level` / `new_level` are stored as TEXT to mirror
+/// `tasks.effort_level` — same enum, same lack of CHECK
+/// constraint, validated in code via
+/// [`boss_protocol::EffortLevel::from_str`].
+/// `markers` is a JSON-encoded array of strings (the §Q4 marker
+/// list the heuristic matched against the row at creation), kept
+/// in one column rather than a normalised side table because the
+/// audit only ever scans events in bulk — the join cost would
+/// outweigh the storage win.
+fn migrate_effort_escalations_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS effort_escalations (
+             id             TEXT PRIMARY KEY,
+             product_id     TEXT NOT NULL,
+             work_item_id   TEXT NOT NULL,
+             original_level TEXT NOT NULL,
+             new_level      TEXT NOT NULL,
+             markers        TEXT NOT NULL,
+             rule_id        TEXT,
+             created_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS effort_escalations_product_idx
+             ON effort_escalations(product_id, created_at);
+         CREATE INDEX IF NOT EXISTS effort_escalations_work_item_idx
+             ON effort_escalations(work_item_id);",
     )?;
     Ok(())
 }
@@ -11328,6 +11516,104 @@ mod tests {
             .unwrap();
         assert_eq!(budget, 3, "product budget must default to 3 on fresh init");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Fresh-init must include the `effort_escalations` side table
+    /// the audit report reads (design §Q4 follow-up, PR #370). New
+    /// databases get the table directly; legacy databases pick it
+    /// up via [`migrate_effort_escalations_table`] on first open.
+    #[test]
+    fn fresh_init_includes_effort_escalations_table() {
+        let path = temp_db_path("effort-escalations-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'effort_escalations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        // Every column the audit / record paths touch must exist
+        // so we can fail fast on a partial migration.
+        for column in [
+            "id",
+            "product_id",
+            "work_item_id",
+            "original_level",
+            "new_level",
+            "markers",
+            "rule_id",
+            "created_at",
+        ] {
+            assert!(
+                table_has_column(&conn, "effort_escalations", column).unwrap(),
+                "missing column {column}",
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Record-then-read round-trips through the engine API the
+    /// audit report depends on. Confirms the row encodes the
+    /// markers JSON array intact, that the level enums survive a
+    /// FromStr / Display round-trip, and that the listing query
+    /// filters by `product_id` and applies the window cutoff.
+    #[test]
+    fn record_and_list_effort_escalations_round_trip() {
+        let path = temp_db_path("effort-escalations-rt");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Rename helper".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let chore_id = chore.id.clone();
+        let recorded = db
+            .record_effort_escalation(
+                &chore_id,
+                EffortLevel::Trivial,
+                EffortLevel::Small,
+                &["rename".to_owned(), "cursor".to_owned()],
+                Some("rule-5"),
+            )
+            .unwrap();
+        assert_eq!(recorded.product_id, product.id);
+        assert_eq!(recorded.work_item_id, chore_id);
+        assert_eq!(recorded.markers, vec!["rename", "cursor"]);
+        assert_eq!(recorded.rule_id.as_deref(), Some("rule-5"));
+        assert!(recorded.id.starts_with("esc_"));
+
+        let listed = db
+            .list_effort_escalations_for_product(&product.id, None)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, recorded.id);
+        assert_eq!(listed[0].markers, vec!["rename", "cursor"]);
+
+        // A window cutoff in the future drops the row.
+        let listed_far_future = db
+            .list_effort_escalations_for_product(&product.id, Some(i64::MAX / 2))
+            .unwrap();
+        assert!(listed_far_future.is_empty());
         let _ = std::fs::remove_file(path);
     }
 
