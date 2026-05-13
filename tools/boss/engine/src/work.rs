@@ -3056,6 +3056,51 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Conflict-resolution attempts that are stranded: the parent task
+    /// is `blocked: merge_conflict`, the `conflict_resolutions` row is
+    /// `pending`, and no live execution (`kind='conflict_resolution'`
+    /// AND `status IN ('ready','running','waiting_human')`) exists for
+    /// that `work_item_id`. The merge poller's recovery sweep re-emits
+    /// a fresh execution request for each of these so a worker can
+    /// attempt the rebase.
+    ///
+    /// `abandoned` rows are excluded by the `status = 'pending'`
+    /// filter — the churn guard (or a human) owns that path and those
+    /// rows must not be automatically rescued.
+    pub fn list_stranded_conflict_resolution_attempts(
+        &self,
+    ) -> Result<Vec<StrandedConflictAttempt>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
+             FROM conflict_resolutions cr
+             WHERE cr.status = 'pending'
+               AND EXISTS (
+                   SELECT 1 FROM tasks t
+                   WHERE t.id = cr.work_item_id
+                     AND t.status = 'blocked'
+                     AND t.blocked_reason = 'merge_conflict'
+                     AND t.deleted_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = cr.work_item_id
+                     AND we.kind = 'conflict_resolution'
+                     AND we.status IN ('ready', 'running', 'waiting_human')
+               )
+             ORDER BY cr.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StrandedConflictAttempt {
+                attempt_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                product_id: row.get(2)?,
+                pr_url: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Chores and project_tasks the engine has flagged with either
     /// `blocked: ci_failure` or `blocked: ci_failure_exhausted`. The
     /// merge poller iterates this list alongside the in_review and
@@ -4265,6 +4310,22 @@ pub struct WorkerPrCompletion {
 /// or project_task the merge poller still needs to ask GitHub about.
 #[derive(Debug, Clone)]
 pub struct PendingMergeCheck {
+    pub work_item_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+}
+
+/// A `conflict_resolutions` row that is `pending` but has no live
+/// execution (`kind='conflict_resolution'` with status in
+/// `'ready'`, `'running'`, or `'waiting_human'`). The merge poller's
+/// stranded-attempt sweep rescues these by re-emitting a fresh
+/// execution request.
+///
+/// `abandoned` rows are excluded by the caller's SQL (`status =
+/// 'pending'` filter) — the churn guard or a human owns that path.
+#[derive(Debug, Clone)]
+pub struct StrandedConflictAttempt {
+    pub attempt_id: String,
     pub work_item_id: String,
     pub product_id: String,
     pub pr_url: String,
