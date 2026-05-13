@@ -6,6 +6,10 @@ exports_files(["Cargo.toml"])
 rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/installer:__pkg__",
+    ],
     deps = [
         "//tools/boss/client",
         "//tools/boss/protocol",

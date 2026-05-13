@@ -1,0 +1,52 @@
+load("@build_bazel_rules_apple//apple:versioning.bzl", "apple_bundle_version")
+load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs")
+
+package(default_visibility = ["//visibility:private"])
+
+# The set of binaries bundled inside Boss.app/Contents/Resources/bin/.
+# Note: cube is intentionally absent — it is assumed pre-installed on the
+# target machine and resolved by workers from PATH (design doc Q3).
+filegroup(
+    name = "bundled_binaries",
+    srcs = [
+        "//tools/boss/engine:engine",
+        "//tools/boss/cli:boss",
+        "//tools/boss/bossctl:bossctl",
+        "//tools/boss/event-shim:boss-event",
+    ],
+)
+
+filegroup(
+    name = "installer_scripts",
+    srcs = glob(["scripts/*"]),
+)
+
+# Staged payload directory: Boss.app/ tree with bundled binaries in
+# Contents/Resources/bin/ (binaries are included via additional_contents
+# on the macos_application rule in //tools/boss/app-macos:Boss).
+boss_pkg_payload(
+    name = "boss_pkg_payload",
+    app = "//tools/boss/app-macos:Boss",
+)
+
+# Unsigned .pkg installer.  Output: boss_pkg_unsigned/Boss-<sha>.pkg.
+# Requires --config=release to embed the git SHA in the filename; without
+# --stamp the output is Boss-unknown.pkg.
+#
+# Done criteria reference (design doc Q4 Phase 1 + Phase 2):
+#   Phase 1 — Bazel produces the binaries (this rule + boss_pkg_payload)
+#   Phase 2 — workspace-status.sh threads the git SHA into the filename
+boss_pkg_unsigned(
+    name = "boss_pkg_unsigned",
+    payload = ":boss_pkg_payload",
+    scripts = ":installer_scripts",
+)
+
+# Stamped Rust constants file.  Chore 3 wires this into engine_lib / boss /
+# bossctl so --version output reflects the build SHA (design doc Q4 Phase 2,
+# Q7).  This target only produces the plumbing; the wiring lands in chore 3.
+build_info_rs(
+    name = "build_info_rs",
+    out = "build_info_generated.rs",
+    visibility = ["//tools/boss:__subpackages__"],
+)

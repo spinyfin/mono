@@ -16,14 +16,14 @@
     <string>Boss</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <!-- TODO(chore-1): replace with ${BAZEL_STAMP_STABLE_BOSS_GIT_SHA} once
-         workspace-status.sh + the --stamp build config from chore 1 are wired.
-         Until then CFBundleShortVersionString carries "0+unknown" so at least
-         the version format is consistent with the CLI --version output (Q7). -->
+    <!-- Version strings must be dot-separated integers per Apple guidelines.
+         The human-readable "0+<sha>" format lives in BossBuildVersion below.
+         CFBundleShortVersionString stamping with the git SHA is an open
+         question deferred to chore 3 (see design doc Q7 / Open Questions). -->
     <key>CFBundleShortVersionString</key>
-    <string>0+unknown</string>
+    <string>0.0</string>
     <key>CFBundleVersion</key>
-    <string>0+unknown</string>
+    <string>1.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSPrincipalClass</key>

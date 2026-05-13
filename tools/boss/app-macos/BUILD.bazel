@@ -28,4 +28,15 @@ macos_application(
     infoplists = ["Info.plist"],
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_lib"],
+    # Bundle the engine and the Boss CLIs into Contents/Resources/bin/ so that
+    # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
+    # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
+    # cube is intentionally absent — assumed pre-installed on target machine.
+    additional_contents = {
+        "//tools/boss/engine:engine": "Resources/bin",
+        "//tools/boss/cli:boss": "Resources/bin",
+        "//tools/boss/bossctl:bossctl": "Resources/bin",
+        "//tools/boss/event-shim:boss-event": "Resources/bin",
+    },
+    visibility = ["//tools/boss/installer:__pkg__"],
 )
