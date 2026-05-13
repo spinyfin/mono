@@ -30,7 +30,10 @@ use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
-use crate::work::{ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck, WorkDb};
+use crate::work::{
+    ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck,
+    StrandedConflictAttempt, WorkDb,
+};
 
 /// One-shot startup backfill: create a `ready` `conflict_resolution`
 /// execution for every `conflict_resolutions` row that is `pending` but
@@ -465,6 +468,68 @@ pub async fn on_resolved(
         "conflict_watch: PR mergeable again; retire path ran",
     );
     true
+}
+
+/// Re-emit a `conflict_resolution` execution for a stranded pending
+/// attempt — one where the `conflict_resolutions` row is `pending` but
+/// no live execution exists. This happens when the engine restarts after
+/// the attempt row was inserted but before `create_execution` ran, or
+/// when the dispatched worker dies before reaching a terminal state
+/// (leaving the attempt stuck in `pending` with no live execution).
+///
+/// Only the product-level opt-out is checked here; the PR-label opt-out
+/// requires a fresh GH probe that this recovery path intentionally skips
+/// to avoid extra network round-trips.  Label changes are rare and the
+/// normal probe sweep will catch them on the next pass.
+///
+/// Returns `true` if a new execution was successfully emitted.
+pub async fn rescue_stranded_attempt(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    attempt: &StrandedConflictAttempt,
+) -> bool {
+    let candidate = PendingMergeCheck {
+        work_item_id: attempt.work_item_id.clone(),
+        product_id: attempt.product_id.clone(),
+        pr_url: attempt.pr_url.clone(),
+    };
+    if auto_pr_maintenance_disabled(work_db, &candidate, &[]) {
+        return false;
+    }
+    match work_db.create_execution(CreateExecutionInput {
+        work_item_id: attempt.work_item_id.clone(),
+        kind: "conflict_resolution".to_owned(),
+        status: Some("ready".to_owned()),
+        repo_remote_url: None,
+        cube_repo_id: None,
+        cube_lease_id: None,
+        cube_workspace_id: None,
+        workspace_path: None,
+        priority: None,
+        preferred_workspace_id: None,
+        started_at: None,
+        finished_at: None,
+    }) {
+        Ok(_) => {
+            publisher.kick_scheduler();
+            tracing::info!(
+                work_item_id = %attempt.work_item_id,
+                attempt_id = %attempt.attempt_id,
+                pr_url = %attempt.pr_url,
+                "conflict_watch: re-dispatched execution for stranded pending attempt",
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %attempt.work_item_id,
+                attempt_id = %attempt.attempt_id,
+                ?err,
+                "conflict_watch: failed to re-emit execution for stranded attempt",
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
