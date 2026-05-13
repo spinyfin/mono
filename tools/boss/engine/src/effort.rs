@@ -101,6 +101,12 @@ impl SpawnConfig {
     /// level (per design §Q2: omit and let `claude` fall through to
     /// `high` for untagged rows).
     ///
+    /// Permission mode is model-dependent: Opus supports
+    /// `--permission-mode auto`; all other models (Haiku, Sonnet, …)
+    /// use `--dangerously-skip-permissions` because `--permission-mode
+    /// auto` is Opus-only and falls back to interactive mode on
+    /// non-Opus, making the worker unusable.
+    ///
     /// The trailing newline is what the pane treats as the user
     /// hitting return — match today's behaviour byte-for-byte.
     pub fn claude_invocation(&self) -> String {
@@ -109,9 +115,22 @@ impl SpawnConfig {
             cmd.push_str(" --effort ");
             cmd.push_str(effort);
         }
+        if model_is_opus(&self.model) {
+            cmd.push_str(" --permission-mode auto");
+        } else {
+            cmd.push_str(" --dangerously-skip-permissions");
+        }
         cmd.push_str(" \"$(cat .claude/initial-prompt.txt)\"\n");
         cmd
     }
+}
+
+/// Returns `true` iff the resolved model slug belongs to the Opus family.
+/// Matching is liberal and case-insensitive: any id that contains the
+/// substring `"opus"` counts as Opus. Non-Opus models (Haiku, Sonnet, …)
+/// return `false`.
+pub fn model_is_opus(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("opus")
 }
 
 /// Resolve dispatch knobs per design §Q3 precedence:
@@ -413,33 +432,99 @@ mod tests {
 
     #[test]
     fn null_row_invocation_matches_today_plus_explicit_model() {
-        // Regression: the only thing that must change for an untagged
-        // row is the explicit `--model` slug. No `--effort`, no other
-        // flags, same trailing newline. The "today" baseline is the
-        // string at `runner.rs:279` before this change.
+        // Untagged rows fall through to ENGINE_DEFAULT_MODEL (Opus). Must
+        // carry --permission-mode auto (Opus) and no --effort.
         let cfg = resolve_spawn_config(None, None, None);
         assert_eq!(
             cfg.claude_invocation(),
-            "claude --model claude-opus-4-7 \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model claude-opus-4-7 --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
     #[test]
     fn trivial_invocation_includes_both_flags() {
+        // Haiku is non-Opus → --dangerously-skip-permissions.
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
             cfg.claude_invocation(),
-            "claude --model claude-haiku-4-5-20251001 --effort low \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model claude-haiku-4-5-20251001 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
     #[test]
     fn medium_with_override_uses_override_model_and_medium_effort() {
+        // model_override = "opus" → Opus family → --permission-mode auto.
         let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None);
         assert_eq!(
             cfg.claude_invocation(),
-            "claude --model opus --effort high \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
+    }
+
+    // --- permission-mode branching ---
+
+    #[test]
+    fn opus_model_gets_permission_mode_auto() {
+        for model in ["claude-opus-4-7", "claude-opus-4-5", "opus"] {
+            let cfg = SpawnConfig {
+                effort_level: None,
+                claude_effort: None,
+                model: model.to_owned(),
+                prompt_addendum: None,
+            };
+            let inv = cfg.claude_invocation();
+            assert!(
+                inv.contains("--permission-mode auto"),
+                "Opus model {model:?} must carry --permission-mode auto, got: {inv:?}",
+            );
+            assert!(
+                !inv.contains("--dangerously-skip-permissions"),
+                "Opus model {model:?} must NOT carry --dangerously-skip-permissions, got: {inv:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn non_opus_model_gets_dangerously_skip_permissions() {
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+        ] {
+            let cfg = SpawnConfig {
+                effort_level: None,
+                claude_effort: None,
+                model: model.to_owned(),
+                prompt_addendum: None,
+            };
+            let inv = cfg.claude_invocation();
+            assert!(
+                inv.contains("--dangerously-skip-permissions"),
+                "Non-Opus model {model:?} must carry --dangerously-skip-permissions, got: {inv:?}",
+            );
+            assert!(
+                !inv.contains("--permission-mode"),
+                "Non-Opus model {model:?} must NOT carry --permission-mode, got: {inv:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn model_is_opus_recognises_all_opus_variants() {
+        assert!(model_is_opus("claude-opus-4-7"));
+        assert!(model_is_opus("claude-opus-4-5"));
+        assert!(model_is_opus("opus"));
+        assert!(model_is_opus("OPUS"));
+        assert!(model_is_opus("Claude-Opus-4-7"));
+    }
+
+    #[test]
+    fn model_is_opus_rejects_non_opus_models() {
+        assert!(!model_is_opus("claude-haiku-4-5-20251001"));
+        assert!(!model_is_opus("claude-sonnet-4-6"));
+        assert!(!model_is_opus("haiku"));
+        assert!(!model_is_opus("sonnet"));
+        assert!(!model_is_opus(""));
     }
 
     #[test]
