@@ -6,20 +6,20 @@ Boss runs only on the machine it was built on. Getting it onto a new Mac today m
 
 That setup story is fine for `mono` developers. It is unviable for the immediate motivating use case: the user putting Boss on a work laptop where the only safe assumption is "macOS 15+, an Apple ID, and an internet connection." It is also unviable for sharing Boss with anyone else: there is no single artifact a recipient can run.
 
-This doc proposes a **per-user signed and notarized macOS `.pkg`** as the v1 distribution format, the corresponding Bazel release pipeline that produces it, the on-disk layout the .pkg materialises, how the .app finds the engine and CLIs at runtime, how a single git SHA is stamped through every binary, and the uninstall path. The deliverable is one file the user downloads, double-clicks, and walks through three Installer screens — after which `Boss.app` is in `~/Applications`, `boss` / `bossctl` / `cube` are on PATH, and double-clicking the app launches the engine on first run with no manual `BOSS_ENGINE_CMD` or `bazel run`.
+This doc proposes a **per-user signed and notarized macOS `.pkg`** as the v1 distribution format, the corresponding Bazel release pipeline that produces it, the on-disk layout the .pkg materialises, how the .app finds the engine and the bundled CLIs at runtime, how a single git SHA is stamped through every binary, and the uninstall path. The deliverable is one file the user downloads, double-clicks, and walks through three Installer screens — after which `Boss.app` is in `~/Applications`, the engine and the bundled CLIs (`boss`, `bossctl`) live at known offsets inside the bundle, and double-clicking the app launches the engine on first run with no manual `BOSS_ENGINE_CMD` or `bazel run`. `cube` is assumed to already be on the target machine's PATH; the installer does not ship it.
 
 Three follow-up implementation chores will consume this design:
 
-- A Bazel target that produces the unsigned `.pkg` payload from the four binaries + the `Boss.app` rule output.
-- A `tools/boss/installer/release.sh` driver that signs every binary, signs the bundle, signs and notarizes the .pkg, and staples the ticket — driven by env-var-supplied certs and a `notarytool` API key.
-- App-side changes so `EngineProcessController` discovers the engine inside `Boss.app/Contents/Resources/bin/engine` rather than shelling out to `bazel run`, plus a `boss uninstall` verb for the documented uninstall path.
+- A Bazel target that produces the unsigned `.pkg` payload from the three bundled binaries (`engine`, `boss`, `bossctl`) plus the `Boss.app` rule output.
+- A `tools/boss/installer/release.sh` driver that signs every binary, signs the bundle, signs and notarizes the .pkg, and staples the ticket. Notary credential storage on the build machine is the subject of a separate chore (see Q2).
+- App-side changes so `EngineProcessController` discovers the engine inside `Boss.app/Contents/Resources/bin/engine` rather than shelling out to `bazel run`, the engine propagates the bundle's `bin/` directory to spawned workers so callbacks resolve the bundled `boss` rather than any PATH copy, plus a `boss uninstall` verb for the documented uninstall path.
 
 ## Goals
 
-- A single artifact — `Boss-<version>+<short-sha>.pkg` — that, when run on a clean macOS 15 machine, installs Boss.app, the engine, and the three CLIs (`boss`, `bossctl`, `cube`) such that the user can immediately launch the .app or run any CLI from a fresh shell.
-- **No `sudo` and no `/Applications` requirement.** Per-user install into `~/Applications` and `~/.local/bin`. The installer must work without admin rights.
-- All five artifacts (`Boss.app`, `engine`, `boss`, `bossctl`, `cube`) are built from one git SHA in one Bazel invocation, and the SHA flows into each binary's `--version` output and the .app's `Info.plist`.
-- The .app finds the engine and the CLIs by **bundle-relative path**, not by PATH search and not by `bazel run`. The shipped `Boss.app` is self-contained.
+- A single artifact — `Boss-<version>+<short-sha>.pkg` — that, when run on a clean macOS 15 machine, installs `Boss.app` with the engine and the bundled CLIs (`boss`, `bossctl`) inside it, such that the user can immediately launch the .app and have a working Boss. `cube` is assumed pre-installed on the target machine and is detected (not installed) by the .app on first launch.
+- **No `sudo` and no `/Applications` requirement.** Per-user install into `~/Applications`. The installer must work without admin rights and must not write outside `$HOME`.
+- All four bundled artifacts (`Boss.app`, `engine`, `boss`, `bossctl`) are built from one git SHA in one Bazel invocation, and the SHA flows into each binary's `--version` output and the .app's `Info.plist`.
+- The .app finds the engine and the bundled CLIs by **bundle-relative path**, not by PATH search and not by `bazel run`. The shipped `Boss.app` is self-contained, and the user's shell PATH is never modified.
 - Hardened runtime + Developer ID signing + notarization, so Gatekeeper opens the .pkg without "unidentified developer" friction.
 - A documented uninstall path that removes binaries by default but leaves the user's state (`~/Library/Application Support/Boss/`) intact unless they opt in to purging it.
 - The bazel rule for the .pkg is reproducible: given the same git SHA and the same signing identities, two invocations produce byte-identical payloads (and the surrounding signatures differ only by their timestamps).
@@ -40,7 +40,7 @@ Three follow-up implementation chores will consume this design:
 - **Artifact**: `Boss-<short-sha>.pkg`, e.g. `Boss-abc1234.pkg`. We do not maintain a separate semver string in v1 — the short git SHA *is* the version. Once the product reaches a stable release cadence we can layer `vX.Y.Z+<sha>` semantics on top; until then, "the SHA is the version" is the simplest scheme that satisfies the goal "all binaries report the same version."
 - **Bundle identifier**: `dev.spinyfin.bossmacapp` (unchanged from today's `Info.plist`).
 - **Installer identifier**: `dev.spinyfin.boss.installer`. Distinct from the bundle id because the .pkg signature carries its own identifier.
-- **Install root for binaries**: `~/Applications/Boss.app/` for the .app, with engine and CLIs *inside the bundle* at `Boss.app/Contents/Resources/bin/`. The `~/.local/bin/` directory holds three small shim symlinks pointing into the bundle (Q3).
+- **Install root for binaries**: `~/Applications/Boss.app/` for the .app, with the engine and the bundled CLIs *inside the bundle* at `Boss.app/Contents/Resources/bin/`. Nothing is installed outside the bundle. The user's shell PATH is never modified by the installer, and `boss` / `bossctl` are deliberately *not* exposed on PATH from an installed bundle (Q3).
 - **State root**: `~/Library/Application Support/Boss/`, unchanged. The engine already resolves this in `config.rs:147` and `audit.rs:89`.
 - **Bazel targets**:
   - `//tools/boss/installer:boss_pkg_payload` — the staged payload directory (a `pkg_filegroup` / `genrule` output).
@@ -69,13 +69,13 @@ Three follow-up implementation chores will consume this design:
 
 (c) is tempting because it sidesteps `productbuild`. The blockers: (i) the user is on a fresh work laptop, where the first thing they do with a downloaded `.tar.gz` is wonder how to extract it; (ii) Gatekeeper quarantines the extracted binaries and the .app, and the recipient needs the right-click-Open dance for the first launch; (iii) we lose the standard Installer.app summary screen that lists what's about to be installed. v1 prioritises "user-cannot-fail" over "smallest possible artifact."
 
-(b) is the classic Mac install pattern and is correct for an app with no CLIs. Boss is not that app. The CLIs are not optional ergonomics — the entire `boss` taxonomy surface lives there, and the user runs them from terminals all day. A .dmg that does not put the CLIs on PATH delegates a load-bearing step to the user; one that *does* needs a postinstall scriptlet, at which point we are reinventing .pkg with worse plumbing. The "first-run setup copies CLIs out" variant has a worse failure mode: if the user launches a CLI before launching the .app, the CLI does not exist, and the user gets `command not found` instead of an install confirmation. .pkg postinstall is atomic: by the time the Installer.app summary screen says "Done," every CLI is on PATH.
+(b) is the classic Mac install pattern and is correct for an app with no postinstall side-effects. Boss is borderline. The engine and the bundled CLIs live entirely inside the .app, so a drag-to-Applications .dmg *could* deliver everything in one bundle. We reject (b) anyway: the .pkg's distribution XML gives the user a standard Installer.app summary screen that names the bundle id and the install location, and the .pkg has a real preinstall/postinstall hook surface that a .dmg lacks (a "kill the running engine before replacing the .app" preinstall is a likely v1.x add). A .dmg trades that machinery away for a featureless Finder window.
 
-(a) is the right shape for a multi-component product on macOS. `productbuild --component` lets us declare the app bundle and the CLI binaries as one logical install, the postinstall scriptlet places per-user symlinks in `~/.local/bin`, and the signed/notarized .pkg gives the recipient the standard "this is from <Developer ID>" Gatekeeper experience. The cost is the build pipeline complexity, which we have to absorb regardless because the binaries must be signed and notarized for *any* distribution channel — a tap or a .dmg would face the same `codesign` + `notarytool` work.
+(a) is the right shape on macOS for a signed and notarized install. `productbuild --component` lets us declare the app bundle (with its internal `Contents/Resources/bin/` payload) as one logical install, and the signed/notarized .pkg gives the recipient the standard "this is from <Developer ID>" Gatekeeper experience. The cost is the build pipeline complexity, which we have to absorb regardless because the binaries must be signed and notarized for *any* distribution channel — a tap or a .dmg would face the same `codesign` + `notarytool` work.
 
 ### Decision
 
-**(a) — per-user signed and notarized `.pkg`.** Domain `currentUserHomeDirectory`. Postinstall scriptlet creates `~/.local/bin/{boss,bossctl,cube}` symlinks pointing into the bundle. (d) is filed as a follow-up that consumes (a)'s output.
+**(a) — per-user signed and notarized `.pkg`.** Domain `currentUserHomeDirectory`. The .pkg drops `Boss.app` into `~/Applications/`; the engine and the bundled CLIs (`boss`, `bossctl`) live inside the bundle and are resolved by absolute path, not by PATH. No symlinks, no PATH mutation, no postinstall write outside the bundle. (d) is filed as a follow-up that consumes (a)'s output.
 
 ### What "per-user domain" buys us
 
@@ -103,7 +103,7 @@ Two distinct Apple Developer certs, both issued by Apple's CA:
 
 These are different certs with different purposes; productsign refuses an Application cert and codesign refuses an Installer cert. Both live in the developer's login keychain on whatever machine drives the release; CI is a future concern.
 
-The release driver script reads the cert identities from env vars (`BOSS_SIGN_APPLICATION_IDENTITY`, `BOSS_SIGN_INSTALLER_IDENTITY`) — it does not hard-code names, because the user's cert names will differ between home (personal Developer ID) and work (a corporate-issued cert if it comes to that).
+The release driver script reads the cert identity references from the developer's keychain by stable identifier; it does not hard-code names. The exact identifier scheme — whether SHA-1 hashes, friendly names, or labels — is part of the build-machine credential configuration tracked by chore `task_18af2b6ce51452e0_1c`.
 
 ### Entitlements
 
@@ -118,7 +118,9 @@ These go in two `Boss.entitlements` plist files (one for the .app, one for the e
 
 ### Notarization
 
-`xcrun notarytool submit --wait` against an App Store Connect API key. The API key (a `.p8` file plus key id + issuer id) is read by `release.sh` from env vars (`BOSS_NOTARY_API_KEY_FILE`, `BOSS_NOTARY_API_KEY_ID`, `BOSS_NOTARY_API_KEY_ISSUER`). The `--wait` flag turns the script synchronous; if Apple's notary service rejects the submission, we get the JSON log inline and bail.
+`xcrun notarytool submit --wait` against an App Store Connect API key. The `--wait` flag turns the script synchronous; if Apple's notary service rejects the submission, we get the JSON log inline and bail.
+
+Notary credentials (Apple ID / app-specific password / team ID, or an App Store Connect API key as a `.p8` file plus key id + issuer id) are stored in the macOS Keychain on the build machine and accessed by `release.sh` at build time. The full Keychain-item shape and the Boss-side configuration UI for setting these credentials are out of scope for this design — see follow-up chore `task_18af2b6ce51452e0_1c`. That chore also covers any other sensitive runtime configuration the release pipeline currently expects from the environment (e.g. `ANTHROPIC_API_KEY` referenced in Q5's setup checklist), so the design does not need to commit here to specific env-var names.
 
 `xcrun stapler staple` is the final step: it embeds the notarization ticket into the .pkg so the recipient can verify offline. Without stapling, a recipient on an airplane sees a Gatekeeper hang while it tries to reach Apple.
 
@@ -148,19 +150,13 @@ Fail-fast on either check.
     Resources/
       bin/
         engine                 (the Rust engine binary)
-        boss                   (the user CLI)
-        bossctl                (the coordinator CLI)
-        cube                   (workspace manager)
+        boss                   (the user CLI, bundle-only — not on user PATH)
+        bossctl                (the coordinator CLI, bundle-only — not on user PATH)
         boss-event             (the hook shim the engine resolves into the worker's PATH)
       Frameworks/
         GhosttyKit.framework   (built by bootstrap-ghosttykit.sh, copied in)
       Boss.entitlements        (informational; for `codesign --display`)
     PkgInfo
-
-~/.local/bin/
-  boss        -> /Users/<user>/Applications/Boss.app/Contents/Resources/bin/boss
-  bossctl     -> /Users/<user>/Applications/Boss.app/Contents/Resources/bin/bossctl
-  cube        -> /Users/<user>/Applications/Boss.app/Contents/Resources/bin/cube
 
 ~/Library/Application Support/Boss/
   state.db                     (created by engine on first run; not touched by installer)
@@ -170,15 +166,24 @@ Fail-fast on either check.
   executions/
 ```
 
-### Why CLIs live inside the bundle, not in `~/.local/bin` directly
+Three things to note up front:
 
-Two reasons.
+- **Nothing is installed outside `~/Applications/Boss.app/`.** No symlinks in `~/.local/bin`, no shims in `/usr/local/bin`, no edits to dotfiles, no PATH mutation. The installer's filesystem footprint is exactly the .app bundle, and the engine's `~/Library/Application Support/Boss/` directory is created lazily by the engine on first run (not by the installer).
+- **`cube` is not bundled.** It is assumed to be pre-installed on the target machine and resolved from the user's PATH (see "How the worker pane finds external tools" below). If `cube` is missing on first launch, the .app surfaces a setup-checklist error and refuses to start the engine.
+- **`boss` and `bossctl` are not exposed on the user's shell PATH.** They are bundled inside the .app and invoked by the .app and the engine by absolute path. A user who wants `boss` / `bossctl` available in an interactive terminal continues to use `repobin install` from a working copy — the dev path, scoped to `mono` developers working on Boss itself (Non-goals call this out explicitly; v1's distribution channel does not provide shell access to the bundled CLIs).
 
-First, **uninstall.** With the CLI binaries inside the bundle, removing the .app removes the binaries; the `~/.local/bin` symlinks dangle, and the uninstall script removes those dangling symlinks. If the CLIs were *copies* in `~/.local/bin`, removing the .app would leave stale binaries running against a now-gone engine path, and the uninstall script would have to know to delete them.
+### How the .app and engine resolve CLI binaries in installed mode
 
-Second, **version coherence.** The whole point of building everything in one Bazel invocation from one git SHA is that the four binaries are byte-coherent. If the user upgrades by re-running a new .pkg, the old .app's bundle is replaced atomically; the new CLIs are immediately the new ones because the symlinks point into the new bundle. There is no window where the user has a new app and old CLIs.
+The bundle is the single source of truth for `boss` / `bossctl` / `boss-event`. The chosen mechanism is an environment variable, **`BOSS_BIN_DIR`**, set by the .app at launch and propagated through the engine to every worker process. The rules:
 
-The symlinks themselves are unconditional — the postinstall scriptlet `rm -f` them first, then `ln -s` afresh. That handles the "user previously installed Boss" case cleanly.
+1. **The .app, at launch**, computes `Bundle.main.resourcePath + "/bin"` and exports `BOSS_BIN_DIR=<that absolute path>` in the environment of the engine process it spawns. This sits alongside the existing `BOSS_ENGINE_CMD` mechanism: `BOSS_ENGINE_CMD` is the developer override that selects *which* engine binary to run; `BOSS_BIN_DIR` is the installed-mode signal that tells the engine where its sibling CLIs live.
+2. **The engine**, when it needs to invoke a bundled Boss CLI (today: `boss-event` from the hook propagator; tomorrow: any sibling Boss binary), resolves it as `$BOSS_BIN_DIR/<name>` if the env var is set. The existing resolution chain in `engine/src/runner.rs::resolve_boss_event_binary` gains a "if `BOSS_BIN_DIR` is set, take `$BOSS_BIN_DIR/boss-event`" rule at the top of the order, ahead of the sibling-of-engine rule and the PATH-search fallback. The sibling-of-engine rule still works for the installed case (engine and `boss-event` are siblings in `Contents/Resources/bin/`), but `BOSS_BIN_DIR` is the explicit, primary signal so the resolution is independent of where the engine binary happens to be on disk.
+3. **The engine propagates `BOSS_BIN_DIR` and prepends it to the worker's `PATH`** when spawning workers. Workers that call back into Boss — e.g. via `boss event …` from a Claude hook — pick up the bundled `boss` because it is now the first PATH match, and the engine's own callbacks resolve `boss-event` from `BOSS_BIN_DIR` directly without leaving the worker to PATH-search.
+4. **The bundled `boss` / `bossctl` themselves**, when they need to invoke a sibling binary, resolve it as `dirname(argv[0]) + "/<sibling>"`. This is the robust intra-bundle case: even if `BOSS_BIN_DIR` is unset (a user manually exec'd the bundled binary from a Finder action, say — supported but not advertised), siblings are found via argv[0]. The bundled CLIs deliberately never PATH-search for `boss` / `bossctl` / `boss-event` — if they did, a `repobin install` copy in `~/.local/bin` could shadow the bundled copy and break version coherence.
+
+The asymmetry **`cube` is the one CLI Boss does *not* resolve from the bundle.** It is allowed to come from PATH because (a) it is assumed pre-installed on the target machine per the constraint above, (b) the .app gates engine startup on `command -v cube` and surfaces a clear missing-tool error if it is not present, and (c) workers (which lease and release cube workspaces) need it on PATH anyway — Boss does not own the `cube` invocation point.
+
+**Dev-mode fallback.** When the .app is launched from `bazel run` rather than from an installed bundle, `Bundle.main.resourcePath` still points into the bazel-built `.app` bundle on disk, but that bundle may not have the binaries copied into `Contents/Resources/bin/` (the developer is iterating on one component at a time). In that case `BOSS_BIN_DIR` is set to the bundle path but the binaries it names may not exist. The engine, when a `$BOSS_BIN_DIR/<name>` lookup misses, falls back to the existing development-mode resolution (sibling-of-engine, then PATH including any `~/.local/bin` copy a developer maintains via `repobin install`). This fallback is the *only* place `repobin`-installed copies of Boss CLIs are involved; mainstream installed-mode Boss never touches them.
 
 ### How the .app finds the engine
 
@@ -188,25 +193,23 @@ After this change, `EngineProcessController` resolves the engine binary in this 
 
 1. **`BOSS_ENGINE_CMD` env override** — unchanged; still wins so a developer running the in-source app against a custom engine works. (`bazel run //tools/boss/app-macos:Boss` continues to use this.)
 2. **Bundle-relative path** — `[Bundle.main.resourcePath]/bin/engine`. This is the path the installed app uses. Inside the bundle, `Bundle.main.resourcePath` is `<Boss.app>/Contents/Resources`, so the engine lives at a fixed offset from the .app's main binary. No PATH search, no env var required.
-3. **(Fallback for dev builds) `bazel run //tools/boss/engine:engine`** — what we have today, kept for the case where someone runs the .app out of `bazel-bin/` and the bundle is the unsigned dev bundle.
+3. **(Fallback for dev builds) `bazel run //tools/boss/engine:engine`** — what we have today, kept for the case where someone runs the .app out of `bazel-bin/` and the bundle is the unsigned dev bundle. This branch is the only path that touches a working-copy bazel build; mainstream installed-mode Boss never enters it.
 
-The same logic applies to the existing `boss-event` resolver in `engine/src/runner.rs::resolve_boss_event_binary`. Resolution order today already has a "sibling of engine_path" check (rule #4 at line 194). When the engine binary lives at `Boss.app/Contents/Resources/bin/engine`, its sibling at `Boss.app/Contents/Resources/bin/boss-event` is exactly where the shim ships, and rule #4 finds it without a new code path. Free wins are nice.
+### How the worker pane finds external tools
 
-### How the worker pane finds `claude`, `jj`, `gh`, `cube`
+Worker panes still see whatever `PATH` the parent shell exports, plus `BOSS_BIN_DIR` prepended to that `PATH` by the engine. The third-party tools that workers depend on — `claude`, `jj`, `gh`, and `cube` — are all expected to be already on the user's PATH; Boss does not vendor them and does not modify `~/.zshrc`.
 
-This part does *not* change. Workers still see whatever `PATH` the parent shell exports. The installer's postinstall scriptlet emits a "setup checklist" note (Q7) that names the third-party tools the user must install themselves. Boss does not vendor them and does not modify `~/.zshrc`.
+`cube` is the load-bearing dependency among the external tools: workers call `cube workspace lease` / `release` against it. The .app probes for `cube` on PATH at first launch (`command -v cube`) before starting the engine; if absent, the .app surfaces an "install `cube` first" error in the Setup tab and refuses to start the engine. We deliberately refuse to start in this state rather than letting workers fail mid-execution.
 
-The one CLI Boss ships that workers need on their PATH is `cube` (workers call `cube workspace lease` / `release`). The `~/.local/bin/cube` symlink the installer creates handles this — `~/.local/bin` is on most users' PATH already, and if it is not, the setup checklist tells them so (Q7).
+`claude`, `jj`, `gh`, `bk` are similarly listed in the setup checklist (Q5); the .app warns when any are missing but does not refuse to start (a user might be doing read-only Boss work that does not invoke them).
 
-### Why `~/.local/bin` (not `/usr/local/bin`, not `~/bin`, not a custom dir)
+### Why no shell PATH exposure of `boss` / `bossctl`
 
-Three constraints converge:
+Three considerations:
 
-- The .pkg cannot write to `/usr/local/bin` in the per-user domain.
-- `~/bin` is on many but not all macOS users' PATH by default; `~/.local/bin` is the modern XDG-flavoured convention and is what `pipx`, `cargo install`, `pnpm setup`, etc. use.
-- The user's CLAUDE.md workspace rules already reference `~/.local/bin` ("Per-user install in `~/Applications` and `~/.local/bin` (or wherever design lands) is fine"). Picking it matches the user's prior intent.
-
-If `~/.local/bin` is not on PATH, the checklist tells the user the one line to add to `~/.zshrc`. We do not mutate dotfiles.
+- **The bundle is the version-coherent unit.** If `boss` were on PATH (via a symlink, a copy, or a PATH mutation), there is a window where the user has upgraded the .app but their terminal still holds stale state, and `boss` and the engine could disagree on which version they are. Keeping `boss` / `bossctl` invoked only by the .app and the engine — which always know where their own bundle is — closes that window. (This is why the bundled CLIs also refuse to PATH-search for their own siblings, per resolution rule 4 above.)
+- **No interference with `repobin`-installed copies.** A `mono` developer who runs `repobin install` keeps working-copy `boss` / `bossctl` in `~/.local/bin/`. The installed bundle must not collide with those copies. Keeping bundle CLIs off the user's PATH means a developer can run the installed .app *and* keep their dev CLIs on PATH for their own dev work, without symlink wars between the two.
+- **No PATH mutation, no dotfile edits, clean uninstall.** Removing the .app removes every Boss binary on the system in one operation. No dangling symlinks, no entries in `~/.zshrc` to back out, no `~/.zshenv` files we left behind. The uninstall surface is exactly `rm -rf ~/Applications/Boss.app` (plus optional state purge — see Q6).
 
 ---
 
@@ -224,13 +227,14 @@ load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application")
 load(":pkg.bzl", "boss_pkg")
 
 # The set of binaries that must end up inside Boss.app/Contents/Resources/bin/.
+# Note: `cube` is intentionally NOT in this list — it is assumed to be
+# pre-installed on the target machine and is resolved by workers from PATH.
 filegroup(
     name = "bundled_binaries",
     srcs = [
         "//tools/boss/engine:engine",
         "//tools/boss/cli:boss",
         "//tools/boss/bossctl:bossctl",
-        "//tools/cube:cube",
         "//tools/boss/event-shim:boss-event",
     ],
     visibility = ["//tools/boss/installer:__pkg__"],
@@ -296,7 +300,7 @@ build:release --workspace_status_command=tools/boss/installer/workspace-status.s
 build:release --stamp
 ```
 
-`rules_rust`'s `rust_binary` reads stamping via `--@rules_rust//rust/settings:rustc_version` and `cargo_build_script`-style env injection. We do not need that; we instead pass the values into the binaries via a tiny `cc_library` / `genrule` that emits a `build_info.rs` file with the stamped constants, depended on by `engine_lib`, `boss`, `bossctl`, and `cube`. Each binary's `--version` prints `boss-engine 0+abc1234 built 2026-05-12T11:14:02Z` (or the equivalent for its name).
+`rules_rust`'s `rust_binary` reads stamping via `--@rules_rust//rust/settings:rustc_version` and `cargo_build_script`-style env injection. We do not need that; we instead pass the values into the binaries via a tiny `cc_library` / `genrule` that emits a `build_info.rs` file with the stamped constants, depended on by `engine_lib`, `boss`, and `bossctl`. Each bundled binary's `--version` prints `boss-engine 0+abc1234 built 2026-05-12T11:14:02Z` (or the equivalent for its name). `cube` is not stamped by this rule — it is a separate tool with its own build and version surface.
 
 For the .app's `Info.plist`, the same SHA is substituted into `CFBundleShortVersionString` and `CFBundleVersion` via the existing `infoplists` mechanism in `macos_application`. `rules_apple` supports `${BAZEL_STAMP}` substitution; we use it.
 
@@ -305,13 +309,15 @@ For the .app's `Info.plist`, the same SHA is substituted into `CFBundleShortVers
 `tools/boss/installer/release.sh` runs after `bazel build --config=release //tools/boss/installer:boss_pkg_unsigned` and:
 
 1. Stages the .app and the binaries into a writable scratch dir (bazel outputs are read-only).
-2. `codesign --options runtime --entitlements <e>.entitlements -s "$BOSS_SIGN_APPLICATION_IDENTITY"` every Mach-O.
-3. `codesign --options runtime --entitlements app.entitlements -s "$BOSS_SIGN_APPLICATION_IDENTITY" Boss.app`.
+2. `codesign --options runtime --entitlements <e>.entitlements -s <application-identity>` every Mach-O.
+3. `codesign --options runtime --entitlements app.entitlements -s <application-identity> Boss.app`.
 4. `codesign --verify --strict --deep` and `spctl --assess` to fail-fast on any signing mistake.
-5. `pkgbuild` to produce the payload .pkg from the signed bundle; `productbuild --distribution distribution.xml` to wrap it; `productsign -s "$BOSS_SIGN_INSTALLER_IDENTITY"` to sign the wrapper.
-6. `xcrun notarytool submit --wait --key "$BOSS_NOTARY_API_KEY_FILE" --key-id "$BOSS_NOTARY_API_KEY_ID" --issuer "$BOSS_NOTARY_API_KEY_ISSUER" Boss-<sha>.pkg`. Fail if the response isn't `Accepted`.
+5. `pkgbuild` to produce the payload .pkg from the signed bundle; `productbuild --distribution distribution.xml` to wrap it; `productsign -s <installer-identity>` to sign the wrapper.
+6. `xcrun notarytool submit --wait <credential-args> Boss-<sha>.pkg`. The credential arguments are supplied by reading the notary key from the macOS Keychain on the build machine (see Q2; full mechanism is the subject of chore `task_18af2b6ce51452e0_1c`). Fail if the response isn't `Accepted`.
 7. `xcrun stapler staple Boss-<sha>.pkg`.
 8. Print the final path and `shasum -a 256` it.
+
+The `<application-identity>`, `<installer-identity>`, and `<credential-args>` placeholders above are resolved by the same Keychain lookup. The design does not commit to specific env-var names for any of them; chore `task_18af2b6ce51452e0_1c` owns the credential-source layer.
 
 The script is idempotent: re-running with the same SHA produces the same payload digest; only the signature timestamps differ.
 
@@ -321,7 +327,7 @@ v1 publishes by hand: the user uploads `Boss-<sha>.pkg` somewhere (private GitHu
 
 ### Why not productbuild without pkgbuild?
 
-`productbuild --component <bundle>` *can* take a .app directly and skip the pkgbuild step. We use pkgbuild + productbuild because the productbuild path can't directly express the postinstall scriptlet for the `~/.local/bin` symlinks; pkgbuild can. The two-step is annoying but well-trodden — every Apple sample for "app + CLI + scriptlet" uses it.
+`productbuild --component <bundle>` *can* take a .app directly and skip the pkgbuild step. We use pkgbuild + productbuild because pkgbuild gives precise control over the install location, the preinstall script (the "kill the running engine before replacing the bundle" hook flagged in Q1), and the bundle-id-to-payload mapping. `productbuild --component` papers over those choices and is harder to scope cleanly to the per-user `currentUserHomeDirectory` domain. The two-step is well-trodden — every Apple sample for "signed .app distributed via .pkg" uses it.
 
 ---
 
@@ -349,7 +355,7 @@ The .app side is currently broken-by-design for a fresh install: `EngineProcessC
 
 ### Detecting an existing install
 
-The .pkg preinstall script runs `[ -e ~/Applications/Boss.app ]` and `[ -e ~/Library/Application\ Support/Boss/state.db ]`. The first triggers a "this looks like a re-install; replacing the bundle." The second is *ignored* — re-installing must never wipe state. The postinstall scriptlet only ever creates symlinks and stamps a setup-completed marker; it does not initialise the state directory.
+The .pkg preinstall script runs `[ -e ~/Applications/Boss.app ]` and `[ -e ~/Library/Application\ Support/Boss/state.db ]`. The first triggers a "this looks like a re-install; replacing the bundle." The second is *ignored* — re-installing must never wipe state. The postinstall scriptlet only stamps a setup-completed marker file inside the bundle; it does not initialise the state directory and does not write outside the bundle.
 
 ### Setup checklist
 
@@ -361,11 +367,11 @@ The .pkg's postinstall scriptlet writes a one-page text file to the .app's bundl
 
 …and the .app shows its contents in a "Setup" tab the first time it launches without a state.db present. The checklist names:
 
-- **Required tools**: `jj`, `gh`, `claude`, Xcode command-line tools (for `xcrun notarytool`-adjacent things in the worker workflow), the user's preferred shell PATH knob if `~/.local/bin` is not on PATH.
-- **Required env vars**: `ANTHROPIC_API_KEY` for pane summaries (read by the engine).
-- **Optional**: `bk` for Buildkite querying, `repobin install` for in-source dev work.
+- **Required tools**: `cube`, `jj`, `gh`, `claude`, Xcode command-line tools.
+- **Required credentials**: `ANTHROPIC_API_KEY` for pane summaries (read by the engine). The long-term storage mechanism for this credential — a Boss setting backed by the macOS Keychain rather than a process env var — is the subject of chore `task_18af2b6ce51452e0_1c`; v1 reads it from the engine's environment as today.
+- **Optional**: `bk` for Buildkite querying. `repobin install` is *only* needed by `mono` developers who want to run a working-copy `boss` / `bossctl` in a terminal — it is not a requirement of mainstream installed-mode Boss.
 
-The checklist is informational. Boss does not block on it.
+The checklist is informational for the optional items; missing `cube` is a hard error (Q3) and the .app refuses to start the engine until it is resolved. Other missing tools surface as warnings in the Setup tab.
 
 ---
 
@@ -377,10 +383,11 @@ The checklist is informational. Boss does not block on it.
 
 1. Asks the user to confirm (prints what it will delete, requires `y/N`).
 2. Stops the engine if running (`kill <pid>` from `/tmp/boss-engine.pid`).
-3. Removes the `~/.local/bin/{boss,bossctl,cube}` symlinks.
-4. Removes the `~/Applications/Boss.app` bundle.
-5. **If `--purge-state` was passed**: removes `~/Library/Application Support/Boss/`. Otherwise, leaves it.
-6. Prints a one-line summary.
+3. Removes the `~/Applications/Boss.app` bundle.
+4. **If `--purge-state` was passed**: removes `~/Library/Application Support/Boss/`. Otherwise, leaves it.
+5. Prints a one-line summary.
+
+There are no symlinks, dotfile edits, or out-of-bundle files for the uninstall to chase — by design, the installer only ever writes inside `~/Applications/Boss.app/` (Q3). The uninstall surface is symmetric: the only filesystem changes are removing the bundle and (optionally) the state directory.
 
 `boss uninstall` is the same binary that's about to delete itself. The flow handles this by `exec`'ing a small `rm -rf` shell script that runs after the parent process exits — same trick `pyenv uninstall` and `nvm uninstall` use. The script lives at `~/.cache/boss-uninstall.sh` for the duration of the uninstall, then deletes itself.
 
@@ -388,9 +395,13 @@ The checklist is informational. Boss does not block on it.
 
 There is no such feature in Installer.app. macOS .pkg installers are intentionally one-way; the user is expected to use the app's own uninstaller or a manual `rm -rf` of the install root. We pick the former because the manual route requires the user to remember exactly which directories were touched.
 
+### How the user invokes `boss uninstall`
+
+Because `boss` is not on the user's shell PATH (Q3), `boss uninstall` is invoked either through a menu item in `Boss.app` ("Boss → Uninstall Boss…") that spawns the bundled CLI, or — for users comfortable in a terminal — by running the absolute bundle path: `~/Applications/Boss.app/Contents/Resources/bin/boss uninstall`. The Setup tab in the .app shows both forms.
+
 ### The fallback manual route
 
-For users who lost the `boss` CLI (e.g. they ran `rm -rf ~/Applications/Boss.app` first), `SETUP.txt` includes a "Manual uninstall" section listing the exact paths to remove. There is no second-level magic here — Boss only writes to three places, and the checklist names all three.
+For users who lost the `boss` CLI (e.g. they ran `rm -rf ~/Applications/Boss.app` first), `SETUP.txt` includes a "Manual uninstall" section listing the exact paths to remove. There is no second-level magic here — Boss only writes to two places (the .app bundle and the state directory), and the checklist names both.
 
 ### What state purge means
 
@@ -412,14 +423,14 @@ A user can re-install Boss after uninstalling without `--purge-state`, and their
 
 ## Design Question 7 — Version Stamping
 
-### One git SHA, four binaries, one .app, one .pkg
+### One git SHA, three bundled binaries, one .app, one .pkg
 
-The contract: the SHA reported by `engine --version`, `boss --version`, `bossctl --version`, `cube --version`, the `CFBundleShortVersionString` in `Boss.app/Contents/Info.plist`, and the filename of the .pkg are all the *same* short SHA.
+The contract: the SHA reported by `engine --version`, `boss --version`, `bossctl --version`, the `CFBundleShortVersionString` in `Boss.app/Contents/Info.plist`, and the filename of the .pkg are all the *same* short SHA. (`cube` is not in this contract — it is a pre-installed external tool with its own version, per Q3.)
 
 ### How the SHA flows
 
 1. **`tools/boss/installer/workspace-status.sh`** runs at the start of every `bazel build --config=release` and emits `STABLE_BOSS_GIT_SHA <sha>` to bazel's stamping mechanism.
-2. **A `genrule`** at `//tools/boss/installer:build_info_rs` consumes `bazel-out/stable-status.txt` and produces a Rust source file with `pub const BOSS_GIT_SHA: &str = "<sha>";` etc. All four binaries depend on this genrule and link the generated code in. The existing `engine/src/build_info.rs` switches from `option_env!("BOSS_ENGINE_GIT_SHA")` to reading the linked-in constant.
+2. **A `genrule`** at `//tools/boss/installer:build_info_rs` consumes `bazel-out/stable-status.txt` and produces a Rust source file with `pub const BOSS_GIT_SHA: &str = "<sha>";` etc. The three bundled Rust binaries (`engine_lib`, `boss`, `bossctl`) depend on this genrule and link the generated code in. The existing `engine/src/build_info.rs` switches from `option_env!("BOSS_ENGINE_GIT_SHA")` to reading the linked-in constant.
 3. **The .app's `Info.plist`** receives the SHA via `rules_apple`'s `${BAZEL_STAMP}` substitution: `CFBundleShortVersionString = ${BAZEL_STAMP_BOSS_GIT_SHA}`, `CFBundleVersion = ${BAZEL_STAMP_BOSS_GIT_SHA}`.
 4. **The .pkg filename** is `Boss-${BOSS_GIT_SHA}.pkg`. The release driver script reads the SHA from the stable-status file before invoking `productbuild`.
 
@@ -449,39 +460,21 @@ The day we want to call something "v1.0," we drop a `VERSION` file at the repo r
 
 **Resolution plan**: the implementation chore for `release.sh` runs the entire pipeline against a test Apple ID first (the user's personal Developer ID), iterating on the entitlements set until notarization returns `Accepted`. The final entitlements files are committed; the design accepts that the entitlements set may grow by one or two keys.
 
-### Q-Risk-2 — `~/.local/bin` PATH situation on macOS is heterogeneous
+### Q-Risk-2 — Bazel + the Apple toolchain pin on the build machine
 
-Some users have `~/.local/bin` on PATH (via Homebrew or manual `.zshrc` edits). Many do not. The setup checklist names the exact `.zshrc` line, but it does not run it. Mutating dotfiles from an installer is a one-way bug magnet (no clean uninstall, sets user expectations that we manage their shell, etc.).
+`tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` requires Xcode's Metal Toolchain component (it bails with a `xcodebuild -downloadComponent MetalToolchain` hint if missing). The release driver inherits this requirement on the *build* machine. Today that is one laptop — the user's main Mac, where Boss is being developed. There is no central CI yet; CI is explicitly out of scope for v1, and the release pipeline does not run anywhere else.
 
-A v1.x option is to detect "user does not have `~/.local/bin` on PATH" in the postinstall scriptlet and write a `~/.zshenv` file with a single `export PATH=$HOME/.local/bin:$PATH` line. `~/.zshenv` is loaded for *every* zsh invocation including non-interactive ones, which is exactly what we want for `cube workspace lease` from inside a libghostty subshell. The risk: the user already has a `~/.zshenv` and we don't want to clobber it. Workable resolution: write `~/.zshenv` only if it does not exist; otherwise leave a note in the checklist.
+This is therefore a **build-machine-only** concern, not a runtime risk for end users: the installed artifact is a bundle of pre-compiled, signed binaries that have no Bazel-time dependency at runtime. A recipient running the .pkg on a fresh macOS laptop never invokes Bazel, never touches Xcode's Metal Toolchain, and is unaffected by any Apple-toolchain pin drift on the build machine.
 
-This is a "ship v1 with the manual-PATH-fix advice in the checklist, watch for friction, then ship the optional `~/.zshenv` write in v1.1" decision. Not gating on v1.
+The user's CLAUDE.md names the remedy when the build machine *does* hit toolchain pin weirdness (`bazel clean --expunge`). The maintenance story for this design is the same: on the one machine that runs `bazel run //tools/boss/installer:release`, expunge bazel state before debugging anything else. No new design risk; explicitly scoping the existing one.
 
-### Q-Risk-3 — Bazel + the Apple toolchain pin
-
-`tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` requires Xcode's Metal Toolchain component (it bails with a `xcodebuild -downloadComponent MetalToolchain` hint if missing). The release driver inherits this requirement. CI that runs this pipeline must have the Metal Toolchain installed; a stale `DEVELOPER_DIR` will cause bazel to fail in confusing ways.
-
-The user's CLAUDE.md already names the remedy (`bazel clean --expunge` for Apple toolchain pin mismatches), so the maintenance story for this design is "if you see Xcode/CC toolchain weirdness in release, expunge bazel state before debugging anything else." No new design risk; just inheriting the existing one.
-
-### Q-Risk-4 — Notary API credentials live somewhere
-
-The release driver expects `BOSS_NOTARY_API_KEY_FILE` to be a real `.p8` file on disk. For the user's first release, that's their own laptop with the file in `~/.private/`. For an eventual CI release, the key needs to be in a secret store — this is a real cost we accept later. v1 acknowledges that releases come from one (the user's) laptop.
-
-### Q-Risk-5 — Engine `--version` does not exist yet
+### Q-Risk-3 — Engine `--version` does not exist yet
 
 The engine binary today does not honour a `--version` flag (the existing `build_info` module is exposed via the live-status debug RPC, not a CLI flag). The implementation chore for "thread the SHA through" must add the flag to the engine main + each CLI's argparser. Trivial work; called out so a reviewer doesn't read "every binary has --version" and assume it's already true.
 
 ### Q-Open-1 — Versioning when there is no clean tag
 
 If a user runs `bazel run //tools/boss/installer:release` from a dirty working copy, the SHA is the parent commit's SHA but the binaries reflect uncommitted changes. The workspace-status script could detect dirtiness (`git status --porcelain`) and append `-dirty`, producing `Boss-abc1234-dirty.pkg`. Recommend: yes, do that; refuse to notarize a dirty build (Apple notarization succeeds either way, but we should be opinionated). Final call: dirty builds produce a `-dirty` artifact and the release script logs `WARN: skipping notarization for dirty build`. The artifact is still installable; the user has been told.
-
-### Q-Open-2 — Whether to ship a Distribution.xml welcome / readme
-
-`productbuild --distribution` accepts a `distribution.xml` that can declare `welcome`, `readme`, `license`, and `conclusion` HTML/text files shown during the install. v1 ships none: the Installer.app default chrome is sufficient. v1.1 might add a `conclusion.txt` ("Boss is installed. Open the Setup tab in the app for the checklist of third-party tools you'll need."). Not gating on v1.
-
-### Q-Open-3 — Building the .pkg on Linux CI
-
-The notarization step requires `xcrun notarytool`, which is macOS-only. The `pkgbuild` / `productbuild` steps similarly. v1 accepts that releases run on macOS. A future CI move to Linux runners is blocked by Apple's tooling and is out of scope.
 
 ---
 
