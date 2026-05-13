@@ -1339,10 +1339,10 @@ mod pane_spawn_tests {
         assert_eq!(
             input.initial_input,
             format!(
-                "claude --model {} \"$(cat .claude/initial-prompt.txt)\"\n",
+                "claude --model {} --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::effort::ENGINE_DEFAULT_MODEL
             ),
-            "untagged row should spawn with the engine default model and no --effort",
+            "untagged row should spawn with the engine default model, --permission-mode auto (Opus), and no --effort",
         );
 
         // No addendum prepended — the existing implementation framing
@@ -1399,6 +1399,16 @@ mod pane_spawn_tests {
             "trivial row must pass --effort low, got: {:?}",
             input.initial_input,
         );
+        assert!(
+            input.initial_input.contains("--dangerously-skip-permissions"),
+            "trivial row (Haiku, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            !input.initial_input.contains("--permission-mode"),
+            "trivial row (Haiku, non-Opus) must NOT carry --permission-mode, got: {:?}",
+            input.initial_input,
+        );
 
         let prompt = std::fs::read_to_string(
             workspace.path().join(".claude").join("initial-prompt.txt"),
@@ -1445,6 +1455,16 @@ mod pane_spawn_tests {
             "medium effort_level must still produce --effort high, got: {:?}",
             input.initial_input,
         );
+        assert!(
+            input.initial_input.contains("--permission-mode auto"),
+            "model_override=opus must carry --permission-mode auto, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            !input.initial_input.contains("--dangerously-skip-permissions"),
+            "model_override=opus must NOT carry --dangerously-skip-permissions, got: {:?}",
+            input.initial_input,
+        );
 
         let prompt = std::fs::read_to_string(
             workspace.path().join(".claude").join("initial-prompt.txt"),
@@ -1485,6 +1505,16 @@ mod pane_spawn_tests {
         assert!(
             input.initial_input.contains("--effort xhigh"),
             "large row must pass --effort xhigh, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--permission-mode auto"),
+            "large row (Opus) must carry --permission-mode auto, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            !input.initial_input.contains("--dangerously-skip-permissions"),
+            "large row (Opus) must NOT carry --dangerously-skip-permissions, got: {:?}",
             input.initial_input,
         );
 
@@ -1531,6 +1561,16 @@ mod pane_spawn_tests {
         assert!(
             !input.initial_input.contains("--effort"),
             "untagged row must not pass --effort, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--dangerously-skip-permissions"),
+            "Sonnet (non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            !input.initial_input.contains("--permission-mode"),
+            "Sonnet (non-Opus) must NOT carry --permission-mode, got: {:?}",
             input.initial_input,
         );
     }
