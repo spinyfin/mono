@@ -56,6 +56,31 @@ final class GhosttyTerminalHostView: NSView {
     /// pane-divider drag fires the call on every layout tick (60–
     /// 120 Hz) and blocks the main thread for the whole drag.
     private static let geometrySyncMinInterval: TimeInterval = 1.0 / 30.0
+    /// Serial background queue for `ghostty_surface_set_focus` calls.
+    ///
+    /// libghostty's `focusCallback` acquires `renderer_state.mutex`
+    /// (shared with the IO thread that processes PTY output) and pushes
+    /// a message to the renderer thread's 64-slot mailbox with a
+    /// `.forever` timeout. Both operations block the calling thread when
+    /// contended: the mutex blocks while an IO thread is writing PTY
+    /// output, and the mailbox push blocks when the renderer's
+    /// CVDisplayLink is paused in background while active Claude sessions
+    /// continue generating render requests.
+    ///
+    /// Blocking the main thread inside `becomeFirstResponder` causes the
+    /// CMD-Tab-back beachball. Dispatching through this serial queue lets
+    /// AppKit's first-responder switch return immediately while the
+    /// potentially-blocking libghostty handshake completes off the main
+    /// run-loop.
+    ///
+    /// Lifetime note: terminal views in the Boss macOS app are kept alive
+    /// for the app's lifetime (ZStack opacity toggle, never removed), so
+    /// the captured surface pointer is always valid when the queued block
+    /// executes during normal operation.
+    private static let focusQueue = DispatchQueue(
+        label: "boss.terminal.focus",
+        qos: .userInitiated
+    )
 
     init(runtime: GhosttyRuntime, session: TerminalPaneSession, launchSpec: TerminalLaunchSpec) {
         self.runtime = runtime
@@ -131,14 +156,18 @@ final class GhosttyTerminalHostView: NSView {
         pendingGeometrySync?.cancel()
         claudeMonitorTimer?.invalidate()
         if let surface {
-            // Clear focus before freeing so libghostty's
-            // focused-surface bookkeeping doesn't dangle into a
-            // freed surface, then run the destructor. libghostty
-            // action callbacks fire synchronously on the main
-            // thread (see PR #209), so by the time we reach this
-            // MainActor deinit no callback can be mid-flight racing
-            // the free, and the userdata pointer (this view) stays
-            // valid until deinit returns.
+            // Drain any pending async focus call before freeing. focusQueue
+            // is a serial background queue so sync'ing to it here cannot
+            // deadlock (different thread from MainActor). In practice terminal
+            // views have app lifetime so this barrier is a no-op, but it
+            // ensures correctness if a view is ever torn down mid-flight.
+            Self.focusQueue.sync {}
+            // Clear focus before freeing so libghostty's focused-surface
+            // bookkeeping doesn't dangle into a freed surface. Action
+            // callbacks fire on the main thread via ghostty_app_tick (see
+            // PR #209), and the focusQueue barrier above guarantees no
+            // async focus call is in progress, so the userdata pointer
+            // (this view) stays valid until deinit returns.
             ghostty_surface_set_focus(surface, false)
             ghostty_surface_free(surface)
         }
@@ -149,7 +178,10 @@ final class GhosttyTerminalHostView: NSView {
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
         if accepted, let surface {
-            ghostty_surface_set_focus(surface, true)
+            // Dispatch off the main thread — see focusQueue doc-comment above.
+            Self.focusQueue.async {
+                ghostty_surface_set_focus(surface, true)
+            }
         }
         return accepted
     }
@@ -157,7 +189,10 @@ final class GhosttyTerminalHostView: NSView {
     override func resignFirstResponder() -> Bool {
         let accepted = super.resignFirstResponder()
         if accepted, let surface {
-            ghostty_surface_set_focus(surface, false)
+            // Dispatch off the main thread for symmetry with becomeFirstResponder.
+            Self.focusQueue.async {
+                ghostty_surface_set_focus(surface, false)
+            }
         }
         return accepted
     }
