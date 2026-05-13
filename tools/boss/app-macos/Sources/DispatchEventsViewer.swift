@@ -447,6 +447,7 @@ enum DispatchExecutionLoader {
 struct DispatchEventsViewer: View {
     @StateObject private var model = DispatchEventsViewerModel()
     @State private var selected: DispatchEvent?
+    @AppStorage("boss.dispatchEventsViewer.visible") private var isOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -456,8 +457,8 @@ struct DispatchEventsViewer: View {
             Divider()
             content
         }
-        .onAppear { model.start() }
-        .onDisappear { model.stop() }
+        .onAppear { model.start(); isOpen = true }
+        .onDisappear { model.stop(); isOpen = false }
         .frame(minWidth: 900, minHeight: 520)
     }
 
@@ -791,103 +792,3 @@ private let timestampFormatter: DateFormatter = {
     f.dateFormat = "HH:mm:ss.SSS"
     return f
 }()
-
-// MARK: - Window controller
-
-@MainActor
-final class DispatchEventsWindowController: NSObject, NSWindowDelegate {
-    static let shared = DispatchEventsWindowController()
-
-    static let visibilityDefaultsKey = "boss.dispatchEventsViewer.visible"
-    static let frameDefaultsKey = "boss.dispatchEventsViewer.frame"
-
-    private var window: NSWindow?
-    private var modelHost: NSHostingView<DispatchEventsViewer>?
-
-    private override init() {
-        super.init()
-    }
-
-    var isVisible: Bool {
-        window?.isVisible ?? false
-    }
-
-    func toggle() {
-        if isVisible {
-            hide()
-        } else {
-            show()
-        }
-    }
-
-    /// Restore visibility on app launch — call after the app's main
-    /// window has been installed.
-    func restoreIfNeeded() {
-        if UserDefaults.standard.bool(forKey: Self.visibilityDefaultsKey) {
-            show(activate: false)
-        }
-    }
-
-    func show(activate: Bool = true) {
-        let window = ensureWindow()
-        window.makeKeyAndOrderFront(nil)
-        if activate {
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        UserDefaults.standard.set(true, forKey: Self.visibilityDefaultsKey)
-    }
-
-    func hide() {
-        window?.orderOut(nil)
-        UserDefaults.standard.set(false, forKey: Self.visibilityDefaultsKey)
-    }
-
-    private func ensureWindow() -> NSWindow {
-        if let window { return window }
-        let host = NSHostingView(rootView: DispatchEventsViewer())
-        let frame = persistedFrame() ?? NSRect(x: 0, y: 0, width: 1040, height: 620)
-        let window = NSWindow(
-            contentRect: frame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Dispatch Events"
-        window.contentView = host
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        window.setFrameAutosaveName("BossDispatchEventsViewer")
-        if persistedFrame() == nil {
-            window.center()
-        }
-        self.window = window
-        self.modelHost = host
-        return window
-    }
-
-    private func persistedFrame() -> NSRect? {
-        guard let s = UserDefaults.standard.string(forKey: Self.frameDefaultsKey) else {
-            return nil
-        }
-        let r = NSRectFromString(s)
-        return r == .zero ? nil : r
-    }
-
-    // MARK: NSWindowDelegate
-
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: Self.frameDefaultsKey)
-        UserDefaults.standard.set(false, forKey: Self.visibilityDefaultsKey)
-    }
-
-    func windowDidMove(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: Self.frameDefaultsKey)
-    }
-
-    func windowDidResize(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: Self.frameDefaultsKey)
-    }
-}
