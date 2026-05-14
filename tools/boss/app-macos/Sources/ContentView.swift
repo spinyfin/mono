@@ -17,7 +17,6 @@ struct ContentView: View {
     @StateObject private var bossPane = BossPaneModel()
     #endif
     @State private var isSearchExpanded: Bool = false
-    @FocusState private var searchFocused: Bool
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -133,15 +132,13 @@ struct ContentView: View {
                     WorkGroupToolbarMenu(model: model)
                     WorkSearchToolbarItem(
                         model: model,
-                        isExpanded: $isSearchExpanded,
-                        isFocused: $searchFocused
+                        isExpanded: $isSearchExpanded
                     )
                 }
             }
         }
         .onChange(of: model.navigationMode) { _, _ in
             isSearchExpanded = false
-            searchFocused = false
         }
         .alert(
             "Work Error",
@@ -905,23 +902,20 @@ private struct WorkGroupToolbarMenu: View {
 private struct WorkSearchToolbarItem: View {
     @ObservedObject var model: ChatViewModel
     @Binding var isExpanded: Bool
-    @FocusState.Binding var isFocused: Bool
 
     var body: some View {
         if isExpanded {
-            TextField("Search", text: $model.workSearchText)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 160)
-                .focused($isFocused)
-                .onKeyPress(.escape) {
+            NativeSearchField(
+                text: $model.workSearchText,
+                onEscape: {
                     isExpanded = false
                     model.workSearchText = ""
-                    return .handled
+                },
+                onFocusLost: {
+                    isExpanded = false
                 }
-                .onChange(of: isFocused) { _, focused in
-                    if !focused { isExpanded = false }
-                }
-                .onAppear { isFocused = true }
+            )
+            .frame(width: 160)
         } else {
             Button {
                 isExpanded = true
@@ -930,6 +924,67 @@ private struct WorkSearchToolbarItem: View {
             }
             .help("Search (⌘F)")
             .keyboardShortcut("f", modifiers: .command)
+        }
+    }
+}
+
+private final class AutoFocusSearchField: NSSearchField {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.makeFirstResponder(self)
+    }
+}
+
+private struct NativeSearchField: NSViewRepresentable {
+    @Binding var text: String
+    var onEscape: () -> Void
+    var onFocusLost: () -> Void
+
+    func makeNSView(context: Context) -> NSSearchField {
+        let field = AutoFocusSearchField()
+        field.placeholderString = "Search"
+        field.delegate = context.coordinator
+        return field
+    }
+
+    func updateNSView(_ nsView: NSSearchField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: NativeSearchField
+        private var escapeHandled = false
+
+        init(_ parent: NativeSearchField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSSearchField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                escapeHandled = true
+                parent.onEscape()
+                return true
+            }
+            return false
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            if escapeHandled {
+                escapeHandled = false
+                return
+            }
+            parent.onFocusLost()
         }
     }
 }
