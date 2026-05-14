@@ -150,6 +150,11 @@ const JJ_STALE_SIGNATURE: &str = "working copy is stale";
 /// `jj workspace update-stale`. The wording has been stable across releases.
 const JJ_OP_DIVERGED_SIGNATURE: &str = "seems to be a sibling";
 
+/// Stable substring jj prints when a jj repo does not exist in the
+/// current directory. If a `.git/` directory is present alongside the
+/// missing `.jj/`, `jj git init --colocate` can recover the workspace.
+const JJ_NO_JJ_REPO_SIGNATURE: &str = "there is no jj repo";
+
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -1802,11 +1807,13 @@ fn read_head_status(
 }
 
 /// Run a `jj` command against a workspace, transparently recovering
-/// from a stale working copy or op-log divergence. If the underlying
-/// command fails with either the `working copy is stale` or
-/// `seems to be a sibling` signature, runs `jj workspace update-stale`
-/// once and retries. Other failures and non-`jj` invocations pass
-/// through untouched.
+/// from a stale working copy, op-log divergence, or a missing jj repo
+/// alongside an existing git repo. If the underlying command fails with
+/// `working copy is stale` or `seems to be a sibling`, runs
+/// `jj workspace update-stale` once and retries. If it fails with
+/// `there is no jj repo` and a `.git/` directory is present, runs
+/// `jj git init --colocate` once and retries. Other failures and
+/// non-`jj` invocations pass through untouched.
 fn run_jj(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -1815,6 +1822,33 @@ fn run_jj(
     match runner.run(invocation) {
         Ok(out) => Ok(out),
         Err(err) => {
+            // Sibling heal: workspace has .git but no .jj — colocate-init jj.
+            if jj_needs_colocate_init(&err, &invocation.cwd) {
+                eprintln!(
+                    "cube: initialised jj on existing git workspace {}",
+                    invocation.cwd.display()
+                );
+                let init = RealCommandRunner::invocation(
+                    &invocation.cwd,
+                    "jj",
+                    &["git", "init", "--colocate"],
+                );
+                if runner.run(&init).is_err() {
+                    return Err(err);
+                }
+                audit!(
+                    database_path,
+                    "workspace.jj_colocate_initialised",
+                    workspace_path = invocation.cwd.display().to_string(),
+                    program = invocation.program,
+                    args = invocation.args,
+                );
+                return match runner.run(invocation) {
+                    Ok(out) => Ok(out),
+                    Err(_) => Err(err),
+                };
+            }
+
             let Some(recovery_kind) = jj_update_stale_recovery_kind(&err) else {
                 return Err(err);
             };
@@ -1851,6 +1885,21 @@ fn run_jj(
             }
         }
     }
+}
+
+/// Returns `true` when the error is `jj`'s "no jj repo" diagnostic AND a
+/// `.git/` directory exists at `cwd`, meaning `jj git init --colocate` can
+/// recover the workspace. Returns `false` for all other errors or when
+/// `.git/` is absent (truly broken state — do not paper over it).
+fn jj_needs_colocate_init(err: &CubeError, cwd: &Path) -> bool {
+    let CubeError::CommandFailed { program, stderr, .. } = err else {
+        return false;
+    };
+    if program != "jj" {
+        return false;
+    }
+    let lower = stderr.to_lowercase();
+    lower.contains(JJ_NO_JJ_REPO_SIGNATURE) && cwd.join(".git").is_dir()
 }
 
 /// Returns the audit event name if the error is one that `jj workspace
@@ -6658,6 +6707,110 @@ steps:
         }
     }
 
+    #[test]
+    fn workspace_lease_colocate_inits_when_git_repo_has_no_jj() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        // Simulate a workspace that has .git but no .jj.
+        std::fs::create_dir_all(workspace_path.join(".git")).expect(".git dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // `jj status` returns the "no jj repo" error. The wrapper should
+        // run `jj git init --colocate` once, then retry `jj status`. The
+        // remainder of the lease proceeds normally.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::no_jj_repo(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "init", "--colocate"],
+                "",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "colocate init demo"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease should auto-recover by running jj git init --colocate");
+        runner.assert_exhausted();
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
+        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+
+        let audit_dir = database_path.parent().unwrap().join("audit");
+        let logs = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).expect("audit log"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            logs.contains("\"event\":\"workspace.jj_colocate_initialised\""),
+            "expected jj_colocate_initialised audit event, got: {logs}"
+        );
+        assert!(
+            logs.contains(workspace_path.display().to_string().as_str()),
+            "audit event should record the workspace path"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_does_not_colocate_init_when_no_git_dir() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        // No .git directory — this is truly broken state, not a git+no-jj case.
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::no_jj_repo(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            // No jj git init --colocate expected — .git/ is absent so we
+            // should surface the original error verbatim.
+        ]);
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "no git dir"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("lease should fail verbosely when no .git dir present");
+        runner.assert_exhausted();
+
+        assert!(
+            matches!(error, CubeError::CommandFailed { .. }),
+            "expected original CommandFailed, got: {error:?}"
+        );
+    }
+
     /// Sets `lease_expires_at_epoch_s` directly in the SQLite store.
     /// Used by reconcile tests to age a lease past its TTL without having
     /// to wait wall-clock seconds.
@@ -7482,6 +7635,28 @@ steps:
                     stderr: "Internal error: The repo was loaded at operation a44a2f689f46, \
                              which seems to be a sibling of the working copy's operation \
                              17fb914fb03f"
+                        .to_string(),
+                }),
+                creates_dir: None,
+            }
+        }
+
+        /// Build an expectation that simulates jj's "no jj repo" failure.
+        /// The wording matches `JJ_NO_JJ_REPO_SIGNATURE` and is recovered
+        /// by `jj git init --colocate` when `.git/` is present.
+        fn no_jj_repo(cwd: PathBuf, program: &str, args: &[&str]) -> Self {
+            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            Self {
+                cwd,
+                program: program.to_string(),
+                args: args_owned.clone(),
+                result: Err(CubeError::CommandFailed {
+                    program: program.to_string(),
+                    args: args_owned,
+                    status: Some(1),
+                    stderr: "Error: There is no jj repo in \".\"\n\
+                             Hint: It looks like this is a git repo. You can create a jj repo \
+                             backed by it by running this:\njj git init --colocate"
                         .to_string(),
                 }),
                 creates_dir: None,
