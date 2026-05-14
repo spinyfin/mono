@@ -15,9 +15,9 @@
 //! local registry without leaking state across tests.
 //!
 //! Phase 1 ships the registry, the primitives, the `state.db`
-//! tables, the flush task and the startup-rehydrate path. The
-//! `bossctl metrics` surfacing verbs and the actual counters at call
-//! sites land in subsequent phases.
+//! tables, the flush task and the startup-rehydrate path. Phase 4
+//! migrates `DispatcherStats` onto the framework. The `bossctl
+//! metrics` surfacing verbs land in a subsequent phase.
 
 pub mod persistence;
 pub mod registry;
@@ -36,12 +36,10 @@ pub use registry::{CounterHandle, GaugeHandle, Registry};
 /// touches every handle so registration happens once, deterministically,
 /// at engine startup.
 ///
-/// Phase 1 ships zero production counters — the concrete counters
-/// (`pr_url_capture.*`, `dependency_unblock.*`, the
-/// `DispatcherStats` / `SweepOutcome` migrations) are filed as
-/// phases 3–5. As each new counter module lands, add one line here
-/// to register its handles.
-pub fn init_all(_registry: &Registry) {
-    // Intentionally empty in phase 1. Subsequent phases append one
-    // `<module>::init(registry)` call per new counter module.
+/// As each new counter module lands, add one line here to register
+/// its handles so duplicate-name panics surface at boot rather than
+/// at the first increment (design §"Risks / open questions" item 6).
+pub fn init_all(registry: &Registry) {
+    // Phase 4: DispatcherStats counters migrated to the framework.
+    crate::live_status_loop::register_metrics(registry);
 }

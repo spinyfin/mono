@@ -36,7 +36,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -47,6 +46,7 @@ use tokio::task::JoinHandle;
 
 use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::metrics::Registry;
 use crate::transcript_tail::TranscriptTail;
 
 /// Per-slot diagnostic state captured by the trigger fan-in. The
@@ -146,27 +146,80 @@ fn epoch_now() -> i64 {
         .unwrap_or(0)
 }
 
+// Phase-4 counter handles for DispatcherStats. Registered via
+// `register_metrics` which is called from `metrics::init_all` at
+// engine startup.
+crate::register_counter!(
+    DISPATCHER_HOOK_EVENTS_TOTAL,
+    "dispatcher.hook_events.total",
+    "Total hook events received by dispatch_live_worker_state."
+);
+crate::register_counter!(
+    DISPATCHER_HOOK_EVENTS_DROPPED_MISSING_RUN_ID,
+    "dispatcher.hook_events.dropped_missing_run_id",
+    "Hook events dropped because no run_id could be resolved."
+);
+crate::register_counter!(
+    DISPATCHER_HOOK_EVENTS_WITH_TRANSCRIPT_PATH,
+    "dispatcher.hook_events.with_transcript_path",
+    "Hook events whose payload carried a non-empty transcript_path."
+);
+crate::register_counter!(
+    DISPATCHER_HOOK_EVENTS_WITHOUT_TRANSCRIPT_PATH,
+    "dispatcher.hook_events.without_transcript_path",
+    "Hook events whose payload lacked transcript_path (cache may cover)."
+);
+crate::register_counter!(
+    DISPATCHER_TRANSCRIPT_PATH_PERSIST_UPDATED,
+    "dispatcher.transcript_path_persist.updated",
+    "set_run_transcript_path_if_unset calls that updated a work_runs row."
+);
+crate::register_counter!(
+    DISPATCHER_TRANSCRIPT_PATH_PERSIST_NOOP,
+    "dispatcher.transcript_path_persist.noop",
+    "Persist calls where the row already had transcript_path set."
+);
+crate::register_counter!(
+    DISPATCHER_TRANSCRIPT_PATH_PERSIST_ROW_MISSING,
+    "dispatcher.transcript_path_persist.row_missing",
+    "Persist calls where no matching work_runs row exists yet."
+);
+crate::register_counter!(
+    DISPATCHER_TRANSCRIPT_PATH_PERSIST_ERR,
+    "dispatcher.transcript_path_persist.err",
+    "Persist calls that returned Err (DB write failed)."
+);
+crate::register_counter!(
+    DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE,
+    "dispatcher.transcript_path_persist.from_cache",
+    "Persist calls that resolved transcript_path from the in-memory cache."
+);
+
+/// Register every DispatcherStats counter handle with `registry`.
+/// Called once from `metrics::init_all` at engine startup so duplicate-name
+/// panics surface at boot rather than on the first increment.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&DISPATCHER_HOOK_EVENTS_TOTAL);
+    registry.register_counter(&DISPATCHER_HOOK_EVENTS_DROPPED_MISSING_RUN_ID);
+    registry.register_counter(&DISPATCHER_HOOK_EVENTS_WITH_TRANSCRIPT_PATH);
+    registry.register_counter(&DISPATCHER_HOOK_EVENTS_WITHOUT_TRANSCRIPT_PATH);
+    registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_UPDATED);
+    registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_NOOP);
+    registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_ROW_MISSING);
+    registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_ERR);
+    registry.register_counter(&DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE);
+}
+
 /// Engine-wide counters for the hook-event dispatcher. One instance
 /// is shared by `Arc` from `ServerState` so every call into
 /// `dispatch_live_worker_state` can bump the appropriate counters.
 ///
-/// Each counter is monotonic across the engine process lifetime and
-/// only resets when the engine itself restarts (which the debug
-/// verb's top-level `engine_process_started_at` field documents). The
-/// counters answer the question PR #366's regression test couldn't:
-/// did the dispatcher actually attempt the persist, and what did it
-/// return?
-#[derive(Default)]
+/// After phase-4 migration the per-counter state lives in the framework
+/// registry (`self.metrics`). The `inc_*` methods are kept as one-release
+/// compat shims so call sites compile without change; a follow-up chore
+/// will delete them once call sites move to the handles directly.
 pub struct DispatcherStats {
-    pub hook_events_total: AtomicU64,
-    pub hook_events_dropped_missing_run_id: AtomicU64,
-    pub hook_events_with_transcript_path_in_payload: AtomicU64,
-    pub hook_events_without_transcript_path_in_payload: AtomicU64,
-    pub transcript_path_persist_updated: AtomicU64,
-    pub transcript_path_persist_noop: AtomicU64,
-    pub transcript_path_persist_row_missing: AtomicU64,
-    pub transcript_path_persist_err: AtomicU64,
-    pub transcript_path_persist_from_cache: AtomicU64,
+    metrics: Arc<Registry>,
     /// Last hook event the dispatcher processed. Held behind a mutex
     /// rather than atomics because the run id is a String.
     last_hook: StdMutex<Option<LastHookSnapshot>>,
@@ -180,44 +233,44 @@ pub struct LastHookSnapshot {
 }
 
 impl DispatcherStats {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(metrics: Arc<Registry>) -> Self {
+        Self {
+            metrics,
+            last_hook: StdMutex::new(None),
+        }
     }
 
+    // One-release compat shims. Each delegates to the framework handle
+    // so both `snapshot()` and `registry.counter_value(name)` reflect
+    // the same value. A follow-up chore removes these wrappers once
+    // call sites migrate to the handles directly.
+
     pub fn inc_hook_events_total(&self) {
-        self.hook_events_total.fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_HOOK_EVENTS_TOTAL.inc(&self.metrics);
     }
     pub fn inc_dropped_missing_run_id(&self) {
-        self.hook_events_dropped_missing_run_id
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_HOOK_EVENTS_DROPPED_MISSING_RUN_ID.inc(&self.metrics);
     }
     pub fn inc_with_transcript_path(&self) {
-        self.hook_events_with_transcript_path_in_payload
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_HOOK_EVENTS_WITH_TRANSCRIPT_PATH.inc(&self.metrics);
     }
     pub fn inc_without_transcript_path(&self) {
-        self.hook_events_without_transcript_path_in_payload
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_HOOK_EVENTS_WITHOUT_TRANSCRIPT_PATH.inc(&self.metrics);
     }
     pub fn inc_persist_updated(&self) {
-        self.transcript_path_persist_updated
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_TRANSCRIPT_PATH_PERSIST_UPDATED.inc(&self.metrics);
     }
     pub fn inc_persist_noop(&self) {
-        self.transcript_path_persist_noop
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_TRANSCRIPT_PATH_PERSIST_NOOP.inc(&self.metrics);
     }
     pub fn inc_persist_row_missing(&self) {
-        self.transcript_path_persist_row_missing
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_TRANSCRIPT_PATH_PERSIST_ROW_MISSING.inc(&self.metrics);
     }
     pub fn inc_persist_err(&self) {
-        self.transcript_path_persist_err
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_TRANSCRIPT_PATH_PERSIST_ERR.inc(&self.metrics);
     }
     pub fn inc_persist_from_cache(&self) {
-        self.transcript_path_persist_from_cache
-            .fetch_add(1, Ordering::Relaxed);
+        DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE.inc(&self.metrics);
     }
 
     pub fn record_last_hook(&self, run_id: &str, kind: &str) {
@@ -236,36 +289,47 @@ impl DispatcherStats {
             .clone()
     }
 
-    /// Read-only snapshot of every counter as plain `u64`. Used by
-    /// the live-status debug RPC handler to populate the wire
-    /// `DispatcherStatsReport`.
+    /// Read-only snapshot of every counter as plain `u64`. Populated
+    /// from the framework registry so `snapshot()` and
+    /// `registry.counter_value(name)` always agree.
     pub fn snapshot(&self) -> DispatcherStatsSnapshot {
         DispatcherStatsSnapshot {
-            hook_events_total: self.hook_events_total.load(Ordering::Relaxed),
+            hook_events_total: self
+                .metrics
+                .counter_value(DISPATCHER_HOOK_EVENTS_TOTAL.name())
+                .unwrap_or(0),
             hook_events_dropped_missing_run_id: self
-                .hook_events_dropped_missing_run_id
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_HOOK_EVENTS_DROPPED_MISSING_RUN_ID.name())
+                .unwrap_or(0),
             hook_events_with_transcript_path_in_payload: self
-                .hook_events_with_transcript_path_in_payload
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_HOOK_EVENTS_WITH_TRANSCRIPT_PATH.name())
+                .unwrap_or(0),
             hook_events_without_transcript_path_in_payload: self
-                .hook_events_without_transcript_path_in_payload
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_HOOK_EVENTS_WITHOUT_TRANSCRIPT_PATH.name())
+                .unwrap_or(0),
             transcript_path_persist_updated: self
-                .transcript_path_persist_updated
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_UPDATED.name())
+                .unwrap_or(0),
             transcript_path_persist_noop: self
-                .transcript_path_persist_noop
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_NOOP.name())
+                .unwrap_or(0),
             transcript_path_persist_row_missing: self
-                .transcript_path_persist_row_missing
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_ROW_MISSING.name())
+                .unwrap_or(0),
             transcript_path_persist_err: self
-                .transcript_path_persist_err
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_ERR.name())
+                .unwrap_or(0),
             transcript_path_persist_from_cache: self
-                .transcript_path_persist_from_cache
-                .load(Ordering::Relaxed),
+                .metrics
+                .counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_FROM_CACHE.name())
+                .unwrap_or(0),
             last_hook: self.last_hook(),
         }
     }
@@ -1326,5 +1390,50 @@ mod tests {
         // K-1 sub-modulo notifies all coalesce — no broadcast.
         assert_eq!(bc.calls.load(Ordering::Relaxed), 0);
         mgr.stop_slot(5);
+    }
+
+    /// Phase-4 acceptance test: an increment via the legacy `inc_*`
+    /// wrapper and a direct increment via the framework handle both
+    /// show up in `snapshot()` and in `registry.counter_value()`.
+    #[test]
+    fn dispatcher_stats_dual_surface_consistency() {
+        let registry = Arc::new(Registry::new());
+        register_metrics(&registry);
+        let stats = DispatcherStats::new(registry.clone());
+
+        // Increment via the legacy shim.
+        stats.inc_hook_events_total();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.hook_events_total, 1, "snapshot must reflect inc_* increment");
+        assert_eq!(
+            registry.counter_value(DISPATCHER_HOOK_EVENTS_TOTAL.name()),
+            Some(1),
+            "registry.counter_value must reflect inc_* increment"
+        );
+
+        // Increment via the framework handle directly.
+        DISPATCHER_HOOK_EVENTS_TOTAL.inc(&registry);
+
+        let snap2 = stats.snapshot();
+        assert_eq!(
+            snap2.hook_events_total, 2,
+            "snapshot must reflect direct handle increment"
+        );
+        assert_eq!(
+            registry.counter_value(DISPATCHER_HOOK_EVENTS_TOTAL.name()),
+            Some(2),
+            "registry.counter_value must reflect direct handle increment"
+        );
+
+        // Spot-check a second counter via both surfaces.
+        stats.inc_persist_updated();
+        stats.inc_persist_updated();
+        let snap3 = stats.snapshot();
+        assert_eq!(snap3.transcript_path_persist_updated, 2);
+        assert_eq!(
+            registry.counter_value(DISPATCHER_TRANSCRIPT_PATH_PERSIST_UPDATED.name()),
+            Some(2),
+        );
     }
 }

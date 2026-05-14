@@ -649,6 +649,7 @@ impl ServerState {
         // increment.
         let metrics_registry = Arc::new(crate::metrics::Registry::new());
         let metrics_for_state = metrics_registry.clone();
+        let metrics_for_dispatcher = metrics_registry.clone();
 
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -709,7 +710,9 @@ impl ServerState {
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
                 live_status_manager: Arc::new(LiveStatusManager::new()),
-                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new()),
+                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(
+                    metrics_for_dispatcher,
+                )),
                 transcript_path_cache: Arc::new(
                     crate::live_status_loop::TranscriptPathCache::new(),
                 ),

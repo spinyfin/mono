@@ -577,10 +577,21 @@ mod tests {
     }
 
     #[test]
-    fn init_all_is_a_no_op_in_phase_1() {
+    fn init_all_registers_dispatcher_stats_counters() {
         let registry = Registry::new();
         crate::metrics::init_all(&registry);
-        assert!(registry.counter_snapshots().is_empty());
+        // Phase 4 wired in 9 DispatcherStats counters; init_all is no
+        // longer a no-op.
+        let names: Vec<_> = registry
+            .counter_snapshots()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "dispatcher.hook_events.total"),
+            "expected dispatcher.hook_events.total to be registered; got {names:?}",
+        );
+        assert_eq!(names.len(), 9, "expected exactly 9 dispatcher counters registered");
         assert!(registry.gauge_snapshots().is_empty());
     }
 }
