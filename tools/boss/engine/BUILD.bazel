@@ -65,6 +65,10 @@ rust_binary(
     # `boss-event` as a bare name that isn't on the worker's
     # sanitized PATH — every hook fires `command not found`.
     data = ["//tools/boss/event-shim:boss-event"],
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/installer:__pkg__",
+    ],
     deps = [
         ":engine_lib",
     ] + all_crate_deps(normal = True),

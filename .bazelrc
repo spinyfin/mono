@@ -1,2 +1,8 @@
 build --jobs=200
 build --disk_cache=~/.cache/bazelcache
+
+# Release config: stamps binaries with the git SHA and wires the
+# workspace-status.sh script so STABLE_BOSS_GIT_SHA and BUILD_EMBED_LABEL
+# flow into the build (design doc Q4 Phase 2).
+build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
+build:release --stamp

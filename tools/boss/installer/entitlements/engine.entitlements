@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The engine binary is plain Rust with no JIT and no foreign dylibs;
+         it needs no additional entitlements beyond the hardened runtime
+         default. This file is a placeholder so release.sh can pass
+         --entitlements consistently for all Mach-Os. -->
+</dict>
+</plist>
