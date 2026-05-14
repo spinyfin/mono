@@ -503,6 +503,11 @@ struct ProductUpdateArgs {
 
     #[arg(long)]
     status: Option<ProductStatus>,
+
+    /// Configurable text prepended to every worker's initial spawn context
+    /// for this product. Pass an empty string to clear.
+    #[arg(long = "dispatch-preamble")]
+    dispatch_preamble: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1519,6 +1524,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 description: args.description,
                 status: args.status.map(|status| status.as_str().to_owned()),
                 repo_remote_url: args.repo_remote_url,
+                dispatch_preamble: args.dispatch_preamble,
                 ..WorkItemPatch::default()
             };
             ensure_patch_present(
@@ -3807,6 +3813,7 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.effort_level.is_some()
         || patch.model_override.is_some()
         || patch.default_model.is_some()
+        || patch.dispatch_preamble.is_some()
         || patch.autostart.is_some();
 
     if has_fields {
@@ -4159,6 +4166,9 @@ fn print_product_details(title: &str, product: &Product) {
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
     if let Some(model) = product.default_model.as_deref() {
         println!("Default model: {model}");
+    }
+    if let Some(preamble) = product.dispatch_preamble.as_deref() {
+        println!("Dispatch preamble: {preamble}");
     }
     if !product.description.is_empty() {
         println!("Description: {}", product.description);
@@ -4691,6 +4701,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             default_model: None,
+            dispatch_preamble: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Product(product)).is_err());
 
@@ -4728,6 +4739,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             default_model: None,
+            dispatch_preamble: None,
         }
     }
 
@@ -5690,6 +5702,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             default_model: None,
+            dispatch_preamble: None,
         }
     }
 

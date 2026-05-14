@@ -18,6 +18,12 @@ pub struct Product {
     /// migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Configurable text prepended (with visible markers) to every
+    /// worker's initial spawn context for this product. `None` / empty
+    /// → today's behaviour unchanged. Set per-product so wording can
+    /// adapt as codebase tooling evolves (e.g. bazel readiness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_preamble: Option<String>,
 }
 
 /// Allowed values for `tasks.effort_level`. Per design §"Naming" /
@@ -873,6 +879,11 @@ pub struct WorkItemPatch {
     /// project. `None` → leave unchanged. `Some("")` → clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Product-level dispatch preamble. Only honoured on
+    /// product-targeted updates; ignored when patching a task/chore/
+    /// project. `None` → leave unchanged. `Some("")` → clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_preamble: Option<String>,
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

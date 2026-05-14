@@ -291,14 +291,6 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             None
         };
-        let prompt_text = compose_execution_prompt(
-            execution,
-            work_item,
-            parent_project.as_ref(),
-            workspace_path,
-            cube_change_id,
-            conflict_attempt.as_ref(),
-        );
 
         // Resolve the per-execution effort + model knobs (design §Q3
         // precedence). Read both columns off the row, the parent
@@ -306,23 +298,43 @@ impl ExecutionRunner for PaneSpawnRunner {
         // first non-empty value. The resolver also derives the
         // `--effort` value and the optional prompt addendum from the
         // row's `effort_level` (model_override never changes those —
-        // design §Q3).
-        let (row_effort, row_model_override, product_default_model) = match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                let product_default = self
-                    .work_db
-                    .get_product(&task.product_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.default_model);
-                (task.effort_level, task.model_override.clone(), product_default)
-            }
-            _ => (None, None, None),
-        };
+        // design §Q3). Also capture `dispatch_preamble` here since the
+        // product lookup is already happening for `default_model`.
+        let (row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
+            match work_item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => {
+                    let product = self
+                        .work_db
+                        .get_product(&task.product_id)
+                        .ok()
+                        .flatten();
+                    let product_default_model =
+                        product.as_ref().and_then(|p| p.default_model.clone());
+                    let product_dispatch_preamble =
+                        product.and_then(|p| p.dispatch_preamble.clone());
+                    (
+                        task.effort_level,
+                        task.model_override.clone(),
+                        product_default_model,
+                        product_dispatch_preamble,
+                    )
+                }
+                _ => (None, None, None, None),
+            };
         let spawn_config = resolve_spawn_config(
             row_effort,
             row_model_override.as_deref(),
             product_default_model.as_deref(),
+        );
+
+        let prompt_text = compose_execution_prompt(
+            execution,
+            work_item,
+            parent_project.as_ref(),
+            workspace_path,
+            cube_change_id,
+            conflict_attempt.as_ref(),
+            product_dispatch_preamble.as_deref(),
         );
 
         // Per-level prompt addendum lands at the very top of the file
@@ -425,6 +437,7 @@ fn compose_execution_prompt(
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     conflict_attempt: Option<&ConflictResolution>,
+    dispatch_preamble: Option<&str>,
 ) -> String {
     // The conflict_resolution kind has a wholly different shape than
     // implementation/design kinds — it carries an embedded diagnosis,
@@ -446,6 +459,11 @@ fn compose_execution_prompt(
         }
     }
     let mut prompt = String::new();
+    if let Some(preamble) = dispatch_preamble.filter(|s| !s.is_empty()) {
+        prompt.push_str("[product-preamble]\n");
+        prompt.push_str(preamble);
+        prompt.push_str("\n[/product-preamble]\n\n");
+    }
     prompt.push_str(
         "You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n",
     );
