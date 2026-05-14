@@ -15,6 +15,7 @@ use crate::cli::{
     WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
+use crate::config;
 use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths;
@@ -162,7 +163,7 @@ fn run_with_dependencies(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
 ) -> Result<RunResult> {
-    run_with_context(cli, database_path, runner, None)
+    run_with_context(cli, database_path, runner, None, None)
 }
 
 fn run_with_context(
@@ -170,9 +171,12 @@ fn run_with_context(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
     repo_ensure_defaults: Option<&RepoEnsureDefaults>,
+    cube_config: Option<config::CubeConfig>,
 ) -> Result<RunResult> {
     match cli.command {
-        Command::Repo { command } => run_repo(command, database_path, runner, repo_ensure_defaults),
+        Command::Repo { command } => {
+            run_repo(command, database_path, runner, repo_ensure_defaults, cube_config)
+        }
         Command::Workspace { command } => run_workspace(command, database_path, runner),
         Command::Change { command } => run_change(command, database_path, runner),
         Command::Stack { command } => run_stack(command),
@@ -187,6 +191,7 @@ fn run_repo(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
     repo_ensure_defaults: Option<&RepoEnsureDefaults>,
+    cube_config: Option<config::CubeConfig>,
 ) -> Result<RunResult> {
     let store = if let Some(path) = database_path {
         Store::open_at(path)?
@@ -202,7 +207,7 @@ fn run_repo(
             } else {
                 default_repo_ensure_defaults()?
             };
-            let record = ensure_repo(&store, runner, &origin, &defaults)?;
+            let record = ensure_repo(&store, runner, &origin, &defaults, cube_config)?;
             let repo_id = record.repo.clone();
             RunResult::new(
                 format!("Ensured repo `{repo_id}`."),
@@ -265,10 +270,16 @@ fn ensure_repo(
     runner: &dyn CommandRunner,
     origin: &str,
     defaults: &RepoEnsureDefaults,
+    cube_config: Option<config::CubeConfig>,
 ) -> Result<RepoRecord> {
+    let cfg = match cube_config {
+        Some(c) => c,
+        None => config::load_config()?,
+    };
+
     if let Some(record) = store.get_repo_by_origin(origin)? {
         fs::create_dir_all(&record.workspace_root)?;
-        materialize_repo_source_if_missing(runner, &record)?;
+        materialize_repo_source_if_missing(runner, &record, &cfg)?;
         return Ok(record);
     }
 
@@ -281,7 +292,7 @@ fn ensure_repo(
     }
 
     fs::create_dir_all(&record.workspace_root)?;
-    materialize_repo_source_if_missing(runner, &record)?;
+    materialize_repo_source_if_missing(runner, &record, &cfg)?;
     store.upsert_repo(&record)
 }
 
@@ -322,6 +333,7 @@ fn infer_repo_record_from_origin(
 fn materialize_repo_source_if_missing(
     runner: &dyn CommandRunner,
     record: &RepoRecord,
+    config: &config::CubeConfig,
 ) -> Result<()> {
     let Some(source) = &record.source else {
         return Ok(());
@@ -344,17 +356,86 @@ fn materialize_repo_source_if_missing(
         ))
     })?;
     fs::create_dir_all(parent)?;
-    runner.run(&CommandInvocation {
-        cwd: parent.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "git".to_string(),
-            "clone".to_string(),
-            record.origin.clone(),
-            source.display().to_string(),
-        ],
-    })?;
+
+    let mp = &config.multiproduct;
+    if mp.enabled && is_multiproduct_repo(&record.origin, &mp.org) {
+        let repo_name = repo_name_for_mint_clone(&record.origin)?;
+        if which::which(&mp.clone_command).is_err() {
+            let config_path = config::config_file_path()
+                .unwrap_or_else(|_| PathBuf::from("~/.config/cube/cube.toml"));
+            return Err(CubeError::InvalidArgument(format!(
+                "`{}` is not on PATH, but multiproduct cloning is enabled in `{}`. \
+                 Install `{}` or set `[multiproduct] enabled = false` in that file.",
+                mp.clone_command,
+                config_path.display(),
+                mp.clone_command,
+            )));
+        }
+        eprintln!(
+            "cube: using `{} clone` for multiproduct repo `{}`",
+            mp.clone_command, repo_name
+        );
+        runner.run(&CommandInvocation {
+            cwd: parent.to_path_buf(),
+            program: mp.clone_command.clone(),
+            args: vec!["clone".to_string(), repo_name],
+        })?;
+        eprintln!(
+            "cube: running `jj git init --colocate` in {}",
+            source.display()
+        );
+        runner.run(&CommandInvocation {
+            cwd: source.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "git".to_string(),
+                "init".to_string(),
+                "--colocate".to_string(),
+            ],
+        })?;
+    } else {
+        eprintln!("cube: using `jj git clone` for repo `{}`", record.repo);
+        runner.run(&CommandInvocation {
+            cwd: parent.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "git".to_string(),
+                "clone".to_string(),
+                record.origin.clone(),
+                source.display().to_string(),
+            ],
+        })?;
+    }
     Ok(())
+}
+
+/// Returns true when the given origin URL identifies a multiproduct repo.
+/// Detection uses two strategies:
+/// - URL-based (option b): the remote path contains `/{org}/` or `:{org}/`
+/// - Bare-name (option a): the origin has no URL separators (no `/`, `:`, or `@`),
+///   i.e. the user passed a short repo name directly
+fn is_multiproduct_repo(origin: &str, org: &str) -> bool {
+    origin.contains(&format!("/{org}/"))
+        || origin.contains(&format!(":{org}/"))
+        || (!origin.contains('/') && !origin.contains(':') && !origin.contains('@'))
+}
+
+/// Extract the short repo name from an origin to pass to `mint clone`.
+/// For a full URL like `org-127256988@github.com:linkedin-multiproduct/frontend-api.git`,
+/// returns `"frontend-api"`. For a bare name like `"frontend-api"`, returns it as-is.
+fn repo_name_for_mint_clone(origin: &str) -> Result<String> {
+    let trimmed = origin.trim().trim_end_matches('/');
+    let tail = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(trimmed);
+    let name = tail.strip_suffix(".git").unwrap_or(tail);
+    if name.is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "could not extract repo name from origin `{origin}` for mint clone"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 fn repo_id_from_origin(origin: &str) -> Result<String> {
@@ -2325,6 +2406,7 @@ mod tests {
             Some(&database_path),
             &FakeRunner::default(),
             Some(&defaults),
+            None,
         )
         .expect("ensure");
 
@@ -2381,7 +2463,7 @@ mod tests {
             "--origin",
             "git@github.com:spinyfin/mono.git",
         ]);
-        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults))
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
             .expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
@@ -2416,7 +2498,7 @@ mod tests {
             "--origin",
             "git@github.com:spinyfin/mono.git",
         ]);
-        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults))
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
             .expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
@@ -2432,6 +2514,245 @@ mod tests {
         );
         assert!(defaults.workspace_root.is_dir());
         runner.assert_exhausted();
+    }
+
+    fn multiproduct_config(enabled: bool) -> crate::config::CubeConfig {
+        multiproduct_config_with_cmd(enabled, "mint")
+    }
+
+    fn multiproduct_config_with_cmd(enabled: bool, cmd: &str) -> crate::config::CubeConfig {
+        crate::config::CubeConfig {
+            multiproduct: crate::config::MultiproductConfig {
+                enabled,
+                clone_command: cmd.to_string(),
+                org: "linkedin-multiproduct".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn repo_ensure_uses_mint_clone_for_multiproduct_url() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("frontend-api");
+        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
+
+        // Use "true" as the clone command — it exists on PATH (/usr/bin/true)
+        // so the which-check succeeds without mint being installed.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "true",
+                &["clone", "frontend-api"],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["git", "init", "--colocate"],
+                "",
+            ),
+        ]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(multiproduct_config_with_cmd(true, "true")),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `frontend-api`.");
+        assert_eq!(result.payload["repo_id"], "frontend-api");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn repo_ensure_uses_mint_clone_for_bare_name() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("frontend-api");
+
+        // Use "true" as the clone command so the which-check passes without mint installed.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "true",
+                &["clone", "frontend-api"],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["git", "init", "--colocate"],
+                "",
+            ),
+        ]);
+
+        let ensure =
+            Cli::parse_from(["cube", "repo", "ensure", "--origin", "frontend-api"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(multiproduct_config_with_cmd(true, "true")),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `frontend-api`.");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn repo_ensure_uses_git_clone_for_non_multiproduct_url_even_when_flag_enabled() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("myrepo");
+        let origin = "git@github.com:linkedin-sandbox/myrepo.git";
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            defaults.repo_root.clone(),
+            "jj",
+            &[
+                "git",
+                "clone",
+                origin,
+                &source_path.display().to_string(),
+            ],
+            "",
+        )]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(multiproduct_config(true)),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `myrepo`.");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn repo_ensure_uses_git_clone_when_multiproduct_disabled() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("frontend-api");
+        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            defaults.repo_root.clone(),
+            "jj",
+            &[
+                "git",
+                "clone",
+                origin,
+                &source_path.display().to_string(),
+            ],
+            "",
+        )]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(multiproduct_config(false)),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `frontend-api`.");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn is_multiproduct_repo_detection() {
+        // URL-based detection
+        assert!(super::is_multiproduct_repo(
+            "org-127@github.com:linkedin-multiproduct/frontend-api.git",
+            "linkedin-multiproduct"
+        ));
+        assert!(super::is_multiproduct_repo(
+            "https://github.com/linkedin-multiproduct/frontend-api",
+            "linkedin-multiproduct"
+        ));
+        // Bare name detection
+        assert!(super::is_multiproduct_repo("frontend-api", "linkedin-multiproduct"));
+        // Non-multiproduct URLs
+        assert!(!super::is_multiproduct_repo(
+            "git@github.com:linkedin-sandbox/myrepo.git",
+            "linkedin-multiproduct"
+        ));
+        assert!(!super::is_multiproduct_repo(
+            "git@github.com:spinyfin/mono.git",
+            "linkedin-multiproduct"
+        ));
+    }
+
+    #[test]
+    fn repo_name_for_mint_clone_extracts_names() {
+        assert_eq!(
+            super::repo_name_for_mint_clone(
+                "org-127@github.com:linkedin-multiproduct/frontend-api.git"
+            )
+            .unwrap(),
+            "frontend-api"
+        );
+        assert_eq!(
+            super::repo_name_for_mint_clone("frontend-api").unwrap(),
+            "frontend-api"
+        );
+        assert_eq!(
+            super::repo_name_for_mint_clone(
+                "https://github.com/linkedin-multiproduct/frontend-api"
+            )
+            .unwrap(),
+            "frontend-api"
+        );
+    }
+
+    #[test]
+    fn repo_ensure_errors_clearly_when_clone_command_not_on_path() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
+
+        // Use a binary name that definitely does not exist on PATH.
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let err = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            Some(multiproduct_config_with_cmd(
+                true,
+                "this-binary-does-not-exist-cube-test",
+            )),
+        )
+        .expect_err("should fail when clone command is missing");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("this-binary-does-not-exist-cube-test"),
+            "error should name the missing binary: {msg}"
+        );
+        assert!(
+            msg.contains("not on PATH"),
+            "error should mention PATH: {msg}"
+        );
+        assert!(
+            msg.contains("multiproduct"),
+            "error should reference multiproduct config: {msg}"
+        );
     }
 
     #[test]
