@@ -135,10 +135,6 @@ struct ContentView: View {
                 }
             }
 
-            ToolbarItem(placement: .principal) {
-                BossTitleView(model: model)
-            }
-
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
                     WorkProjectFilterToolbarButton(model: model)
@@ -842,15 +838,6 @@ private struct WorkSidebarFilterRow: View {
     }
 }
 
-private struct BossTitleView: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        Text(model.selectedProduct?.name ?? "Boss")
-            .font(.headline)
-    }
-}
-
 private struct WorkProjectFilterToolbarButton: View {
     @ObservedObject var model: ChatViewModel
     @State private var isShowingPopover = false
@@ -943,6 +930,7 @@ private struct NativeSearchField: NSViewRepresentable {
     func makeNSView(context: Context) -> NSSearchField {
         let field = AutoFocusSearchField()
         field.placeholderString = "Search"
+        field.controlSize = .small
         field.delegate = context.coordinator
         return field
     }
