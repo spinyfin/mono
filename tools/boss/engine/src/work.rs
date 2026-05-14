@@ -1437,9 +1437,15 @@ impl WorkDb {
         // different status vocabulary and aren't rendered on the
         // kanban. Don't downgrade items already in `done` or
         // `archived` — manual transitions win.
+        //
+        // `autostart` is cleared here (single-shot semantics): once a
+        // row has ever transitioned to Doing, the flag is consumed so
+        // that moving the card back to Backlog later does not trigger
+        // re-dispatch by the reconciler or orphan-active sweep.
         tx.execute(
             "UPDATE tasks
              SET status = 'active',
+                 autostart = 0,
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
@@ -2772,8 +2778,13 @@ impl WorkDb {
         // sees every task/project row that earlier migrations may
         // have inserted (notably `migrate_backfill_project_design_tasks`).
         migrate_short_id_columns(&conn)?;
+        // Clears `autostart` on rows that have already been dispatched
+        // so the single-shot semantics (AI #2, Incident 001) apply to
+        // existing data too. Must run after `migrate_tasks_autostart`
+        // so the column exists.
+        migrate_backfill_autostart_consumed(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '9')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -6098,6 +6109,21 @@ fn migrate_short_id_columns(conn: &Connection) -> Result<()> {
              ON projects(product_id, short_id) WHERE short_id IS NOT NULL;",
     )?;
 
+    Ok(())
+}
+
+/// Backfill `autostart = 0` for tasks that are past their first Doing
+/// transition (AI #2, Incident 001). From schema version 10 onward
+/// `autostart` is single-shot: the engine clears it to `0` when a row
+/// first enters `active` via `start_execution_run`. Rows that already
+/// made that transition before this migration still carry `autostart = 1`
+/// in the column, so we clear them here. Any row whose `status != 'todo'`
+/// has been dispatched at least once and no longer needs the flag.
+fn migrate_backfill_autostart_consumed(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET autostart = 0 WHERE autostart = 1 AND status != 'todo'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -10551,6 +10577,183 @@ mod tests {
         assert_eq!(executions[0].status, "failed");
     }
 
+    /// `start_execution_run` clears `autostart` to `0` in the same
+    /// transaction that advances `tasks.status` to `'active'`. After
+    /// that single-shot consumption the reconciler must not re-dispatch
+    /// the task if it is reset to `todo` (the Done→Backlog gesture).
+    #[test]
+    fn start_execution_run_clears_autostart() {
+        let path = temp_db_path("start-run-clears-autostart");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Autostart chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        assert!(chore.autostart, "newly created chore should have autostart=true");
+
+        // Place a ready execution so start_execution_run can run.
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => {
+                assert_eq!(t.status, "active");
+                assert!(!t.autostart, "autostart must be cleared after first Doing transition");
+            }
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+
+        // Simulate Done→Backlog: move back to todo. With autostart
+        // consumed, reconcile_product_executions must NOT create a
+        // new ready execution (task_accepts_execution returns false
+        // when autostart=false and status='todo').
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("todo".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let executions_before = db.list_executions(Some(&chore.id)).unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let executions_after = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions_before.len(),
+            executions_after.len(),
+            "reset-to-todo task with consumed autostart must not be re-dispatched by reconcile",
+        );
+    }
+
+    /// The backfill migration clears `autostart` for rows that are
+    /// already past their first Doing transition (status != 'todo') so
+    /// single-shot semantics apply to pre-migration databases.
+    #[test]
+    fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
+        let path = disk_db_path("autostart-backfill");
+        // Pre-populate a v9 schema with rows in various statuses, all
+        // with autostart = 1, then re-open via WorkDb to run migrations.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // Minimal schema that satisfies the migration chain up to v9.
+            conn.execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE products (
+                     id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                     description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                     status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                     auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 0,
+                     default_model TEXT, dispatch_preamble TEXT,
+                     ci_attempt_budget INTEGER);
+                 CREATE TABLE projects (
+                     id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                     slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                     goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                     priority TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                     last_status_actor TEXT NOT NULL DEFAULT 'human',
+                     design_doc TEXT, design_doc_updated_at TEXT, design_doc_draft TEXT,
+                     short_id INTEGER);
+                 CREATE TABLE tasks (
+                     id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                     kind TEXT NOT NULL DEFAULT 'chore', name TEXT NOT NULL,
+                     description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                     ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                     autostart INTEGER NOT NULL DEFAULT 1,
+                     last_status_actor TEXT NOT NULL DEFAULT 'human',
+                     priority TEXT NOT NULL DEFAULT 'medium',
+                     created_via TEXT NOT NULL DEFAULT 'human',
+                     blocked_reason TEXT, blocked_attempt_id TEXT,
+                     repo_remote_url TEXT,
+                     effort_level TEXT, model_override TEXT,
+                     ci_attempt_budget INTEGER, ci_attempts_used INTEGER NOT NULL DEFAULT 0,
+                     short_id INTEGER);
+                 CREATE TABLE IF NOT EXISTS short_id_sequences (
+                     product_id TEXT PRIMARY KEY, next_value INTEGER NOT NULL DEFAULT 1);
+                 INSERT INTO metadata(key, value) VALUES ('schema_version', '9');
+                 INSERT INTO products VALUES (
+                     'prod-1', 'Boss', 'boss', '', NULL, 'active',
+                     '1700000000', '1700000000', 0, NULL, NULL, NULL);
+                 INSERT INTO tasks VALUES (
+                     'task-todo', 'prod-1', NULL, 'chore', 'Todo task', '', 'todo',
+                     1, NULL, NULL, '1700000001', '1700000001', 1,
+                     'human', 'medium', 'human', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL);
+                 INSERT INTO tasks VALUES (
+                     'task-active', 'prod-1', NULL, 'chore', 'Active task', '', 'active',
+                     2, NULL, NULL, '1700000002', '1700000002', 1,
+                     'human', 'medium', 'human', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL);
+                 INSERT INTO tasks VALUES (
+                     'task-done', 'prod-1', NULL, 'chore', 'Done task', '', 'done',
+                     3, NULL, NULL, '1700000003', '1700000003', 1,
+                     'human', 'medium', 'human', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL);
+                 INSERT INTO tasks VALUES (
+                     'task-blocked', 'prod-1', NULL, 'chore', 'Blocked task', '', 'blocked',
+                     4, NULL, NULL, '1700000004', '1700000004', 1,
+                     'human', 'medium', 'human', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL);",
+            )
+            .unwrap();
+        }
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        let autostart_for = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT autostart FROM tasks WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(autostart_for("task-todo"), 1, "todo row must keep autostart=1");
+        assert_eq!(autostart_for("task-active"), 0, "active row must be cleared to autostart=0");
+        assert_eq!(autostart_for("task-done"), 0, "done row must be cleared to autostart=0");
+        assert_eq!(autostart_for("task-blocked"), 0, "blocked row must be cleared to autostart=0");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "10");
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// FIFO ordering: the active chore that was moved to `active`
     /// first should be the first one redispatched. Later kanban
     /// drags wait their turn.
@@ -12109,7 +12312,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
         let _ = std::fs::remove_file(path);
     }
 
@@ -12289,7 +12492,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
         let _ = std::fs::remove_file(path);
     }
 
@@ -12335,7 +12538,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
 
         let _ = std::fs::remove_file(path);
     }
@@ -12423,7 +12626,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13206,7 +13409,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
 
         // After migration we can also write a fresh `blocked` row
         // and re-backfill is still a no-op (the existing rows
