@@ -91,7 +91,7 @@ fn audit_dir(database_path: Option<&Path>) -> Result<PathBuf, CubeError> {
 fn append(dir: &Path, event: &str, fields: Map<String, Value>) -> Result<(), CubeError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
+        .map_err(|e| CubeError::Io(std::io::Error::other(e)))?
         .as_secs() as i64;
     append_at(dir, now, event, fields)
 }
@@ -102,7 +102,10 @@ pub(crate) fn append_at(
     event: &str,
     mut fields: Map<String, Value>,
 ) -> Result<(), CubeError> {
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).map_err(|e| CubeError::AuditLogIo {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
     let path = dir.join(week_file_name(now_epoch_s));
 
     fields.insert("ts".into(), Value::String(format_iso8601(now_epoch_s)));
@@ -112,8 +115,18 @@ pub(crate) fn append_at(
     let mut line = serde_json::to_string(&Value::Object(fields))?;
     line.push('\n');
 
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    file.write_all(line.as_bytes())?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| CubeError::AuditLogIo {
+            path: path.clone(),
+            source: e,
+        })?;
+    file.write_all(line.as_bytes()).map_err(|e| CubeError::AuditLogIo {
+        path: path.clone(),
+        source: e,
+    })?;
 
     let _ = prune(dir, now_epoch_s);
     Ok(())

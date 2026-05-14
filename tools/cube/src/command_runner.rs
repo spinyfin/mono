@@ -31,7 +31,8 @@ impl CommandRunner for RealCommandRunner {
         let output = Command::new(&invocation.program)
             .args(&invocation.args)
             .current_dir(&invocation.cwd)
-            .output()?;
+            .output()
+            .map_err(CubeError::Io)?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

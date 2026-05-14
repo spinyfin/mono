@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -76,8 +77,22 @@ pub enum CubeError {
     SetupStepFailed { step: String, error: String },
     #[error("failed to access Cube metadata: {0}")]
     Storage(#[source] rusqlite::Error),
-    #[error("failed to prepare Cube data directory: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("failed to create workspace directory `{path}`: {source}")]
+    WorkspaceDirCreate { path: PathBuf, source: io::Error },
+    #[error("failed to read workspace directory `{path}`: {source}")]
+    WorkspaceDirRead { path: PathBuf, source: io::Error },
+    #[error("failed to remove workspace directory `{path}`: {source}")]
+    WorkspaceDirRemove { path: PathBuf, source: io::Error },
+    #[error("failed to create repo source directory `{path}`: {source}")]
+    RepoSourceDirCreate { path: PathBuf, source: io::Error },
+    #[error("failed to open state database at `{path}`: {source}")]
+    StateDbIo { path: PathBuf, source: io::Error },
+    #[error("failed to write audit log entry at `{path}`: {source}")]
+    AuditLogIo { path: PathBuf, source: io::Error },
+    #[error("failed to acquire repo lock at `{path}`: {source}")]
+    LockIo { path: PathBuf, source: io::Error },
+    #[error("I/O error: {0}")]
+    Io(#[source] io::Error),
     #[error(
         "command `{program} {}` failed{}{}",
         args.join(" "),
@@ -141,6 +156,13 @@ impl CubeError {
             Self::SetupStepFailed { .. } => ExitCode::from(6),
             Self::Storage(_)
             | Self::Io(_)
+            | Self::WorkspaceDirCreate { .. }
+            | Self::WorkspaceDirRead { .. }
+            | Self::WorkspaceDirRemove { .. }
+            | Self::RepoSourceDirCreate { .. }
+            | Self::StateDbIo { .. }
+            | Self::AuditLogIo { .. }
+            | Self::LockIo { .. }
             | Self::CommandFailed { .. }
             | Self::Json(_)
             | Self::StaleRecoveryFailed { .. } => ExitCode::FAILURE,
@@ -278,7 +300,10 @@ fn ensure_repo(
     };
 
     if let Some(record) = store.get_repo_by_origin(origin)? {
-        fs::create_dir_all(&record.workspace_root)?;
+        fs::create_dir_all(&record.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
+            path: record.workspace_root.clone(),
+            source: e,
+        })?;
         materialize_repo_source_if_missing(runner, &record, &cfg)?;
         return Ok(record);
     }
@@ -291,7 +316,10 @@ fn ensure_repo(
         )));
     }
 
-    fs::create_dir_all(&record.workspace_root)?;
+    fs::create_dir_all(&record.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
+        path: record.workspace_root.clone(),
+        source: e,
+    })?;
     materialize_repo_source_if_missing(runner, &record, &cfg)?;
     store.upsert_repo(&record)
 }
@@ -355,7 +383,10 @@ fn materialize_repo_source_if_missing(
             source.display()
         ))
     })?;
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(|e| CubeError::RepoSourceDirCreate {
+        path: parent.to_path_buf(),
+        source: e,
+    })?;
 
     let mp = &config.multiproduct;
     if mp.enabled && is_multiproduct_repo(&record.origin, &mp.org) {
@@ -1059,8 +1090,13 @@ fn run_workspace(
             if expunge {
                 match fs::remove_dir_all(&record.workspace_path) {
                     Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(CubeError::Io(err)),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(CubeError::WorkspaceDirRemove {
+                            path: record.workspace_path.clone(),
+                            source: err,
+                        })
+                    }
                 }
             }
 
@@ -1260,7 +1296,10 @@ fn auto_create_workspace(
     let workspace_id = next_workspace_id(&repo_record.workspace_prefix, &existing_ids);
     let workspace_path = repo_record.workspace_root.join(&workspace_id);
 
-    fs::create_dir_all(&repo_record.workspace_root)?;
+    fs::create_dir_all(&repo_record.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
+        path: repo_record.workspace_root.clone(),
+        source: e,
+    })?;
 
     let clone_source = match &repo_record.source {
         Some(source) if source.exists() => source.display().to_string(),
@@ -1324,9 +1363,18 @@ fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::Workspa
     if !repo.workspace_root.is_dir() {
         return Ok(candidates);
     }
-    for entry in fs::read_dir(&repo.workspace_root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    for entry in fs::read_dir(&repo.workspace_root).map_err(|e| CubeError::WorkspaceDirRead {
+        path: repo.workspace_root.clone(),
+        source: e,
+    })? {
+        let entry = entry.map_err(|e| CubeError::WorkspaceDirRead {
+            path: repo.workspace_root.clone(),
+            source: e,
+        })?;
+        let file_type = entry.file_type().map_err(|e| CubeError::WorkspaceDirRead {
+            path: entry.path(),
+            source: e,
+        })?;
         if !file_type.is_dir() {
             continue;
         }
@@ -2163,7 +2211,7 @@ fn repo_lock_path(repo: &str, database_path: Option<&Path>) -> Result<PathBuf> {
 fn current_epoch_s() -> Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
+        .map_err(|e| CubeError::Io(io::Error::other(e)))?
         .as_secs() as i64)
 }
 
@@ -6779,5 +6827,33 @@ steps:
                 creates_dir: None,
             }
         }
+    }
+
+    #[test]
+    fn workspace_dir_create_error_has_specific_variant() {
+        // Ensure that when workspace directory creation fails, the error surfaces
+        // as WorkspaceDirCreate (not the generic Io variant). This guards against
+        // regressions to the old #[from] io::Error pattern that reported every
+        // io error as "failed to prepare Cube data directory".
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        // Create a *file* at the workspace_root path so create_dir_all fails.
+        std::fs::write(&workspace_root, b"not a dir").expect("write sentinel file");
+
+        let defaults = RepoEnsureDefaults {
+            repo_root: tempdir.path().join("repos"),
+            workspace_root: workspace_root.clone(),
+        };
+
+        let cli = Cli::parse_from(["cube", "repo", "ensure", "--origin", "https://github.com/example/repo"]);
+        let runner = crate::command_runner::RealCommandRunner;
+        let err = run_with_context(cli, Some(&database_path), &runner, Some(&defaults), None)
+            .expect_err("should fail because workspace_root is a file");
+
+        assert!(
+            matches!(err, CubeError::WorkspaceDirCreate { ref path, .. } if path == &workspace_root),
+            "expected WorkspaceDirCreate, got: {err:?}"
+        );
     }
 }
