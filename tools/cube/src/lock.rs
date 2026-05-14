@@ -12,14 +12,24 @@ pub struct RepoLock {
 impl RepoLock {
     pub fn acquire(lock_path: &Path) -> Result<Self, CubeError> {
         if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|e| CubeError::LockIo {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(lock_path)?;
-        FileExt::lock_exclusive(&file)?;
+            .open(lock_path)
+            .map_err(|e| CubeError::LockIo {
+                path: lock_path.to_path_buf(),
+                source: e,
+            })?;
+        FileExt::lock_exclusive(&file).map_err(|e| CubeError::LockIo {
+            path: lock_path.to_path_buf(),
+            source: e,
+        })?;
         Ok(Self { _file: file })
     }
 }

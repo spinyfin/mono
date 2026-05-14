@@ -68,7 +68,7 @@ pub fn load_config() -> Result<CubeConfig, CubeError> {
     if !path.exists() {
         return Ok(CubeConfig::default());
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(&path).map_err(CubeError::Io)?;
     toml::from_str(&content).map_err(|e| {
         CubeError::InvalidArgument(format!(
             "failed to parse cube config at {}: {e}",

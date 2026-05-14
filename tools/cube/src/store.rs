@@ -83,7 +83,10 @@ impl Store {
     pub fn open_at(path: impl AsRef<Path>) -> Result<Self, CubeError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|e| CubeError::StateDbIo {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
 
         let connection = Connection::open(path).map_err(CubeError::Storage)?;
