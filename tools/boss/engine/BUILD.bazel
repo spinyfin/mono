@@ -87,6 +87,13 @@ rust_test(
     crate = ":engine_lib",
     edition = "2024",
     size = "small",
+    env = {
+        # coordinator tests call cube_default_workspace_root_for_test() and
+        # workspace_root_is_cube_default(), both of which require HOME or a
+        # cube data-dir env var. The sandbox may strip HOME; set CUBE_DATA_DIR
+        # to a fixed path so both helpers agree on the same workspace root.
+        "CUBE_DATA_DIR": "/tmp/boss-engine-test-cube",
+    },
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

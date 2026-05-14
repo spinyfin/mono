@@ -1094,6 +1094,18 @@ mod tests {
             }
         };
 
+        // mark_conflict_resolution_succeeded requires status = 'running'.
+        // Simulate the coordinator transitioning the attempt to running before
+        // calling on_resolved (on_conflict_detected leaves it 'pending').
+        db.mark_conflict_resolution_running(
+            &started_attempt_id,
+            "test-lease",
+            "ws-test",
+            "worker-test",
+        )
+        .unwrap()
+        .expect("attempt must transition to running");
+
         let cube = Arc::new(RecordingCubeClient::default());
         on_resolved(
             &db,

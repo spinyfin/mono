@@ -7860,7 +7860,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let project = db
@@ -7924,7 +7924,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let project = db
@@ -8000,7 +8000,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
 
@@ -8727,21 +8727,20 @@ mod tests {
                 no_design_task: false,
             })
             .unwrap();
-        let task = db
-            .create_task(CreateTaskInput {
-                product_id: product.id.clone(),
-                project_id: project.id.clone(),
-                name: "First".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
-            .unwrap();
+        // Neither product nor task has a repo — enforce_task_repo_invariant now
+        // blocks this at the API layer. Insert via raw SQL to represent a
+        // pre-existing legacy row that the reconciler must handle gracefully.
+        let task_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+                 VALUES (?1, ?2, ?3, 'project_task', 'First', '', 'todo', 1, NULL, NULL, ?4, ?4, 1, 'medium', 'test')",
+                params![id, product.id, project.id, now],
+            ).unwrap();
+            id
+        };
 
         // Mark the auto-created design task done so the user's task
         // is the first incomplete and would be `ready` once the repo
@@ -8769,7 +8768,7 @@ mod tests {
         // exactly one execution.
         assert_eq!(second_pass.created.len(), 1);
 
-        let task_execution = db.list_executions(Some(&task.id)).unwrap();
+        let task_execution = db.list_executions(Some(&task_id)).unwrap();
         assert_eq!(task_execution.len(), 1);
         assert_eq!(task_execution[0].status, "ready");
 
@@ -8785,11 +8784,14 @@ mod tests {
         let path = temp_db_path("reconcile-chore-override");
         let db = WorkDb::open(path.clone()).unwrap();
 
+        // Product has no default repo; chore supplies its own override URL.
+        // (enforce_task_repo_invariant blocks setting a per-chore override when
+        // the product already has a repo — the two-URL scenario is no longer valid.)
         let product = db
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
                 description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                repo_remote_url: None,
             })
             .unwrap();
         let chore = db
@@ -8846,20 +8848,20 @@ mod tests {
                 repo_remote_url: None,
             })
             .unwrap();
-        let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Orphan".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
-            .unwrap();
+        // Neither product nor chore has a repo — enforce_task_repo_invariant now
+        // blocks this at the API layer. Insert via raw SQL to represent a
+        // pre-existing legacy row that the reconciler must handle gracefully.
+        let chore_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+                 VALUES (?1, ?2, NULL, 'chore', 'Orphan', '', 'todo', NULL, NULL, NULL, ?3, ?3, 1, 'medium', 'test')",
+                params![id, product.id, now],
+            ).unwrap();
+            id
+        };
 
         let first_pass = db.reconcile_product_executions(&product.id).unwrap();
         assert!(first_pass.created.is_empty(), "no execution row when repo unresolved");
@@ -8868,20 +8870,20 @@ mod tests {
             "the failure is sticky-via-attention, not via a phantom execution row",
         );
 
-        let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
         assert_eq!(items.len(), 1, "one sticky attention item per work item");
         let item = &items[0];
         assert_eq!(item.kind, "repo_unresolved");
         assert_eq!(item.status, "open");
         assert_eq!(item.execution_id, None);
-        assert_eq!(item.work_item_id.as_deref(), Some(chore.id.as_str()));
+        assert_eq!(item.work_item_id.as_deref(), Some(chore_id.as_str()));
         assert!(
             item.body_markdown.contains("boss chore update --repo <url>"),
             "body should tell the user how to fix it (got `{}`)",
             item.body_markdown,
         );
         assert!(
-            item.body_markdown.contains(&chore.id),
+            item.body_markdown.contains(&chore_id),
             "body should name the work item (got `{}`)",
             item.body_markdown,
         );
@@ -8891,7 +8893,7 @@ mod tests {
         assert!(second_pass.created.is_empty());
         assert!(second_pass.updated.is_empty());
         assert_eq!(
-            db.list_attention_items_for_work_item(&chore.id)
+            db.list_attention_items_for_work_item(&chore_id)
                 .unwrap()
                 .len(),
             1,
@@ -8918,25 +8920,25 @@ mod tests {
                 repo_remote_url: None,
             })
             .unwrap();
-        let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Orphan".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
-            .unwrap();
+        // Neither product nor chore has a repo — enforce_task_repo_invariant now
+        // blocks this at the API layer. Insert via raw SQL to represent a
+        // pre-existing legacy row that the reconciler must handle gracefully.
+        let chore_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+                 VALUES (?1, ?2, NULL, 'chore', 'Orphan', '', 'todo', NULL, NULL, NULL, ?3, ?3, 1, 'medium', 'test')",
+                params![id, product.id, now],
+            ).unwrap();
+            id
+        };
 
         let err = db
             .request_execution_with_live_check(
                 RequestExecutionInput {
-                    work_item_id: chore.id.clone(),
+                    work_item_id: chore_id.clone(),
                     priority: None,
                     preferred_workspace_id: None,
                     force: false,
@@ -8958,7 +8960,7 @@ mod tests {
             "the refused request must not leave an execution row behind",
         );
 
-        let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
         assert_eq!(items.len(), 1, "the kanban surface mirrors the CLI error");
         assert_eq!(items[0].kind, "repo_unresolved");
 
@@ -8975,6 +8977,8 @@ mod tests {
         let path = temp_db_path("reconcile-repair-override");
         let db = WorkDb::open(path.clone()).unwrap();
 
+        // Product has no default repo — the chore provides its own override.
+        // (enforce_task_repo_invariant rejects setting both simultaneously.)
         let product = db
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
@@ -8982,32 +8986,32 @@ mod tests {
                 repo_remote_url: None,
             })
             .unwrap();
-        let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Orphan".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
-            .unwrap();
+        // Neither product nor chore has a repo — enforce_task_repo_invariant now
+        // blocks this at the API layer. Insert via raw SQL to represent a
+        // pre-existing legacy row that the reconciler must handle gracefully.
+        let chore_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+                 VALUES (?1, ?2, NULL, 'chore', 'Orphan', '', 'todo', NULL, NULL, NULL, ?3, ?3, 1, 'medium', 'test')",
+                params![id, product.id, now],
+            ).unwrap();
+            id
+        };
 
         let first_pass = db.reconcile_product_executions(&product.id).unwrap();
         assert!(first_pass.created.is_empty());
         assert_eq!(
-            db.list_attention_items_for_work_item(&chore.id)
+            db.list_attention_items_for_work_item(&chore_id)
                 .unwrap()
                 .len(),
             1,
         );
 
         db.update_work_item(
-            &chore.id,
+            &chore_id,
             WorkItemPatch {
                 repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
                 effort_level: None,
@@ -9018,7 +9022,7 @@ mod tests {
         .unwrap();
         let second_pass = db.reconcile_product_executions(&product.id).unwrap();
         assert_eq!(second_pass.created.len(), 1);
-        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        let executions = db.list_executions(Some(&chore_id)).unwrap();
         assert_eq!(executions.len(), 1);
         assert_eq!(
             executions[0].repo_remote_url,
@@ -11506,14 +11510,15 @@ mod tests {
 
     #[test]
     fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
-        let path = temp_db_path("ts-migrate");
+        // disk_db_path required: re-opens the DB to trigger migration.
+        let path = disk_db_path("ts-migrate");
         let db = WorkDb::open(path.clone()).unwrap();
 
         let product = db
             .create_product(CreateProductInput {
                 name: "Boss".to_owned(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let chore = db
@@ -12586,13 +12591,18 @@ mod tests {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE tasks SET last_status_actor = 'human' WHERE id = ?1",
+                // Clear blocked_reason so the cascade guard falls through to the
+                // actor check (None => actor == "engine"). With blocked_reason =
+                // 'dependency' still set, the new guard unconditionally unblocks
+                // regardless of actor — nulling it out simulates the "stale block"
+                // scenario where a human edit already cleared the reason.
+                "UPDATE tasks SET last_status_actor = 'human', blocked_reason = NULL WHERE id = ?1",
                 [&dependent.id],
             )
             .unwrap();
 
         // Complete the prereq. The cascade fires but skips dependent
-        // because last_status_actor='human'.
+        // because last_status_actor='human' (and blocked_reason is NULL).
         db.update_work_item(
             &prereq.id,
             WorkItemPatch {
@@ -12603,10 +12613,12 @@ mod tests {
         .unwrap();
 
         // Verify the dependent is still stuck (cascade was skipped).
+        // blocked_reason is NULL because we cleared it above to simulate
+        // the stale-block scenario.
         let still_stuck = db.get_work_item(&dependent.id).unwrap();
         let WorkItem::Chore(stuck) = still_stuck else { panic!() };
         assert_eq!(stuck.status, "blocked", "cascade skipped — still stuck");
-        assert_eq!(stuck.blocked_reason.as_deref(), Some("dependency"));
+        assert_eq!(stuck.blocked_reason, None);
 
         // RequestExecution (the user-override path) must succeed and
         // clear the stale block.
@@ -12762,7 +12774,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "P".to_owned(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
 
@@ -13571,7 +13583,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let chore = db
@@ -14780,7 +14792,11 @@ mod tests {
     fn concurrent_writes_do_not_return_database_locked() {
         const WORKERS: usize = 8;
 
-        let path = temp_db_path("concurrent-writes");
+        // disk_db_path required: in-memory SQLite with shared-cache does not
+        // support WAL mode, so concurrent writers get SQLITE_LOCKED_SHAREDCACHE
+        // (which busy_timeout does not retry). A real file-backed database uses
+        // WAL + BEGIN IMMEDIATE so the second writer waits in the busy handler.
+        let path = disk_db_path("concurrent-writes");
         let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
 
         let product = db
@@ -15057,7 +15073,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -15091,7 +15107,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let chore = db
@@ -15292,13 +15308,14 @@ mod tests {
     /// pre-v7 schema from scratch.
     #[test]
     fn migration_re_adds_effort_and_model_columns_on_upgrade() {
-        let path = temp_db_path("effort-upgrade");
+        // disk_db_path required: drops columns and re-opens the DB to trigger migration.
+        let path = disk_db_path("effort-upgrade");
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let chore = db
@@ -15391,7 +15408,8 @@ mod tests {
     /// expected to honour.
     #[test]
     fn migration_leaves_existing_rows_with_null_effort_and_model() {
-        let path = temp_db_path("effort-migrate");
+        // disk_db_path required: re-opens the DB to trigger migration.
+        let path = disk_db_path("effort-migrate");
 
         // Stand up a "pre-migration" DB by hand-rolling rows with the
         // older column set, then re-open via `WorkDb::open` so the
@@ -15403,7 +15421,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:test/repo.git".into()),
             })
             .unwrap();
         let chore = db
@@ -15466,7 +15484,8 @@ mod tests {
     /// left unchanged.
     #[test]
     fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_divergent() {
-        let path = temp_db_path("migration-null-redundant-repos");
+        // disk_db_path required: the test re-opens the DB to trigger the migration.
+        let path = disk_db_path("migration-null-redundant-repos");
         let db = WorkDb::open(path.clone()).unwrap();
         let conn = db.connect().unwrap();
 
@@ -15561,7 +15580,9 @@ mod tests {
     /// gap-free ids starting at 1.
     #[test]
     fn allocator_concurrent_inserts_produce_distinct_short_ids() {
-        let path = temp_db_path("short-id-concurrent");
+        // disk_db_path required: same shared-cache WAL limitation as
+        // concurrent_writes_do_not_return_database_locked above.
+        let path = disk_db_path("short-id-concurrent");
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {
@@ -15627,7 +15648,9 @@ mod tests {
         assert_eq!(next, N as i64 + 1);
 
         drop(conn);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     /// Two products run independent sequences: each starts at 1, and
