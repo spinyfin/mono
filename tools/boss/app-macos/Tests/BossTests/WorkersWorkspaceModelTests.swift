@@ -187,3 +187,77 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+final class WorkersWorkspaceModelReleaseTests: XCTestCase {
+    private func makeSpawn(slot: Int) -> EngineSpawnRequest {
+        EngineSpawnRequest(
+            runId: "run-release-\(slot)",
+            workspacePath: "/tmp/ws",
+            slotId: slot,
+            initialInput: "claude\n",
+            env: [],
+            summary: nil
+        )
+    }
+
+    func testReleaseUnknownSlotReturnsUnknownSlot() {
+        // Engine asked the app to release slot 99 but the workers
+        // grid is 1...8 — there's nothing to release. Mirrors the
+        // `sendToPane` / `focusWorkerPane` shape so the engine's
+        // failure-handling stays uniform across pane verbs.
+        let model = WorkersWorkspaceModel()
+        let result = model.releaseWorkerPane(slotId: 99, killGraceSeconds: 0)
+        guard case .failure(.unknownSlot) = result else {
+            XCTFail("expected .unknownSlot for slot outside 1...8, got \(result)")
+            return
+        }
+    }
+
+    func testReleaseIdleSlotReturnsUnknownSlot() {
+        // An allocated slot with no session is the same class of
+        // failure as a nonexistent one — there's no live pty to
+        // reap. The engine relies on this to make
+        // `release_worker_pane` idempotent across the redundant
+        // chore-done / completion-detection / `bossctl agents stop`
+        // paths.
+        let model = WorkersWorkspaceModel()
+        let result = model.releaseWorkerPane(slotId: 1, killGraceSeconds: 5)
+        guard case .failure(.unknownSlot) = result else {
+            XCTFail("expected .unknownSlot for idle slot, got \(result)")
+            return
+        }
+    }
+
+    func testReleaseLiveSlotClearsSessionAndSucceeds() {
+        // After a real spawn the slot hosts a session. Releasing the
+        // slot must (a) return `.success` synchronously (the engine's
+        // 5s timeout fires otherwise) and (b) drop the session,
+        // runId, and summary fields so the kanban / pane titlebar
+        // stop showing the worker as attached. The kill-ladder side
+        // effects are covered by `WorkerProcessKillerTests`; here we
+        // only assert the slot-state half so a regression on the
+        // session-clearing wouldn't masquerade as success.
+        let model = WorkersWorkspaceModel()
+        let spawn = model.spawnWorkerPane(makeSpawn(slot: 4))
+        guard case .success = spawn else {
+            XCTFail("spawn precondition failed: \(spawn)")
+            return
+        }
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 4 })?.session)
+
+        let result = model.releaseWorkerPane(slotId: 4, killGraceSeconds: 0)
+        guard case .success = result else {
+            XCTFail("expected .success releasing a live slot, got \(result)")
+            return
+        }
+        XCTAssertNil(
+            model.slots.first(where: { $0.slotId == 4 })?.session,
+            "session must be cleared so SwiftUI tears down the libghostty surface"
+        )
+        XCTAssertNil(
+            model.slots.first(where: { $0.slotId == 4 })?.runId,
+            "runId must be cleared so the kanban stops attributing the slot to the run"
+        )
+    }
+}
