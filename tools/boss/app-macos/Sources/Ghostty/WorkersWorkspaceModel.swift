@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import GhosttyKit
 
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
@@ -64,16 +65,44 @@ final class WorkersWorkspaceModel: ObservableObject {
         return .success(slotId: slotId, shellPid: 0)
     }
 
-    /// Release a previously allocated slot. Currently just clears the
-    /// session reference so SwiftUI tears down the surface; real
-    /// kill-grace handling lands as a follow-up.
+    /// Release a previously allocated slot.
+    ///
+    /// Niling the session lets SwiftUI dismantle the libghostty surface
+    /// via `GhosttyTerminalHostView.deinit` — which clears focus and
+    /// calls `ghostty_surface_free`, freeing the PTY, scrollback and
+    /// GPU resources. That alone is insufficient to reap the worker:
+    /// `claude` runs as a descendant of the pty's foreground process
+    /// group, and closing the master fd only delivers `SIGHUP`, which
+    /// node-based processes commonly ignore.
+    ///
+    /// Incident 001 (cross-workspace PR-detection killed running
+    /// workers) revealed that the engine considered the worker dead as
+    /// soon as the IPC came back successful, but the `claude` process
+    /// kept running invisibly against the workspace. Here we (a)
+    /// snapshot the foreground pid from the surface *before* we nil the
+    /// session so SwiftUI's teardown can't race us, and (b) escalate
+    /// SIGTERM → SIGKILL through [`WorkerProcessKiller`] on the worker's
+    /// process group, matching the engine-side `signal_shell_pids`
+    /// shape (engine.app.shutdown_workers uses the same ladder for the
+    /// shutdown-path fallback).
+    ///
+    /// The SIGTERM is fired synchronously before this method returns
+    /// — so by the time the engine sees `Ok(ReleaseWorkerPaneResult)`,
+    /// the worker has at minimum been asked to exit. The SIGKILL
+    /// escalation runs on a detached task so we don't block the IPC
+    /// dispatcher's main-actor turn for `killGraceSeconds` (5s by
+    /// default, which would itself blow the engine's 5s round-trip
+    /// budget).
     func releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32) -> EngineReleaseResult {
         guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
-        guard slots[index].session != nil else {
+        guard let session = slots[index].session else {
             return .failure(.unknownSlot)
         }
+
+        let foregroundPid = foregroundPid(for: session)
+
         slots[index].session = nil
         slots[index].runId = nil
         slots[index].summary = nil
@@ -81,7 +110,34 @@ final class WorkersWorkspaceModel: ObservableObject {
         // slot don't show the same line — fresh recreation each time
         // the crew member clocks out.
         slots[index].idleFlavorCycle &+= 1
+
+        if let pid = foregroundPid {
+            Task.detached(priority: .userInitiated) {
+                await WorkerProcessKiller.killForegroundProcessTree(
+                    pid: pid,
+                    graceSeconds: killGraceSeconds
+                )
+            }
+        }
         return .success
+    }
+
+    /// Resolve the foreground pid of the pty hosting `session`, or
+    /// `nil` if the session never reached the point of having one
+    /// (surface not yet attached, or the child already exited). Reads
+    /// `ghostty_surface_foreground_pid`, which returns whatever pid is
+    /// currently the foreground process group leader on the controlling
+    /// tty — typically `claude` while a turn is in flight, or the shell
+    /// between turns. Signalling that pid's process group reaches every
+    /// descendant `claude` spawned, which is the killing radius we
+    /// want.
+    private func foregroundPid(for session: TerminalPaneSession) -> pid_t? {
+        guard let host = session.hostView, let surface = host.surface else {
+            return nil
+        }
+        let raw = ghostty_surface_foreground_pid(surface)
+        guard raw > 0, raw <= UInt64(pid_t.max) else { return nil }
+        return pid_t(raw)
     }
 
     /// Type text into the slot's libghostty surface and submit it as
