@@ -71,3 +71,14 @@ use_repo(
     "swift_package",
     "swiftpkg_textual",
 )
+
+# Prebuilt GhosttyKit.xcframework for the Bazel installer.
+# Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "ghostty_kit",
+    urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-b0f827665/GhosttyKit-b0f827665.tar.gz"],
+    sha256 = "210c6914395c2222b76857cd63853916313a5c4a10964b934e38f84b8cf64a06",
+    build_file = "//tools/boss/app-macos:ghosttykit.BUILD",
+)

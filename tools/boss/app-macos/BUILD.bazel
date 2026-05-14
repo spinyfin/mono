@@ -6,23 +6,20 @@ package(default_visibility = ["//visibility:private"])
 exports_files([
     "Package.resolved",
     "Package.swift",
+    "ghosttykit.BUILD",
 ])
 
 swift_library(
     name = "boss_mac_app_lib",
     module_name = "Boss",
-    # Single-level glob: Sources/Ghostty/*.swift is intentionally excluded
-    # from the Bazel build. Those files require GhosttyKit.xcframework, which
-    # is built out-of-band by scripts/bootstrap-ghosttykit.sh and only wired
-    # through SwiftPM. The Workers mode in ContentView is gated on
-    # `canImport(GhosttyKit)` and shows a placeholder under Bazel.
-    srcs = glob(["Sources/*.swift"]),
+    srcs = glob(["Sources/**/*.swift"]),
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
         "-DTEXTUAL_ENABLE_TEXT_SELECTION",
     ],
     deps = [
+        "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],
 )
