@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Builds GhosttyKit.xcframework from source for SwiftPM dev builds (swift run Boss).
+#
+# NOTE — Bazel installer builds do NOT need this script.
+# The Bazel build fetches a prebuilt xcframework via http_archive (MODULE.bazel).
+# Only run this script when iterating locally with SwiftPM or when cutting a new
+# prebuilt release. See tools/boss/docs/runbooks/update-ghostty-prebuilt.md.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
