@@ -362,7 +362,15 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         std::fs::write(&prompt_path, &prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
-        let initial_input = spawn_config.claude_invocation();
+        // Scrub ANTHROPIC_API_KEY from the worker shell's environment before
+        // invoking claude. The engine needs the var in its own process for
+        // pane-summary LLM calls; workers must authenticate via OAuth
+        // credentials (~/.claude/.credentials.json) and inherit nothing.
+        // Without this unset, a user who sets ANTHROPIC_API_KEY in their
+        // shell profile (or via `launchctl setenv`) causes every worker
+        // spawn to show: "Auth conflict: Using ANTHROPIC_API_KEY instead of
+        // Anthropic Console key."
+        let initial_input = format!("unset ANTHROPIC_API_KEY; {}", spawn_config.claude_invocation());
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and
@@ -1344,8 +1352,8 @@ mod pane_spawn_tests {
             input.initial_input
         );
         assert!(
-            input.initial_input.starts_with("claude"),
-            "expected initial_input to invoke claude, got: {:?}",
+            input.initial_input.starts_with("unset ANTHROPIC_API_KEY; claude"),
+            "expected initial_input to unset ANTHROPIC_API_KEY and invoke claude, got: {:?}",
             input.initial_input
         );
     }

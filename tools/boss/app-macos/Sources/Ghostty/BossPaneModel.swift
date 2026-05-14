@@ -15,10 +15,17 @@ final class BossPaneModel: ObservableObject {
     init() {
         self.runtime = GhosttyRuntime.shared
         let workingDirectory = Self.ensureBossWorkingDirectory()
+        // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
+        // session authenticates via OAuth (~/.claude/.credentials.json)
+        // rather than the engine's API key. The macOS app process still
+        // holds ANTHROPIC_API_KEY for engine-side LLM calls (pane
+        // summaries, etc.); the shell child must not inherit it or
+        // Claude Code shows "Auth conflict: Using ANTHROPIC_API_KEY
+        // instead of Anthropic Console key."
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: workingDirectory,
-            initialInput: "claude\n"
+            initialInput: "unset ANTHROPIC_API_KEY; claude\n"
         )
         self.session = TerminalPaneSession(
             id: "boss",
