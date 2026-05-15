@@ -6,6 +6,6 @@ set -euo pipefail
 echo "--- [bazel-build] starting"
 echo "[bazel-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel build //... --config=ci
+bazel build //...
 
 echo "[bazel-build] ok"

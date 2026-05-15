@@ -42,7 +42,7 @@ Ensures the agent has the required toolchain:
 - Rust: installs / pins via `rust-toolchain.toml` using `rustup`.
 - Bazel: `bazelisk` should be on `$PATH`; version is read from `.bazelversion`.
 - pnpm: installs if not present, pins to the version in `package.json#packageManager`.
-- Restores the agent-local bazel disk cache (`/var/cache/bazel-mono`, configured in `.bazelrc.ci`).
+- Restores the agent-local bazel disk cache (uses `~/.cache/bazelcache` from `.bazelrc`).
 
 ### `cargo-check.sh`
 
@@ -80,11 +80,9 @@ Each `steps/*.sh` script can be run directly from the repo root (no buildkite-sp
 # Run a specific step locally
 bash .buildkite/steps/cargo-check.sh
 
-# Reproduce bazel step with CI config
-bazel test //... --config=ci
+# Reproduce bazel step locally
+bazel test //...
 ```
-
-For bazel steps, the CI config is in `.bazelrc.ci` (added when real bazel steps are wired in #3).
 
 ## Required checks (branch protection)
 
@@ -99,4 +97,4 @@ The check names buildkite will report (once the pipeline is wired to the buildki
 
 ## Status
 
-Task #3 (static checks) is complete. `cargo-check.sh`, `bazel-build.sh`, `pnpm-typecheck.sh`, and `checks.sh` now run real invocations. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`). `bazel-test.sh` and `pnpm-test.sh` remain placeholders; they are wired in task #4 (test steps).
+Task #3 (static checks) is complete. `cargo-check.sh`, `bazel-build.sh`, `pnpm-typecheck.sh`, and `checks.sh` now run real invocations. `bazel-build.sh` and `bazel-test.sh` use the default disk cache path (`~/.cache/bazelcache` from `.bazelrc`). `pnpm-test.sh` remains advisory; it is wired in task #4 (test steps).
