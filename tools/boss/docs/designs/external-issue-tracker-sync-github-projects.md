@@ -10,12 +10,25 @@ Boss as a chore, or a Boss task is marked `done` while the upstream issue
 stays open. This is the "two pieces of paper" problem.
 
 This design proposes a one-way ingestion layer that pulls upstream tracker
-state into Boss's existing taxonomy. The initial backend is
-**GitHub Projects + Issues** (against `spinyfin/mono`'s "Boss" project). The
-seam is an internal `ExternalTracker` trait so that a Jira or Linear
-implementation can land later without re-architecting the engine's reconciler.
-Sync is **product-scoped**: every product can be bound to at most one upstream
+state into Boss's existing taxonomy, plus a **narrow but mandatory write
+surface**: Boss explicitly closes the upstream issue when a linked PR
+merges. The initial backend is **GitHub Projects + Issues** (against
+`spinyfin/mono`'s "Boss" project). The seam is an internal
+`ExternalTracker` trait — with a required `close_issue` capability
+alongside the read-side methods — so that a Jira or Linear implementation
+can land later without re-architecting the engine's reconciler. Sync is
+**product-scoped**: every product can be bound to at most one upstream
 tracker, and every work item under that product inherits the binding.
+
+**Boss does not rely on GitHub's `Fixes #N` / `Closes #N` auto-close
+behavior** to close upstream issues on PR-merge. That behavior only fires
+when the PR body contains the right keyword and references the right issue
+number, which Boss cannot rely on for every PR — human-authored PRs may
+omit the footer, and worker-authored PRs may reference a different
+identifier (a Boss work-item id, an exec id, a draft scratch description).
+The reconciler therefore issues the close API call itself; the upstream
+auto-close (when it does fire) is just a redundant backstop that the
+idempotent close path tolerates.
 
 The artefact this design produces is the doc itself plus a list of follow-up
 implementation chores. No code is written here.
@@ -25,8 +38,9 @@ implementation chores. No code is written here.
 ## Goals
 
 - A single source of truth for the *existence* and *status* of a Boss work
-  item that has an upstream issue: the upstream issue. Boss reads, Boss does
-  not duplicate-write.
+  item that has an upstream issue: the upstream issue. Boss reads the
+  source state; Boss owns one narrow write surface (closing the upstream
+  issue) and explicitly avoids all other duplicate writes.
 - A product-level binding so all work items under a product share the same
   upstream surface. No per-task wiring.
 - A stable internal pointer (`work_item.external_ref`) that survives renames,
@@ -39,11 +53,17 @@ implementation chores. No code is written here.
   in GitHub doesn't have to mirror-type it.
 - Auto-close-mirror: when the upstream issue closes, the Boss work item moves
   to `done` (or `archived` for `not planned` closures).
-- Automatic PR association: when a PR mentions an upstream issue
-  (`Fixes #N` / `Closes #N`), and that issue is bound to a Boss work item, the
-  PR URL lands on the Boss row's `pr_url` column.
+- Automatic PR association: when a PR is linked to an upstream issue
+  (whether via the GitHub `Fixes #N` footer, via the existing Boss
+  `pr_url_capture` pipeline, or via manual link), the PR URL lands on the
+  Boss row's `pr_url` column.
+- **Explicit close-on-PR-merge:** when a PR linked to a Boss work item
+  merges, Boss moves the work item to `done` *and* explicitly closes the
+  upstream issue via the tracker's `close_issue` capability. Boss does not
+  delegate the upstream close to GitHub's `Fixes #N` auto-close behavior.
 - An `ExternalTracker` trait surface narrow enough that the engine's
-  reconciler loop has no GitHub-specific code paths.
+  reconciler loop has no GitHub-specific code paths, but rich enough to
+  include the required `close_issue` write-back affordance.
 
 ## Non-Goals
 
@@ -52,9 +72,17 @@ implementation chores. No code is written here.
   upstream issue is the description on the Boss row at *create* time; later
   edits do not re-sync.
 - **Boss → upstream creation.** A Boss chore created locally does *not* spawn
-  an upstream GitHub issue. v1 is one-way (upstream → Boss) with one narrow
-  exception: reverse-close (closing the upstream issue when its Boss work item
-  finishes), gated behind a product-config flag and disabled by default.
+  an upstream GitHub issue. v1 ingestion is one-way for *content*
+  (titles, bodies, descriptions). There are two writeback paths, both
+  narrow:
+  - **Close-on-PR-merge** (Behavior 5): always on for any bound product.
+    When the linked PR merges, Boss closes the upstream issue.
+  - **Reverse-close** (Behavior 3): opt-in via `reverse_close` flag.
+    When a Boss work item is marked `done` *without* a merged PR driving
+    the transition, Boss closes the upstream issue.
+
+  Both paths route through the same `ExternalTracker::close_issue`
+  capability; the difference is what triggers them.
 - **Multiple trackers per product.** One product → one tracker. A monorepo
   spanning two tracking surfaces (say, an open-source repo + an internal
   Jira) gets modelled as two products.
@@ -214,7 +242,10 @@ shape is validated against a kind-specific schema at write time:
   "repo": "mono",
   "project_number": 1,
   "label_filter": null,          // optional: array of labels; null = all
-  "status_field_mapping": null   // optional: map of project status → boss status
+  "status_field_mapping": null,  // optional: map of project status → boss status
+  "reverse_close": false         // optional: opt-in for Behavior 3.
+                                  // Behavior 5 (PR-merge close) is always on
+                                  // and is not a config flag.
 }
 ```
 
@@ -247,10 +278,30 @@ pub trait ExternalTracker: Send + Sync {
     /// reconciler probes a single known issue rather than the whole list).
     async fn fetch_item(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<Option<UpstreamItem>>;
 
-    /// Optional write-back: close an upstream issue. Returns `Unsupported`
-    /// for trackers that don't implement this (or have it disabled by
-    /// config). Called only when reverse-close is gated on for the product.
-    async fn close_item(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()>;
+    /// Write-back: close an upstream issue. Required for any tracker that
+    /// participates in Boss's standard work-lifecycle (i.e. all trackers
+    /// ship-ready in v1+). The reconciler calls this in two situations:
+    ///
+    /// 1. **PR-merge propagation (Behavior 5, always on):** the linked PR
+    ///    has merged. Boss flips the work item to `done` and calls
+    ///    `close_issue` so the upstream issue closes deterministically,
+    ///    without depending on the PR body containing a `Fixes #N`
+    ///    footer.
+    /// 2. **Reverse-close (Behavior 3, opt-in):** the user flipped a Boss
+    ///    work item to `done` independent of any PR. Only called when the
+    ///    product's `reverse_close` config flag is set.
+    ///
+    /// **Idempotency contract.** Implementations MUST treat closing an
+    /// already-closed issue as success (no-op). Implementations MUST
+    /// classify errors so the reconciler can decide retry vs. surface:
+    /// `Transient` (network, 5xx, rate-limit) → reconciler retries with
+    /// backoff on subsequent ticks; `PermissionDenied` (403) → surface
+    /// attention item, do not retry; `NotFound` (404) → treat as
+    /// equivalent to already-closed.
+    ///
+    /// `Unsupported` is reserved for read-only trackers (none ship in v1;
+    /// see "Why not a read-only variant of the trait" below).
+    async fn close_issue(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()>;
 }
 
 pub struct TrackerContext {
@@ -315,11 +366,31 @@ cheap to schedule async. The trait does not constrain the impl to use HTTP
 directly — the v1 `GitHubTracker` shells out to `gh` (Q3), but a future Jira
 impl could use `reqwest`.
 
+### Why not a read-only variant of the trait
+
+Splitting `ExternalTracker` into `ReadOnlyTracker` and `WritableTracker`
+sub-traits is tempting — it would let v1 ship the GitHub impl and a future
+"read-only Linear viewer" without forcing the latter to implement
+`close_issue`. Rejected for two reasons:
+
+1. Boss's lifecycle assumes close-on-PR-merge (Behavior 5) works. A
+   read-only tracker would break that contract: the work item flips to
+   `done` but the upstream issue stays open. That's the exact "two pieces
+   of paper" failure mode this design exists to prevent.
+2. The two real candidate backends after GitHub (Jira, Linear) both
+   support issue-close via API. There is no concrete "read-only tracker"
+   use case to design for; YAGNI.
+
+If a read-only need ever materialises, the trait can grow a
+`fn supports_close(&self) -> bool` predicate and the reconciler can
+fall back to "Boss-side only" close behavior — without rearchitecting.
+
 ### Recommendation
 
-The trait above. One file (`engine/src/external_tracker/mod.rs`); the
-GitHub impl lives at `engine/src/external_tracker/github.rs`. No
-GitHub-specific types leak into the reconciler.
+The trait above, with `close_issue` as a required method. One file
+(`engine/src/external_tracker/mod.rs`); the GitHub impl lives at
+`engine/src/external_tracker/github.rs`. No GitHub-specific types leak
+into the reconciler.
 
 ---
 
@@ -376,6 +447,13 @@ gh api graphql -F org=spinyfin -F number=1 -f query='
 
 # Fetch one issue (for single-item probes):
 gh api repos/spinyfin/mono/issues/560
+
+# Close one issue (Behavior 5 close-on-merge, or reverse-close).
+# Uses REST PATCH. `state_reason` distinguishes "completed" vs
+# "not planned"; defaults to "completed" for both Behavior 5 and the
+# reverse-close happy path.
+gh api -X PATCH repos/spinyfin/mono/issues/560 \
+  -f state=closed -f state_reason=completed
 ```
 
 `closedByPullRequestsReferences` is GitHub's first-class field for "PRs that
@@ -397,6 +475,13 @@ cadence per product, this is well under budget for ~10 products. The impl
 records the `X-RateLimit-Remaining` header that `gh` exposes and trips an
 exponential backoff if it drops below a threshold (say 100 remaining).
 
+The REST `close_issue` write goes against a *separate* rate limit (5000
+core/hour for users), so it does not contend with GraphQL reads. Each
+close is one REST request. The per-tick close budget (Q5,
+"Close-write transactionality") caps closes at 20/tick by default; at the
+default 120s cadence that's 600 closes/hour worst-case, well under
+budget.
+
 ### Failure modes
 
 - **Network failure / `gh` unavailable.** Return `Err(TrackerError::Transient)`.
@@ -406,6 +491,18 @@ exponential backoff if it drops below a threshold (say 100 remaining).
   as an attention item on the product: *"External tracker binding points
   at `spinyfin/mono` project #1 which does not exist or is not visible."*
 - **Auth failure.** `Err(TrackerError::Auth)`. Same attention-item shape.
+- **`close_issue` 404.** The issue was deleted or moved before Boss got
+  to close it. Treat as success (Behavior 12 / Q12 picks up the
+  disappearance on the next read-side reconcile).
+- **`close_issue` 403 (permission denied).** Credential lacks
+  `issues:write`. Surface as an attention item; do not retry. The Boss
+  work item still flips to `done` (Boss owns its own status); the upstream
+  stays open until a human with write permission closes it or fixes the
+  credential. Emit `external_tracker.close_failed{reason=permission}`.
+- **`close_issue` transient (5xx, 429).** Reconciler does not roll back
+  Boss-side state. The Boss work item is `done`; the upstream issue close
+  is retried on subsequent ticks until it succeeds or the issue is
+  observed already-closed. See "Close-write transactionality" in Q5.
 
 ### Recommendation
 
@@ -549,13 +646,58 @@ For each product with `external_tracker_kind IS NOT NULL`:
     b. `list_external_refs_for_product(product_id)` → existing bindings.
     c. For each upstream item:
        - If `find_by_external_ref(kind, canonical_id)` returns `Some(row)`:
-         **reconcile_existing** (Q6).
+         **reconcile_existing** (Q6). This includes the close-on-merge
+         decision: if the Boss row's associated PR has merged and the
+         upstream is still `Open`, queue a `close_issue` call for after
+         the transaction commits (Behavior 5).
        - Else: **import_new** (Q7).
     d. For each existing binding whose canonical_id is *not* in the fetched
        map: it's been removed from the project upstream. Apply
        **handle_removed_upstream** (Q12).
-4. Commit. Emit per-tick metrics
-   (`external_tracker.imported`, `.closed`, `.pr_attached`, etc.).
+    e. If reverse-close is enabled, for each work item flipped to `done`
+       since its `external_ref_synced_at` whose upstream is still `Open`,
+       queue a `close_issue` call (Behavior 3).
+4. Commit the SQL transaction. Boss-side state is now correct.
+5. **Issue the queued `close_issue` calls** to the upstream tracker, *after*
+   the SQL commit. Each call is independent; failures on one do not roll
+   back others. See "Close-write transactionality" below.
+6. Emit per-tick metrics (`external_tracker.imported`, `.closed`,
+   `.pr_attached`, `.pr_merge_close_succeeded`,
+   `.pr_merge_close_failed`, etc.).
+
+### Close-write transactionality
+
+The reconcile pass deliberately commits Boss-side state *before* issuing
+the upstream `close_issue` calls. This is the right ordering for three
+reasons:
+
+1. **Boss owns Boss's status.** A merged PR is sufficient evidence that
+   the Boss work item is `done`, regardless of whether the upstream API
+   call succeeds. We don't want a flaky GitHub 502 to leave the Boss row
+   in `in_review` when the work is plainly finished locally.
+2. **The close call is idempotent and retried.** If the call fails
+   transiently, the next reconcile tick observes the upstream issue still
+   `Open` while the Boss row is `done`, and the close gets re-queued. The
+   retry cadence matches the reconcile cadence (default 120s); no
+   separate backoff scheduler is needed.
+3. **Behavior 2 (close-mirror) is the redundant backstop.** If `gh` /
+   GitHub's auto-close fires anyway (PR happened to include `Fixes #N`),
+   the upstream closes via a different path and Boss's next tick observes
+   it as `Closed` — at which point `reconcile_existing` sees Boss is
+   already `done` and the upstream is already `Closed` and is a no-op.
+   The two paths converge idempotently.
+
+The reconciler tracks "pending close" intent persistently via the
+existing `pr_url` + `status` columns (no extra column needed): on each
+tick, any row with `status = done`, `pr_url IS NOT NULL`, and an upstream
+ref pointing at an `Open` issue is a close candidate. This means a Boss
+crash mid-reconcile cannot lose a pending close — the next reconciler
+start-up re-derives the work from current SQL + upstream state.
+
+A per-tick budget (default: 20 close calls per pass) prevents a flood of
+batch-merged PRs from saturating the rate-limit window. Excess closes
+defer to the next tick. Emit
+`external_tracker.close_deferred_rate_budget` when this kicks in.
 
 ### Idempotency
 
@@ -706,69 +848,174 @@ already-closed items at first-sight. Stamp `created_via`.
 
 ---
 
-## Design Question 8 — PR Association
+## Design Question 8 — PR Association and Behavior 5 (PR-merge close)
 
-GitHub maintains `closedByPullRequestsReferences` automatically when a PR
-body matches `Fixes #N` / `Closes #N` / `Resolves #N`. The reconciler
-reads this field and propagates it to the Boss row.
+Two separate signals feed Boss's understanding of "which PR is linked to
+which upstream issue":
 
-### Rules
+1. **GitHub's `closedByPullRequestsReferences` field**, populated when a
+   PR body matches `Fixes #N` / `Closes #N` / `Resolves #N`. Read on each
+   reconcile tick.
+2. **Boss's existing `pr_url_capture` / `merge_poller` pipeline**, which
+   already attaches a PR URL to a Boss work item based on worker activity
+   (commits authored on the worker's branch, the worker's annotated
+   `pr_url`, etc.). This source does not require the PR body to mention
+   the issue at all.
+
+Either signal is sufficient to bind a PR to a Boss work item; whichever
+arrives first wins, and the reconciler tolerates both pointing at the
+same `pr_url`.
+
+### Behavior 4 — `pr_url` attachment rules
 
 1. On reconcile, if `upstream_item.pr_associations` is non-empty:
    - Pick the most recent association (sorted by `merged_at` desc, then
      by `pr_url`).
-   - If `boss_row.pr_url IS NULL` or `boss_row.pr_url != association.pr_url`,
-     update it. Emit `external_tracker.pr_attached`.
-2. If the chosen association has `merged = true` and the upstream issue
-   has not yet closed (race condition: PR merged, issue not yet auto-closed
-   by GitHub), the reconciler does *not* short-circuit and close the
-   issue itself. We trust GitHub's auto-close. On the next tick (≤2 min)
-   the issue will be `Closed{Completed}` and the standard close-mirror
-   path runs.
-3. Multiple PR associations are rare but legal (one issue, multiple PRs).
+   - If `boss_row.pr_url IS NULL`, write the URL. Emit
+     `external_tracker.pr_attached`.
+   - If `boss_row.pr_url` is already non-null but came from the
+     `pr_url_capture` pipeline, **do not overwrite** — the worker-attached
+     URL is the more trusted signal. The two URLs are usually identical
+     anyway.
+2. Multiple PR associations are rare but legal (one issue, multiple PRs).
    v1 picks the most recent; future work could surface a list.
 
-### Behaviour (5) — PR merge propagation
+### Behavior 5 — Explicit close-on-PR-merge (overrides D1)
 
-The acceptance criterion lists behaviour 5 as "when the associated PR
-merges, transition the GitHub issue to closed." This is **GitHub's job,
-not Boss's** when the PR body contains `Fixes #N`. Boss does not need to
-explicitly close the issue — GitHub does it. The Boss reconciler then
-picks up the closure on its next tick.
+**When the reconciler observes a merged PR linked to a Boss work item
+whose upstream is still `Open`, Boss closes the upstream issue itself,
+via `tracker.close_issue(ref, CloseReason::Completed)`. Boss does not
+delegate this to GitHub's `Fixes #N` auto-close.**
 
-The only case where Boss might need to write back is when a PR merges
-*without* a `Fixes #N` footer but is nonetheless associated with the Boss
-work item. v1's policy: Boss does not write back in this case either. The
-human can either edit the PR body to add the footer, or close the issue
-manually. Auto-closing the upstream issue from Boss requires the
-reverse-close path (Q9) and is off by default.
+Reasoning (per design directive D1):
+
+- GitHub's auto-close fires only when the PR body contains the right
+  keyword (`Fixes`, `Closes`, `Resolves`) referencing the right issue
+  number in the right syntax. Boss cannot rely on every PR being authored
+  that way:
+  - Human-authored PRs frequently omit the footer ("forgot to add it",
+    "didn't know about it", "addresses #N partially so no footer").
+  - Worker-authored PRs may reference a Boss work-item id, an exec id, a
+    draft commit description, or no issue at all.
+  - Stacked PR workflows often have the footer on only the top PR of the
+    stack, not the one that actually merges first.
+- Boss already knows the binding (via `pr_url` linkage to a work item
+  with an `external_ref`). Boss is therefore the more reliable agent for
+  this transition than GitHub's text-parsing heuristic.
+
+The two close paths (Boss explicit, GitHub auto) are **idempotent w.r.t.
+each other**: closing an already-closed issue is a no-op (HTTP 200 from
+the GitHub side; treat the second close as success). If both fire, the
+later one is a harmless duplicate. If only one fires (e.g. PR has no
+footer → GitHub doesn't auto-close → Boss does), the upstream still ends
+up closed.
+
+#### Trigger conditions
+
+On each reconcile tick, queue a `close_issue` call for the work item if
+*all* of the following hold:
+
+- `work_item.external_ref_canonical_id IS NOT NULL` (it's bound).
+- `work_item.pr_url IS NOT NULL` (a PR is linked).
+- The linked PR's state is `merged` (resolved via the existing merge
+  poller's view of the PR — re-using the same merge signal Boss already
+  trusts elsewhere).
+- The upstream issue's current `UpstreamStatus = Open`.
+- The Boss work item's status flips to `done` as part of this same
+  reconcile, or was already `done` from a prior tick whose close call
+  failed.
+
+The first four conditions form the "close decision"; the fifth handles
+the retry case where Boss-side state already advanced but the upstream
+close didn't land. Together they guarantee: every merged-PR-linked Boss
+work item ends up with both Boss `done` *and* upstream closed, even
+across crashes and transient failures.
+
+#### Why not move the Boss work item to `done` *first* and let Behavior 3
+#### (reverse-close) handle the upstream close?
+
+This was considered. Rejected because reverse-close is opt-in per
+product, and Behavior 5 is non-negotiable (PR-merge must close upstream).
+Wiring Behavior 5 through the reverse-close path would force users to
+enable reverse-close to get correct PR-merge behavior, which conflates
+two distinct policies:
+
+- **Behavior 5 (always on):** "PR merged → upstream closes."
+  This is a workflow guarantee, not a policy choice.
+- **Behavior 3 (opt-in):** "I marked it done locally → upstream closes."
+  This is a policy choice about whether Boss may close upstream issues
+  that weren't shipped via a PR.
+
+Both end up calling `tracker.close_issue`, but the triggers and the
+default-on/default-off semantics differ. They share the affordance but
+not the policy.
 
 ### Failure mode: PR-association points at a PR not owned by this product
 
 Possible if a fork or external PR mentions the issue. Boss still writes
 the PR URL to `pr_url` — `pr_url` is a URL, not a foreign key. The
 merge poller skips PRs whose host repo doesn't match the product's
-`repo_remote_url` (existing behaviour); the Boss side is harmless.
+`repo_remote_url` (existing behaviour); Behavior 5's close logic also
+gates on "merge poller observed merged = true," so an external PR that
+the merge poller does not track cannot drive a Behavior 5 close. Safe.
+
+### Failure mode: `close_issue` fails transiently
+
+The Boss work item is already `done` (SQL committed). The close call
+returns `TrackerError::Transient`. The reconciler logs, emits
+`external_tracker.pr_merge_close_failed{reason=transient}`, and the
+next tick re-evaluates trigger conditions: the upstream is still `Open`,
+the Boss row is still `done`, the PR is still merged → the call is
+re-queued. This continues until either the close succeeds or the
+upstream is observed `Closed` (via GitHub's auto-close kicking in, or a
+human closing it manually).
+
+### Failure mode: `close_issue` fails with `PermissionDenied`
+
+The credential lacks `issues:write`. The Boss work item is `done`
+(unchanged). The reconciler emits an attention item on the product
+("Boss could not close upstream issue `<canonical_id>` — credential
+lacks write scope. Re-run `gh auth login --scopes repo` to grant write
+permission."). Do not retry on subsequent ticks (the credential won't
+spontaneously gain permission); clear the attention item once a tick
+observes the upstream as `Closed` (someone closed it manually) or once
+the credential is re-resolved with write scope.
 
 ### Recommendation
 
-Read `closedByPullRequestsReferences`; update `pr_url` when it changes;
-trust GitHub for auto-close.
+- Read `closedByPullRequestsReferences` and `pr_url_capture` results;
+  attach `pr_url` per the rules above.
+- On observing a merged-PR-linked Boss work item whose upstream is
+  `Open`, call `tracker.close_issue` after SQL commit.
+- Tolerate redundancy with GitHub's auto-close (both paths converge
+  idempotently).
+- Surface persistent permission failures as product attention items.
 
 ---
 
-## Design Question 9 — Reverse-Close (Behaviour 3)
+## Design Question 9 — Reverse-Close (Behavior 3)
 
-The acceptance criterion lists behaviour 3 as "boss work item marked `done`
+The acceptance criterion lists Behavior 3 as "boss work item marked `done`
 → close the upstream GitHub issue," gated behind a config flag.
+
+This is the **non-PR-driven** writeback path. Behavior 5 (Q8) already
+closes upstream when a linked PR merges; reverse-close handles the
+*remaining* cases where a Boss user flips a row to `done` without a
+merged PR driving the transition (manual archiving, "wontfix", "dupe
+of #M", etc.).
 
 ### Why off by default
 
 Closing a public GitHub issue is **visible to other humans**. A Boss user
-marking a task `done` locally might mean "I shipped this," or it might
-mean "I'm done dealing with this and reclassifying it." Closing upstream
-in the latter case is rude. Default off; users who run a tight upstream =
-local mapping can opt in per-product.
+marking a task `done` locally without a PR-merge backing the transition
+might mean "I shipped this through some out-of-band channel," or it
+might mean "I'm done dealing with this and reclassifying it." Closing
+upstream in the latter case is rude. Default off; users who run a tight
+upstream = local mapping can opt in per-product.
+
+(Behavior 5 *is* on by default because a merged PR is unambiguous
+evidence that the work shipped; no such evidence exists for non-PR
+transitions, hence the opt-in gate.)
 
 ### Configuration
 
@@ -783,12 +1030,13 @@ local mapping can opt in per-product.
 
 When `true`, the reconciler examines every product-bound work item whose
 status flipped to `done` since `external_ref_synced_at` and whose
-upstream issue is still `Open`, and calls `tracker.close_item(ref,
-CloseReason::Completed)`.
+upstream issue is still `Open`, and calls `tracker.close_issue(ref,
+CloseReason::Completed)`. These calls reuse the same trait method as
+Behavior 5; the only difference is the trigger.
 
 ### Idempotency
 
-`close_item` is idempotent on the GitHub side: closing an already-closed
+`close_issue` is idempotent on the GitHub side: closing an already-closed
 issue is a no-op. The reconciler still gates on "current upstream status
 is `Open`" to avoid pointless API calls.
 
@@ -796,10 +1044,16 @@ is `Open`" to avoid pointless API calls.
 
 - **Permission denied** (closing an issue requires write access). Surface
   as an attention item on the product; users with read-only `gh auth`
-  cannot use reverse-close. Log + emit
+  cannot use reverse-close (and also cannot benefit from Behavior 5's
+  explicit close, since both share the credential). Log + emit
   `external_tracker.reverse_close_failed`.
 - **Race condition** (issue closed upstream between fetch and close).
   GitHub returns 200; harmless.
+- **Race with Behavior 5** (PR merges *and* user clicks "done" in the
+  same window). The reconciler de-duplicates: the close decision is
+  evaluated once per work item per tick, and `close_issue` is itself
+  idempotent. Whichever trigger fires the call first wins; the other
+  becomes a no-op.
 
 ### Recommendation
 
@@ -811,27 +1065,48 @@ attention item if the flag is on but the credential lacks write scope.
 ## Design Question 10 — Source-of-Truth Policy
 
 The brief asks for justification + failure modes. The chosen mode:
-**one-way ingestion with zero writeback to GitHub Projects in v1.** The
-narrow exception is reverse-close (Q9), which is opt-in and orthogonal.
+**one-way ingestion of content (titles, bodies, descriptions, status
+mirroring), with Boss owning exactly one write surface — closing the
+upstream issue.** Closes fire from two triggers:
 
-### Justification
+- **Behavior 5 (always on):** PR linked to the Boss work item has merged.
+- **Behavior 3 (opt-in, per product `reverse_close` flag):** Boss work
+  item flipped to `done` independent of a merged PR.
 
-Three reasons:
+No other writes (title edits, body edits, label changes, project-field
+edits, status-field edits, comment posts) leave Boss in v1.
+
+### Why a deliberate write surface (and not zero writes)
+
+The previous design pass concluded zero writes and trusted GitHub's
+`Fixes #N` auto-close for Behavior 5. Design directive D1 corrects this:
+auto-close fires only when PR bodies happen to be authored with the right
+keyword referencing the right issue, which is fragile for both
+human-authored and worker-authored PRs. The fix is to make Boss the
+agent of closure, not GitHub's parser. Q8 covers this in detail.
+
+### Justification for keeping writes narrow
+
+Three reasons to keep the write surface to just the close action:
 
 1. **Writeback is a permission ladder.** Reading from GitHub is a low
    threshold (any authenticated `gh` works). Writing to GitHub requires
-   the credential to have `issues:write` and/or
-   `projects:write`. Many users authenticated for `gh pr view` are not
-   authenticated for `gh issue edit`. Opting writeback off by default
-   means Boss works for the most users with the least setup.
-2. **Writeback risks cycles.** Once Boss writes back, the next reconcile
-   tick reads Boss's own write — and if there's any timestamp skew or
-   field-mapping bug, the reconciler can ping-pong. The simplest defence
-   is "don't write."
+   the credential to have `issues:write`. Closing an issue is the
+   lowest-impact write available — it doesn't mutate body, comments, or
+   project structure — so it's the most defensible single write to ask
+   the user's credential to perform.
+2. **Writeback risks cycles** when both sides write the same fields.
+   Closing is **not** a cycle hazard because the close transition is
+   monotonic (an open issue closed by Boss can't be "re-opened" by Boss;
+   only a human can re-open). The reconciler observes a closed issue and
+   ensures the Boss row is `done`; the Boss row being `done` and the
+   upstream being `Closed` is a stable fixed point, not a ping-pong.
 3. **`external_ref_*` is enough for stable identity.** The premise of
    "writeback custom field" is "without it, Boss can't re-identify the
    issue after a rename." But identity is by issue number, not title.
-   Issue numbers never change; renames don't break us.
+   Issue numbers never change; renames don't break us. So we do *not*
+   need to write a `boss_id` custom field back to the project — the
+   binding is robust without it.
 
 ### Failure modes of the chosen mode
 
@@ -849,9 +1124,11 @@ Three reasons:
 
 ### Recommendation
 
-One-way ingestion. Reverse-close opt-in. No custom-field writebacks. If
-behavioural needs in v2 demand more, the trait's `close_item` shape
-generalises naturally to `update_status` / `set_field`.
+One-way ingestion of content. Boss owns the close write surface,
+triggered always-on by Behavior 5 (PR-merge) and opt-in by Behavior 3
+(reverse-close). No custom-field writebacks. If behavioural needs in v2
+demand more, the trait's `close_issue` shape generalises naturally to
+`update_status` / `set_field`.
 
 ---
 
@@ -1027,12 +1304,22 @@ The brief lists four open questions. Sketched answers:
 2. **Resolution policy when Boss and tracker disagree on status (Boss says
    `done`, GitHub issue still open)?**
    Upstream wins on `Closed`; Boss wins on everything else. Specifically:
-   if upstream is `Open` and Boss is `done`, Boss's status holds (a user
-   actively closing the local work is more recent than the upstream
-   state, which hasn't caught up yet). If reverse-close is enabled, the
-   reverse-close handler propagates Boss → upstream; otherwise the issue
-   stays open upstream until a human closes it. No "tug of war." See Q6
-   and Q9.
+   if upstream is `Open` and Boss is `done`, Boss's status holds. What
+   happens *next* depends on why the status diverged:
+   - **PR-driven divergence (Behavior 5, always on).** Boss is `done`
+     because the linked PR merged; the reconciler immediately queues a
+     `close_issue` call to converge upstream. No tug of war; the
+     divergence is transient.
+   - **Non-PR-driven divergence with `reverse_close = true`.** Boss is
+     `done` because a user marked it so; the reconciler queues a
+     `close_issue` call (Q9). Again transient.
+   - **Non-PR-driven divergence with `reverse_close = false` (default).**
+     Boss stays `done`; upstream stays `Open`. The divergence persists
+     until a human closes the upstream manually or the user opts into
+     `reverse_close`. This is the only persistent disagreement case, and
+     it is opt-in by the product's config.
+
+   See Q6, Q8, and Q9 for the full rules.
 
 3. **Granularity of the reconcile loop — global, per-product, or
    event-driven via webhooks?**
@@ -1161,8 +1448,13 @@ Counters, registered on the existing `Registry`:
 - `external_tracker.fetch_succeeded`
 - `external_tracker.fetch_failed`
 - `external_tracker.imported`
-- `external_tracker.closed`
+- `external_tracker.closed` — Boss row flipped to `done` because the
+  upstream observed as `Closed` (Behavior 2, close-mirror).
 - `external_tracker.pr_attached`
+- `external_tracker.pr_merge_close_succeeded` — Boss's explicit close
+  API call after a linked PR merge (Behavior 5).
+- `external_tracker.pr_merge_close_failed{reason=transient|permission|notfound}`
+- `external_tracker.close_deferred_rate_budget`
 - `external_tracker.unbound`
 - `external_tracker.reverse_close_succeeded`
 - `external_tracker.reverse_close_failed`
@@ -1200,8 +1492,18 @@ Cardinality is bounded by product count; no per-item labels.
       │     INSERT INTO tasks (...)                    │            │
       │ for each existing binding not in fetch:       │            │
       │   handle_removed_upstream (clear + unbound_at)│            │
+      │ collect close candidates (Behavior 5 + opt-in │            │
+      │   reverse-close) into a list                  │            │
       │ COMMIT                                         │            │
       │ ──────────────────────────────────────────────│───────────►│
+      │ for each close candidate (post-commit):       │            │
+      │   tracker.close_issue(ref, Completed)         │            │
+      │   │ gh api -X PATCH …/issues/N state=closed   │            │
+      │   │ ───────────────►                          │            │
+      │   │ 200 OK / 404 / 5xx                        │            │
+      │   │ ◄───────────────                          │            │
+      │   on transient: log+metric, retry next tick   │            │
+      │   on permission: surface attention item       │            │
       │ emit metrics                                  │            │
       │ sleep(interval)                                │            │
 ```
@@ -1286,6 +1588,41 @@ UI. Mitigation: the existing `created_via` column already supports this
 shape; the kanban renders a tiny "📡" badge on cards whose
 `created_via = 'external_tracker_sync'`.
 
+**R10 — Stuck close-on-merge after persistent transient failure.** A
+merged PR linked to a Boss work item triggers a `close_issue` call that
+fails transiently (GitHub 5xx, intermittent network). Boss commits its
+side (`work_item.status = done`) but the upstream stays open. The next
+reconcile tick re-queues the call. This is the desired behavior, but if
+the failure persists for hours (e.g. extended GitHub Issues incident),
+the user sees a Boss work item that says `done` while the upstream issue
+is conspicuously still open. Mitigation: (a) the reconciler emits
+`external_tracker.pr_merge_close_failed{reason=transient}` per failed
+attempt — a rising counter is observable. (b) After N consecutive
+transient failures (default 10, ~20 minutes at the default 120s cadence),
+the reconciler surfaces an attention item on the product
+("Boss has been unable to close `<canonical_id>` after a merged PR.
+Last error: <classified-reason>. The Boss work item is already `done`;
+the upstream issue may be closed manually or Boss will retry
+indefinitely.") which clears once a tick succeeds or observes the
+upstream as `Closed`.
+
+**R11 — Behavior 5 fires for a stale `pr_url`.** Suppose
+`work_item.pr_url` points at a PR that merged, was later force-pushed
+to revert, and re-opened. The merge poller now reports `merged = false`
+again. Behavior 5's trigger gates on `merged = true` from the *current*
+merge poller view, not on a frozen flag — so a re-opened PR un-triggers
+Behavior 5. If the upstream was already closed by an earlier Behavior 5
+firing, Boss does not re-open it. Re-opening is out of scope. Mitigation:
+documented; users who force-push-revert a merged PR should manually
+re-open the upstream issue.
+
+**R12 — Worker authors a PR that doesn't reference the upstream issue
+in its body.** This is the directly addressed case from directive D1.
+GitHub's auto-close does *not* fire (no `Fixes #N` footer). Boss's
+explicit close *does* fire (it relies on the `pr_url` linkage on the
+work item, not on the PR body). The previous design pass got this
+wrong; the corrected design works regardless of PR body content.
+
 **Open Q1.** Should the reconciler emit an event on every reconcile pass
 even when nothing changed, so the kanban can show a "last refreshed"
 timestamp on the product? Tradeoff: per-tick chatter on a topic vs.
@@ -1337,9 +1674,11 @@ Bite-sized; each fits one worker session. Ordered roughly by dependency.
 5. **GitHub impl: `fetch_item`** — single-issue `gh api repos/...`
    fetch. Acceptance: unit tests for 200 / 404 / 500 responses.
 
-6. **GitHub impl: `close_item`** — `gh issue close <url> --reason
-   completed`. Acceptance: unit tests for success / permission-denied /
-   already-closed.
+6. **GitHub impl: `close_issue`** — `gh api -X PATCH
+   repos/{owner}/{repo}/issues/{number} -f state=closed -f
+   state_reason=completed`. Required for v1 (powers Behavior 5).
+   Acceptance: unit tests for success / permission-denied /
+   already-closed / 404 / transient (mocked 5xx).
 
 7. **Credential resolver** — `gh auth status` default impl; attention
    item emission on failure. Acceptance: unit tests with a fake
@@ -1352,9 +1691,13 @@ Bite-sized; each fits one worker session. Ordered roughly by dependency.
    unbound state.
 
 9. **Reconciler core: `run_one_pass`** — per-product processing without
-   the spawn loop. Acceptance: integration test feeds a synthetic
+   the spawn loop. Includes Behavior 5 close-on-merge wiring: post-commit
+   issues `close_issue` calls for each merged-PR-linked work item whose
+   upstream is `Open`. Acceptance: integration test feeds a synthetic
    `EchoTracker` and asserts the SQL state matches expectations across
-   create / close / pr-attach / unbind cases.
+   create / close / pr-attach / pr-merge-close (verifying `close_issue`
+   was called on the fake) / unbind cases; covers the transient-failure
+   retry path (call fails once, next tick re-queues, succeeds).
 
 10. **Reconciler spawn loop** — `tokio::spawn` with the configured
     interval, mirroring `merge_poller::spawn_loop`. Acceptance: smoke
@@ -1385,8 +1728,12 @@ Bite-sized; each fits one worker session. Ordered roughly by dependency.
     Acceptance: integration test for each of the four reasons.
 
 17. **Reverse-close handler** — engine path that closes upstream when
-    Boss flips a row to `done` and reverse-close is on. Acceptance:
-    integration test with a faked `close_item`.
+    Boss flips a row to `done` *without* a merged PR backing the
+    transition, and reverse-close is on. Shares the `close_issue` call
+    site with Behavior 5; differs only in the trigger condition.
+    Acceptance: integration test with a faked `close_issue` covering
+    enabled-and-fires, enabled-but-PR-driven-so-Behavior-5-fires-instead,
+    and disabled-so-no-close cases.
 
 18. **Documentation** — runbook for binding a tracker, troubleshooting
     auth, interpreting attention items. One markdown file under
@@ -1410,9 +1757,13 @@ Bite-sized; each fits one worker session. Ordered roughly by dependency.
 ## Out of Scope
 
 - Bidirectional field sync (assignees, labels, comments, milestones,
-  body re-sync).
-- Boss → GitHub issue creation. Boss work items created locally do not
-  auto-spawn upstream issues.
+  body re-sync, title re-sync).
+- Boss → GitHub issue *creation*. Boss work items created locally do not
+  auto-spawn upstream issues. (Boss → GitHub issue *closing* is in scope;
+  see Behavior 5 and Behavior 3.)
+- Boss → GitHub issue re-opening. If an upstream issue is closed (by
+  Boss or otherwise) and the Boss work item later reverts to an unfinished
+  state, Boss does not re-open the upstream.
 - Multiple trackers per product.
 - Webhook-driven push delivery.
 - Title-match heuristic for bulk-linking existing work items.
