@@ -974,6 +974,7 @@ mod conflict_resolution_prompt_tests {
             finished_at: None,
             pre_start_failure_count: 0,
             dispatch_not_before: None,
+            pr_url: None,
         }
     }
 
@@ -1565,6 +1566,7 @@ mod pane_spawn_tests {
             finished_at: None,
             pre_start_failure_count: 0,
             dispatch_not_before: None,
+            pr_url: None,
         }
     }
 
