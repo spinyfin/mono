@@ -3,9 +3,9 @@ import XCTest
 
 /// Covers the friendly-id badge on `WorkBoardCardView` and related
 /// surfaces (popover header, right-click copy). Per the design for
-/// "macOS kanban: short_id badge" (chore 4 of 5), every card that
-/// carries a `shortID` must surface it as a `T<n>` badge anchored
-/// top-right; the popover header repeats it inline; and right-click
+/// "macOS kanban: short_id badge", every card that carries a `shortID`
+/// must surface it as a `T<n>` badge anchored bottom-right in the
+/// footer; the popover header repeats it inline; and right-click
 /// offers "Copy Friendly ID". These tests pin the data layer that the
 /// views reflect so correctness is asserted without spinning up a
 /// SwiftUI host — the same approach as `WorkDependencyKanbanTests`.
