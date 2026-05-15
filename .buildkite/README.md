@@ -70,4 +70,4 @@ Required checks are managed via branch protection rules. The check names buildki
 
 ## Status
 
-The pipeline is canonical — `bazel-build` and `bazel-test` are the source of truth. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).
+Task #5 (branch protection) is complete. Branch protection on `main` now requires `buildkite/mono/bootstrap`, `buildkite/mono/bazel-build`, `buildkite/mono/bazel-test`, and `buildkite/mono/checks`. `REQUIRED_CHECKS.md` documents the canonical names and the rename contract. The pipeline is canonical — `bazel-build` and `bazel-test` are the source of truth. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).

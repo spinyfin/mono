@@ -139,3 +139,10 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+sh_test(
+    name = "no_gh_pr_merge_test",
+    srcs = ["tests/no_gh_pr_merge.sh"],
+    data = glob(["src/**/*.rs"]),
+    size = "small",
+)

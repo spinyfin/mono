@@ -8,16 +8,16 @@ GitHub's branch protection rule references exact check names. If a step key chan
 
 Buildkite emits check names in the form `buildkite/mono/<step-key>`, where `<step-key>` matches the `key:` field in `pipeline.yml`.
 
-## Current required checks
+## Current required checks (ramp step 2)
 
 These checks are currently **required** (block merge if red):
 
-| Check name | Step key in pipeline.yml |
-|---|---|
-| `buildkite/mono/bootstrap` | `bootstrap` |
-| `buildkite/mono/bazel-build` | `bazel-build` |
-| `buildkite/mono/bazel-test` | `bazel-test` |
-| `buildkite/mono/checks` | `checks` |
+| Check name | Step key in pipeline.yml | Required since |
+|---|---|---|
+| `buildkite/mono/bootstrap` | `bootstrap` | 2026-05-15 |
+| `buildkite/mono/bazel-build` | `bazel-build` | 2026-05-15 |
+| `buildkite/mono/bazel-test` | `bazel-test` | 2026-05-15 |
+| `buildkite/mono/checks` | `checks` | 2026-05-15 |
 
 ## Rename contract
 
