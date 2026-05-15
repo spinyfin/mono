@@ -1409,6 +1409,12 @@ struct WorkBoardCardView: View {
                         RepoChipView(presentation: repoChip)
                     }
                     Spacer()
+                    if let id = task.shortID {
+                        Text("T\(id)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("T\(id)")
+                    }
                     if task.kind == "design",
                        let state = designDocState,
                        let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
@@ -1455,16 +1461,6 @@ struct WorkBoardCardView: View {
                 )
         )
         .draggable(task.id)
-        .overlay(alignment: .topTrailing) {
-            if let id = task.shortID {
-                Text("T\(id)")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.trailing, 10)
-                    .padding(.top, 8)
-                    .accessibilityLabel("T\(id)")
-            }
-        }
     }
 
     /// The footer renders the priority chip on every card so a glance
