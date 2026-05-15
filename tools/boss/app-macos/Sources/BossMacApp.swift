@@ -35,6 +35,7 @@ struct BossMacApp: App {
         WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
             if let content {
                 MarkdownViewerView(title: content.title, source: content.markdown)
+                    .navigationTitle(content.title)
             }
         }
         .defaultSize(width: 760, height: 640)
@@ -48,6 +49,7 @@ struct BossMacApp: App {
         WindowGroup("Design Doc", id: "design-renderer", for: DesignRendererContent.self) { $content in
             if let content {
                 DesignRendererView(content: content)
+                    .navigationTitle(content.title)
             }
         }
         .defaultSize(width: 880, height: 700)
