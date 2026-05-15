@@ -135,6 +135,10 @@ struct ContentView: View {
                 }
             }
 
+            ToolbarItem(placement: .principal) {
+                BossTitleView(model: model)
+            }
+
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
                     WorkProjectFilterToolbarButton(model: model)
@@ -835,6 +839,15 @@ private struct WorkSidebarFilterRow: View {
         .padding(.vertical, subtitle == nil ? 6 : 7)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct BossTitleView: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        Text(model.selectedProduct?.name ?? "Boss")
+            .font(.headline)
     }
 }
 
