@@ -1,6 +1,8 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -379,6 +381,55 @@ exit 17
     assert!(rendered.contains("stderr: bad-output"));
 }
 
+/// Script exits immediately (without reading stdin) and writes to stderr.
+/// The executor must surface the stderr text rather than just "Broken pipe".
+#[test]
+#[cfg(unix)]
+fn exec_runtime_surfaces_child_stderr_on_epipe() {
+    let temp = tempdir().expect("temp dir");
+    let script_path = temp.path().join("check.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+echo 'child exited early: reason from stderr' >&2
+exit 5
+"#,
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "exec-check".to_owned(),
+        runtime: EXTERNAL_CHECK_EXEC_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Exec(ExternalCheckExecPackage {
+            executable_path: "check.sh".to_owned(),
+            args: Vec::new(),
+            provenance: None,
+        }),
+    };
+
+    let error = executor
+        .execute(
+            &package,
+            &ChangeSet::default(),
+            &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect_err("must fail");
+    let rendered = format!("{error:#}");
+    // Error must surface the child's stderr regardless of whether we hit EPIPE
+    // or the child finishes after stdin is written.
+    assert!(
+        rendered.contains("child exited early"),
+        "expected child stderr in error; got: {rendered}"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn exec_runtime_sets_bazel_bindir_for_bazel_bin_launchers() {
@@ -419,6 +470,64 @@ printf '%s' '{"findings":[{"severity":"info","message":"bazel-bindir-ok","locati
             &package,
             &ChangeSet::default(),
             &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Info);
+    assert_eq!(result.findings[0].message, "bazel-bindir-ok");
+}
+
+/// Covers the macOS `/tmp` → `/private/tmp` case and bazel sandbox TMPDIR
+/// paths where the root passed to the executor is a symlink.
+/// `uses_bazel_bin_launcher` must fire even when the root resolves through
+/// a symlink to a different canonical path.
+#[test]
+#[cfg(unix)]
+fn exec_runtime_sets_bazel_bindir_when_root_is_symlink() {
+    let real_temp = tempdir().expect("real temp dir");
+    let link_base = tempdir().expect("link base dir");
+    let symlink_root = link_base.path().join("root_link");
+    symlink(real_temp.path(), &symlink_root).expect("create root symlink");
+
+    let bazel_bin_dir = symlink_root.join("bazel-bin");
+    fs::create_dir_all(&bazel_bin_dir).expect("mkdir bazel-bin");
+    let script_path = bazel_bin_dir.join("check.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+if [ "${BAZEL_BINDIR:-}" != "." ]; then
+  echo "expected BAZEL_BINDIR=. but got '${BAZEL_BINDIR:-}'" >&2
+  exit 23
+fi
+printf '%s' '{"findings":[{"severity":"info","message":"bazel-bindir-ok","location":null,"remediation":null,"suggested_fix":null}]}'
+"#,
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let executor =
+        DefaultExternalCheckExecutor::new(&symlink_root).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "exec-check".to_owned(),
+        runtime: EXTERNAL_CHECK_EXEC_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Exec(ExternalCheckExecPackage {
+            executable_path: "bazel-bin/check.sh".to_owned(),
+            args: Vec::new(),
+            provenance: None,
+        }),
+    };
+
+    let result = executor
+        .execute(
+            &package,
+            &ChangeSet::default(),
+            &LocalSourceTree::new(&symlink_root).expect("tree"),
             &toml::Value::Table(Default::default()),
         )
         .expect("execute");

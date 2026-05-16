@@ -328,10 +328,44 @@ impl DefaultExternalCheckExecutor {
             "exec runtime stderr",
         );
 
-        stdin
-            .write_all(&input_bytes)
-            .context("failed to write exec runtime input to stdin")?;
+        let write_result = stdin.write_all(&input_bytes);
         drop(stdin);
+
+        if let Err(write_err) = write_result {
+            // Child exited before consuming stdin (EPIPE). Collect its exit status
+            // and outputs — the child may have succeeded without reading stdin at all
+            // (e.g. env-var-only checks), or it may have failed.
+            let exit_status = child.wait().ok();
+            let stdout_bytes =
+                join_stream_reader(stdout_handle, "exec runtime stdout").unwrap_or_default();
+            let stderr_bytes =
+                join_stream_reader(stderr_handle, "exec runtime stderr").unwrap_or_default();
+
+            if exit_status.map(|s| s.success()).unwrap_or(false) {
+                // Child succeeded without reading stdin; parse its stdout normally.
+                let output: exec_protocol::ExecCheckResponse =
+                    serde_json::from_slice(&stdout_bytes).with_context(|| {
+                        format!(
+                            "exec runtime output for package `{}` was not valid JSON",
+                            package.id
+                        )
+                    })?;
+                return Ok(CheckResult {
+                    check_id: package.id.clone(),
+                    findings: output.findings,
+                });
+            }
+
+            return Err(child_failure_error(
+                package,
+                &executable_path,
+                exit_status,
+                &stderr_bytes,
+            )
+            .context(format!(
+                "failed to write exec runtime input to stdin: {write_err}"
+            )));
+        }
 
         let status = child.wait().with_context(|| {
             format!(
@@ -647,6 +681,30 @@ where
     result.map_err(Into::into)
 }
 
+fn child_failure_error(
+    package: &ExternalCheckPackage,
+    executable_path: &Path,
+    exit_status: Option<ExitStatus>,
+    stderr_bytes: &[u8],
+) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(stderr_bytes).trim().to_owned();
+    let stderr_suffix = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    };
+    let status_phrase = exit_status
+        .map(|s| format!("{s}"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    anyhow::anyhow!(
+        "exec runtime for package `{}` at {} exited with status {}{}",
+        package.id,
+        executable_path.display(),
+        status_phrase,
+        stderr_suffix
+    )
+}
+
 fn ensure_successful_exit(
     package: &ExternalCheckPackage,
     executable_path: &Path,
@@ -656,20 +714,7 @@ fn ensure_successful_exit(
     if status.success() {
         return Ok(());
     }
-
-    let stderr = String::from_utf8_lossy(stderr_bytes).trim().to_owned();
-    let stderr_suffix = if stderr.is_empty() {
-        String::new()
-    } else {
-        format!("; stderr: {stderr}")
-    };
-    bail!(
-        "exec runtime for package `{}` at {} exited with status {}{}",
-        package.id,
-        executable_path.display(),
-        status,
-        stderr_suffix
-    );
+    Err(child_failure_error(package, executable_path, Some(status), stderr_bytes))
 }
 
 fn spawn_stream_reader<R>(
@@ -709,7 +754,14 @@ fn join_stream_reader(
 }
 
 fn uses_bazel_bin_launcher(root: &Path, executable_path: &Path) -> bool {
-    executable_path.starts_with(root.join("bazel-bin"))
+    let bazel_bin = root.join("bazel-bin");
+    // Canonicalize both sides so symlinks (e.g. `bazel-bin` itself as a workspace
+    // symlink, or TMPDIR paths that contain symlinked components in the bazel
+    // Linux sandbox) don't cause a false-negative prefix check.
+    let canonical_bazel_bin = fs::canonicalize(&bazel_bin).unwrap_or(bazel_bin);
+    let canonical_exec =
+        fs::canonicalize(executable_path).unwrap_or_else(|_| executable_path.to_path_buf());
+    canonical_exec.starts_with(&canonical_bazel_bin)
 }
 
 #[cfg(test)]
