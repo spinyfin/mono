@@ -11,7 +11,7 @@ echo "--- [checks] starting"
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
     base_branch="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
     echo "[checks] PR build — scoping to changes against origin/${base_branch}"
-    CHECKLEFT_ARGS=(run --base_ref="origin/${base_branch}")
+    CHECKLEFT_ARGS=(run --base-ref="origin/${base_branch}")
 else
     echo "[checks] push build — running all checks"
     CHECKLEFT_ARGS=(run --all)
