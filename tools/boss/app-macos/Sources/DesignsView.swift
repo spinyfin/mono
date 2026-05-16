@@ -444,32 +444,128 @@ struct MarkdownViewerContent: Codable, Hashable {
 }
 
 /// Stand-alone scrolling viewer for long task / chore descriptions.
-/// Rendered inside the `"markdown-viewer"` WindowGroup scene. The
-/// chrome matches `MarkdownDocumentView` so the "Read full description"
-/// affordance lands in a layout that visually mirrors the Designs file
-/// viewer.
+/// Rendered inside the `"markdown-viewer"` WindowGroup scene and delegated
+/// to from `AsyncMarkdownViewerView`. Supports ⌘F in-document search via
+/// an inline find bar that highlights matches and navigates with ⌘G / ⌘⇧G.
 struct MarkdownViewerView: View {
     let title: String
     let source: String
 
+    @State private var isFindBarVisible = false
+    @State private var searchQuery = ""
+    @State private var blocks: [String] = []
+    @StateObject private var engine = MarkdownSearchEngine()
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(title)
-                    .font(.title3.weight(.semibold))
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(spacing: 0) {
+            if isFindBarVisible {
+                MarkdownFindBar(
+                    query: $searchQuery,
+                    matchCount: engine.matchCount,
+                    currentIndex: max(engine.currentIndex, 0),
+                    onNext: engine.next,
+                    onPrevious: engine.previous,
+                    onDismiss: closeFindBar
+                )
                 Divider()
-                StructuredText(markdown: source)
-                    .bossMarkdown()
-                    .textual.textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            scrollContent
         }
-        .textSelection(.enabled)
+        .onChange(of: source, initial: true) { _, src in
+            let split = splitMarkdownBlocks(src)
+            blocks = split
+            engine.update(blocks: split, query: searchQuery)
+        }
+        .onChange(of: searchQuery) { _, q in
+            engine.update(blocks: blocks, query: q)
+        }
+        .background { findShortcuts }
         .withComments()
+    }
+
+    // MARK: - Scroll content
+
+    private var scrollContent: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(title)
+                        .font(.title3.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Divider()
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(blocks.indices, id: \.self) { idx in
+                            StructuredText(markupKey(idx), parser: blockParser(idx))
+                                .bossMarkdown()
+                                .textual.textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(idx)
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .textSelection(.enabled)
+            .onChange(of: engine.currentIndex) { _, _ in
+                guard let block = engine.currentMatchBlock else { return }
+                withAnimation { proxy.scrollTo(block, anchor: .center) }
+            }
+        }
+    }
+
+    // MARK: - Markup key + parser
+
+    /// The `markup` string passed to each block's StructuredText.
+    /// When there are matches in this block, a synthetic suffix is appended that
+    /// changes with the search state, causing StructuredText to re-parse and
+    /// refresh highlights. The suffix is stripped by SearchHighlightingParser
+    /// before Foundation's markdown parser sees it.
+    private func markupKey(_ idx: Int) -> String {
+        guard idx < blocks.count else { return "" }
+        let md = blocks[idx]
+        guard !searchQuery.isEmpty, engine.localMatchCount(forBlock: idx) > 0 else { return md }
+        let localCurrent = engine.localMatchIndex(forBlock: idx)
+        return "\(md)\(SearchHighlightingParser.findSuffix)\(searchQuery.hashValue):\(localCurrent) -->"
+    }
+
+    private func blockParser(_ idx: Int) -> SearchHighlightingParser {
+        SearchHighlightingParser(
+            query: searchQuery,
+            currentLocalMatchIndex: searchQuery.isEmpty ? -1 : engine.localMatchIndex(forBlock: idx)
+        )
+    }
+
+    // MARK: - Find bar management
+
+    private func openFindBar() {
+        isFindBarVisible = true
+    }
+
+    private func closeFindBar() {
+        isFindBarVisible = false
+        searchQuery = ""
+    }
+
+    // MARK: - Keyboard shortcuts
+
+    private var findShortcuts: some View {
+        HStack(spacing: 0) {
+            Button("") { openFindBar() }
+                .keyboardShortcut("f", modifiers: .command)
+            Button("") {
+                openFindBar()
+                engine.next()
+            }
+            .keyboardShortcut("g", modifiers: .command)
+            Button("") {
+                openFindBar()
+                engine.previous()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+        }
+        .hidden()
     }
 }
 
