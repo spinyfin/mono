@@ -745,6 +745,44 @@ impl WorkDb {
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
     }
 
+    /// Find the most recent `orphaned` execution for a work item that has
+    /// no `pr_url` set. Used by the runner at spawn time to detect a
+    /// prior mid-flight execution whose branch the new worker should
+    /// attempt to resume (startup recovery path).
+    ///
+    /// Returns `None` when:
+    ///   - the work item has no prior executions,
+    ///   - all prior executions are non-orphaned (completed, failed, etc.), or
+    ///   - the latest orphaned execution already has `pr_url` set (that
+    ///     case is handled by the existing `task.pr_url` resume path).
+    ///
+    /// The `current_execution_id` is excluded so the caller doesn't
+    /// accidentally match the execution that's currently being dispatched.
+    pub fn get_prior_orphaned_execution(
+        &self,
+        work_item_id: &str,
+        current_execution_id: &str,
+    ) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+             FROM work_executions
+             WHERE work_item_id = ?1
+               AND id != ?2
+               AND status = 'orphaned'
+               AND pr_url IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            rusqlite::params![work_item_id, current_execution_id],
+            map_execution,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Fetch a single project by id. Used by the runner when it
     /// composes the worker prompt for a `kind = 'design'` task —
     /// the design task itself is sparse, so the runner enriches the
