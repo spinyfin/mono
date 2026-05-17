@@ -341,6 +341,45 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             None
         };
+        // Detect whether this is a respawn after a crash: if the work item has
+        // no task-level pr_url (handled by the existing RESUME EXISTING PR path)
+        // but has a prior orphaned execution with no pr_url, derive its expected
+        // branch so the new worker can attempt to resume it.
+        let recovery_branch: Option<String> = if work_item_pr_url(work_item).is_none() {
+            match self.work_db.get_prior_orphaned_execution(
+                &execution.work_item_id,
+                &execution.id,
+            ) {
+                Ok(Some(prior)) => {
+                    let branch = crate::completion::expected_branch_name(&prior.id);
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        prior_execution_id = %prior.id,
+                        recovery_branch = %branch,
+                        "startup recovery: prior orphaned execution found; directing worker to attempt branch resume",
+                    );
+                    Some(branch)
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        "startup recovery: no prior orphaned execution found; worker will start from main",
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %format!("{err:#}"),
+                        "startup recovery: failed to query prior orphaned execution; worker will start from main",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let prompt_text = compose_execution_prompt(
             execution,
             work_item,
@@ -348,6 +387,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             workspace_path,
             cube_change_id,
             conflict_attempt.as_ref(),
+            recovery_branch.as_deref(),
         );
 
         // Resolve the per-execution effort + model knobs (design §Q3
@@ -506,6 +546,7 @@ fn compose_execution_prompt(
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     conflict_attempt: Option<&ConflictResolution>,
+    recovery_branch: Option<&str>,
 ) -> String {
     // The conflict_resolution kind has a wholly different shape than
     // implementation/design kinds — it carries an embedded diagnosis,
@@ -558,6 +599,34 @@ fn compose_execution_prompt(
              \n\
              If the branch cannot be resumed (deleted upstream, conflict you cannot resolve, etc.),\n\
              STOP and surface the blocker — do NOT silently open a parallel PR.\n\n",
+        ));
+    } else if let Some(prior_branch) = recovery_branch {
+        // No PR URL on the work item, but the prior execution was orphaned
+        // mid-flight (engine crash / UI crash). The prior worker may have
+        // pushed commits to its expected branch before the session died.
+        // Direct the new worker to resume that branch rather than starting
+        // from main — fall back cleanly if the branch doesn't exist on
+        // the remote.
+        let expected_branch_new = crate::completion::expected_branch_name(&execution.id);
+        prompt.push_str(&format!(
+            "## STARTUP RECOVERY\n\
+             \n\
+             This execution was respawned after the previous worker session was interrupted \
+             (engine or UI crash). The prior worker may have pushed commits to \
+             `{prior_branch}` on the remote.\n\
+             \n\
+             After leasing your workspace, attempt to resume the prior branch:\n\
+             ```\n\
+             jj git fetch\n\
+             jj edit {prior_branch}@origin   # resumes prior commits if branch was pushed\n\
+             ```\n\
+             If that command fails (branch not found on remote — prior worker hadn't pushed \
+             yet), fall back to `jj new main` instead.\n\
+             \n\
+             If you successfully resumed the prior branch, continue from those commits and \
+             push using the new expected branch name `{expected_branch_new}` (see the \
+             `expected branch name` line in the execution context below). Do NOT reuse the \
+             prior branch name.\n\n",
         ));
     }
 
@@ -1287,6 +1356,7 @@ mod compose_prompt_tests {
             std::path::Path::new("/tmp/workspace"),
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1304,6 +1374,7 @@ mod compose_prompt_tests {
             std::path::Path::new("/tmp/workspace"),
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1319,6 +1390,7 @@ mod compose_prompt_tests {
             &chore,
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
         );
@@ -1346,6 +1418,7 @@ mod compose_prompt_tests {
             std::path::Path::new("/tmp/workspace"),
             None,
             None,
+            None,
         );
         let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -1365,6 +1438,7 @@ mod compose_prompt_tests {
             std::path::Path::new("/tmp/workspace"),
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -1379,6 +1453,7 @@ mod compose_prompt_tests {
             &chore_without_pr(),
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
         );
@@ -1396,6 +1471,7 @@ mod compose_prompt_tests {
             &chore,
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
         );
@@ -1418,6 +1494,7 @@ mod compose_prompt_tests {
             std::path::Path::new("/tmp/workspace"),
             None,
             None,
+            None,
         );
         assert!(
             prompt.contains("jj bookmark create"),
@@ -1426,6 +1503,112 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("gh pr create"),
             "acceptance criterion should guide opening a new PR:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn no_recovery_block_when_no_prior_branch() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("STARTUP RECOVERY"),
+            "no recovery block expected when recovery_branch is None:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn recovery_block_injected_when_prior_branch_provided() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            Some("boss/exec_prior123_09"),
+        );
+        assert!(
+            prompt.contains("## STARTUP RECOVERY"),
+            "recovery block should be present when recovery_branch is Some:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("boss/exec_prior123_09"),
+            "recovery block should name the prior branch:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("jj edit boss/exec_prior123_09@origin"),
+            "recovery block should instruct jj edit on the remote branch:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn recovery_block_suppressed_when_pr_url_set() {
+        // When the work item already has a PR URL, the existing RESUME
+        // EXISTING PR path takes precedence; the recovery block must not
+        // also appear (that would be contradictory).
+        let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            Some("boss/exec_prior123_09"),
+        );
+        assert!(
+            !prompt.contains("STARTUP RECOVERY"),
+            "recovery block must not appear when existing PR URL takes precedence:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("## RESUME EXISTING PR"),
+            "RESUME EXISTING PR block should still be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn recovery_block_appears_before_execution_context() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            Some("boss/exec_prior123_09"),
+        );
+        let recovery_pos = prompt.find("## STARTUP RECOVERY").expect("missing recovery block");
+        let exec_pos = prompt.find("Execution context:").expect("missing execution context");
+        assert!(
+            recovery_pos < exec_pos,
+            "recovery block must appear before execution context:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn recovery_block_mentions_new_expected_branch() {
+        // The new worker should push under the NEW expected branch name
+        // (derived from the current execution id), not the prior one.
+        let prompt = compose_execution_prompt(
+            &base_execution(),   // id = "exec_abc123_01"
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            Some("boss/exec_prior123_09"),
+        );
+        // "boss/exec_abc123_01" is the new expected branch
+        assert!(
+            prompt.contains("boss/exec_abc123_01"),
+            "recovery block should mention the new expected branch name:\n{prompt}",
         );
     }
 
