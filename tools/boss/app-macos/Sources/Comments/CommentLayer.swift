@@ -1,4 +1,5 @@
 @preconcurrency import AppKit
+import OSLog
 import SwiftUI
 
 /// Owns the in-memory comment array for a single markdown viewer instance
@@ -21,14 +22,30 @@ final class CommentLayer: NSObject, ObservableObject {
     // tokens are installed/removed only on the main actor.
     nonisolated(unsafe) private var keyMonitor: Any?
     nonisolated(unsafe) private var rightClickMonitor: Any?
+    // mouseUpMonitor tracks left-mouse-up in Textual's NSTextInteractionView so we can
+    // anchor the popover to the text selection even though NSTextInteractionView is not
+    // an NSTextView and never posts NSTextView.didChangeSelectionNotification.
+    nonisolated(unsafe) private var mouseUpMonitor: Any?
 
     /// The NSTextView whose selection seeded the pending comment request.
     /// Captured from NSTextView.didChangeSelectionNotification (the object is the text view).
     /// Queried at present-time via firstRect(forCharacterRange:) — never cached as screen coords.
     private weak var anchorTextView: NSTextView?
 
+    /// Anchor for Textual's NSTextInteractionView (an NSView, NOT NSTextView).
+    /// Textual's selection layer does not use NSTextView, so NSTextView.didChangeSelectionNotification
+    /// never fires for design-doc text selections. Instead we track leftMouseUp events: when the
+    /// user releases the mouse over an NSTextInteractionView (Textual's selection handler),
+    /// we store the view-local coordinates of the mouse release so we can position the popover
+    /// relative to the selection even if the user scrolls between selection and click.
+    private weak var anchorTextInteractionView: NSView?
+    private var anchorLocalPoint: NSPoint?
+
     /// The live NSPopover, if one is currently visible.
     private var activePopover: NSPopover?
+
+    // Logger for anchor diagnostics. Leave at .info so future regressions are diagnosable.
+    private static let logger = Logger(subsystem: "com.boss.app", category: "CommentPopupAnchor")
 
     // MARK: - Monitor lifecycle
 
@@ -60,14 +77,26 @@ final class CommentLayer: NSObject, ObservableObject {
             }
             return consume ? nil : event
         }
+        mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            guard let self else { return event }
+            let win = event.window
+            let loc = event.locationInWindow
+            MainActor.assumeIsolated {
+                self.captureTextInteractionAnchor(window: win, locInWindow: loc)
+            }
+            return event
+        }
     }
 
     func removeMonitors() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = rightClickMonitor { NSEvent.removeMonitor(m); rightClickMonitor = nil }
+        if let m = mouseUpMonitor { NSEvent.removeMonitor(m); mouseUpMonitor = nil }
         NotificationCenter.default.removeObserver(
             self, name: NSTextView.didChangeSelectionNotification, object: nil)
         activePopover?.close()
+        anchorTextInteractionView = nil
+        anchorLocalPoint = nil
     }
 
     /// Called by NotificationCenter on the main thread when any NSTextView changes selection.
@@ -80,6 +109,12 @@ final class CommentLayer: NSObject, ObservableObject {
             // Only update while the popover is closed; the comment form's own
             // NSTextView (CommentTextEditor) would otherwise overwrite the anchor.
             self.anchorTextView = textView
+            // An NSTextView gained focus, so clear any Textual interaction view anchor —
+            // the user is now selecting in a different text layer.
+            self.anchorTextInteractionView = nil
+            self.anchorLocalPoint = nil
+            let tvDesc = String(describing: textView)
+            Self.logger.info("CommentPopupAnchor: (a) NSTextView selection-change; anchorTextView=\(tvDesc)")
         }
     }
 
@@ -90,6 +125,11 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingFirstChar = firstChar
 
         guard let (posRect, posView) = resolveAnchor() else { return }
+
+        let posRectStr = NSStringFromRect(posRect)
+        let posViewDesc = String(describing: posView)
+        let posWindowDesc = String(describing: posView.window)
+        Self.logger.info("CommentPopupAnchor: (b) Add Comment clicked; posRect=\(posRectStr) posView=\(posViewDesc) posView.window=\(posWindowDesc)")
 
         let popover = NSPopover()
         popover.contentViewController = NSHostingController(
@@ -161,11 +201,17 @@ final class CommentLayer: NSObject, ObservableObject {
         return false
     }
 
-    /// Returns the positioning rect (in positioningView coords) and view for NSPopover,
-    /// queried fresh from anchorTextView at present-time. AppKit handles coordinate-space
-    /// conversions natively, so this works correctly across multiple displays.
-    /// Falls back to a rect near the top of the key window when no selection is available.
+    /// Returns the positioning rect (in positioningView coords) and view for NSPopover.
+    /// Three paths, tried in order:
+    ///   1. NSTextView (standard AppKit text): query firstRect(forCharacterRange:) live.
+    ///   2. NSTextInteractionView (Textual): use the view-local point captured at mouseUp time.
+    ///      This view does NOT subclass NSTextView and never posts
+    ///      NSTextView.didChangeSelectionNotification, so we track it separately via a mouseUp
+    ///      event monitor (see captureTextInteractionAnchor). View-local coords survive scrolling
+    ///      between selection and clicking "Add Comment".
+    ///   3. Fallback: near the top-centre of the key window content view.
     private func resolveAnchor() -> (NSRect, NSView)? {
+        // Path 1: Standard NSTextView
         if let tv = anchorTextView, let window = tv.window {
             let range = tv.selectedRange()
             if range.length > 0, range.location != NSNotFound {
@@ -177,21 +223,75 @@ final class CommentLayer: NSObject, ObservableObject {
                     // correctly for any display arrangement without explicit screen lookup.
                     let windowRect = window.convertFromScreen(screenRect)
                     let viewRect = tv.convert(windowRect, from: nil)
+                    let srStr = NSStringFromRect(screenRect)
+                    let vrStr = NSStringFromRect(viewRect)
+                    Self.logger.info("CommentPopupAnchor: resolveAnchor via NSTextView; screenRect=\(srStr) viewRect=\(vrStr)")
                     return (viewRect, tv)
                 }
             }
         }
+
+        // Path 2: Textual's NSTextInteractionView (captured at leftMouseUp time)
+        if let view = anchorTextInteractionView,
+           let window = view.window,
+           window == NSApp.keyWindow,
+           let localPoint = anchorLocalPoint {
+            let anchorRect = NSRect(
+                x: localPoint.x - 4, y: localPoint.y - 4, width: 8, height: 8)
+            let lpStr = NSStringFromPoint(localPoint)
+            let arStr = NSStringFromRect(anchorRect)
+            Self.logger.info("CommentPopupAnchor: resolveAnchor via NSTextInteractionView; localPoint=\(lpStr) anchorRect=\(arStr)")
+            return (anchorRect, view)
+        }
+
         // Fallback: anchor near the top-centre of the key window.
+        // NSHostingView (the window's contentView) is flipped (isFlipped=true), so y=0 is at
+        // the visual top. Using y=60 positions the anchor 60pt below the top regardless.
         if let contentView = NSApp.keyWindow?.contentView {
-            let fallback = NSRect(
-                x: contentView.bounds.midX - 8,
-                y: contentView.bounds.maxY - 60,
-                width: 16,
-                height: 16
-            )
+            let yPos: CGFloat = contentView.isFlipped
+                ? 60
+                : contentView.bounds.maxY - 60
+            let fallback = NSRect(x: contentView.bounds.midX - 8, y: yPos, width: 16, height: 16)
+            let atvDesc = String(describing: anchorTextView)
+            let ativDesc = String(describing: anchorTextInteractionView)
+            let alpDesc = String(describing: anchorLocalPoint)
+            let fbStr = NSStringFromRect(fallback)
+            let flipped = contentView.isFlipped
+            Self.logger.warning("CommentPopupAnchor: resolveAnchor using fallback; anchorTextView=\(atvDesc) anchorTextInteractionView=\(ativDesc) anchorLocalPoint=\(alpDesc) fallback=\(fbStr) isFlipped=\(flipped)")
             return (fallback, contentView)
         }
         return nil
+    }
+
+    /// Called from the leftMouseUp NSEvent monitor. If the event's first responder is
+    /// Textual's NSTextInteractionView, records the mouse-release point in the view's own
+    /// coordinate space. View-local coordinates remain valid after scrolling — AppKit converts
+    /// them to screen space at NSPopover presentation time.
+    ///
+    /// NSTextInteractionView (Textual's selection overlay) calls window.makeFirstResponder(self)
+    /// in mouseDown, so by mouseUp it IS the first responder whenever text is being selected.
+    /// The class name check guards against false positives from unrelated NSViews.
+    private func captureTextInteractionAnchor(window: NSWindow?, locInWindow: NSPoint) {
+        guard !isShowingPopover, let window else { return }
+        guard let firstResponder = window.firstResponder as? NSView else { return }
+
+        // Textual's NSTextInteractionView is NOT an NSTextView; it's an NSView subclass
+        // internal to the Textual package. We identify it by class name because we cannot
+        // import the internal type. If this class name ever changes, the fallback anchor
+        // is used instead (no worse than before this fix).
+        let typeName = String(describing: type(of: firstResponder))
+        guard typeName == "NSTextInteractionView" else { return }
+
+        // Convert the mouse-release point to the view's own coordinate space.
+        // NSTextInteractionView has isFlipped=true; AppKit handles the Y-flip when converting
+        // from window coordinates (Y-up) to the view's space (Y-down).
+        let localPoint = firstResponder.convert(locInWindow, from: nil)
+        anchorTextInteractionView = firstResponder
+        anchorLocalPoint = localPoint
+
+        let liwStr = NSStringFromPoint(locInWindow)
+        let lpStr2 = NSStringFromPoint(localPoint)
+        Self.logger.info("CommentPopupAnchor: (a) NSTextInteractionView selection-change; typeName=\(typeName) locInWindow=\(liwStr) localPoint=\(lpStr2)")
     }
 
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
