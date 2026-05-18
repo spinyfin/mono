@@ -21,6 +21,14 @@ steps:
     key: "bazel-build"
     command: ".buildkite/steps/bazel-build.sh"
     depends_on: "bootstrap"
+    # Cold-cache compiles on a fresh linux-amd64 agent dominate this step:
+    # cranelift_codegen (~1200s) and engine_lib (~1200s) are the long pole.
+    # The agent's default ~30-minute job timeout has killed cold-cache runs
+    # (e.g. buildkite/mono/308 and /309, both exit -1 at ~1900s) mid-compile.
+    # 60 minutes gives the slowest Rust crates room to finish; warm-cache runs
+    # still complete in seconds, so this only matters when the local disk cache
+    # is empty.
+    timeout_in_minutes: 60
     artifact_paths:
       - "bazel-out/**/extra_action_outputs/**/*"
     agents:
