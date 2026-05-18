@@ -833,6 +833,27 @@ final class ChatViewModel: ObservableObject {
         pendingWorkEditRequest = nil
     }
 
+    func setProductExternalTracker(
+        productId: String,
+        kind: String,
+        org: String,
+        repo: String,
+        projectNumber: Int,
+        reverseClose: Bool
+    ) {
+        let config: [String: Any] = [
+            "org": org,
+            "repo": repo,
+            "project_number": projectNumber,
+            "reverse_close": reverseClose,
+        ]
+        engine.sendSetProductExternalTracker(productId: productId, kind: kind, config: config)
+    }
+
+    func unsetProductExternalTracker(productId: String) {
+        engine.sendUnsetProductExternalTracker(productId: productId)
+    }
+
     func deleteSelectedWorkItem() {
         guard let task = selectedTask else { return }
         engine.sendDeleteWorkItem(id: task.id)

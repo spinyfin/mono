@@ -216,6 +216,23 @@ struct ContentView: View {
                         priority: priority,
                         prURL: prURL
                     )
+                },
+                onSetTracker: { kind, org, repo, projectNumber, reverseClose in
+                    if case .product(let product) = request.item {
+                        model.setProductExternalTracker(
+                            productId: product.id,
+                            kind: kind,
+                            org: org,
+                            repo: repo,
+                            projectNumber: projectNumber,
+                            reverseClose: reverseClose
+                        )
+                    }
+                },
+                onUnsetTracker: {
+                    if case .product(let product) = request.item {
+                        model.unsetProductExternalTracker(productId: product.id)
+                    }
                 }
             )
         }
@@ -2540,6 +2557,8 @@ private struct WorkEditSheet: View {
     let request: WorkEditRequest
     let onCancel: () -> Void
     let onSave: (String, String, String, String, String, String, String) -> Void
+    let onSetTracker: ((String, String, String, Int, Bool) -> Void)?
+    let onUnsetTracker: (() -> Void)?
 
     @State private var name: String
     @State private var description: String
@@ -2549,14 +2568,27 @@ private struct WorkEditSheet: View {
     @State private var priority: String
     @State private var prURL: String
 
+    // External tracker state (product only)
+    @State private var trackerKind: String
+    @State private var trackerOrg: String
+    @State private var trackerRepo: String
+    @State private var trackerProjectNumber: String
+    @State private var trackerReverseClose: Bool
+    // True if the product had a tracker bound when the sheet opened.
+    private let initialTrackerBound: Bool
+
     init(
         request: WorkEditRequest,
         onCancel: @escaping () -> Void,
-        onSave: @escaping (String, String, String, String, String, String, String) -> Void
+        onSave: @escaping (String, String, String, String, String, String, String) -> Void,
+        onSetTracker: ((String, String, String, Int, Bool) -> Void)? = nil,
+        onUnsetTracker: (() -> Void)? = nil
     ) {
         self.request = request
         self.onCancel = onCancel
         self.onSave = onSave
+        self.onSetTracker = onSetTracker
+        self.onUnsetTracker = onUnsetTracker
 
         switch request.item {
         case .product(let product):
@@ -2567,6 +2599,33 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: "")
             _priority = State(initialValue: "")
             _prURL = State(initialValue: "")
+
+            if let kind = product.externalTrackerKind,
+               let configJSON = product.externalTrackerConfig,
+               let configData = configJSON.data(using: .utf8),
+               let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] {
+                _trackerKind = State(initialValue: kind)
+                _trackerOrg = State(initialValue: config["org"] as? String ?? "")
+                _trackerRepo = State(initialValue: config["repo"] as? String ?? "")
+                let projectNum = config["project_number"]
+                if let n = projectNum as? Int {
+                    _trackerProjectNumber = State(initialValue: String(n))
+                } else if let n = projectNum as? Double {
+                    _trackerProjectNumber = State(initialValue: String(Int(n)))
+                } else {
+                    _trackerProjectNumber = State(initialValue: "")
+                }
+                _trackerReverseClose = State(initialValue: config["reverse_close"] as? Bool ?? false)
+                initialTrackerBound = true
+            } else {
+                _trackerKind = State(initialValue: "github")
+                _trackerOrg = State(initialValue: "")
+                _trackerRepo = State(initialValue: "")
+                _trackerProjectNumber = State(initialValue: "")
+                _trackerReverseClose = State(initialValue: false)
+                initialTrackerBound = false
+            }
+
         case .project(let project):
             _name = State(initialValue: project.name)
             _description = State(initialValue: project.description)
@@ -2575,6 +2634,12 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: project.goal)
             _priority = State(initialValue: project.priority)
             _prURL = State(initialValue: "")
+            _trackerKind = State(initialValue: "github")
+            _trackerOrg = State(initialValue: "")
+            _trackerRepo = State(initialValue: "")
+            _trackerProjectNumber = State(initialValue: "")
+            _trackerReverseClose = State(initialValue: false)
+            initialTrackerBound = false
         case .task(let task), .chore(let task):
             _name = State(initialValue: task.name)
             _description = State(initialValue: task.description)
@@ -2583,6 +2648,12 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: "")
             _priority = State(initialValue: task.priority)
             _prURL = State(initialValue: task.prURL ?? "")
+            _trackerKind = State(initialValue: "github")
+            _trackerOrg = State(initialValue: "")
+            _trackerRepo = State(initialValue: "")
+            _trackerProjectNumber = State(initialValue: "")
+            _trackerReverseClose = State(initialValue: false)
+            initialTrackerBound = false
         }
     }
 
@@ -2602,6 +2673,21 @@ private struct WorkEditSheet: View {
                     }
                 }
                 TextField("Remote URL", text: $repoRemoteURL)
+
+                Divider()
+                    .padding(.vertical, 2)
+
+                ExternalTrackerSection(
+                    trackerKind: $trackerKind,
+                    trackerOrg: $trackerOrg,
+                    trackerRepo: $trackerRepo,
+                    trackerProjectNumber: $trackerProjectNumber,
+                    trackerReverseClose: $trackerReverseClose,
+                    initialTrackerBound: initialTrackerBound,
+                    onSetTracker: onSetTracker,
+                    onUnsetTracker: onUnsetTracker
+                )
+
             case .project:
                 Picker("Status", selection: $status) {
                     ForEach(["planned", "active", "blocked", "done", "archived"], id: \.self) { status in
@@ -2653,6 +2739,65 @@ private struct WorkEditSheet: View {
         case .chore:
             return "Edit Chore"
         }
+    }
+}
+
+/// External tracker sub-form embedded in the product edit sheet.
+/// Mirrors the `boss product set-external-tracker` CLI surface.
+private struct ExternalTrackerSection: View {
+    @Binding var trackerKind: String
+    @Binding var trackerOrg: String
+    @Binding var trackerRepo: String
+    @Binding var trackerProjectNumber: String
+    @Binding var trackerReverseClose: Bool
+
+    let initialTrackerBound: Bool
+    let onSetTracker: ((String, String, String, Int, Bool) -> Void)?
+    let onUnsetTracker: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("External Tracker")
+                .font(.headline)
+
+            Picker("Kind", selection: $trackerKind) {
+                Text("GitHub").tag("github")
+            }
+
+            if trackerKind == "github" {
+                TextField("Organization", text: $trackerOrg)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Repository", text: $trackerRepo)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Project Number", text: $trackerProjectNumber)
+                    .textFieldStyle(.roundedBorder)
+                Toggle("Reverse-close", isOn: $trackerReverseClose)
+                    .help("When a work item is marked done without a merged PR, close the upstream GitHub issue.")
+
+                HStack {
+                    if initialTrackerBound {
+                        Button("Unset", role: .destructive) {
+                            onUnsetTracker?()
+                        }
+                    }
+                    Spacer()
+                    Button("Save Tracker") {
+                        if let num = Int(trackerProjectNumber) {
+                            onSetTracker?("github", trackerOrg, trackerRepo, num, trackerReverseClose)
+                        }
+                    }
+                    .disabled(!trackerFormValid)
+                }
+            }
+        }
+    }
+
+    private var trackerFormValid: Bool {
+        guard trackerKind == "github" else { return false }
+        let org = trackerOrg.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repo = trackerRepo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !org.isEmpty && !repo.isEmpty && Int(project) != nil
     }
 }
 
