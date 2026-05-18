@@ -5787,6 +5787,256 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::ListCiRemediations {
+                product_id,
+                status,
+                work_item_id,
+                limit,
+            } => {
+                // Read-only listing surface for `boss engine ci list`
+                // (design Phase 11 #35). Mirror of
+                // `ListConflictResolutions`.
+                match work_db.list_ci_remediations(
+                    product_id.as_deref(),
+                    &status,
+                    work_item_id.as_deref(),
+                    limit,
+                ) {
+                    Ok(attempts) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiRemediationsList { attempts },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetCiRemediation { attempt_id } => {
+                match work_db.get_ci_remediation(&attempt_id) {
+                    Ok(Some(attempt)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiRemediation { attempt },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {attempt_id:?} is unknown",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::RetryCiRemediation { selector } => {
+                // The CLI accepts either a `ci_remediations` attempt id
+                // or a work-item id (design Q11 "When invoked on an
+                // attempt id, the engine resolves the attempt to its
+                // work_item_id and acts on the parent."). Resolve the
+                // selector before invoking the engine path so the
+                // error messages stay grounded in what the caller
+                // typed.
+                let resolved: Result<Option<String>, anyhow::Error> = if selector
+                    .starts_with("cir_")
+                {
+                    work_db
+                        .get_ci_remediation(&selector)
+                        .map(|opt| opt.map(|a| a.work_item_id))
+                } else {
+                    Ok(Some(selector.clone()))
+                };
+                match resolved {
+                    Ok(Some(work_item_id)) => {
+                        match work_db.retry_ci_remediation_for_work_item(&work_item_id) {
+                            Ok(Some((budget, was_exhausted))) => {
+                                tracing::warn!(
+                                    %work_item_id,
+                                    was_exhausted,
+                                    "retry_ci_remediation: budget reset, parent unblocked={was_exhausted}",
+                                );
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::CiRemediationRetryDone {
+                                        work_item_id,
+                                        budget,
+                                        was_exhausted,
+                                    },
+                                );
+                            }
+                            Ok(None) => send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: format!(
+                                        "work item {work_item_id:?} is unknown",
+                                    ),
+                                },
+                            ),
+                            Err(err) => send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: err.to_string(),
+                                },
+                            ),
+                        }
+                    }
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {selector:?} is unknown",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::AbandonCiRemediation { attempt_id, reason } => {
+                match work_db.mark_ci_remediation_abandoned(&attempt_id, &reason) {
+                    Ok(Some(attempt)) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            pr_url = %attempt.pr_url,
+                            %reason,
+                            "abandon_ci_remediation: attempt flipped to abandoned",
+                        );
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::CiRemediationAbandoned {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                    failure_reason: reason.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::CiRemediationMarkedAbandoned { attempt },
+                        );
+                    }
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetCiBudget { work_item_id } => {
+                match work_db.ci_budget_snapshot(&work_item_id) {
+                    Ok(Some(budget)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiBudget { budget },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!("work item {work_item_id:?} is unknown"),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::SetCiBudget {
+                work_item_id,
+                budget,
+            } => {
+                match work_db.set_ci_attempt_budget(&work_item_id, budget) {
+                    Ok(Some(snapshot)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiBudgetUpdated { budget: snapshot },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!("work item {work_item_id:?} is unknown"),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::ListEngineAttempts {
+                kinds,
+                product_id,
+                status,
+                work_item_id,
+                limit,
+            } => {
+                match work_db.list_engine_attempts(
+                    &kinds,
+                    product_id.as_deref(),
+                    &status,
+                    work_item_id.as_deref(),
+                    limit,
+                ) {
+                    Ok(attempts) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::EngineAttemptsList { attempts },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
             FrontendRequest::SetProductDefaultModel { product_id, model } => {
                 match work_db.set_product_default_model(&product_id, model.as_deref()) {
                     Ok(product) => {

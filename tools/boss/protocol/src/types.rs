@@ -771,6 +771,77 @@ pub struct ExecutionReconcileResult {
     pub updated: Vec<WorkExecution>,
 }
 
+/// Snapshot of a per-PR CI attempt budget — the wire shape behind the
+/// `boss engine ci budget show <work-item-id>` verb (design Phase 11
+/// #35). `per_pr_override` is the value of `tasks.ci_attempt_budget`
+/// when it has been explicitly set on the PR (otherwise `None`).
+/// `product_default` is the product's `ci_attempt_budget` (defaults to
+/// `3` when the column is unset). `effective` is what the engine
+/// actually uses for budget checks (`per_pr_override` when present,
+/// else `product_default`, clamped to `0..=10`). `used` is the live
+/// `tasks.ci_attempts_used` counter.
+///
+/// `blocked_reason` carries the parent's current `tasks.blocked_reason`
+/// when the task is `status='blocked'`, so the CLI can surface "now
+/// exhausted" vs "now in-flight". `None` when the parent is not blocked
+/// (e.g. `in_review` / `done`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiBudgetSnapshot {
+    pub work_item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_pr_override: Option<i64>,
+    pub product_default: i64,
+    pub effective: i64,
+    pub used: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// One row in the unified `boss engine attempts list` v2 result —
+/// design Phase 11 #36. A small projection across three attempt
+/// subsystems (`conflict_resolutions`, `rebase_attempts`,
+/// `ci_remediations`) with a `kind` discriminator. The full per-row
+/// state still lives on its origin table; this view is the columns the
+/// shared list view needs (id, kind, status, work item, PR, reason,
+/// timestamps) — callers fetching deeper detail switch to the
+/// kind-specific `show` verb.
+///
+/// `kind` is one of:
+/// - `"conflict"`  — `conflict_resolutions` row (merge-conflict flow)
+/// - `"rebase"`    — `rebase_attempts` row (auto-rebase flow)
+/// - `"ci"`        — `ci_remediations` row (CI-failure flow)
+///
+/// `work_item_id` is the parent's id where the kind has one;
+/// `rebase_attempts` is keyed on `dependent_pr_url`, so its
+/// `work_item_id` may be `None` (depending on schema as it lands).
+///
+/// `extra` carries kind-specific scalar values that are useful in the
+/// shared list view but don't justify a column — currently
+/// `attempt_kind` for `ci` rows. The contract is "stringly typed
+/// extras"; consumers index by key and tolerate absence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineAttemptListEntry {
+    pub kind: String,
+    pub id: String,
+    pub product_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    pub pr_url: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// Kind-specific scalar columns the consumer may want to render
+    /// (e.g. `attempt_kind` for `ci`). Stringly-typed; consumers
+    /// fall back to the kind-specific `show` verb for deep detail.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
 /// Live runtime status for a single task/chore — the current execution
 /// and most recent run, summarized for the kanban view. `None` fields
 /// mean no execution (or no run) exists yet for the work item.

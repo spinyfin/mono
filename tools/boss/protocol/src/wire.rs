@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, CiRemediation, ConflictResolution, CreateAttentionItemInput,
-    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter,
-    LinkExternalRefInput, ListDependenciesInput, Product, Project, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    AddDependencyInput, CiBudgetSnapshot, CiRemediation, ConflictResolution,
+    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
+    DependencyFilter, EngineAttemptListEntry, LinkExternalRefInput, ListDependenciesInput, Product,
+    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
+    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -652,6 +653,81 @@ pub enum FrontendRequest {
     UnlinkWorkItemExternalRef {
         work_item_id: String,
     },
+    /// Read-only: list `ci_remediations` rows. The CLI surface is
+    /// `boss engine ci list` (design Phase 11 #35). Filters are AND-ed;
+    /// an empty `status` list matches every status. Ordering is
+    /// `created_at DESC, id DESC` so the freshest attempt is first.
+    ListCiRemediations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Read-only: fetch a single `ci_remediations` row by id. Returns
+    /// [`FrontendEvent::CiRemediation`] on success and
+    /// [`FrontendEvent::WorkError`] when the id is unknown.
+    GetCiRemediation { attempt_id: String },
+    /// User-facing reset for an `in_review` PR that has been blocked
+    /// by the CI auto-fix flow. Accepts either a work-item id or a
+    /// `ci_remediations` attempt id (the engine resolves an attempt id
+    /// to its parent's `work_item_id`). Resets `tasks.ci_attempts_used`
+    /// to 0 and, when the parent is `blocked: ci_failure_exhausted`,
+    /// flips it back to `in_review` so the next merge-poller sweep
+    /// re-fires the auto-fix path. Design Phase 11 #35; see also Q11.
+    RetryCiRemediation {
+        /// Either a `ci_remediations` attempt id (`cir_…`) or a
+        /// work-item id. The engine handles both shapes.
+        selector: String,
+    },
+    /// Engine-side abandon for a non-terminal `ci_remediations`
+    /// attempt. Distinct from `MarkCiRemediationFailed` (the
+    /// worker-facing "I gave up" surface) in that the caller is
+    /// explicitly stepping away (manual override). Idempotent on rows
+    /// already terminal — returns [`FrontendEvent::WorkError`].
+    AbandonCiRemediation {
+        attempt_id: String,
+        reason: String,
+    },
+    /// Read-only: snapshot a work item's CI attempt budget — the
+    /// `tasks.ci_attempt_budget` override, the product's default, the
+    /// effective value the engine uses, and the live
+    /// `tasks.ci_attempts_used` counter. Backs the
+    /// `boss engine ci budget show <work-item-id>` verb.
+    GetCiBudget { work_item_id: String },
+    /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`
+    /// override. Pass `Some(n)` (clamped server-side to `0..=10`) or
+    /// `None` (clear → product default applies). Backs
+    /// `boss engine ci budget set`.
+    SetCiBudget {
+        work_item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<i64>,
+    },
+    /// Read-only: list rows from any of the three attempt subsystems
+    /// (`conflict_resolutions`, `rebase_attempts`, `ci_remediations`),
+    /// projected through the [`EngineAttemptListEntry`] shape with a
+    /// `kind` discriminator. Design Phase 11 #36.
+    ///
+    /// `kinds` is the set of `kind` values to include; an empty vec
+    /// matches all three. `status` is AND-ed across all included
+    /// kinds (each row is filtered by its own table's `status`
+    /// column). Ordering: `created_at DESC` across the merged set.
+    ListEngineAttempts {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kinds: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1213,6 +1289,49 @@ pub enum FrontendEvent {
     /// is the "pass started" confirmation rather than a streaming
     /// progress push.
     ExternalTrackerSyncStarted { product_id: String },
+    /// Response to [`FrontendRequest::ListCiRemediations`]: the
+    /// filtered set of `ci_remediations` rows, ordered freshest-first.
+    CiRemediationsList {
+        attempts: Vec<CiRemediation>,
+    },
+    /// Response to [`FrontendRequest::GetCiRemediation`]: a single
+    /// `ci_remediations` row by id.
+    CiRemediation {
+        attempt: CiRemediation,
+    },
+    /// Response to [`FrontendRequest::RetryCiRemediation`]: the parent
+    /// work item's CI budget after the retry path ran. Echoes the
+    /// `work_item_id` the engine resolved (so a caller that passed an
+    /// attempt id can confirm the parent). `was_exhausted` indicates
+    /// whether the parent was in `blocked: ci_failure_exhausted` at
+    /// the time of the call (and is now back at `in_review`); `false`
+    /// means the parent wasn't exhausted and the retry was a counter
+    /// reset only.
+    CiRemediationRetryDone {
+        work_item_id: String,
+        budget: CiBudgetSnapshot,
+        was_exhausted: bool,
+    },
+    /// Response to [`FrontendRequest::AbandonCiRemediation`]: the row
+    /// after the flip to `abandoned`.
+    CiRemediationMarkedAbandoned {
+        attempt: CiRemediation,
+    },
+    /// Response to [`FrontendRequest::GetCiBudget`].
+    CiBudget {
+        budget: CiBudgetSnapshot,
+    },
+    /// Response to [`FrontendRequest::SetCiBudget`]: the post-update
+    /// snapshot of the work item's CI budget.
+    CiBudgetUpdated {
+        budget: CiBudgetSnapshot,
+    },
+    /// Response to [`FrontendRequest::ListEngineAttempts`]: the
+    /// projected and merged row set, ordered freshest-first across the
+    /// three attempt subsystems.
+    EngineAttemptsList {
+        attempts: Vec<EngineAttemptListEntry>,
+    },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.

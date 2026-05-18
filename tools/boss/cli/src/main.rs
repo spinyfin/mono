@@ -8,14 +8,14 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_CLI, ConflictResolution, CreateChoreInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
-    EffortLevel, FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
-    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch,
+    AddDependencyInput, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
+    CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
+    EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent, FrontendRequest,
+    LinkExternalRefInput, ListDependenciesInput, Product, Project, ProjectDesignDocState,
+    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -380,17 +380,44 @@ enum EngineCommand {
         #[command(subcommand)]
         command: EngineConflictsCommand,
     },
-    /// Worker-facing markers for the CI-remediation attempt table
-    /// (`ci_remediations`). Phase 9 #30 of
+    /// Inspect and manage the CI-remediation attempt table
+    /// (`ci_remediations`) plus the per-PR CI attempt budget.
+    /// Phase 9 #30 / Phase 11 #35 of
     /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`.
     Ci {
         #[command(subcommand)]
         command: EngineCiCommand,
     },
+    /// Unified view across the three engine attempt subsystems
+    /// (`conflict_resolutions`, `rebase_attempts`, `ci_remediations`).
+    /// Design Phase 11 #36.
+    Attempts {
+        #[command(subcommand)]
+        command: EngineAttemptsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum EngineCiCommand {
+    /// List `ci_remediations` rows, freshest first. Filters are
+    /// AND-ed; omit them all to see every attempt. Human output is a
+    /// table; `--json` emits the full row vector.
+    List(EngineCiListArgs),
+    /// Show a single `ci_remediations` row by id. Carries every
+    /// column the engine has for the attempt, including the
+    /// `failed_checks` JSON blob and `log_excerpt` — useful when
+    /// debugging what the worker was handed.
+    Show(EngineCiShowArgs),
+    /// Reset a parent's CI-attempt counter to 0 and (when the parent
+    /// is in `blocked: ci_failure_exhausted`) flip it back to
+    /// `in_review`. The next merge-poller sweep observes the failing
+    /// CI and re-fires the auto-fix flow. Accepts either a
+    /// `ci_remediations` attempt id or a work-item id.
+    Retry(EngineCiRetryArgs),
+    /// Mark a non-terminal `ci_remediations` attempt `abandoned`
+    /// (distinct from `mark-failed`: the caller is explicitly
+    /// stepping away rather than declaring the worker gave up).
+    Abandon(EngineCiAbandonArgs),
     /// Stamp the worker's post-log triage decision on a
     /// `ci_remediations` attempt. Canonical values:
     /// `tractable`, `flaky_or_infra`, `unfixable`. Pure metadata
@@ -411,6 +438,120 @@ enum EngineCiCommand {
     /// `consumes_budget = 0` and decrements `tasks.ci_attempts_used`
     /// to refund the detection-side bump.
     MarkSucceededViaRebase(EngineCiMarkSucceededViaRebaseArgs),
+    /// Per-PR / per-product CI attempt budget management.
+    Budget {
+        #[command(subcommand)]
+        command: EngineCiBudgetCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCiBudgetCommand {
+    /// Print the effective CI attempt budget for a work item — the
+    /// per-PR override (if set), the product default, the effective
+    /// value the engine uses, and the current `ci_attempts_used`
+    /// counter.
+    Show(EngineCiBudgetShowArgs),
+    /// Set (or clear) the per-PR `tasks.ci_attempt_budget` override.
+    /// Pass `--budget N` (clamped server-side to 0..=10) or `--clear`
+    /// to remove the override and inherit the product default.
+    Set(EngineCiBudgetSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineAttemptsCommand {
+    /// List rows from any of the three engine attempt subsystems
+    /// with a `kind` discriminator column. Mirrors `boss engine
+    /// conflicts list` / `boss engine ci list` for callers who want
+    /// one merged view (design Phase 11 #36).
+    List(EngineAttemptsListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiListArgs {
+    /// Filter to a single product (id or slug). Omit for all products.
+    #[arg(long)]
+    product: Option<String>,
+    /// Filter by status. Repeatable / comma-separated. Documented
+    /// values: pending, running, succeeded, failed, abandoned,
+    /// superseded.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<String>,
+    /// Filter to a single parent work item id.
+    #[arg(long = "work-item")]
+    work_item: Option<String>,
+    /// Cap the number of returned rows. Engine returns every match
+    /// when omitted; the CLI default is 50 to keep human output
+    /// readable. Pass `--limit 0` for no cap (useful for JSON callers).
+    #[arg(long)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiShowArgs {
+    /// Attempt id from the `ci_remediations` table (`cir_…`).
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiRetryArgs {
+    /// Either a `ci_remediations` attempt id (`cir_…`) or a work-item
+    /// id. The engine resolves an attempt id to its parent and acts
+    /// on the parent.
+    selector: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiAbandonArgs {
+    /// Attempt id from the `ci_remediations` table (`cir_…`).
+    attempt_id: String,
+    /// Free-form reason stored verbatim in `failure_reason`.
+    /// Default: `manual_abandon`.
+    #[arg(long, default_value = "manual_abandon")]
+    reason: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiBudgetShowArgs {
+    /// Work item id (`chr_…` / `tsk_…`). Friendly numeric / short ids
+    /// are not resolved at the CLI level — pass the canonical id.
+    work_item_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiBudgetSetArgs {
+    /// Work item id.
+    work_item_id: String,
+    /// New per-PR override. Clamped server-side to `0..=10`.
+    /// `--budget 0` means "notify only" (no auto-fix attempts).
+    #[arg(long, value_name = "N", conflicts_with = "clear")]
+    budget: Option<i64>,
+    /// Clear the per-PR override so the product default applies.
+    #[arg(long, conflicts_with = "budget")]
+    clear: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineAttemptsListArgs {
+    /// Filter to one or more attempt kinds. Repeatable /
+    /// comma-separated. Documented values: `conflict`, `rebase`, `ci`.
+    /// Omit to include all three.
+    #[arg(long, value_delimiter = ',')]
+    kind: Vec<String>,
+    /// Filter to a single product (id or slug). Omit for all products.
+    #[arg(long)]
+    product: Option<String>,
+    /// Filter by status. Repeatable / comma-separated. Applied per
+    /// kind against each table's own `status` column.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<String>,
+    /// Filter to a single parent work item id.
+    #[arg(long = "work-item")]
+    work_item: Option<String>,
+    /// Cap the number of returned rows. Defaults to 50; pass
+    /// `--limit 0` for no cap.
+    #[arg(long)]
+    limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2604,6 +2745,7 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
         }
         EngineCommand::Conflicts { command } => run_engine_conflicts_command(command, ctx).await,
         EngineCommand::Ci { command } => run_engine_ci_command(command, ctx).await,
+        EngineCommand::Attempts { command } => run_engine_attempts_command(command, ctx).await,
     }
 }
 
@@ -2734,6 +2876,225 @@ async fn run_engine_ci_command(
                     Err(CliError::application(message))
                 }
                 other => Err(unexpected_event("ci mark-succeeded-via-rebase", &other)),
+            }
+        }
+        EngineCiCommand::List(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let product_id = match args.product.clone() {
+                Some(selector) => Some(
+                    resolve_product(&mut client, Some(selector), ctx)
+                        .await?
+                        .id,
+                ),
+                None => None,
+            };
+            // Mirror conflicts: `--limit 0` → no cap, default 50.
+            let limit = match args.limit {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(50),
+            };
+            let response = client
+                .send_request(&FrontendRequest::ListCiRemediations {
+                    product_id,
+                    status: args.status.clone(),
+                    work_item_id: args.work_item.clone(),
+                    limit,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationsList { attempts } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempts": attempts }),
+                    || print_ci_remediations_table(&attempts),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci list", &other)),
+            }
+        }
+        EngineCiCommand::Show(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::GetCiRemediation {
+                    attempt_id: args.attempt_id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediation { attempt } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt }),
+                    || print_ci_remediation_detail(&attempt),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci show", &other)),
+            }
+        }
+        EngineCiCommand::Retry(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::RetryCiRemediation {
+                    selector: args.selector.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationRetryDone {
+                    work_item_id,
+                    budget,
+                    was_exhausted,
+                } => print_entity(
+                    ctx,
+                    &serde_json::json!({
+                        "work_item_id": work_item_id,
+                        "budget": budget,
+                        "was_exhausted": was_exhausted,
+                    }),
+                    || {
+                        if !ctx.quiet {
+                            print_ci_budget_after_retry(&work_item_id, &budget, was_exhausted);
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci retry", &other)),
+            }
+        }
+        EngineCiCommand::Abandon(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::AbandonCiRemediation {
+                    attempt_id: args.attempt_id.clone(),
+                    reason: args.reason.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationMarkedAbandoned { attempt } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt }),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "ci_remediation {} marked abandoned (reason: {}).",
+                                attempt.id,
+                                attempt.failure_reason.as_deref().unwrap_or("<unset>"),
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci abandon", &other)),
+            }
+        }
+        EngineCiCommand::Budget { command } => match command {
+            EngineCiBudgetCommand::Show(args) => {
+                let mut client = connect_for_work(ctx).await?;
+                let response = client
+                    .send_request(&FrontendRequest::GetCiBudget {
+                        work_item_id: args.work_item_id.clone(),
+                    })
+                    .await
+                    .map_err(CliError::internal)?;
+                match response {
+                    FrontendEvent::CiBudget { budget } => print_entity(
+                        ctx,
+                        &serde_json::json!({ "budget": budget }),
+                        || {
+                            if !ctx.quiet {
+                                print_ci_budget_snapshot(&budget);
+                            }
+                        },
+                    ),
+                    FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                        Err(CliError::application(message))
+                    }
+                    other => Err(unexpected_event("ci budget show", &other)),
+                }
+            }
+            EngineCiBudgetCommand::Set(args) => {
+                if args.budget.is_none() && !args.clear {
+                    return Err(CliError::usage(
+                        "specify --budget <n> to set a per-PR override or --clear to remove it",
+                    ));
+                }
+                let mut client = connect_for_work(ctx).await?;
+                let response = client
+                    .send_request(&FrontendRequest::SetCiBudget {
+                        work_item_id: args.work_item_id.clone(),
+                        budget: if args.clear { None } else { args.budget },
+                    })
+                    .await
+                    .map_err(CliError::internal)?;
+                match response {
+                    FrontendEvent::CiBudgetUpdated { budget } => print_entity(
+                        ctx,
+                        &serde_json::json!({ "budget": budget }),
+                        || {
+                            if !ctx.quiet {
+                                print_ci_budget_snapshot(&budget);
+                            }
+                        },
+                    ),
+                    FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                        Err(CliError::application(message))
+                    }
+                    other => Err(unexpected_event("ci budget set", &other)),
+                }
+            }
+        },
+    }
+}
+
+async fn run_engine_attempts_command(
+    command: EngineAttemptsCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        EngineAttemptsCommand::List(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let product_id = match args.product.clone() {
+                Some(selector) => Some(
+                    resolve_product(&mut client, Some(selector), ctx)
+                        .await?
+                        .id,
+                ),
+                None => None,
+            };
+            let limit = match args.limit {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(50),
+            };
+            let response = client
+                .send_request(&FrontendRequest::ListEngineAttempts {
+                    kinds: args.kind.clone(),
+                    product_id,
+                    status: args.status.clone(),
+                    work_item_id: args.work_item.clone(),
+                    limit,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::EngineAttemptsList { attempts } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempts": attempts }),
+                    || print_engine_attempts_table(&attempts),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("attempts list", &other)),
             }
         }
     }
@@ -2972,6 +3333,156 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
         println!("conflict_diagnosis (raw):");
         println!("{diag}");
     }
+}
+
+fn print_ci_remediations_table(attempts: &[CiRemediation]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
+        ]);
+    for attempt in attempts {
+        table.add_row(vec![
+            attempt.id.as_str(),
+            attempt.attempt_kind.as_str(),
+            attempt.status.as_str(),
+            attempt.pr_url.as_str(),
+            attempt.work_item_id.as_str(),
+            attempt.failure_reason.as_deref().unwrap_or(""),
+            attempt.created_at.as_str(),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn print_ci_remediation_detail(attempt: &CiRemediation) {
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["FIELD", "VALUE"]);
+    let unset = "<unset>".to_owned();
+    let rows: Vec<(&str, String)> = vec![
+        ("id", attempt.id.clone()),
+        ("status", attempt.status.clone()),
+        ("attempt_kind", attempt.attempt_kind.clone()),
+        ("consumes_budget", attempt.consumes_budget.to_string()),
+        ("product_id", attempt.product_id.clone()),
+        ("work_item_id", attempt.work_item_id.clone()),
+        ("pr_url", attempt.pr_url.clone()),
+        ("pr_number", attempt.pr_number.to_string()),
+        ("head_branch", attempt.head_branch.clone()),
+        ("head_sha_at_trigger", attempt.head_sha_at_trigger.clone()),
+        (
+            "head_sha_after",
+            attempt.head_sha_after.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "triage_class",
+            attempt.triage_class.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "failure_reason",
+            attempt.failure_reason.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "cube_lease_id",
+            attempt.cube_lease_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "cube_workspace_id",
+            attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "worker_id",
+            attempt.worker_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        ("created_at", attempt.created_at.clone()),
+        (
+            "started_at",
+            attempt.started_at.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "finished_at",
+            attempt.finished_at.clone().unwrap_or_else(|| unset.clone()),
+        ),
+    ];
+    for (field, value) in &rows {
+        table.add_row(vec![*field, value.as_str()]);
+    }
+    println!("{table}");
+    if !attempt.failed_checks.is_empty() {
+        println!();
+        println!("failed_checks (raw):");
+        println!("{}", attempt.failed_checks);
+    }
+    if let Some(log) = &attempt.log_excerpt {
+        println!();
+        println!("log_excerpt:");
+        println!("{log}");
+    }
+}
+
+fn print_ci_budget_snapshot(snapshot: &CiBudgetSnapshot) {
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["FIELD", "VALUE"]);
+    let override_text = match snapshot.per_pr_override {
+        Some(n) => n.to_string(),
+        None => "<inherit>".to_owned(),
+    };
+    let blocked = snapshot.blocked_reason.clone().unwrap_or_else(|| "—".to_owned());
+    let rows = vec![
+        ("work_item_id", snapshot.work_item_id.clone()),
+        ("per_pr_override", override_text),
+        ("product_default", snapshot.product_default.to_string()),
+        ("effective", snapshot.effective.to_string()),
+        ("used", snapshot.used.to_string()),
+        ("blocked_reason", blocked),
+    ];
+    for (field, value) in &rows {
+        table.add_row(vec![*field, value.as_str()]);
+    }
+    println!("{table}");
+}
+
+fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, was_exhausted: bool) {
+    if was_exhausted {
+        println!(
+            "Reset ci_attempts_used for {} (used: {}/{} effective).",
+            work_item_id, budget.used, budget.effective,
+        );
+        println!("Cleared blocked_reason='ci_failure_exhausted'.");
+        println!(
+            "Parent will re-enter in_review on next probe; engine will auto-fix on detection of failure.",
+        );
+    } else {
+        println!(
+            "Reset ci_attempts_used for {} (used: {}/{} effective).",
+            work_item_id, budget.used, budget.effective,
+        );
+        println!("Parent was not exhausted; no status change.");
+    }
+}
+
+fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
+        ]);
+    for row in attempts {
+        table.add_row(vec![
+            row.kind.as_str(),
+            row.id.as_str(),
+            row.status.as_str(),
+            row.pr_url.as_str(),
+            row.work_item_id.as_deref().unwrap_or(""),
+            row.failure_reason.as_deref().unwrap_or(""),
+            row.created_at.as_str(),
+        ]);
+    }
+    println!("{table}");
 }
 
 /// Human-readable rendering for `boss product audit-effort`. The
