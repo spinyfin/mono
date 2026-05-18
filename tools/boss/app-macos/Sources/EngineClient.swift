@@ -120,6 +120,10 @@ enum EngineEvent {
     /// rows for the Engine tab. Phase 5 #13/#14 of the merge-conflict
     /// design.
     case conflictResolutionsList(attempts: [WorkConflictResolution])
+    /// Response to `list_ci_remediations` — the filtered set of
+    /// `ci_remediations` rows for the Engine tab. Phase 11 #37 of
+    /// the merge-conflict design (CI extensions).
+    case ciRemediationsList(attempts: [WorkCiRemediation])
     /// Activity-feed push: a fresh conflict-resolution attempt was
     /// created (or a `retry` reset an existing one) and a worker is
     /// about to take over. The Engine tab refreshes; the badge state
@@ -492,6 +496,30 @@ final class EngineClient: @unchecked Sendable {
         limit: Int? = nil
     ) {
         var payload: [String: Any] = ["type": "list_conflict_resolutions"]
+        if let productID {
+            payload["product_id"] = productID
+        }
+        if !statuses.isEmpty {
+            payload["status"] = statuses
+        }
+        if let workItemID {
+            payload["work_item_id"] = workItemID
+        }
+        if let limit {
+            payload["limit"] = limit
+        }
+        sendLine(payload)
+    }
+
+    /// Engine-tab listing fetch for CI remediations (design Phase 11
+    /// #37). Mirror of `sendListConflictResolutions`.
+    func sendListCiRemediations(
+        productID: String? = nil,
+        statuses: [String] = [],
+        workItemID: String? = nil,
+        limit: Int? = nil
+    ) {
+        var payload: [String: Any] = ["type": "list_ci_remediations"]
         if let productID {
             payload["product_id"] = productID
         }
@@ -916,6 +944,10 @@ final class EngineClient: @unchecked Sendable {
                 let raw = payload["attempts"] as? [[String: Any]] ?? []
                 let attempts = raw.compactMap(parseConflictResolution)
                 emit(.conflictResolutionsList(attempts: attempts))
+            case "ci_remediations_list":
+                let raw = payload["attempts"] as? [[String: Any]] ?? []
+                let attempts = raw.compactMap(parseCiRemediation)
+                emit(.ciRemediationsList(attempts: attempts))
             case "conflict_resolution_started":
                 emit(.conflictResolutionStarted(
                     productID: payload["product_id"] as? String ?? "",
@@ -1202,6 +1234,47 @@ final class EngineClient: @unchecked Sendable {
             cubeWorkspaceID: payload["cube_workspace_id"] as? String,
             workerID: payload["worker_id"] as? String,
             conflictDiagnosis: payload["conflict_diagnosis"] as? String,
+            createdAt: createdAt,
+            startedAt: payload["started_at"] as? String,
+            finishedAt: payload["finished_at"] as? String
+        )
+    }
+
+    private func parseCiRemediation(_ payload: [String: Any]) -> WorkCiRemediation? {
+        guard let id = payload["id"] as? String,
+              let productID = payload["product_id"] as? String,
+              let workItemID = payload["work_item_id"] as? String,
+              let prURL = payload["pr_url"] as? String,
+              let headBranch = payload["head_branch"] as? String,
+              let headSHAAtTrigger = payload["head_sha_at_trigger"] as? String,
+              let attemptKind = payload["attempt_kind"] as? String,
+              let failedChecks = payload["failed_checks"] as? String,
+              let status = payload["status"] as? String,
+              let createdAt = payload["created_at"] as? String
+        else {
+            return nil
+        }
+        let prNumber = (payload["pr_number"] as? NSNumber)?.intValue ?? 0
+        let consumesBudget = (payload["consumes_budget"] as? NSNumber)?.intValue ?? 0
+        return WorkCiRemediation(
+            id: id,
+            productID: productID,
+            workItemID: workItemID,
+            prURL: prURL,
+            prNumber: prNumber,
+            headBranch: headBranch,
+            headSHAAtTrigger: headSHAAtTrigger,
+            headSHAAfter: payload["head_sha_after"] as? String,
+            attemptKind: attemptKind,
+            consumesBudget: consumesBudget,
+            failedChecks: failedChecks,
+            triageClass: payload["triage_class"] as? String,
+            logExcerpt: payload["log_excerpt"] as? String,
+            status: status,
+            failureReason: payload["failure_reason"] as? String,
+            cubeLeaseID: payload["cube_lease_id"] as? String,
+            cubeWorkspaceID: payload["cube_workspace_id"] as? String,
+            workerID: payload["worker_id"] as? String,
             createdAt: createdAt,
             startedAt: payload["started_at"] as? String,
             finishedAt: payload["finished_at"] as? String

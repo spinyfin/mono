@@ -57,15 +57,16 @@ pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
     AddDependencyInput, BlockedSignal, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
-    CiRemediation, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
-    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, EffortLevel, ExecutionReconcileResult, ListDependenciesInput, Product,
-    Project, ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
-    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
-    WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionItemInput,
+    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
+    DependencyEdge, DependencyFilter, EffortLevel, EngineAttemptListEntry,
+    ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -4343,6 +4344,414 @@ impl WorkDb {
     pub fn get_ci_remediation(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
         let conn = self.connect()?;
         query_ci_remediation(&conn, attempt_id)
+    }
+
+    /// Read-only list of `ci_remediations` rows for `boss engine ci
+    /// list` (design Phase 11 #35). Mirror of
+    /// [`Self::list_conflict_resolutions`]. Filters are AND-ed; an
+    /// empty `status` slice means "any status." Rows come back freshest
+    /// first (`created_at DESC, id DESC`); `limit = None` returns every
+    /// match — the CLI applies its own default cap.
+    pub fn list_ci_remediations(
+        &self,
+        product_id: Option<&str>,
+        statuses: &[String],
+        work_item_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<CiRemediation>> {
+        let conn = self.connect()?;
+        let mut sql = String::from(
+            "SELECT id, product_id, work_item_id, pr_url, pr_number,
+                    head_branch, head_sha_at_trigger, head_sha_after,
+                    attempt_kind, consumes_budget, failed_checks,
+                    triage_class, log_excerpt, status, failure_reason,
+                    cube_lease_id, cube_workspace_id, worker_id,
+                    created_at, started_at, finished_at
+             FROM ci_remediations WHERE 1=1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(pid) = product_id {
+            sql.push_str(" AND product_id = ?");
+            params_vec.push(Box::new(pid.to_owned()));
+        }
+        if let Some(wid) = work_item_id {
+            sql.push_str(" AND work_item_id = ?");
+            params_vec.push(Box::new(wid.to_owned()));
+        }
+        if !statuses.is_empty() {
+            sql.push_str(" AND status IN (");
+            for (idx, status) in statuses.iter().enumerate() {
+                if idx > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                params_vec.push(Box::new(status.clone()));
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC");
+        if let Some(cap) = limit {
+            sql.push_str(" LIMIT ?");
+            params_vec.push(Box::new(cap as i64));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(refs.as_slice(), map_ci_remediation)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// User-facing `boss engine ci retry` action — design Phase 11
+    /// #35 / Q11 "manual escape hatch." Two side effects:
+    ///
+    /// 1. Reset `tasks.ci_attempts_used` to 0 so the next probe is not
+    ///    gated by the budget.
+    /// 2. When the parent is currently `blocked: ci_failure_exhausted`,
+    ///    flip it back to `in_review` (the next merge-poller sweep
+    ///    re-fires the auto-fix flow on the still-failing CI). The
+    ///    matching `task_blocked_signals` row is stamped `cleared_at`.
+    ///
+    /// Returns the post-update [`CiBudgetSnapshot`] and a flag for
+    /// whether the parent had actually been in the exhausted state at
+    /// the time of the call (so the CLI can render "now unblocked"
+    /// vs "counter reset only"). `Ok(None)` when `work_item_id` does
+    /// not exist (or has been soft-deleted).
+    pub fn retry_ci_remediation_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<(CiBudgetSnapshot, bool)>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        // Confirm the parent exists (and capture its current
+        // blocked_reason). A missing parent → Ok(None) so the CLI can
+        // surface "unknown work item" without conflating with the
+        // counter-reset-only path.
+        let row: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT status, blocked_reason FROM tasks
+                  WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((status, blocked_reason)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let now = now_string();
+        // Always reset the counter — repeated retry calls are
+        // idempotent at the counter level.
+        tx.execute(
+            "UPDATE tasks
+                SET ci_attempts_used = 0,
+                    updated_at       = ?2
+              WHERE id = ?1
+                AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        let was_exhausted = matches!(
+            (status.as_deref(), blocked_reason.as_deref()),
+            (Some("blocked"), Some("ci_failure_exhausted"))
+        );
+        if was_exhausted {
+            // Clear the parent's exhaustion: status → in_review, drop
+            // blocked_reason / blocked_attempt_id. The merge-poller's
+            // next sweep observes CI=Failing and re-enters the
+            // detection flow naturally.
+            tx.execute(
+                "UPDATE tasks
+                    SET status             = 'in_review',
+                        blocked_reason     = NULL,
+                        blocked_attempt_id = NULL,
+                        last_status_actor  = 'engine',
+                        updated_at         = ?2
+                  WHERE id = ?1
+                    AND status = 'blocked'
+                    AND blocked_reason = 'ci_failure_exhausted'
+                    AND deleted_at IS NULL",
+                params![work_item_id, now],
+            )?;
+            // Clear the matching blocked-signal row so the side table
+            // reflects the parent's transition out of the blocked set.
+            tx.execute(
+                "UPDATE task_blocked_signals
+                    SET cleared_at = ?2
+                  WHERE work_item_id = ?1
+                    AND reason = 'ci_failure_exhausted'
+                    AND cleared_at IS NULL",
+                params![work_item_id, now],
+            )?;
+        }
+        // Compute the post-update budget snapshot for the response.
+        let per_pr_override: Option<i64> = tx
+            .query_row(
+                "SELECT ci_attempt_budget FROM tasks WHERE id = ?1",
+                params![work_item_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        let product_default: i64 = tx
+            .query_row(
+                "SELECT COALESCE(p.ci_attempt_budget, 3)
+                   FROM tasks t
+                   JOIN products p ON p.id = t.product_id
+                  WHERE t.id = ?1",
+                params![work_item_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(3);
+        let used: i64 = tx
+            .query_row(
+                "SELECT ci_attempts_used FROM tasks WHERE id = ?1",
+                params![work_item_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        let post_blocked_reason: Option<String> = tx
+            .query_row(
+                "SELECT blocked_reason FROM tasks
+                  WHERE id = ?1
+                    AND status = 'blocked'
+                    AND deleted_at IS NULL",
+                params![work_item_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None);
+        tx.commit()?;
+        let effective = per_pr_override.unwrap_or(product_default).clamp(0, 10);
+        Ok(Some((
+            CiBudgetSnapshot {
+                work_item_id: work_item_id.to_owned(),
+                per_pr_override,
+                product_default,
+                effective,
+                used,
+                blocked_reason: post_blocked_reason,
+            },
+            was_exhausted,
+        )))
+    }
+
+    /// Read the current [`CiBudgetSnapshot`] for `work_item_id`.
+    /// Returns `Ok(None)` when the row is missing (or soft-deleted).
+    /// Used by both the `boss engine ci budget show` verb and the
+    /// retry path's response.
+    pub fn ci_budget_snapshot(&self, work_item_id: &str) -> Result<Option<CiBudgetSnapshot>> {
+        let conn = self.connect()?;
+        let row: Option<(Option<i64>, i64, i64, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT t.ci_attempt_budget,
+                        COALESCE(p.ci_attempt_budget, 3) AS product_default,
+                        t.ci_attempts_used,
+                        t.status,
+                        t.blocked_reason
+                 FROM tasks t
+                 JOIN products p ON p.id = t.product_id
+                 WHERE t.id = ?1
+                   AND t.deleted_at IS NULL",
+                params![work_item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((per_pr_override, product_default, used, status, blocked_reason)) = row else {
+            return Ok(None);
+        };
+        let effective = per_pr_override.unwrap_or(product_default).clamp(0, 10);
+        let blocked_reason = match status.as_deref() {
+            Some("blocked") => blocked_reason,
+            _ => None,
+        };
+        Ok(Some(CiBudgetSnapshot {
+            work_item_id: work_item_id.to_owned(),
+            per_pr_override,
+            product_default,
+            effective,
+            used,
+            blocked_reason,
+        }))
+    }
+
+    /// Set (or clear) `tasks.ci_attempt_budget` for `work_item_id`.
+    /// `None` clears the override (the product default applies).
+    /// `Some(n)` is clamped server-side to `0..=10` per the design's
+    /// reserved range. Returns the post-update [`CiBudgetSnapshot`];
+    /// `Ok(None)` when the work item does not exist.
+    pub fn set_ci_attempt_budget(
+        &self,
+        work_item_id: &str,
+        budget: Option<i64>,
+    ) -> Result<Option<CiBudgetSnapshot>> {
+        let conn = self.connect()?;
+        let clamped = budget.map(|b| b.clamp(0, 10));
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE tasks
+                SET ci_attempt_budget = ?2,
+                    updated_at        = ?3
+              WHERE id = ?1
+                AND deleted_at IS NULL",
+            params![work_item_id, clamped, now],
+        )?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        self.ci_budget_snapshot(work_item_id)
+    }
+
+    /// Unified [`EngineAttemptListEntry`] projection across the three
+    /// attempt subsystems (`conflict_resolutions`, `rebase_attempts`,
+    /// `ci_remediations`). Filters are AND-ed; `kinds` is the set of
+    /// kind discriminators to include (empty == all three);
+    /// `statuses` and `work_item_id` apply within each kind's own
+    /// schema. Backs `boss engine attempts list` (design Phase 11 #36).
+    ///
+    /// `rebase_attempts` is the auto-rebase flow's table — it is
+    /// guarded with `table_exists` because its DDL ships with
+    /// `auto-rebase-stacked-prs.md`, which has not landed at the time
+    /// this method does. When the table isn't there, the rebase kind
+    /// silently contributes zero rows.
+    pub fn list_engine_attempts(
+        &self,
+        kinds: &[String],
+        product_id: Option<&str>,
+        statuses: &[String],
+        work_item_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<EngineAttemptListEntry>> {
+        let want_conflict = kinds.is_empty() || kinds.iter().any(|k| k == "conflict");
+        let want_rebase = kinds.is_empty() || kinds.iter().any(|k| k == "rebase");
+        let want_ci = kinds.is_empty() || kinds.iter().any(|k| k == "ci");
+        let mut out: Vec<EngineAttemptListEntry> = Vec::new();
+        if want_conflict {
+            for c in self.list_conflict_resolutions(product_id, statuses, work_item_id, None)? {
+                out.push(EngineAttemptListEntry {
+                    kind: "conflict".into(),
+                    id: c.id,
+                    product_id: c.product_id,
+                    work_item_id: Some(c.work_item_id),
+                    pr_url: c.pr_url,
+                    status: c.status,
+                    failure_reason: c.failure_reason,
+                    created_at: c.created_at,
+                    started_at: c.started_at,
+                    finished_at: c.finished_at,
+                    extra: Default::default(),
+                });
+            }
+        }
+        if want_ci {
+            for r in self.list_ci_remediations(product_id, statuses, work_item_id, None)? {
+                let mut extra = std::collections::BTreeMap::new();
+                extra.insert("attempt_kind".into(), r.attempt_kind.clone());
+                out.push(EngineAttemptListEntry {
+                    kind: "ci".into(),
+                    id: r.id,
+                    product_id: r.product_id,
+                    work_item_id: Some(r.work_item_id),
+                    pr_url: r.pr_url,
+                    status: r.status,
+                    failure_reason: r.failure_reason,
+                    created_at: r.created_at,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    extra,
+                });
+            }
+        }
+        if want_rebase {
+            let conn = self.connect()?;
+            if table_exists(&conn, "rebase_attempts")? {
+                // The rebase_attempts schema is established by the
+                // auto-rebase-stacked-prs flow. We project a minimal
+                // set of columns matching what we project for the
+                // other kinds, tolerating columns that may not exist
+                // yet by reading defensively. Today only the test
+                // shim's DDL is in the tree (id / dependent_pr_url /
+                // status); the production table will add timestamps
+                // and product_id.
+                let mut sql = String::from(
+                    "SELECT id,
+                            COALESCE(product_id, '') AS product_id,
+                            dependent_pr_url AS pr_url,
+                            status,
+                            COALESCE(failure_reason, NULL) AS failure_reason,
+                            COALESCE(created_at, '') AS created_at,
+                            started_at,
+                            finished_at
+                     FROM rebase_attempts WHERE 1=1",
+                );
+                let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                if let Some(pid) = product_id {
+                    sql.push_str(" AND product_id = ?");
+                    params_vec.push(Box::new(pid.to_owned()));
+                }
+                if !statuses.is_empty() {
+                    sql.push_str(" AND status IN (");
+                    for (idx, status) in statuses.iter().enumerate() {
+                        if idx > 0 {
+                            sql.push(',');
+                        }
+                        sql.push('?');
+                        params_vec.push(Box::new(status.clone()));
+                    }
+                    sql.push(')');
+                }
+                sql.push_str(" ORDER BY created_at DESC, id DESC");
+                // Use a sub-scope so the prepared statement borrow
+                // ends before we move `conn` again.
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })?;
+                for r in rows {
+                    let (id, pid, pr_url, status, fr, created_at, started_at, finished_at) = r?;
+                    out.push(EngineAttemptListEntry {
+                        kind: "rebase".into(),
+                        id,
+                        product_id: pid,
+                        // rebase_attempts is keyed on PR URL today;
+                        // no work_item_id projection yet.
+                        work_item_id: None,
+                        pr_url,
+                        status,
+                        failure_reason: fr,
+                        created_at,
+                        started_at,
+                        finished_at,
+                        extra: Default::default(),
+                    });
+                }
+            }
+        }
+        // Merge by created_at DESC so the unified list is freshest-first.
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        if let Some(cap) = limit {
+            out.truncate(cap as usize);
+        }
+        Ok(out)
     }
 
     /// Latest non-terminal `ci_remediations` row for `work_item_id`,
@@ -18630,6 +19039,398 @@ mod tests {
             actor, "human",
             "genuine status change must flip last_status_actor to 'human'"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `list_ci_remediations` honours the `(product, status, work_item)`
+    /// filter triple AND-ed and orders rows freshest-first. The empty
+    /// filter set returns every row; `status = []` matches every
+    /// status.
+    #[test]
+    fn list_ci_remediations_filters_and_orders_freshest_first() {
+        let path = disk_db_path("list-ci-remediations-filters");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore_a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-a".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let chore_b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-b".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        // Two rows for chore_a with different attempt_kinds + statuses.
+        let r1 = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore_a.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/100".into(),
+                pr_number: 100,
+                head_branch: "feature-a".into(),
+                head_sha_at_trigger: "head-a-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+            })
+            .unwrap()
+            .expect("insert");
+        let r2 = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore_a.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/100".into(),
+                pr_number: 100,
+                head_branch: "feature-a".into(),
+                head_sha_at_trigger: "head-a-2".into(),
+                attempt_kind: "retrigger".into(),
+                consumes_budget: 0,
+                failed_checks: "[]".into(),
+            })
+            .unwrap()
+            .expect("insert");
+        // One row for chore_b.
+        let r3 = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore_b.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/101".into(),
+                pr_number: 101,
+                head_branch: "feature-b".into(),
+                head_sha_at_trigger: "head-b-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+            })
+            .unwrap()
+            .expect("insert");
+        db.mark_ci_remediation_failed(&r1.id, "boom").unwrap();
+
+        // No filters → every row, freshest first.
+        let all = db.list_ci_remediations(None, &[], None, None).unwrap();
+        assert_eq!(all.len(), 3);
+        // Most-recently-inserted row should be first.
+        assert_eq!(all[0].id, r3.id);
+
+        // Filter by product.
+        let by_product = db
+            .list_ci_remediations(Some(&product.id), &[], None, None)
+            .unwrap();
+        assert_eq!(by_product.len(), 3);
+
+        // Filter by work item.
+        let by_item = db
+            .list_ci_remediations(None, &[], Some(&chore_a.id), None)
+            .unwrap();
+        assert_eq!(by_item.len(), 2);
+        for row in &by_item {
+            assert_eq!(row.work_item_id, chore_a.id);
+        }
+
+        // Filter by status: `failed` matches only r1.
+        let failed_rows = db
+            .list_ci_remediations(None, &["failed".into()], None, None)
+            .unwrap();
+        assert_eq!(failed_rows.len(), 1);
+        assert_eq!(failed_rows[0].id, r1.id);
+
+        // Limit caps the row set.
+        let capped = db.list_ci_remediations(None, &[], None, Some(2)).unwrap();
+        assert_eq!(capped.len(), 2);
+
+        // Compound: product + work_item + status, intersected.
+        let intersect = db
+            .list_ci_remediations(
+                Some(&product.id),
+                &["pending".into()],
+                Some(&chore_a.id),
+                None,
+            )
+            .unwrap();
+        assert_eq!(intersect.len(), 1);
+        assert_eq!(intersect[0].id, r2.id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `ci_budget_snapshot` joins `tasks.ci_attempt_budget` with the
+    /// product's `ci_attempt_budget` to produce the effective budget,
+    /// reads `ci_attempts_used`, and clamps the effective value to
+    /// `0..=10`. `blocked_reason` is reported only when the task is
+    /// currently `status='blocked'`.
+    #[test]
+    fn ci_budget_snapshot_combines_override_and_product_default() {
+        let path = disk_db_path("ci-budget-snapshot");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-budget".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Defaults: no per-PR override, product default = 3, used = 0.
+        let snap = db.ci_budget_snapshot(&chore.id).unwrap().unwrap();
+        assert_eq!(snap.per_pr_override, None);
+        assert_eq!(snap.product_default, 3);
+        assert_eq!(snap.effective, 3);
+        assert_eq!(snap.used, 0);
+        assert_eq!(snap.blocked_reason, None);
+
+        // Override path: `set_ci_attempt_budget` clamps to `0..=10`.
+        let snap = db.set_ci_attempt_budget(&chore.id, Some(7)).unwrap().unwrap();
+        assert_eq!(snap.per_pr_override, Some(7));
+        assert_eq!(snap.effective, 7);
+        // Out-of-range value clamps.
+        let snap = db.set_ci_attempt_budget(&chore.id, Some(25)).unwrap().unwrap();
+        assert_eq!(snap.per_pr_override, Some(10));
+        assert_eq!(snap.effective, 10);
+        // Clear path → product default applies.
+        let snap = db.set_ci_attempt_budget(&chore.id, None).unwrap().unwrap();
+        assert_eq!(snap.per_pr_override, None);
+        assert_eq!(snap.effective, 3);
+
+        // Unknown work item.
+        assert!(db.ci_budget_snapshot("chr_does_not_exist").unwrap().is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `retry_ci_remediation_for_work_item` always zeroes the
+    /// `ci_attempts_used` counter, and additionally flips the parent
+    /// from `blocked: ci_failure_exhausted` back to `in_review` when
+    /// that's where the parent was. The matching
+    /// `task_blocked_signals` row is also cleared.
+    #[test]
+    fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
+        let path = disk_db_path("ci-retry-resets");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-retry".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/foo/bar/pull/200".to_owned();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url).unwrap();
+
+        let (snapshot, was_exhausted) = db
+            .retry_ci_remediation_for_work_item(&chore.id)
+            .unwrap()
+            .expect("work item exists");
+        assert!(was_exhausted);
+        assert_eq!(snapshot.used, 0);
+        // After unblock the parent should no longer be blocked.
+        assert_eq!(snapshot.blocked_reason, None);
+
+        let conn = db.connect().unwrap();
+        let (status, blocked_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, blocked_reason FROM tasks WHERE id = ?1",
+                rusqlite::params![chore.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "in_review");
+        assert_eq!(blocked_reason, None);
+        // The matching blocked-signal row must be cleared.
+        let cleared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_blocked_signals
+                  WHERE work_item_id = ?1
+                    AND reason = 'ci_failure_exhausted'
+                    AND cleared_at IS NULL",
+                rusqlite::params![chore.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, 0);
+
+        // Second call: counter is already zero and the parent is
+        // already in_review, so was_exhausted is false.
+        let (snapshot, was_exhausted) = db
+            .retry_ci_remediation_for_work_item(&chore.id)
+            .unwrap()
+            .expect("work item exists");
+        assert!(!was_exhausted);
+        assert_eq!(snapshot.used, 0);
+
+        // Unknown work item → Ok(None).
+        assert!(db
+            .retry_ci_remediation_for_work_item("chr_does_not_exist")
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `list_engine_attempts` unions the three subsystems with a
+    /// `kind` discriminator, applies the `kinds` filter when present,
+    /// and orders by `created_at DESC`.
+    #[test]
+    fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
+        let path = disk_db_path("list-engine-attempts");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-attempts".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/foo/bar/pull/300".to_owned();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        // CI remediation row.
+        let ci = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.clone(),
+                pr_number: 300,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "head-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+            })
+            .unwrap()
+            .unwrap();
+        // Conflict resolution row.
+        let crz = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.clone(),
+                pr_number: 300,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-1".into()),
+                head_sha_before: Some("head-1".into()),
+            })
+            .unwrap()
+            .unwrap();
+        // Unfiltered → both rows, ordered by created_at DESC.
+        let unfiltered = db.list_engine_attempts(&[], None, &[], None, None).unwrap();
+        // ci was inserted second, so it should be first.
+        assert_eq!(unfiltered.len(), 2);
+        let kinds: Vec<&str> = unfiltered.iter().map(|r| r.kind.as_str()).collect();
+        assert!(kinds.contains(&"ci"));
+        assert!(kinds.contains(&"conflict"));
+        // Filter to only `ci`.
+        let only_ci = db
+            .list_engine_attempts(&["ci".into()], None, &[], None, None)
+            .unwrap();
+        assert_eq!(only_ci.len(), 1);
+        assert_eq!(only_ci[0].kind, "ci");
+        assert_eq!(only_ci[0].id, ci.id);
+        // ci rows expose `attempt_kind` under `extra`.
+        assert_eq!(only_ci[0].extra.get("attempt_kind").map(String::as_str), Some("fix"));
+        // Filter to only `conflict`.
+        let only_conflict = db
+            .list_engine_attempts(&["conflict".into()], None, &[], None, None)
+            .unwrap();
+        assert_eq!(only_conflict.len(), 1);
+        assert_eq!(only_conflict[0].kind, "conflict");
+        assert_eq!(only_conflict[0].id, crz.id);
+        // Filter to `rebase`: the table doesn't exist in this fixture,
+        // so the result must be empty (no panic).
+        let only_rebase = db
+            .list_engine_attempts(&["rebase".into()], None, &[], None, None)
+            .unwrap();
+        assert!(only_rebase.is_empty());
+        // Limit honoured.
+        let capped = db.list_engine_attempts(&[], None, &[], None, Some(1)).unwrap();
+        assert_eq!(capped.len(), 1);
 
         let _ = std::fs::remove_file(path);
     }

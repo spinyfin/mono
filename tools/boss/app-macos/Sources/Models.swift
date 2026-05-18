@@ -1315,18 +1315,75 @@ struct WorkConflictResolution: Identifiable, Hashable {
     var finishedAt: String?
 }
 
+/// PR-card chip state for the CI auto-fix flow (design Q11 / Phase
+/// 11 #37). Either "engine is still trying" (with a numeric
+/// `used/budget`) or "engine has given up." The exhausted variant
+/// stays visible until the user kicks `boss engine ci retry`; the
+/// in-flight variant clears when the next probe observes CI back at
+/// `Clean`.
+struct CiFailureBadge: Equatable, Hashable {
+    enum State: String, Hashable {
+        /// `blocked: ci_failure` — engine still trying.
+        case inFlight = "in_flight"
+        /// `blocked: ci_failure_exhausted` — engine has given up.
+        case exhausted
+    }
+    var state: State
+    var attemptsUsed: Int
+    var budget: Int
+}
+
+/// Swift mirror of `boss_protocol::CiRemediation`. One engine attempt
+/// to clear a CI failure on an `in_review` PR. Powers the Engine
+/// tab's CI rows (design Phase 11 #37) and the per-PR badges (Q11).
+struct WorkCiRemediation: Identifiable, Hashable {
+    let id: String
+    var productID: String
+    var workItemID: String
+    var prURL: String
+    var prNumber: Int
+    var headBranch: String
+    var headSHAAtTrigger: String
+    var headSHAAfter: String?
+    /// `"fix"` or `"retrigger"` — the engine's pre-spawn triage call.
+    var attemptKind: String
+    /// `1` for fix-kind attempts that actually pushed; `0` for
+    /// retriggers and triage-bailouts.
+    var consumesBudget: Int
+    /// JSON-encoded list of failing-check snapshots captured at trigger
+    /// time. Stored as a verbatim string; consumers parse on demand.
+    var failedChecks: String
+    /// Worker-assigned classification of the failure after reading the
+    /// log — one of `tractable` / `flaky_or_infra` / `unfixable`. `nil`
+    /// until the worker fills it.
+    var triageClass: String?
+    var logExcerpt: String?
+    /// `pending` / `running` / `succeeded` / `failed` / `abandoned` /
+    /// `superseded`. See the wire-type docs in `boss_protocol::types`.
+    var status: String
+    var failureReason: String?
+    var cubeLeaseID: String?
+    var cubeWorkspaceID: String?
+    var workerID: String?
+    var createdAt: String
+    var startedAt: String?
+    var finishedAt: String?
+}
+
 /// Discriminator for the unified Engine-tab attempt feed. Phase 5 #14
-/// lists `conflict_resolutions` and (when the auto-rebase-stacked-prs
-/// flow lands) `rebase_attempts` together. The Swift side keeps the
-/// row kinds in a single sortable list so future row kinds (CI
-/// remediations per the design Phase 9 #37) just grow this enum.
+/// lists `conflict_resolutions`; Phase 11 #37 grows the enum with the
+/// CI subsystem (`ci_remediations`). The `rebase_attempts` row kind
+/// is reserved for when the `auto-rebase-stacked-prs` flow lands.
 enum EngineAttemptRow: Identifiable, Hashable {
     case conflictResolution(WorkConflictResolution)
+    case ciRemediation(WorkCiRemediation)
 
     var id: String {
         switch self {
         case .conflictResolution(let r):
             return "crz:\(r.id)"
+        case .ciRemediation(let r):
+            return "cir:\(r.id)"
         }
     }
 
@@ -1334,12 +1391,20 @@ enum EngineAttemptRow: Identifiable, Hashable {
         switch self {
         case .conflictResolution:
             return "Conflict"
+        case .ciRemediation(let r):
+            switch r.attemptKind {
+            case "fix": return "CI fix"
+            case "retrigger": return "CI retrigger"
+            default: return "CI"
+            }
         }
     }
 
     var status: String {
         switch self {
         case .conflictResolution(let r):
+            return r.status
+        case .ciRemediation(let r):
             return r.status
         }
     }
@@ -1348,12 +1413,16 @@ enum EngineAttemptRow: Identifiable, Hashable {
         switch self {
         case .conflictResolution(let r):
             return r.prURL
+        case .ciRemediation(let r):
+            return r.prURL
         }
     }
 
     var workItemID: String {
         switch self {
         case .conflictResolution(let r):
+            return r.workItemID
+        case .ciRemediation(let r):
             return r.workItemID
         }
     }
@@ -1362,6 +1431,8 @@ enum EngineAttemptRow: Identifiable, Hashable {
         switch self {
         case .conflictResolution(let r):
             return r.createdAt
+        case .ciRemediation(let r):
+            return r.createdAt
         }
     }
 
@@ -1369,12 +1440,16 @@ enum EngineAttemptRow: Identifiable, Hashable {
         switch self {
         case .conflictResolution(let r):
             return r.finishedAt
+        case .ciRemediation(let r):
+            return r.finishedAt
         }
     }
 
     var failureReason: String? {
         switch self {
         case .conflictResolution(let r):
+            return r.failureReason
+        case .ciRemediation(let r):
             return r.failureReason
         }
     }

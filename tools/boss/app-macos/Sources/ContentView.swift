@@ -1220,6 +1220,8 @@ private struct WorkBoardCardItem: View {
                     gatingPrereqs: gatingPrereqs,
                     repoChip: repoChip,
                     showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
+                    showsCIAutoFixedBadge: model.showsCIAutoFixedBadge(forPR: task.prURL),
+                    ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
                     isResolvingConflicts: isResolvingConflicts,
                     designDocState: designDocState,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
@@ -1352,6 +1354,14 @@ struct WorkBoardCardView: View {
     /// `"🔧 conflict cleared"` chip in the footer; ages out after 24h
     /// via [[ChatViewModel.showsConflictClearedBadge(forPR:)]].
     var showsConflictClearedBadge: Bool = false
+    /// True when this card's PR has a successful CI auto-fix inside
+    /// the 24h freshness window. Renders the `"✅ ci auto-fixed"` chip
+    /// per design Q11 / Phase 11 #37.
+    var showsCIAutoFixedBadge: Bool = false
+    /// In-flight / exhausted CI-failure chip for the PR, or `nil` when
+    /// no CI auto-fix is currently tracked. Renders `🟧 ci failing
+    /// (used/budget)` or `🛑 ci failing (exhausted)` per design Q11.
+    var ciFailureBadge: CiFailureBadge? = nil
     /// True when this card is in the Doing column because a merge-
     /// resolution worker is actively running against it. Suppresses the
     /// blocked-row orange chrome and renders the `"resolving conflicts"`
@@ -1465,6 +1475,12 @@ struct WorkBoardCardView: View {
                     }
                     if showsConflictClearedBadge {
                         ConflictClearedBadge()
+                    }
+                    if showsCIAutoFixedBadge {
+                        CIAutoFixedBadge()
+                    }
+                    if let ciFailureBadge {
+                        CIFailureChip(badge: ciFailureBadge)
                     }
                     if let repoChip {
                         RepoChipView(presentation: repoChip)
@@ -2903,6 +2919,89 @@ private struct ConflictClearedBadge: View {
         .clipShape(Capsule())
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
+    }
+}
+
+/// "✅ ci auto-fixed" PR-card chip. Phase 11 #37 / design Q11.
+/// Parallels [[ConflictClearedBadge]] — green, 24-hour freshness
+/// window — for cards whose PR was the target of a successful CI
+/// auto-fix attempt.
+private struct CIAutoFixedBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "checkmark.seal.fill")
+                .font(.caption2.weight(.semibold))
+            Text("ci auto-fixed")
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(Color.green)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.green.opacity(0.12))
+        .clipShape(Capsule())
+        .help("The engine auto-fixed a CI failure on this PR within the last 24 hours.")
+        .accessibilityLabel("CI auto-fixed by the engine")
+    }
+}
+
+/// In-flight / exhausted CI-failure chip. Design Q11 calls for two
+/// visual states:
+///  - 🟧 `ci failing (used/budget)` while the engine still has budget
+///    and a worker is/was in flight.
+///  - 🛑 `ci failing (exhausted)` once the engine has given up; the
+///    user is the next actor (`boss engine ci retry`).
+private struct CIFailureChip: View {
+    let badge: CiFailureBadge
+
+    private var label: String {
+        switch badge.state {
+        case .inFlight:
+            if badge.budget > 0 {
+                return "ci failing (\(badge.attemptsUsed)/\(badge.budget))"
+            }
+            return "ci failing"
+        case .exhausted:
+            return "ci failing (exhausted)"
+        }
+    }
+
+    private var color: Color {
+        switch badge.state {
+        case .inFlight: return .orange
+        case .exhausted: return .red
+        }
+    }
+
+    private var icon: String {
+        switch badge.state {
+        case .inFlight: return "exclamationmark.triangle.fill"
+        case .exhausted: return "octagon.fill"
+        }
+    }
+
+    private var tooltip: String {
+        switch badge.state {
+        case .inFlight:
+            return "The engine is auto-fixing a CI failure on this PR. \(badge.attemptsUsed) of \(badge.budget) attempts used."
+        case .exhausted:
+            return "The engine has exhausted its CI auto-fix budget for this PR. Run `boss engine ci retry <work-item>` to try again."
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+            Text(label)
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(color.opacity(0.14))
+        .clipShape(Capsule())
+        .help(tooltip)
+        .accessibilityLabel(tooltip)
     }
 }
 

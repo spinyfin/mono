@@ -190,3 +190,27 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+# End-to-end coverage for `boss engine ci ...` and `boss engine
+# attempts list` (design Phase 11 #35/#36 of
+# merge-conflict-handling-in-review.md). Drives the `boss` binary
+# against an in-process engine with `ci_remediations` rows seeded via
+# the engine's WorkDb.
+rust_test(
+    name = "engine_ci_verbs_test",
+    srcs = ["tests/engine_ci_verbs.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

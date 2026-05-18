@@ -148,8 +148,18 @@ final class ActivityLogModel: ObservableObject {
         tailer = nil
     }
 
-    func updateEngineAttempts(_ resolutions: [WorkConflictResolution]) {
-        engineAttempts = resolutions.map { .conflictResolution($0) }
+    /// Merge the two attempt subsystems (`conflict_resolutions` +
+    /// `ci_remediations`) into the single sortable list the activity
+    /// log renders. Design Phase 11 #37 grows this from one row kind
+    /// to two; future kinds (rebase, review-feedback) just add another
+    /// argument here.
+    func updateEngineAttempts(
+        conflicts: [WorkConflictResolution],
+        ci: [WorkCiRemediation]
+    ) {
+        let conflictRows = conflicts.map { EngineAttemptRow.conflictResolution($0) }
+        let ciRows = ci.map { EngineAttemptRow.ciRemediation($0) }
+        engineAttempts = conflictRows + ciRows
     }
 
     private func appendDispatch(_ new: [DispatchEvent]) {
@@ -236,13 +246,19 @@ struct ActivityLogView: View {
         }
         .onAppear {
             model.start()
-            model.updateEngineAttempts(chat.conflictResolutions)
+            model.updateEngineAttempts(
+                conflicts: chat.conflictResolutions,
+                ci: chat.ciRemediations
+            )
         }
         .onDisappear {
             model.stop()
         }
         .onChange(of: chat.conflictResolutions) { _, new in
-            model.updateEngineAttempts(new)
+            model.updateEngineAttempts(conflicts: new, ci: chat.ciRemediations)
+        }
+        .onChange(of: chat.ciRemediations) { _, new in
+            model.updateEngineAttempts(conflicts: chat.conflictResolutions, ci: new)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -266,7 +282,7 @@ struct ActivityLogView: View {
                 }
             }
             Button {
-                chat.refreshConflictResolutions()
+                chat.refreshEngineAttempts()
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
@@ -690,6 +706,46 @@ private struct ActivityEngineDetailPane: View {
                                 .padding(.top, 8)
                             ScrollView {
                                 Text(diag)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 220)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                    case .ciRemediation(let remediation):
+                        engineDetailRow("Attempt kind", body: remediation.attemptKind)
+                        engineDetailRow(
+                            "Consumes budget",
+                            body: remediation.consumesBudget == 1 ? "yes" : "no"
+                        )
+                        engineDetailRow(
+                            "Triage class",
+                            body: remediation.triageClass ?? "—"
+                        )
+                        engineDetailRow("Head SHA", body: remediation.headSHAAtTrigger)
+                        if !remediation.failedChecks.isEmpty,
+                           remediation.failedChecks != "[]" {
+                            Text("Failed checks")
+                                .font(.subheadline.bold())
+                                .padding(.top, 8)
+                            ScrollView {
+                                Text(remediation.failedChecks)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 180)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        if let log = remediation.logExcerpt, !log.isEmpty {
+                            Text("Log excerpt")
+                                .font(.subheadline.bold())
+                                .padding(.top, 8)
+                            ScrollView {
+                                Text(log)
                                     .font(.system(.caption, design: .monospaced))
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
