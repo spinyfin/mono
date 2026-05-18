@@ -17,8 +17,10 @@
 //! lock is held only for the lifetime of one push; a long-running
 //! worker that already saw a matching version never grabs it.)
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -28,6 +30,36 @@ use crate::remote_wrapper::{
     rendered_wrapper,
 };
 use crate::ssh_transport::{SshFailureKind, SshTransport, classify_stderr};
+
+/// Per-host push-lock registry. Each host id maps to one
+/// `tokio::sync::Mutex<()>`; acquiring it before any push or
+/// verify-then-push sequence serializes concurrent dispatches against
+/// the same host without blocking dispatches to different hosts.
+///
+/// The registry itself uses a `std::sync::Mutex` for the map — only
+/// held briefly to look up or insert an `Arc`; never held across an
+/// `.await`.
+#[derive(Debug, Default)]
+pub struct WrapperPushLocks {
+    inner: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl WrapperPushLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the async mutex for `host_id`, creating one on first use.
+    /// Callers that hold the returned lock guard serialize pushes to
+    /// that host; callers for a different host get an independent lock.
+    pub fn lock_for(&self, host_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.inner.lock().expect("WrapperPushLocks map poisoned");
+        Arc::clone(
+            map.entry(host_id.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+}
 
 /// Outcome of a wrapper push. The engine surfaces these on the host
 /// row's `last_error_text` and uses them to decide retry posture.
@@ -155,7 +187,16 @@ pub async fn verify_wrapper_version(transport: &SshTransport) -> Result<VersionC
 /// reports anything other than [`VersionCheck::Match`]. Returns the
 /// push outcome (or [`WrapperPushOutcome::Ok`] when the handshake
 /// already matched).
-pub async fn ensure_wrapper_current(transport: &SshTransport) -> Result<WrapperPushOutcome> {
+///
+/// Acquires the per-host lock from `locks` before running
+/// verify-then-push so the pair is atomic against concurrent callers
+/// on the same host. Callers for different hosts run in parallel.
+pub async fn ensure_wrapper_current(
+    transport: &SshTransport,
+    locks: &WrapperPushLocks,
+) -> Result<WrapperPushOutcome> {
+    let host_lock = locks.lock_for(&transport.host_id);
+    let _guard = host_lock.lock().await;
     match verify_wrapper_version(transport).await? {
         VersionCheck::Match => Ok(WrapperPushOutcome::Ok),
         VersionCheck::Mismatch { .. } | VersionCheck::Missing => push_wrapper(transport).await,
@@ -227,6 +268,80 @@ impl Drop for TempFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── WrapperPushLocks tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn same_host_locks_contend() {
+        // Two callers on the same host id must see the same mutex, so
+        // they serialize: while one guard is held, try_lock on a second
+        // handle fails.
+        let locks = WrapperPushLocks::new();
+        let lock1 = locks.lock_for("host-a");
+        let lock2 = locks.lock_for("host-a");
+
+        let _guard = lock1.lock().await;
+        assert!(
+            lock2.try_lock().is_err(),
+            "same-host second lock_for should contend while first guard is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_host_serializes_after_release() {
+        // Once the first guard is dropped the second caller can proceed.
+        let locks = WrapperPushLocks::new();
+        let lock1 = locks.lock_for("host-a");
+        let lock2 = locks.lock_for("host-a");
+
+        {
+            let _guard = lock1.lock().await;
+            assert!(lock2.try_lock().is_err());
+            // _guard dropped here
+        }
+        assert!(
+            lock2.try_lock().is_ok(),
+            "same-host lock should be acquirable after first guard is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_hosts_do_not_contend() {
+        // Holding host-a's lock must not block host-b.
+        let locks = WrapperPushLocks::new();
+        let lock_a = locks.lock_for("host-a");
+        let lock_b = locks.lock_for("host-b");
+
+        let _guard_a = lock_a.lock().await;
+        assert!(
+            lock_b.try_lock().is_ok(),
+            "different-host locks should be independent"
+        );
+    }
+
+    #[test]
+    fn lock_for_returns_identical_arc_for_same_host() {
+        // The registry must hand out the *same* Arc for repeated calls
+        // with the same host id so that two callers contend on one mutex.
+        let locks = WrapperPushLocks::new();
+        let a = locks.lock_for("zakalwe");
+        let b = locks.lock_for("zakalwe");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "lock_for must return the same Arc for the same host id"
+        );
+    }
+
+    #[test]
+    fn lock_for_returns_distinct_arcs_for_different_hosts() {
+        let locks = WrapperPushLocks::new();
+        let a = locks.lock_for("host-a");
+        let b = locks.lock_for("host-b");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "lock_for must return different Arcs for different host ids"
+        );
+    }
 
     #[test]
     fn subclass_labels_match_design() {

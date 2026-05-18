@@ -29,7 +29,7 @@ use crate::coordinator::{
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::ssh_transport::SshTransport;
 use crate::work::{WorkExecution, WorkItem};
-use crate::wrapper_distribution::{WrapperPushOutcome, ensure_wrapper_current};
+use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
 /// Abstracts all host-specific operations: workspace lifecycle and
 /// worker spawn. Later phases extend this with control-channel
@@ -202,11 +202,15 @@ impl HostAdapter for LocalHostAdapter {
 /// transcript readback, signal channel) lands in a follow-up.
 pub struct SshHostAdapter {
     transport: SshTransport,
+    push_locks: WrapperPushLocks,
 }
 
 impl SshHostAdapter {
     pub fn new(transport: SshTransport) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            push_locks: WrapperPushLocks::new(),
+        }
     }
 
     pub fn transport(&self) -> &SshTransport {
@@ -482,7 +486,7 @@ impl HostAdapter for SshHostAdapter {
         // Verify the wrapper before any other work — drifted versions
         // turn into `host_wrapper_push_failed` early so we don't try
         // to invoke a stale wrapper contract.
-        match ensure_wrapper_current(&self.transport).await? {
+        match ensure_wrapper_current(&self.transport, &self.push_locks).await? {
             WrapperPushOutcome::Ok => {}
             WrapperPushOutcome::Failed(_kind, detail) => {
                 bail!(
