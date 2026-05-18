@@ -45,6 +45,22 @@ private func ghosttyRuntimeCloseSurface(_ userdata: UnsafeMutableRawPointer?, _ 
 
 enum GhosttyBootstrap {
     private static let initialized: Void = {
+        // Strip `GHOSTTY_*` env vars from the process environment before
+        // libghostty initializes. When Boss is launched from inside a
+        // Ghostty.app terminal pane (the dev workflow with `swift run Boss`
+        // from a Ghostty shell), the parent injects `GHOSTTY_RESOURCES_DIR`,
+        // `GHOSTTY_BIN_DIR`, `GHOSTTY_SHELL_FEATURES` and friends. Those
+        // point at the host Ghostty.app's resource tree, which can be a
+        // different libghostty version than the one bundled in this app —
+        // and `ghostty_init` / `ghostty_app_new` consume them. The observed
+        // failure mode is `ghostty_surface_new` returning NULL after every
+        // other input checks out (see #613 dump path). Removing the
+        // pollution before we touch libghostty closes that surface.
+        //
+        // Subprocesses (the Claude panes) are unaffected — their env is
+        // built separately and passed via `ghostty_surface_config_s.env_vars`.
+        stripGhosttyEnvVars()
+
         let result = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
         guard result == GHOSTTY_SUCCESS else {
             fatalError("ghostty_init failed with status \(result)")
@@ -53,6 +69,24 @@ enum GhosttyBootstrap {
 
     static func ensureInitialized() {
         _ = initialized
+    }
+
+    private static func stripGhosttyEnvVars() {
+        // Snapshot the names first; `unsetenv` mutates `environ`, so
+        // iterating it in-place is unsafe.
+        var toRemove: [String] = []
+        var envp: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?> = environ
+        while let raw = envp.pointee {
+            if let entry = String(validatingCString: raw),
+               let eq = entry.firstIndex(of: "="),
+               entry[..<eq].hasPrefix("GHOSTTY_") {
+                toRemove.append(String(entry[..<eq]))
+            }
+            envp = envp.successor()
+        }
+        for name in toRemove {
+            unsetenv(name)
+        }
     }
 }
 
