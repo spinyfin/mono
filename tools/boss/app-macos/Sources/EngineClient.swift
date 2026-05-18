@@ -433,6 +433,28 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendSetProductExternalTracker(
+        productId: String,
+        kind: String,
+        config: [String: Any]
+    ) {
+        sendLine([
+            "type": "set_product_external_tracker",
+            "product_id": productId,
+            "kind": kind,
+            "config": config,
+            "unset": false,
+        ])
+    }
+
+    func sendUnsetProductExternalTracker(productId: String) {
+        sendLine([
+            "type": "set_product_external_tracker",
+            "product_id": productId,
+            "unset": true,
+        ])
+    }
+
     func sendReorderProjectTasks(projectId: String, taskIds: [String]) {
         sendLine([
             "type": "reorder_project_tasks",
