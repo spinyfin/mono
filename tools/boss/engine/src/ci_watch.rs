@@ -885,6 +885,28 @@ pub async fn on_ci_resolved(
         }
     };
 
+    // A merge_queue_rebounce failure must not be cleared by a clean head-branch
+    // CI probe.  The PR's own CI is always green in this case — the failure is on
+    // the synthetic merge commit the queue assembled, not on the PR's head ref.
+    // Clearing here would immediately undo detection and create a flip-flop loop
+    // where every sweep detects the rebounce and the next probe clears it.
+    // The block is released only when the ci_remediation worker marks the attempt
+    // succeeded (at which point `active_ci_remediation_for_work_item` returns None
+    // and this guard doesn't fire).
+    if attempt
+        .as_ref()
+        .and_then(|a| a.failure_kind.as_deref())
+        == Some("merge_queue_rebounce")
+    {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "ci_watch: skipping on_ci_resolved — active merge_queue_rebounce attempt; \
+             head-branch CI clean is not the clearing signal for queue failures",
+        );
+        return false;
+    }
+
     let task_result = work_db
         .clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url);
     let task_transitioned = match task_result {
@@ -1911,5 +1933,221 @@ mod tests {
             .unwrap();
         assert!(again.is_none(), "second call must be a no-op");
         assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+    }
+
+    // ----- Merge-queue rebounce detection (T605 regression, PR #690) -----
+
+    /// A PR whose head-branch CI is all green but that was removed from
+    /// the merge queue with `reason=FAILED_CHECKS` must flip its owning
+    /// chore to `blocked: ci_failure` and park a `ci_remediation` execution.
+    ///
+    /// This is the basic reproducer for the T604 missed-detection: the
+    /// engine must act on the `RemovedFromMergeQueueEvent` timeline signal,
+    /// not on the per-PR `statusCheckRollup` (which stays SUCCESS after a
+    /// dequeue).
+    #[tokio::test]
+    async fn rebounce_flips_in_review_to_blocked_ci_failure() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/500";
+        let (product, chore) = make_in_review(&db, "C-rebounce-detect", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let flipped = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature-branch"),
+            None,
+            "synthetic-merge-sha-abc",
+            &[],
+        )
+        .await;
+        assert!(flipped, "rebounce detection must flip chore to ci_failure");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+
+        // A ci_remediation work_execution must be parked for the worker.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let exec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_executions
+                  WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exec_count, 1, "expected exactly one ci_remediation execution");
+
+        // The ci_remediations row must record the failure as a queue rebounce.
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("active attempt row");
+        assert_eq!(
+            attempt.failure_kind.as_deref(),
+            Some("merge_queue_rebounce")
+        );
+        assert_eq!(
+            attempt.before_commit_sha.as_deref(),
+            Some("synthetic-merge-sha-abc")
+        );
+    }
+
+    /// THE REGRESSION (T604 / PR #690 04:44Z miss): a clean head-branch CI
+    /// probe must NOT clear a `merge_queue_rebounce` block.
+    ///
+    /// Before the fix, `on_ci_resolved` treated "head-branch CI is green" as
+    /// a sufficient clearing signal for ALL ci_failure reasons.  For a
+    /// rebounce, the PR's own CI is *always* green (the failure is on the
+    /// synthetic merge commit), so every sweep immediately un-blocked the
+    /// chore, preventing detection from sticking.
+    #[tokio::test]
+    async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/501";
+        let (product, chore) = make_in_review(&db, "C-rebounce-noclr", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Step 1: detect the rebounce — chore flips to blocked: ci_failure.
+        let flipped = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature-branch"),
+            None,
+            "synthetic-sha-xyz",
+            &[],
+        )
+        .await;
+        assert!(flipped);
+
+        // Step 2: simulate the merge_poller's next sweep — the head-branch CI
+        // probe returns Clean (statusCheckRollup is all SUCCESS), so sweep_one
+        // calls on_ci_resolved.  This must NOT clear the rebounce block.
+        let cleared = on_ci_resolved(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(
+            !cleared,
+            "on_ci_resolved must not clear a merge_queue_rebounce block based on \
+             head-branch CI; the PR's own CI is always green in this case"
+        );
+
+        // Chore must still be blocked after the clean probe.
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+    }
+
+    /// A second probe of the same dequeue event (same `before_commit_sha`)
+    /// is idempotent: the INSERT OR IGNORE is a no-op, but the chore stays
+    /// blocked and no new execution is created.
+    #[tokio::test]
+    async fn rebounce_detection_idempotent_on_same_sha() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/502";
+        let (product, chore) = make_in_review(&db, "C-rebounce-idem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let first = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-A",
+            &[],
+        )
+        .await;
+        // Repeat for the same SHA (as would happen when the same dequeue event
+        // appears in the timeline across consecutive sweeps).
+        let second = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-A",
+            &[],
+        )
+        .await;
+        assert!(first, "first detection must flip the chore");
+        assert!(!second, "second probe for same SHA must be a no-op");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+
+        // Exactly one execution row.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let exec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_executions
+                  WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exec_count, 1, "duplicate probe must not create a second execution");
+    }
+
+    /// After the worker marks the attempt succeeded, the next `on_ci_resolved`
+    /// call (with clean head-branch CI) should clear the rebounce block — that
+    /// is the correct terminal path.
+    #[tokio::test]
+    async fn rebounce_block_clears_after_worker_succeeds() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/503";
+        let (product, chore) = make_in_review(&db, "C-rebounce-retire", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // 1. Detect.
+        on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-Q",
+            &[],
+        )
+        .await;
+
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("attempt row");
+
+        // 2. Worker marks attempt succeeded (re-enqueued the PR).
+        db.mark_ci_remediation_succeeded(&attempt.id, None)
+            .unwrap()
+            .expect("succeeded update");
+
+        // 3. Now on_ci_resolved fires (head-branch CI still clean) — no active
+        //    attempt exists, so the rebounce guard does not fire and the block
+        //    is cleared correctly.
+        let cleared = on_ci_resolved(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(cleared, "after worker succeeds, on_ci_resolved must clear the block");
+
+        let (status, _) = chore_state(&db, &chore);
+        assert_eq!(status, "in_review");
     }
 }
