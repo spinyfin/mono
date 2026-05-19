@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 
 final class EngineProcessController: @unchecked Sendable {
-    private let pidFilePath: String
+    private let paths: BossEnginePaths
     private let lockFilePath: String
     private let launchDirectory: String
     private let forceRestart: Bool
@@ -12,25 +12,25 @@ final class EngineProcessController: @unchecked Sendable {
     var onOutputLine: (@MainActor @Sendable (String) -> Void)?
 
     init(
-        pidFilePath: String = ProcessInfo.processInfo.environment["BOSS_ENGINE_PID_PATH"]
-            ?? "/tmp/boss-engine.pid",
+        paths: BossEnginePaths,
         launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
             ?? FileManager.default.currentDirectoryPath,
         forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
         stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1"
     ) {
-        self.pidFilePath = pidFilePath
-        self.lockFilePath = "\(pidFilePath).lock"
+        self.paths = paths
+        self.lockFilePath = "\(paths.pidPath).lock"
         self.launchDirectory = launchDirectory
         self.forceRestart = forceRestart
         self.stopOnExit = stopOnExit
     }
 
-    func start(socketPath: String) throws {
+    func start() throws {
+        let socketPath = paths.socketPath
         try withStartLock {
             if forceRestart, let pid = currentEnginePID() {
                 emit("[engine restart] terminating existing engine pid=\(pid)")
-                terminateProcess(pid: pid)
+                terminateEngine(pid: pid)
                 clearPIDFileIfOwned(pid: pid)
             }
 
@@ -87,11 +87,11 @@ final class EngineProcessController: @unchecked Sendable {
                 }
 
                 emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing engine pid=\(pid)")
-                terminateProcess(pid: pid)
+                terminateEngine(pid: pid)
                 clearPIDFileIfOwned(pid: pid)
                 let closed = waitForSocketClose(socketPath: socketPath, timeoutSeconds: 8.0)
                 if !closed {
-                    emit("[engine upgrade] socket did not close within 8s after SIGTERM; SIGKILL should have fired already")
+                    emit("[engine upgrade] socket did not close within 8s after shutdown rpc; SIGKILL should have fired already")
                 }
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
@@ -102,7 +102,7 @@ final class EngineProcessController: @unchecked Sendable {
             if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
                 emit("[engine launch] detached pid=\(pid) \(command)")
             } else {
-                emit("[engine launch] started but pid file not observed yet: \(pidFilePath)")
+                emit("[engine launch] started but pid file not observed yet: \(paths.pidPath)")
             }
         }
     }
@@ -289,7 +289,7 @@ final class EngineProcessController: @unchecked Sendable {
             return
         }
 
-        terminateProcess(pid: pid)
+        terminateEngine(pid: pid)
         clearPIDFileIfOwned(pid: pid)
         emit("[engine stop] terminated pid=\(pid)")
     }
@@ -394,7 +394,7 @@ final class EngineProcessController: @unchecked Sendable {
     }
 
     private func readPIDFile() -> pid_t? {
-        guard let content = try? String(contentsOfFile: pidFilePath, encoding: .utf8) else {
+        guard let content = try? String(contentsOfFile: paths.pidPath, encoding: .utf8) else {
             return nil
         }
 
@@ -409,7 +409,7 @@ final class EngineProcessController: @unchecked Sendable {
         guard let owner = readPIDFile(), owner == pid else {
             return
         }
-        try? FileManager.default.removeItem(atPath: pidFilePath)
+        try? FileManager.default.removeItem(atPath: paths.pidPath)
     }
 
     private func isProcessRunning(_ pid: pid_t) -> Bool {
@@ -457,11 +457,34 @@ final class EngineProcessController: @unchecked Sendable {
         return nil
     }
 
-    private func terminateProcess(pid: pid_t) {
+    /// Tear down the running engine. Preferred path is the
+    /// token-authenticated shutdown RPC — same authority the CLI
+    /// uses (issue #705). Falls through to SIGTERM only when the
+    /// token is unavailable, the socket isn't reachable, or the
+    /// engine refused the token; the everyday case never sends
+    /// SIGTERM, so a test that ends up here without a valid token
+    /// is rejected by the engine rather than killing it.
+    private func terminateEngine(pid: pid_t) {
         guard isProcessRunning(pid) else {
             return
         }
 
+        if attemptRpcShutdown() {
+            // Wait for the engine to actually exit before returning so
+            // the caller can `clearPIDFileIfOwned` and then re-spawn
+            // without racing the still-alive process.
+            for _ in 0..<50 {
+                if !isProcessRunning(pid) {
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            emit("[engine stop] rpc accepted but pid=\(pid) still alive after 5s; falling back to SIGKILL")
+            _ = kill(pid, SIGKILL)
+            return
+        }
+
+        emit("[engine stop] rpc shutdown unavailable; falling back to SIGTERM pid=\(pid)")
         _ = kill(pid, SIGTERM)
         for _ in 0..<20 {
             if !isProcessRunning(pid) {
@@ -470,6 +493,108 @@ final class EngineProcessController: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.1)
         }
         _ = kill(pid, SIGKILL)
+    }
+
+    /// Try the token-authenticated shutdown RPC. Returns `true` when
+    /// the engine acknowledged `ShutdownAccepted`. Any failure
+    /// (no token file, socket unreachable, token rejected, malformed
+    /// reply) returns `false` so the caller can fall back to SIGTERM.
+    private func attemptRpcShutdown() -> Bool {
+        let tokenPath = paths.controlTokenPath
+        guard FileManager.default.fileExists(atPath: tokenPath) else {
+            return false
+        }
+        guard let raw = try? String(contentsOfFile: tokenPath, encoding: .utf8),
+              let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = json["token"] as? String
+        else {
+            return false
+        }
+        // Prefer the socket path the engine wrote into the token file
+        // so we always dial whichever process actually minted the
+        // token, even if the env override has since changed.
+        let socketPath = (json["socket_path"] as? String) ?? paths.socketPath
+        return sendShutdownRequest(socketPath: socketPath, token: token, timeoutSeconds: 5.0)
+    }
+
+    /// Open a synchronous Unix-domain connection, send a `shutdown`
+    /// request with the supplied token, and wait for either
+    /// `shutdown_accepted` or `shutdown_rejected`. Returns `true`
+    /// only on `shutdown_accepted`.
+    private func sendShutdownRequest(
+        socketPath: String,
+        token: String,
+        timeoutSeconds: Double
+    ) -> Bool {
+        let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { Darwin.close(sock) }
+
+        var tv = timeval(
+            tv_sec: Int(timeoutSeconds),
+            tv_usec: Int32((timeoutSeconds.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
+        )
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let sunPathMax = MemoryLayout.size(ofValue: addr.sun_path)
+        _ = socketPath.withCString { cStr in
+            withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+                memcpy(UnsafeMutableRawPointer(dst), cStr, min(strlen(cStr), sunPathMax - 1))
+            }
+        }
+        let connectResult: Int32 = withUnsafePointer(to: addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else { return false }
+
+        let request: [String: Any] = [
+            "request_id": "engine-stop",
+            "payload": [
+                "type": "shutdown",
+                "token": token,
+            ],
+        ]
+        guard let body = try? JSONSerialization.data(withJSONObject: request) else { return false }
+        var line = body
+        line.append(0x0A)
+        let sent = line.withUnsafeBytes { buf in
+            Darwin.send(sock, buf.baseAddress!, buf.count, 0)
+        }
+        guard sent == line.count else { return false }
+
+        var responseBuffer = Data()
+        var readBuf = [UInt8](repeating: 0, count: 4096)
+        outer: while true {
+            let n = Darwin.recv(sock, &readBuf, readBuf.count, 0)
+            if n <= 0 { break }
+            responseBuffer.append(contentsOf: readBuf[..<n])
+            while let newlineIdx = responseBuffer.firstIndex(of: 0x0A) {
+                let lineData = Data(responseBuffer[..<newlineIdx])
+                responseBuffer.removeSubrange(...newlineIdx)
+                guard
+                    let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                    json["request_id"] as? String == "engine-stop",
+                    let payload = json["payload"] as? [String: Any],
+                    let kind = payload["type"] as? String
+                else { continue }
+                if kind == "shutdown_accepted" {
+                    return true
+                }
+                if kind == "shutdown_rejected" {
+                    let reason = (payload["reason"] as? String) ?? "unknown"
+                    emit("[engine stop] shutdown rpc rejected: \(reason)")
+                    return false
+                }
+            }
+            if responseBuffer.count > 256 * 1024 { break outer }
+        }
+        return false
     }
 
     private func withStartLock<T>(_ body: () throws -> T) throws -> T {

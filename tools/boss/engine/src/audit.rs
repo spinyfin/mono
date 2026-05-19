@@ -215,6 +215,22 @@ pub fn record_accept_loop_started(kind: &str, path: &Path) {
     write_record(now, "accept_loop_started", fields);
 }
 
+/// Record a `shutdown_rpc` attempt — the engine received a
+/// `Shutdown` request on the frontend socket. `outcome` is one of
+/// `"accepted"`, `"token_mismatch"`, or `"token_missing"`. Logged
+/// regardless of result so a wrong-target test or worker leaves an
+/// explicit trail rather than silently SIGTERMing the engine.
+pub fn record_shutdown_rpc(outcome: &str, peer_pid: Option<i32>) {
+    let now = epoch_now_s();
+    let mut fields = Map::new();
+    fields.insert("pid".into(), json!(std::process::id()));
+    fields.insert("outcome".into(), Value::String(outcome.to_owned()));
+    if let Some(p) = peer_pid {
+        fields.insert("peer_pid".into(), json!(p));
+    }
+    write_record(now, "shutdown_rpc", fields);
+}
+
 /// Record an arbitrary auxiliary event. Reserved for future expansion
 /// (e.g. socket teardown, accept errors). Keeps a single funnel into
 /// the file format.

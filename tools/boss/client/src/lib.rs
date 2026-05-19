@@ -244,10 +244,39 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
     )
 }
 
+/// Stop the running engine. Preferred path is the token-authenticated
+/// `Shutdown` RPC on the frontend socket — same authority the macOS
+/// app uses (issue #705). Falls back to `SIGTERM` only when the RPC
+/// path can't be exercised (no token file, socket unreachable,
+/// engine refuses the token). The SIGTERM fallback exists so a
+/// developer recovering from a wedged engine on a non-standard layout
+/// still has a recoverable kill switch; the everyday "restart engine"
+/// case always takes the RPC.
 pub fn stop_engine(pid_file_path: &str) -> Result<()> {
     let Some(pid) = running_engine_pid(pid_file_path) else {
         return Ok(());
     };
+
+    // Best-effort attempt to take the RPC route. Any failure here
+    // falls through to SIGTERM so the caller's "please make the
+    // engine go away" still works on a host where the token file
+    // never landed.
+    match try_shutdown_via_rpc() {
+        Ok(()) => {
+            if let Some(owner) = read_pid_file(pid_file_path) {
+                if owner == pid {
+                    let _ = std::fs::remove_file(pid_file_path);
+                }
+            }
+            return Ok(());
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                "stop_engine: rpc shutdown unavailable; falling back to SIGTERM",
+            );
+        }
+    }
 
     let status = Command::new("/bin/kill")
         .args(["-TERM", &pid.to_string()])
@@ -267,6 +296,68 @@ pub fn stop_engine(pid_file_path: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Try the token-authenticated shutdown RPC. Returns `Ok(())` when
+/// the engine acknowledged `ShutdownAccepted`. Any failure (no token
+/// file, socket unreachable, token rejected, unexpected response) is
+/// surfaced as an `Err` so the caller can decide whether to fall back.
+fn try_shutdown_via_rpc() -> Result<()> {
+    let token_path = default_control_token_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve engine-control token path"))?;
+    let raw = std::fs::read_to_string(&token_path).with_context(|| {
+        format!(
+            "failed to read engine-control token file {}",
+            token_path.display()
+        )
+    })?;
+    let parsed: ControlTokenFile = serde_json::from_str(&raw)
+        .with_context(|| format!("malformed engine-control token file {}", token_path.display()))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build temporary tokio runtime for shutdown RPC")?;
+
+    runtime.block_on(async move {
+        let mut client = BossClient::connect_socket(&parsed.socket_path).await?;
+        let event = client
+            .send_request(&FrontendRequest::Shutdown {
+                token: parsed.token.clone(),
+            })
+            .await?;
+        match event {
+            FrontendEvent::ShutdownAccepted => Ok(()),
+            FrontendEvent::ShutdownRejected { reason } => {
+                bail!("engine rejected shutdown rpc: {reason}");
+            }
+            other => bail!("unexpected response to Shutdown rpc: {:?}", other),
+        }
+    })
+}
+
+/// Minimal on-disk view of the engine-control token file. Kept in
+/// this crate (rather than reused from `boss-engine`) so the CLI's
+/// dep graph doesn't pull the full engine.
+#[derive(Debug, serde::Deserialize)]
+struct ControlTokenFile {
+    token: String,
+    socket_path: String,
+}
+
+/// Default token path, mirroring `boss_engine::engine_control::default_token_path`.
+/// Duplicated rather than re-exported so the CLI does not depend on
+/// the engine crate.
+pub fn default_control_token_path() -> Option<PathBuf> {
+    const ENV: &str = "BOSS_ENGINE_CONTROL_TOKEN_PATH";
+    if let Some(override_path) = std::env::var_os(ENV) {
+        let trimmed = override_path.to_string_lossy().trim().to_owned();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/Boss/engine-control.token"))
 }
 
 fn start_engine_process(discovery: &Discovery) -> Result<()> {

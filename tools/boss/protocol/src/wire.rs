@@ -749,6 +749,21 @@ pub enum FrontendRequest {
     RevealWorkItem {
         id: String,
     },
+    /// Token-authenticated shutdown. The engine writes a random token
+    /// to `~/Library/Application Support/Boss/engine-control.token`
+    /// (mode 0600) at startup; callers that want to ask the engine to
+    /// exit cleanly read the token file and send it here. The engine
+    /// validates the token verbatim and, on match, replies with
+    /// [`FrontendEvent::ShutdownAccepted`] then triggers the same
+    /// graceful-shutdown path SIGTERM takes. A mismatch replies with
+    /// [`FrontendEvent::ShutdownRejected`] and records an audit entry.
+    ///
+    /// Replaces SIGTERM as the everyday "restart engine" gesture — see
+    /// issue #705. The macOS app, `boss engine stop`, and bossctl all
+    /// take this route; SIGTERM remains the OS-shutdown fallback.
+    Shutdown {
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1382,6 +1397,21 @@ pub enum FrontendEvent {
     /// `id` so `bossctl reveal` can confirm which item was highlighted.
     WorkItemRevealed {
         id: String,
+    },
+    /// Response to [`FrontendRequest::Shutdown`] when the supplied
+    /// token matched the engine's. The engine sends this immediately
+    /// before starting graceful shutdown so the caller has a
+    /// well-defined "accepted, you should now wait for the socket to
+    /// close" signal.
+    ShutdownAccepted,
+    /// Response to [`FrontendRequest::Shutdown`] when the supplied
+    /// token did not match. The engine logs an audit record and keeps
+    /// running. `reason` is a short stable label
+    /// (`token_mismatch`, `token_missing`) so callers can distinguish
+    /// auth failures from unrelated socket errors without parsing a
+    /// human string.
+    ShutdownRejected {
+        reason: String,
     },
 }
 

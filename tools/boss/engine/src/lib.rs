@@ -15,6 +15,7 @@ pub mod design_detector;
 pub mod dispatch_events;
 pub mod dispatch_reader;
 pub mod effort;
+pub mod engine_control;
 pub mod events_socket;
 pub mod external_tracker;
 pub mod feature_flags;
