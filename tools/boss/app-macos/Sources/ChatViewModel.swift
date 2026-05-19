@@ -477,7 +477,11 @@ final class ChatViewModel: ObservableObject {
     private let showSystemMessages: Bool
     private var didStart = false
     private var didStartEngine = false
-    private var hasConnectedOnce = false
+    /// Becomes `true` the first time the socket reaches `.ready`. The
+    /// Disconnected banner reads this so it stays hidden during the
+    /// short initial-connect window (avoiding a flash on launch) and
+    /// only appears once the engine has been reachable at least once.
+    @Published private(set) var hasConnectedOnce = false
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
@@ -1404,7 +1408,18 @@ final class ChatViewModel: ObservableObject {
         case .workError(let message):
             workErrorMessage = message
         case .error(let message):
-            if shouldSuppressSocketStartupError(message) { return }
+            if isSocketTransportError(message) {
+                // Transport errors fire continuously while the engine
+                // is unreachable (every reconnect attempt re-emits a
+                // `socket waiting:` line). Routing them through the
+                // work-error modal makes the app unusable: dismissing
+                // re-opens it on the next retry. The disconnected
+                // banner in the main chrome is the user-facing signal
+                // for this state — see `hasConnectedOnce` /
+                // `isConnected` in ContentView.
+                appendSystemMessage(message)
+                return
+            }
             workErrorMessage = message
         case .workerLiveStatesList(let states):
             liveWorkerStates.update(states: states)
@@ -1601,9 +1616,16 @@ final class ChatViewModel: ObservableObject {
         engine.start()
     }
 
-    private func shouldSuppressSocketStartupError(_ message: String) -> Bool {
-        guard !showSystemMessages, !hasConnectedOnce else { return false }
-        return message.hasPrefix("socket failed:") || message.hasPrefix("socket waiting:")
+    /// Whether an `.error` message is a transport-level signal from
+    /// `EngineClient` rather than a real engine-reported error.
+    /// Transport errors are emitted on every reconnect attempt while
+    /// the socket can't be opened, so they must not drive any modal
+    /// UI — see the `.error` arm of `handle(_:)` for context.
+    private func isSocketTransportError(_ message: String) -> Bool {
+        return message.hasPrefix("socket failed:")
+            || message.hasPrefix("socket waiting:")
+            || message.hasPrefix("socket send failed:")
+            || message.hasPrefix("socket receive failed:")
     }
 
     private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {

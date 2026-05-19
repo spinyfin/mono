@@ -53,6 +53,20 @@ struct ContentView: View {
             }
 
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            // Persistent chrome-level signal that the engine socket is
+            // down. Only shown after we've connected at least once so
+            // the banner doesn't flash on launch during the normal
+            // initial-connect window. Replaces the previous behavior
+            // where every reconnect attempt re-popped a "Work Error"
+            // modal (#698) — transport errors are now routed away from
+            // `workErrorMessage` in `ChatViewModel.handle`.
+            if !model.isConnected && model.hasConnectedOnce {
+                EngineUnreachableBanner()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: model.isConnected)
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
@@ -3644,5 +3658,29 @@ private class ResizeDividerView: NSView {
     override func mouseUp(with event: NSEvent) {
         isDragging = false
         needsDisplay = true
+    }
+}
+
+/// Persistent, full-width strip pinned to the top of the window when
+/// the engine socket can't be reached. Replaces the prior "Work Error"
+/// modal that re-popped every dismissal during a reconnect storm (see
+/// `ChatViewModel.handle` for the matching transport-error suppression
+/// path).
+private struct EngineUnreachableBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.white)
+            Text("Boss engine is unreachable — reconnecting…")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(Color.red.opacity(0.85))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Boss engine is unreachable. Reconnecting.")
     }
 }
