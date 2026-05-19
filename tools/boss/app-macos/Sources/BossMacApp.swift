@@ -4,7 +4,7 @@ import SwiftUI
 @main
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var chatModel = ChatViewModel()
+    @StateObject private var chatModel = ChatViewModel(paths: BossEnginePaths.production())
 
     var body: some Scene {
         WindowGroup {

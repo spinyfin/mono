@@ -427,6 +427,18 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
+    /// Secret token written to the control-token file at startup. A
+    /// frontend `Shutdown { token }` RPC must match this value to
+    /// trigger graceful exit. `None` only in tests / in-process
+    /// `serve` calls that didn't ask for a control token — those
+    /// callers can't shut the engine down over the wire (they always
+    /// have direct ownership of the runtime handle and can drop it).
+    control_token: Option<Arc<String>>,
+    /// Notified by the `Shutdown` RPC handler after a successful token
+    /// match. The accept loop in `serve` selects on this alongside the
+    /// SIGTERM-style shutdown signal and exits the same graceful path
+    /// when either fires.
+    shutdown_trigger: Arc<Notify>,
 }
 
 /// Authorization tier for a frontend RPC.
@@ -565,14 +577,10 @@ pub enum RevealItemError {
 }
 
 impl ServerState {
-    fn new_arc(cfg: Arc<RuntimeConfig>) -> Result<Arc<Self>> {
-        let app_pid = current_parent_pid();
-        Self::new_arc_with_app_pid(cfg, app_pid)
-    }
-
     fn new_arc_with_app_pid(
         cfg: Arc<RuntimeConfig>,
         app_pid: Option<libc::pid_t>,
+        control_token: Option<Arc<String>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg
@@ -738,6 +746,9 @@ impl ServerState {
         let metrics_for_coordinator = metrics_registry.clone();
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
+        let shutdown_trigger = Arc::new(Notify::new());
+        let shutdown_trigger_for_state = shutdown_trigger.clone();
+        let control_token_for_state = control_token.clone();
 
         let mut tracker_registry = crate::external_tracker::TrackerRegistry::new();
         tracker_registry
@@ -845,6 +856,8 @@ impl ServerState {
                 metrics: metrics_for_state,
                 pr_reconciler_kick: pr_reconciler_kick_for_state,
                 tracker_registry: tracker_registry_for_state,
+                control_token: control_token_for_state,
+                shutdown_trigger: shutdown_trigger_for_state,
             }
         });
 
@@ -1915,11 +1928,13 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
     let pid_file_path =
         std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
     let events_socket_path = default_events_socket_path()?;
+    let control_token_path = crate::engine_control::default_token_path();
     serve(
         cfg,
         socket_path.into(),
         Some(pid_file_path.into()),
         Some(events_socket_path),
+        control_token_path,
     )
     .await
 }
@@ -1943,13 +1958,49 @@ fn default_events_socket_path() -> Result<std::path::PathBuf> {
 /// also binds the worker events socket (mode 0600) and runs an accept loop
 /// that decodes hook payloads via the worker registry; pass `None` from
 /// tests that don't exercise the events channel.
+///
+/// When `control_token_path` is `Some`, the engine mints a random
+/// secret on startup, writes it to that path (mode 0600), and accepts
+/// matching `Shutdown { token }` RPCs on the frontend socket. The
+/// file is removed on graceful exit via [`crate::engine_control::ControlTokenGuard`].
+/// Tests pass `None` to skip the file entirely; in-process callers
+/// own the runtime handle and don't need an authenticated wire path.
 pub async fn serve(
     cfg: Arc<RuntimeConfig>,
     socket_path: std::path::PathBuf,
     pid_file_path: Option<std::path::PathBuf>,
     events_socket_path: Option<std::path::PathBuf>,
+    control_token_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let server_state = ServerState::new_arc(cfg.clone())?;
+    let app_pid = current_parent_pid();
+    let (control_token, _control_token_guard) = match control_token_path {
+        Some(path) => {
+            let token = crate::engine_control::generate_token();
+            let contents = crate::engine_control::ControlTokenFile {
+                token: token.clone(),
+                socket_path: socket_path.display().to_string(),
+                pid: std::process::id(),
+            };
+            crate::engine_control::write_token_file(&path, &contents).with_context(|| {
+                format!(
+                    "failed to write engine-control token file {}",
+                    path.display()
+                )
+            })?;
+            tracing::info!(
+                token_path = %path.display(),
+                "engine-control token: ready",
+            );
+            let guard = crate::engine_control::ControlTokenGuard::new(
+                path.clone(),
+                std::process::id(),
+            );
+            (Some(Arc::new(token)), Some(guard))
+        }
+        None => (None, None),
+    };
+    let server_state =
+        ServerState::new_arc_with_app_pid(cfg.clone(), app_pid, control_token.clone())?;
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races
@@ -2407,6 +2458,7 @@ pub async fn serve(
     );
     crate::audit::record_accept_loop_started("frontend", &socket_path);
 
+    let shutdown_trigger_for_loop = server_state.shutdown_trigger.clone();
     loop {
         tokio::select! {
             biased;
@@ -2421,6 +2473,21 @@ pub async fn serve(
                 // shutdown signal isn't dropped on a clean exit.
                 // Crash-loss is acceptable for monotonic counts; a
                 // clean exit can afford to do better.
+                if let Err(err) = crate::metrics::flush_all(
+                    &server_state.metrics,
+                    &server_state.work_db,
+                ) {
+                    tracing::warn!(?err, "metrics: final flush on shutdown failed");
+                }
+                tracing::info!("engine shutdown complete");
+                return Ok(());
+            }
+            _ = shutdown_trigger_for_loop.notified() => {
+                tracing::info!("shutdown rpc accepted; releasing worker panes");
+                crate::audit::record_shutdown("rpc");
+                server_state
+                    .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
+                    .await;
                 if let Err(err) = crate::metrics::flush_all(
                     &server_state.metrics,
                     &server_state.work_db,
@@ -2447,6 +2514,21 @@ pub async fn serve(
             }
         }
     }
+}
+
+/// Constant-time byte comparison. Used by the shutdown-RPC token
+/// gate so a wrong-length or wrong-content token can't be inferred
+/// from response timing — the same costs as the real comparison,
+/// regardless of where the mismatch lands.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 /// Walk up `pid`'s process tree (bounded depth) checking whether
@@ -4918,6 +5000,68 @@ async fn handle_frontend_connection(
                     &request_id,
                     FrontendEvent::WorkerLiveStatesList { states },
                 );
+            }
+            FrontendRequest::Shutdown { token } => {
+                // The token written to disk at startup is the auth
+                // credential — there is no pid-based tier check on
+                // purpose. The whole point of the token gate (issue
+                // #705) is that "same user / same machine" doesn't
+                // separate the legitimate caller (macOS app, boss CLI)
+                // from the accidental caller (a `bazel test` that
+                // resolved the production socket). The bazel sandbox
+                // already denies access to `~/Library/Application
+                // Support/`, so a test that lands here without the
+                // file in scope will fail with `token_missing` rather
+                // than killing a 9-hour-old engine.
+                let outcome = match server_state.control_token.as_deref() {
+                    None => {
+                        // In-process serve() without a control token —
+                        // shouldn't happen for any process that has a
+                        // dialable frontend socket, but the dispatcher
+                        // is the wrong place to assume that. Reject
+                        // explicitly rather than panic.
+                        "token_missing"
+                    }
+                    Some(expected) => {
+                        if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
+                            "accepted"
+                        } else {
+                            "token_mismatch"
+                        }
+                    }
+                };
+                crate::audit::record_shutdown_rpc(outcome, peer_pid.map(|p| p as i32));
+                if outcome == "accepted" {
+                    tracing::info!(
+                        peer_pid = ?peer_pid,
+                        "shutdown rpc: token accepted — graceful exit pending",
+                    );
+                    send_response(&sink, &request_id, FrontendEvent::ShutdownAccepted);
+                    // Defer the actual notify so the writer task has a
+                    // chance to drain the ShutdownAccepted frame into
+                    // the kernel socket buffer before the accept loop
+                    // breaks. 50 ms is well under the shutdown_workers
+                    // grace window and well over the time it takes the
+                    // dispatcher to enqueue + the writer task to flush.
+                    let trigger = server_state.shutdown_trigger.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        trigger.notify_one();
+                    });
+                } else {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        outcome,
+                        "shutdown rpc: rejected",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ShutdownRejected {
+                            reason: outcome.to_owned(),
+                        },
+                    );
+                }
             }
             FrontendRequest::CancelExecution { execution_id } => {
                 if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
@@ -7506,7 +7650,7 @@ mod tests {
         // Leak the temp dir for the lifetime of the test process; the
         // ServerState's WorkDb keeps a handle to a path inside it.
         std::mem::forget(temp);
-        ServerState::new_arc_with_app_pid(cfg, None).unwrap()
+        ServerState::new_arc_with_app_pid(cfg, None, None).unwrap()
     }
 
     fn make_session_sink() -> Arc<SessionSink> {
@@ -7563,7 +7707,7 @@ mod tests {
         };
         let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
         std::mem::forget(temp);
-        let state = ServerState::new_arc_with_app_pid(cfg, None).unwrap();
+        let state = ServerState::new_arc_with_app_pid(cfg, None, None).unwrap();
 
         let report = build_engine_health_report(&state);
         assert!(report.anthropic_api_key_present);
@@ -8412,7 +8556,7 @@ mod tests {
             None,
         ));
         std::mem::forget(temp);
-        ServerState::new_arc_with_app_pid(cfg, Some(app_pid)).unwrap()
+        ServerState::new_arc_with_app_pid(cfg, Some(app_pid), None).unwrap()
     }
 
     #[cfg(target_os = "macos")]

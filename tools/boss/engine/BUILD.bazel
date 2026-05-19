@@ -23,6 +23,7 @@ rust_library(
         "src/dispatch_events.rs",
         "src/dispatch_reader.rs",
         "src/effort.rs",
+        "src/engine_control.rs",
         "src/events_socket.rs",
         "src/external_tracker/credentials.rs",
         "src/external_tracker/github.rs",
@@ -149,6 +150,26 @@ rust_test(
     # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default
     # for size="small" is too tight when concurrent tests contend on the
     # binary_fingerprint OnceLock during startup. timeout="moderate" (300s) gives headroom.
+    timeout = "moderate",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
+    name = "shutdown_rpc_test",
+    srcs = ["tests/shutdown_rpc.rs"],
+    edition = "2024",
+    size = "small",
     timeout = "moderate",
     deps = [
         ":engine_lib",

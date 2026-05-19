@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boss-protocol",
+ "serde",
  "serde_json",
  "shlex",
  "tempfile",

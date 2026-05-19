@@ -509,7 +509,8 @@ final class ChatViewModel: ObservableObject {
         get { engine.outboundRecorder }
         set { engine.outboundRecorder = newValue }
     }
-    private let processController = EngineProcessController()
+    private let processController: EngineProcessController
+    private let paths: BossEnginePaths
     private let socketPath: String
     private let showSystemMessages: Bool
     private var didStart = false
@@ -546,14 +547,35 @@ final class ChatViewModel: ObservableObject {
     private let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     private let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
 
-    init(
-        socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
-            ?? "/tmp/boss-engine.sock"
-    ) {
-        self.socketPath = socketPath
+    init(paths: BossEnginePaths) {
+        self.paths = paths
+        self.socketPath = paths.socketPath
+        self.processController = EngineProcessController(paths: paths)
         let showSystem = ProcessInfo.processInfo.environment["BOSS_SHOW_SYSTEM_MESSAGES"] ?? ""
         showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
-        engine = EngineClient(socketPath: socketPath)
+        engine = EngineClient(socketPath: paths.socketPath)
+
+        commonInit()
+    }
+
+    /// Test-only convenience: build a `ChatViewModel` whose engine
+    /// paths are all derived from a single per-test `socketPath` so a
+    /// test never touches the production pid file or control token.
+    /// Mirrors the call shape `ChatViewModel(socketPath:)` that
+    /// pre-issue-#705 tests used, but routes through
+    /// `BossEnginePaths.forTest(...)` so the test-context refusal in
+    /// `BossEnginePaths.production*()` still applies to anything that
+    /// reaches for the canonical paths.
+    convenience init(socketPath: String) {
+        let paths = BossEnginePaths.forTest(
+            socketPath: socketPath,
+            pidPath: "\(socketPath).pid",
+            controlTokenPath: "\(socketPath).token"
+        )
+        self.init(paths: paths)
+    }
+
+    private func commonInit() {
 
         if let rawMode = defaults.string(forKey: navigationModeDefaultsKey),
            let persistedMode = NavigationMode(rawValue: rawMode) {
@@ -1093,11 +1115,10 @@ final class ChatViewModel: ObservableObject {
 
         let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
         if autostart {
-            let socketPath = self.socketPath
             let processController = self.processController
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 do {
-                    try processController.start(socketPath: socketPath)
+                    try processController.start()
                     DispatchQueue.main.async {
                         self?.startEngineIfNeeded()
                     }
