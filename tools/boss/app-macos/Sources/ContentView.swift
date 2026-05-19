@@ -1661,7 +1661,7 @@ struct WorkBoardCardView: View {
                     if showsConflictClearedBadge {
                         ConflictClearedBadge()
                     }
-                    if showsCIAutoFixedBadge {
+                    if showsCIAutoFixedBadge && ciFailureBadge == nil {
                         CIAutoFixedBadge()
                     }
                     if let ciFailureBadge, !isRemediatingCI {
