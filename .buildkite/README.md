@@ -14,6 +14,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     bazel-build.sh      # bazel build //... (dependency-graph compile guard)
     bazel-test.sh       # bazel test //... (canonical rust + integration tests)
     checks.sh           # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
+    boss-release.sh     # post-merge: build Boss.app with credentials, publish GitHub Release
   README.md             # this file
 ```
 
@@ -21,12 +22,15 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ```
 bootstrap (queue=linux-amd64)┬──► bazel-build ──┐
-                             ├──► checks      ──┼──► (wait) ──► bazel-test ──► green
+                             ├──► mac-app-build ─┼──► (wait) ──► bazel-test ──► green
+                             ├──► checks      ──┘                     │
+                                                                       └──► boss-release (main only)
 ```
 
 - `bootstrap` runs first; all other steps depend on it.
-- `bazel-build` and `checks` run in parallel after bootstrap.
+- `bazel-build`, `mac-app-build`, and `checks` run in parallel after bootstrap.
 - `bazel-test` runs only after all static checks pass (the `wait` step).
+- `boss-release` runs after `bazel-test` passes, but only on the `main` branch. It rebuilds Boss.app with shake credentials embedded and publishes a versioned GitHub Release.
 
 ## Step details
 
@@ -49,6 +53,14 @@ Runs `bazel test //...`. This is the canonical rust test step. With P1 landed (`
 ### `checks.sh`
 
 Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git.
+
+### `boss-release.sh`
+
+Post-merge only (guarded by `if: build.branch == 'main'` in `pipeline.yml`). Runs on `macos-arm64` after `bazel-test` passes.
+
+Reads three secrets from the pipeline environment (`BOSS_SHAKE_APP_ID`, `BOSS_SHAKE_INSTALLATION_ID`, `BOSS_SHAKE_PRIVATE_KEY_PEM`), rebuilds `//tools/boss/app-macos:Boss` with those credentials embedded at compile time, packages the resulting `.app` using `ditto`, computes the next sequential `v1.0.N` tag, and creates a GitHub Release on `spinyfin/mono` with the zipped `.app` as the artifact.
+
+See `tools/boss/docs/buildkite-shake-secrets-setup.md` for one-time provisioning instructions.
 
 ## Agents and queue
 

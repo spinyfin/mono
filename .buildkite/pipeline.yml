@@ -2,6 +2,8 @@
 #
 # Shape:
 #   bootstrap → [bazel-build, mac-app-build, checks] → [bazel-test]
+#                                                              ↓ (main only)
+#                                                        boss-release
 #
 # Each steps/*.sh script contains all logic; no inline shell here.
 # Queue: linux-amd64 — Default cluster queue for Linux agents.
@@ -63,3 +65,14 @@ steps:
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-test"
+
+  - label: ":rocket: boss-release"
+    key: "boss-release"
+    if: "build.branch == 'main'"
+    command: ".buildkite/steps/boss-release.sh"
+    depends_on: "bazel-test"
+    agents:
+      queue: "macos-arm64"
+    notify:
+      - github_commit_status:
+          context: "buildkite/mono/boss-release"
