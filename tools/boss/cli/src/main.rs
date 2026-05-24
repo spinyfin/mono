@@ -6073,6 +6073,8 @@ fn print_lint_design_docs_table(entries: &[LintDesignDocEntry]) {
             entry.suggested_fix,
         );
     }
+    println!();
+    println!("{}", lint_summary_line(entries));
 }
 
 fn lint_severity_label(severity: LintSeverity) -> &'static str {
@@ -6081,6 +6083,29 @@ fn lint_severity_label(severity: LintSeverity) -> &'static str {
         LintSeverity::Missing => "missing",
         LintSeverity::Unverified => "unverified",
     }
+}
+
+/// One-line tally of the lint findings, broken down by severity, for
+/// the human report footer (the JSON form already carries
+/// `broken_count`). Only severities actually present are listed, so a
+/// run that surfaces nothing but stale pointers reads "2 finding(s): 2
+/// broken" rather than padding the line with zero counts. Callers
+/// invoke this only when `entries` is non-empty — the empty case is
+/// handled earlier with a dedicated "no issues" message.
+fn lint_summary_line(entries: &[LintDesignDocEntry]) -> String {
+    let count = |severity| entries.iter().filter(|e| e.severity == severity).count();
+    let parts: Vec<String> = [
+        (LintSeverity::Broken, "broken"),
+        (LintSeverity::Missing, "missing"),
+        (LintSeverity::Unverified, "unverified"),
+    ]
+    .into_iter()
+    .filter_map(|(severity, label)| match count(severity) {
+        0 => None,
+        n => Some(format!("{n} {label}")),
+    })
+    .collect();
+    format!("{} finding(s): {}", entries.len(), parts.join(", "))
 }
 
 /// Format the "Design doc:" line appended by `boss project show` /
@@ -6530,8 +6555,8 @@ mod tests {
         MoveTarget, OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand,
         ProjectStatus, RepoSelector, TaskCommand, classify_bind_pr, classify_lint_finding,
         decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
-        format_project_design_doc_line, format_repo_line, is_typed_work_item_id, pick_by_index,
-        short_name_for, split_shake_report, validate_github_pr_url,
+        format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
+        pick_by_index, short_name_for, split_shake_report, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -7522,6 +7547,46 @@ mod tests {
         assert_eq!(entry.severity, LintSeverity::Missing);
         assert!(entry.design_doc_path.is_none());
         assert!(entry.suggested_fix.contains("set-design-doc boss/alpha"));
+    }
+
+    /// The footer tally lists each present severity with its count and
+    /// omits severities with no findings.
+    #[test]
+    fn lint_summary_line_breaks_down_present_severities() {
+        let product = lint_product();
+        let broken = ProjectDesignDocState::Broken {
+            reason: "no repo".to_owned(),
+        };
+        let entries = vec![
+            classify_lint_finding(
+                &product,
+                &lint_project("a", Some("a.md")),
+                Some(&broken),
+                |_, _| true,
+                false,
+                false,
+            )
+            .unwrap(),
+            classify_lint_finding(
+                &product,
+                &lint_project("b", Some("b.md")),
+                Some(&broken),
+                |_, _| true,
+                false,
+                false,
+            )
+            .unwrap(),
+            classify_lint_finding(
+                &product,
+                &lint_project("c", None),
+                None,
+                |_, _| true,
+                true,
+                false,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(lint_summary_line(&entries), "3 finding(s): 2 broken, 1 missing");
     }
 
     #[test]
