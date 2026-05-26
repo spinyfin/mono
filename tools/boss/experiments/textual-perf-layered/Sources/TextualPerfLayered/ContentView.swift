@@ -74,6 +74,16 @@ enum Layer: String, CaseIterable, Identifiable {
     /// for the slowness via combined invalidation load.
     case fullScaffold
 
+    /// L10: Observability / mount-latency probe. Unlike L0–L9 (which measure
+    /// parse+layout time), this measures the *state-flip -> view-mount*
+    /// latency — the window production logs as `phase=render`. It contrasts
+    /// the production "buggy" observation pattern (a view that reads a nested
+    /// ObservableObject's state through a host it observes, without observing
+    /// the nested object itself) against the "fixed" pattern (observe the
+    /// nested object directly). Targets `AsyncMarkdownViewerView` reading
+    /// `chatModel.asyncMarkdownViewerVM.state` without observing the VM.
+    case observability
+
     var id: String { rawValue }
 
     var label: String {
@@ -88,6 +98,7 @@ enum Layer: String, CaseIterable, Identifiable {
         case .siblingPublisher: "L7 · + sibling pub"
         case .eventMonitor: "L8 · + event monitors"
         case .fullScaffold: "L9 · + full scaffold"
+        case .observability: "L10 · observability"
         }
     }
 
@@ -103,23 +114,72 @@ enum Layer: String, CaseIterable, Identifiable {
         case .siblingPublisher: "L7"
         case .eventMonitor: "L8"
         case .fullScaffold: "L9"
+        case .observability: "L10"
         }
     }
 }
 
-/// Preference key used to detect when `StructuredText` has been laid out
-/// for the first time. Matches the shape Boss uses in
-/// `MarkdownViewerScrollContent` so the parse-end signal is the same.
-struct StructuredTextHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+/// Environment-injected callback that the inner `StructuredText`'s height
+/// reporter invokes once it has laid out (first non-zero height). We use a
+/// *downward-flowing* environment value rather than an upward-bubbling
+/// `PreferenceKey` because the wrapper stack the later layers add
+/// (`withCommentsStub`'s `HStack` + `.overlay` + `.background`) disrupts
+/// preference propagation — the preference signal silently fails to reach
+/// the pane for L3+, so those layers never recorded a `parse_end`. An
+/// environment closure reaches the reporter regardless of intervening
+/// wrappers, so every layer is measured identically.
+private struct ReportRenderHeightKey: EnvironmentKey {
+    static let defaultValue: @MainActor (CGFloat) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var reportRenderHeight: @MainActor (CGFloat) -> Void {
+        get { self[ReportRenderHeightKey.self] }
+        set { self[ReportRenderHeightKey.self] = newValue }
+    }
+}
+
+/// Per-sample timing state. A reference type (rather than `@State` value
+/// types) so the environment closure that the height reporter calls mutates
+/// the live instance instead of a stale captured copy, and the
+/// "fire exactly once" guard is reliable across rapid height callbacks.
+@MainActor
+final class SampleProbe: ObservableObject {
+    var parseStart: Date?
+    @Published var renderMs: Int?
+    @Published var interactiveMs: Int?
+
+    func begin(layer: Layer) {
+        parseStart = Date.now
+        renderMs = nil
+        interactiveMs = nil
+        renderLog.info("phase=parse_start layer=\(layer.shortName, privacy: .public)")
+    }
+
+    func reportHeight(_ height: CGFloat, layer: Layer, iteration: Int, bytes: Int, driver: AutoDriver) {
+        guard height > 0, renderMs == nil, let start = parseStart else { return }
+        let now = Date.now
+        let rMs = Int(now.timeIntervalSince(start) * 1000)
+        let iMs = Int(now.timeIntervalSince(processStartTime) * 1000)
+        renderMs = rMs
+        interactiveMs = iMs
+        renderLog.info(
+            "phase=parse_end layer=\(layer.shortName, privacy: .public) duration_ms=\(rMs, privacy: .public) bytes=\(bytes, privacy: .public)"
+        )
+        renderLog.info(
+            "phase=interactive layer=\(layer.shortName, privacy: .public) duration_ms=\(iMs, privacy: .public)"
+        )
+        driver.reportDone(layer, iteration: iteration, ms: rMs)
     }
 }
 
 struct ContentView: View {
-    @State private var selected: Layer = .textualOnly
     @State private var sample: SampleSource = SampleSource.load()
+
+    // Drives the picker selection / pane id. In auto mode (`TPL_AUTO=1`) it
+    // steps through every layer on its own; otherwise it only changes via
+    // the picker through `selectManually`.
+    @StateObject private var driver = AutoDriver()
 
     // Stubs for L6+: created once and injected into the whole layer pane
     // so each layer can declare only the @EnvironmentObjects it needs.
@@ -129,13 +189,17 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Layer", selection: $selected) {
+            Picker("Layer", selection: Binding(
+                get: { driver.current },
+                set: { driver.selectManually($0) }
+            )) {
                 ForEach(Layer.allCases) { layer in
                     Text(layer.label).tag(layer)
                 }
             }
             .pickerStyle(.segmented)
             .padding(8)
+            .disabled(driver.enabled)
 
             if let error = sample.errorMessage {
                 Text(error)
@@ -146,16 +210,21 @@ struct ContentView: View {
 
             Divider()
 
-            LayerPane(layer: selected, source: sample.text)
+            LayerPane(layer: driver.current, source: sample.text, iteration: driver.iteration)
                 // Inject all stubs so each layer can subscribe selectively
                 // by declaring @EnvironmentObject. L0–L5 never read them,
                 // so they incur no subscription cost.
+                .environmentObject(driver)
                 .environmentObject(chatStub)
                 .environmentObject(siblingPublisher)
                 .environmentObject(extraStub)
-                .id(selected)
+                .id("\(driver.current.rawValue)#\(driver.iteration)")
         }
         .frame(minWidth: 800, minHeight: 600)
+        .task {
+            driver.bind(sibling: siblingPublisher, extra: extraStub)
+            await driver.run()
+        }
     }
 }
 
@@ -165,10 +234,10 @@ struct ContentView: View {
 struct LayerPane: View {
     let layer: Layer
     let source: String
+    let iteration: Int
 
-    @State private var parseStart: Date?
-    @State private var renderMs: Int?
-    @State private var interactiveMs: Int?
+    @EnvironmentObject private var driver: AutoDriver
+    @StateObject private var probe = SampleProbe()
 
     var body: some View {
         ZStack {
@@ -193,28 +262,17 @@ struct LayerPane: View {
                 L8_EventMonitor(source: source)
             case .fullScaffold:
                 L9_FullScaffold(source: source)
+            case .observability:
+                L10_Observability()
             }
         }
-        .onPreferenceChange(StructuredTextHeightKey.self) { h in
-            guard h > 0, renderMs == nil, let start = parseStart else { return }
-            let now = Date.now
-            let rMs = Int(now.timeIntervalSince(start) * 1000)
-            let iMs = Int(now.timeIntervalSince(processStartTime) * 1000)
-            renderMs = rMs
-            interactiveMs = iMs
-            renderLog.info(
-                "phase=parse_end layer=\(layer.shortName, privacy: .public) duration_ms=\(rMs, privacy: .public) bytes=\(source.utf8.count, privacy: .public)"
-            )
-            renderLog.info(
-                "phase=interactive layer=\(layer.shortName, privacy: .public) duration_ms=\(iMs, privacy: .public)"
+        .environment(\.reportRenderHeight) { height in
+            probe.reportHeight(
+                height, layer: layer, iteration: iteration,
+                bytes: source.utf8.count, driver: driver
             )
         }
-        .onAppear {
-            parseStart = Date.now
-            renderMs = nil
-            interactiveMs = nil
-            renderLog.info("phase=parse_start layer=\(layer.shortName, privacy: .public)")
-        }
+        .onAppear { probe.begin(layer: layer) }
         .overlay(alignment: .bottomTrailing) {
             timingOverlay
         }
@@ -222,11 +280,11 @@ struct LayerPane: View {
 
     @ViewBuilder
     private var timingOverlay: some View {
-        if let rMs = renderMs {
+        if let rMs = probe.renderMs {
             VStack(alignment: .trailing, spacing: 2) {
                 Text("parse_end: \(rMs) ms")
                     .font(.caption.monospacedDigit())
-                if let iMs = interactiveMs {
+                if let iMs = probe.interactiveMs {
                     Text("interactive: \(iMs) ms")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)

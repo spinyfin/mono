@@ -614,10 +614,22 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
 /// shows an error affordance when `.failed` — matching the browser-tab
 /// model of open-immediately, then fill.
 struct AsyncMarkdownViewerView: View {
-    @EnvironmentObject private var chatModel: ChatViewModel
+    // Observe the viewer view-model *directly* rather than reaching it through
+    // `chatModel`. The window previously declared only `@EnvironmentObject
+    // chatModel` and read `chatModel.asyncMarkdownViewerVM.state`; because
+    // `asyncMarkdownViewerVM` is a nested ObservableObject that `chatModel`
+    // does not republish, a `.loading -> .loaded` transition was *not*
+    // observed here — the loaded view only mounted on the next incidental
+    // `chatModel` publish (an engine event). Under main-thread contention that
+    // gap stretched to tens of seconds, which is exactly the window
+    // `phase=render` measures. Observing the VM directly mounts the loaded
+    // view the instant the state flips, independent of `chatModel`'s publish
+    // timing. (See `tools/boss/experiments/textual-perf-layered` L10 for the
+    // measured buggy-vs-fixed mount-latency contrast.)
+    @EnvironmentObject private var vm: AsyncMarkdownViewerViewModel
 
     var body: some View {
-        switch chatModel.asyncMarkdownViewerVM.state {
+        switch vm.state {
         case .loading:
             ProgressView("Loading…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -625,21 +637,21 @@ struct AsyncMarkdownViewerView: View {
             MarkdownViewerView(
                 title: title,
                 source: markdown,
-                projectShortID: chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID ?? "",
-                clickStartTime: chatModel.asyncMarkdownViewerVM.clickStartTime
+                projectShortID: vm.pendingRenderProjectShortID ?? "",
+                clickStartTime: vm.clickStartTime
             )
             // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
             // content load, so .onAppear fires even when the window is reused across
             // documents (stable case identity would otherwise suppress it).
-            .id(chatModel.asyncMarkdownViewerVM.renderContentID)
+            .id(vm.renderContentID)
             .navigationTitle(title)
             .onAppear {
-                if let start = chatModel.asyncMarkdownViewerVM.renderStartTime,
-                   let shortID = chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID {
+                if let start = vm.renderStartTime,
+                   let shortID = vm.pendingRenderProjectShortID {
                     let ms = Int(Date().timeIntervalSince(start) * 1000)
                     designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
-                    chatModel.asyncMarkdownViewerVM.renderStartTime = nil
-                    chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
+                    vm.renderStartTime = nil
+                    vm.pendingRenderProjectShortID = nil
                 }
                 // clickStartTime is consumed by MarkdownViewerScrollContent's
                 // layout-complete handler. It is not cleared here on purpose —
