@@ -413,6 +413,10 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Use `--description "$(cat <<'EOF' … EOF)"` when the description contains code, file paths, or shell metacharacters.
 
+    ## Referring to chores and tasks in chat
+
+    When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `T19`, `T30`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
+
     ## Project creation
 
     `boss project create` atomically creates the project + a `kind=design` seed task (`autostart=true` by default).
