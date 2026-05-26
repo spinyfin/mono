@@ -48,17 +48,21 @@ struct GlobalFlags {
     #[arg(long, global = true)]
     no_input: bool,
 
-    /// Suppress autostart side effects.
+    /// Don't auto-dispatch a worker for newly created work items.
     ///
-    /// Three effects, all off-by-default:
-    ///   1. The CLI will not transparently start the engine when
-    ///      its socket is unreachable.
-    ///   2. `boss task create` / `boss chore create` create the work
+    /// This is purely about **worker dispatch**, not engine
+    /// availability — the CLI still transparently starts the engine
+    /// if needed, because the engine is the system of record for any
+    /// work item. To suppress transparent engine startup, use
+    /// `--no-engine-autostart` instead.
+    ///
+    /// Two effects, both off-by-default:
+    ///   1. `boss task create` / `boss chore create` create the work
     ///      item but the engine will NOT auto-dispatch a worker for
     ///      it. The new chore/task stays in the `todo` column until
     ///      something explicitly schedules it (`bossctl work start
     ///      <id>` or a kanban drag-to-Doing).
-    ///   3. `boss project create` still files the project AND its
+    ///   2. `boss project create` still files the project AND its
     ///      auto-spawned `kind=design` seed task, but the seed task
     ///      is born with `autostart=false` so the engine does not
     ///      dispatch a worker against it. Use this to author the
@@ -67,6 +71,18 @@ struct GlobalFlags {
     ///      with `bossctl work start <design-task-id>`.
     #[arg(long, global = true)]
     no_autostart: bool,
+
+    /// Don't transparently start the engine when its socket is
+    /// unreachable.
+    ///
+    /// By default the CLI brings the engine up on demand so it can
+    /// service the request (the engine is the system of record for
+    /// all work items). Pass this when you explicitly do not want the
+    /// CLI to spawn an engine — the command then fails if the engine
+    /// is not already reachable. This is independent of
+    /// `--no-autostart`, which only governs worker dispatch.
+    #[arg(long, global = true)]
+    no_engine_autostart: bool,
 
     #[arg(long, global = true)]
     socket_path: Option<String>,
@@ -1855,10 +1871,11 @@ struct RunContext {
     quiet: bool,
     allow_input: bool,
     discovery: Discovery,
-    /// Mirror of the global `--no-autostart` flag. Today this also
-    /// gates per-work-item auto-dispatch (`boss chore create
-    /// --no-autostart` → engine creates the chore in `todo` but does
-    /// not spin up a worker for it).
+    /// Mirror of the global `--no-autostart` flag. Gates per-work-item
+    /// auto-dispatch (`boss chore create --no-autostart` → engine
+    /// creates the chore in `todo` but does not spin up a worker for
+    /// it). It does NOT affect transparent engine startup — that is
+    /// governed by `--no-engine-autostart` via `discovery.autostart`.
     no_autostart: bool,
 }
 
@@ -1957,7 +1974,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Treat this reference output as the authoritative current CLI surface for this build.",
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
-            "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create` (also gates the auto-spawned `kind=design` seed task on `project create`).",
+            "Omit --no-autostart unless you explicitly need to suppress worker auto-dispatch on `task create` / `chore create` (also gates the auto-spawned `kind=design` seed task on `project create`). --no-autostart does NOT prevent the CLI from transparently starting the engine — the engine is always needed to track work. To forbid transparent engine startup, use --no-engine-autostart (independent of --no-autostart).",
             "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
@@ -2057,7 +2074,7 @@ impl RunContext {
             !flags.no_input && io::stdin().is_terminal() && io::stdout().is_terminal();
         let discovery = Discovery::from_env(flags.socket_path.as_deref())
             .map_err(CliError::internal)?
-            .with_autostart(!flags.no_autostart);
+            .with_autostart(!flags.no_engine_autostart);
 
         Ok(Self {
             output_mode: if flags.json {
@@ -6709,10 +6726,11 @@ mod tests {
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity,
         MoveTarget, OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand,
-        ProjectStatus, RepoSelector, TaskCommand, classify_bind_pr, classify_lint_finding,
-        decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
-        format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
-        pick_by_index, short_name_for, split_shake_report, validate_github_pr_url,
+        ProjectStatus, RepoSelector, RunContext, TaskCommand, classify_bind_pr,
+        classify_lint_finding, decide_open_design_action, ensure_explicit_product_matches,
+        expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
+        is_typed_work_item_id, lint_summary_line, pick_by_index, short_name_for,
+        split_shake_report, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -6793,6 +6811,54 @@ mod tests {
             }
             _ => panic!("expected chore move command"),
         }
+    }
+
+    /// `--no-autostart` and `--no-engine-autostart` are distinct global
+    /// flags (issue #787). `--no-autostart` governs only worker
+    /// auto-dispatch; `--no-engine-autostart` governs transparent
+    /// engine startup. Pin that they parse into independent fields.
+    #[test]
+    fn no_autostart_and_no_engine_autostart_are_independent_flags() {
+        let cli = Cli::parse_from(["boss", "--no-autostart", "engine", "status"]);
+        assert!(cli.global.no_autostart);
+        assert!(!cli.global.no_engine_autostart);
+
+        let cli = Cli::parse_from(["boss", "--no-engine-autostart", "engine", "status"]);
+        assert!(!cli.global.no_autostart);
+        assert!(cli.global.no_engine_autostart);
+    }
+
+    /// Regression for #787: `--no-autostart` must NOT suppress
+    /// transparent engine startup — the engine is the system of record
+    /// and must stay reachable to service the request. Only
+    /// `--no-engine-autostart` flips `discovery.autostart` off.
+    #[test]
+    fn no_autostart_leaves_engine_autostart_enabled() {
+        // `--no-autostart` alone: worker dispatch suppressed, engine
+        // autostart still enabled.
+        let cli = Cli::parse_from(["boss", "--no-autostart", "engine", "status"]);
+        let ctx = RunContext::from_flags(&cli.global).expect("from_flags");
+        assert!(ctx.no_autostart, "no_autostart should propagate");
+        assert!(
+            ctx.discovery.autostart,
+            "--no-autostart must not disable transparent engine startup"
+        );
+
+        // `--no-engine-autostart` alone: engine autostart suppressed,
+        // worker dispatch untouched.
+        let cli = Cli::parse_from(["boss", "--no-engine-autostart", "engine", "status"]);
+        let ctx = RunContext::from_flags(&cli.global).expect("from_flags");
+        assert!(!ctx.no_autostart, "no_autostart should default to false");
+        assert!(
+            !ctx.discovery.autostart,
+            "--no-engine-autostart must disable transparent engine startup"
+        );
+
+        // Neither flag: both default on/dispatching.
+        let cli = Cli::parse_from(["boss", "engine", "status"]);
+        let ctx = RunContext::from_flags(&cli.global).expect("from_flags");
+        assert!(!ctx.no_autostart);
+        assert!(ctx.discovery.autostart);
     }
 
     fn dummy_task(id: &str, kind: &str) -> Task {

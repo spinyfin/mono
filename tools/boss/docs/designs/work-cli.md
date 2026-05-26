@@ -110,10 +110,17 @@ work commands, using the same local defaults the app uses.
 
 Add:
 
-- `--no-autostart` to fail instead of launching the engine,
+- `--no-engine-autostart` to fail instead of launching the engine,
 - `boss engine status`,
 - `boss engine start`,
 - `boss engine stop`.
+
+Note: `--no-autostart` is a *separate* concern — it suppresses worker
+auto-dispatch for newly created work items (and the seed `design` task on
+`project create`), but still lets the CLI bring the engine up to service the
+request. The engine is the system of record, so it must always be reachable to
+create or track work. Suppressing transparent engine startup is the job of
+`--no-engine-autostart` alone.
 
 The explicit `engine` subcommands are useful for humans, but they are secondary
 to the work commands.
