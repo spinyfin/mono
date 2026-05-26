@@ -13,7 +13,17 @@ build:release --stamp
 # GitHub App into the binary at compile time. Values must be set in your
 # shell (or via direnv) before running bazel build //tools/boss/cli:boss.
 # See tools/boss/cli/README.md for the one-time developer setup instructions.
+#
+# --action_env is kept for belt-and-suspenders (non-rust actions, tooling).
+# --define supplies the values to the rustc_env Make-variable expansion on
+# the rust_binary target; rules_rust does not forward --action_env into the
+# rustc compile action's env or cache key, but --define IS part of the key.
+# Empty defaults here mean dev builds compile cleanly; the release pipeline
+# overrides via --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID" etc.
 build --action_env=BOSS_SHAKE_APP_ID
 build --action_env=BOSS_SHAKE_INSTALLATION_ID
 build --action_env=BOSS_SHAKE_PRIVATE_KEY_PEM
+build --define=BOSS_SHAKE_APP_ID=
+build --define=BOSS_SHAKE_INSTALLATION_ID=
+build --define=BOSS_SHAKE_PRIVATE_KEY_PEM=
 
