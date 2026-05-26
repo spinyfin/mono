@@ -1397,99 +1397,18 @@ fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
     }
 }
 
-/// The PR this task is bound to, if any. Prefers the explicit
-/// `task.pr_url` column (set by `reconciler_attach_pr_url` and the
-/// `pr_url_capture` pipeline); when that is empty, falls back to
-/// scanning `task.description` for a single canonical GitHub PR URL.
+/// The PR this task is bound to, if any.
 ///
-/// The fallback exists because a task can be created — by a human via
-/// `bossctl`, by the issue importer's bootstrap path, or by any other
-/// surface — with a PR URL referenced in the description before the
-/// reconciler has had a chance to attach it. Without this fallback the
-/// worker dispatched against such a task does not see the
-/// `RESUME EXISTING PR` directive and falls through to the default
-/// "push a fresh `boss/exec_*` branch + `gh pr create`" flow,
-/// producing a duplicate PR alongside the one the task was already
-/// linked to (incident: mono#742).
+/// Returns the value of the structured `task.pr_url` column only.
+/// The description field is intentionally never scanned for PR URLs:
+/// any free-text description can mention arbitrary PR links (e.g.
+/// imported issue bodies that cite unrelated PRs as repro context),
+/// and binding to a URL scraped from free text causes wrong-PR
+/// dispatches that are harder to recover from than a clean new-PR
+/// flow. The structured `pr_url` column is authoritative; if it is
+/// null, the worker starts fresh (`jj new main` + `gh pr create`).
 pub(crate) fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
-    if let Some(url) = task.pr_url.as_deref().filter(|u| !u.is_empty()) {
-        return Some(url);
-    }
-    extract_pr_url_from_text(&task.description)
-}
-
-/// Find a single canonical GitHub PR URL inside arbitrary text.
-///
-/// Returns `Some(&str)` when exactly one distinct
-/// `https://github.com/<owner>/<repo>/pull/<N>` URL appears anywhere
-/// in `text`. Returns `None` if the text has no PR URL, or has two
-/// or more *distinct* PR URLs (we never guess which one is meant —
-/// the worker is better off in the new-PR flow than bound to the
-/// wrong existing PR).
-///
-/// The returned slice is the canonical form ending at the last digit
-/// of `<N>`: trailing path segments (`/files`, `/commits/<sha>`),
-/// query strings, fragments, and surrounding punctuation are all
-/// dropped so the same URL appearing twice with different decorations
-/// counts as one match.
-pub(crate) fn extract_pr_url_from_text(text: &str) -> Option<&str> {
-    const SCHEME: &str = "https://github.com/";
-    let mut found: Option<&str> = None;
-    let mut offset: usize = 0;
-    while let Some(rel) = text[offset..].find(SCHEME) {
-        let start = offset + rel;
-        let after_scheme = start + SCHEME.len();
-        match parse_canonical_pr_url(text, after_scheme) {
-            Some(end) => {
-                let canonical = &text[start..end];
-                match found {
-                    None => found = Some(canonical),
-                    Some(prev) if prev == canonical => {}
-                    Some(_) => return None,
-                }
-                offset = end;
-            }
-            None => {
-                offset = after_scheme;
-            }
-        }
-    }
-    found
-}
-
-/// Given `after_scheme` = byte index just past `https://github.com/`
-/// in `text`, try to parse `<owner>/<repo>/pull/<N>` and return the
-/// byte index just past the last digit of `<N>`. `None` if the
-/// structure doesn't match (e.g. the URL is for an issue, a tree, the
-/// repo root, etc.).
-fn parse_canonical_pr_url(text: &str, after_scheme: usize) -> Option<usize> {
-    let rest = text.get(after_scheme..)?;
-    let slash1 = rest.find('/')?;
-    let owner = &rest[..slash1];
-    if !is_github_path_segment(owner) {
-        return None;
-    }
-    let after_owner = slash1 + 1;
-    let slash2_rel = rest.get(after_owner..)?.find('/')?;
-    let slash2 = after_owner + slash2_rel;
-    let repo = &rest[after_owner..slash2];
-    if !is_github_path_segment(repo) {
-        return None;
-    }
-    let after_repo = slash2 + 1;
-    let tail = rest.get(after_repo..)?;
-    let tail = tail.strip_prefix("pull/")?;
-    let digit_len = tail.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digit_len == 0 {
-        return None;
-    }
-    Some(after_scheme + after_repo + "pull/".len() + digit_len)
-}
-
-fn is_github_path_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    task.pr_url.as_deref().filter(|u| !u.is_empty())
 }
 
 fn extract_pr_number(pr_url: &str) -> Option<u64> {
@@ -2125,74 +2044,6 @@ mod compose_prompt_tests {
     }
 
     #[test]
-    fn extract_pr_url_from_text_finds_bare_url() {
-        let s = "see https://github.com/org/repo/pull/42 for context";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_strips_trailing_punctuation() {
-        let s = "follow-up on https://github.com/org/repo/pull/42.";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_strips_subpath() {
-        let s = "see https://github.com/org/repo/pull/42/files";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_handles_markdown_link() {
-        let s = "[PR](https://github.com/org/repo/pull/7) is in review";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/7"),
-        );
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_returns_none_for_issue_url() {
-        let s = "> Imported from https://github.com/org/repo/issues/742";
-        assert_eq!(extract_pr_url_from_text(s), None);
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_returns_none_for_no_url() {
-        assert_eq!(extract_pr_url_from_text("just a #235 reference"), None);
-        assert_eq!(extract_pr_url_from_text(""), None);
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_returns_none_when_two_distinct_prs() {
-        // Two distinct PR URLs in the same text — abort rather than
-        // guess; the worker is safer in the new-PR flow than bound to
-        // the wrong existing PR.
-        let s = "rebase https://github.com/org/repo/pull/10 onto https://github.com/org/repo/pull/20";
-        assert_eq!(extract_pr_url_from_text(s), None);
-    }
-
-    #[test]
-    fn extract_pr_url_from_text_dedupes_same_url() {
-        // The same PR mentioned twice (once bare, once with /files) is
-        // still one match.
-        let s = "PR https://github.com/org/repo/pull/42 also at https://github.com/org/repo/pull/42/files";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
-    }
-
-    #[test]
     fn task_bound_pr_url_prefers_explicit_column() {
         let chore = chore_with_pr("https://github.com/org/repo/pull/99");
         let task = match &chore {
@@ -2206,13 +2057,17 @@ mod compose_prompt_tests {
     }
 
     #[test]
-    fn task_bound_pr_url_falls_back_to_description() {
-        // Reproduces the mono#742 incident: task has no explicit
-        // `pr_url` column but its description references the PR. The
-        // worker must see the PR so it doesn't open a duplicate.
+    fn task_bound_pr_url_returns_none_when_description_has_pr_url_but_column_is_null() {
+        // Guard against regression: even if the task's description mentions
+        // a GitHub PR URL, task_bound_pr_url must NOT scrape it. Binding to
+        // a free-text URL risks attaching to an unrelated PR mentioned in
+        // copied issue body text (the bug that prompted this fix).
         let chore = match chore_without_pr() {
             WorkItem::Chore(mut task) => {
-                task.description = "Resolve merge conflicts on https://github.com/org/repo/pull/235 — please rebase.".into();
+                task.description =
+                    "Imported from https://github.com/org/repo/issues/789. \
+                     Repro: parent chore C19 opened PR #250 on linkedin-multiproduct/dev-infra."
+                        .into();
                 WorkItem::Chore(task)
             }
             other => other,
@@ -2221,34 +2076,17 @@ mod compose_prompt_tests {
             WorkItem::Chore(t) => t,
             _ => unreachable!(),
         };
-        assert_eq!(
-            task_bound_pr_url(task),
-            Some("https://github.com/org/repo/pull/235"),
+        assert!(
+            task_bound_pr_url(task).is_none(),
+            "description PR URL must not be scraped; pr_url column is null so result must be None",
         );
     }
 
     #[test]
-    fn task_bound_pr_url_returns_none_when_description_has_only_issue_url() {
-        let chore = match chore_without_pr() {
-            WorkItem::Chore(mut task) => {
-                task.description = "> Imported from https://github.com/org/repo/issues/742".into();
-                WorkItem::Chore(task)
-            }
-            other => other,
-        };
-        let task = match &chore {
-            WorkItem::Chore(t) => t,
-            _ => unreachable!(),
-        };
-        assert!(task_bound_pr_url(task).is_none());
-    }
-
-    #[test]
-    fn resume_directive_uses_pr_url_from_description() {
-        // Integration: when only the description mentions the PR, the
-        // composed prompt must still inject the RESUME EXISTING PR
-        // block — this is the worker-facing contract that closes the
-        // duplicate-PR incident.
+    fn resume_directive_absent_when_pr_url_null_even_if_description_has_pr_url() {
+        // Guard against regression: even when the task description cites a
+        // GitHub PR URL, the RESUME EXISTING PR block must NOT appear unless
+        // the structured pr_url column is set.
         let chore = match chore_without_pr() {
             WorkItem::Chore(mut task) => {
                 task.description =
@@ -2268,20 +2106,8 @@ mod compose_prompt_tests {
             None,
         );
         assert!(
-            prompt.contains("## RESUME EXISTING PR"),
-            "resume block must fire when only the description carries the PR URL:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("https://github.com/org/repo/pull/235"),
-            "resume block must quote the description-derived PR URL:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("#235"),
-            "resume block must surface the PR number:\n{prompt}",
-        );
-        assert!(
-            !prompt.contains("jj bookmark create boss/exec_abc123_01"),
-            "acceptance criterion must NOT instruct opening a fresh boss/exec_* branch:\n{prompt}",
+            !prompt.contains("## RESUME EXISTING PR"),
+            "RESUME EXISTING PR block must NOT appear when pr_url column is null:\n{prompt}",
         );
     }
 }
