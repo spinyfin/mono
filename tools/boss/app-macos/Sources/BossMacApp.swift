@@ -47,7 +47,13 @@ struct BossMacApp: App {
         Window("Design Doc", id: "async-markdown-viewer") {
             AsyncMarkdownViewerView()
         }
+        // Inject the viewer VM directly so the window observes its
+        // `.loading -> .loaded` transition immediately, rather than waiting
+        // for the next incidental `chatModel` publish (see
+        // [[AsyncMarkdownViewerView]]). `chatModel` stays injected for the
+        // comment layer and other descendants.
         .environmentObject(chatModel)
+        .environmentObject(chatModel.asyncMarkdownViewerVM)
         .defaultSize(width: 760, height: 640)
 
         // In-app renderer for a project's design-doc pointer. Wired to

@@ -19,6 +19,23 @@ log stream --predicate 'subsystem == "com.boss.textualperf"' --level info
 
 Use the segmented picker at the top to switch between layers. Each picker click logs `phase=parse_start layer=Ln`, and the first non-zero `StructuredText` height fires `phase=parse_end layer=Ln duration_ms=…`. The pane is keyed by `.id(layer)`, so re-clicking a layer captures a fresh sample.
 
+### Headless / automated runs
+
+Set `TPL_AUTO=1` to cycle every layer automatically without clicking the picker — the driver steps through the layers, takes `TPL_ITERS` samples each (waiting for each `parse_end` before advancing), logs a `phase=auto_layer layer=Ln samples_ms=[…]` summary per layer, then logs `phase=auto_done` and exits. Useful when a human can't sit and click, and for reproducible numbers.
+
+Environment knobs:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `TPL_AUTO`    | unset | `1` enables the auto-driver; otherwise the picker is manual |
+| `TPL_ITERS`   | 3     | samples per layer in auto mode |
+| `TPL_TIMEOUT` | 90    | per-sample timeout (s) before logging `parse_timeout` and advancing |
+| `TPL_LAYERS`  | all   | comma-separated subset to run, e.g. `L6,L7,L8,L9` |
+| `TPL_PUB_MS`  | 500   | sibling-publisher (L7+) / L10-host publish interval (ms) |
+| `BOSS_SAMPLE_MD` | bundled 47 KB doc | absolute path to the markdown sample to render |
+
+> **Render-complete signal.** The height the `parse_end` logic keys on is reported via a *downward-flowing* `reportRenderHeight` environment closure, not an upward-bubbling `PreferenceKey`. The earlier `PreferenceKey` approach silently failed for the wrapped layers (L3+) — `withCommentsStub`'s `HStack`/`.overlay`/`.background` disrupted preference propagation, so those layers never recorded a `parse_end` and the "L1–L5 fine" reading was eyeball-only. The environment closure reaches the reporter regardless of intervening wrappers.
+
 `bazel run //tools/boss/experiments/textual-perf-layered:textualperflayered` also builds the .app, but the working directory is whatever Bazel sets and the relative path resolution won't find the sample — set `BOSS_SAMPLE_MD=/absolute/path/to/sample.md` when running under Bazel.
 
 ## Sample source
@@ -45,6 +62,23 @@ The doc is *not* duplicated into this experiment's Resources folder — keeping 
 | L7    | L6 + `SiblingPublisherStub` firing every ~500 ms      | sibling-publisher invalidation cascade forcing design-doc body re-evaluation           |
 | L8    | L7 + local NSEvent monitors (keyDown, rightMouseDown, leftMouseUp) | event-monitor overhead on main-thread availability during render               |
 | L9    | L8 + `ExtraViewModelStub` at ~350 ms cadence          | combined publish load from all active observers (full production scene complement)     |
+| L10   | mount-latency probe (not a parse layer)               | *the actual root cause* — see below                                                    |
+
+### L10: mount-latency / observability probe
+
+L0–L9 all measure parse+layout time. **Production's `phase=render` does not** — it measures the latency from `state = .loaded` to the loaded view *mounting* (`AsyncMarkdownViewerView`'s `.loaded`-branch `.onAppear`), which excludes the `StructuredText` parse. L10 targets that window. It contrasts two observation patterns and logs `phase=obs pattern=buggy|fixed latency_ms=… pub_ms=…`:
+
+- **buggy** (what production shipped): a view observes a *host* `ObservableObject` but reads a *nested* object's state through it, without observing the nested object. The nested state change is only picked up on the next host publish, so mount latency tracks `TPL_PUB_MS`.
+- **fixed**: the view observes the nested object directly → mount latency is ~constant few ms, independent of host publish timing.
+
+Measured (buggy tracks the publish interval; fixed is ~3 ms regardless):
+
+| `TPL_PUB_MS` | buggy | fixed |
+|--------------|-------|-------|
+| 500          | ~210 ms  | ~3 ms |
+| 3000         | ~2200 ms | ~3 ms |
+
+This reproduces `AsyncMarkdownViewerView` reading `chatModel.asyncMarkdownViewerVM.state` without observing the (nested, non-`@Published`) `asyncMarkdownViewerVM`. Under main-thread contention the gap to the next `chatModel` publish stretches to the tens of seconds seen as the wall. The production fix observes the VM directly. See `tools/boss/docs/investigations/markdown-render-slowness-2026-05-18.md`.
 
 The comments stub (L3+) is intentionally a `@Published`-surface lookalike without NSEvent monitors. Adding global event monitors from a benchmark rig is hazardous (they leak across runs and intercept other apps' shortcuts), and the monitors don't fire during render — they only fire on user key/right-click events. If the rig's L3 shows the slowness, the cause is in the wrapper structure, not the monitors.
 

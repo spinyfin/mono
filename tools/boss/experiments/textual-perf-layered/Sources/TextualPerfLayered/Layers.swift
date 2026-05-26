@@ -3,19 +3,33 @@ import Foundation
 import SwiftUI
 import Textual
 
-// Adds a GeometryReader to measure height and propagate StructuredTextHeightKey
-// preference up to the parent LayerPane. Using overlay ensures the preference
-// properly bubbles up the view hierarchy, unlike .background().
-private extension View {
-    func publishHeight() -> some View {
-        self.overlay(alignment: .topLeading) {
+// Measures the laid-out height of the StructuredText and reports it to the
+// pane via the `reportRenderHeight` environment closure. The closure flows
+// *down* from `LayerPane`, so it reaches this reporter regardless of the
+// wrapper stack the later layers interpose (HStack / overlay / background) —
+// unlike an upward-bubbling PreferenceKey, which those wrappers disrupt.
+private struct HeightReporter: ViewModifier {
+    @Environment(\.reportRenderHeight) private var report
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .topLeading) {
             GeometryReader { geo in
-                Color.clear.preference(
-                    key: StructuredTextHeightKey.self,
-                    value: geo.size.height
-                )
+                // Report on the 0 -> non-zero transition (no `initial:`), which
+                // lands when the synchronous Textual parse+layout finishes and
+                // the StructuredText first gets a real height. Firing `initial`
+                // would record a premature ~0 ms at appear, before the parse.
+                Color.clear
+                    .onChange(of: geo.size.height) { _, height in
+                        report(height)
+                    }
             }
         }
+    }
+}
+
+private extension View {
+    func publishHeight() -> some View {
+        modifier(HeightReporter())
     }
 }
 
@@ -325,13 +339,21 @@ final class ChatViewModelStub: ObservableObject {
 
 // MARK: SiblingPublisherStub (L7+)
 
-/// Publishes objectWillChange on a ~500 ms timer. Mirrors the combined
-/// publish cadence of production's kanban view-models, live-status pollers,
-/// and engine-subscription Combine graph that fire while the design-doc
-/// window is open. Start/stop are idempotent and safe to call repeatedly.
+/// Publishes objectWillChange on a timer. Mirrors the combined publish
+/// cadence of production's kanban view-models, live-status pollers, and
+/// engine-subscription Combine graph that fire while the design-doc window
+/// is open. The interval defaults to ~500 ms but is overridable via the
+/// `TPL_PUB_MS` environment variable — production engine events during an
+/// active worker session burst far faster than 500 ms, so cranking the
+/// cadence down tests whether invalidations landing *during* the render
+/// window (rather than between renders) are what reproduce the wall.
+/// Start/stop are idempotent and safe to call repeatedly.
 @MainActor
 final class SiblingPublisherStub: ObservableObject {
     @Published var tickCount: Int = 0
+
+    static let intervalMs: Int = ProcessInfo.processInfo.environment["TPL_PUB_MS"]
+        .flatMap(Int.init) ?? 500
 
     private var publishTask: Task<Void, Never>?
 
@@ -339,7 +361,7 @@ final class SiblingPublisherStub: ObservableObject {
         guard publishTask == nil else { return }
         publishTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
+                try? await Task.sleep(for: .milliseconds(Self.intervalMs))
                 self?.tickCount += 1
             }
         }
@@ -526,5 +548,142 @@ struct L9_FullScaffold: View {
                 extra.stop()
                 monitors.manager.remove()
             }
+    }
+}
+
+// MARK: - L10 · Observability / mount-latency probe
+
+/// Nested sub-view-model holding the load state. Mirrors production's
+/// `AsyncMarkdownViewerViewModel`, which is a *nested* ObservableObject
+/// reachable through `ChatViewModel.asyncMarkdownViewerVM` (a plain `let`,
+/// not `@Published`).
+@MainActor
+final class ObsSubStub: ObservableObject {
+    enum LoadState: Equatable { case loading, loaded }
+    @Published var state: LoadState = .loading
+}
+
+/// Host that owns the nested `ObsSubStub` and publishes on its own cadence —
+/// standing in for `ChatViewModel`, which fires `objectWillChange`
+/// constantly from engine events but whose nested `asyncMarkdownViewerVM`
+/// state changes do NOT propagate through it. Mutating `sub.state` does not
+/// fire `host.objectWillChange`; only `tick` does (on the timer).
+@MainActor
+final class ObsHostStub: ObservableObject {
+    let sub = ObsSubStub()
+    @Published var tick: Int = 0
+
+    private var task: Task<Void, Never>?
+
+    func start() {
+        guard task == nil else { return }
+        task = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(SiblingPublisherStub.intervalMs))
+                self?.tick += 1
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+    }
+}
+
+/// BUGGY pattern (current production): observes only the *host*, but reads
+/// `host.sub.state`. Because the view never subscribes to `sub`, a
+/// `sub.state` change does not re-render it — the loaded branch only appears
+/// on the next *host* publish. The latency from the flip to this view
+/// mounting its loaded branch is what production logs as `phase=render`.
+private struct ObsBuggyChild: View {
+    @ObservedObject var host: ObsHostStub
+    let onLoadedAppear: () -> Void
+
+    var body: some View {
+        let _ = host.tick
+        switch host.sub.state {
+        case .loading:
+            ProgressView("loading (buggy)")
+        case .loaded:
+            Text("loaded (buggy)").onAppear(perform: onLoadedAppear)
+        }
+    }
+}
+
+/// FIXED pattern: observes the `sub` directly, so a `sub.state` change
+/// re-renders it immediately — independent of host publish timing.
+private struct ObsFixedChild: View {
+    @ObservedObject var sub: ObsSubStub
+    let onLoadedAppear: () -> Void
+
+    var body: some View {
+        switch sub.state {
+        case .loading:
+            ProgressView("loading (fixed)")
+        case .loaded:
+            Text("loaded (fixed)").onAppear(perform: onLoadedAppear)
+        }
+    }
+}
+
+/// Measures the *mount latency* (state-flip -> loaded-branch onAppear) for
+/// both observation patterns. This targets the window production's
+/// `phase=render` actually measures, which the parse-time layers (L0-L9) do
+/// not. Buggy latency tracks the host publish interval (`TPL_PUB_MS`); fixed
+/// latency is ~0 regardless. Logs `phase=obs pattern=… latency_ms=…`, then
+/// signals the driver to advance via the height-report closure.
+struct L10_Observability: View {
+    @Environment(\.reportRenderHeight) private var advance
+
+    @StateObject private var host = ObsHostStub()
+    @State private var phase: Int = 0  // 0 = buggy, 1 = fixed, 2 = done
+    @State private var flipTime: Date?
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("L10 · observability (mount-latency)")
+                .font(.headline)
+            switch phase {
+            case 0:
+                ObsBuggyChild(host: host) { record(pattern: "buggy", next: 1) }
+            case 1:
+                ObsFixedChild(sub: host.sub) { record(pattern: "fixed", next: 2) }
+            default:
+                Text("done")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            host.start()
+            beginPhase()
+        }
+        .onDisappear { host.stop() }
+    }
+
+    private func beginPhase() {
+        host.sub.state = .loading
+        Task { @MainActor in
+            // Settle, then flip the nested state WITHOUT touching the host.
+            try? await Task.sleep(for: .milliseconds(800))
+            flipTime = Date.now
+            host.sub.state = .loaded
+        }
+    }
+
+    private func record(pattern: String, next: Int) {
+        guard let start = flipTime else { return }
+        let ms = Int(Date.now.timeIntervalSince(start) * 1000)
+        renderLog.info(
+            "phase=obs pattern=\(pattern, privacy: .public) latency_ms=\(ms, privacy: .public) pub_ms=\(SiblingPublisherStub.intervalMs, privacy: .public)"
+        )
+        flipTime = nil
+        if next < 2 {
+            phase = next
+            beginPhase()
+        } else {
+            phase = 2
+            advance(1)  // signal LayerPane/driver that this layer is "done"
+        }
     }
 }

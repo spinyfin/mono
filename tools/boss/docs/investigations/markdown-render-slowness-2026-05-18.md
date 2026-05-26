@@ -141,6 +141,60 @@ Pick each layer in sequence, L6 → L7 → L8 → L9. Capture 3+ samples per lay
 
 If none of L6–L9 reproduces the wall, the cause is something not captured by the rig — likely full AppDelegate registration (NSApplicationDelegateAdaptor), GhosttyKit terminal views active in the same NSWindow, or a side-effect of the `NavigationSplitView` that wraps `ContentView` in production. File as a follow-up with a description of what L9 measured.
 
+## L6–L9 bisection result + root cause (2026-05-26)
+
+Ran the full L0–L9 bisection live on macOS via a new auto-advance mode in the rig (`TPL_AUTO=1`, which cycles the layers and emits `parse_end duration_ms` without manual picker clicks). **None of L0–L9 reproduces the wall.** All layers render the 47 KB prose sample in ~180–360 ms:
+
+| Layer | parse_end (ms, 3 samples) |
+|-------|----------------------------|
+| L0 · Textual only          | 183, 185, 187 |
+| L1 · + bossMarkdown()      | 185, 183, 181 |
+| L2 · + Boss inner wrappers | 251, 259, 247 |
+| L3 · + .withComments()     | 252, 249, 258 |
+| L4 · + view-model          | 250, 247, 251 |
+| L5 · + async fetch         | 285, 290, 283 |
+| L6 · + env object          | 284, 356, 300 |
+| L7 · + sibling pub         | 303, 304, 302 |
+| L8 · + event monitors      | 329, 304, 302 |
+| L9 · + full scaffold       | 293, 294, 301 |
+
+### Two instrumentation problems found and fixed in the rig
+
+1. **The `parse_end` signal silently failed for every wrapped layer (L3+).** It used a `PreferenceKey` (`StructuredTextHeightKey`) that bubbles *up* the view tree, but `withCommentsStub`'s `HStack` + `.overlay` + `.background` disrupts that bubbling, so L3–L9 never recorded a height and timed out. This is why the earlier (2026-05-19) "L1–L5 fine" conclusion was eyeball-only — `parse_end` was never actually emitted for the wrapped layers. Fixed by switching the height reporter to a *downward-flowing* environment closure (`reportRenderHeight`), which reaches the reporter regardless of intervening wrappers. After the fix L3–L9 report normally (table above).
+
+2. **The publisher-cadence hypothesis (L7–L9) is mechanically refuted.** `SiblingPublisherStub` is now cadence-configurable (`TPL_PUB_MS`). Cranking it from 500 ms down to **2 ms (~500 publishes/sec)** leaves L6–L9 unchanged at ~225–263 ms. A main-actor publisher cannot slow a main-actor render unless it forces the `StructuredText` to *re-parse*, and with stable `.id`s it does not. So "sibling-publisher invalidation cascade" is not the mechanism.
+
+### Content is the dominant lever (not the scene tree)
+
+A synthetic 46 KB doc heavy on tables/code (≈60 tables + 60 code blocks) renders in **~2.5 s in plain Textual (L0)** — ~13× the prose doc at the same byte size. Boss wrappers add little on top (L0→L3: 2.5 s → 3.1 s; `bossMarkdown` adds ~0 ms). The publisher has no effect even here (L6–L9 ≈ 2.8 s at both 500 ms and 2 ms cadence). So most render cost is intrinsic to Textual's table/code layout of the specific content — but ~3 s still does not reach the production 38 s wall.
+
+### The actual root cause: `phase=render` is a *mount-latency* window, not a parse window
+
+`phase=render` is logged in `AsyncMarkdownViewerView`'s `.loaded`-branch `.onAppear` relative to `renderStartTime` (stamped just before `state = .loaded` in `ChatViewModel.fetchAndUpdateAsyncMarkdownViewerVM`). It measures the latency from the *state flip* to the loaded view *mounting* — it does **not** include the `StructuredText` parse (that is `phase=parse`). The L0–L9 layers all measure parse time, so they were measuring the wrong window.
+
+`AsyncMarkdownViewerView` declared only `@EnvironmentObject var chatModel: ChatViewModel` and read `chatModel.asyncMarkdownViewerVM.state`. But `asyncMarkdownViewerVM` is a *nested* `ObservableObject` (a plain `let` on `ChatViewModel`, not `@Published`), and the view never subscribed to it. So mutating `asyncMarkdownViewerVM.state` did not re-render the window — the loaded view only mounted on the **next incidental `chatModel` publish** (an engine event). `phase=render` therefore measures "time until the next `chatModel` publish after the content loaded," which under main-thread contention (the observed kanban resolve spike 170 ms → 1,427 ms, bursty engine events) stretches to the tens of seconds seen as the wall. The 129 s → 38 s variability across sessions is consistent with a publish-timing dependence, not a fixed compute cost.
+
+Confirmed in the rig with a dedicated **L10 mount-latency probe** that contrasts the production "buggy" pattern (a view observing a host but reading a nested object's state) against the "fixed" pattern (observe the nested object directly):
+
+| host publish interval (`TPL_PUB_MS`) | buggy mount latency | fixed mount latency |
+|---|---|---|
+| 500 ms  | 200–221 ms   | 2–4 ms |
+| 3000 ms | 2190–2219 ms | 2–4 ms |
+
+Buggy mount latency tracks the host publish interval; fixed is ~3 ms regardless. This is the mechanism, reproduced and measured.
+
+### Fix
+
+`AsyncMarkdownViewerView` now observes `AsyncMarkdownViewerViewModel` **directly** (`@EnvironmentObject var vm: AsyncMarkdownViewerViewModel`, injected on the `async-markdown-viewer` `Window` scene in `BossMacApp`). The loaded view now mounts the instant `state` flips, independent of `chatModel`'s publish timing — eliminating the `phase=render` wall. `chatModel` remains injected on the scene for the comment layer and other descendants.
+
+### Live-app verification still outstanding
+
+The before/after `phase=render` from a live Boss app run could not be captured in this pass: a Boss worker cannot drive the production app (it connects to the engine/DB, which workers must not touch — see `.claude/CLAUDE.md`). The rig L10 probe confirms the mechanism and the fix's effect on mount latency, but a human should still open the editorial-controls doc in the real app before/after this change and paste the `com.boss.app:DesignDocTiming phase=render duration_ms` line into the PR for the record.
+
+### T617 status
+
+T617 (remove the `textual-perf*` rigs) remains **blocked**: the rig is still the only artifact that demonstrates and guards the mount-latency mechanism (L10), and a live before/after confirmation has not yet been recorded. Keep the rig until the fix is verified in the real app.
+
 ## Open questions
 
 - Does **L1** alone reproduce the slowness, or is it L2 / L3 that crosses? The static review can't distinguish — only the rig measurements can.
