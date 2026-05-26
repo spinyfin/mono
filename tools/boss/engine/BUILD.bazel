@@ -68,6 +68,10 @@ rust_library(
         "remote/boss-remote-run.sh",
     ],
     edition = "2024",
+    rustc_flags = select({
+        "//:opt_mode": ["-Cstrip=symbols"],
+        "//conditions:default": [],
+    }),
     visibility = [
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
@@ -91,6 +95,10 @@ rust_binary(
     # `boss-event` as a bare name that isn't on the worker's
     # sanitized PATH — every hook fires `command not found`.
     data = ["//tools/boss/event-shim:boss-event"],
+    rustc_flags = select({
+        "//:opt_mode": ["-Cstrip=symbols"],
+        "//conditions:default": [],
+    }),
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
