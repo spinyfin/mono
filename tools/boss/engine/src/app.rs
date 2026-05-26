@@ -1910,31 +1910,153 @@ impl TopicBroker {
     }
 }
 
-pub async fn run(cli: Cli) -> Result<()> {
-    let cfg = Arc::new(RuntimeConfig::load_from_env()?);
-    tracing::info!(
-        cwd = %cfg.work.cwd.display(),
-        db_path = %cfg.work.db_path.display(),
-        "starting boss-engine runtime",
-    );
-
-    run_server(cli, cfg).await
+/// Paths derived from a non-default `--socket-path` to ensure a
+/// test-fixture engine never touches production state.
+///
+/// When `socket_path` equals `DEFAULT_SOCKET_PATH` every field is `None` and
+/// the engine resolves paths through its normal env-var / home-dir logic.
+/// When `socket_path` is non-default, each field is `Some(derived_path)`
+/// **unless** the corresponding env override is already set by the caller, in
+/// which case the caller's choice wins and that field is `None`.
+///
+/// The struct is computed once in [`run`] and threaded through to
+/// [`run_server`] so both the `WorkConfig` DB path and the socket/pid paths
+/// inside [`serve`] use the same derived roots without touching env vars.
+struct IsolationPaths {
+    /// True when the engine is operating as a test fixture (non-default socket).
+    is_test_fixture: bool,
+    /// Isolated SQLite DB path derived from the socket stem.
+    db_path: Option<std::path::PathBuf>,
+    /// Isolated events socket derived from the socket stem.
+    events_socket: Option<std::path::PathBuf>,
+    /// Isolated pid file derived from the socket stem.
+    pid_path: Option<std::path::PathBuf>,
 }
 
-async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
+impl IsolationPaths {
+    /// Derive isolation paths from `socket_path`.
+    ///
+    /// Non-default socket → derive paths from the socket's directory and
+    /// file-stem (e.g. `/tmp/boss-test-UUID.sock` → `/tmp/boss-test-UUID.db`,
+    /// `/tmp/boss-test-UUID.events.sock`, `/tmp/boss-test-UUID.pid`).
+    ///
+    /// Each derived path is suppressed (left as `None`) when the corresponding
+    /// env override is already set, so an explicit `BOSS_DB_PATH=…` in the
+    /// environment always wins.
+    fn derive(socket_path: &str) -> Self {
+        if socket_path == DEFAULT_SOCKET_PATH {
+            return Self {
+                is_test_fixture: false,
+                db_path: None,
+                events_socket: None,
+                pid_path: None,
+            };
+        }
+
+        let path = std::path::Path::new(socket_path);
+        let dir = path.parent().unwrap_or(std::path::Path::new("/tmp"));
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "boss-test".to_owned());
+
+        // Honour explicit env overrides: only set a derived path when the
+        // caller hasn't already pointed this socket at an explicit location.
+        let db_path = std::env::var_os("BOSS_DB_PATH")
+            .is_none()
+            .then(|| dir.join(format!("{stem}.db")));
+        let events_socket = std::env::var_os("BOSS_EVENTS_SOCKET")
+            .is_none()
+            .then(|| dir.join(format!("{stem}.events.sock")));
+        let pid_path = std::env::var_os("BOSS_ENGINE_PID_PATH")
+            .is_none()
+            .then(|| dir.join(format!("{stem}.pid")));
+
+        Self {
+            is_test_fixture: true,
+            db_path,
+            events_socket,
+            pid_path,
+        }
+    }
+}
+
+pub async fn run(cli: Cli) -> Result<()> {
+    let socket_str = cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);
+    let isolation = IsolationPaths::derive(socket_str);
+
+    // Build WorkConfig, overriding db_path when the isolation guard derived one.
+    // This must happen before RuntimeConfig so the DB the engine opens is
+    // already the isolated one — not the production state.db that
+    // WorkConfig::load_from_env() would resolve from $HOME.
+    let mut work = crate::config::WorkConfig::load_from_env()?;
+    if let Some(ref iso_db) = isolation.db_path {
+        work.db_path = iso_db.clone();
+    }
+    let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
+
+    if isolation.is_test_fixture {
+        tracing::info!(
+            cwd = %cfg.work.cwd.display(),
+            db_path = %cfg.work.db_path.display(),
+            events_socket = ?isolation.events_socket,
+            pid_path = ?isolation.pid_path,
+            "test-fixture mode: isolated paths derived from non-default socket; \
+             production state (events.sock, state.db, pid file) will not be touched"
+        );
+    } else {
+        tracing::info!(
+            cwd = %cfg.work.cwd.display(),
+            db_path = %cfg.work.db_path.display(),
+            "starting boss-engine runtime",
+        );
+    }
+
+    run_server(cli, cfg, isolation).await
+}
+
+async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths) -> Result<()> {
     let socket_path = cli
         .socket_path
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
-    let pid_file_path =
-        std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
-    let events_socket_path = default_events_socket_path()?;
+
+    // Use the isolation-derived pid path, falling back to env / hard default.
+    let pid_file_path = isolation
+        .pid_path
+        .or_else(|| {
+            std::env::var("BOSS_ENGINE_PID_PATH")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| DEFAULT_PID_PATH.into());
+
+    // Use the isolation-derived events socket, falling back to env / home default.
+    let events_socket_path = isolation
+        .events_socket
+        .map(Ok)
+        .unwrap_or_else(default_events_socket_path)?;
+
     let control_token_path = crate::engine_control::default_token_path();
+
+    // Orphan watcher: when the engine is a test fixture (non-default socket),
+    // watch the parent process pid.  If the parent exits (e.g. a `bazel test`
+    // runner that failed mid-run), this engine should exit too rather than
+    // becoming an orphan that keeps production state bound.
+    let watched_parent_pid = if isolation.is_test_fixture {
+        let ppid = unsafe { libc::getppid() };
+        tracing::debug!(parent_pid = ppid, "orphan watcher armed");
+        Some(ppid)
+    } else {
+        None
+    };
+
     serve(
         cfg,
         socket_path.into(),
-        Some(pid_file_path.into()),
+        Some(pid_file_path),
         Some(events_socket_path),
         control_token_path,
+        watched_parent_pid,
     )
     .await
 }
@@ -1947,6 +2069,24 @@ fn default_events_socket_path() -> Result<std::path::PathBuf> {
         bail!("HOME must be set to derive the default events socket path");
     };
     Ok(std::path::PathBuf::from(home).join("Library/Application Support/Boss/events.sock"))
+}
+
+/// Return `true` if the process at `pid` is still alive on this machine.
+///
+/// Uses `kill(pid, 0)` (signal 0 = probe, no signal delivered): returns `true`
+/// when the kernel confirms the process exists.  `EPERM` (process exists but
+/// we can't signal it) also counts as alive; only `ESRCH` (no such process)
+/// means dead.
+pub fn process_is_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
 }
 
 /// Run the frontend server until the listener fails.
@@ -1965,12 +2105,18 @@ fn default_events_socket_path() -> Result<std::path::PathBuf> {
 /// file is removed on graceful exit via [`crate::engine_control::ControlTokenGuard`].
 /// Tests pass `None` to skip the file entirely; in-process callers
 /// own the runtime handle and don't need an authenticated wire path.
+///
+/// When `watched_parent_pid` is `Some(ppid)`, a background task polls
+/// `kill(ppid, 0)` once per second; if the process is gone the task fires an
+/// orphan-shutdown trigger that causes this function to return `Ok(())`.
+/// Pass `None` from in-process tests that don't need orphan detection.
 pub async fn serve(
     cfg: Arc<RuntimeConfig>,
     socket_path: std::path::PathBuf,
     pid_file_path: Option<std::path::PathBuf>,
     events_socket_path: Option<std::path::PathBuf>,
     control_token_path: Option<std::path::PathBuf>,
+    watched_parent_pid: Option<libc::pid_t>,
 ) -> Result<()> {
     let app_pid = current_parent_pid();
     let (control_token, _control_token_guard) = match control_token_path {
@@ -2466,6 +2612,29 @@ pub async fn serve(
 
     install_panic_hook(&server_state);
 
+    // Orphan watcher: poll the watched parent pid every second.  When it's
+    // gone (the bazel test runner that spawned us exited), fire a notify so
+    // the accept loop below can exit cleanly instead of becoming a
+    // long-lived orphan that holds production sockets / DB / pid file.
+    // Only armed for test-fixture engines (watched_parent_pid is Some).
+    let orphan_trigger = Arc::new(Notify::new());
+    if let Some(ppid) = watched_parent_pid {
+        let trigger = orphan_trigger.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !process_is_alive(ppid) {
+                    tracing::warn!(
+                        parent_pid = ppid,
+                        "parent process exited — test-fixture engine orphaned; exiting cleanly"
+                    );
+                    trigger.notify_one();
+                    break;
+                }
+            }
+        });
+    }
+
     tracing::info!(
         socket_path = %socket_path.display(),
         "frontend socket: accept loop started",
@@ -2473,6 +2642,7 @@ pub async fn serve(
     crate::audit::record_accept_loop_started("frontend", &socket_path);
 
     let shutdown_trigger_for_loop = server_state.shutdown_trigger.clone();
+    let orphan_trigger_for_loop = orphan_trigger.clone();
     loop {
         tokio::select! {
             biased;
@@ -2509,6 +2679,11 @@ pub async fn serve(
                     tracing::warn!(?err, "metrics: final flush on shutdown failed");
                 }
                 tracing::info!("engine shutdown complete");
+                return Ok(());
+            }
+            _ = orphan_trigger_for_loop.notified() => {
+                tracing::info!("orphan shutdown: test-fixture parent is gone; exiting");
+                crate::audit::record_shutdown("orphan");
                 return Ok(());
             }
             accept = listener.accept() => {

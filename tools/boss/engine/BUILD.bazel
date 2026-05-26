@@ -205,6 +205,48 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "isolation_guard_test",
+    srcs = ["tests/isolation_guard.rs"],
+    edition = "2024",
+    size = "small",
+    timeout = "moderate",
+    env = {"HOME": "/tmp"},
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
+    name = "orphan_reaping_test",
+    srcs = ["tests/orphan_reaping.rs"],
+    edition = "2024",
+    size = "small",
+    # The orphan-reap watcher polls every 1s; ORPHAN_TIMEOUT is 8s.
+    # On slow CI runners allow plenty of headroom.
+    timeout = "moderate",
+    env = {"HOME": "/tmp"},
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
 filegroup(
     name = "engine_srcs",
     srcs = glob(["src/**/*.rs"]),

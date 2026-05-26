@@ -49,7 +49,7 @@ impl TestEngine {
         let socket_for_serve = socket_path.clone();
         let token_for_serve = token_path.clone();
         let join = tokio::spawn(async move {
-            serve(cfg, socket_for_serve, None, None, Some(token_for_serve)).await
+            serve(cfg, socket_for_serve, None, None, Some(token_for_serve), None).await
         });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
