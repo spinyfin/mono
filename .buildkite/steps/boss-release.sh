@@ -48,10 +48,36 @@ else
   if [[ -z "${LAST_TAG}" ]]; then
     echo "[boss-release] no previous boss-v* tag found; proceeding with first release"
   else
+    # BK checkouts are shallow (single-commit fetch, no --tags). Fetch the
+    # specific release tag so git rev-list can resolve it locally.
+    git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
+
     LAST_SHA=$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)
+
     if [[ -z "${LAST_SHA}" ]]; then
-      echo "[boss-release] could not resolve tag ${LAST_TAG} to a SHA; proceeding"
+      # Local resolution still failed (annotated tag, fetch blocked, etc.).
+      # Fall back to GitHub API — resolves both lightweight and annotated tags.
+      echo "[boss-release] ${LAST_TAG} not in local refs; querying GitHub API"
+      LAST_SHA=$(gh api "repos/spinyfin/mono/commits/${LAST_TAG}" \
+        --jq '.sha' 2>/dev/null || true)
+    fi
+
+    if [[ -z "${LAST_SHA}" ]]; then
+      echo "[boss-release] WARNING: could not resolve tag ${LAST_TAG} by any means; proceeding"
     else
+      HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")
+      # Guard: if HEAD is already the last-released commit, nothing to do.
+      if [[ "${HEAD_SHA}" == "${LAST_SHA}" ]]; then
+        echo "release step skipped: HEAD (${HEAD_SHA:0:12}) is already the commit for ${LAST_TAG}"
+        exit 0
+      fi
+
+      # Unshallow if needed so git diff can reach LAST_SHA.
+      if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+        echo "[boss-release] unshallowing repo for full diff"
+        git fetch --unshallow origin 2>/dev/null || true
+      fi
+
       TOUCHED=$(git diff --name-only "${LAST_SHA}..HEAD" 2>/dev/null || true)
       BOSS_TOUCHED=$(echo "${TOUCHED}" | grep -E "^(tools/boss/|\.buildkite/steps/boss-release\.sh|\.buildkite/pipeline\.yml)" || true)
 
