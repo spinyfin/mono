@@ -142,7 +142,13 @@ fi
 # Bazel uses a different cache key from the credential-free mac-app-build step.
 
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"
-bazel build -c opt //tools/boss/app-macos:Boss
+# Pass credentials via --define so rules_rust includes them in the rustc
+# compile action's cache key (--action_env alone does not affect it).
+bazel build -c opt \
+  --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID" \
+  --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID" \
+  --define=BOSS_SHAKE_PRIVATE_KEY_PEM="$BOSS_SHAKE_PRIVATE_KEY_PEM" \
+  //tools/boss/app-macos:Boss
 
 # Discover the actual zip output path via cquery (defensive against rule changes).
 log "[boss-release] discovering Boss.zip output path"

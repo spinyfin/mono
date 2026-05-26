@@ -58,17 +58,21 @@ pub struct AppConfig {
 /// binary was built without the three `BOSS_SHAKE_*` env vars set.
 /// See tools/boss/cli/README.md for developer setup instructions.
 pub fn embedded_config() -> Result<AppConfig> {
-    let app_id = EMBEDDED_APP_ID
+    // filter(|s| !s.is_empty()): the rustc_env Make-variable expansion
+    // always sets the vars (to "" when no --define override is passed),
+    // so option_env! returns Some("") for dev builds. Treat that the same
+    // as absent so the sentinel error fires instead of an empty-creds failure.
+    let app_id = EMBEDDED_APP_ID.filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"
         ))?;
-    let installation_id = EMBEDDED_INSTALLATION_ID
+    let installation_id = EMBEDDED_INSTALLATION_ID.filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"
         ))?;
-    let private_key_pem = EMBEDDED_PRIVATE_KEY_PEM
+    let private_key_pem = EMBEDDED_PRIVATE_KEY_PEM.filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"

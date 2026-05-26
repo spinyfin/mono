@@ -12,6 +12,16 @@ rust_binary(
     # `include_str!` is parsed unconditionally — Bazel needs them
     # staged in the sandbox or the binary fails to compile.
     compile_data = glob(["tests/fixtures/**"]),
+    # rules_rust does NOT propagate --action_env into the rustc compile
+    # action's cache key or environment. Use rustc_env + --define so that
+    # the cache key changes when the credential values change and rustc
+    # actually sees the vars via option_env!(). Default values are empty
+    # strings (see .bazelrc); the release pipeline overrides via --define.
+    rustc_env = {
+        "BOSS_SHAKE_APP_ID": "$(BOSS_SHAKE_APP_ID)",
+        "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
+        "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
+    },
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
