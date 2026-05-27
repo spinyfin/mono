@@ -163,6 +163,27 @@ PLIST_EOF
   ar rcs "${XCFW}/macos-arm64/GhosttyKit.a" /tmp/ghosttykit_stub.o
 fi
 
+# ── fetch boss-v* tags so workspace-status.sh can derive the version ──────────
+# Buildkite agents do a shallow clone with no tags.  Without at least one
+# boss-v* tag present locally, git describe returns empty and the build
+# stamps "0.0.0-dev-<sha>" instead of the real version.
+#
+# This block runs unconditionally (change-detection above only fetches the
+# tag on the cron path; manual triggers skip it entirely).
+log "[boss-release] fetching boss-v* tags for version stamping"
+LATEST_TAG_FOR_STAMP=$(gh release list --repo spinyfin/mono --limit 200 --json tagName \
+  --jq '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName' 2>/dev/null || true)
+if [[ -n "${LATEST_TAG_FOR_STAMP}" ]]; then
+  git fetch origin "refs/tags/${LATEST_TAG_FOR_STAMP}:refs/tags/${LATEST_TAG_FOR_STAMP}" 2>/dev/null || true
+  # Unshallow so git describe can traverse back to the tag commit.
+  if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+    echo "[boss-release] unshallowing so git describe can reach ${LATEST_TAG_FOR_STAMP}"
+    git fetch --unshallow origin 2>/dev/null || true
+  fi
+else
+  echo "[boss-release] WARNING: no boss-v* tags found; version will stamp as 0.0.0-dev-<sha>"
+fi
+
 # ── build Boss.app (optimised, credentials embedded) ─────────────────────────
 # Credentials are passed via --define so rules_rust includes them in the rustc
 # compile action's cache key + env (option_env! reads them at compile time);
@@ -178,7 +199,12 @@ fi
 # fail in CI: the credentials were embedded correctly in the opt artifact, but
 # the smoke test extracted the fastbuild one. Keep BUILD_FLAGS the single
 # source of truth shared by both invocations.
+#
+# --config=release activates --stamp and --workspace_status_command so Bazel
+# calls workspace-status.sh and writes STABLE_BOSS_VERSION / STABLE_BOSS_BASE_VERSION
+# into stable-status.txt.  Without it the version is always 0.0.0 (no stamping).
 BUILD_FLAGS=(
+  --config=release
   -c opt
   --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
   --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"
