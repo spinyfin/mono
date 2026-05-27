@@ -13,7 +13,8 @@ use crate::audit_effort;
 use crate::cli::Cli;
 use crate::ipc_log::IpcLogger;
 use crate::completion::{
-    CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
+    CommandHeadShaPrFinder, CommandPrDetector, CommandWorkspaceHeadReader, PrDetector, ProbeQueuer,
+    WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{
@@ -781,6 +782,8 @@ impl ServerState {
             .with_staged_resolution_signals(staged_resolution_signals.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
+            .with_workspace_head_reader(Arc::new(CommandWorkspaceHeadReader::new()))
+            .with_head_sha_pr_finder(Arc::new(CommandHeadShaPrFinder::new()))
             .with_metrics(metrics_for_completion),
         );
 

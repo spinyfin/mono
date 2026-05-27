@@ -79,6 +79,16 @@ crate::register_counter!(
     "pr_url_capture.recheck_staged.branch_mismatch",
     "staged URL's PR branch did not match execution's expected branch; URL was dropped.",
 );
+crate::register_counter!(
+    PR_HEAD_SHA_RESCUE_HIT,
+    "pr_url_capture.head_sha_rescue.hit",
+    "branch-keyed detection missed but an open PR was found on the worker's HEAD commit (PR lives on an off-prefix branch).",
+);
+crate::register_counter!(
+    PR_HEAD_SHA_RESCUE_AMBIGUOUS,
+    "pr_url_capture.head_sha_rescue.ambiguous",
+    "multiple open PRs shared the worker's HEAD commit and none was unambiguously the engine-assigned branch; surfaced to operator instead of guessing.",
+);
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics::init_all`] at engine startup so duplicate-name panics
@@ -88,6 +98,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
+    registry.register_counter(&PR_HEAD_SHA_RESCUE_HIT);
+    registry.register_counter(&PR_HEAD_SHA_RESCUE_AMBIGUOUS);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -393,6 +405,250 @@ async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String
     Ok(head_oid)
 }
 
+/// An open PR whose head ref points at a specific commit SHA. Returned
+/// by [`HeadShaPrFinder`] for the head-SHA rescue path: when branch-keyed
+/// detection misses (the worker pushed under a branch name that differs
+/// from the engine-assigned `boss/<execution_id>`), the rescue grounds
+/// "did the worker open a PR?" on the commit instead of the branch string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadShaPr {
+    /// Canonical GitHub PR URL (`html_url`).
+    pub url: String,
+    /// The PR's head branch name (`head.ref`). Used only to break a tie
+    /// when more than one open PR shares the worker's head commit —
+    /// prefer the one whose branch matches the engine-assigned prefix.
+    pub head_ref_name: String,
+}
+
+/// Reads the worker's working-copy commit SHA (`@`) from a cube
+/// workspace. This is the bridge the head-SHA rescue needs: branch-keyed
+/// detection keys on a GitHub branch name, but the PR may live on a
+/// different branch (org push hooks, manual fixups, future configurable
+/// prefixes). The worker's local HEAD is the one signal that survives a
+/// branch-name divergence.
+///
+/// **Incident-001 safety:** reading `@` in a *specific* workspace is the
+/// safe half of the old, withdrawn SHA-keyed recipe. The fan-out bug
+/// (`tools/boss/docs/postmortems/incident-001-pr-fan-out.md`) came from
+/// the `bookmarks() & committer_date(after:…)` revset clause, which
+/// returned *every* sibling workspace's bookmarks out of cube's shared
+/// `.jj/repo/store/git`. `@` is per-workspace working-copy state — jj
+/// tracks a distinct working-copy commit per workspace — so it carries
+/// no cross-workspace contamination. The implementation passes
+/// `--ignore-working-copy` so it neither snapshots nor locks the live
+/// worker's working copy.
+#[async_trait]
+pub trait WorkspaceHeadReader: Send + Sync {
+    /// Git commit id of the working-copy commit (`@`) in
+    /// `workspace_path`, or `Ok(None)` when it can't be resolved (the
+    /// path isn't a jj workspace, `@` has no commit, etc.). `Err(_)` is
+    /// reserved for tool failures so callers can distinguish "no signal"
+    /// from "couldn't ask".
+    async fn head_commit_sha(&self, workspace_path: &str) -> Result<Option<String>>;
+}
+
+/// `WorkspaceHeadReader` that shells out to
+/// `jj log -r @ --ignore-working-copy -T commit_id`.
+#[derive(Debug, Default)]
+pub struct CommandWorkspaceHeadReader;
+
+impl CommandWorkspaceHeadReader {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl WorkspaceHeadReader for CommandWorkspaceHeadReader {
+    async fn head_commit_sha(&self, workspace_path: &str) -> Result<Option<String>> {
+        read_workspace_head_sha_cmd(workspace_path).await
+    }
+}
+
+/// `WorkspaceHeadReader` that always reports "no HEAD". This is the
+/// default wired by [`WorkerCompletionHandler::new`] so unit tests that
+/// don't opt into the rescue never spawn `jj`; production wires
+/// [`CommandWorkspaceHeadReader`] via
+/// [`WorkerCompletionHandler::with_workspace_head_reader`].
+#[derive(Debug, Default)]
+pub struct NoopWorkspaceHeadReader;
+
+#[async_trait]
+impl WorkspaceHeadReader for NoopWorkspaceHeadReader {
+    async fn head_commit_sha(&self, _workspace_path: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Finds open PRs whose head ref points at a given commit SHA. Used by
+/// the head-SHA rescue when branch-keyed detection returns no PR for the
+/// engine-assigned branch.
+///
+/// **Incident-001 safety:** unlike the withdrawn recipe, this is fed a
+/// *single* workspace-local SHA (the worker's own `@`), not a
+/// date-windowed set of bookmark tips that crossed workspace boundaries.
+/// Implementations must additionally require the PR's `head.sha` to
+/// equal the queried SHA — "the worker's commit is the PR head," not
+/// merely "contained somewhere in the PR's history."
+#[async_trait]
+pub trait HeadShaPrFinder: Send + Sync {
+    /// Open PRs in `repo_remote_url` whose head commit SHA equals
+    /// `head_sha`. Empty vec when none match. `Err(_)` is reserved for
+    /// tool / network failures.
+    async fn find_open_prs_by_head_sha(
+        &self,
+        repo_remote_url: &str,
+        head_sha: &str,
+    ) -> Result<Vec<HeadShaPr>>;
+}
+
+/// `HeadShaPrFinder` that shells out to
+/// `gh api repos/<slug>/commits/<sha>/pulls`.
+#[derive(Debug, Default)]
+pub struct CommandHeadShaPrFinder;
+
+impl CommandHeadShaPrFinder {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl HeadShaPrFinder for CommandHeadShaPrFinder {
+    async fn find_open_prs_by_head_sha(
+        &self,
+        repo_remote_url: &str,
+        head_sha: &str,
+    ) -> Result<Vec<HeadShaPr>> {
+        let repo_slug = parse_repo_slug(repo_remote_url)
+            .with_context(|| format!("failed to parse repo slug from `{repo_remote_url}`"))?;
+        query_open_prs_by_head_sha_cmd(&repo_slug, head_sha).await
+    }
+}
+
+/// `HeadShaPrFinder` that never finds anything. Default wired by
+/// [`WorkerCompletionHandler::new`] so the rescue stays inert in unit
+/// tests; production wires [`CommandHeadShaPrFinder`] via
+/// [`WorkerCompletionHandler::with_head_sha_pr_finder`].
+#[derive(Debug, Default)]
+pub struct NoopHeadShaPrFinder;
+
+#[async_trait]
+impl HeadShaPrFinder for NoopHeadShaPrFinder {
+    async fn find_open_prs_by_head_sha(
+        &self,
+        _repo_remote_url: &str,
+        _head_sha: &str,
+    ) -> Result<Vec<HeadShaPr>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Shell out to `jj log -r @ --ignore-working-copy --no-graph -T commit_id`
+/// in `workspace_path` and return the working-copy commit's git SHA, or
+/// `Ok(None)` if the path is not a jj workspace / `@` can't be resolved.
+///
+/// `--ignore-working-copy` keeps this strictly read-only: jj neither
+/// snapshots nor takes the working-copy lock, so it cannot race a live
+/// worker session in the same workspace.
+async fn read_workspace_head_sha_cmd(workspace_path: &str) -> Result<Option<String>> {
+    let output = Command::new("jj")
+        .args([
+            "log",
+            "-r",
+            "@",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ])
+        .current_dir(workspace_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `jj log -r @` in {workspace_path}"))?;
+    if !output.status.success() {
+        // Not a jj workspace, jj missing, etc. Treat as "no signal"
+        // rather than a hard error: the rescue falls back to prompting.
+        tracing::debug!(
+            workspace_path,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "head-sha rescue: `jj log -r @` failed; treating as no HEAD",
+        );
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sha))
+}
+
+/// Shell out to `gh api repos/<slug>/commits/<sha>/pulls` and return the
+/// open PRs whose head ref's commit SHA equals `head_sha`.
+///
+/// The endpoint returns every PR associated with the commit (open and
+/// closed, and PRs where the commit is merely contained in the history).
+/// We filter to `state == "open"` AND `head.sha == head_sha` so the
+/// result is exactly "open PRs whose head is this commit."
+async fn query_open_prs_by_head_sha_cmd(
+    repo_slug: &str,
+    head_sha: &str,
+) -> Result<Vec<HeadShaPr>> {
+    let endpoint = format!("repos/{repo_slug}/commits/{head_sha}/pulls");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            r#".[] | [(.state // ""), (.head.sha // ""), (.head.ref // ""), (.html_url // "")] | @tsv"#,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`gh api {endpoint}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut prs = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let state = parts.next().unwrap_or("").trim();
+        let pr_head_sha = parts.next().unwrap_or("").trim();
+        let head_ref = parts.next().unwrap_or("").trim();
+        let url = parts.next().unwrap_or("").trim();
+        if url.is_empty() {
+            continue;
+        }
+        // Require open state AND head.sha == queried sha: the worker's
+        // commit must be the PR head, not merely contained in it.
+        if !state.eq_ignore_ascii_case("open") || pr_head_sha != head_sha {
+            continue;
+        }
+        prs.push(HeadShaPr {
+            url: url.to_owned(),
+            head_ref_name: head_ref.to_owned(),
+        });
+    }
+    Ok(prs)
+}
+
 /// Parse the PR number from a canonical GitHub PR URL
 /// (`https://github.com/<owner>/<repo>/pull/<N>`).
 pub(crate) fn pr_number_from_url(pr_url: &str) -> Option<u64> {
@@ -680,6 +936,21 @@ pub struct WorkerCompletionHandler {
     /// finalizer unchanged.
     staged_resolution_signals:
         Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
+    /// Reads the worker's working-copy commit SHA (`@`) from its cube
+    /// workspace for the head-SHA rescue. When branch-keyed detection
+    /// returns no PR for the engine-assigned branch, the rescue uses
+    /// this SHA to find a PR the worker opened under a *different* branch
+    /// name (org push hooks, manual fixups). Defaults to
+    /// [`NoopWorkspaceHeadReader`] (rescue inert) so unit tests never
+    /// spawn `jj`; production wires [`CommandWorkspaceHeadReader`] via
+    /// [`Self::with_workspace_head_reader`].
+    workspace_head_reader: Arc<dyn WorkspaceHeadReader>,
+    /// Finds open PRs whose head ref points at a given commit SHA — the
+    /// GitHub half of the head-SHA rescue. Defaults to
+    /// [`NoopHeadShaPrFinder`] (rescue inert) so unit tests never shell
+    /// out to `gh`; production wires [`CommandHeadShaPrFinder`] via
+    /// [`Self::with_head_sha_pr_finder`].
+    head_sha_pr_finder: Arc<dyn HeadShaPrFinder>,
 }
 
 impl WorkerCompletionHandler {
@@ -713,6 +984,8 @@ impl WorkerCompletionHandler {
             staged_resolution_signals: Arc::new(
                 crate::resolution_signal_capture::StagedResolutionSignalCache::new(),
             ),
+            workspace_head_reader: Arc::new(NoopWorkspaceHeadReader),
+            head_sha_pr_finder: Arc::new(NoopHeadShaPrFinder),
         }
     }
 
@@ -787,6 +1060,30 @@ impl WorkerCompletionHandler {
         cache: Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
     ) -> Self {
         self.staged_resolution_signals = cache;
+        self
+    }
+
+    /// Wire an externally-owned [`WorkspaceHeadReader`] for the head-SHA
+    /// rescue. `app.rs` calls this with [`CommandWorkspaceHeadReader`].
+    /// Tests that exercise the rescue wire a stub; tests that don't get
+    /// the default [`NoopWorkspaceHeadReader`] and never spawn `jj`.
+    pub fn with_workspace_head_reader(
+        mut self,
+        reader: Arc<dyn WorkspaceHeadReader>,
+    ) -> Self {
+        self.workspace_head_reader = reader;
+        self
+    }
+
+    /// Wire an externally-owned [`HeadShaPrFinder`] for the head-SHA
+    /// rescue. `app.rs` calls this with [`CommandHeadShaPrFinder`]. Tests
+    /// that exercise the rescue wire a stub; tests that don't get the
+    /// default [`NoopHeadShaPrFinder`] and never shell out to `gh`.
+    pub fn with_head_sha_pr_finder(
+        mut self,
+        finder: Arc<dyn HeadShaPrFinder>,
+    ) -> Self {
+        self.head_sha_pr_finder = finder;
         self
     }
 
@@ -1035,11 +1332,46 @@ impl WorkerCompletionHandler {
         };
 
         let (pr_url, target) = match pr_status {
-            PrStatus::None | PrStatus::Closed { .. } => {
+            PrStatus::None => {
+                // Branch-keyed detection found no PR on the
+                // engine-assigned branch. Before nudging, ground the
+                // question on the worker's HEAD commit: the PR may exist
+                // on a different branch (org push hooks, manual fixups).
+                // See issue #841 / [`Self::rescue_pr_by_head_sha`].
+                match self.rescue_pr_by_head_sha(&execution, &expected_branch).await {
+                    HeadShaRescue::Found { pr_url } => {
+                        (pr_url, WorkerPrCompletionTarget::InReview)
+                    }
+                    HeadShaRescue::Ambiguous { pr_urls } => {
+                        tracing::warn!(
+                            execution_id,
+                            expected_branch = %expected_branch,
+                            candidates = ?pr_urls,
+                            "stop event: multiple PRs share the worker HEAD — surfacing ambiguity instead of binding"
+                        );
+                        self.publish_awaiting_pr(&execution).await;
+                        self.probe_queuer
+                            .queue_probe(execution_id, PROBE_AMBIGUOUS_PR);
+                        return StopOutcome::AwaitingInput;
+                    }
+                    HeadShaRescue::NotFound => {
+                        tracing::info!(
+                            execution_id,
+                            expected_branch = %expected_branch,
+                            "stop event: worker idle without an active PR — probing to push and open one"
+                        );
+                        self.publish_awaiting_pr(&execution).await;
+                        self.probe_queuer
+                            .queue_probe(execution_id, PROBE_NO_PR);
+                        return StopOutcome::AwaitingInput;
+                    }
+                }
+            }
+            PrStatus::Closed { .. } => {
                 tracing::info!(
                     execution_id,
                     expected_branch = %expected_branch,
-                    "stop event: worker idle without an active PR — probing to push and open one"
+                    "stop event: worker's branch PR is closed without merge — probing to push and open one"
                 );
                 self.publish_awaiting_pr(&execution).await;
                 self.probe_queuer
@@ -1229,7 +1561,20 @@ impl WorkerCompletionHandler {
         };
         let (pr_url, target) = match pr_status {
             // Quiet returns — no probes, no awaiting-input publish.
-            PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
+            PrStatus::None => {
+                // Head-SHA rescue, quiet variant (no probe). If the
+                // worker opened a PR on an off-prefix branch, bind it;
+                // ambiguity stays quiet here (on_stop surfaces it).
+                match self.rescue_pr_by_head_sha(&execution, &expected_branch).await {
+                    HeadShaRescue::Found { pr_url } => {
+                        (pr_url, WorkerPrCompletionTarget::InReview)
+                    }
+                    HeadShaRescue::NotFound | HeadShaRescue::Ambiguous { .. } => {
+                        return StopOutcome::AwaitingInput;
+                    }
+                }
+            }
+            PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
             PrStatus::Stale { url, reason } => {
                 return StopOutcome::StalePr { pr_url: url, reason }
             }
@@ -2218,6 +2563,136 @@ impl WorkerCompletionHandler {
             ShaDeltaGateOutcome::Contributed { pr_url: bound_pr_url }
         }
     }
+
+    /// Head-SHA rescue: branch-keyed detection found no PR for the
+    /// engine-assigned branch (`expected_branch`). Before concluding the
+    /// worker never opened a PR, ground the question on the worker's
+    /// HEAD commit — the PR may live on a branch the worker had to push
+    /// under instead of `boss/<execution_id>` (org push hooks, manual
+    /// fixups, future configurable prefixes). See issue #841.
+    ///
+    /// Resolution (mirrors the issue's spec):
+    /// 1. Read the worker's HEAD commit SHA from its workspace.
+    /// 2. Find open PRs whose head ref is that exact commit.
+    /// 3. Exactly one → bind it regardless of branch name.
+    /// 4. Zero → `NotFound` (caller prompts / returns as before).
+    /// 5. Many → prefer the one on the engine-assigned branch; if that
+    ///    is not unambiguous, `Ambiguous` (surface to operator, never
+    ///    guess — wrong-PR binding is the incident-001 failure class).
+    async fn rescue_pr_by_head_sha(
+        &self,
+        execution: &crate::work::WorkExecution,
+        expected_branch: &str,
+    ) -> HeadShaRescue {
+        let workspace_path = match execution.workspace_path.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    "head-sha rescue: execution has no workspace_path; cannot read worker HEAD",
+                );
+                return HeadShaRescue::NotFound;
+            }
+        };
+        let head_sha = match self
+            .workspace_head_reader
+            .head_commit_sha(workspace_path)
+            .await
+        {
+            Ok(Some(sha)) if !sha.is_empty() => sha,
+            Ok(_) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    workspace_path,
+                    "head-sha rescue: could not resolve worker HEAD commit; skipping rescue",
+                );
+                return HeadShaRescue::NotFound;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    workspace_path,
+                    ?err,
+                    "head-sha rescue: reading worker HEAD failed; skipping rescue",
+                );
+                return HeadShaRescue::NotFound;
+            }
+        };
+        let prs = match self
+            .head_sha_pr_finder
+            .find_open_prs_by_head_sha(&execution.repo_remote_url, &head_sha)
+            .await
+        {
+            Ok(prs) => prs,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    head_sha = %head_sha,
+                    ?err,
+                    "head-sha rescue: querying PRs by head SHA failed; skipping rescue",
+                );
+                return HeadShaRescue::NotFound;
+            }
+        };
+        match prs.len() {
+            0 => HeadShaRescue::NotFound,
+            1 => {
+                let pr = prs.into_iter().next().expect("len checked == 1");
+                tracing::info!(
+                    execution_id = %execution.id,
+                    head_sha = %head_sha,
+                    pr_url = %pr.url,
+                    pr_branch = %pr.head_ref_name,
+                    %expected_branch,
+                    "head-sha rescue: branch-keyed detection missed; bound the PR on the worker's HEAD commit",
+                );
+                PR_HEAD_SHA_RESCUE_HIT.inc(&self.metrics);
+                HeadShaRescue::Found { pr_url: pr.url }
+            }
+            _ => {
+                // Multiple open PRs share the HEAD commit. Prefer the
+                // one on the engine-assigned branch; only bind if that
+                // pick is unambiguous (exactly one such PR).
+                let mut preferred: Vec<&HeadShaPr> = prs
+                    .iter()
+                    .filter(|p| branch_matches_expected(&p.head_ref_name, expected_branch))
+                    .collect();
+                if preferred.len() == 1 {
+                    let pr = preferred.remove(0);
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        head_sha = %head_sha,
+                        pr_url = %pr.url,
+                        pr_branch = %pr.head_ref_name,
+                        %expected_branch,
+                        match_count = prs.len(),
+                        "head-sha rescue: multiple PRs on HEAD commit; bound the one on the engine-assigned branch",
+                    );
+                    PR_HEAD_SHA_RESCUE_HIT.inc(&self.metrics);
+                    return HeadShaRescue::Found { pr_url: pr.url.clone() };
+                }
+                let pr_urls: Vec<String> = prs.iter().map(|p| p.url.clone()).collect();
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    head_sha = %head_sha,
+                    %expected_branch,
+                    candidates = ?pr_urls,
+                    "head-sha rescue: multiple open PRs share the worker HEAD and none is unambiguously the engine-assigned branch; surfacing ambiguity",
+                );
+                PR_HEAD_SHA_RESCUE_AMBIGUOUS.inc(&self.metrics);
+                HeadShaRescue::Ambiguous { pr_urls }
+            }
+        }
+    }
+}
+
+/// Whether `head_ref_name` is the PR branch the engine would have
+/// assigned this execution. Matches the exact engine-assigned branch
+/// (`boss/<execution_id>`) or, defensively, anything under the `boss/`
+/// prefix — a worker that published under a slightly different `boss/…`
+/// name still reads as "the engine's branch" for tie-break purposes.
+fn branch_matches_expected(head_ref_name: &str, expected_branch: &str) -> bool {
+    head_ref_name == expected_branch || head_ref_name.starts_with("boss/")
 }
 
 #[async_trait]
@@ -2248,6 +2723,25 @@ enum ShaDeltaGateOutcome {
     Inapplicable,
 }
 
+/// Outcome of the head-SHA rescue: branch-keyed detection found no PR
+/// for the engine-assigned branch, so we ground the question on the
+/// worker's HEAD commit instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadShaRescue {
+    /// Exactly one open PR has its head ref at the worker's HEAD commit
+    /// (or, on a multi-match, exactly one of them is on the
+    /// engine-assigned branch). Bind it.
+    Found { pr_url: String },
+    /// No workspace path, the HEAD couldn't be read, the finder failed,
+    /// or zero open PRs share the HEAD commit. Caller proceeds as
+    /// before (prompt / quiet return).
+    NotFound,
+    /// More than one open PR shares the HEAD commit and none is
+    /// unambiguously the engine-assigned branch. The engine refuses to
+    /// guess; the caller surfaces the ambiguity to the operator.
+    Ambiguous { pr_urls: Vec<String> },
+}
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
@@ -2271,6 +2765,16 @@ changed. This usually means you committed and pushed without making any edits. \
 Run `jj diff -r @` to verify your working-copy changes. If the diff is empty, \
 you have not made any changes — do not keep this PR open. Either make the required \
 edits and push them, or close the PR and explain what went wrong.";
+
+/// Probe text dispatched when more than one open PR shares the worker's
+/// HEAD commit and the engine cannot tell which one is this work's PR
+/// (none is on the engine-assigned branch, or several are). The engine
+/// refuses to guess — binding the wrong PR is the failure class behind
+/// incident 001 — and asks the worker to disambiguate.
+pub const PROBE_AMBIGUOUS_PR: &str = "Your branch's head commit is shared by more than \
+one open PR, and the engine can't tell which one belongs to this task. It will not \
+guess. Reply with the URL of the PR for this work, or push to the engine-assigned \
+branch so it can be matched automatically.";
 
 /// What happened during a stop event handler invocation. The runtime
 /// only logs this; tests assert on it.
@@ -2477,6 +2981,79 @@ mod tests {
             let guard = self.head_oid_result.lock().await;
             match &*guard {
                 Ok(oid) => Ok(oid.clone()),
+                Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            }
+        }
+    }
+
+    /// Workspace HEAD reader stub for the head-SHA rescue tests. Returns
+    /// a fixed `Ok(Some(sha))` / `Ok(None)` / `Err` without spawning jj.
+    struct StubWorkspaceHeadReader {
+        result: Result<Option<String>, String>,
+    }
+
+    impl StubWorkspaceHeadReader {
+        fn some(sha: &str) -> Arc<Self> {
+            Arc::new(Self {
+                result: Ok(Some(sha.to_owned())),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceHeadReader for StubWorkspaceHeadReader {
+        async fn head_commit_sha(&self, _workspace_path: &str) -> Result<Option<String>> {
+            match &self.result {
+                Ok(v) => Ok(v.clone()),
+                Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            }
+        }
+    }
+
+    /// Head-SHA PR finder stub. Returns a fixed PR list (or error) and
+    /// records the SHA it was queried with.
+    struct StubHeadShaPrFinder {
+        result: Result<Vec<HeadShaPr>, String>,
+        queried: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StubHeadShaPrFinder {
+        fn returning(prs: Vec<HeadShaPr>) -> Arc<Self> {
+            Arc::new(Self {
+                result: Ok(prs),
+                queried: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// One open PR on the given branch.
+        fn one(url: &str, head_ref: &str) -> Arc<Self> {
+            Self::returning(vec![HeadShaPr {
+                url: url.to_owned(),
+                head_ref_name: head_ref.to_owned(),
+            }])
+        }
+
+        fn query_count(&self) -> usize {
+            self.queried
+                .lock()
+                .expect("StubHeadShaPrFinder mutex poisoned")
+                .len()
+        }
+    }
+
+    #[async_trait]
+    impl HeadShaPrFinder for StubHeadShaPrFinder {
+        async fn find_open_prs_by_head_sha(
+            &self,
+            _repo_remote_url: &str,
+            head_sha: &str,
+        ) -> Result<Vec<HeadShaPr>> {
+            self.queried
+                .lock()
+                .expect("StubHeadShaPrFinder mutex poisoned")
+                .push(head_sha.to_owned());
+            match &self.result {
+                Ok(prs) => Ok(prs.clone()),
                 Err(msg) => Err(anyhow::anyhow!(msg.clone())),
             }
         }
@@ -3112,6 +3689,214 @@ mod tests {
             "exactly one probe must be queued when the worker stops without a PR, got {queued:?}",
         );
         assert_eq!(queued[0].0, execution_id);
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    #[test]
+    fn branch_matches_expected_recognises_engine_branch_and_prefix() {
+        let expected = "boss/exec_18b3884f6cb4b918_1b";
+        assert!(branch_matches_expected(expected, expected));
+        assert!(branch_matches_expected("boss/exec_other", expected));
+        assert!(!branch_matches_expected("bduff/go-lib-publish-idempotent", expected));
+        assert!(!branch_matches_expected("alice/feature", expected));
+    }
+
+    // ---- head-SHA rescue (issue #841) ------------------------------
+
+    /// Branch-keyed detection misses (the PR is on `bduff/…`, not the
+    /// engine-assigned branch), but the worker's HEAD commit carries an
+    /// open PR. The rescue must bind it and advance to in_review rather
+    /// than gaslighting the worker with PROBE_NO_PR.
+    #[tokio::test]
+    async fn head_sha_rescue_binds_pr_on_off_prefix_branch() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let head_reader = StubWorkspaceHeadReader::some("7a239229a437");
+        let finder = StubHeadShaPrFinder::one(
+            "https://github.com/linkedin-eng/ci-infra/pull/996",
+            "bduff/go-lib-publish-idempotent",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_workspace_head_reader(head_reader)
+        .with_head_sha_pr_finder(finder.clone());
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "off-prefix PR on the worker HEAD must be detected, got {outcome:?}",
+        );
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/linkedin-eng/ci-infra/pull/996"),
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // The finder was queried with the worker's HEAD SHA, and no
+        // PROBE_NO_PR was queued.
+        assert_eq!(finder.query_count(), 1);
+        assert!(
+            probes.snapshot().is_empty(),
+            "a recognised PR must not trigger any probe, got {:?}",
+            probes.snapshot(),
+        );
+    }
+
+    /// Multiple open PRs share the worker's HEAD commit, but exactly one
+    /// is on the engine-assigned branch — prefer it.
+    #[tokio::test]
+    async fn head_sha_rescue_prefers_engine_branch_on_multiple_match() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let expected_branch = expected_branch_name(&execution_id);
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let head_reader = StubWorkspaceHeadReader::some("deadbeef1234");
+        let finder = StubHeadShaPrFinder::returning(vec![
+            HeadShaPr {
+                url: "https://github.com/foo/bar/pull/1".into(),
+                head_ref_name: "bduff/some-branch".into(),
+            },
+            HeadShaPr {
+                url: "https://github.com/foo/bar/pull/2".into(),
+                head_ref_name: expected_branch.clone(),
+            },
+        ]);
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_workspace_head_reader(head_reader)
+        .with_head_sha_pr_finder(finder);
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/foo/bar/pull/2"),
+                    "must bind the PR on the engine-assigned branch",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// Multiple open PRs share the HEAD commit and none is on the
+    /// engine-assigned branch — refuse to guess; surface the ambiguity.
+    #[tokio::test]
+    async fn head_sha_rescue_ambiguous_surfaces_probe_and_does_not_bind() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let head_reader = StubWorkspaceHeadReader::some("deadbeef1234");
+        let finder = StubHeadShaPrFinder::returning(vec![
+            HeadShaPr {
+                url: "https://github.com/foo/bar/pull/1".into(),
+                head_ref_name: "alice/feature".into(),
+            },
+            HeadShaPr {
+                url: "https://github.com/foo/bar/pull/2".into(),
+                head_ref_name: "bob/feature".into(),
+            },
+        ]);
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_workspace_head_reader(head_reader)
+        .with_head_sha_pr_finder(finder);
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active", "ambiguity must NOT bind a PR");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "ambiguity must NOT release the cube workspace",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1, PROBE_AMBIGUOUS_PR);
+    }
+
+    /// Head reader resolves a SHA but no open PR matches it — fall back
+    /// to the existing PROBE_NO_PR nudge (pre-change behaviour preserved
+    /// for the genuinely-no-PR case).
+    #[tokio::test]
+    async fn head_sha_rescue_falls_back_to_probe_when_no_pr_matches() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let head_reader = StubWorkspaceHeadReader::some("deadbeef1234");
+        let finder = StubHeadShaPrFinder::returning(vec![]);
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_workspace_head_reader(head_reader)
+        .with_head_sha_pr_finder(finder);
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].1, PROBE_NO_PR);
     }
 
