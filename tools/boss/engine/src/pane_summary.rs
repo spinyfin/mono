@@ -104,28 +104,18 @@ pub fn item_id(item: &WorkItem) -> &str {
     }
 }
 
-/// Fall back to a local lowercase trim of the work item's name. Used
-/// when the API key is absent or the upstream call fails — better
-/// than surfacing a raw exec id when we can do something readable
-/// for free. The fallback is *not* cached because a later spawn
-/// might be able to reach Claude.
-///
-/// We lowercase so the result reads tolerably when prefixed with
-/// `"<AgentName> is "` in the UI. The phrasing won't be true
-/// gerund form (an imperative title like "Fix bossctl stubs" yields
-/// `"Riker is fix bossctl stubs"` which is grammatically rough), but
-/// it stays readable and only surfaces in the no-API-key path; the
-/// real Claude path produces proper gerund phrasing.
+/// Truncate a work item name to at most 6 words. Used in tests and
+/// by the caller to produce a short display label when no API key is
+/// available. The result is intentionally NOT lowercased here — the
+/// caller decides formatting (e.g. `"<AgentName>: <result>"`).
+/// The fallback is *not* cached because a later spawn might be able
+/// to reach Claude and generate a proper gerund phrase.
 pub fn local_fallback(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let words: Vec<String> = trimmed
-        .split_whitespace()
-        .take(6)
-        .map(|w| w.to_lowercase())
-        .collect();
+    let words: Vec<&str> = trimmed.split_whitespace().take(6).collect();
     if words.is_empty() {
         return None;
     }
@@ -215,18 +205,18 @@ pub async fn get_or_generate(
                 tracing::warn!(
                     work_item_id = id,
                     ?err,
-                    "pane_summary: Claude call failed; using local fallback",
+                    "pane_summary: Claude call failed; returning None so UI uses task_title",
                 );
             }
         }
     } else {
         tracing::debug!(
             work_item_id = id,
-            "pane_summary: no ANTHROPIC_API_KEY in config; using local fallback",
+            "pane_summary: no ANTHROPIC_API_KEY in config; returning None so UI uses task_title",
         );
     }
 
-    local_fallback(name)
+    None
 }
 
 #[derive(Debug, Serialize)]
@@ -477,19 +467,18 @@ mod tests {
     }
 
     #[test]
-    fn local_fallback_lowercases_first_six_words() {
-        // The fallback feeds into "<Name> is <phrase>" rendering, so
-        // we lowercase up to six words. It won't be a true gerund
-        // (the title is imperative), but it stays readable.
+    fn local_fallback_truncates_to_first_six_words() {
+        // The fallback trims to six words but preserves original case
+        // since the caller renders it as "<Name>: <phrase>" (no "is").
         assert_eq!(
             local_fallback("Show short task summary in agent pane titlebar").as_deref(),
-            Some("show short task summary in agent"),
+            Some("Show short task summary in agent"),
         );
     }
 
     #[test]
-    fn local_fallback_returns_short_input_lowercased() {
-        assert_eq!(local_fallback("Fix Fencer").as_deref(), Some("fix fencer"));
+    fn local_fallback_returns_short_input_unchanged() {
+        assert_eq!(local_fallback("Fix Fencer").as_deref(), Some("Fix Fencer"));
     }
 
     #[test]
@@ -609,8 +598,10 @@ mod tests {
         db.set_pane_summary("task-1", "fixing fencer scraper", &basis)
             .unwrap();
 
-        // No API key → would normally fall through to local
-        // fallback. A cache hit should short-circuit before that.
+        // No API key, but there IS a cache hit — the cached gerund
+        // summary is returned. Cache is checked before the key path,
+        // so a previously-computed gerund still surfaces even without
+        // an API key present on this spawn.
         let summary = get_or_generate(&db, None, &item).await;
         assert_eq!(summary.as_deref(), Some("fixing fencer scraper"));
     }
@@ -623,21 +614,25 @@ mod tests {
         db.set_pane_summary("task-1", "stale summary", &stale_basis)
             .unwrap();
 
-        // Same id, different name → cache should miss; with no API
-        // key we get the local lowercase fallback derived from the
-        // new name.
+        // Same id, different name → cache should miss. With no API
+        // key, get_or_generate now returns None (the engine passes
+        // the raw task name separately as task_title for the UI).
         let item = sample_task("task-1", "New Name Goes Here", "new desc");
         let summary = get_or_generate(&db, None, &item).await;
-        assert_eq!(summary.as_deref(), Some("new name goes here"));
+        assert_eq!(summary.as_deref(), None);
     }
 
     #[tokio::test]
-    async fn no_api_key_falls_back_to_lowercased_name() {
+    async fn no_api_key_returns_none() {
+        // When no API key is present, get_or_generate returns None.
+        // The engine passes the raw work-item name as task_title in
+        // the spawn request; the UI renders it as "<Name>: <title>"
+        // rather than the gerund "<Name> is <phrase>" form.
         let dir = TempDir::new().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let item = sample_task("task-1", "Show short task summary in agent pane", "");
         let summary = get_or_generate(&db, None, &item).await;
-        assert_eq!(summary.as_deref(), Some("show short task summary in agent"));
+        assert_eq!(summary.as_deref(), None);
     }
 
     #[tokio::test]

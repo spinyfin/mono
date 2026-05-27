@@ -12,12 +12,16 @@ struct EngineSpawnRequest: Sendable {
     let slotId: Int
     let initialInput: String
     let env: [(String, String)]
-    /// Engine-supplied 2–4 word summary of the task this worker is
-    /// running. Surfaced in the pane titlebar in place of the raw
-    /// run id; the run id is kept available as a tooltip for
-    /// traceability. `nil` means the engine had no summary to offer
-    /// — the pane falls back to displaying the run id.
+    /// Engine-supplied 2–4 word present-continuous gerund phrase
+    /// describing what the worker is doing (e.g. "fixing the fencer
+    /// scraper"). Present only when the engine successfully called
+    /// Claude to generate the phrase. When nil, use `taskTitle` for
+    /// the fallback format `"<AgentName>: <taskTitle>"`.
     let summary: String?
+    /// Raw work-item title (the task's name column). Used as the
+    /// fallback display label when `summary` is nil — rendered as
+    /// `"<AgentName>: <taskTitle>"` rather than with a gerund "is".
+    let taskTitle: String?
 }
 
 enum EngineSpawnError: Sendable {
@@ -946,13 +950,15 @@ final class EngineClient: @unchecked Sendable {
                         return (k, v)
                     }
                     let summary = request["summary"] as? String
+                    let taskTitle = request["task_title"] as? String
                     let spawn = EngineSpawnRequest(
                         runId: runId,
                         workspacePath: workspacePath,
                         slotId: slotId,
                         initialInput: initialInput,
                         env: env,
-                        summary: summary
+                        summary: summary,
+                        taskTitle: taskTitle
                     )
                     emit(.engineRequest(requestId: requestId, request: .spawnWorkerPane(spawn)))
                 case "release_worker_pane":

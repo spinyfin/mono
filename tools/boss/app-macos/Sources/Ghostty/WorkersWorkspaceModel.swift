@@ -56,6 +56,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         slots[index].session = session
         slots[index].runId = request.runId
         slots[index].summary = request.summary
+        slots[index].taskTitle = request.taskTitle
 
         // TODO: use proc_listpids(PROC_PPID_ONLY, ...)
         // right after surface init to find the shell pid. For now
@@ -106,6 +107,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         slots[index].session = nil
         slots[index].runId = nil
         slots[index].summary = nil
+        slots[index].taskTitle = nil
         // Re-roll the idle flavor so consecutive idle bouts on the same
         // slot don't show the same line — fresh recreation each time
         // the crew member clocks out.
@@ -221,11 +223,16 @@ struct WorkerSlot: Identifiable, Equatable {
     let slotId: Int
     var session: TerminalPaneSession?
     var runId: String?
-    /// Short lowercase gerund phrase the engine generated for this
-    /// run (e.g. `"fixing the fencer scraper"`). Rendered in the pane
-    /// titlebar as `"<WorkerName> is <phrase>"` in place of `runId`
-    /// when present; the runId stays available as a tooltip.
+    /// Short present-continuous gerund phrase the engine generated for
+    /// this run via Claude (e.g. `"fixing the fencer scraper"`).
+    /// Rendered in the pane titlebar as `"<WorkerName> is <phrase>"`.
+    /// Present only when ANTHROPIC_API_KEY was available and the
+    /// Claude call succeeded. When nil, `taskTitle` is used instead.
     var summary: String?
+    /// Raw work-item title (the task's name column). Used when
+    /// `summary` is nil — rendered as `"<WorkerName>: <taskTitle>"`
+    /// so the header still identifies the task without a gerund.
+    var taskTitle: String?
     /// Bumped every time the slot re-enters idle so the flavor line
     /// changes between idle bouts; kept stable for the lifetime of a
     /// single bout so renders don't flicker.
@@ -237,6 +244,7 @@ struct WorkerSlot: Identifiable, Equatable {
         lhs.slotId == rhs.slotId
             && lhs.runId == rhs.runId
             && lhs.summary == rhs.summary
+            && lhs.taskTitle == rhs.taskTitle
             && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
     }
