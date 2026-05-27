@@ -2709,6 +2709,11 @@ impl WorkDb {
         let task_runtimes = collect_task_runtimes(&conn, &tasks, &chores)?;
         let dependencies = collect_product_dependencies(&conn, product_id)?;
 
+        // Compute revision projections (revision_seq, revision_parent_pr_url)
+        // for every `kind = 'revision'` task. These are derived fields —
+        // not stored columns — so they are calculated fresh here.
+        let tasks = attach_revision_projections(tasks, &chores);
+
         Ok(WorkTree {
             product,
             projects,
@@ -3530,6 +3535,14 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/revision-tasks.md
         migrate_tasks_parent_task_id_column(&conn)?;
         migrate_work_executions_prefer_is_soft(&conn)?;
+        // Revision card fix: update existing revision rows whose `name` was
+        // set to the full description text (the original insertion behaviour).
+        // The new insertion code uses only the first line; this backfill
+        // aligns pre-fix rows by truncating to the first newline-terminated
+        // segment using SQLite string functions. Rows whose name already
+        // differs from description (e.g. manually patched via `boss task edit`)
+        // are intentionally skipped.
+        migrate_revision_names_to_first_line(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -6863,6 +6876,10 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         investigation_doc_repo_remote_url: None,
         investigation_doc_branch: None,
         parent_task_id: None,
+        // Revision projections are computed in attach_revision_projections
+        // (get_work_tree); they are never stored as columns.
+        revision_seq: None,
+        revision_parent_pr_url: None,
     })
 }
 
@@ -7593,6 +7610,134 @@ fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Result<St
     )
 }
 
+// ── Revision projection helpers ─────────────────────────────────────────────
+
+/// Derive `revision_seq` and `revision_parent_pr_url` for every revision task
+/// in `tasks` and return the annotated list.
+///
+/// Algorithm:
+/// 1. Build a lookup of all task IDs → (kind, parent_task_id, pr_url) from
+///    both `tasks` and `chores` (the chain root can be a chore).
+/// 2. For each revision, walk `parent_task_id` links until a non-revision
+///    ancestor is reached — that is the chain root.
+/// 3. Group revisions by chain-root ID; sort each group by `created_at ASC`
+///    (creation order = R<n> order).
+/// 4. Assign 1-based sequence numbers within each group and set
+///    `revision_parent_pr_url` from the chain root's `pr_url`.
+///
+/// Capped at a chain depth of 20 to protect against cycles in corrupt data.
+fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec<Task> {
+    // Compact lookup: id → (kind, parent_task_id, pr_url)
+    type Entry = (String, Option<String>, Option<String>);
+    let mut lookup: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
+    for t in tasks.iter().chain(chores.iter()) {
+        lookup.insert(
+            t.id.clone(),
+            (t.kind.clone(), t.parent_task_id.clone(), t.pr_url.clone()),
+        );
+    }
+
+    /// Walk parent_task_id links to the first non-revision ancestor.
+    /// Returns `(root_id, root_pr_url)` or `None` when the chain is broken.
+    fn chain_root(
+        start: &str,
+        lookup: &std::collections::HashMap<String, (String, Option<String>, Option<String>)>,
+    ) -> Option<(String, Option<String>)> {
+        let mut cur = start.to_owned();
+        for _ in 0..20 {
+            let (kind, parent_id, pr_url) = lookup.get(&cur)?;
+            if kind != "revision" {
+                return Some((cur, pr_url.clone()));
+            }
+            cur = parent_id.clone()?;
+        }
+        None // cycle or unexpectedly deep chain
+    }
+
+    // Find chain root for every revision, then group and sequence.
+    // We work with indices into `tasks` so we can mutate them afterwards.
+    let mut root_info: Vec<Option<(String, Option<String>)>> = tasks
+        .iter()
+        .map(|t| {
+            if t.kind == "revision" {
+                chain_root(&t.id, &lookup)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Group revision indices by root_id, sorted by created_at.
+    // Key: root_id → Vec<(created_at, index)> sorted by created_at.
+    let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> =
+        std::collections::HashMap::new();
+    for (idx, t) in tasks.iter().enumerate() {
+        if t.kind == "revision" {
+            if let Some((root_id, _)) = &root_info[idx] {
+                by_root
+                    .entry(root_id.clone())
+                    .or_default()
+                    .push((t.created_at.clone(), idx));
+            }
+        }
+    }
+    for entries in by_root.values_mut() {
+        entries.sort_by(|a, b| a.0.cmp(&b.0)); // stable sort by created_at
+    }
+
+    // Build seq map: task index → 1-based sequence number.
+    let mut seq_map: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+    for entries in by_root.values() {
+        for (seq_0, (_, idx)) in entries.iter().enumerate() {
+            seq_map.insert(*idx, (seq_0 + 1) as i64);
+        }
+    }
+
+    // Apply projections to the task list.
+    for (idx, task) in tasks.iter_mut().enumerate() {
+        if task.kind != "revision" {
+            continue;
+        }
+        if let Some((_, pr_url)) = root_info[idx].take() {
+            task.revision_parent_pr_url = pr_url;
+        }
+        if let Some(seq) = seq_map.get(&idx) {
+            task.revision_seq = Some(*seq);
+        }
+    }
+
+    tasks
+}
+
+// ── revision name helpers ────────────────────────────────────────────────────
+
+/// Extract a short display name from a revision description.
+///
+/// Returns the first non-empty, non-blank line of `description`, trimmed.
+/// If that first line exceeds 120 characters it is hard-truncated at the
+/// nearest word boundary below 120 and an ellipsis is appended. The full
+/// description is stored separately in `tasks.description`; the `name`
+/// column is just the compact card title.
+fn revision_name_from_description(description: &str) -> String {
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return if trimmed.len() <= 120 {
+            trimmed.to_owned()
+        } else {
+            let cutoff = &trimmed[..120];
+            match cutoff.rfind(' ') {
+                Some(pos) => format!("{}…", &cutoff[..pos]),
+                None => format!("{cutoff}…"),
+            }
+        };
+    }
+    // Fallback: should not reach here — insert_revision_in_tx enforces non-empty.
+    description.trim().to_owned()
+}
+
 /// Insert a `kind = 'revision'` task row. Called only after the gate passes.
 ///
 /// `parent_id` is the immediate parent (may itself be a revision).
@@ -7625,6 +7770,9 @@ fn insert_revision_in_tx(
     let product_id = &root.product_id;
     let project_id = root.project_id.as_deref();
     let short_id = allocate_short_id(conn, product_id)?;
+    // `name` is the compact one-line card title derived from the first
+    // non-empty line of `description`. `description` retains the full text.
+    let name = revision_name_from_description(&description);
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
@@ -7635,7 +7783,7 @@ fn insert_revision_in_tx(
             id,
             product_id,
             project_id,
-            description, // revision tasks use description as the name/title too
+            name,
             description,
             now,
             priority,
@@ -8015,6 +8163,53 @@ fn migrate_tasks_parent_task_id_column(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id
              ON tasks(parent_task_id);",
     )?;
+    Ok(())
+}
+
+/// Backfill revision `name` to first-line-of-description for existing rows.
+///
+/// The original `insert_revision_in_tx` stored the full description in both
+/// `name` and `description` (see revision-tasks.md implementation). This
+/// caused the macOS kanban card to display the entire multi-paragraph
+/// description verbatim. The corrected insert now uses `revision_name_from_description`
+/// (first non-empty line, ≤120 chars) as `name`; this migration aligns
+/// pre-fix rows that still carry `name = description`.
+///
+/// SQLite's INSTR + SUBSTR extract the first `\n`-terminated segment.
+/// Rows where `name` already differs from `description` (e.g. manually
+/// patched) are left as-is. Idempotent.
+fn migrate_revision_names_to_first_line(conn: &Connection) -> Result<()> {
+    // Pull all revision task IDs + descriptions where name = description.
+    // We do the first-line extraction in Rust (not raw SQL) because
+    // SQLite's string functions cannot reliably handle Unicode ellipsis
+    // or word-boundary truncation.
+    struct Row {
+        id: String,
+        description: String,
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, description FROM tasks
+         WHERE kind = 'revision' AND name = description AND deleted_at IS NULL",
+    )?;
+    let rows: Vec<Row> = stmt
+        .query_map([], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                description: row.get(1)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for row in rows {
+        let name = revision_name_from_description(&row.description);
+        if name != row.description {
+            conn.execute(
+                "UPDATE tasks SET name = ?1 WHERE id = ?2",
+                rusqlite::params![name, row.id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -22735,5 +22930,200 @@ mod tests {
             Some(parent_id.as_str()),
             "get_work_item_by_short_id must surface the revision's parent_task_id"
         );
+    }
+
+    // ── revision_name_from_description ──────────────────────────────────────
+
+    #[test]
+    fn revision_name_single_line_unchanged() {
+        assert_eq!(
+            revision_name_from_description("Fix the thing"),
+            "Fix the thing"
+        );
+    }
+
+    #[test]
+    fn revision_name_uses_first_nonempty_line() {
+        let desc = "Rename --dry-run to --plan before merge\n\nSome extra detail here.";
+        assert_eq!(
+            revision_name_from_description(desc),
+            "Rename --dry-run to --plan before merge"
+        );
+    }
+
+    #[test]
+    fn revision_name_skips_blank_leading_lines() {
+        let desc = "\n\nActual first content\nMore stuff";
+        assert_eq!(
+            revision_name_from_description(desc),
+            "Actual first content"
+        );
+    }
+
+    #[test]
+    fn revision_name_truncates_long_first_line_at_word_boundary() {
+        // Build a line longer than 120 chars with a space before the limit.
+        let long = "word ".repeat(30); // 150 chars: "word " × 30
+        let name = revision_name_from_description(&long);
+        assert!(name.len() <= 125, "name must be ≤120 + '…': got {}", name.len());
+        assert!(name.ends_with('…'), "long names must end with ellipsis");
+    }
+
+    #[test]
+    fn revision_name_from_description_crlf_lines() {
+        let desc = "First line\r\nSecond line";
+        // Rust `str::lines()` strips \r\n correctly.
+        assert_eq!(revision_name_from_description(desc), "First line");
+    }
+
+    // ── attach_revision_projections ─────────────────────────────────────────
+
+    /// Build a minimal Task with enough fields for `attach_revision_projections`.
+    fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, ts: &str) -> Task {
+        Task {
+            id: id.to_owned(),
+            short_id: None,
+            product_id: "p".to_owned(),
+            project_id: None,
+            kind: kind.to_owned(),
+            name: "n".to_owned(),
+            description: "d".to_owned(),
+            status: "todo".to_owned(),
+            ordinal: None,
+            pr_url: pr.map(str::to_owned),
+            deleted_at: None,
+            created_at: ts.to_owned(),
+            updated_at: ts.to_owned(),
+            autostart: true,
+            last_status_actor: "human".to_owned(),
+            priority: "medium".to_owned(),
+            created_via: "cli".to_owned(),
+            repo_remote_url: None,
+            blocked_reason: None,
+            blocked_attempt_id: None,
+            blocked_signals: vec![],
+            effort_level: None,
+            model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            ci_required_state: None,
+            ci_required_detail: None,
+            review_required_state: None,
+            review_required_detail: None,
+            pr_state_polled_at: None,
+            merge_queue_state: None,
+            external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
+            parent_task_id: parent.map(str::to_owned),
+            revision_seq: None,
+            revision_parent_pr_url: None,
+        }
+    }
+
+    #[test]
+    fn attach_revision_projections_assigns_seq_and_pr_url() {
+        let root = make_bare_task("root", "chore", None, Some("https://gh/pull/1"), "2026-01-01");
+        let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+        let r2 = make_bare_task("r2", "revision", Some("root"), None, "2026-01-03");
+
+        let chores = vec![root.clone()];
+        let result = attach_revision_projections(vec![r1, r2], &chores);
+
+        let rev1 = result.iter().find(|t| t.id == "r1").unwrap();
+        assert_eq!(rev1.revision_seq, Some(1), "r1 must be R1");
+        assert_eq!(
+            rev1.revision_parent_pr_url.as_deref(),
+            Some("https://gh/pull/1")
+        );
+
+        let rev2 = result.iter().find(|t| t.id == "r2").unwrap();
+        assert_eq!(rev2.revision_seq, Some(2), "r2 must be R2");
+        assert_eq!(
+            rev2.revision_parent_pr_url.as_deref(),
+            Some("https://gh/pull/1")
+        );
+    }
+
+    #[test]
+    fn attach_revision_projections_chained_revisions_flat_seq() {
+        // R2 is a revision-of-R1 (chained); both should still get a flat
+        // sequence number relative to the chain root.
+        let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2"), "2026-01-01");
+        let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+        let r2 = make_bare_task("r2", "revision", Some("r1"), None, "2026-01-03");
+
+        let chores = vec![root.clone()];
+        let result = attach_revision_projections(vec![r1, r2], &chores);
+
+        let rev1 = result.iter().find(|t| t.id == "r1").unwrap();
+        let rev2 = result.iter().find(|t| t.id == "r2").unwrap();
+        assert_eq!(rev1.revision_seq, Some(1));
+        assert_eq!(rev2.revision_seq, Some(2), "chained revision-of-revision must be R2, not R1.1");
+    }
+
+    #[test]
+    fn attach_revision_projections_non_revision_tasks_unaffected() {
+        let task = make_bare_task("t1", "project_task", None, Some("https://gh/pull/3"), "2026-01-01");
+        let result = attach_revision_projections(vec![task], &[]);
+        let t = &result[0];
+        assert_eq!(t.revision_seq, None, "non-revision tasks must not get a seq");
+        assert_eq!(t.revision_parent_pr_url, None);
+    }
+
+    #[test]
+    fn get_work_tree_includes_revision_seq_and_pr_url() {
+        // End-to-end: get_work_tree must populate revision projections.
+        let db = WorkDb::open(temp_db_path("revision-projections-work-tree")).unwrap();
+        let product_id = make_revision_product(&db, "proj-rev");
+        let pr_url = "https://github.com/spinyfin/mono/pull/99";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        let tree = db.get_work_tree(&product_id).unwrap();
+        // Revision arrives in the tasks array (not chores).
+        let rev_task = tree
+            .tasks
+            .iter()
+            .find(|t| t.id == revision.id)
+            .expect("revision must be in work_tree tasks");
+
+        assert_eq!(rev_task.revision_seq, Some(1), "first revision must be R1");
+        assert_eq!(
+            rev_task.revision_parent_pr_url.as_deref(),
+            Some(pr_url),
+            "revision_parent_pr_url must carry the chain root's PR URL"
+        );
+    }
+
+    #[test]
+    fn get_work_tree_two_revisions_get_distinct_seqs() {
+        let db = WorkDb::open(temp_db_path("revision-two-seqs")).unwrap();
+        let product_id = make_revision_product(&db, "two-revs");
+        let pr_url = "https://github.com/spinyfin/mono/pull/100";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        let r2 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        let tree = db.get_work_tree(&product_id).unwrap();
+        let seq = |id: &str| {
+            tree.tasks
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.revision_seq)
+        };
+        assert_eq!(seq(&r1.id), Some(1), "r1 must be R1");
+        assert_eq!(seq(&r2.id), Some(2), "r2 must be R2");
     }
 }

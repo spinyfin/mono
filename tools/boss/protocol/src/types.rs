@@ -382,6 +382,18 @@ pub struct Task {
     /// backfill, so pre-revision rows carry `NULL` as expected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// Engine-computed R-number for revision tasks. 1-based, chain-root-scoped,
+    /// creation-ordered: the N-th revision filed against a given chain root
+    /// gets `revision_seq = N`. `None` for every non-`revision` row. This is
+    /// a derived projection — not a stored column — computed fresh on every
+    /// `get_work_tree` call so deletions and soft-deletes stay consistent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_seq: Option<i64>,
+    /// Denormalised PR URL of the chain-root task for fast revision-card
+    /// rendering. `None` for non-revision rows and for revisions whose chain
+    /// root has no PR yet (rare — the create gate normally blocks that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_parent_pr_url: Option<String>,
 }
 
 fn default_true() -> bool {

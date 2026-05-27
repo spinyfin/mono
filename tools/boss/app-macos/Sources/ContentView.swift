@@ -1670,6 +1670,11 @@ struct WorkBoardCardView: View {
                             .font(.body.weight(.medium))
                             .foregroundStyle(.primary)
                             .multilineTextAlignment(.leading)
+                            // Revision descriptions can be multi-paragraph; cap
+                            // the card body to 2 lines so the card stays compact.
+                            // The full text is accessible via the detail popover.
+                            .lineLimit(task.kind == "revision" ? 2 : nil)
+                            .truncationMode(.tail)
                     }
                     if let blockedBy, !blockedBy.isEmpty {
                         let prefix = task.status == "blocked" ? "Blocked by" : "Waiting on:"
