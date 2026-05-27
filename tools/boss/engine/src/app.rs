@@ -2525,6 +2525,20 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic transient-recovery reconciler: detects workers wedged by
+    // a transient Claude API error (the interactive `claude` session
+    // printed the error, ended its turn, and sits Idle while the chore
+    // is unfinished) and auto-resumes them on the same workspace with
+    // bounded retries + backoff, escalating non-retryable / cap-reached
+    // failures for human attention. Runs every 60s and fires on boot.
+    let _transient_recovery_handle = crate::transient_recovery::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        crate::transient_recovery::DEFAULT_INTERVAL,
+    );
+
     // Periodic orphan-active reconciler: re-dispatches `active` work
     // items that have no live execution (the post-crash "stuck-in-Doing"
     // fix). Runs every 60s and fires immediately on boot so items left
