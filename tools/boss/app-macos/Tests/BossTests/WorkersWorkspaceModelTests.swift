@@ -171,7 +171,8 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             slotId: slot,
             initialInput: "claude\n",
             env: [],
-            summary: nil
+            summary: nil,
+            taskTitle: nil
         )
     }
 
@@ -235,7 +236,8 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
             slotId: slot,
             initialInput: "claude\n",
             env: [],
-            summary: nil
+            summary: nil,
+            taskTitle: nil
         )
     }
 

@@ -220,19 +220,26 @@ private struct WorkerSlotView: View {
     }
 
     /// First line in the titlebar — the overall task this worker is
-    /// on, in gerund form, with the worker name as subject. Stable
-    /// for the duration of a run (sourced from
-    /// `engine/src/pane_summary.rs`, which caches a Claude-generated
-    /// gerund phrase per work item). For an idle slot or while the
-    /// engine hasn't shipped a summary yet, falls back to the bare
-    /// worker name (active run) or just the name (idle) — never
-    /// empty, never grammatically broken.
+    /// on. When ANTHROPIC_API_KEY is available and Claude generated a
+    /// gerund phrase, it renders as `"<Name> is <gerund>"` (e.g.
+    /// "Riker is fixing the fencer scraper"). When the key is absent
+    /// or summarization failed, the engine sends the raw task title
+    /// and this renders as `"<Name>: <title>"` (e.g. "Crusher:
+    /// kanban: revision cards render broken") — grammatically correct
+    /// and clearly identifying the task without the gerund connector.
     @ViewBuilder
     private var slotTaskLine: some View {
         let name = WorkerNames.name(forSlot: slot.slotId)
         let text: String = {
             if let summary = slot.summary, !summary.isEmpty {
+                // Success path: Claude-generated gerund phrase.
+                // Preserved verbatim — do NOT change this branch.
                 return "\(name) is \(summary)"
+            }
+            if let taskTitle = slot.taskTitle, !taskTitle.isEmpty {
+                // Fallback path: no gerund available (no API key or
+                // summarization failed). Use "<Name>: <task>" format.
+                return "\(name): \(taskTitle)"
             }
             if slot.runId != nil {
                 return "\(name) is working"

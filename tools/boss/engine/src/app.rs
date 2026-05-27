@@ -8306,6 +8306,7 @@ mod tests {
                     initial_input: "claude\n".into(),
                     env: vec![],
                     summary: None,
+                    task_title: None,
                 }),
                 Duration::from_millis(50),
             )
@@ -8332,6 +8333,7 @@ mod tests {
                         initial_input: "claude\n".into(),
                         env: vec![],
                         summary: None,
+                        task_title: None,
                     }),
                     Duration::from_secs(2),
                 )
@@ -8435,6 +8437,7 @@ mod tests {
                     initial_input: "claude\n".into(),
                     env: vec![],
                     summary: None,
+                    task_title: None,
                 }),
                 Duration::from_millis(50),
             )
@@ -8461,6 +8464,7 @@ mod tests {
                         initial_input: "claude\n".into(),
                         env: vec![],
                         summary: None,
+                        task_title: None,
                     }),
                     Duration::from_secs(5),
                 )
@@ -8507,6 +8511,7 @@ mod tests {
                 initial_input: "claude\n".into(),
                 env: vec![],
                 summary: None,
+                task_title: None,
             })
         };
 

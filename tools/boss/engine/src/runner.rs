@@ -519,6 +519,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 initial_input,
                 extra_env: vec![],
                 title_summary,
+                task_title: Some(work_item_name(work_item).to_owned()),
                 work_item_binding,
                 model: spawn_config.model.clone(),
                 draft_pr_mode: spawner.draft_pr_mode(),

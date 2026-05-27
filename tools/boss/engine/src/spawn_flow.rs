@@ -81,12 +81,15 @@ pub struct StartWorkerInput {
     /// settings.json template injects (`BOSS_EVENTS_SOCKET`,
     /// `BOSS_LEASE_ID`).
     pub extra_env: Vec<(String, String)>,
-    /// Optional 2–4 word summary to display in the pane titlebar in
-    /// place of the run id. The app keeps the run id available as a
-    /// tooltip; this field is purely visual. `None` means the
-    /// engine had no summary to offer (e.g., generation failed) —
-    /// the app falls back to showing the run id.
+    /// Optional 2–4 word gerund summary to display in the pane
+    /// titlebar (e.g. `"fixing the fencer scraper"`). Set only when
+    /// the engine successfully called Claude to generate the phrase.
+    /// When absent, `task_title` is used for the fallback display.
     pub title_summary: Option<String>,
+    /// Raw work-item title passed alongside `title_summary` so the
+    /// app can render `"<AgentName>: <task_title>"` when no gerund
+    /// summary is available (no API key or generation failed).
+    pub task_title: Option<String>,
     /// Work-item linkage stamped onto the resulting `LiveWorkerState`
     /// so `bossctl agents list` / `agents status` can resolve "the
     /// worker on chore X" without prompting for a slot. `None` from
@@ -290,6 +293,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 initial_input: input.initial_input,
                 env,
                 summary: input.title_summary,
+                task_title: input.task_title,
             }),
             Duration::from_secs(spawn_timeout.as_secs()),
         )
@@ -436,6 +440,7 @@ mod tests {
             initial_input: "claude\n".into(),
             extra_env: vec![],
             title_summary: None,
+            task_title: None,
             work_item_binding: None,
             model: "claude-opus-4-7".into(),
             draft_pr_mode: false,

@@ -49,11 +49,19 @@ pub struct SpawnWorkerPaneInput {
     /// The app renders this under the worker's display name as a
     /// natural-language sentence: `"Riker is fixing the fencer
     /// scraper"`. The full run id is still surfaced as a tooltip for
-    /// traceability. Optional so the app can fall back to displaying
-    /// the run id if the engine couldn't produce a summary (e.g.,
-    /// API key missing or generation failed).
+    /// traceability. Present only when the engine successfully called
+    /// Claude to generate a proper gerund phrase (ANTHROPIC_API_KEY
+    /// was available and the call succeeded). When absent, the app
+    /// uses `task_title` for the fallback format `"Riker: <task>"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Raw work-item title (the task's `name` column), passed for
+    /// display when `summary` is absent (no API key or generation
+    /// failed). The app renders this as `"<AgentName>: <task_title>"`
+    /// — no gerund connector — so the pane header still identifies
+    /// the task without looking grammatically broken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
 }
 
 /// App's reply when allocation succeeds. The slot is dictated by
@@ -227,6 +235,7 @@ mod tests {
                 value: "lease-uuid".into(),
             }],
             summary: Some("fixing the fencer scraper".into()),
+            task_title: None,
         });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("\"slot_id\":3"));
@@ -243,11 +252,31 @@ mod tests {
             initial_input: "claude\n".into(),
             env: vec![],
             summary: None,
+            task_title: None,
         });
         let json = serde_json::to_string(&original).unwrap();
-        // None should not serialize a `summary: null`; it should be
-        // omitted so apps that predate the field continue to parse.
+        // None should not serialize `summary` or `task_title`; they
+        // must be omitted so apps that predate the field continue to parse.
         assert!(!json.contains("summary"));
+        assert!(!json.contains("task_title"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn spawn_request_with_task_title_round_trips() {
+        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
+            run_id: "run-2".into(),
+            workspace_path: "/tmp/ws".into(),
+            slot_id: 2,
+            initial_input: "claude\n".into(),
+            env: vec![],
+            summary: None,
+            task_title: Some("kanban: revision cards render broken".into()),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("task_title"));
+        assert!(!json.contains("\"summary\""));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
