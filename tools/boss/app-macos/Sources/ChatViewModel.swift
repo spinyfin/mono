@@ -2141,7 +2141,13 @@ final class ChatViewModel: ObservableObject {
         }
 
         let grouped = Dictionary(grouping: items) { task in
-            task.isChore ? "Chores" : (projectName(for: task.projectID) ?? "No Project")
+            if task.isChore { return "Chores" }
+            // Chore-parented revisions inherit nil projectID from the chain
+            // root (a chore). Group them with chores so they don't land in
+            // a confusing "No Project" section — they are logically part of
+            // the chore world.
+            if task.kind == "revision", task.projectID == nil { return "Chores" }
+            return projectName(for: task.projectID) ?? "No Project"
         }
 
         return grouped.keys.sorted().compactMap { key in

@@ -130,6 +130,50 @@ final class RevisionKanbanTests: XCTestCase {
         XCTAssertTrue(revisions.isEmpty, "task with no revisions should return empty list")
     }
 
+    // MARK: project grouping
+
+    /// Chore-parented revisions (nil projectID) must appear under the "Chores"
+    /// section in project-grouped mode, not under "No Project".
+    func testChoreParentedRevisionGroupsUnderChores() {
+        let model = makeModel()
+        model.workBoardGrouping = .project
+        let chore = makeChore(id: "chore_c19", status: "active")
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        let sections = model.workSections(in: .doing)
+        let titles = sections.map(\.title)
+        XCTAssertFalse(titles.contains("No Project"),
+                       "chore-parented revision must NOT appear in a 'No Project' section")
+        XCTAssertTrue(titles.contains("Chores"),
+                      "chore-parented revision must appear in the 'Chores' section")
+        let choreSection = sections.first { $0.title == "Chores" }
+        XCTAssertTrue(
+            choreSection?.items.contains { $0.id == revision.id } ?? false,
+            "revision must be in the Chores section"
+        )
+    }
+
+    /// Project-task-parented revisions (with a projectID) must appear under
+    /// their project's section, not under "Chores" or "No Project".
+    func testProjectTaskParentedRevisionGroupsUnderProject() {
+        let model = makeModel()
+        model.workBoardGrouping = .project
+        let revision = makeRevision(status: "todo", seq: 1)
+        model.tasksByProjectID = ["proj_1": [revision]]
+
+        let sections = model.workSections(in: .backlog)
+        let titles = sections.map(\.title)
+        XCTAssertFalse(titles.contains("No Project"),
+                       "project-task-parented revision must NOT land in 'No Project'")
+        XCTAssertFalse(titles.contains("Chores"),
+                       "project-task-parented revision must NOT land in 'Chores'")
+        XCTAssertTrue(titles.contains("Test Project"),
+                      "revision must appear under its parent project's section")
+    }
+
     // MARK: workTask(withID:)
 
     func testWorkTaskWithIDFindsProjectTask() {
