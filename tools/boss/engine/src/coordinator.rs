@@ -4342,7 +4342,7 @@ mod tests {
             spawn_config: Some(crate::effort::SpawnConfig {
                 effort_level: Some(crate::work::EffortLevel::Trivial),
                 claude_effort: Some("low"),
-                model: "claude-sonnet-4-6".to_owned(),
+                model: "haiku".to_owned(),
                 prompt_addendum: None,
             }),
             ..FakeExecutionRunner::default()
@@ -4374,7 +4374,7 @@ mod tests {
             });
         assert_eq!(spawn["effort_level"], "trivial");
         assert_eq!(spawn["claude_effort"], "low");
-        assert_eq!(spawn["model"], "claude-sonnet-4-6");
+        assert_eq!(spawn["model"], "haiku");
         assert_eq!(spawn["prompt_addendum_applied"], false);
     }
 

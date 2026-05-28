@@ -22,9 +22,9 @@ use boss_protocol::EffortLevel;
 /// instrumentation stream regardless of how it was resolved, and
 /// that's only useful if the engine-default branch resolves to an
 /// explicit slug rather than relying on `claude`'s implicit default.
-/// Today this matches what `claude` itself would pick (Opus 4.7);
-/// retune when that drifts.
-pub const ENGINE_DEFAULT_MODEL: &str = "claude-opus-4-7";
+/// Using the `"opus"` family alias means this auto-tracks the latest
+/// Opus snapshot without requiring a code change on each model release.
+pub const ENGINE_DEFAULT_MODEL: &str = "opus";
 
 /// What the row's effort level maps to for `claude --effort`. Note
 /// these are **claude**'s vocabulary, not Boss's — `Trivial` becomes
@@ -44,18 +44,16 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
 ///
-/// `trivial` originally mapped to Haiku 4.5, but Haiku doesn't honour
-/// `--permission-mode auto` or `--dangerously-skip-permissions` on the
-/// corp-laptop CLI build, so trivial worker spawns ended up prompting
-/// for every individual tool call. Sonnet is the next-cheapest model
-/// that runs through the same dispatcher unattended, so trivial rows
-/// fall back to Sonnet here. Direct-API summarization
-/// (see [`crate::live_status::SUMMARY_MODEL`]) still uses Haiku — that
-/// path doesn't go through the worker CLI.
+/// Family aliases (`"haiku"`, `"sonnet"`, `"opus"`) are used so the
+/// engine auto-tracks the latest snapshot per family without requiring
+/// a code change on each model release. Direct-API summarization
+/// (see [`crate::live_status::SUMMARY_MODEL`]) still uses a pinned
+/// model — that path doesn't go through the worker CLI.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
-        EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "claude-sonnet-4-6",
-        EffortLevel::Large | EffortLevel::Max => "claude-opus-4-7",
+        EffortLevel::Trivial => "haiku",
+        EffortLevel::Small | EffortLevel::Medium => "sonnet",
+        EffortLevel::Large | EffortLevel::Max => "opus",
     }
 }
 
@@ -400,17 +398,17 @@ mod tests {
     #[test]
     fn effort_level_alone_picks_level_default_model() {
         let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
-        assert_eq!(trivial.model, "claude-sonnet-4-6");
+        assert_eq!(trivial.model, "haiku");
         assert_eq!(trivial.claude_effort, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
         let small = resolve_spawn_config(Some(EffortLevel::Small), None, None);
-        assert_eq!(small.model, "claude-sonnet-4-6");
+        assert_eq!(small.model, "sonnet");
         assert_eq!(small.claude_effort, Some("medium"));
         assert_eq!(small.prompt_addendum, None);
 
         let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None);
-        assert_eq!(medium.model, "claude-sonnet-4-6");
+        assert_eq!(medium.model, "sonnet");
         assert_eq!(medium.claude_effort, Some("high"));
         assert!(
             medium.prompt_addendum.unwrap().starts_with("Sketch"),
@@ -418,12 +416,12 @@ mod tests {
         );
 
         let large = resolve_spawn_config(Some(EffortLevel::Large), None, None);
-        assert_eq!(large.model, "claude-opus-4-7");
+        assert_eq!(large.model, "opus");
         assert_eq!(large.claude_effort, Some("xhigh"));
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None);
-        assert_eq!(max.model, "claude-opus-4-7");
+        assert_eq!(max.model, "opus");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
@@ -458,7 +456,7 @@ mod tests {
         // tolerates the looser shape so a hand-edited DB row doesn't
         // produce `claude --model ""`.
         let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None);
-        assert_eq!(cfg.model, "claude-opus-4-7");
+        assert_eq!(cfg.model, "opus");
     }
 
     #[test]
@@ -468,7 +466,7 @@ mod tests {
         let cfg = resolve_spawn_config(None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model claude-opus-4-7 --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
@@ -501,7 +499,7 @@ mod tests {
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model claude-sonnet-4-6 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model haiku --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 

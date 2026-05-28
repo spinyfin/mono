@@ -21,7 +21,7 @@ use boss_protocol::{
 /// has yet reported one — this is the model the launcher *asked* for,
 /// surfaced so the UI can render the real model name immediately
 /// instead of "Claude Unknown".
-pub const DEFAULT_LAUNCH_MODEL: &str = "claude-opus-4-7";
+pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]

@@ -2945,11 +2945,10 @@ mod pane_spawn_tests {
     }
 
     /// Smoke test for the design-spec acceptance criterion: a
-    /// `trivial` row dispatches with `--model claude-sonnet-4-6
-    /// --effort low` and no prompt addendum. (Trivial originally
-    /// mapped to Haiku, but Haiku doesn't honour the unattended-permission
-    /// flags on every CLI build, so trivial rows now fall through to
-    /// Sonnet — see [`crate::effort::default_model_for_level`].)
+    /// `trivial` row dispatches with `--model haiku --effort low`
+    /// and no prompt addendum. The `"haiku"` family alias auto-tracks
+    /// the latest Haiku snapshot — see
+    /// [`crate::effort::default_model_for_level`].
     #[tokio::test]
     async fn trivial_row_spawn_uses_sonnet_at_low_effort() {
         let workspace = TempDir::new().unwrap();
@@ -2973,8 +2972,8 @@ mod pane_spawn_tests {
         assert!(
             input
                 .initial_input
-                .contains("--model claude-sonnet-4-6"),
-            "trivial row must spawn Sonnet, got: {:?}",
+                .contains("--model haiku"),
+            "trivial row must spawn Haiku, got: {:?}",
             input.initial_input,
         );
         assert!(
@@ -2984,12 +2983,12 @@ mod pane_spawn_tests {
         );
         assert!(
             input.initial_input.contains("--dangerously-skip-permissions"),
-            "trivial row (Sonnet, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
+            "trivial row (Haiku, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
             input.initial_input,
         );
         assert!(
             !input.initial_input.contains("--permission-mode"),
-            "trivial row (Sonnet, non-Opus) must NOT carry --permission-mode, got: {:?}",
+            "trivial row (Haiku, non-Opus) must NOT carry --permission-mode, got: {:?}",
             input.initial_input,
         );
 
@@ -3083,7 +3082,7 @@ mod pane_spawn_tests {
         let input = spawner.spawn_input();
 
         assert!(
-            input.initial_input.contains("--model claude-opus-4-7"),
+            input.initial_input.contains("--model opus"),
             "large row must spawn Opus, got: {:?}",
             input.initial_input,
         );
@@ -3229,7 +3228,7 @@ mod pane_spawn_tests {
             .expect("PaneSpawnRunner should always populate spawn_config");
         assert_eq!(spawn.effort_level, Some(EffortLevel::Trivial));
         assert_eq!(spawn.claude_effort, Some("low"));
-        assert_eq!(spawn.model, "claude-sonnet-4-6");
+        assert_eq!(spawn.model, "haiku");
         assert_eq!(spawn.prompt_addendum, None);
     }
 
