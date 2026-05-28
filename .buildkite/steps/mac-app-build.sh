@@ -49,7 +49,7 @@ PLIST_EOF
   ar rcs "${XCFW}/macos-arm64/GhosttyKit.a" /tmp/ghosttykit_stub.o
 fi
 
-bazel build //tools/boss/app-macos/... //tools/boss/installer/...
-bazel test --test_output=errors //tools/boss/app-macos:BossTests
+bazel build --config=ci-linux-disk-cache //tools/boss/app-macos/... //tools/boss/installer/...
+bazel test --config=ci-linux-disk-cache --test_output=errors //tools/boss/app-macos:BossTests
 
 echo "[mac-app-build] ok"

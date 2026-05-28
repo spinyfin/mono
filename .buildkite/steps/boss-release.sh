@@ -259,7 +259,7 @@ BUILD_FLAGS=(
 )
 
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"
-bazel build "${BUILD_FLAGS[@]}" //tools/boss/app-macos:Boss
+bazel build --config=ci-linux-disk-cache "${BUILD_FLAGS[@]}" //tools/boss/app-macos:Boss
 
 # Discover the actual zip output path via cquery, using the SAME BUILD_FLAGS so
 # the resolved path matches the configuration we just built (see note above).
