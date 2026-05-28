@@ -1660,6 +1660,8 @@ struct WorkBoardCardView: View {
     /// in the Designs viewer).
     var onDepBadgeHover: ((Bool) -> Void)? = nil
 
+    @State private var isHovered: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if task.kind == "revision", let seq = task.revisionSeq {
@@ -1884,12 +1886,18 @@ struct WorkBoardCardView: View {
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(cardBackground)
+                .brightness(isHovered && !isSelected ? 0.04 : 0)
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(borderColor, lineWidth: isSelected ? 2 : 1)
                 )
         )
         .draggable(task.id)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovered = hovering
+            }
+        }
     }
 
     /// The footer renders the priority chip on every card so a glance
