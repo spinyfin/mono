@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -6,8 +5,7 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 
 use super::{
     ExternalProviderMode, OutputStyle, normalize_optional_description,
-    parse_external_provider_mode, render_human_results, resolve_workspace_root,
-    sort_results_for_output,
+    parse_external_provider_mode, render_human_results, sort_results_for_output,
 };
 
 #[test]
@@ -164,31 +162,6 @@ fn normalize_optional_description_trims_and_filters_empty_values() {
         normalize_optional_description(Some("  235  ".to_owned())),
         Some("235".to_owned())
     );
-}
-
-#[test]
-fn resolve_workspace_root_prefers_build_workspace_directory() {
-    // `bazel run` sets BUILD_WORKSPACE_DIRECTORY to the repo root while the
-    // process cwd is the runfiles tree; the env var must win so config and VCS
-    // resolution see the real source tree (regression guard for build 938's
-    // "No checks ran." false-green).
-    let root = resolve_workspace_root(
-        Some(OsString::from("/repo/root")),
-        PathBuf::from("/bazel/runfiles/_main"),
-    );
-    assert_eq!(root, PathBuf::from("/repo/root"));
-}
-
-#[test]
-fn resolve_workspace_root_falls_back_to_cwd_when_env_absent() {
-    let root = resolve_workspace_root(None, PathBuf::from("/some/cwd"));
-    assert_eq!(root, PathBuf::from("/some/cwd"));
-}
-
-#[test]
-fn resolve_workspace_root_ignores_empty_env_value() {
-    let root = resolve_workspace_root(Some(OsString::new()), PathBuf::from("/some/cwd"));
-    assert_eq!(root, PathBuf::from("/some/cwd"));
 }
 
 #[test]

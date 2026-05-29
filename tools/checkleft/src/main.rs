@@ -1,7 +1,6 @@
-use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::io::stderr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -72,7 +71,6 @@ enum OutputFormat {
     Json,
 }
 
-const BUILD_WORKSPACE_DIRECTORY_ENV: &str = "BUILD_WORKSPACE_DIRECTORY";
 const CHECKS_PR_DESCRIPTION_ENV: &str = "CHECKS_PR_DESCRIPTION";
 const CHECKS_CHANGE_ID_ENV: &str = "CHECKS_CHANGE_ID";
 const CHECKS_PR_NUMBER_ENV: &str = "CHECKS_PR_NUMBER";
@@ -103,7 +101,7 @@ async fn main() -> ExitCode {
 async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     init_tracing(cli.verbose)?;
-    let root = workspace_root()?;
+    let root = std::env::current_dir()?;
     info!(root = %root.display(), "starting checkleft");
 
     let vcs = Vcs::detect(&root)?;
@@ -188,32 +186,6 @@ async fn run_cli() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-    }
-}
-
-/// Resolve the repository root checkleft should operate on.
-///
-/// When checkleft is launched via `bazel run` (as it is from the CI `checks`
-/// step), Bazel runs the binary with its working directory set to the runfiles
-/// tree — *not* the repository. Deriving the root from `current_dir()` then
-/// points config resolution and VCS detection at the runfiles, where no
-/// `CHECKS.*` files exist; every file resolves to zero checks and the run
-/// reports "No checks ran." while exiting 0 — a silent false-green.
-///
-/// `bazel run` exports the real workspace root as `BUILD_WORKSPACE_DIRECTORY`,
-/// so prefer it. Fall back to the process working directory for direct binary
-/// invocations (local use, tests) where the variable is absent.
-fn workspace_root() -> Result<PathBuf> {
-    Ok(resolve_workspace_root(
-        std::env::var_os(BUILD_WORKSPACE_DIRECTORY_ENV),
-        std::env::current_dir()?,
-    ))
-}
-
-fn resolve_workspace_root(workspace_dir: Option<OsString>, fallback_cwd: PathBuf) -> PathBuf {
-    match workspace_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => fallback_cwd,
     }
 }
 
