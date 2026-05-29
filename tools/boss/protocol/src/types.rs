@@ -1054,6 +1054,8 @@ pub enum WorkItem {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateProductInput {
     pub name: String,
     pub description: Option<String>,
@@ -1144,6 +1146,8 @@ pub struct CreateTaskInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateChoreInput {
     pub product_id: String,
     pub name: String,
@@ -1155,6 +1159,7 @@ pub struct CreateChoreInput {
     /// clients that omit this field get the historical behavior
     /// (`autostart = true`).
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`).
@@ -1178,6 +1183,7 @@ pub struct CreateChoreInput {
     pub model_override: Option<String>,
     /// See [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
 }
 
@@ -1245,6 +1251,8 @@ pub struct SetTaskInvestigationDocInput {
 /// inherited from the parent at create time; `repo_remote_url` is likewise
 /// inherited so the revision always targets the parent's repo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateRevisionInput {
     /// The task whose PR this revision will commit to. Must refer to a task
     /// (or chain of revisions) with an open, unmerged PR. May itself be a
@@ -1276,6 +1284,7 @@ pub struct CreateRevisionInput {
     /// Bypass the recent-duplicate guard. See
     /// [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
     /// Surface that filed this revision — `"operator"` for Source A
     /// (direct boss-operator feedback); `"pr-comment:<repo>#<pr>:<cid>"`
@@ -1306,6 +1315,8 @@ pub struct CreateManyChoresInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateExecutionInput {
     pub work_item_id: String,
     pub kind: String,
@@ -1323,6 +1334,7 @@ pub struct CreateExecutionInput {
     /// workspace if the preferred workspace is gone or leased. Used for
     /// `revision_implementation` executions where warmth is a hint only.
     #[serde(default)]
+    #[builder(default)]
     pub prefer_is_soft: bool,
     /// PR URL to bind to this execution row at creation time. For
     /// `revision_implementation` this is the chain root's `pr_url` so
