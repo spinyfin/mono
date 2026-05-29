@@ -13,7 +13,10 @@ exports_files([
 swift_library(
     name = "boss_mac_app_lib",
     module_name = "Boss",
-    srcs = glob(["Sources/**/*.swift"]),
+    srcs = glob(
+        ["Sources/**/*.swift"],
+        exclude = ["Sources/Update/**/*.swift"],
+    ),
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
@@ -29,6 +32,7 @@ swift_library(
         "-strict-concurrency=complete",
     ],
     deps = [
+        "//tools/boss/app-macos/Sources/Update:UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],

@@ -15,13 +15,19 @@ let package = Package(
             name: "GhosttyKit",
             path: "ThirdParty/GhosttyKit.xcframework"
         ),
+        .target(
+            name: "UpdateCore",
+            path: "Sources/Update"
+        ),
         .executableTarget(
             name: "Boss",
             dependencies: [
                 .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
+                "UpdateCore",
             ],
             path: "Sources",
+            exclude: ["Update"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
@@ -40,6 +46,11 @@ let package = Package(
             name: "BossTests",
             dependencies: ["Boss"],
             path: "Tests/BossTests"
+        ),
+        .testTarget(
+            name: "UpdateTests",
+            dependencies: ["UpdateCore"],
+            path: "Tests/UpdateTests"
         ),
     ]
 )
