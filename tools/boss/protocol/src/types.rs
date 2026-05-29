@@ -1675,6 +1675,72 @@ pub struct LinkExternalRefInput {
     pub canonical_id: String,
 }
 
+/// Display-safe GitHub OAuth auth state pushed from the engine to the UI.
+/// The token itself is never included — only fields safe to render.
+///
+/// Matches the state machine in the OAuth device-flow design (§3):
+/// `Disconnected → RequestingCode → PendingUserAuth → Authorized/Expired/Denied/Error`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GitHubAuthStateDto {
+    /// No stored token; no flow in progress.
+    Disconnected,
+    /// Device code is being requested from GitHub's `/login/device/code`.
+    RequestingCode,
+    /// Device code obtained. The user must type `user_code` at
+    /// `verification_uri` (or `verification_uri_complete` if present) to
+    /// authorize. The engine is polling.
+    PendingUserAuth {
+        user_code: String,
+        verification_uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification_uri_complete: Option<String>,
+        /// Unix epoch seconds when the device code expires.
+        expires_at: i64,
+        interval_seconds: u32,
+    },
+    /// Token obtained, validated, and stored. `granted_scopes` is what
+    /// GitHub actually granted (may differ from what was requested).
+    Authorized {
+        login: String,
+        granted_scopes: Vec<String>,
+        org_state: OrgAuthState,
+    },
+    /// The device code expired before the user completed authorization.
+    /// The user must restart the flow.
+    Expired,
+    /// The user denied the authorization request in the browser.
+    Denied,
+    /// A non-recoverable error occurred during the flow.
+    Error {
+        message: String,
+    },
+}
+
+/// Sub-state of `GitHubAuthStateDto::Authorized` that reflects whether the
+/// stored token can actually reach private org resources. A valid user token
+/// may still be blocked by org approval or SAML SSO requirements.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OrgAuthState {
+    /// Token can read the org's private resources. Sync should work.
+    Ok,
+    /// The OAuth App has not yet been approved by an org owner. Sync
+    /// against private org resources will fail. `request_url` is the
+    /// org-owner approval / request page.
+    NeedsOrgApproval {
+        request_url: String,
+    },
+    /// The token requires SAML SSO authorization for the org. `sso_url`
+    /// is the SSO authorization URL from GitHub's `X-GitHub-SSO` header.
+    NeedsSso {
+        sso_url: String,
+    },
+    /// Org auth state could not be determined (probe failed for an
+    /// unexpected reason). Sync may or may not work.
+    Unknown,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2575,5 +2641,170 @@ mod tests {
         }
         let back: CiRemediation = serde_json::from_value(encoded).unwrap();
         assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_disconnected_roundtrips() {
+        let state = GitHubAuthStateDto::Disconnected;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "disconnected");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_requesting_code_roundtrips() {
+        let state = GitHubAuthStateDto::RequestingCode;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "requesting_code");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_pending_user_auth_roundtrips() {
+        let state = GitHubAuthStateDto::PendingUserAuth {
+            user_code: "WDJB-MJHT".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            verification_uri_complete: Some(
+                "https://github.com/login/device?user_code=WDJB-MJHT".into(),
+            ),
+            expires_at: 1_748_000_000,
+            interval_seconds: 5,
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "pending_user_auth");
+        assert_eq!(raw["user_code"], "WDJB-MJHT");
+        assert_eq!(raw["interval_seconds"], 5);
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_pending_user_auth_skips_none_complete_uri() {
+        let state = GitHubAuthStateDto::PendingUserAuth {
+            user_code: "WDJB-MJHT".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            verification_uri_complete: None,
+            expires_at: 1_748_000_000,
+            interval_seconds: 5,
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert!(!raw.as_object().unwrap().contains_key("verification_uri_complete"));
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_authorized_roundtrips() {
+        let state = GitHubAuthStateDto::Authorized {
+            login: "octocat".into(),
+            granted_scopes: vec!["repo".into(), "project".into()],
+            org_state: OrgAuthState::Ok,
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "authorized");
+        assert_eq!(raw["login"], "octocat");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_expired_roundtrips() {
+        let state = GitHubAuthStateDto::Expired;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "expired");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_denied_roundtrips() {
+        let state = GitHubAuthStateDto::Denied;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "denied");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_error_roundtrips() {
+        let state = GitHubAuthStateDto::Error {
+            message: "network error fetching device code".into(),
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "error");
+        assert_eq!(raw["message"], "network error fetching device code");
+        let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn org_auth_state_ok_roundtrips() {
+        let state = OrgAuthState::Ok;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "ok");
+        let back: OrgAuthState = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn org_auth_state_needs_org_approval_roundtrips() {
+        let state = OrgAuthState::NeedsOrgApproval {
+            request_url: "https://github.com/orgs/spinyfin/policies/applications".into(),
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "needs_org_approval");
+        assert_eq!(
+            raw["request_url"],
+            "https://github.com/orgs/spinyfin/policies/applications"
+        );
+        let back: OrgAuthState = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn org_auth_state_needs_sso_roundtrips() {
+        let state = OrgAuthState::NeedsSso {
+            sso_url: "https://github.com/orgs/spinyfin/sso".into(),
+        };
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "needs_sso");
+        assert_eq!(raw["sso_url"], "https://github.com/orgs/spinyfin/sso");
+        let back: OrgAuthState = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn org_auth_state_unknown_roundtrips() {
+        let state = OrgAuthState::Unknown;
+        let raw = serde_json::to_value(&state).unwrap();
+        assert_eq!(raw["type"], "unknown");
+        let back: OrgAuthState = serde_json::from_value(raw).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn github_auth_state_dto_authorized_with_org_states_roundtrips() {
+        let states = vec![
+            OrgAuthState::Ok,
+            OrgAuthState::NeedsOrgApproval {
+                request_url: "https://example.com/approve".into(),
+            },
+            OrgAuthState::NeedsSso {
+                sso_url: "https://example.com/sso".into(),
+            },
+            OrgAuthState::Unknown,
+        ];
+        for org_state in states {
+            let auth = GitHubAuthStateDto::Authorized {
+                login: "user".into(),
+                granted_scopes: vec!["repo".into()],
+                org_state: org_state.clone(),
+            };
+            let raw = serde_json::to_value(&auth).unwrap();
+            let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
+            assert_eq!(auth, back);
+        }
     }
 }

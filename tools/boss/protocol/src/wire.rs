@@ -7,8 +7,8 @@ use crate::types::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
-    EngineAttemptListEntry, LinkExternalRefInput, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task,
     TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
@@ -812,6 +812,22 @@ pub enum FrontendRequest {
     Shutdown {
         token: String,
     },
+    /// Begin the GitHub OAuth device-flow authorization for github.com.
+    /// The engine starts the flow, requests a device code, and pushes
+    /// [`FrontendEvent::GitHubAuthState`] events as the flow advances.
+    /// If a flow is already in progress this is a no-op.
+    GitHubAuthStart,
+    /// Abort an in-progress device-flow authorization. The engine
+    /// stops the poll loop and transitions to `Disconnected`. No-op
+    /// if no flow is in progress.
+    GitHubAuthCancel,
+    /// Delete the stored OAuth token and return to `Disconnected`.
+    /// The deletion is local only (no server-side revocation).
+    GitHubAuthDisconnect,
+    /// Request the current GitHub auth state. The engine replies
+    /// immediately with a [`FrontendEvent::GitHubAuthState`] push
+    /// reflecting the latest known state.
+    GitHubAuthStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1465,6 +1481,13 @@ pub enum FrontendEvent {
     /// human string.
     ShutdownRejected {
         reason: String,
+    },
+    /// Pushed whenever the GitHub OAuth auth state changes — in
+    /// response to [`FrontendRequest::GitHubAuthStatus`] and
+    /// proactively as the device-flow poll loop advances. The UI
+    /// renders whatever state the engine pushes without polling.
+    GitHubAuthState {
+        state: GitHubAuthStateDto,
     },
 }
 
