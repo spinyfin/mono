@@ -127,8 +127,8 @@ struct ContentView: View {
             model.asyncMarkdownViewerOpener = { [openWindow] in
                 openWindow(id: "async-markdown-viewer")
             }
-            model.reviewTerminalOpener = { [openWindow] content in
-                openWindow(id: "review-terminal", value: content)
+            model.reviewTerminalOpener = { [openWindow] in
+                openWindow(id: "review-terminal")
             }
             model.startIfNeeded()
         }
