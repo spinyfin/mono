@@ -74,13 +74,15 @@ pub use boss_protocol::{
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
     EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult,
-    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
-    RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
-    is_known_created_via,
+    ListDependenciesInput, MagicWandDispatch, MAGIC_WAND_STATUS_APPLIED,
+    MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED,
+    MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED, PrWorkItemMatch, Product, Project,
+    ProjectDesignDocState, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
+    WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses

@@ -2548,6 +2548,57 @@ pub struct ResolvedComment {
     pub resolution: CommentResolution,
 }
 
+// --- Magic-wand dispatch (Phase 3: engine-owned docs) ---
+
+/// `magic_wand_dispatches.status` values.
+pub const MAGIC_WAND_STATUS_IN_FLIGHT: &str = "in_flight";
+pub const MAGIC_WAND_STATUS_RETURNED: &str = "returned";
+pub const MAGIC_WAND_STATUS_APPLIED: &str = "applied";
+pub const MAGIC_WAND_STATUS_DISCARDED: &str = "discarded";
+pub const MAGIC_WAND_STATUS_CONFLICT: &str = "conflict";
+pub const MAGIC_WAND_STATUS_FAILED: &str = "failed";
+
+/// An engine-persisted magic-wand dispatch row (`magic_wand_dispatches` table).
+/// Records the one-shot specialised Claude call dispatched when the user clicks
+/// the magic-wand button on a comment against a work-item description (Phase 3
+/// of comments-in-markdown-viewer.md). 12 fields → builder pattern per project
+/// convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct MagicWandDispatch {
+    pub id: String,
+    pub comment_id: String,
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    /// The `doc_version` from the comment — the plain-text-projection SHA the
+    /// dispatch ran against. Used as the CAS value on Apply.
+    pub doc_version: String,
+    /// `in_flight` | `returned` | `applied` | `discarded` | `conflict` | `failed`
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    /// The proposed updated markdown. `None` until the dispatch completes
+    /// successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_md: Option<String>,
+    /// Short error classification (`length_sanity` | `diff_sanity` | `api_error`
+    /// | `empty_response`). `None` on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    /// True when the model returned a result but the highlighted anchor text is
+    /// absent from the result AND wholesale changes occurred elsewhere. Surfaced
+    /// as a warning in the preview sheet; the user decides whether to apply.
+    #[serde(default)]
+    #[builder(default)]
+    pub anchor_warning: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

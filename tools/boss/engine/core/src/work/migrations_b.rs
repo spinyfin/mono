@@ -1007,6 +1007,35 @@ pub(crate) fn migrate_ci_remediations_revision_task_id(conn: &Connection) -> Res
     Ok(())
 }
 
+/// Create the `magic_wand_dispatches` table for Phase 3 of
+/// comments-in-markdown-viewer. Each row records one specialised Claude call
+/// dispatched when the user clicks the magic-wand button on a comment against
+/// a work-item description. Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`.
+/// Design: `tools/boss/docs/designs/comments-in-markdown-viewer.md`
+/// § Engine schema (magic_wand_dispatches).
+pub(crate) fn migrate_magic_wand_dispatches_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS magic_wand_dispatches (
+             id            TEXT PRIMARY KEY,
+             comment_id    TEXT NOT NULL REFERENCES work_comments(id),
+             artifact_kind TEXT NOT NULL,
+             artifact_id   TEXT NOT NULL,
+             doc_version   TEXT NOT NULL,
+             status        TEXT NOT NULL,
+             input_tokens  INTEGER,
+             output_tokens INTEGER,
+             result_md     TEXT,
+             error_kind    TEXT,
+             anchor_warning INTEGER NOT NULL DEFAULT 0,
+             created_at    TEXT NOT NULL,
+             resolved_at   TEXT
+         );
+         CREATE INDEX IF NOT EXISTS magic_wand_dispatches_by_comment
+             ON magic_wand_dispatches(comment_id, created_at);",
+    )?;
+    Ok(())
+}
+
 /// Create the `work_comments` table for the comments-in-markdown-viewer
 /// feature (Phase 2). Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`,
 /// safe to re-run on every engine start. Schema follows design
