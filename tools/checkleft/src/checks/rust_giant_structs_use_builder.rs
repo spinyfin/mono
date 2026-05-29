@@ -128,9 +128,8 @@ impl ConfiguredCheck for ParsedConfig {
                         column: Some(1),
                     }),
                     remediation: Some(format!(
-                        "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct. \
-                        To permanently exempt a file for grandfathering, add it to `exclude_globs` in the relevant `CHECKS.toml`. \
-                        For a one-off PR exception use `BYPASS_RUST_GIANT_STRUCTS_USE_BUILDER=<reason>` in the PR description (requires `allow_bypass = true` in policy).",
+                        "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.\n\
+                        Permanently exempt a file by adding it to `exclude_globs` in `CHECKS.toml`.",
                         self.builder.crate_name(),
                     )),
                     suggested_fix: None,
