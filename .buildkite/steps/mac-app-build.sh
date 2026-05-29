@@ -8,6 +8,11 @@ set -euo pipefail
 echo "--- [mac-app-build] starting"
 echo "[mac-app-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
+# Pin the Apple toolchain autoconfig to the live Xcode so an in-place Xcode/OS
+# upgrade invalidates @local_config_apple_cc / @local_config_xcode instead of
+# reusing a stale SDK (which fails BossTests with TEST EXECUTE FAILED — build 904).
+source "$(dirname "${BASH_SOURCE[0]}")/xcode-env.sh"
+
 # rules_swift_package_manager's swift_deps module extension runs
 # `swift package describe` during every Bazel analysis.  The Package.swift
 # declares a .binaryTarget(path: "ThirdParty/GhosttyKit.xcframework") for

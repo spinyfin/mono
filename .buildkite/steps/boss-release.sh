@@ -23,6 +23,10 @@ log "[boss-release] starting"
 echo "[boss-release] agent: $(uname -a)"
 echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
+# Pin the Apple toolchain autoconfig to the live Xcode (see xcode-env.sh) so this
+# macOS-agent step re-detects after an in-place Xcode/OS upgrade.
+source "$(dirname "${BASH_SOURCE[0]}")/xcode-env.sh"
+
 # ── resolve last released tag (all trigger paths) ────────────────────────────
 # Always resolve the last boss-v* tag and its commit SHA.  Both the
 # idempotency guard (below) and the cron change-detection block need them,
