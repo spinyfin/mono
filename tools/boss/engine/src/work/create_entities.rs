@@ -234,9 +234,23 @@ impl WorkDb {
                 }
                 Some(p) => p.to_owned(),
             };
-            let repo = input
+            // When the caller omits --repo, resolve from the product's docs_repo,
+            // then the task's own repo_remote_url, then the product's repo_remote_url.
+            // Storing a resolved value avoids relying on read-time fallback logic for
+            // newly written pointers.
+            let repo = if let Some(r) = input
                 .investigation_doc_repo_remote_url
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+            {
+                Some(r)
+            } else {
+                let product = query_product(&conn, &task.product_id)?;
+                product
+                    .as_ref()
+                    .and_then(|p| p.docs_repo.clone())
+                    .or_else(|| task.repo_remote_url.clone())
+                    .or_else(|| product.as_ref().and_then(|p| p.repo_remote_url.clone()))
+            };
             let branch = input.investigation_doc_branch.filter(|s| !s.is_empty());
             conn.execute(
                 "UPDATE tasks

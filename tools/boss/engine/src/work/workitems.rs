@@ -296,6 +296,28 @@ impl WorkDb {
         // not stored columns — so they are calculated fresh here.
         let tasks = attach_revision_projections(tasks, &chores);
 
+        // For investigation tasks whose doc pointer was registered without an
+        // explicit repo URL (--repo omitted), resolve the repo from the
+        // product's `docs_repo`, then the task's own `repo_remote_url`, then
+        // the product's `repo_remote_url`. This covers records written before
+        // `set_task_investigation_doc` began resolving the repo at write time.
+        let tasks = tasks
+            .into_iter()
+            .map(|mut t| {
+                if t.kind == "investigation"
+                    && t.investigation_doc_path.is_some()
+                    && t.investigation_doc_repo_remote_url.is_none()
+                {
+                    t.investigation_doc_repo_remote_url = product
+                        .docs_repo
+                        .clone()
+                        .or_else(|| t.repo_remote_url.clone())
+                        .or_else(|| product.repo_remote_url.clone());
+                }
+                t
+            })
+            .collect::<Vec<_>>();
+
         Ok(WorkTree {
             product,
             projects,
@@ -405,11 +427,11 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
-                map_task_with_parent,
+                map_task_with_parent_and_investigation_doc,
             )
             .optional()?
         {
