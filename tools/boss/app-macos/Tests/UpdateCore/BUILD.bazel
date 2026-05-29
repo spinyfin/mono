@@ -14,6 +14,6 @@ swift_library(
     module_name = "UpdateTests",
     srcs = glob(["*.swift"]),
     copts = [],
-    deps = ["//tools/boss/app-macos/Sources/Update:UpdateCore"],
+    deps = ["//tools/boss/app-macos/Sources/UpdateCore:UpdateCore"],
     testonly = True,
 )

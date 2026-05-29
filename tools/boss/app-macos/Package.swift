@@ -17,7 +17,7 @@ let package = Package(
         ),
         .target(
             name: "UpdateCore",
-            path: "Sources/Update"
+            path: "Sources/UpdateCore"
         ),
         .executableTarget(
             name: "Boss",
@@ -27,7 +27,7 @@ let package = Package(
                 "UpdateCore",
             ],
             path: "Sources",
-            exclude: ["Update"],
+            exclude: ["UpdateCore"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
@@ -50,7 +50,7 @@ let package = Package(
         .testTarget(
             name: "UpdateTests",
             dependencies: ["UpdateCore"],
-            path: "Tests/UpdateTests"
+            path: "Tests/UpdateCore"
         ),
     ]
 )
