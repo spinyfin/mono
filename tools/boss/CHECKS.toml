@@ -4,7 +4,11 @@ id = "rust-giant-structs-use-builder"
 [checks.config]
 builder = "bon"
 # Grandfathered files containing structs with 6+ named fields and no bon::Builder.
-# TODO: Convert each listed struct to use bon::Builder and remove the file from this list.
+# `exclude_globs` skips the WHOLE file, so a new giant struct added to one of these
+# files is never examined. Prefer `exclude_structs` (below) for ordinary grandfathering:
+# it keeps the file in scope and exempts only the named legacy structs, so new
+# violators are still caught. Migrate files off this list onto `exclude_structs`.
+# TODO: Convert each listed struct to use bon::Builder and shrink both lists to empty.
 exclude_globs = [
   "tools/boss/bossctl/src/main.rs",
   "tools/boss/cli/src/main.rs",
@@ -31,8 +35,42 @@ exclude_globs = [
   "tools/boss/protocol/src/engine_app.rs",
   "tools/boss/protocol/src/live_status_debug.rs",
   "tools/boss/protocol/src/live_worker_state.rs",
-  "tools/boss/protocol/src/types.rs",
   "tools/boss/protocol/src/wire.rs",
+]
+# Grandfathered struct NAMES. The file is still scanned, so any NEW giant struct added
+# alongside these is flagged. `tools/boss/protocol/src/types.rs` was migrated here off
+# `exclude_globs` so that new input/row types added to it (e.g. CreateAttentionInput)
+# are caught. TODO: convert these to #[derive(bon::Builder)] and remove them.
+#
+# Entry forms:
+#   "StructName"                   — simple name, scoped to this CHECKS.toml's subtree
+#                                    (tools/boss/). A same-named struct elsewhere in the
+#                                    repo is NOT exempted.
+#   "relative/path.rs::StructName" — qualified, resolved relative to this file's directory.
+#                                    Exempts that struct only in that exact file.
+exclude_structs = [
+  # tools/boss/protocol/src/types.rs
+  "WorkItemExternalRef",
+  "WorkRun",
+  "WorkAttentionItem",
+  "EffortEscalation",
+  "EffortAuditMarkerRow",
+  "EffortAuditReport",
+  "ConflictResolution",
+  "CiRemediation",
+  "CiBudgetSnapshot",
+  "EngineAttemptListEntry",
+  "WorkTree",
+  "CreateProductInput",
+  "CreateProjectInput",
+  "CreateTaskInput",
+  "CreateChoreInput",
+  "CreateInvestigationInput",
+  "CreateRevisionInput",
+  "CreateExecutionInput",
+  "CreateRunInput",
+  "CreateAttentionItemInput",
+  "WorkItemPatch",
 ]
 
 [checks.policy]

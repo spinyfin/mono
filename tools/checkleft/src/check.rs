@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -19,6 +20,17 @@ pub trait Check: Send + Sync {
     fn description(&self) -> &str;
 
     fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>>;
+
+    /// Like `configure`, but also passes the CHECKS.toml directory (repo-root-relative).
+    /// Checks that need to scope exclusions to the config subtree should override this.
+    /// The default delegates to `configure`, ignoring the scope.
+    fn configure_scoped(
+        &self,
+        config: &toml::Value,
+        _config_dir: Option<&Path>,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        self.configure(config)
+    }
 
     async fn run(
         &self,
