@@ -76,27 +76,38 @@ pub(crate) struct GhResponse {
 #[async_trait]
 pub(crate) trait GhRunner: Send + Sync {
     /// Run `gh api graphql -f query=<query> -F k=v ...` and return parsed JSON.
+    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
     async fn graphql(
         &self,
         query: &str,
         vars: &[(&str, &str)],
+        token: Option<&str>,
     ) -> std::result::Result<Value, GhRunnerError>;
 
     /// Run `gh api <path>` (GET) and return parsed JSON body.
-    async fn rest_get(&self, path: &str) -> std::result::Result<GhResponse, GhRunnerError>;
+    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
+    async fn rest_get(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<GhResponse, GhRunnerError>;
 
     /// Run `gh api -X PATCH <path> -f k=v ...` and return parsed JSON body.
+    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
     async fn rest_patch(
         &self,
         path: &str,
         fields: &[(&str, &str)],
+        token: Option<&str>,
     ) -> std::result::Result<GhResponse, GhRunnerError>;
 
     /// Run `gh api -X POST <path> --input -` with a JSON body and return parsed JSON body.
+    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
     async fn rest_post(
         &self,
         path: &str,
         body: &serde_json::Value,
+        token: Option<&str>,
     ) -> std::result::Result<GhResponse, GhRunnerError>;
 }
 
@@ -123,8 +134,12 @@ impl GhRunner for CommandGhRunner {
         &self,
         query: &str,
         vars: &[(&str, &str)],
+        token: Option<&str>,
     ) -> std::result::Result<Value, GhRunnerError> {
         let mut cmd = Command::new("gh");
+        if let Some(t) = token {
+            cmd.env("GH_TOKEN", t);
+        }
         cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
         for (k, v) in vars {
             cmd.args(["-F", &format!("{k}={v}")]);
@@ -151,8 +166,16 @@ impl GhRunner for CommandGhRunner {
             .map_err(|e| GhRunnerError::transient(format!("failed to parse graphql response: {e}")))
     }
 
-    async fn rest_get(&self, path: &str) -> std::result::Result<GhResponse, GhRunnerError> {
-        let output = Command::new("gh")
+    async fn rest_get(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<GhResponse, GhRunnerError> {
+        let mut cmd = Command::new("gh");
+        if let Some(t) = token {
+            cmd.env("GH_TOKEN", t);
+        }
+        let output = cmd
             .args(["api", path])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -177,8 +200,12 @@ impl GhRunner for CommandGhRunner {
         &self,
         path: &str,
         fields: &[(&str, &str)],
+        token: Option<&str>,
     ) -> std::result::Result<GhResponse, GhRunnerError> {
         let mut cmd = Command::new("gh");
+        if let Some(t) = token {
+            cmd.env("GH_TOKEN", t);
+        }
         cmd.args(["api", "-X", "PATCH", path]);
         for (k, v) in fields {
             cmd.args(["-f", &format!("{k}={v}")]);
@@ -207,11 +234,15 @@ impl GhRunner for CommandGhRunner {
         &self,
         path: &str,
         body: &serde_json::Value,
+        token: Option<&str>,
     ) -> std::result::Result<GhResponse, GhRunnerError> {
         use tokio::io::AsyncWriteExt as _;
         let stdin_bytes = serde_json::to_vec(body)
             .map_err(|e| GhRunnerError::transient(format!("failed to serialize POST body: {e}")))?;
         let mut cmd = Command::new("gh");
+        if let Some(t) = token {
+            cmd.env("GH_TOKEN", t);
+        }
         cmd.args(["api", "-X", "POST", "--input", "-", path])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -570,7 +601,8 @@ fn check_graphql_errors(response: &Value) -> Result<()> {
 /// Map a `GhRunnerError` from a GraphQL call to a `TrackerError`.
 fn map_graphql_error(err: GhRunnerError) -> TrackerError {
     match err.http_status {
-        Some(401) | Some(403) => TrackerError::Auth(err.message),
+        Some(401) => TrackerError::TokenRevoked(err.message),
+        Some(403) => TrackerError::Auth(err.message),
         Some(404) => TrackerError::ConfigInvalid(err.message),
         Some(s) if s >= 500 => TrackerError::Transient(err.message),
         _ => TrackerError::Transient(err.message),
@@ -585,6 +617,12 @@ fn map_write_error(err: GhRunnerError) -> TrackerError {
         Some(s) if s >= 500 => TrackerError::Transient(err.message),
         _ => TrackerError::Transient(err.message),
     }
+}
+
+/// Extract the OAuth token from a `TrackerContext` as an `Option<&str>`.
+/// Returns `None` when the credential is ambient (empty token).
+fn opt_token(ctx: &TrackerContext) -> Option<&str> {
+    if ctx.credential.token.is_empty() { None } else { Some(&ctx.credential.token) }
 }
 
 // ── GitHubTracker ─────────────────────────────────────────────────────────────
@@ -651,7 +689,7 @@ impl ExternalTracker for GitHubTracker {
 
             let response = self
                 .runner
-                .graphql(GITHUB_GRAPHQL_QUERY, &vars)
+                .graphql(GITHUB_GRAPHQL_QUERY, &vars, opt_token(ctx))
                 .await
                 .map_err(map_graphql_error)?;
 
@@ -720,7 +758,7 @@ impl ExternalTracker for GitHubTracker {
             })?;
 
         let path = format!("repos/{}/{}/issues/{}", config.org, config.repo, issue_number);
-        match self.runner.rest_get(&path).await {
+        match self.runner.rest_get(&path, opt_token(ctx)).await {
             Ok(resp) => Ok(parse_rest_issue(&resp.body, &config.org, &config.repo)),
             Err(e) if e.http_status == Some(404) => Ok(None),
             Err(e) => Err(map_write_error(e)),
@@ -752,7 +790,7 @@ impl ExternalTracker for GitHubTracker {
         let path = format!("repos/{}/{}/issues/{}", config.org, config.repo, issue_number);
         let fields = [("state", "closed"), ("state_reason", state_reason)];
 
-        match self.runner.rest_patch(&path, &fields).await {
+        match self.runner.rest_patch(&path, &fields, opt_token(ctx)).await {
             Ok(_) => Ok(()),
             // 404: issue deleted or never existed; treat as already-closed (success).
             Err(e) if e.http_status == Some(404) => Ok(()),
@@ -783,7 +821,7 @@ impl ExternalTracker for GitHubTracker {
         );
 
         // Idempotency: skip if any existing comment already mentions this PR URL.
-        match self.runner.rest_get(&comments_path).await {
+        match self.runner.rest_get(&comments_path, opt_token(ctx)).await {
             Ok(resp) => {
                 if let Some(comments) = resp.body.as_array() {
                     let already_present = comments.iter().any(|c| {
@@ -804,7 +842,7 @@ impl ExternalTracker for GitHubTracker {
 
         let comment_text = format!("Closed by {pr_url}");
         let comment_body = serde_json::json!({ "body": comment_text });
-        match self.runner.rest_post(&comments_path, &comment_body).await {
+        match self.runner.rest_post(&comments_path, &comment_body, opt_token(ctx)).await {
             Ok(_) => Ok(()),
             // Issue gone between the GET and POST — treat as success.
             Err(e) if e.http_status == Some(404) => Ok(()),
@@ -838,6 +876,7 @@ impl ExternalTracker for GitHubTracker {
             .graphql(
                 GITHUB_PROJECT_METADATA_QUERY,
                 &[("org", &config.org), ("number", &project_number_str)],
+                opt_token(ctx),
             )
             .await
             .map_err(map_graphql_error)?;
@@ -901,6 +940,7 @@ impl ExternalTracker for GitHubTracker {
                     ("fieldId", field_id.as_str()),
                     ("optionId", option_id.as_str()),
                 ],
+                opt_token(ctx),
             )
             .await
             .map_err(map_graphql_error)?;
@@ -938,7 +978,7 @@ impl ExternalTracker for GitHubTracker {
         let path = format!("repos/{}/issues/{}/labels", repo_with_owner, issue_number);
         let body = serde_json::json!({ "labels": [label] });
 
-        match self.runner.rest_post(&path, &body).await {
+        match self.runner.rest_post(&path, &body, opt_token(ctx)).await {
             Ok(_) => Ok(()),
             // 404: issue deleted or never existed; treat as no-op success
             // so a label-add failure can't block reconciliation forever.
@@ -966,6 +1006,10 @@ mod tests {
         rest_get_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
         rest_patch_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
         rest_post_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
+        /// Captures the `token` argument from the most recent call (any method).
+        /// `None` = no call made yet; `Some(None)` = called with ambient (no token);
+        /// `Some(Some(t))` = called with OAuth token `t`.
+        last_token: Mutex<Option<Option<String>>>,
     }
 
     impl FakeGhRunner {
@@ -975,7 +1019,13 @@ mod tests {
                 rest_get_q: Mutex::new(VecDeque::new()),
                 rest_patch_q: Mutex::new(VecDeque::new()),
                 rest_post_q: Mutex::new(VecDeque::new()),
+                last_token: Mutex::new(None),
             }
+        }
+
+        #[allow(dead_code)]
+        fn last_token(&self) -> Option<Option<String>> {
+            self.last_token.lock().unwrap().clone()
         }
 
         fn push_graphql_ok(&mut self, v: Value) -> &mut Self {
@@ -1037,7 +1087,9 @@ mod tests {
             &self,
             _query: &str,
             _vars: &[(&str, &str)],
+            token: Option<&str>,
         ) -> std::result::Result<Value, GhRunnerError> {
+            *self.last_token.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.graphql_q
                 .lock()
                 .unwrap()
@@ -1048,7 +1100,9 @@ mod tests {
         async fn rest_get(
             &self,
             _path: &str,
+            token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.last_token.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.rest_get_q
                 .lock()
                 .unwrap()
@@ -1060,7 +1114,9 @@ mod tests {
             &self,
             _path: &str,
             _fields: &[(&str, &str)],
+            token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.last_token.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.rest_patch_q
                 .lock()
                 .unwrap()
@@ -1072,7 +1128,9 @@ mod tests {
             &self,
             _path: &str,
             _body: &serde_json::Value,
+            token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.last_token.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.rest_post_q
                 .lock()
                 .unwrap()
@@ -1240,6 +1298,108 @@ mod tests {
             canonical_id: format!("spinyfin/mono#{number}"),
             raw: json!({ "issue_number": number, "project_item_id": "PVTI_xxx" }),
         }
+    }
+
+    // ── GH_TOKEN threading ───────────────────────────────────────────────────────
+
+    fn github_ctx_with_token(token: &str) -> TrackerContext {
+        TrackerContext {
+            product_id: "prod1".to_owned(),
+            config: json!({
+                "org": "spinyfin",
+                "repo": "mono",
+                "project_number": 1
+            }),
+            credential: super::super::TrackerCredential { token: token.to_owned() },
+        }
+    }
+
+    /// Thin wrapper around `FakeGhRunner` that records the `token` argument
+    /// from each call into a shared `Arc<Mutex<...>>` so the test can read it
+    /// back after the runner is consumed into a `Box<dyn GhRunner>`.
+    struct TokenCapturingRunner {
+        inner: FakeGhRunner,
+        captured: std::sync::Arc<Mutex<Option<Option<String>>>>,
+    }
+
+    impl TokenCapturingRunner {
+        fn new_with_capture(
+            inner: FakeGhRunner,
+        ) -> (Self, std::sync::Arc<Mutex<Option<Option<String>>>>) {
+            let captured = std::sync::Arc::new(Mutex::new(None));
+            let r = Self { inner, captured: captured.clone() };
+            (r, captured)
+        }
+    }
+
+    #[async_trait]
+    impl GhRunner for TokenCapturingRunner {
+        async fn graphql(
+            &self,
+            query: &str,
+            vars: &[(&str, &str)],
+            token: Option<&str>,
+        ) -> std::result::Result<Value, GhRunnerError> {
+            *self.captured.lock().unwrap() = Some(token.map(|t| t.to_owned()));
+            self.inner.graphql(query, vars, token).await
+        }
+
+        async fn rest_get(
+            &self,
+            path: &str,
+            token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.captured.lock().unwrap() = Some(token.map(|t| t.to_owned()));
+            self.inner.rest_get(path, token).await
+        }
+
+        async fn rest_patch(
+            &self,
+            path: &str,
+            fields: &[(&str, &str)],
+            token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.captured.lock().unwrap() = Some(token.map(|t| t.to_owned()));
+            self.inner.rest_patch(path, fields, token).await
+        }
+
+        async fn rest_post(
+            &self,
+            path: &str,
+            body: &serde_json::Value,
+            token: Option<&str>,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            *self.captured.lock().unwrap() = Some(token.map(|t| t.to_owned()));
+            self.inner.rest_post(path, body, token).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_items_passes_token_from_context() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        let (runner, captured) = TokenCapturingRunner::new_with_capture(fake);
+        let tracker = GitHubTracker::with_runner(runner);
+        let _ = tracker.fetch_items(&github_ctx_with_token("ghp_oauth_token_abc")).await;
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(Some("ghp_oauth_token_abc".to_owned())),
+            "fetch_items should pass the credential token to the runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_items_passes_no_token_when_ambient() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        let (runner, captured) = TokenCapturingRunner::new_with_capture(fake);
+        let tracker = GitHubTracker::with_runner(runner);
+        let _ = tracker.fetch_items(&github_ctx()).await;
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(None),
+            "fetch_items should pass None when credential is ambient"
+        );
     }
 
     // ── fetch_items: integration test against fixture ─────────────────────────
@@ -1792,6 +1952,7 @@ mod tests {
             &self,
             _query: &str,
             _vars: &[(&str, &str)],
+            _token: Option<&str>,
         ) -> std::result::Result<Value, GhRunnerError> {
             unimplemented!("CapturingGhRunner only supports rest_post")
         }
@@ -1799,6 +1960,7 @@ mod tests {
         async fn rest_get(
             &self,
             _path: &str,
+            _token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
             unimplemented!("CapturingGhRunner only supports rest_post")
         }
@@ -1807,6 +1969,7 @@ mod tests {
             &self,
             _path: &str,
             _fields: &[(&str, &str)],
+            _token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
             unimplemented!("CapturingGhRunner only supports rest_post")
         }
@@ -1815,6 +1978,7 @@ mod tests {
             &self,
             _path: &str,
             body: &serde_json::Value,
+            _token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
             self.post_bodies.lock().unwrap().push(body.clone());
             Ok(GhResponse { body: json!([{"name": "tracked"}]) })
