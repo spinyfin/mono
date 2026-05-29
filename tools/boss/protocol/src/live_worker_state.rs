@@ -105,10 +105,10 @@ pub struct LiveWorkerState {
     #[serde(default)]
     pub name: String,
     pub run_id: String,
-    /// Model identifier the worker is running on, e.g.
-    /// `claude-opus-4-7`. Initially the engine-launched default; once
-    /// `SessionStart` reports a model, this updates to the
-    /// authoritative value.
+    /// Model identifier the worker is running on, e.g. `opus` (the
+    /// family alias the engine defaults to). Initially the
+    /// engine-launched default; once `SessionStart` reports a model,
+    /// this updates to the authoritative value.
     pub model: String,
     /// Best-effort shell pid the app returned at spawn. `0` if the
     /// app did not yet plumb pid back through `proc_listpids`.
