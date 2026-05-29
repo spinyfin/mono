@@ -23,6 +23,7 @@ use super::{
     CloseReason, ExternalTracker, TrackerContext, TrackerCredential, TrackerError, TrackerRegistry,
     UpstreamItem, UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
 };
+use super::credentials::{TrackerCredentialError, TrackerCredentialResolver};
 use crate::metrics::Registry;
 use crate::work::WorkDb;
 
@@ -206,6 +207,7 @@ pub async fn run_one_pass(
     registry: &TrackerRegistry,
     metrics: &Registry,
     publisher: &dyn WorkInvalidationPublisher,
+    credential_resolver: &dyn TrackerCredentialResolver,
 ) -> PassOutcome {
     let products = match work_db.list_products() {
         Ok(p) => p,
@@ -233,10 +235,27 @@ pub async fn run_one_pass(
             }
         };
 
+        let credential = match credential_resolver.resolve(&kind, &config).await {
+            Ok(c) => c,
+            Err(TrackerCredentialError::AuthFailed { host, detail }) => {
+                SKIP_NO_CREDENTIAL.inc(metrics);
+                warn!(
+                    product_id = %product.id,
+                    %kind,
+                    %host,
+                    %detail,
+                    "credential resolution failed; skipping product this tick"
+                );
+                outcome.products_skipped += 1;
+                continue;
+            }
+            Err(TrackerCredentialError::UnsupportedKind(_)) => TrackerCredential::ambient(),
+        };
+
         let ctx = TrackerContext {
             product_id: product.id.clone(),
             config,
-            credential: TrackerCredential::ambient(),
+            credential,
         };
 
         process_product(work_db, &*tracker, &product.id, &ctx, &mut outcome, metrics, publisher)
@@ -261,6 +280,7 @@ pub fn spawn_loop(
     interval: Duration,
     metrics: Arc<Registry>,
     publisher: Arc<dyn WorkInvalidationPublisher>,
+    credential_resolver: Arc<dyn TrackerCredentialResolver>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -269,6 +289,7 @@ pub fn spawn_loop(
                 registry.as_ref(),
                 metrics.as_ref(),
                 publisher.as_ref(),
+                credential_resolver.as_ref(),
             )
             .await;
             if outcome.products_processed > 0
@@ -316,6 +337,7 @@ pub async fn run_one_pass_for_product(
     metrics: &Registry,
     product_id: &str,
     publisher: &dyn WorkInvalidationPublisher,
+    credential_resolver: &dyn TrackerCredentialResolver,
 ) -> Option<PassOutcome> {
     let products = match work_db.list_products() {
         Ok(p) => p,
@@ -340,10 +362,20 @@ pub async fn run_one_pass_for_product(
         }
     };
 
+    let credential = match credential_resolver.resolve(&kind, &config).await {
+        Ok(c) => c,
+        Err(TrackerCredentialError::AuthFailed { host, detail }) => {
+            SKIP_NO_CREDENTIAL.inc(metrics);
+            warn!(product_id, %kind, %host, %detail, "credential resolution failed; skipping product");
+            return None;
+        }
+        Err(TrackerCredentialError::UnsupportedKind(_)) => TrackerCredential::ambient(),
+    };
+
     let ctx = TrackerContext {
         product_id: product_id.to_owned(),
         config,
-        credential: TrackerCredential::ambient(),
+        credential,
     };
 
     let mut outcome = PassOutcome::default();
@@ -407,6 +439,7 @@ async fn process_product(
             // fetch has succeeded.
             for kind in &[
                 "external_tracker_auth_failed",
+                "external_tracker_token_revoked",
                 "external_tracker_transient_errors",
             ] {
                 if let Err(e) = work_db.resolve_external_tracker_attention(product_id, kind) {
@@ -415,13 +448,33 @@ async fn process_product(
             }
             items
         }
+        Err(ref e @ TrackerError::TokenRevoked(ref msg)) => {
+            FETCH_FAILED.inc(metrics);
+            warn!(product_id, error = %e, "fetch_items 401: OAuth token revoked; skipping product this tick");
+            let title = format!("GitHub OAuth token revoked for product {product_id}");
+            let body = format!(
+                "Boss received HTTP 401 from GitHub — the stored OAuth token has been revoked or expired: {msg}\n\n\
+                 Please reconnect via Settings → Issue Sync → Connect to authorize a new token."
+            );
+            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
+                product_id,
+                "external_tracker_token_revoked",
+                &title,
+                &body,
+            ) {
+                warn!(product_id, error = %attn_err,
+                    "upsert_external_tracker_attention (token_revoked) failed");
+            }
+            return;
+        }
         Err(ref e @ TrackerError::Auth(ref msg)) => {
             FETCH_FAILED.inc(metrics);
             warn!(product_id, error = %e, "fetch_items auth failure; skipping product this tick");
             let title = format!("External tracker auth failed for product {product_id}");
             let body = format!(
                 "Boss could not authenticate with the external tracker: {msg}\n\n\
-                 Run `gh auth login` to refresh credentials, then try again."
+                 This may indicate an org approval or SSO authorization is needed. \
+                 Check your GitHub org settings, or run `gh auth login` to refresh credentials."
             );
             if let Err(attn_err) = work_db.upsert_external_tracker_attention(
                 product_id,
@@ -1100,6 +1153,25 @@ mod tests {
         NoopWorkInvalidationPublisher
     }
 
+    /// Credential resolver that always returns ambient credentials.
+    /// Used in reconciler tests that don't care about credential resolution.
+    struct AmbientResolver;
+
+    #[async_trait]
+    impl TrackerCredentialResolver for AmbientResolver {
+        async fn resolve(
+            &self,
+            _kind: &str,
+            _config: &serde_json::Value,
+        ) -> std::result::Result<TrackerCredential, TrackerCredentialError> {
+            Ok(TrackerCredential::ambient())
+        }
+    }
+
+    fn ambient_resolver() -> AmbientResolver {
+        AmbientResolver
+    }
+
     /// Records every `publish_work_item_invalidated` call for assertions.
     #[derive(Default)]
     struct RecordingPublisher {
@@ -1186,6 +1258,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back(Err(TrackerError::Auth("token invalid".to_owned())));
+            self
+        }
+
+        fn push_fetch_token_revoked_error(self: &Arc<Self>) -> &Arc<Self> {
+            self.fetch_errors
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::TokenRevoked("401 Unauthorized".to_owned())));
             self
         }
 
@@ -1427,7 +1507,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_imported, 1, "should import one item");
         assert_eq!(outcome.products_processed, 1);
@@ -1456,7 +1536,7 @@ mod tests {
         register_metrics(&metrics);
         let publisher = Arc::new(RecordingPublisher::default());
 
-        run_one_pass(&db, &registry, &metrics, publisher.as_ref()).await;
+        run_one_pass(&db, &registry, &metrics, publisher.as_ref(), &ambient_resolver()).await;
 
         let calls = publisher.recorded();
         assert_eq!(calls.len(), 1, "expected exactly one invalidation event");
@@ -1476,7 +1556,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_imported, 1);
         assert_eq!(outcome.tracked_label_attach_succeeded, 1);
@@ -1500,7 +1580,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_imported, 1);
         assert_eq!(
@@ -1523,7 +1603,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         // Import itself must still succeed.
         assert_eq!(outcome.items_imported, 1);
@@ -1545,7 +1625,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert!(
             tracker.add_label_calls().is_empty(),
@@ -1585,7 +1665,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.tracked_label_attach_succeeded, 1,
             "reconcile should attach tracked label when it is missing");
@@ -1627,7 +1707,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert!(
             tracker.add_label_calls().is_empty(),
@@ -1646,7 +1726,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_imported, 0, "closed item should be skipped");
         let found = db.find_by_external_ref("spy", "spy#2").expect("query ok");
@@ -1689,7 +1769,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_closed, 1);
         let updated = db
@@ -1735,7 +1815,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.pr_attached, 1);
         let updated = db
@@ -1781,7 +1861,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.close_issue_succeeded, 1, "close_issue should succeed");
         assert_eq!(outcome.items_closed, 1, "boss row should flip to done");
@@ -1826,7 +1906,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.items_unbound, 1, "one item should be unbound");
 
@@ -1874,7 +1954,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome1.close_issue_failed, 1, "tick 1: should record failed close");
         assert_eq!(outcome1.items_closed, 1, "tick 1: boss row should flip to done");
@@ -1888,7 +1968,7 @@ mod tests {
         // Tick 2: upstream is still Open (close didn't land); close_issue succeeds.
         tracker.push_ok();
 
-        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome2.close_issue_succeeded, 1, "tick 2: close should succeed");
         assert_eq!(outcome2.items_closed, 0, "tick 2: boss already done, no extra close");
@@ -1911,11 +1991,11 @@ mod tests {
         register_metrics(&metrics);
 
         // First pass: import.
-        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome1.items_imported, 1);
 
         // Second pass: nothing should change.
-        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome2.items_imported, 0);
         assert_eq!(outcome2.items_closed, 0);
         assert_eq!(outcome2.pr_attached, 0);
@@ -1961,7 +2041,7 @@ mod tests {
         let registry_empty = spy_registry(tracker_empty);
         let metrics = Registry::new();
         register_metrics(&metrics);
-        let outcome_unbind = run_one_pass(&db, &registry_empty, &metrics, &noop_pub()).await;
+        let outcome_unbind = run_one_pass(&db, &registry_empty, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome_unbind.items_unbound, 1);
 
         // Verify unbound.
@@ -1976,7 +2056,7 @@ mod tests {
         let registry_reappear = spy_registry(tracker_reappear);
         let metrics2 = Registry::new();
         register_metrics(&metrics2);
-        let outcome_rebind = run_one_pass(&db, &registry_reappear, &metrics2, &noop_pub()).await;
+        let outcome_rebind = run_one_pass(&db, &registry_reappear, &metrics2, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome_rebind.items_imported, 0, "should rebind, not import");
 
         // Only one chore with spy#9 should exist.
@@ -2035,7 +2115,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.reverse_close_succeeded, 1, "reverse-close should succeed");
         assert_eq!(outcome.close_issue_succeeded, 0, "Behavior 5 should NOT fire");
@@ -2064,7 +2144,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         // Behavior 5 fires; reverse-close path must not.
         assert_eq!(outcome.close_issue_succeeded, 1, "Behavior 5 should succeed");
@@ -2095,7 +2175,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.reverse_close_succeeded, 0, "reverse-close disabled");
         assert_eq!(outcome.reverse_close_failed, 0);
@@ -2123,7 +2203,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome1.items_imported, 1, "pass 1: should import one item");
 
         // The imported chore must have its external_ref bound so the
@@ -2145,7 +2225,7 @@ mod tests {
         // Pass 2: upstream still Open, boss is done, no merged PR
         //         → reverse_close must fire.
         tracker.push_ok();
-        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome2.reverse_close_succeeded, 1,
             "reverse_close must fire for an imported-then-done chore");
@@ -2198,6 +2278,7 @@ mod tests {
             interval,
             metrics.clone(),
             Arc::new(noop_pub()),
+            Arc::new(ambient_resolver()),
         );
 
         // Poll until the imported counter advances (max 5 s).
@@ -2241,7 +2322,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub())
+        let outcome = run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub(), &ambient_resolver())
             .await
             .expect("should return Some for a bound product");
 
@@ -2267,7 +2348,7 @@ mod tests {
         register_metrics(&metrics);
 
         let result =
-            run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub()).await;
+            run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub(), &ambient_resolver()).await;
         assert!(result.is_none(), "unbound product should return None");
     }
 
@@ -2293,7 +2374,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let auth_items: Vec<_> = items.iter()
@@ -2301,9 +2382,36 @@ mod tests {
             .collect();
         assert_eq!(auth_items.len(), 1, "should emit exactly one auth_failed attention item");
         assert!(
-            auth_items[0].body_markdown.contains("gh auth login"),
+            auth_items[0].body_markdown.contains("gh auth login")
+                || auth_items[0].body_markdown.contains("org approval"),
             "body should contain remediation hint; got: {}",
             auth_items[0].body_markdown
+        );
+    }
+
+    /// 401 fetch error (token revoked) emits `external_tracker_token_revoked` on the product.
+    #[tokio::test]
+    async fn attention_item_emitted_for_token_revoked() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![]);
+        tracker.push_fetch_token_revoked_error();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
+
+        let items = attention_items_for_product(&db, &product.id);
+        let revoked_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_token_revoked" && i.status == "open")
+            .collect();
+        assert_eq!(revoked_items.len(), 1, "should emit exactly one token_revoked attention item");
+        assert!(
+            revoked_items[0].body_markdown.contains("401")
+                || revoked_items[0].body_markdown.contains("revoked"),
+            "body should mention token revocation; got: {}",
+            revoked_items[0].body_markdown
         );
     }
 
@@ -2319,7 +2427,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let transient_items: Vec<_> = items.iter()
@@ -2359,7 +2467,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
         let unbound_items: Vec<_> = items.iter()
@@ -2408,7 +2516,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
         let perm_items: Vec<_> = items.iter()
@@ -2436,8 +2544,8 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let auth_items: Vec<_> = items.iter()
@@ -2459,7 +2567,7 @@ mod tests {
         register_metrics(&metrics);
 
         // Tick 1: auth failure → attention item created.
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         let items = attention_items_for_product(&db, &product.id);
         assert!(
             items.iter().any(|i| i.kind == "external_tracker_auth_failed" && i.status == "open"),
@@ -2467,7 +2575,7 @@ mod tests {
         );
 
         // Tick 2: fetch succeeds (no more queued error) → attention item resolved.
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         let items2 = attention_items_for_product(&db, &product.id);
         let still_open = items2.iter()
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
@@ -2535,7 +2643,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.in_progress_set_succeeded, 1, "Behavior 6 should succeed");
         assert_eq!(outcome.in_progress_set_failed, 0);
@@ -2561,7 +2669,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.in_progress_set_succeeded, 0, "should not fire when already In progress");
         assert_eq!(outcome.in_progress_set_failed, 0);
@@ -2602,7 +2710,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert_eq!(outcome.in_progress_set_succeeded, 0, "should not fire for todo task");
         assert!(tracker.set_project_status_calls().is_empty());
@@ -2630,7 +2738,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         assert!(
             tracker.set_project_status_calls().is_empty(),
@@ -2657,13 +2765,13 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome1.in_progress_set_failed, 1, "tick 1: should record failure");
         assert_eq!(outcome1.in_progress_set_succeeded, 0);
 
         // Tick 2: succeeds.
         tracker.push_set_project_status_ok();
-        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome2.in_progress_set_succeeded, 1, "tick 2: should succeed");
 
         let calls = tracker.set_project_status_calls();
@@ -2688,7 +2796,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         assert_eq!(outcome.in_progress_set_succeeded, 1, "should fire when project_status is None");
         let calls = tracker.set_project_status_calls();
         assert_eq!(calls, vec!["spy#35"]);

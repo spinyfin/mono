@@ -452,6 +452,10 @@ struct ServerState {
     /// [`FrontendEvent::GitHubAuthState`] on [`TOPIC_GITHUB_AUTH`] plus runs
     /// the org/SSO probe. See the OAuth device-flow design (§3, §4, §7).
     github_auth: Arc<GitHubAuthController>,
+    /// Resolves credentials for external-tracker sync. Uses
+    /// `KeychainOAuthResolver` in production so a stored OAuth token
+    /// takes precedence over ambient `gh` auth.
+    tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver>,
     /// Shared kick signal for the merge-poller loop. The macOS app
     /// fires [`FrontendRequest::KickPrReconcilers`] on window
     /// activation; the handler calls `notify_one()` here so the
@@ -801,6 +805,10 @@ impl ServerState {
         );
         let github_auth_for_state = Arc::new(github_auth_controller);
 
+        let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
+            Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
+                crate::external_tracker::github_oauth::KeychainTokenStore::new(),
+            ));
         let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -899,6 +907,7 @@ impl ServerState {
                 pr_reconciler_kick: pr_reconciler_kick_for_state,
                 tracker_registry: tracker_registry_for_state,
                 github_auth: github_auth_for_state,
+                tracker_credential_resolver,
                 control_token: control_token_for_state,
                 shutdown_trigger: shutdown_trigger_for_state,
             }
@@ -2670,6 +2679,7 @@ pub async fn serve(
             Duration::from_secs(120),
             server_state.metrics.clone(),
             server_state.clone(),
+            server_state.tracker_credential_resolver.clone(),
         );
 
     // GitHub OAuth auth-state forwarder: restores any persisted token at boot,
@@ -7188,6 +7198,7 @@ async fn handle_frontend_connection(
                 let registry = server_state.tracker_registry.clone();
                 let metrics = server_state.metrics.clone();
                 let publisher = server_state.clone();
+                let credential_resolver = server_state.tracker_credential_resolver.clone();
                 let sink2 = sink.clone();
                 let request_id2 = request_id.clone();
                 tokio::spawn(async move {
@@ -7197,6 +7208,7 @@ async fn handle_frontend_connection(
                         metrics.as_ref(),
                         &product_id,
                         publisher.as_ref(),
+                        credential_resolver.as_ref(),
                     )
                     .await
                     {

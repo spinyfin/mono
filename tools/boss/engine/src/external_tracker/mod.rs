@@ -145,6 +145,11 @@ pub enum TrackerError {
     #[error("auth error: {0}")]
     Auth(String),
 
+    /// OAuth token revoked or expired (401 from upstream).
+    /// Surface a re-authorize attention item; clear the stored token.
+    #[error("token revoked: {0}")]
+    TokenRevoked(String),
+
     /// Permission denied on a write operation (403 on close_issue).
     /// Surface as an attention item; do not retry.
     #[error("permission denied: {0}")]
