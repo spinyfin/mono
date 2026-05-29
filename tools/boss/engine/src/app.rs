@@ -7200,6 +7200,18 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::GitHubAuthStart
+            | FrontendRequest::GitHubAuthCancel
+            | FrontendRequest::GitHubAuthDisconnect
+            | FrontendRequest::GitHubAuthStatus => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: "github auth not yet implemented (T-2)".to_owned(),
+                    },
+                );
+            }
         }
     }
 
