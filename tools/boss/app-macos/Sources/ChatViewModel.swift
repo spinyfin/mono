@@ -332,12 +332,17 @@ final class ChatViewModel: ObservableObject {
         try await GitHubContentFetcher.fetch(url)
     }
 
-    /// Indirection for opening a review terminal window. Installed by
-    /// [[ContentView]] using `@Environment(\.openWindow)` — same
-    /// boundary-crossing pattern as [[designRendererOpener]]. When set,
-    /// a `ReviewTerminalReady` engine event triggers `openWindow` for the
-    /// `"review-terminal"` scene. `nil` in tests and headless contexts.
-    var reviewTerminalOpener: ((ReviewTerminalContent) -> Void)?
+    /// Indirection for opening the review-terminal window. Installed by
+    /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
+    /// click (before the engine responds) so the window opens immediately
+    /// in a loading state. `nil` in tests and headless contexts.
+    var reviewTerminalOpener: (() -> Void)?
+
+    /// Shared state for the `"review-terminal"` Window scene. Owned here
+    /// and injected via EnvironmentObject so the window can observe the
+    /// loading → ready transition without going through a value-type
+    /// openWindow payload (which can't be updated after the window opens).
+    let reviewTerminalVM = ReviewTerminalViewModel()
 
     /// Work item IDs for which `open_review_terminal` has been sent but
     /// `review_terminal_ready` (or `work_error`) has not yet arrived.
@@ -345,11 +350,18 @@ final class ChatViewModel: ObservableObject {
     private var openingReviewTerminalIDs: Set<String> = []
 
     /// Ask the engine to lease a workspace for the given Review-column
-    /// task's PR branch and open a Ghostty terminal there. Idempotent per
-    /// in-flight request: a second call while one is pending is a no-op.
+    /// task's PR branch and open a terminal there. Opens the window
+    /// immediately with a loading spinner; the terminal becomes live once
+    /// the engine sends back `ReviewTerminalReady`.
     func openReviewTerminal(for task: WorkTask) {
         guard let prURL = task.prURL, !prURL.isEmpty else { return }
-        guard !openingReviewTerminalIDs.contains(task.id) else { return }
+        guard !openingReviewTerminalIDs.contains(task.id) else {
+            // Same task still loading — just re-focus the window.
+            reviewTerminalOpener?()
+            return
+        }
+        reviewTerminalVM.state = .loading(taskName: task.name)
+        reviewTerminalOpener?()
         openingReviewTerminalIDs.insert(task.id)
         engine.sendOpenReviewTerminal(workItemID: task.id)
     }
@@ -1668,6 +1680,9 @@ final class ChatViewModel: ObservableObject {
             // that failed — the specific work_error message is shown in the
             // modal, so clearing in-flight state here is safe.
             openingReviewTerminalIDs.removeAll()
+            if case .loading = reviewTerminalVM.state {
+                reviewTerminalVM.state = .idle
+            }
         case .error(let message):
             if isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
@@ -1829,7 +1844,13 @@ final class ChatViewModel: ObservableObject {
                 taskName: resolved?.name,
                 taskShortID: resolved?.shortID
             )
-            reviewTerminalOpener?(content)
+            if reviewTerminalVM.windowIsOpen {
+                reviewTerminalVM.state = .ready(content)
+            } else {
+                // Window was closed while the engine was still setting up.
+                // Release the lease immediately since nobody will consume it.
+                engine.sendReleaseReviewTerminal(leaseID: leaseID)
+            }
         }
     }
 
