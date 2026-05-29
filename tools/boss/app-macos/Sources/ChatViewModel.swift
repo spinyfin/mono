@@ -169,6 +169,14 @@ final class ChatViewModel: ObservableObject {
     /// in this session.
     @Published var featureFlags: [FeatureFlag] = []
 
+    /// Current GitHub OAuth auth state for github.com (OAuth device-flow
+    /// design §3/§4). The engine owns a single per-host state; the app
+    /// subscribes to the `github.auth` topic and refreshes this on every
+    /// `git_hub_auth_state` push as the device flow advances. Backs the
+    /// "GitHub account" subsection of the external-tracker settings.
+    /// Defaults to `.disconnected` until the engine's first reply lands.
+    @Published var gitHubAuthState: GitHubAuthState = .disconnected
+
     /// Resolved design-doc pointer state per project. Populated lazily
     /// when a project surface (kanban project header, future detail
     /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
@@ -330,6 +338,47 @@ final class ChatViewModel: ObservableObject {
     /// Tests inject a stub so the affordance tests never shell out.
     var rawContentFetcher: (URL) async throws -> String = { url in
         try await GitHubContentFetcher.fetch(url)
+    }
+
+    /// Indirection for opening the review-terminal window. Installed by
+    /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
+    /// click (before the engine responds) so the window opens immediately
+    /// in a loading state. `nil` in tests and headless contexts.
+    var reviewTerminalOpener: (() -> Void)?
+
+    /// Shared state for the `"review-terminal"` Window scene. Owned here
+    /// and injected via EnvironmentObject so the window can observe the
+    /// loading → ready transition without going through a value-type
+    /// openWindow payload (which can't be updated after the window opens).
+    let reviewTerminalVM = ReviewTerminalViewModel()
+
+    /// Work item IDs for which `open_review_terminal` has been sent but
+    /// `review_terminal_ready` (or `work_error`) has not yet arrived.
+    /// Guards against a second click while the engine is still leasing.
+    private var openingReviewTerminalIDs: Set<String> = []
+
+    /// Ask the engine to lease a workspace for the given Review-column
+    /// task's PR branch and open a terminal there. Opens the window
+    /// immediately with a loading spinner; the terminal becomes live once
+    /// the engine sends back `ReviewTerminalReady`.
+    func openReviewTerminal(for task: WorkTask) {
+        guard let prURL = task.prURL, !prURL.isEmpty else { return }
+        guard !openingReviewTerminalIDs.contains(task.id) else {
+            // Same task still loading — just re-focus the window.
+            reviewTerminalOpener?()
+            return
+        }
+        reviewTerminalVM.state = .loading(taskName: task.name)
+        reviewTerminalOpener?()
+        openingReviewTerminalIDs.insert(task.id)
+        engine.sendOpenReviewTerminal(workItemID: task.id)
+    }
+
+    /// Notify the engine that the review terminal for `leaseID` has
+    /// closed so the workspace lease can be released. Called from the
+    /// `ReviewTerminalView.onDisappear` handler.
+    func releaseReviewTerminal(leaseID: String) {
+        engine.sendReleaseReviewTerminal(leaseID: leaseID)
     }
 
     /// Toggle the live-status summarizer for `slotId`. Sends the
@@ -1061,6 +1110,40 @@ final class ChatViewModel: ObservableObject {
         engine.sendUnsetProductExternalTracker(productId: productId)
     }
 
+    // MARK: GitHub OAuth device-flow bridges (OAuth device-flow design §4)
+    //
+    // Thin pass-throughs to the engine RPCs. The engine owns the flow and
+    // the token; these just kick state transitions. The resulting
+    // `gitHubAuthState` updates arrive via `git_hub_auth_state` events.
+
+    /// Begin the device flow (the "Connect" / "Start over" action).
+    func gitHubAuthConnect() {
+        engine.sendGitHubAuthStart()
+    }
+
+    /// Abort an in-progress device flow (the "Cancel" action).
+    func gitHubAuthCancel() {
+        engine.sendGitHubAuthCancel()
+    }
+
+    /// Delete the stored token and return to disconnected.
+    func gitHubAuthDisconnect() {
+        engine.sendGitHubAuthDisconnect()
+    }
+
+    /// Re-run the device flow, overwriting the stored token. Identical to
+    /// `gitHubAuthConnect` at the wire level (the engine restarts the flow
+    /// from `Authorized`); named separately so the call site reads clearly.
+    func gitHubAuthReauthorize() {
+        engine.sendGitHubAuthStart()
+    }
+
+    /// Re-request the current state, which re-runs the engine's org/SSO
+    /// probe when connected (the "Re-check" affordance, design §7).
+    func gitHubAuthRecheck() {
+        engine.sendGitHubAuthStatus()
+    }
+
     func deleteSelectedWorkItem() {
         guard let task = selectedTask else { return }
         engine.sendDeleteWorkItem(id: task.id)
@@ -1460,6 +1543,11 @@ final class ChatViewModel: ObservableObject {
             // so the top-of-window banner reflects the *current* engine,
             // not the one we attached to before a restart (#699).
             engine.sendGetEngineHealth()
+            // Pull the current GitHub OAuth auth state so the "GitHub
+            // account" settings subsection reflects a token persisted by a
+            // prior session (the engine restores it from the keychain at
+            // boot) without waiting for a device-flow transition.
+            engine.sendGitHubAuthStatus()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
@@ -1635,6 +1723,13 @@ final class ChatViewModel: ObservableObject {
             }
         case .workError(let message):
             workErrorMessage = message
+            // Allow the user to retry any in-flight review terminal request
+            // that failed — the specific work_error message is shown in the
+            // modal, so clearing in-flight state here is safe.
+            openingReviewTerminalIDs.removeAll()
+            if case .loading = reviewTerminalVM.state {
+                reviewTerminalVM.state = .idle
+            }
         case .error(let message):
             if isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
@@ -1786,6 +1881,28 @@ final class ChatViewModel: ObservableObject {
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
+        case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
+            openingReviewTerminalIDs.remove(workItemID)
+            let resolved = task(withID: workItemID)
+            let content = ReviewTerminalContent(
+                workItemID: workItemID,
+                workspacePath: workspacePath,
+                leaseID: leaseID,
+                taskName: resolved?.name,
+                taskShortID: resolved?.shortID
+            )
+            if reviewTerminalVM.windowIsOpen {
+                reviewTerminalVM.state = .ready(content)
+            } else {
+                // Window was closed while the engine was still setting up.
+                // Release the lease immediately since nobody will consume it.
+                engine.sendReleaseReviewTerminal(leaseID: leaseID)
+            }
+        case .gitHubAuthState(let state):
+            // The engine pushes this on every device-flow transition (and
+            // as the reply to a `git_hub_auth_*` request). The settings
+            // subsection observes `gitHubAuthState` and re-renders.
+            gitHubAuthState = state
         }
     }
 
@@ -1831,7 +1948,12 @@ final class ChatViewModel: ObservableObject {
     }
 
     private var desiredWorkTopics: Set<String> {
-        var topics: Set<String> = ["work.products", "worker.live_states"]
+        // `github.auth` is a global (per-host, not per-product) topic
+        // carrying GitHub OAuth auth-state pushes; the engine fans every
+        // device-flow transition out on it. We stay subscribed for the
+        // whole session so the "GitHub account" settings subsection
+        // re-renders live (OAuth device-flow design §4, TOPIC_GITHUB_AUTH).
+        var topics: Set<String> = ["work.products", "worker.live_states", "github.auth"]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }

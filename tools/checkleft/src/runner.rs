@@ -433,7 +433,7 @@ impl Runner {
                 };
             };
 
-            return match built_in.configure(&check.config) {
+            return match built_in.configure_scoped(&check.config, check.source_path.parent()) {
                 Ok(configured) => ScheduledExecution::BuiltInConfigured { check: configured },
                 Err(err) => ScheduledExecution::Invalid {
                     message: err.to_string(),

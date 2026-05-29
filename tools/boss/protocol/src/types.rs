@@ -401,6 +401,17 @@ pub struct Task {
     /// root has no PR yet (rare — the create gate normally blocks that).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_parent_pr_url: Option<String>,
+    /// `true` when any descendant revision task in the chain has status
+    /// `todo` or `active` — new commits are still incoming, so the PR is
+    /// not safe to merge yet. Derived projection, not stored. Only
+    /// meaningful on chain-root tasks that carry a `pr_url`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub has_in_progress_revision: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 fn default_true() -> bool {
@@ -1875,7 +1886,8 @@ pub struct WorkComment {
 /// `comments_create` request body. The renderer supplies `doc_version` (it
 /// hashes the plain-text projection) so the engine and renderer agree on the
 /// authoring input without the engine having to render markdown itself.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateCommentInput {
     pub artifact_kind: String,
     pub artifact_id: String,
@@ -1884,6 +1896,7 @@ pub struct CreateCommentInput {
     pub body: String,
     pub author: String,
     #[serde(default)]
+    #[builder(default)]
     pub plain_text_projection_version: i64,
 }
 

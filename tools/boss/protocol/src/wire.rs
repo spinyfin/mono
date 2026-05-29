@@ -17,6 +17,14 @@ use crate::types::{
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 
+/// Global topic carrying GitHub OAuth auth-state pushes
+/// ([`FrontendEvent::GitHubAuthState`]). Unlike work topics this is not
+/// per-product: the engine owns a single per-host (github.com) auth state and
+/// fans every transition out on this one topic. The macOS app subscribes to it
+/// to render the issue-sync "GitHub account" section as the device flow
+/// advances. See the OAuth device-flow design (§3 state machine, §4 RPC).
+pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }
@@ -890,6 +898,20 @@ pub enum FrontendRequest {
         #[serde(default)]
         plain_text_projection_version: i64,
     },
+    /// App asks the engine to lease a workspace for the given Review-
+    /// column work item, fetch the PR branch, and create a fresh jj
+    /// commit off `<branch>@origin`. The engine replies with
+    /// [`FrontendEvent::ReviewTerminalReady`] on success or
+    /// [`FrontendEvent::WorkError`] on failure.
+    OpenReviewTerminal {
+        work_item_id: String,
+    },
+    /// App notifies the engine that a review terminal window has closed
+    /// and the associated workspace lease should be released. This is
+    /// fire-and-forget: the engine logs failures but does not reply.
+    ReleaseReviewTerminal {
+        lease_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1570,6 +1592,17 @@ pub enum FrontendEvent {
         artifact_kind: String,
         artifact_id: String,
         comments: Vec<ResolvedComment>,
+    },
+    /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
+    /// has leased a workspace, fetched the PR branch, and created a new
+    /// jj commit atop `<branch>@origin`. The app should open a Ghostty
+    /// terminal window rooted at `workspace_path` and send
+    /// [`FrontendRequest::ReleaseReviewTerminal`] with `lease_id` when
+    /// the window closes to avoid leaking the lease.
+    ReviewTerminalReady {
+        work_item_id: String,
+        workspace_path: String,
+        lease_id: String,
     },
 }
 

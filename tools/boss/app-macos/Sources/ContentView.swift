@@ -2,6 +2,10 @@ import AppKit
 import SwiftUI
 
 private let workBoardColumnWidth: CGFloat = 280
+private let workBoardColumnWidthWide: CGFloat = 340
+private let workBoardColumnWidthMax: CGFloat = 420
+private let workBoardWideThreshold: CGFloat = 1400
+private let workBoardUltraWideThreshold: CGFloat = 1800
 private let workBoardColumnSpacing: CGFloat = 12
 private let workBoardHorizontalPadding: CGFloat = 20
 private let workBossPanelDefaultExpandedWidth: CGFloat = 380
@@ -122,6 +126,9 @@ struct ContentView: View {
             }
             model.asyncMarkdownViewerOpener = { [openWindow] in
                 openWindow(id: "async-markdown-viewer")
+            }
+            model.reviewTerminalOpener = { [openWindow] in
+                openWindow(id: "review-terminal")
             }
             model.startIfNeeded()
         }
@@ -264,6 +271,11 @@ struct ContentView: View {
                     }
                 }
             )
+            // Re-inject the model so the nested GitHubAccountSection (inside
+            // ExternalTrackerSection) can read it via @EnvironmentObject;
+            // sheet content does not always inherit the presenter's
+            // environment objects.
+            .environmentObject(model)
         }
     }
 
@@ -686,20 +698,31 @@ struct ContentView: View {
     }
 
     private func workBoard() -> some View {
-        ScrollView(.horizontal) {
-            HStack(alignment: .top, spacing: workBoardColumnSpacing) {
-                ForEach(WorkBoardColumnKey.allCases) { column in
-                    workColumn(column)
+        GeometryReader { geometry in
+            let columnWidth: CGFloat = {
+                if geometry.size.width >= workBoardUltraWideThreshold {
+                    return workBoardColumnWidthMax
+                } else if geometry.size.width >= workBoardWideThreshold {
+                    return workBoardColumnWidthWide
+                } else {
+                    return workBoardColumnWidth
                 }
+            }()
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: workBoardColumnSpacing) {
+                    ForEach(WorkBoardColumnKey.allCases) { column in
+                        workColumn(column, width: columnWidth)
+                    }
+                }
+                .padding(.horizontal, workBoardHorizontalPadding)
+                .padding(.top, workBoardHorizontalPadding)
+                .frame(maxHeight: .infinity, alignment: .top)
             }
-            .padding(.horizontal, workBoardHorizontalPadding)
-            .padding(.top, workBoardHorizontalPadding)
-            .frame(maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func workColumn(_ column: WorkBoardColumnKey) -> some View {
+    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth) -> some View {
         let sections = model.workSections(in: column)
         let itemCount = sections.reduce(0) { $0 + $1.items.count }
 
@@ -746,7 +769,7 @@ struct ContentView: View {
             }
         }
         .padding(14)
-        .frame(width: workBoardColumnWidth, alignment: .topLeading)
+        .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1441,7 +1464,10 @@ private struct WorkBoardCardItem: View {
                     parentShortID: parentShortID,
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
-                    }
+                    },
+                    onOpenReviewTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
+                        ? { model.openReviewTerminal(for: task) }
+                        : nil
                 )
             }
             .buttonStyle(.plain)
@@ -1660,6 +1686,10 @@ struct WorkBoardCardView: View {
     /// `nil` when the card doesn't need to report badge hover (e.g.
     /// in the Designs viewer).
     var onDepBadgeHover: ((Bool) -> Void)? = nil
+    /// Invoked when the user taps the terminal icon on a Review-column
+    /// card. `nil` hides the button — callers only pass a closure when
+    /// `column == .review && task.prURL != nil`.
+    var onOpenReviewTerminal: (() -> Void)? = nil
 
     @State private var isHovered: Bool = false
 
@@ -1825,6 +1855,18 @@ struct WorkBoardCardView: View {
                             .buttonStyle(.plain)
                             .help("Open investigation doc: \(webURL)")
                         }
+                        if let openTerminal = onOpenReviewTerminal {
+                            Button {
+                                openTerminal()
+                            } label: {
+                                Image(systemName: "terminal")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.secondary)
+                                    .accessibilityLabel("Open terminal on PR branch")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open terminal on PR branch")
+                        }
                     }
                     if stacksStatusBadges {
                         HStack(spacing: 6) {
@@ -1854,6 +1896,9 @@ struct WorkBoardCardView: View {
                         font: .caption,
                         ambiguousRepoNames: ambiguousRepoNames
                     )
+                    if task.hasInProgressRevision {
+                        PrInRevisionIndicator()
+                    }
                     Spacer(minLength: 0)
                 }
             }
@@ -3327,10 +3372,176 @@ private struct ExternalTrackerSection: View {
                         Spacer()
                     }
                 }
+
+                GitHubAccountSection()
             }
         }
     }
 
+}
+
+/// "GitHub account" subsection of the external-tracker settings — drives
+/// and renders the engine-owned OAuth device flow (OAuth device-flow design
+/// §4/§7/§8). All flow logic lives in the engine; the display mapping lives
+/// in `GitHubAuthPresentation`. This view is a thin renderer over
+/// `model.gitHubAuthState` plus button wiring to the `gitHubAuth*` bridges.
+///
+/// The auth state is global (one github.com token shared across all
+/// GitHub-bound products), so this subsection shows the same state in every
+/// product's settings sheet.
+private struct GitHubAccountSection: View {
+    @EnvironmentObject private var model: ChatViewModel
+
+    private var presentation: GitHubAuthPresentation {
+        GitHubAuthPresentation.forState(model.gitHubAuthState)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .padding(.vertical, 2)
+
+            Text("GitHub account")
+                .font(.subheadline.weight(.semibold))
+
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if presentation.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: presentation.statusIcon)
+                        .foregroundStyle(.secondary)
+                }
+                Text(presentation.statusLine)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let prompt = presentation.pendingPrompt {
+                pendingPromptView(prompt)
+            }
+
+            ForEach(Array(presentation.banners.enumerated()), id: \.offset) { _, banner in
+                bannerView(banner)
+            }
+
+            if !presentation.actions.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(presentation.actions, id: \.self) { action in
+                        actionButton(action)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(_ action: GitHubAuthPresentation.Action) -> some View {
+        switch action {
+        case .connect:
+            Button(presentation.connectIsRestart ? "Start over" : "Connect") {
+                model.gitHubAuthConnect()
+            }
+        case .cancel:
+            Button("Cancel") {
+                model.gitHubAuthCancel()
+            }
+        case .disconnect:
+            Button("Disconnect", role: .destructive) {
+                model.gitHubAuthDisconnect()
+            }
+        case .reauthorize:
+            Button("Re-authorize") {
+                model.gitHubAuthReauthorize()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pendingPromptView(_ prompt: GitHubAuthPresentation.PendingPrompt) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Code")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(prompt.userCode)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                if let url = URL(string: prompt.openURL) {
+                    Link("Open in browser", destination: url)
+                }
+                Text(prompt.verificationURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text("Enter the code at the verification URL to authorize Boss for issue sync.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    @ViewBuilder
+    private func bannerView(_ banner: GitHubAuthPresentation.Banner) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: bannerIcon(banner.kind))
+                    .foregroundStyle(bannerColor(banner.kind))
+                Text(banner.message)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if banner.actionURL != nil || banner.offersRecheck {
+                HStack(spacing: 8) {
+                    if let urlString = banner.actionURL,
+                       let label = banner.actionLabel,
+                       let url = URL(string: urlString) {
+                        Link(label, destination: url)
+                    }
+                    if banner.offersRecheck {
+                        Button("Re-check") {
+                            model.gitHubAuthRecheck()
+                        }
+                    }
+                }
+                .font(.caption)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(bannerColor(banner.kind).opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func bannerIcon(_ kind: GitHubAuthPresentation.Banner.Kind) -> String {
+        switch kind {
+        case .needsOrgApproval: return "building.2"
+        case .needsSso: return "lock.shield"
+        case .unknownOrg: return "questionmark.circle"
+        case .limitedScopes: return "exclamationmark.triangle"
+        case .expired: return "clock.badge.exclamationmark"
+        case .denied: return "hand.raised"
+        case .error: return "exclamationmark.octagon"
+        }
+    }
+
+    private func bannerColor(_ kind: GitHubAuthPresentation.Banner.Kind) -> Color {
+        switch kind {
+        case .needsOrgApproval, .needsSso, .unknownOrg, .limitedScopes, .expired:
+            return .orange
+        case .denied, .error:
+            return .red
+        }
+    }
 }
 
 /// Capsule chip surfacing a repo's short name on a kanban card or
@@ -3608,6 +3819,27 @@ private struct PrMergingIndicator: View {
         @unknown default:
             return Color(red: 165/255, green: 107/255, blue: 0/255)
         }
+    }
+}
+
+/// Warning indicator shown on the PR card of a chain root when at least one
+/// descendant revision is still `todo` or `active`. Signals that new commits
+/// are incoming and the PR should not be merged yet.
+private struct PrInRevisionIndicator: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2.weight(.semibold))
+            Text("in revision")
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(Color.white)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.orange)
+        .clipShape(Capsule())
+        .help("A revision is in progress — do not merge this PR yet")
+        .accessibilityLabel("In revision — do not merge")
     }
 }
 

@@ -210,6 +210,17 @@ enum EngineEvent {
     /// Response to `list_attention_items_for_work_item` — open and
     /// resolved attention items for a given product/work-item id.
     case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])
+    /// Response to `open_review_terminal` — the engine has leased a
+    /// workspace, fetched the PR branch, and created a new jj commit
+    /// atop `<branch>@origin`. The app should open a Ghostty terminal
+    /// window rooted at `workspacePath`.
+    case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String)
+    /// GitHub OAuth auth-state push (OAuth device-flow design §4).
+    /// Delivered both as the immediate reply to a `git_hub_auth_*`
+    /// request and proactively on the `github.auth` topic as the
+    /// engine's device-flow poll loop advances. The DTO is display-safe;
+    /// the token and private device code never appear in it.
+    case gitHubAuthState(state: GitHubAuthState)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -395,6 +406,56 @@ final class EngineClient: @unchecked Sendable {
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
         ])
+    }
+
+    /// Ask the engine to lease a workspace for the given Review-column
+    /// work item, check out the PR head branch, and return the workspace
+    /// path for opening a Ghostty terminal. The engine replies with
+    /// `review_terminal_ready` or `work_error`.
+    func sendOpenReviewTerminal(workItemID: String) {
+        sendLine([
+            "type": "open_review_terminal",
+            "work_item_id": workItemID,
+        ])
+    }
+
+    /// Notify the engine that a review terminal window closed so it can
+    /// release the associated workspace lease. Fire-and-forget.
+    func sendReleaseReviewTerminal(leaseID: String) {
+        sendLine([
+            "type": "release_review_terminal",
+            "lease_id": leaseID,
+        ])
+    }
+
+    // MARK: GitHub OAuth device-flow (OAuth device-flow design §4)
+    //
+    // Four unit requests drive the engine-owned device-flow state machine.
+    // The engine replies to each with a `git_hub_auth_state` event and also
+    // pushes further `git_hub_auth_state` events on the `github.auth` topic
+    // as its poll loop advances. The `type` strings are serde's snake_case
+    // rendering of the `FrontendRequest::GitHubAuth*` variants.
+
+    /// Begin (or restart) the GitHub OAuth device flow for github.com.
+    func sendGitHubAuthStart() {
+        sendLine(["type": "git_hub_auth_start"])
+    }
+
+    /// Abort an in-progress device-flow authorization.
+    func sendGitHubAuthCancel() {
+        sendLine(["type": "git_hub_auth_cancel"])
+    }
+
+    /// Delete the stored OAuth token and return to `Disconnected`.
+    func sendGitHubAuthDisconnect() {
+        sendLine(["type": "git_hub_auth_disconnect"])
+    }
+
+    /// Request the current GitHub auth state. When connected this also
+    /// re-runs the engine's org/SSO probe, so it doubles as the "Re-check"
+    /// affordance behind the org-approval / SSO banners (design §7).
+    func sendGitHubAuthStatus() {
+        sendLine(["type": "git_hub_auth_status"])
     }
 
     func sendCreateProduct(name: String, description: String, repoRemoteURL: String) {
@@ -1141,6 +1202,26 @@ final class EngineClient: @unchecked Sendable {
                 if !workItemID.isEmpty {
                     emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
                 }
+            case "review_terminal_ready":
+                let workItemID = payload["work_item_id"] as? String ?? ""
+                let workspacePath = payload["workspace_path"] as? String ?? ""
+                let leaseID = payload["lease_id"] as? String ?? ""
+                if !workItemID.isEmpty && !workspacePath.isEmpty && !leaseID.isEmpty {
+                    emit(.reviewTerminalReady(
+                        workItemID: workItemID,
+                        workspacePath: workspacePath,
+                        leaseID: leaseID
+                    ))
+                }
+            case "git_hub_auth_state":
+                guard let statePayload = payload["state"] as? [String: Any],
+                      let stateData = try? JSONSerialization.data(withJSONObject: statePayload),
+                      let state = try? JSONDecoder().decode(GitHubAuthState.self, from: stateData)
+                else {
+                    emit(.error(message: "received invalid git_hub_auth_state payload"))
+                    break
+                }
+                emit(.gitHubAuthState(state: state))
             default:
                 break
             }
@@ -1284,7 +1365,8 @@ final class EngineClient: @unchecked Sendable {
             investigationDocBranch: payload["investigation_doc_branch"] as? String,
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
-            revisionParentPrUrl: payload["revision_parent_pr_url"] as? String
+            revisionParentPrUrl: payload["revision_parent_pr_url"] as? String,
+            hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false
         )
     }
 

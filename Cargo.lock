@@ -248,10 +248,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bon",
  "boss-client",
  "boss-protocol",
  "clap",
  "fastrand 2.3.0",
+ "keyring",
  "libc",
  "regex",
  "reqwest",

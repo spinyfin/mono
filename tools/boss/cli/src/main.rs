@@ -13,7 +13,8 @@ use boss_protocol::{
     CreateRevisionInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
     DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
-    FrontendRequest, LinkExternalRefInput, ListDependenciesInput, Product, Project,
+    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    OrgAuthState, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
     SetTaskInvestigationDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
@@ -158,6 +159,15 @@ enum Commands {
     /// Reads BK_API_TOKEN from the environment. See
     /// tools/boss/docs/buildkite-release-setup.md for provisioning.
     Release,
+    /// GitHub integration management.
+    ///
+    /// Subcommands for managing the Boss ↔ GitHub OAuth connection used
+    /// by issue sync. Drives the same engine RPCs as the macOS app's
+    /// issue-sync settings UI — useful for headless setups and testing.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -595,6 +605,45 @@ enum EngineAttemptsCommand {
     /// conflicts list` / `boss engine ci list` for callers who want
     /// one merged view (design Phase 11 #36).
     List(EngineAttemptsListArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubCommand {
+    /// Manage the GitHub OAuth token used by issue sync.
+    Auth {
+        #[command(subcommand)]
+        command: GithubAuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubAuthCommand {
+    /// Authenticate with GitHub via the OAuth device flow.
+    ///
+    /// Initiates a device-flow authorization against the Boss OAuth App.
+    /// The engine requests a device code from GitHub, prints it for you to
+    /// enter at github.com/login/device (or via the printed URL), and polls
+    /// until authorization completes or expires.
+    ///
+    /// On success the token is stored in the macOS keychain and issue sync
+    /// will use it on the next reconcile tick. To check the stored state
+    /// afterwards, use `boss github auth status`.
+    Login,
+    /// Print the current GitHub auth state.
+    ///
+    /// Reports whether a stored OAuth token exists, the GitHub login it
+    /// belongs to, the granted scopes, and the org/SSO access state for
+    /// the bound org. Also triggers a re-probe of the org/SSO state when
+    /// a token is present (clears the approval banner if the org owner
+    /// has since granted access or the user has SSO-authorized the token).
+    Status,
+    /// Remove the stored GitHub OAuth token.
+    ///
+    /// Deletes the token from the macOS keychain. Issue sync falls back to
+    /// the ambient `gh auth` credential after this. Does not revoke the
+    /// token server-side — to fully revoke, visit
+    /// https://github.com/settings/applications.
+    Logout,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2069,6 +2118,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Uninstall(args) => run_uninstall_command(args, &cli.global).await,
         Commands::Shake(args) => run_shake_command(args, &cli.global).await,
         Commands::Release => run_release_command(&cli.global).await,
+        Commands::Github { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_github_command(command, &ctx).await
+        }
     }
 }
 
@@ -3204,6 +3257,221 @@ fn label_titlecase(label: &str) -> &'static str {
         "task" => "Task",
         "chore" => "Chore",
         _ => "Item",
+    }
+}
+
+async fn run_github_command(command: GithubCommand, ctx: &RunContext) -> Result<(), CliError> {
+    match command {
+        GithubCommand::Auth { command } => run_github_auth_command(command, ctx).await,
+    }
+}
+
+async fn run_github_auth_command(
+    command: GithubAuthCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        GithubAuthCommand::Login => run_github_auth_login(ctx).await,
+        GithubAuthCommand::Status => run_github_auth_status(ctx).await,
+        GithubAuthCommand::Logout => run_github_auth_logout(ctx).await,
+    }
+}
+
+async fn run_github_auth_login(ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+
+    let response = client
+        .send_request(&FrontendRequest::GitHubAuthStart)
+        .await
+        .map_err(CliError::internal)?;
+
+    let mut state = match response {
+        FrontendEvent::GitHubAuthState { state } => state,
+        other => {
+            return Err(CliError::internal(anyhow::anyhow!(
+                "unexpected response to GitHubAuthStart: {other:?}"
+            )));
+        }
+    };
+
+    let mut code_shown = false;
+
+    loop {
+        let poll_secs: u64 = match &state {
+            GitHubAuthStateDto::Authorized {
+                login,
+                granted_scopes,
+                org_state,
+            } => {
+                let json = serde_json::json!({
+                    "status": "authorized",
+                    "login": login,
+                    "granted_scopes": granted_scopes,
+                    "org_state": org_state,
+                });
+                let (login, granted_scopes, org_state) =
+                    (login.clone(), granted_scopes.clone(), org_state.clone());
+                return print_entity(ctx, &json, move || {
+                    println!("Authorized as @{login}");
+                    println!("Scopes: {}", granted_scopes.join(", "));
+                    print_org_state_human(&org_state);
+                });
+            }
+            GitHubAuthStateDto::Expired => {
+                return Err(CliError::application(
+                    "Device code expired. Run `boss github auth login` again to start over.",
+                ));
+            }
+            GitHubAuthStateDto::Denied => {
+                return Err(CliError::application(
+                    "Authorization denied. Run `boss github auth login` again to start over.",
+                ));
+            }
+            GitHubAuthStateDto::Error { message } => {
+                return Err(CliError::application(format!("Auth error: {message}")));
+            }
+            GitHubAuthStateDto::PendingUserAuth {
+                user_code,
+                verification_uri,
+                verification_uri_complete,
+                interval_seconds,
+                ..
+            } => {
+                if !code_shown && matches!(ctx.output_mode, OutputMode::Human) {
+                    println!("Open this URL in a browser to authorize Boss:");
+                    if let Some(complete) = verification_uri_complete {
+                        println!("  {complete}");
+                        println!(
+                            "Or visit {} and enter code: {user_code}",
+                            verification_uri
+                        );
+                    } else {
+                        println!("  {verification_uri}");
+                        println!("Enter code: {user_code}");
+                    }
+                    println!("Waiting for authorization...");
+                }
+                code_shown = true;
+                *interval_seconds as u64
+            }
+            GitHubAuthStateDto::RequestingCode | GitHubAuthStateDto::Disconnected => 2,
+        };
+
+        tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+
+        let response = client
+            .send_request(&FrontendRequest::GitHubAuthStatus)
+            .await
+            .map_err(CliError::internal)?;
+        state = match response {
+            FrontendEvent::GitHubAuthState { state } => state,
+            other => {
+                return Err(CliError::internal(anyhow::anyhow!(
+                    "unexpected response to GitHubAuthStatus: {other:?}"
+                )));
+            }
+        };
+    }
+}
+
+async fn run_github_auth_status(ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let response = client
+        .send_request(&FrontendRequest::GitHubAuthStatus)
+        .await
+        .map_err(CliError::internal)?;
+    match response {
+        FrontendEvent::GitHubAuthState { state } => {
+            let json = serde_json::to_value(&state).unwrap_or(serde_json::Value::Null);
+            print_entity(ctx, &json, || print_auth_state_human(&state))
+        }
+        other => Err(CliError::internal(anyhow::anyhow!(
+            "unexpected response to GitHubAuthStatus: {other:?}"
+        ))),
+    }
+}
+
+async fn run_github_auth_logout(ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let response = client
+        .send_request(&FrontendRequest::GitHubAuthDisconnect)
+        .await
+        .map_err(CliError::internal)?;
+    match response {
+        FrontendEvent::GitHubAuthState { .. } => print_entity(
+            ctx,
+            &serde_json::json!({ "status": "disconnected" }),
+            || {
+                if !ctx.quiet {
+                    println!(
+                        "Disconnected. Token removed from keychain. Issue sync will fall back \
+                         to ambient `gh auth` credentials."
+                    );
+                }
+            },
+        ),
+        other => Err(CliError::internal(anyhow::anyhow!(
+            "unexpected response to GitHubAuthDisconnect: {other:?}"
+        ))),
+    }
+}
+
+fn print_auth_state_human(state: &GitHubAuthStateDto) {
+    match state {
+        GitHubAuthStateDto::Disconnected => {
+            println!("Not connected. Run `boss github auth login` to authenticate.");
+        }
+        GitHubAuthStateDto::RequestingCode => {
+            println!("Requesting device code from GitHub...");
+        }
+        GitHubAuthStateDto::PendingUserAuth {
+            user_code,
+            verification_uri,
+            verification_uri_complete,
+            ..
+        } => {
+            println!("Pending authorization. Open this URL in a browser:");
+            if let Some(complete) = verification_uri_complete {
+                println!("  {complete}");
+                println!("Or visit {} and enter code: {user_code}", verification_uri);
+            } else {
+                println!("  {verification_uri}");
+                println!("Enter code: {user_code}");
+            }
+        }
+        GitHubAuthStateDto::Authorized {
+            login,
+            granted_scopes,
+            org_state,
+        } => {
+            println!("Authorized as @{login}");
+            println!("Scopes: {}", granted_scopes.join(", "));
+            print_org_state_human(org_state);
+        }
+        GitHubAuthStateDto::Expired => {
+            println!("Device code expired. Run `boss github auth login` to start over.");
+        }
+        GitHubAuthStateDto::Denied => {
+            println!("Authorization denied. Run `boss github auth login` to start over.");
+        }
+        GitHubAuthStateDto::Error { message } => {
+            println!("Auth error: {message}");
+        }
+    }
+}
+
+fn print_org_state_human(org_state: &OrgAuthState) {
+    match org_state {
+        OrgAuthState::Ok => println!("Org access: OK"),
+        OrgAuthState::NeedsOrgApproval { request_url } => {
+            println!("Org access: needs org-owner approval");
+            println!("  Approval page: {request_url}");
+        }
+        OrgAuthState::NeedsSso { sso_url } => {
+            println!("Org access: needs SAML SSO authorization");
+            println!("  Authorize: {sso_url}");
+        }
+        OrgAuthState::Unknown => println!("Org access: unknown (probe failed)"),
     }
 }
 

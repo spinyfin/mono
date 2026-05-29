@@ -12,14 +12,18 @@
 //! - [`GitHubAuthController`] — state machine driver that T-4 uses from
 //!   `app.rs` to handle `GitHubAuthStart/Cancel/Disconnect/Status` RPCs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 
 use boss_protocol::{GitHubAuthStateDto, OrgAuthState};
+
+use crate::external_tracker::github::GitHubConfig;
+use crate::work::WorkDb;
 
 // ── Client-id + GitHub endpoint constants ────────────────────────────────────
 
@@ -73,7 +77,8 @@ impl Default for DeviceFlowConfig {
 
 // ── GitHub API response shapes ────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 struct RawDeviceCodeResponse {
     device_code: String,
     user_code: String,
@@ -112,7 +117,8 @@ struct RawUserResponse {
 /// Information returned from the device-code request step.
 /// The `device_code` is a bearer-equivalent secret kept internal to the engine;
 /// the UI only ever sees `user_code` and `verification_uri` via the DTO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DeviceCodeInfo {
     /// Bearer-equivalent secret — never send to the UI.
     pub device_code: String,
@@ -124,9 +130,9 @@ pub struct DeviceCodeInfo {
     pub interval_secs: u64,
 }
 
-/// Captured token with identity metadata.  T-3 will persist this in the
-/// macOS keychain.
-#[derive(Debug, Clone)]
+/// Captured token with identity metadata.  Persisted in the macOS keychain
+/// by [`KeychainTokenStore`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub token: String,
     pub login: String,
@@ -530,19 +536,82 @@ pub struct GitHubAuthController {
     state_tx: watch::Sender<GitHubAuthState>,
     cancel_slot: Arc<Mutex<Option<watch::Sender<bool>>>>,
     flow: Arc<DeviceFlow>,
+    /// Durable token store.  `Some` in production (the engine wires the
+    /// keychain in); `None` in unit tests that only exercise the in-memory
+    /// state machine.  When present, the controller persists the captured
+    /// token on `Authorized` and deletes it on `disconnect`.
+    store: Option<Arc<KeychainTokenStore>>,
 }
 
 impl GitHubAuthController {
-    /// Create a new controller.  Returns the controller and an initial state
-    /// receiver that the caller can watch for state-change notifications.
+    /// Create a new controller with no durable store.  Returns the controller
+    /// and an initial state receiver that the caller can watch for state-change
+    /// notifications.  Used by tests that only exercise the state machine.
     pub fn new(flow: DeviceFlow) -> (Self, watch::Receiver<GitHubAuthState>) {
+        Self::build(flow, None)
+    }
+
+    /// Create a controller backed by a durable [`KeychainTokenStore`].  The
+    /// captured token is persisted on `Authorized` (before the state is
+    /// broadcast, so a sync that fires immediately afterward finds it) and
+    /// deleted on `disconnect`.  This is the production constructor T-4 uses
+    /// from `app.rs`.
+    pub fn with_store(
+        flow: DeviceFlow,
+        store: Arc<KeychainTokenStore>,
+    ) -> (Self, watch::Receiver<GitHubAuthState>) {
+        Self::build(flow, Some(store))
+    }
+
+    fn build(
+        flow: DeviceFlow,
+        store: Option<Arc<KeychainTokenStore>>,
+    ) -> (Self, watch::Receiver<GitHubAuthState>) {
         let (tx, rx) = watch::channel(GitHubAuthState::Disconnected);
         let ctrl = Self {
             state_tx: tx,
             cancel_slot: Arc::new(Mutex::new(None)),
             flow: Arc::new(flow),
+            store,
         };
         (ctrl, rx)
+    }
+
+    /// Handle to the underlying [`DeviceFlow`].  T-4's orchestrator uses this
+    /// to run the org/SSO probe ([`probe_and_record_org_state`]) with the
+    /// engine's shared HTTP client rather than standing up a second one.
+    pub fn device_flow(&self) -> Arc<DeviceFlow> {
+        Arc::clone(&self.flow)
+    }
+
+    /// Re-hydrate state from the durable store at engine startup.  If a token
+    /// is persisted, transitions to `Authorized { org_state: Unknown }` so the
+    /// status surface reflects the connection across engine restarts; the org
+    /// probe then runs to resolve `org_state`.  A keychain read error is
+    /// logged and treated as "no token" (design §5: keychain unavailable →
+    /// fall back, never panic).  Returns `true` if a token was restored.
+    pub fn restore_from_store(&self) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        match store.get() {
+            Ok(Some(record)) => {
+                self.state_tx.send_replace(GitHubAuthState::Authorized {
+                    record,
+                    org_state: OrgAuthState::Unknown,
+                });
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "boss_engine::external_tracker::github_oauth",
+                    error = %e,
+                    "restore_from_store: keychain read failed; treating as disconnected"
+                );
+                false
+            }
+        }
     }
 
     /// Subscribe to state changes.  Each call returns a new receiver starting
@@ -574,6 +643,7 @@ impl GitHubAuthController {
 
         let flow = Arc::clone(&self.flow);
         let state_tx = self.state_tx.clone();
+        let store = self.store.clone();
 
         tokio::spawn(async move {
             // Step 1: request device + user code.
@@ -614,8 +684,24 @@ impl GitHubAuthController {
             // Transition based on poll outcome.
             let new_state = match outcome {
                 PollOutcome::Authorized(record) => {
-                    // T-3 will add keychain persistence here.
-                    // Org state is Unknown until T-4 runs probe_org_state().
+                    // Persist the captured token to the durable store before
+                    // broadcasting `Authorized`, so a reconcile tick that fires
+                    // immediately afterward resolves the token via the keychain.
+                    // A keychain write failure is logged but does not fail the
+                    // flow — the in-memory state still reflects the live token
+                    // (design §5: keychain unavailable → fall back, don't abort).
+                    if let Some(store) = &store {
+                        if let Err(e) = store.set(&record) {
+                            tracing::error!(
+                                target: "boss_engine::external_tracker::github_oauth",
+                                error = %e,
+                                "failed to persist OAuth token to keychain; \
+                                 token held in memory only"
+                            );
+                        }
+                    }
+                    // Org state is Unknown here; T-4's orchestrator runs the
+                    // org/SSO probe and calls `update_org_state` to resolve it.
                     GitHubAuthState::Authorized {
                         record,
                         org_state: OrgAuthState::Unknown,
@@ -638,9 +724,20 @@ impl GitHubAuthController {
     }
 
     /// Disconnect: immediately transition to `Disconnected` and delete any
-    /// stored token.  T-3 will add the keychain deletion here.
+    /// stored token.  The keychain deletion is unconditional and local even if
+    /// the network is down (design §5); a delete failure is logged but the
+    /// in-memory state still drops to `Disconnected`.
     pub async fn disconnect(&self) {
         self.signal_cancel().await;
+        if let Some(store) = &self.store {
+            if let Err(e) = store.delete() {
+                tracing::warn!(
+                    target: "boss_engine::external_tracker::github_oauth",
+                    error = %e,
+                    "disconnect: failed to delete OAuth token from keychain"
+                );
+            }
+        }
         self.state_tx.send_replace(GitHubAuthState::Disconnected);
     }
 
@@ -665,6 +762,175 @@ impl GitHubAuthController {
     }
 }
 
+// ── Org/SSO probe orchestration (T-4) ─────────────────────────────────────────
+
+/// Attention-item kind raised when the OAuth App is not yet approved for a
+/// GitHub-bound product's org.
+pub(crate) const ATTN_ORG_UNAPPROVED: &str = "github_oauth_org_unapproved";
+/// Attention-item kind raised when the stored token needs SAML SSO
+/// authorization for a GitHub-bound product's org.
+pub(crate) const ATTN_SSO_REQUIRED: &str = "github_oauth_sso_required";
+
+/// Run the org/SSO probe (design §7) for every GitHub-bound product and reflect
+/// the outcome as product attention items (design §8), returning the aggregate
+/// [`OrgAuthState`] for the single per-host auth state.
+///
+/// For each product whose `external_tracker_kind == "github"`, the org login is
+/// read from its stored [`GitHubConfig`] and probed with the captured token.
+/// Probe results are cached per distinct org, so N products sharing one org
+/// cost a single probe. Per product the matching attention item is raised (and
+/// the other auth-attention kind resolved):
+/// - `Ok` → resolve both auth attention kinds.
+/// - `NeedsOrgApproval` → raise [`ATTN_ORG_UNAPPROVED`], resolve the SSO one.
+/// - `NeedsSso` → raise [`ATTN_SSO_REQUIRED`], resolve the approval one.
+/// - `Unknown` → inconclusive (network/parse error): leave items untouched so a
+///   transient blip doesn't flap the banner.
+///
+/// The returned aggregate is the "worst" state across products
+/// (`NeedsSso` > `NeedsOrgApproval` > `Ok` > `Unknown`); the orchestrator
+/// records it on the controller via `update_org_state`. When no GitHub-bound
+/// product exists the result is `Unknown`.
+pub(crate) async fn probe_and_record_org_state(
+    work_db: &WorkDb,
+    flow: &DeviceFlow,
+    token: &str,
+) -> OrgAuthState {
+    let products = match work_db.list_products() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "boss_engine::external_tracker::github_oauth",
+                error = %e,
+                "probe_and_record_org_state: list_products failed"
+            );
+            return OrgAuthState::Unknown;
+        }
+    };
+
+    let mut per_org: HashMap<String, OrgAuthState> = HashMap::new();
+    let mut aggregate = OrgAuthState::Unknown;
+    let mut probed_any = false;
+
+    for product in &products {
+        let org = match (
+            product.external_tracker_kind.as_deref(),
+            product.external_tracker_config.as_ref(),
+        ) {
+            (Some("github"), Some(config)) => {
+                match serde_json::from_value::<GitHubConfig>(config.clone()) {
+                    Ok(cfg) => cfg.org,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "boss_engine::external_tracker::github_oauth",
+                            product_id = %product.id, error = %e,
+                            "probe_and_record_org_state: invalid GitHub config; skipping product"
+                        );
+                        continue;
+                    }
+                }
+            }
+            _ => continue,
+        };
+
+        let state = match per_org.get(&org) {
+            Some(s) => s.clone(),
+            None => {
+                let s = flow.probe_org_state(token, Some(org.as_str())).await;
+                per_org.insert(org.clone(), s.clone());
+                s
+            }
+        };
+
+        probed_any = true;
+        apply_org_attention(work_db, &product.id, &state);
+        aggregate = merge_org_state(aggregate, state);
+    }
+
+    if !probed_any {
+        return OrgAuthState::Unknown;
+    }
+    aggregate
+}
+
+/// Raise the attention item matching `state` on `product_id` and resolve the
+/// opposing auth-attention kind. Idempotent: `upsert_external_tracker_attention`
+/// is a no-op when an open item of the same kind already exists, so this can
+/// run every probe tick without piling up rows.
+fn apply_org_attention(work_db: &WorkDb, product_id: &str, state: &OrgAuthState) {
+    let resolve = |kind: &str| {
+        if let Err(e) = work_db.resolve_external_tracker_attention(product_id, kind) {
+            tracing::warn!(
+                target: "boss_engine::external_tracker::github_oauth",
+                %product_id, %kind, error = %e,
+                "resolve_external_tracker_attention (github oauth) failed"
+            );
+        }
+    };
+    let raise = |kind: &str, title: &str, body: &str| {
+        if let Err(e) = work_db.upsert_external_tracker_attention(product_id, kind, title, body) {
+            tracing::warn!(
+                target: "boss_engine::external_tracker::github_oauth",
+                %product_id, %kind, error = %e,
+                "upsert_external_tracker_attention (github oauth) failed"
+            );
+        }
+    };
+
+    match state {
+        OrgAuthState::Ok => {
+            resolve(ATTN_ORG_UNAPPROVED);
+            resolve(ATTN_SSO_REQUIRED);
+        }
+        OrgAuthState::NeedsOrgApproval { request_url } => {
+            let body = format!(
+                "Boss is connected to GitHub, but the Boss OAuth App is not yet approved \
+                 for this product's organization, so issue sync cannot read its private \
+                 issues.\n\nAn organization owner must approve the app at:\n\n{request_url}\n\n\
+                 Sync recovers automatically once approval is granted."
+            );
+            raise(
+                ATTN_ORG_UNAPPROVED,
+                "GitHub OAuth App not approved for this organization",
+                &body,
+            );
+            resolve(ATTN_SSO_REQUIRED);
+        }
+        OrgAuthState::NeedsSso { sso_url } => {
+            let body = format!(
+                "Boss is connected to GitHub, but the stored token needs SAML SSO \
+                 authorization for this product's organization before issue sync can \
+                 read its private issues.\n\nAuthorize the token via SSO at:\n\n{sso_url}\n\n\
+                 Sync recovers automatically once the token is SSO-authorized."
+            );
+            raise(
+                ATTN_SSO_REQUIRED,
+                "GitHub token needs SAML SSO authorization",
+                &body,
+            );
+            resolve(ATTN_ORG_UNAPPROVED);
+        }
+        OrgAuthState::Unknown => {
+            // Inconclusive (network error / no org binding). Leave any existing
+            // items as-is; the next probe (sync 403 or a Re-check) reclassifies.
+        }
+    }
+}
+
+/// Aggregate two org states into the "worst" for the single per-host auth
+/// state: `NeedsSso` > `NeedsOrgApproval` > `Ok` > `Unknown`. A transient
+/// `Unknown` from one org never downgrades an `Ok` reached for another.
+fn merge_org_state(acc: OrgAuthState, next: OrgAuthState) -> OrgAuthState {
+    fn rank(s: &OrgAuthState) -> u8 {
+        match s {
+            OrgAuthState::Unknown => 0,
+            OrgAuthState::Ok => 1,
+            OrgAuthState::NeedsOrgApproval { .. } => 2,
+            OrgAuthState::NeedsSso { .. } => 3,
+        }
+    }
+    if rank(&next) >= rank(&acc) { next } else { acc }
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
@@ -674,14 +940,201 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+// ── KeychainTokenStore ────────────────────────────────────────────────────────
+
+/// OS keychain coordinates for the stored OAuth token.
+pub(crate) const KEYCHAIN_SERVICE: &str = "dev.spinyfin.boss.github";
+pub(crate) const KEYCHAIN_ACCOUNT: &str = "oauth-user-token@github.com";
+
+/// Error type for [`KeychainTokenStore`] operations.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenStoreError {
+    #[error("keychain error: {0}")]
+    Keychain(#[from] keyring::Error),
+    #[error("token record (de)serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Low-level storage backend abstraction.  The production impl uses
+/// [`keyring::Entry`]; tests inject [`FakeStore`] to avoid touching the
+/// real keychain.
+pub(crate) trait KeystoreBackend: Send + Sync {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError>;
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError>;
+    fn delete_raw(&self) -> Result<(), TokenStoreError>;
+}
+
+/// Production backend: delegates to the OS keychain via `keyring::Entry`.
+struct KeyringBackend;
+
+impl KeystoreBackend for KeyringBackend {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        match entry.get_password() {
+            Ok(s) => Ok(Some(s)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(TokenStoreError::Keychain(e)),
+        }
+    }
+
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        entry.set_password(value).map_err(TokenStoreError::Keychain)
+    }
+
+    fn delete_raw(&self) -> Result<(), TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(TokenStoreError::Keychain(e)),
+        }
+    }
+}
+
+/// Stores and retrieves a [`TokenRecord`] in the OS keychain.
+///
+/// The value at rest is a JSON blob serialised from / into [`TokenRecord`].
+/// Production code constructs this with [`KeychainTokenStore::new`]; tests
+/// supply a [`FakeStore`] via [`KeychainTokenStore::with_backend`].
+pub struct KeychainTokenStore {
+    backend: Box<dyn KeystoreBackend>,
+}
+
+impl KeychainTokenStore {
+    /// Creates a store backed by the real OS keychain.
+    pub fn new() -> Self {
+        Self { backend: Box::new(KeyringBackend) }
+    }
+
+    /// Creates a store backed by the given test fake.  Only available in
+    /// `#[cfg(test)]` builds.
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: impl KeystoreBackend + 'static) -> Self {
+        Self { backend: Box::new(backend) }
+    }
+
+    /// Returns the stored [`TokenRecord`], or `None` if no token is present.
+    pub fn get(&self) -> Result<Option<TokenRecord>, TokenStoreError> {
+        match self.backend.get_raw()? {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persists a [`TokenRecord`] in the keychain, overwriting any prior value.
+    pub fn set(&self, record: &TokenRecord) -> Result<(), TokenStoreError> {
+        let s = serde_json::to_string(record)?;
+        self.backend.set_raw(&s)
+    }
+
+    /// Removes the stored token.  A no-op if none is present.
+    pub fn delete(&self) -> Result<(), TokenStoreError> {
+        self.backend.delete_raw()
+    }
+}
+
+// ── FakeStore (test-only) ─────────────────────────────────────────────────────
+
+/// In-memory [`KeystoreBackend`] for tests.  Never touches the real keychain.
+#[cfg(test)]
+pub(crate) struct FakeStore(std::sync::Mutex<Option<String>>);
+
+#[cfg(test)]
+impl FakeStore {
+    pub(crate) fn empty() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    pub(crate) fn prefilled(record: &TokenRecord) -> Self {
+        let s = serde_json::to_string(record).expect("TokenRecord should serialize");
+        Self(std::sync::Mutex::new(Some(s)))
+    }
+}
+
+#[cfg(test)]
+impl KeystoreBackend for FakeStore {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError> {
+        *self.0.lock().unwrap() = Some(value.to_owned());
+        Ok(())
+    }
+
+    fn delete_raw(&self) -> Result<(), TokenStoreError> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
+    use boss_protocol::CreateProductInput;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sample_record() -> TokenRecord {
+        TokenRecord {
+            token: "gho_sample".to_owned(),
+            login: "octocat".to_owned(),
+            granted_scopes: vec!["repo".to_owned(), "project".to_owned()],
+            obtained_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn keychain_store_round_trips_token_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        assert!(store.get().unwrap().is_none());
+
+        let record = sample_record();
+        store.set(&record).unwrap();
+
+        let got = store.get().unwrap().expect("should have a record");
+        assert_eq!(got.token, record.token);
+        assert_eq!(got.login, record.login);
+        assert_eq!(got.granted_scopes, record.granted_scopes);
+        assert_eq!(got.obtained_at, record.obtained_at);
+    }
+
+    #[test]
+    fn keychain_store_delete_removes_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record()));
+        assert!(store.get().unwrap().is_some());
+
+        store.delete().unwrap();
+        assert!(store.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn keychain_store_delete_is_idempotent_when_empty() {
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        store.delete().unwrap(); // should not error
+    }
+
+    #[test]
+    fn keychain_store_set_overwrites_existing_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record()));
+        let new_record = TokenRecord {
+            token: "gho_new_token".to_owned(),
+            login: "newuser".to_owned(),
+            granted_scopes: vec!["repo".to_owned()],
+            obtained_at: 1_800_000_000,
+        };
+        store.set(&new_record).unwrap();
+
+        let got = store.get().unwrap().expect("should have a record");
+        assert_eq!(got.token, "gho_new_token");
+        assert_eq!(got.login, "newuser");
+    }
 
     // Install rustls crypto provider once per test process.
     fn test_client() -> reqwest::Client {
@@ -1319,5 +1772,269 @@ mod tests {
             ),
             "expected OrgAuthState::Ok"
         );
+    }
+
+    // ── Keychain wiring (T-4) tests ──────────────────────────────────────────
+
+    async fn mount_full_flow(server: &MockServer, token: &str, login: &str, scopes: &str) {
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dc-test",
+                "user_code": "TEST-CODE",
+                "verification_uri": "https://github.com/login/device",
+                "expires_in": 900,
+                "interval": 0
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": token,
+                "token_type": "bearer"
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(user_mock(login, scopes))
+            .mount(server)
+            .await;
+    }
+
+    async fn wait_until_authorized(rx: &mut watch::Receiver<GitHubAuthState>) {
+        while matches!(
+            *rx.borrow(),
+            GitHubAuthState::Disconnected
+                | GitHubAuthState::RequestingCode
+                | GitHubAuthState::PendingUserAuth { .. }
+        ) {
+            rx.changed().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_with_store_persists_token_on_authorized() {
+        let server = MockServer::start().await;
+        mount_full_flow(&server, "gho_persist", "grace", "repo, project").await;
+
+        let store = Arc::new(KeychainTokenStore::with_backend(FakeStore::empty()));
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let (ctrl, mut rx) = GitHubAuthController::with_store(flow, Arc::clone(&store));
+
+        ctrl.start_flow().await;
+        wait_until_authorized(&mut rx).await;
+
+        let persisted = store.get().unwrap().expect("token should be persisted");
+        assert_eq!(persisted.login, "grace");
+        assert_eq!(persisted.token, "gho_persist");
+    }
+
+    #[tokio::test]
+    async fn controller_with_store_deletes_token_on_disconnect() {
+        let server = MockServer::start().await;
+        let store =
+            Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let (ctrl, _rx) = GitHubAuthController::with_store(flow, Arc::clone(&store));
+
+        assert!(store.get().unwrap().is_some());
+        ctrl.disconnect().await;
+
+        assert!(
+            store.get().unwrap().is_none(),
+            "disconnect must clear the keychain item"
+        );
+        assert!(matches!(ctrl.current_state(), GitHubAuthState::Disconnected));
+    }
+
+    #[tokio::test]
+    async fn controller_restore_from_store_rehydrates_authorized() {
+        let server = MockServer::start().await;
+        let store =
+            Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let (ctrl, _rx) = GitHubAuthController::with_store(flow, store);
+
+        assert!(matches!(ctrl.current_state(), GitHubAuthState::Disconnected));
+        assert!(ctrl.restore_from_store(), "should report a restored token");
+
+        assert!(
+            matches!(
+                ctrl.current_state(),
+                GitHubAuthState::Authorized {
+                    ref record,
+                    org_state: OrgAuthState::Unknown
+                } if record.login == "octocat"
+            ),
+            "expected restored Authorized(octocat) with Unknown org_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_restore_from_store_noop_when_empty() {
+        let server = MockServer::start().await;
+        let store = Arc::new(KeychainTokenStore::with_backend(FakeStore::empty()));
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let (ctrl, _rx) = GitHubAuthController::with_store(flow, store);
+
+        assert!(!ctrl.restore_from_store());
+        assert!(matches!(ctrl.current_state(), GitHubAuthState::Disconnected));
+    }
+
+    // ── Org/SSO probe orchestration (T-4) tests ──────────────────────────────
+
+    fn github_product_db(org: &str) -> (WorkDb, String) {
+        let db = WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory WorkDb");
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Test Product".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .expect("create product");
+        let config = serde_json::json!({
+            "org": org,
+            "repo": "mono",
+            "project_number": 1
+        });
+        db.set_product_external_tracker(&product.id, Some("github"), Some(&config), false)
+            .expect("set external tracker");
+        (db, product.id)
+    }
+
+    fn open_attn_kinds(db: &WorkDb, product_id: &str) -> Vec<String> {
+        db.list_attention_items_for_work_item(product_id)
+            .expect("list attention items")
+            .into_iter()
+            .filter(|a| a.status == "open")
+            .map(|a| a.kind)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn probe_org_state_raises_org_approval_attention_on_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/spinyfin"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let (db, product_id) = github_product_db("spinyfin");
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+
+        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
+
+        assert!(
+            matches!(state, OrgAuthState::NeedsOrgApproval { .. }),
+            "expected NeedsOrgApproval, got {state:?}"
+        );
+        let kinds = open_attn_kinds(&db, &product_id);
+        assert!(
+            kinds.contains(&ATTN_ORG_UNAPPROVED.to_owned()),
+            "expected org-unapproved attention item, got {kinds:?}"
+        );
+        assert!(!kinds.contains(&ATTN_SSO_REQUIRED.to_owned()));
+    }
+
+    #[tokio::test]
+    async fn probe_org_state_raises_sso_attention_on_sso_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/spinyfin"))
+            .respond_with(ResponseTemplate::new(403).append_header(
+                "X-GitHub-SSO",
+                "required; url=https://github.com/orgs/spinyfin/sso?token=abc",
+            ))
+            .mount(&server)
+            .await;
+
+        let (db, product_id) = github_product_db("spinyfin");
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+
+        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
+
+        assert!(
+            matches!(state, OrgAuthState::NeedsSso { .. }),
+            "expected NeedsSso, got {state:?}"
+        );
+        let kinds = open_attn_kinds(&db, &product_id);
+        assert!(
+            kinds.contains(&ATTN_SSO_REQUIRED.to_owned()),
+            "expected sso-required attention item, got {kinds:?}"
+        );
+        assert!(!kinds.contains(&ATTN_ORG_UNAPPROVED.to_owned()));
+    }
+
+    #[tokio::test]
+    async fn probe_org_state_ok_resolves_stale_attention() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/spinyfin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "login": "spinyfin" })),
+            )
+            .mount(&server)
+            .await;
+
+        let (db, product_id) = github_product_db("spinyfin");
+        // Seed a stale org-approval attention item; a successful probe must
+        // resolve it (design §7 "Re-check" recovery).
+        db.upsert_external_tracker_attention(&product_id, ATTN_ORG_UNAPPROVED, "stale", "stale")
+            .unwrap();
+        assert!(open_attn_kinds(&db, &product_id).contains(&ATTN_ORG_UNAPPROVED.to_owned()));
+
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
+
+        assert!(matches!(state, OrgAuthState::Ok), "expected Ok, got {state:?}");
+        assert!(
+            open_attn_kinds(&db, &product_id).is_empty(),
+            "Ok probe must resolve stale auth attention items"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_org_state_unknown_without_github_products() {
+        let server = MockServer::start().await;
+        let db = WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory WorkDb");
+        let flow = DeviceFlow::new(config_for(&server), test_client());
+
+        let state = probe_and_record_org_state(&db, &flow, "gho_tok").await;
+        assert!(matches!(state, OrgAuthState::Unknown));
+    }
+
+    #[test]
+    fn merge_org_state_prefers_worst() {
+        let ok = OrgAuthState::Ok;
+        let approval = OrgAuthState::NeedsOrgApproval {
+            request_url: "u".to_owned(),
+        };
+        let sso = OrgAuthState::NeedsSso {
+            sso_url: "s".to_owned(),
+        };
+        assert!(matches!(
+            merge_org_state(OrgAuthState::Unknown, ok.clone()),
+            OrgAuthState::Ok
+        ));
+        assert!(matches!(
+            merge_org_state(ok.clone(), approval.clone()),
+            OrgAuthState::NeedsOrgApproval { .. }
+        ));
+        assert!(matches!(
+            merge_org_state(approval, sso),
+            OrgAuthState::NeedsSso { .. }
+        ));
+        // A transient Unknown never downgrades an Ok.
+        assert!(matches!(
+            merge_org_state(ok, OrgAuthState::Unknown),
+            OrgAuthState::Ok
+        ));
     }
 }
