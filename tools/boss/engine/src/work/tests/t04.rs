@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 /// Schema v7 migration: a pre-v7 `work_attention_items` table
 /// (NOT NULL `execution_id`, no `work_item_id`) is rebuilt in

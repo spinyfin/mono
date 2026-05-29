@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 /// `retry_ci_remediation_for_work_item` always zeroes the
 /// `ci_attempts_used` counter, and additionally flips the parent
