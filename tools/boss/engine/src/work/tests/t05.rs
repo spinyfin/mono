@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 #[test]
 fn sync_project_design_doc_from_detector_populates_when_null() {

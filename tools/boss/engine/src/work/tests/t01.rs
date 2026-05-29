@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 #[test]
 fn metadata_get_returns_none_for_missing_key() {

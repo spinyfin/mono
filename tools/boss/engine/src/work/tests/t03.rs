@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 /// FIFO ordering: the active chore that was moved to `active`
 /// first should be the first one redispatched. Later kanban

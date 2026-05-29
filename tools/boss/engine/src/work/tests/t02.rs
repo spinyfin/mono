@@ -1,5 +1,4 @@
 use super::*;
-use crate::work::*;
 
 /// `list_in_flight_executions` is the input to the engine-startup
 /// reconciler: it returns rows that the engine considers actively
