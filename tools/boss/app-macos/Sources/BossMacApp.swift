@@ -9,22 +9,17 @@ private let appUpdateLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var chatModel = ChatViewModel(paths: BossEnginePaths.production())
-    @StateObject private var updateModel: UpdateModel = UpdateModel.makeForApp()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .task {
                     appDelegate.liveWorkerStates = chatModel.liveWorkerStates
-                    appDelegate.updateModel = updateModel
-                    updateModel.startPollingIfNeeded()
-                }
-                .task {
-                    updateModel.startPollingIfNeeded()
+                    appDelegate.updateModel.startPollingIfNeeded()
                 }
         }
         .environmentObject(chatModel)
-        .environmentObject(updateModel)
+        .environmentObject(appDelegate.updateModel)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1060, height: 680)
         .commands {
@@ -55,7 +50,7 @@ struct BossMacApp: App {
         Settings {
             SettingsView()
                 .environmentObject(chatModel)
-                .environmentObject(updateModel)
+                .environmentObject(appDelegate.updateModel)
         }
 
         WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
@@ -219,9 +214,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// brief window between launch and first-render — treated as "no agents
     /// working" so a very-early Cmd-Q is never held hostage.
     var liveWorkerStates: LiveWorkerStateStore?
-    /// Set by BossMacApp on first ContentView appear. Accessed by CheckForUpdatesCommand
-    /// (commands cannot reliably use @EnvironmentObject; AppDelegate is always reachable).
-    var updateModel: UpdateModel?
+    /// Owned here so CheckForUpdatesCommand can always reach it — initialized
+    /// at AppDelegate construction time, before any view renders or menu fires.
+    /// (Commands cannot reliably use @EnvironmentObject; AppDelegate is always reachable.)
+    let updateModel: UpdateModel = UpdateModel.makeForApp()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // When launched outside a regular .app bundle (e.g. `swift run`
