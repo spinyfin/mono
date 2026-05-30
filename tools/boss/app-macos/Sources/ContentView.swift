@@ -1368,6 +1368,7 @@ private struct WorkBoardCardItem: View {
     var isFrontierHighlighted: Bool = false
     @ObservedObject var model: ChatViewModel
     @ObservedObject var liveStates: LiveWorkerStateStore
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         let liveState: WorkerLiveState? = {
@@ -1523,6 +1524,9 @@ private struct WorkBoardCardItem: View {
                         pb.clearContents()
                         pb.setString("T\(id)", forType: .string)
                     }
+                }
+                Button("View transcripts…") {
+                    openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
                 }
             }
             .popover(
@@ -2423,6 +2427,8 @@ private struct WorkCardPopoverView: View {
 
             WorkDependenciesSection(model: model, taskID: task.id)
 
+            executionsSection
+
             VStack(alignment: .leading, spacing: 8) {
                 Text("Move")
                     .font(.caption)
@@ -2464,6 +2470,9 @@ private struct WorkCardPopoverView: View {
         }
         .padding(20)
         .frame(width: 360, alignment: .leading)
+        .onAppear {
+            model.loadExecutions(taskId: task.id)
+        }
         .sheet(isPresented: $presentingRepoPicker) {
             RepoOverridePicker(
                 presentation: model.repoOverridePresentation(for: task),
@@ -2577,6 +2586,49 @@ private struct WorkCardPopoverView: View {
         if trimmed.contains("```") { return true }
         if trimmed.contains("\n#") || trimmed.hasPrefix("#") { return true }
         return false
+    }
+
+    @ViewBuilder
+    private var executionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Executions")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("View transcripts…") {
+                    openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .accessibilityIdentifier("work-card-view-transcripts")
+            }
+            if let executions = model.executionsByTaskID[task.id] {
+                if executions.isEmpty {
+                    Text("No executions yet.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(executions) { exec in
+                            Button {
+                                openWindow(
+                                    id: "transcript-viewer",
+                                    value: TranscriptViewerRef(taskId: task.id, preselectExecutionId: exec.id)
+                                )
+                            } label: {
+                                ExecutionRow(exec: exec)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
     }
 
     @ViewBuilder
