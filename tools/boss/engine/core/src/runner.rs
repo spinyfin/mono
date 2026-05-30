@@ -940,21 +940,16 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
 ///   direct-push shortcut in the user's CLAUDE.md does NOT apply here:
 ///   the PR review window is the user's opportunity to edit the doc
 ///   before it is saved for posterity. Always open a PR.
-/// - After opening the PR, record the doc pointer with
-///   `boss task set-investigation-doc` so the kanban affordance can
-///   link to the doc.
-fn compose_investigation_directive(work_item: &WorkItem) -> String {
-    let task_id = work_item_id(work_item);
+/// - The engine registers the doc pointer automatically on PR detection
+///   (`investigation_detector`); workers must not call
+///   `boss task set-investigation-doc`.
+fn compose_investigation_directive(_work_item: &WorkItem) -> String {
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- the deliverable is a **markdown document**, not code. Do not edit source code, build files, or anything other than the investigation doc.\n");
     out.push_str("- the PR for this run contains **only the markdown doc** (one new file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
     out.push_str("- choose a filename that reflects the topic (e.g. `docs/investigations/my-topic.md`). Use an `investigations/` subdirectory if one exists in the repo, or create it.\n");
     out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window.\n");
-    out.push_str("- after the PR is open, register the doc pointer so the kanban card shows the doc affordance:\n");
-    out.push_str(&format!(
-        "  `boss task set-investigation-doc --task {task_id} --path <repo-relative-path> --branch <pr-branch>`\n"
-    ));
     out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
     out
 }
