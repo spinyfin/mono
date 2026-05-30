@@ -3054,15 +3054,25 @@ mod tests {
             .unwrap()
             .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome.ci_flagged, 1, "first sweep must flip to ci_failure");
+        assert_eq!(outcome.ci_flagged, 1, "first sweep must run the CI remediation flow");
         assert_eq!(outcome.conflict_flagged, 0);
+        // Unified in_review model (#1007 parity): the parent STAYS in_review
+        // while the engine-triggered CI-fix revision is in flight; an active
+        // `ci_failure` blocked-signal row keeps the retire path armed.
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "blocked");
-                assert_eq!(t.blocked_reason.as_deref(), Some("ci_failure"));
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
         }
+        assert!(
+            db.active_blocked_signals(&chore)
+                .unwrap()
+                .iter()
+                .any(|s| s.reason == "ci_failure"),
+            "an active ci_failure signal must keep the retire path armed",
+        );
 
         // Pass 2: probe still reports the same failure.
         let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
@@ -5540,8 +5550,11 @@ mod tests {
         );
         let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(out1.ci_flagged, 1);
+        // Unified in_review model: the parent stays in_review with a CI-fix
+        // revision in flight; the pending ci_remediations row still exists and
+        // is what drives the badge this test guards.
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
 

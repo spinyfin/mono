@@ -37,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, FrontendEvent};
 use serde::Serialize;
 
+use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
@@ -211,6 +212,47 @@ pub async fn on_ci_failure_detected(
                 ?err,
                 "ci_watch: failed to check active conflict_resolutions; deferring",
             );
+            return false;
+        }
+    }
+
+    // Pre-flight (mirrors conflict_watch::on_conflict_detected): a fix revision
+    // is already in flight for this work item — an idempotent re-probe while the
+    // CI is still red, or a row blocked before the in_review model shipped.
+    // Re-arm the side-table signal and either reconcile a still-`blocked` parent
+    // back to `in_review` or no-op for an already-`in_review` parent, without
+    // churning the flip / insert / budget path on every sweep.
+    if let Ok(Some(active)) =
+        work_db.active_ci_remediation_for_work_item(&candidate.work_item_id)
+    {
+        if active.revision_task_id.is_some() {
+            if work_db
+                .rearm_blocked_ci_failure_signal(&candidate.work_item_id)
+                .unwrap_or(false)
+            {
+                // Parent is still `blocked: ci_failure` with an active revision —
+                // reconcile it back to `in_review`; the revision card in Doing is
+                // the user-visible signal.
+                let reconciled = blocking_signal::reconcile_blocked_parent_with_revision(
+                    work_db,
+                    SignalKind::CiFailure,
+                    candidate,
+                    &active.id,
+                );
+                if reconciled {
+                    publisher
+                        .publish_work_item_changed(
+                            &candidate.product_id,
+                            &candidate.work_item_id,
+                            "ci_revision_in_flight",
+                        )
+                        .await;
+                }
+                return reconciled;
+            }
+            // Parent is `in_review` (or human-moved): idempotent probe. Keep the
+            // in-flight signal armed so `maybe_clear_blocked` fires on green.
+            let _ = work_db.record_ci_failure_in_flight(&candidate.work_item_id, &active.id);
             return false;
         }
     }
@@ -411,20 +453,40 @@ pub async fn on_ci_failure_detected(
     // path handled in the `task_transitioned` block below. Budget exhaustion
     // was already handled above (no insert, no attempt), so an exhausted PR
     // never reaches here.
+    // #1007 parent-state model, now shared with the conflict path via
+    // [`crate::blocking_signal`]: on a successful `fix`-revision spawn, clear
+    // the upfront `blocked: ci_failure` flip back to `in_review` and record the
+    // in-flight signal, so the parent stays in the Review column while the
+    // revision runs in Doing.
+    let mut task_unblocked_for_revision = false;
     if let Some(ref a) = attempt {
         if a.attempt_kind == "fix" && a.status == "pending" && a.revision_task_id.is_none() {
-            maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await;
+            if maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
+            {
+                task_unblocked_for_revision = blocking_signal::unblock_for_revision(
+                    work_db,
+                    SignalKind::CiFailure,
+                    candidate,
+                    &a.id,
+                );
+            }
+            // If the spawn was refused (create_revision gate), the attempt is
+            // abandoned and the parent stays `blocked: ci_failure` — the
+            // human-attention terminal.
         }
     }
 
-    if task_transitioned {
-        // Bump the budget counter only when the row actually
-        // transitioned AND we created a fix-kind attempt — the design
-        // (§Q3) says the counter increments when "a fix attempt
-        // actually progresses past the worker's go/no-go." For Phase 8
-        // we approximate that with "the engine successfully created a
-        // fix-kind attempt"; Phase 9 will refine to wait for the
-        // worker's classify call.
+    // (The "parent already blocked with an active revision" reconcile case is
+    // handled by the pre-flight early-exit above; here `task_unblocked_for_revision`
+    // is set only by a fresh-attempt spawn.)
+    let task_changed = task_transitioned || task_unblocked_for_revision;
+    if task_changed {
+        // Bump the budget counter when we created a fix-kind attempt — the
+        // design (§Q3) says the counter increments when "a fix attempt
+        // actually progresses past the worker's go/no-go." The flip may have
+        // been cleared back to `in_review` for an in-flight revision, but a fix
+        // attempt still progressed, so the bump is keyed off the attempt, not
+        // the parent's terminal status.
         if attempt.is_some() && attempt_kind == "fix" {
             if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
                 tracing::warn!(
@@ -434,11 +496,19 @@ pub async fn on_ci_failure_detected(
                 );
             }
         }
+        // Parent stays in Review while the revision runs
+        // (`ci_revision_in_flight`); it surfaces in Blocked
+        // (`blocked_ci_failure`) only when there is no fix vehicle.
+        let change_reason = if task_unblocked_for_revision {
+            "ci_revision_in_flight"
+        } else {
+            "blocked_ci_failure"
+        };
         publisher
             .publish_work_item_changed(
                 &candidate.product_id,
                 &candidate.work_item_id,
-                "blocked_ci_failure",
+                change_reason,
             )
             .await;
         if let Some(attempt) = attempt.as_ref() {
@@ -496,7 +566,9 @@ pub async fn on_ci_failure_detected(
             head_sha,
             attempt_kind,
             failures = failures.len(),
-            "ci_watch: CI failure detected; parent flipped to blocked: ci_failure",
+            task_transitioned,
+            task_unblocked_for_revision,
+            "ci_watch: CI failure detected; remediation flow ran",
         );
         true
     } else {
@@ -552,7 +624,7 @@ async fn maybe_spawn_ci_revision(
     candidate: &PendingMergeCheck,
     failures: &[RequiredCheckFailure],
     attempt: &CiRemediation,
-) {
+) -> bool {
     let description = ci_revision_description(failures);
     let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{}", attempt.id);
 
@@ -587,7 +659,9 @@ async fn maybe_spawn_ci_revision(
                     "ci_watch: failed to abandon attempt after create_revision failure",
                 );
             }
-            return;
+            // Spawn refused (parent no longer revisable). Parent stays
+            // `blocked: ci_failure` — the human-attention terminal.
+            return false;
         }
     };
 
@@ -624,6 +698,7 @@ async fn maybe_spawn_ci_revision(
     // Nudge the scheduler so the reconcile loop dispatches the revision's
     // `revision_implementation` execution promptly.
     publisher.kick_scheduler();
+    true
 }
 
 /// Entry point for merge-queue rebounce detection.
@@ -1200,9 +1275,28 @@ pub async fn on_ci_resolved(
 
     let mut attempt_transitioned = false;
     if let Some(attempt) = attempt.as_ref() {
+        // Parent stayed `in_review` the whole time (the shared in_review model
+        // — a fix revision was in flight): the task clear above missed because
+        // the status never moved to blocked, but the attempt should retire and
+        // the in-flight signal must clear so `maybe_clear_blocked` does not
+        // re-fire. Detect via a pending attempt that has a revision. Mirrors
+        // conflict_watch::on_resolved.
+        let parent_in_review_with_revision =
+            !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
         match work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
             Ok(Some(succeeded)) => {
                 attempt_transitioned = true;
+                if parent_in_review_with_revision {
+                    if let Err(err) =
+                        work_db.clear_ci_failure_signal_only(&candidate.work_item_id)
+                    {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            ?err,
+                            "ci_watch: failed to clear in-flight signal after retire",
+                        );
+                    }
+                }
                 publisher
                     .publish_frontend_event_on_product(
                         &candidate.product_id,
