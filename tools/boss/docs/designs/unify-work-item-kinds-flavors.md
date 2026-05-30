@@ -17,6 +17,17 @@ Conflating them is why "promote a chore into a project" has no clean path (the o
 
 This doc resolves the model and lays out a phased, zero-break implementation. Full motivation lives in the tracking issue: https://github.com/spinyfin/mono/issues/731 (Boss row T638).
 
+## Prior investigation / Spike findings
+
+A read-only spike (T903; [writeup](https://github.com/spinyfin/mono/blob/main/tools/boss/docs/investigations/chore-vs-project-task-collapse-2026-05-30.md), merged in PR #1026) audited every site across the engine, CLI, protocol, macOS app, and SQL that treats `chore` differently from `project_task` — approximately 33 distinct sites. Every one falls into one of two categories:
+
+- **Pure project-membership**: the branch diverges only because a chore has no `project_id` and a project_task has one, so it collapses to a `project_id IS NULL` / `IS NOT NULL` check.
+- **Derived display / identifier label**: a noun in an error string, a JSON envelope key, a kanban label, or a metric name — all derived from membership, not an independent behavioral distinction.
+
+Zero sites branch the two kinds for any non-membership behavioral reason. The collapse hypothesis is confirmed. The strongest historical evidence: the one time the engine ever treated them differently in real behavior — a merge poller sweeping only `kind = 'chore'` — was logged as a bug and fixed by treating them the same.
+
+Concrete wins the collapse buys: three divergent list queries become one filter (removing the `boss task list` invisibility-bug class by construction), two insert paths become one, chore↔task promotion becomes a `project_id` field write instead of destructive delete-and-recreate, approximately five `match kind` arms and nine macOS `isChore` checks lose their `kind` dependency. The only care required is a small, fully-enumerated set of derived identifiers (JSON envelope keys, the `kind` JSON field, the execution-kind label, the `total_chores` metric, macOS card chrome) that must be preserved or migrated consciously — these are catalogued in §Flavor-behavior preservation below. Recommendation: proceed, using "derive `kind` from `(flavor, project_id)`" as a transition aid that is explicitly deprecated/removed — not a permanent derived field.
+
 ## Goals
 
 - A single leaf work-item entity with a **`flavor`** attribute (the deliverable/behavior axis) and **project membership as an orthogonal nullable `project_id`** (not a kind).
