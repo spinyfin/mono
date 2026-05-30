@@ -1,0 +1,91 @@
+load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files([
+    "Package.resolved",
+    "Package.swift",
+    "ghosttykit.BUILD",
+])
+
+swift_library(
+    name = "boss_mac_app_lib",
+    module_name = "Boss",
+    srcs = glob(["Sources/**/*.swift"]),
+    copts = [
+        # Mirror the swiftSettings define in Package.swift so @inlinable
+        # Textual APIs (e.g. .textual.textSelection) expand correctly here.
+        "-DTEXTUAL_ENABLE_TEXT_SELECTION",
+        # Match Package.swift's `swift-tools-version: 6.2`. Without this,
+        # bazel compiles under the rules_swift default (Swift 5 mode) and
+        # silently skips the strict-concurrency diagnostics that
+        # `swift run` would fire. CI then passes on changes that break
+        # the dev workflow — see #601 (LogViewer.swift global formatter)
+        # for a recent example.
+        "-swift-version",
+        "6",
+        "-strict-concurrency=complete",
+    ],
+    deps = [
+        "//tools/boss/app-macos/Sources/UpdateCore:UpdateCore",
+        "@ghostty_kit//:GhosttyKit",
+        "@swiftpkg_textual//:Textual",
+    ],
+)
+
+macos_unit_test(
+    name = "BossTests",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_lib",
+    module_name = "BossTests",
+    srcs = glob(["Tests/BossTests/**/*.swift"]),
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    deps = [":boss_mac_app_lib"],
+    testonly = True,
+)
+
+# Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and
+# CFBundleVersion (numeric-only, e.g. "1.0.4") from workspace-status.sh stable keys.
+# Both keys are in one plist to ensure our values are the final word — using
+# apple_bundle_version alongside infoplists caused apple_bundle_version's version
+# provider to be merged after infoplists, silently overriding CFBundleShortVersionString.
+boss_short_version_plist(
+    name = "boss_version_plist",
+    out = "BossVersion.plist",
+    visibility = ["//visibility:private"],
+)
+
+macos_application(
+    name = "Boss",
+    bundle_id = "dev.spinyfin.bossmacapp",
+    infoplists = ["Info.plist", ":boss_version_plist"],
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_lib"],
+    # Bundle the engine and the Boss CLIs into Contents/Resources/bin/ so that
+    # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
+    # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
+    # cube is bundled so the engine can find it even when the macOS GUI launchd
+    # PATH excludes the user's shell PATH (see config.rs resolve_cube_command).
+    # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
+    # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
+    additional_contents = {
+        "//tools/boss/engine/core:engine": "Resources/bin",
+        "//tools/boss/cli:boss": "Resources/bin",
+        "//tools/boss/bossctl:bossctl": "Resources/bin",
+        "//tools/boss/event-shim:boss-event": "Resources/bin",
+        "//tools/cube:cube": "Resources/bin",
+        "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",
+        # relaunch-helper.sh: the detached swap/relaunch watchdog the app spawns
+        # after UpdateInstaller (UpdateCore) stages the new bundle in-process.
+        # Bundled at Resources/ top level so the app resolves it with
+        # Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh").
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper": "Resources",
+    },
+    visibility = ["//tools/boss/installer:__pkg__"],
+)

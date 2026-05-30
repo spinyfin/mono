@@ -1,0 +1,34 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files([
+    "Cargo.toml",
+])
+
+rust_library(
+    name = "broker-robinhood",
+    crate_name = "broker_robinhood",
+    visibility = ["//tools/hood:__pkg__"],
+    srcs = [
+        "src/auth.rs",
+        "src/client.rs",
+        "src/error.rs",
+        "src/lib.rs",
+    ],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "broker_robinhood_tests",
+    size = "small",
+    crate = ":broker-robinhood",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

@@ -1,0 +1,76 @@
+[workspace]
+members = [
+  "lib/rust/broker-robinhood",
+  "tools/boss/bossctl",
+  "tools/boss/cli",
+  "tools/boss/client",
+  "tools/boss/engine/conflict-diagnosis",
+  "tools/boss/engine/core",
+  "tools/boss/engine/editorial",
+  "tools/boss/engine/core/boss-transcript-markdown",
+  "tools/boss/event-shim",
+  "tools/boss/engine/feature-flags",
+  "tools/boss/protocol",
+  "tools/boss/engine/ssh-transport",
+  "tools/boss/engine/transcript-tail",
+  "tools/hood",
+  "tools/checkleft",
+  "tools/checkleft_package",
+  "tools/cube",
+  "tools/repobin",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.97"
+async-trait = "0.1.86"
+bon = "3.9.1"
+# chrono / chrono-tz: IANA-timezone-aware occurrence math for the
+# automation scheduler (maintenance-tasks.md). `clock` is intentionally
+# off — the scheduler injects "now" as epoch seconds, so we never need
+# `Local::now` or the platform tz lookup that `clock` pulls in.
+chrono = { version = "0.4.39", default-features = false, features = ["std"] }
+chrono-tz = "0.10.1"
+clap = "4.5.39"
+flate2 = "1.1.5"
+fs4 = "0.13"
+comfy-table = "7.2.2"
+console = "0.15.11"
+fastrand = "2.3.0"
+globset = "0.4.18"
+hashbrown = { version = "0.15.5", features = ["default-hasher", "serde"] }
+indicatif = "0.17.11"
+jsonwebtoken = "10.4.0"
+keyring = "3.6.3"
+regex = "1.11.1"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
+rpassword = "7.5.0"
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
+serde = "1.0.219"
+serde_json = "1.0.140"
+serde_yaml = "0.9.34"
+serde_urlencoded = "0.7"
+shlex = "1.3.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+sha2 = "0.10.9"
+tempfile = "3.25.0"
+thiserror = "1.0"
+tar = "0.4.45"
+tokio = "1.45.0"
+toml = "1.0.7"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+tree-sitter = "0.26.7"
+tree-sitter-java = "0.23.5"
+tree-sitter-starlark = "1.3.0"
+url = "2"
+uuid = "1"
+walkdir = "2.5.0"
+wasmtime = "42.0.2"
+wat = "1.240.0"
+which = "7.0.3"
+wiremock = "0.5.22"

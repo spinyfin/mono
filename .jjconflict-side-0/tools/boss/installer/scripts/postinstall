@@ -1,0 +1,42 @@
+#!/bin/sh
+# postinstall — write the setup checklist into the installed bundle.
+# Runs as the installing user (per-user domain install).
+set -euo pipefail
+
+BUNDLE="$HOME/Applications/Boss.app"
+RESOURCES="$BUNDLE/Contents/Resources"
+
+cat > "$RESOURCES/SETUP.txt" << 'EOF'
+Boss Setup Checklist
+====================
+
+Required tools (Boss will not start without these):
+
+  cube   workspace management (https://github.com/spinyfin/cube)
+         Install: cargo install cube  OR  pre-built binary from releases
+
+  jj     Jujutsu VCS — used by workers for all repository operations
+  gh     GitHub CLI — used by workers for PR / issue operations
+  claude Claude Code CLI — the worker backend
+
+Optional tools:
+
+  bk     Buildkite CLI — needed for CI query features
+
+Required credentials:
+
+  ANTHROPIC_API_KEY  API key for Claude. The engine reads this from
+                     the environment of the process that launches it
+                     (i.e., the shell that double-clicks Boss.app, or
+                     sets it in launchd / shell profile).
+
+Uninstall:
+  ~/Applications/Boss.app/Contents/Resources/bin/boss uninstall
+  Add --purge-state to also remove ~/Library/Application Support/Boss/.
+
+Manual uninstall (if the CLI is unavailable):
+  rm -rf ~/Applications/Boss.app
+  # Optional: rm -rf ~/Library/Application\ Support/Boss
+EOF
+
+exit 0
