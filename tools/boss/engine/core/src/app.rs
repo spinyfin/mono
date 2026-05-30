@@ -8172,6 +8172,88 @@ async fn handle_frontend_connection(
                     },
                 );
             }
+
+            FrontendRequest::ListAutomationRuns { automation_id } => {
+                match work_db.list_automation_runs(&automation_id) {
+                    Ok(runs) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationRunsList {
+                            automation_id,
+                            runs,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::ListAutomationTasks { automation_id } => {
+                match work_db.list_tasks_for_automation(&automation_id) {
+                    Ok(tasks) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationTasksList {
+                            automation_id,
+                            tasks,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::RunAutomation { automation_id, force: _ } => {
+                // The scheduler loop (maintenance-tasks.md T5) and triage
+                // dispatch (T6) are not yet implemented. The engine can verify
+                // the automation exists and that the open-task cap allows a
+                // fire, but it cannot actually enqueue a triage execution yet.
+                // Return a clear "not yet implemented" error so the CLI can
+                // surface it honestly.
+                let automation_exists = match work_db.get_automation(&automation_id) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("unknown automation: {automation_id}"),
+                            },
+                        );
+                        false
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                        false
+                    }
+                };
+                if automation_exists {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: "automation triage dispatch not yet implemented \
+                                      (depends on maintenance-tasks.md task 5/6 — \
+                                      scheduler loop and triage execution)"
+                                .to_owned(),
+                        },
+                    );
+                }
+            }
         }
     }
 

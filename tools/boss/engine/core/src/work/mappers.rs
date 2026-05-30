@@ -162,6 +162,15 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// Like [`map_task`] but reads a trailing `source_automation_id` column
+/// at index 30. Used by `list_tasks_for_automation` so produced tasks
+/// carry their provenance on the wire.
+pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task(row)?;
+    task.source_automation_id = row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
 /// Like [`map_task`] but also reads a trailing `parent_task_id` column
 /// (index 30, i.e. appended right after `merge_queue_state`). Internal
 /// building-block used by [`map_task_with_parent_and_investigation_doc`]
@@ -648,7 +657,6 @@ pub(crate) fn map_automation(
 /// Map a row from the canonical `automation_runs` SELECT column order:
 /// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
 /// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail
-#[allow(dead_code)] // prepared for automation_runs list queries not yet implemented
 pub(crate) fn map_automation_run(
     row: &Row<'_>,
 ) -> rusqlite::Result<boss_protocol::AutomationRun> {
