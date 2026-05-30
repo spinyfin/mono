@@ -313,6 +313,41 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         }));
     }
 
+    // Block the bundled `verify` skill in every worker session. `verify`
+    // is "runtime observation": it builds and *runs the real app* and
+    // drives it, explicitly forbidding the test path. For a Boss UI task
+    // that means launching Boss.app and its bundled engine, which defaults
+    // to the live engine socket (`/tmp/boss-engine.sock`) — so a worker's
+    // verification step attaches to the operator's running engine/state
+    // and triggers repeated macOS permission prompts. This actually
+    // happened: a trivial badge-relabel chore invoked `verify`, launched
+    // the production app, collided with the live engine, and wedged it.
+    //
+    // Workers verify via `bazel build`/`bazel test`; runtime / UI
+    // observation is the coordinator's job, not a sandboxed worker's. The
+    // guard matches the `Skill` tool, reads the `skill` field from the
+    // tool_input, and blocks only `verify` — every other skill is
+    // approved. (Mirrors the inline-Python decision-hook shape used by the
+    // revision `gh pr create` guard below.)
+    let verify_guard_command = concat!(
+        "python3 -c \"",
+        "import json,sys; ",
+        "inp=json.load(sys.stdin); ",
+        "skill=inp.get('tool_input',{}).get('skill',''); ",
+        "msg='The verify skill builds and runs the real application and drives it (it forbids the test path). For a Boss worker that means launching Boss.app and its bundled engine on the live socket, colliding with the running engine and triggering repeated OS permission prompts. Verify with bazel build and bazel test instead; runtime and UI observation are left to the coordinator. (verify is disabled in worker sessions.)'; ",
+        "print(json.dumps({'decision':'block','reason':msg}) if skill=='verify' else json.dumps({'decision':'approve'})); ",
+        "\""
+    );
+    pre_tool_use_hooks.push(serde_json::json!({
+        "matcher": "Skill",
+        "hooks": [
+            {
+                "type": "command",
+                "command": verify_guard_command,
+            }
+        ],
+    }));
+
     let is_revision = input.execution_kind == "revision_implementation"
         || input.task_kind.as_deref() == Some("revision");
     if is_revision {
@@ -1062,8 +1097,9 @@ mod tests {
             let entries = hooks.get(name).unwrap().as_array().unwrap();
             // The boss-event shim is always the first entry for every
             // hook event. `PreToolUse` carries extra entries (the
-            // deterministic path guard, plus a revision-only guard); the
-            // other six events are wired exactly once.
+            // deterministic path guard, the always-on verify-skill guard,
+            // plus a revision-only guard); the other six events are wired
+            // exactly once.
             assert!(!entries.is_empty(), "{name} has no hook entries");
             assert_eq!(entries[0]["matcher"], "*");
             if name != "PreToolUse" {
@@ -1744,12 +1780,13 @@ mod tests {
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
-        // Must have 3 entries: the shim, the deterministic path guard,
-        // and the revision-only gh-pr-create guard.
+        // Must have 4 entries: the shim, the deterministic path guard,
+        // the always-on verify-skill guard, and the revision-only
+        // gh-pr-create guard.
         assert_eq!(
             pre.len(),
-            3,
-            "revision_implementation PreToolUse must have shim + path guard + pr guard, got {pre:?}",
+            4,
+            "revision_implementation PreToolUse must have shim + path guard + verify guard + pr guard, got {pre:?}",
         );
         // The revision guard is the Bash-matcher entry.
         let pr_guard = pre
@@ -1780,12 +1817,13 @@ mod tests {
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
-        // chore: [boss-event shim, deterministic path guard]. The
-        // revision-only `gh pr create` guard must NOT be present.
+        // chore: [boss-event shim, deterministic path guard, verify-skill
+        // guard]. The revision-only `gh pr create` guard must NOT be
+        // present.
         assert_eq!(
             pre.len(),
-            2,
-            "chore_implementation PreToolUse must have shim + path guard, got {pre:?}",
+            3,
+            "chore_implementation PreToolUse must have shim + path guard + verify guard, got {pre:?}",
         );
         assert_eq!(
             pre[0]["matcher"],
@@ -1803,6 +1841,34 @@ mod tests {
             assert!(
                 !cmd.contains("ensure"),
                 "chore must not carry the revision gh-pr-create guard: {cmd}",
+            );
+        }
+    }
+
+    /// Every worker session — regardless of kind — must carry a PreToolUse
+    /// guard that blocks the bundled `verify` skill. `verify` runs the real
+    /// app and would launch Boss.app against the live engine socket; workers
+    /// verify via bazel instead. Guard matches the `Skill` tool, reads the
+    /// `skill` field, and emits a block decision for `verify`.
+    #[test]
+    fn every_worker_blocks_verify_skill_in_pre_tool_use() {
+        for kind in ["chore_implementation", "revision_implementation"] {
+            let mut input = sample_input();
+            input.execution_kind = kind.into();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&render_settings_json(&input)).unwrap();
+            let pre = parsed["hooks"]["PreToolUse"]
+                .as_array()
+                .expect("PreToolUse must be an array");
+            let verify_guard = pre
+                .iter()
+                .find(|e| e["matcher"] == serde_json::Value::String("Skill".into()))
+                .unwrap_or_else(|| panic!("{kind} PreToolUse must include a Skill-matcher guard"));
+            let cmd = verify_guard["hooks"][0]["command"].as_str().unwrap_or("");
+            // It inspects the `skill` field, keys on `verify`, and blocks.
+            assert!(
+                cmd.contains("'skill'") && cmd.contains("verify") && cmd.contains("block"),
+                "{kind} verify guard must inspect the skill field and block verify: {cmd}",
             );
         }
     }
@@ -1827,8 +1893,8 @@ mod tests {
 
         assert_eq!(
             pre.len(),
-            3,
-            "revision task_kind must add the pr guard (shim + path guard + pr guard) even when execution_kind is wrong, got {pre:?}",
+            4,
+            "revision task_kind must add the pr guard (shim + path guard + verify guard + pr guard) even when execution_kind is wrong, got {pre:?}",
         );
         let pr_guard = pre
             .iter()
