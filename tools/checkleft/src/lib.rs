@@ -4,6 +4,7 @@
 //! behavior, and built-in checks may change without notice.
 
 pub mod bypass;
+pub mod change_detection;
 pub mod check;
 pub mod checks;
 pub mod config;
