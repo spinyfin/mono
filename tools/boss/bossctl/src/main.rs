@@ -2559,21 +2559,53 @@ fn resolve_log_source_path(source: &LogSource, state_root: &Path) -> PathBuf {
 }
 
 /// Build an oldest-to-newest list of log segments for `base_path`.
-/// Rotated files are expected at `<base_path>.N` for N = 1..=10, where `.1`
-/// is the most recent rotation and `.10` is the oldest. Any segment that does
-/// not exist on disk is silently skipped. The live file (`base_path` itself)
-/// is always appended last even if it is absent — callers handle missing
-/// primary files gracefully via [`read_file_lines`].
+///
+/// Rotated files use the timestamped format produced by PR #1081:
+/// `<base_path>.<unix_seconds>` (e.g. `engine-trace.jsonl.1748694000`).
+/// Files are sorted by the numeric timestamp suffix so the result is in
+/// chronological order (lowest timestamp = oldest). Any file in the same
+/// directory whose name does not match `<base_filename>.<all-digits>` is
+/// ignored. The live file (`base_path` itself) is always appended last even
+/// if absent — callers handle missing files gracefully via [`read_file_lines`].
 fn rotated_segments(base_path: &Path) -> Vec<PathBuf> {
-    let mut segments: Vec<PathBuf> = Vec::new();
-    for i in (1u32..=10).rev() {
-        let candidate = PathBuf::from(format!("{}.{i}", base_path.display()));
-        if candidate.exists() {
-            segments.push(candidate);
-        }
-    }
+    let mut segments = list_rotated_log_files(base_path);
+    // Sort ascending by numeric timestamp so oldest segment comes first.
+    segments.sort_by_key(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.rsplit('.').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
     segments.push(base_path.to_path_buf());
     segments
+}
+
+/// Enumerate rotated log files alongside `active_path`.
+/// A file qualifies iff its name is `<active_filename>.<all-digits>`.
+fn list_rotated_log_files(active_path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = active_path.parent() else {
+        return vec![];
+    };
+    let Some(stem) = active_path.file_name().and_then(|n| n.to_str()) else {
+        return vec![];
+    };
+    let prefix = format!("{stem}.");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| {
+                    let suffix = n.strip_prefix(prefix.as_str()).unwrap_or("");
+                    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                })
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 /// Read all lines from `path` that match the optional `grep` filter.
@@ -3036,5 +3068,76 @@ mod tests {
         let base = std::path::Path::new("/tmp/fake-engine-trace.jsonl");
         let segs = rotated_segments(base);
         assert_eq!(segs.last().unwrap(), base);
+    }
+
+    #[test]
+    fn rotated_segments_orders_timestamp_files_oldest_first() {
+        use std::io::Write as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("engine-trace.jsonl");
+        // Create three rotated files with ascending timestamps.
+        for ts in [1000u64, 3000, 2000] {
+            let mut f = std::fs::File::create(dir.path().join(format!("engine-trace.jsonl.{ts}")))
+                .unwrap();
+            writeln!(f, "ts={ts}").unwrap();
+        }
+        // Create the live file.
+        let mut live = std::fs::File::create(&base).unwrap();
+        writeln!(live, "live").unwrap();
+
+        let segs = rotated_segments(&base);
+        // 4 segments: 3 rotated + 1 live.
+        assert_eq!(segs.len(), 4);
+        // First three should be in ascending timestamp order.
+        assert!(segs[0].to_string_lossy().ends_with(".1000"));
+        assert!(segs[1].to_string_lossy().ends_with(".2000"));
+        assert!(segs[2].to_string_lossy().ends_with(".3000"));
+        // Live file last.
+        assert_eq!(&segs[3], &base);
+    }
+
+    #[test]
+    fn rotated_segments_ignores_non_timestamp_siblings() {
+        use std::io::Write as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("engine-trace.jsonl");
+        // A valid rotated file.
+        let mut f =
+            std::fs::File::create(dir.path().join("engine-trace.jsonl.1748694000")).unwrap();
+        writeln!(f, "old").unwrap();
+        // Unrelated files that must NOT be included.
+        std::fs::write(dir.path().join("engine-trace.jsonl.bak"), b"noise").unwrap();
+        std::fs::write(dir.path().join("engine-trace.jsonl.1.gz"), b"noise").unwrap();
+        std::fs::write(dir.path().join("other-file.txt"), b"noise").unwrap();
+
+        let segs = rotated_segments(&base);
+        // Only the valid timestamp file + live path.
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].to_string_lossy().ends_with(".1748694000"));
+        assert_eq!(&segs[1], &base);
+    }
+
+    #[test]
+    fn collect_tail_lines_spans_rotated_segments() {
+        use std::io::Write as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("engine-trace.jsonl");
+        // Older rotated segment (lower timestamp).
+        let mut old =
+            std::fs::File::create(dir.path().join("engine-trace.jsonl.1000")).unwrap();
+        writeln!(old, "old-line-1").unwrap();
+        writeln!(old, "old-line-2").unwrap();
+        // Newer rotated segment (higher timestamp).
+        let mut newer =
+            std::fs::File::create(dir.path().join("engine-trace.jsonl.2000")).unwrap();
+        writeln!(newer, "newer-line-1").unwrap();
+        // Live file.
+        let mut live = std::fs::File::create(&base).unwrap();
+        writeln!(live, "live-line-1").unwrap();
+        writeln!(live, "live-line-2").unwrap();
+
+        // Tail 3 lines — should come from newer + live segments, in order.
+        let lines = collect_tail_lines(&base, 3, None).unwrap();
+        assert_eq!(lines, vec!["newer-line-1", "live-line-1", "live-line-2"]);
     }
 }
