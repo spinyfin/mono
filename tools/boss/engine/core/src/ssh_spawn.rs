@@ -108,7 +108,8 @@ fn sanitize_run_id(run_id: &str) -> String {
 /// Everything needed to compose the `env … wrapper` argv the engine
 /// runs on the remote. All fields are plain owned data — the caller
 /// (PR 2's `spawn_worker`) fills them from the execution + lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RemoteSpawnPlan {
     /// Engine-assigned run id. Spliced into every hook payload by the
     /// shim (`_boss_run_id`) for correlation.
