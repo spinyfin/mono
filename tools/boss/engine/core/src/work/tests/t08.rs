@@ -8,65 +8,54 @@ use super::*;
 fn fixture() -> (WorkDb, String, String, String) {
     let db = WorkDb::open(temp_db_path("attentions")).unwrap();
     let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
     let project = db
-        .create_project(CreateProjectInput {
-            product_id: product.id.clone(),
-            name: "Attentions".to_owned(),
-            description: None,
-            goal: Some("goal".to_owned()),
-            autostart: true,
-            no_design_task: false,
-        })
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Attentions")
+                .goal("goal")
+                .build(),
+        )
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Engine core".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Engine core")
+                .build(),
+        )
         .unwrap();
     (db, product.id, project.id, task.id)
 }
 
 fn question(project_id: &str, doc_path: &str, prompt: &str) -> CreateAttentionInput {
-    CreateAttentionInput {
-        kind: "question".to_owned(),
-        association_project_id: Some(project_id.to_owned()),
-        source_kind: Some("design_doc".to_owned()),
-        source_doc_path: Some(doc_path.to_owned()),
-        question_type: Some("prompt".to_owned()),
-        prompt_text: Some(prompt.to_owned()),
-        ..Default::default()
-    }
+    CreateAttentionInput::builder()
+        .kind("question")
+        .association_project_id(project_id)
+        .source_kind("design_doc")
+        .source_doc_path(doc_path)
+        .question_type("prompt")
+        .prompt_text(prompt)
+        .build()
 }
 
 fn followup(task_id: &str, name: &str) -> CreateAttentionInput {
-    CreateAttentionInput {
-        kind: "followup".to_owned(),
-        association_task_id: Some(task_id.to_owned()),
-        source_kind: Some("task_transcript".to_owned()),
-        source_task_id: Some(task_id.to_owned()),
-        proposed_name: Some(name.to_owned()),
-        proposed_description: Some("do the thing".to_owned()),
-        ..Default::default()
-    }
+    CreateAttentionInput::builder()
+        .kind("followup")
+        .association_task_id(task_id)
+        .source_kind("task_transcript")
+        .source_task_id(task_id)
+        .proposed_name(name)
+        .proposed_description("do the thing")
+        .build()
 }
 
 #[test]
