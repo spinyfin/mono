@@ -1888,6 +1888,83 @@ fn run_pr(command: PrCommand, runner: &dyn CommandRunner) -> Result<RunResult> {
     }
 }
 
+/// Returns true if `path` is a reference to stdin (`/dev/stdin`, `-`, `/dev/fd/0`).
+fn is_stdin_path(path: &str) -> bool {
+    matches!(path, "/dev/stdin" | "-" | "/dev/fd/0")
+}
+
+/// Resolve `--body-file <path>` to a concrete filesystem path, materialising
+/// stdin and pipe/FIFO sources eagerly.
+///
+/// Returns `(resolved_path_string, Option<temp_file_path>)`.  When a temp
+/// file was created the caller is responsible for deleting it (the `PathBuf`
+/// is returned so the caller can `fs::remove_file` it after the subprocess
+/// finishes).
+///
+/// Fails loudly if the body source is empty — an empty description is almost
+/// certainly a bug, not intentional.
+fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
+    use std::io::Read;
+
+    // Decide whether we need to slurp the content into memory.
+    let is_stdin_like = is_stdin_path(path);
+
+    #[cfg(unix)]
+    let is_pipe_or_special = if is_stdin_like {
+        true
+    } else {
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.file_type().is_fifo() || meta.file_type().is_char_device(),
+            Err(_) => false,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let is_pipe_or_special = is_stdin_like;
+
+    if is_pipe_or_special {
+        // Slurp eagerly before any subprocess can race on the fd.
+        let mut content = String::new();
+        if is_stdin_like {
+            std::io::stdin()
+                .read_to_string(&mut content)
+                .map_err(CubeError::Io)?;
+        } else {
+            std::fs::File::open(path)
+                .and_then(|mut f| f.read_to_string(&mut content))
+                .map_err(CubeError::Io)?;
+        }
+
+        if content.trim().is_empty() {
+            return Err(CubeError::InvalidArgument(format!(
+                "--body-file `{path}` produced empty content; \
+                 refusing to create a PR with no description"
+            )));
+        }
+
+        // Write to a uniquely-named temp file so gh pr create can open it as
+        // a regular file (no race, no /dev/stdin weirdness in the subprocess).
+        let tmp_path = std::env::temp_dir()
+            .join(format!("cube-pr-body-{}.md", Uuid::new_v4()));
+        std::fs::write(&tmp_path, content.as_bytes()).map_err(CubeError::Io)?;
+        let tmp_path_str = tmp_path.display().to_string();
+        Ok((tmp_path_str, Some(tmp_path)))
+    } else {
+        // Regular file path — validate it exists and is non-empty.
+        let meta = std::fs::metadata(path).map_err(|e| {
+            CubeError::InvalidArgument(format!("--body-file `{path}`: {e}"))
+        })?;
+        if meta.len() == 0 {
+            return Err(CubeError::InvalidArgument(format!(
+                "--body-file `{path}` is empty; \
+                 refusing to create a PR with no description"
+            )));
+        }
+        Ok((path.to_string(), None))
+    }
+}
+
 /// Create or reuse a GitHub PR for the current jj bookmark.
 ///
 /// Pushes the branch via `jj git push` and then uses `gh pr create -R
@@ -1972,7 +2049,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     ];
     let title_ref;
     let body_ref;
-    let body_file_ref;
+    // Materialised path for --body-file (may differ from the original when
+    // the source was stdin / a pipe).  Keep `tmp_body_path` alive until after
+    // the gh subprocess exits so the temp file isn't deleted underneath it.
+    let body_file_resolved;
+    let tmp_body_path: Option<PathBuf>;
     if let Some(ref t) = args.title {
         title_ref = t.as_str();
         create_args.push("--title");
@@ -1984,9 +2065,13 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         create_args.push(body_ref);
     }
     if let Some(ref f) = args.body_file {
-        body_file_ref = f.as_str();
+        let (resolved, tmp) = resolve_body_file(f)?;
+        body_file_resolved = resolved;
+        tmp_body_path = tmp;
         create_args.push("--body-file");
-        create_args.push(body_file_ref);
+        create_args.push(&body_file_resolved);
+    } else {
+        tmp_body_path = None;
     }
     if args.draft {
         create_args.push("--draft");
@@ -1995,6 +2080,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     let create_output = runner
         .run(&RealCommandRunner::invocation(&cwd, "gh", &create_args))
         .map_err(|e| CubeError::InvalidArgument(format!("failed to create PR: {e}")))?;
+
+    // Clean up any temp file we created to materialise a piped body source.
+    if let Some(ref p) = tmp_body_path {
+        let _ = std::fs::remove_file(p);
+    }
 
     let url = create_output.trim().to_string();
     if url.is_empty() {
@@ -3478,8 +3568,9 @@ mod tests {
 
     use super::{
         CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
-        is_bare_repo_slug, origin_path_matches_slug, origin_urls_equivalent, parse_github_owner_repo,
-        parse_github_slug, parse_origin, run_with_context, run_with_dependencies,
+        is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
+        parse_github_owner_repo, parse_github_slug, parse_origin, resolve_body_file,
+        run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -10113,6 +10204,130 @@ steps:
     #[test]
     fn parse_github_owner_repo_returns_none_for_empty_output() {
         assert_eq!(parse_github_owner_repo(""), None);
+    }
+
+    // --- resolve_body_file / stdin materialization tests ---
+
+    #[test]
+    fn is_stdin_path_recognises_known_aliases() {
+        assert!(is_stdin_path("/dev/stdin"));
+        assert!(is_stdin_path("-"));
+        assert!(is_stdin_path("/dev/fd/0"));
+    }
+
+    #[test]
+    fn is_stdin_path_does_not_match_regular_paths() {
+        assert!(!is_stdin_path("/tmp/pr-body.md"));
+        assert!(!is_stdin_path("/dev/null"));
+        assert!(!is_stdin_path(""));
+    }
+
+    #[test]
+    fn resolve_body_file_errors_on_empty_regular_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        // File is created empty by default.
+        let result = resolve_body_file(&tmp.path().display().to_string());
+        assert!(
+            result.is_err(),
+            "should error on empty file, got {:?}",
+            result
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("empty"),
+            "error should mention 'empty': {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_body_file_passes_through_non_empty_regular_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), b"## Summary\n\nBody text.").expect("write");
+        let path_str = tmp.path().display().to_string();
+
+        let (resolved, tmpfile) = resolve_body_file(&path_str).expect("resolve regular file");
+
+        // Regular file: path unchanged, no temp file created.
+        assert_eq!(resolved, path_str);
+        assert!(tmpfile.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_body_file_materialises_fifo_content_to_temp_file() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo_path = dir.path().join("test.fifo");
+
+        // Create a FIFO.
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let expected_body = "## PR Body\n\nThis is the materialized body content.";
+        let fifo_path_clone = fifo_path.clone();
+        let body_clone = expected_body.to_string();
+
+        // Write in a background thread — FIFO open blocks until a reader also opens.
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo_path_clone)
+                .expect("open fifo for write");
+            f.write_all(body_clone.as_bytes()).expect("write fifo");
+        });
+
+        let path_str = fifo_path.display().to_string();
+        let (resolved, tmp) = resolve_body_file(&path_str).expect("resolve fifo");
+
+        writer.join().expect("writer thread");
+
+        // resolved path must differ from the FIFO (temp file was created).
+        assert_ne!(
+            resolved, path_str,
+            "resolved path should be a temp file, not the FIFO"
+        );
+        let materialized = std::fs::read_to_string(&resolved).expect("read materialized");
+        assert_eq!(materialized, expected_body);
+
+        if let Some(p) = tmp {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_body_file_errors_on_empty_fifo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo_path = dir.path().join("empty.fifo");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let fifo_path_clone = fifo_path.clone();
+        // Write empty content to FIFO so the reader gets EOF immediately.
+        let writer = std::thread::spawn(move || {
+            // Just open and close without writing.
+            let _f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo_path_clone)
+                .expect("open fifo for write");
+        });
+
+        let path_str = fifo_path.display().to_string();
+        let result = resolve_body_file(&path_str);
+
+        writer.join().expect("writer thread");
+
+        assert!(result.is_err(), "should error on empty FIFO");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("empty"), "error should mention 'empty': {msg}");
     }
 
     // --- ensure_pr body-file regression tests ---
