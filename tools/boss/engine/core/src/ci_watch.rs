@@ -1175,7 +1175,23 @@ pub async fn on_ci_in_flight_supersedes_failure(
     };
 
     if !task_transitioned {
-        return false;
+        // In the in_review model the parent was never blocked, but a stale
+        // in-flight signal may remain from a failed revision attempt. Clear
+        // it so the next Clean sweep does not re-fire the handler.
+        let signal_cleared = work_db
+            .clear_ci_failure_signal_only(&candidate.work_item_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "ci_watch: failed to clear stale in-flight signal on InFlight supersede",
+                );
+                false
+            });
+        if !signal_cleared {
+            return false;
+        }
+        // Signal was present — fall through to publish the supersede events.
     }
 
     publisher
@@ -1274,6 +1290,7 @@ pub async fn on_ci_resolved(
     };
 
     let mut attempt_transitioned = false;
+    let mut parent_in_review_with_revision = false;
     if let Some(attempt) = attempt.as_ref() {
         // Parent stayed `in_review` the whole time (the shared in_review model
         // — a fix revision was in flight): the task clear above missed because
@@ -1281,7 +1298,7 @@ pub async fn on_ci_resolved(
         // the in-flight signal must clear so `maybe_clear_blocked` does not
         // re-fire. Detect via a pending attempt that has a revision. Mirrors
         // conflict_watch::on_resolved.
-        let parent_in_review_with_revision =
+        parent_in_review_with_revision =
             !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
         match work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
             Ok(Some(succeeded)) => {
@@ -1337,7 +1354,48 @@ pub async fn on_ci_resolved(
     }
 
     if !task_transitioned && !attempt_transitioned {
-        return false;
+        // Stale in-flight signal: in_review model, no active attempt (attempt
+        // was terminal before CI went green). Clear the signal so
+        // `maybe_clear_blocked` does not re-fire on every Clean sweep.
+        let signal_cleared = work_db
+            .clear_ci_failure_signal_only(&candidate.work_item_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "ci_watch: failed to clear stale in-flight signal on CI resolved",
+                );
+                false
+            });
+        if !signal_cleared {
+            return false;
+        }
+        if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
+            tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used after stale signal clear");
+        }
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "ci_failure_resolved",
+            )
+            .await;
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::CiFailureCleared {
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "ci_watch: CI back at clean; cleared stale in-flight signal (no active attempt)",
+        );
+        return true;
     }
     if task_transitioned {
         // Design §Q3: a successful cycle clears the counter so the
@@ -1374,6 +1432,14 @@ pub async fn on_ci_resolved(
                     },
                 )
                 .await;
+        }
+    } else if parent_in_review_with_revision && attempt_transitioned {
+        // In_review model: a CI-fix revision finished and CI went green.
+        // The parent was never blocked so `task_transitioned` is false,
+        // but the cycle is complete — reset the budget counter so the
+        // next failure gets a fresh allotment.
+        if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
+            tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used after revision retire");
         }
     }
     tracing::info!(
@@ -1673,12 +1739,14 @@ mod tests {
         .await;
         assert!(flipped, "first detection must flip the row");
 
+        // In the in_review model a spawned revision immediately unblocks the
+        // parent back to `in_review`; `blocked: ci_failure` is transient.
         let (status, reason) = chore_state(&db, &chore);
-        assert_eq!(status, "blocked");
-        assert_eq!(reason.as_deref(), Some("ci_failure"));
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
 
         let events = pub_.events.lock().await.clone();
-        assert!(events.iter().any(|(_, _, r)| r == "blocked_ci_failure"));
+        assert!(events.iter().any(|(_, _, r)| r == "ci_revision_in_flight"));
 
         let typed = pub_.typed_events.lock().await.clone();
         assert!(typed.iter().any(|(_, ev)| matches!(
@@ -1917,8 +1985,9 @@ mod tests {
         )
         .await;
         assert!(detected);
+        // In the in_review model the parent stays in_review while the revision runs.
         let (status, _) = chore_state(&db, &chore);
-        assert_eq!(status, "blocked");
+        assert_eq!(status, "in_review");
 
         // 2. Retire — CI is back to clean.
         let resolved = on_ci_resolved(
@@ -1997,9 +2066,11 @@ mod tests {
         )
         .await;
         assert!(!retired, "opted-out product must not retire automatically");
+        // In the in_review model the parent was never blocked; the retire
+        // no-op leaves it in_review.
         let (status, reason) = chore_state(&db, &chore);
-        assert_eq!(status, "blocked");
-        assert_eq!(reason.as_deref(), Some("ci_failure"));
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
     }
 
     /// When `on_ci_resolved` clears a `blocked: ci_failure` row but finds
@@ -2177,9 +2248,10 @@ mod tests {
         .await;
         assert!(!cleared, "active remediation must not be superseded");
 
+        // In the in_review model the parent stays in_review while the revision runs.
         let (status, reason) = chore_state(&db, &chore);
-        assert_eq!(status, "blocked");
-        assert_eq!(reason.as_deref(), Some("ci_failure"));
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
     }
 
     /// No stale failure to supersede (chore already `in_review`): the

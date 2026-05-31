@@ -3102,7 +3102,11 @@ mod tests {
         let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
-        // Event trail: blocked → resolved (poll-state events excluded).
+        // Event trail: parent never enters `blocked` in the in_review model, so
+        // only "ci_revision_in_flight" fires (pass 1). "ci_failure_resolved" is
+        // NOT emitted when the parent stayed in_review throughout — symmetric
+        // with the conflict path (merge_conflict_resolved is also suppressed
+        // when the parent never blocked). Poll-state events excluded.
         let reasons: Vec<String> = publisher
             .work_events
             .lock()
@@ -3113,10 +3117,7 @@ mod tests {
             .collect();
         assert_eq!(
             reasons,
-            vec![
-                "blocked_ci_failure".to_owned(),
-                "ci_failure_resolved".to_owned(),
-            ],
+            vec!["ci_revision_in_flight".to_owned()],
         );
     }
 
