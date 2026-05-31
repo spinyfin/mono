@@ -31,12 +31,29 @@ struct WorkersDetailView: View {
         VStack(spacing: 0) {
             poolPickerHeader
             Divider()
-            WorkerGrid(
-                runtime: workspace.runtime,
-                slots: selectedPool == .main ? workspace.slots : workspace.automationSlots,
-                liveStates: liveStates,
-                liveStatusModel: liveStatusModel
-            )
+            // Both grids stay permanently in the view hierarchy so that
+            // switching pools is a pure display filter — no SwiftUI identity
+            // churn, no dismantleNSView, no libghostty surface teardown.
+            // Only the visible grid receives hit-testing and is rendered.
+            ZStack {
+                WorkerGrid(
+                    runtime: workspace.runtime,
+                    slots: workspace.slots,
+                    liveStates: liveStates,
+                    liveStatusModel: liveStatusModel
+                )
+                .opacity(selectedPool == .main ? 1 : 0)
+                .allowsHitTesting(selectedPool == .main)
+
+                WorkerGrid(
+                    runtime: workspace.runtime,
+                    slots: workspace.automationSlots,
+                    liveStates: liveStates,
+                    liveStatusModel: liveStatusModel
+                )
+                .opacity(selectedPool == .automations ? 1 : 0)
+                .allowsHitTesting(selectedPool == .automations)
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .separatorColor))
