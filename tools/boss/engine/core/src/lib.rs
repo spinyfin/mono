@@ -17,7 +17,7 @@ pub mod dead_pid_sweep;
 pub mod dep_unblock_sweep;
 pub mod design_detector;
 pub mod dispatch_events;
-pub mod editorial;
+pub use boss_editorial as editorial;
 pub mod dispatch_reader;
 pub mod effort;
 pub mod engine_control;
