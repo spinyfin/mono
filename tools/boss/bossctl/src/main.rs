@@ -12,7 +12,8 @@
 //! print a structured "not_implemented" response so the Boss session
 //! can call them and see which ones are pending.
 
-use std::path::PathBuf;
+use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -137,6 +138,36 @@ enum Command {
         /// Work item to reveal: short id (`T607`) or canonical id.
         id: String,
     },
+    /// Read engine diagnostic logs. Works file-scan-only — no running engine
+    /// required. Resolves log paths automatically from the Boss state root.
+    ///
+    /// The primary log (`engine`, default) is `engine-trace.jsonl` —
+    /// structured JSONL tracing events from the running engine. The `audit`
+    /// log is `engine-audit.log` — compact lifecycle records (start, socket
+    /// bind, shutdown) useful for timeline reconstruction after an incident.
+    ///
+    /// Output is plain text suitable for copy/paste into a shake report.
+    Logs {
+        /// Which log to read.
+        /// `engine` → `engine-trace.jsonl` (structured trace, primary);
+        /// `audit`  → `engine-audit.log` (lifecycle events).
+        #[arg(value_enum, default_value_t = LogSource::Engine)]
+        source: LogSource,
+        /// Print the last N lines (default 50).
+        #[arg(short = 'n', long = "tail", default_value_t = 50)]
+        tail: usize,
+        /// Stream appended lines live, like `tail -f`. Polls every 250 ms;
+        /// press Ctrl-C to stop.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Filter to lines containing this substring (case-sensitive).
+        #[arg(long)]
+        grep: Option<String>,
+        /// Override the Boss state root (defaults to
+        /// `$HOME/Library/Application Support/Boss`).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -213,6 +244,24 @@ impl std::fmt::Display for TranscriptFormat {
             TranscriptFormat::Text => write!(f, "text"),
             TranscriptFormat::Jsonl => write!(f, "jsonl"),
             TranscriptFormat::Markdown => write!(f, "markdown"),
+        }
+    }
+}
+
+/// Which engine log file `bossctl logs` should read.
+#[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
+enum LogSource {
+    /// `engine-trace.jsonl` — structured tracing events (primary log).
+    Engine,
+    /// `engine-audit.log` — lifecycle events (start, socket bind, shutdown).
+    Audit,
+}
+
+impl std::fmt::Display for LogSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogSource::Engine => write!(f, "engine"),
+            LogSource::Audit => write!(f, "audit"),
         }
     }
 }
@@ -656,6 +705,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: HostsAction::Remove { id, state_root },
         } => hosts_remove(cli.json, state_root, id),
         Command::Reveal { id } => reveal_work_item(&cli.socket_path, cli.json, id).await,
+        Command::Logs {
+            source,
+            tail,
+            follow,
+            grep,
+            state_root,
+        } => {
+            if follow {
+                logs_follow(source, state_root, tail, grep).await
+            } else {
+                logs_tail(cli.json, source, state_root, tail, grep.as_deref())
+            }
+        }
     }
 }
 
@@ -2475,6 +2537,192 @@ fn print_host_detail(host: &Host, caps: &[HostCapability]) {
     }
 }
 
+// ── bossctl logs handlers ─────────────────────────────────────────────────────
+
+/// Resolve the on-disk path for a log source, using the state root as the
+/// base directory. For the audit log the engine's own env-var override
+/// (`BOSS_ENGINE_AUDIT_PATH`) is honoured so the CLI and engine always agree
+/// on which file they are talking about.
+fn resolve_log_source_path(source: &LogSource, state_root: &Path) -> PathBuf {
+    match source {
+        LogSource::Engine => state_root.join("engine-trace.jsonl"),
+        LogSource::Audit => {
+            if let Ok(p) = std::env::var(boss_engine::audit::AUDIT_PATH_ENV) {
+                let trimmed = p.trim().to_owned();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed);
+                }
+            }
+            state_root.join("engine-audit.log")
+        }
+    }
+}
+
+/// Build an oldest-to-newest list of log segments for `base_path`.
+/// Rotated files are expected at `<base_path>.N` for N = 1..=10, where `.1`
+/// is the most recent rotation and `.10` is the oldest. Any segment that does
+/// not exist on disk is silently skipped. The live file (`base_path` itself)
+/// is always appended last even if it is absent — callers handle missing
+/// primary files gracefully via [`read_file_lines`].
+fn rotated_segments(base_path: &Path) -> Vec<PathBuf> {
+    let mut segments: Vec<PathBuf> = Vec::new();
+    for i in (1u32..=10).rev() {
+        let candidate = PathBuf::from(format!("{}.{i}", base_path.display()));
+        if candidate.exists() {
+            segments.push(candidate);
+        }
+    }
+    segments.push(base_path.to_path_buf());
+    segments
+}
+
+/// Read all lines from `path` that match the optional `grep` filter.
+/// A missing file is treated as empty (not an error), since the log may not
+/// exist yet on a freshly installed engine.
+fn read_file_lines(path: &Path, grep: Option<&str>) -> Result<Vec<String>> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let lines = std::io::BufReader::new(file)
+        .lines()
+        .filter_map(|r| r.ok())
+        .filter(|line| grep.is_none_or(|g| line.contains(g)))
+        .collect();
+    Ok(lines)
+}
+
+/// Collect the last `tail_n` lines across the current file and any rotated
+/// segments. Segments are read oldest-first so the returned slice is in
+/// chronological order.
+fn collect_tail_lines(base_path: &Path, tail_n: usize, grep: Option<&str>) -> Result<Vec<String>> {
+    let mut all_lines: Vec<String> = Vec::new();
+    for seg in rotated_segments(base_path) {
+        all_lines.extend(read_file_lines(&seg, grep)?);
+    }
+    let start = all_lines.len().saturating_sub(tail_n);
+    Ok(all_lines[start..].to_vec())
+}
+
+fn logs_tail(
+    json: bool,
+    source: LogSource,
+    state_root: Option<PathBuf>,
+    tail_n: usize,
+    grep: Option<&str>,
+) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let base_path = resolve_log_source_path(&source, &root);
+    let tail_lines = collect_tail_lines(&base_path, tail_n, grep)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "source": source.to_string(),
+                "path": base_path.display().to_string(),
+                "lines": tail_lines,
+                "count": tail_lines.len(),
+            })
+        );
+    } else if tail_lines.is_empty() {
+        eprintln!("==> {} <== (no lines)", base_path.display());
+    } else {
+        eprintln!("==> {} <==", base_path.display());
+        for line in &tail_lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Read bytes appended to `path` since `from_pos`. Returns the new lines and
+/// the byte offset of the end of the last complete line consumed. Partial
+/// trailing lines (no newline yet) are left for the next poll so we never
+/// emit a half-written JSON record.
+fn read_new_content(
+    path: &Path,
+    from_pos: u64,
+    grep: Option<&str>,
+) -> Result<(Vec<String>, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(from_pos))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    if buf.is_empty() {
+        return Ok((Vec::new(), from_pos));
+    }
+    let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(pos) => pos,
+        None => return Ok((Vec::new(), from_pos)),
+    };
+    let new_pos = from_pos + last_nl as u64 + 1;
+    let text = String::from_utf8_lossy(&buf[..=last_nl]);
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter(|l| grep.is_none_or(|g| l.contains(g)))
+        .map(|s| s.to_owned())
+        .collect();
+    Ok((lines, new_pos))
+}
+
+async fn logs_follow(
+    source: LogSource,
+    state_root: Option<PathBuf>,
+    tail_n: usize,
+    grep: Option<String>,
+) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let base_path = resolve_log_source_path(&source, &root);
+
+    let tail_lines = collect_tail_lines(&base_path, tail_n, grep.as_deref())?;
+    if !tail_lines.is_empty() {
+        eprintln!("==> {} <==", base_path.display());
+        for line in &tail_lines {
+            println!("{line}");
+        }
+    }
+
+    let mut pos: u64 = std::fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!("==> (following — Ctrl-C to stop) <==");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        match std::fs::metadata(&base_path) {
+            Ok(m) => {
+                let new_len = m.len();
+                if new_len < pos {
+                    // File was rotated or truncated; reset so we catch the new content.
+                    pos = 0;
+                }
+                if new_len > pos {
+                    match read_new_content(&base_path, pos, grep.as_deref()) {
+                        Ok((lines, new_pos)) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
+                            pos = new_pos;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "bossctl: error reading {}: {err}",
+                                base_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // File disappeared (e.g. mid-rotation); reset so we read from start when it reappears.
+                pos = 0;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2692,5 +2940,101 @@ mod tests {
             single.contains("\"live_status_at\":null"),
             "missing live_status_at key in single-state serialization: {single}"
         );
+    }
+
+    // ── logs tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_file_lines_returns_all_lines_without_filter() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "hello world").unwrap();
+        writeln!(f, "foo bar").unwrap();
+        let lines = read_file_lines(&path, None).unwrap();
+        assert_eq!(lines, vec!["hello world", "foo bar"]);
+    }
+
+    #[test]
+    fn read_file_lines_filters_by_grep() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "hello world").unwrap();
+        writeln!(f, "foo bar").unwrap();
+        writeln!(f, "hello again").unwrap();
+        let lines = read_file_lines(&path, Some("hello")).unwrap();
+        assert_eq!(lines, vec!["hello world", "hello again"]);
+    }
+
+    #[test]
+    fn read_file_lines_returns_empty_for_missing_file() {
+        let path = std::path::Path::new("/nonexistent/surely/does/not/exist/test.log");
+        let lines = read_file_lines(path, None).unwrap();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn collect_tail_lines_returns_last_n() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..10u32 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        let lines = collect_tail_lines(&path, 3, None).unwrap();
+        assert_eq!(lines, vec!["line 7", "line 8", "line 9"]);
+    }
+
+    #[test]
+    fn collect_tail_lines_returns_all_when_fewer_than_n() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "only line").unwrap();
+        let lines = collect_tail_lines(&path, 50, None).unwrap();
+        assert_eq!(lines, vec!["only line"]);
+    }
+
+    #[test]
+    fn read_new_content_reads_complete_lines_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("partial.log");
+        // Two complete lines followed by a partial (no trailing newline).
+        std::fs::write(&path, b"line1\nline2\npartial").unwrap();
+        let (lines, pos) = read_new_content(&path, 0, None).unwrap();
+        assert_eq!(lines, vec!["line1", "line2"]);
+        // pos should point past the second newline, not into the partial line.
+        assert_eq!(pos, b"line1\nline2\n".len() as u64);
+    }
+
+    #[test]
+    fn read_new_content_returns_nothing_when_no_complete_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("partial.log");
+        std::fs::write(&path, b"no newline yet").unwrap();
+        let (lines, pos) = read_new_content(&path, 0, None).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(pos, 0); // position should not advance
+    }
+
+    #[test]
+    fn read_new_content_applies_grep_filter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("grep.log");
+        std::fs::write(&path, b"match me\nskip this\nmatch too\n").unwrap();
+        let (lines, _) = read_new_content(&path, 0, Some("match")).unwrap();
+        assert_eq!(lines, vec!["match me", "match too"]);
+    }
+
+    #[test]
+    fn rotated_segments_ends_with_base_path() {
+        let base = std::path::Path::new("/tmp/fake-engine-trace.jsonl");
+        let segs = rotated_segments(base);
+        assert_eq!(segs.last().unwrap(), base);
     }
 }
