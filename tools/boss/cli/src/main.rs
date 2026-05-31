@@ -1399,6 +1399,16 @@ struct TaskCreateArgs {
     /// unconditionally.
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
+
+    /// Mark this task as produced by an automation's triage phase. Accepts
+    /// an automation selector — a canonical `auto_…` id (resolves on its
+    /// own) or an `A<n>` short id (requires `--product`). The engine stamps
+    /// `source_automation_id`, transactionally re-checks the automation's
+    /// open-task cap (the fan-out backstop), inherits the automation's repo,
+    /// and runs the task in the dedicated automations pool. Intended for the
+    /// triage agent; `--project` is ignored when this is set.
+    #[arg(long)]
+    automation: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2938,6 +2948,23 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
     let mut client = connect_for_work(ctx).await?;
     match command {
         TaskCommand::Create(args) => {
+            // `--automation`: the triage agent's create path. The produced
+            // task is product-level (no project) and routed to the automations
+            // pool; the engine owns provenance stamping + the cap re-check.
+            if let Some(selector) = args.automation.clone() {
+                let product =
+                    resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
+                let automation =
+                    resolve_automation(&mut client, &selector, product.as_ref()).await?;
+                let name = required_text(args.name, "Task name", ctx)?;
+                let description = optional_text(args.description, "Description", ctx)?;
+                let task =
+                    create_automation_task(&mut client, &automation.id, name, description).await?;
+                let task = with_display_status(task);
+                return print_entity(ctx, &serde_json::json!({ "task": task }), || {
+                    print_task_details("Created automation task", &task, None, false);
+                });
+            }
             let product = resolve_product_inferable(
                 &mut client,
                 args.product,
@@ -5313,6 +5340,33 @@ async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("task create", &other)),
+    }
+}
+
+/// Create the single task produced by an automation's triage phase
+/// (`boss task create --automation`). The engine resolves provenance, the
+/// open-task-cap re-check, repo inheritance, and execution dispatch; the CLI
+/// is a thin pass-through. A cap-reached rejection surfaces as a `WorkError`.
+async fn create_automation_task(
+    client: &mut BossClient,
+    automation_id: &str,
+    name: String,
+    description: Option<String>,
+) -> Result<Task, CliError> {
+    match client
+        .send_request(&FrontendRequest::CreateAutomationTask {
+            automation_id: automation_id.to_owned(),
+            name,
+            description,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemCreated { item } => expect_chore(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation task create", &other)),
     }
 }
 

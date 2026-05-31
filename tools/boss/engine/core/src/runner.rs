@@ -400,16 +400,56 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             None
         };
-        let prompt_text = compose_execution_prompt(
-            execution,
-            work_item,
-            parent_project.as_ref(),
-            workspace_path,
-            cube_change_id,
-            conflict_attempt.as_ref(),
-            recovery_branch.as_deref(),
-            ci_attempt.as_ref(),
-        );
+        // Maint task 6: an `automation_triage` execution renders the triage
+        // preamble (decision-marker contract + "do not do the work / do not
+        // open a PR" guardrails) instead of the ordinary implementer prompt.
+        // Its `work_item_id` is the automation id, so we read the automation
+        // directly. If the automation vanished mid-flight, fall back to the
+        // generic prompt so the worker at least has workspace context.
+        let prompt_text = if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
+            match self.work_db.get_automation(&execution.work_item_id) {
+                Ok(Some(automation)) => {
+                    let product_name = self
+                        .work_db
+                        .get_product(&automation.product_id)
+                        .ok()
+                        .flatten()
+                        .map(|p| p.name)
+                        .unwrap_or_else(|| automation.product_id.clone());
+                    crate::automation_triage::render_triage_preamble(&automation, &product_name)
+                }
+                other => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        automation_id = %execution.work_item_id,
+                        resolved = ?other.as_ref().map(|o| o.is_some()),
+                        "automation_triage execution could not resolve its automation; \
+                         falling back to generic prompt",
+                    );
+                    compose_execution_prompt(
+                        execution,
+                        work_item,
+                        parent_project.as_ref(),
+                        workspace_path,
+                        cube_change_id,
+                        conflict_attempt.as_ref(),
+                        recovery_branch.as_deref(),
+                        ci_attempt.as_ref(),
+                    )
+                }
+            }
+        } else {
+            compose_execution_prompt(
+                execution,
+                work_item,
+                parent_project.as_ref(),
+                workspace_path,
+                cube_change_id,
+                conflict_attempt.as_ref(),
+                recovery_branch.as_deref(),
+                ci_attempt.as_ref(),
+            )
+        };
 
         // Resolve the per-execution effort + model knobs (design §Q3
         // precedence). Read both columns off the row, the parent

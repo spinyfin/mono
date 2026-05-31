@@ -2055,6 +2055,15 @@ pub const AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT: &str = "suppressed_at_limit";
 pub const AUTOMATION_OUTCOME_FAILED_WILL_RETRY: &str = "failed_will_retry";
 pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
 
+/// `work_executions.kind` discriminator for an automation triage execution
+/// (Maint task 6). A triage execution is bound to an automation (its
+/// `work_item_id` is the `automations.id`), not to a task: it runs a triage
+/// agent that decides whether to produce a single maintenance task. This
+/// kind routes the execution to the dedicated automations worker pool and
+/// drives the triage preamble + outcome detector instead of the normal
+/// PR-completion path.
+pub const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
+
 /// Input to `CreateAutomation`. Carries only the caller-supplied fields;
 /// the engine stamps `id`, `short_id`, `created_at`, `updated_at`, and the
 /// initial scheduler bookkeeping.

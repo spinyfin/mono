@@ -90,7 +90,9 @@ const AUTOMATION_WORKER_ID_PREFIX: &str = "auto-worker-";
 
 /// Execution kind string for automation triage runs. Triage executions
 /// bind to an automation (not a task) and always route to the automation pool.
-pub(crate) const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
+/// Re-exported from `boss_protocol` so the runner (preamble) and completion
+/// handler (outcome detector) share one source of truth.
+pub(crate) use boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE;
 
 /// Upper bound on how long the engine waits for a single
 /// `cube workspace lease` subprocess invocation before declaring the
@@ -1496,6 +1498,50 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Resolve the [`WorkItem`] an execution operates on.
+    ///
+    /// For a normal execution this is the persisted task/chore/product/
+    /// project. An `automation_triage` execution, though, binds to an
+    /// `automations.id` — there is no task row for `get_work_item` to find —
+    /// so we synthesize an in-memory `Chore` carrying the automation's
+    /// product/name/repo. The synthetic item only feeds the task-centric
+    /// spawn plumbing (cube task label, change title, product resolution);
+    /// the runner branches on `kind` to render the triage preamble and the
+    /// completion handler branches on `kind` to run the outcome detector, so
+    /// the synthetic fields never drive real task work.
+    fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
+        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+            if let Some(item) = self.synthetic_triage_work_item(execution) {
+                return Ok(item);
+            }
+        }
+        self.work_db.get_work_item(&execution.work_item_id)
+    }
+
+    /// Build the synthetic `Chore` work item for an `automation_triage`
+    /// execution from the bound automation. `None` when the automation row is
+    /// gone (deleted mid-flight) — the caller then falls back to the normal
+    /// `get_work_item`, which fails cleanly.
+    fn synthetic_triage_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {
+        let automation = self
+            .work_db
+            .get_automation(&execution.work_item_id)
+            .ok()
+            .flatten()?;
+        let task = boss_protocol::Task::builder()
+            .id(automation.id.clone())
+            .product_id(automation.product_id.clone())
+            .kind("chore")
+            .name(format!("Automation triage: {}", automation.name))
+            .description(automation.standing_instruction.clone())
+            .status("active")
+            .repo_remote_url(execution.repo_remote_url.clone())
+            .created_at(automation.created_at.clone())
+            .updated_at(automation.updated_at.clone())
+            .build();
+        Some(WorkItem::Chore(task))
+    }
+
     async fn schedule_execution(
         self: &Arc<Self>,
         execution: &WorkExecution,
@@ -1547,8 +1593,7 @@ impl ExecutionCoordinator {
         }
 
         let work_item = self
-            .work_db
-            .get_work_item(&execution.work_item_id)
+            .resolve_execution_work_item(execution)
             .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))?;
         let task = execution_task_summary(execution, &work_item);
 
@@ -1799,7 +1844,7 @@ impl ExecutionCoordinator {
                 // inside the same transaction. Broadcast a work-tree
                 // invalidation so kanban subscribers re-fetch and
                 // move the card to the Doing column.
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                if let Ok(work_item) = self.resolve_execution_work_item(&execution) {
                     self.publisher
                         .publish_work_item_changed(
                             &work_item_product_id(&work_item),
@@ -2382,6 +2427,31 @@ impl ExecutionCoordinator {
                     error = %error,
                     "recorded execution start failure"
                 );
+
+                // Maint task 6 — transient-retry wiring on `dispatch_not_before`:
+                // an `automation_triage` execution that exhausts its pre-start
+                // retries is the design's `failed_gave_up` terminal state.
+                // Finalise the matching `automation_runs` row so the Automations
+                // tab shows the occurrence was abandoned (the schedule already
+                // advanced past it when the scheduler fired the triage). Until
+                // this point the run sat at the pessimistic `failed_will_retry`.
+                if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                    if let Err(err) = self.work_db.finalize_automation_triage_run(
+                        &execution.id,
+                        boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                        None,
+                        Some(&format!(
+                            "triage pre-start failed permanently after {} attempt(s): {error}",
+                            execution.pre_start_failure_count
+                        )),
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to mark automation run failed_gave_up after permanent triage pre-start failure",
+                        );
+                    }
+                }
 
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one

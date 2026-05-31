@@ -48,9 +48,12 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use boss_protocol::{
-    BranchNaming, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, FrontendEvent,
+    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
+    AUTOMATION_OUTCOME_SKIPPED, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, FrontendEvent,
 };
 
+use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::merge_poller::{
@@ -897,6 +900,14 @@ impl WorkerCompletionHandler {
             }
         }
 
+        // Maint task 6: an `automation_triage` execution never opens a PR.
+        // Its Stop is resolved by the marker-protocol outcome detector
+        // (`automation: task <id>` / `automation: skip — …`), not by PR
+        // detection or the nudge path below. Branch out before any of that.
+        if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
+            return self.finalize_automation_triage(&execution).await;
+        }
+
         // Primary path: a PR URL was already captured from a
         // `PostToolUse` Bash hook event (`gh pr create` /
         // `gh pr view` / `gh pr edit` stdout) while the worker was
@@ -1551,6 +1562,208 @@ must not be asked to open one",
     /// cube lease + pane, publishes invalidation events, and returns
     /// the matching [`StopOutcome`]. `source` distinguishes call
     /// sites in the publish reason and tracing — `"stop"` for the
+    /// Maint task 6: resolve a finished `automation_triage` execution via the
+    /// marker protocol and finalise both its `automation_runs` row and the
+    /// execution itself.
+    ///
+    /// The worker was told to end its final message with exactly one of
+    /// `automation: task <id>` or `automation: skip — <reason>`. Steps:
+    /// 1. read the final assistant message and parse the decision;
+    /// 2. for a `task` marker, verify the id resolves to a task carrying this
+    ///    automation's provenance — so a misbehaving agent can't pass off an
+    ///    unrelated task as its own output;
+    /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
+    ///    `failed_will_retry` for a missing / ambiguous / unverifiable marker);
+    /// 4. finalise the execution (`completed`) and release pane + workspace.
+    async fn finalize_automation_triage(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> StopOutcome {
+        let automation_id = execution.work_item_id.clone();
+        let final_message = self.read_final_triage_message(&execution.id).await;
+        let decision = match final_message.as_deref() {
+            Some(text) => parse_triage_decision(text),
+            None => TriageDecision::NoDecision,
+        };
+
+        let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) =
+            match &decision {
+                TriageDecision::ProducedTask(marker_id) => {
+                    match self.work_db.get_work_item_resolving_short_id(marker_id) {
+                        Ok(Some(WorkItem::Task(t))) | Ok(Some(WorkItem::Chore(t)))
+                            if t.source_automation_id.as_deref()
+                                == Some(automation_id.as_str()) =>
+                        {
+                            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(t.id.clone()), None)
+                        }
+                        other => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                automation_id = %automation_id,
+                                marker_id,
+                                resolved_some = ?other.as_ref().map(|o| o.is_some()),
+                                "triage emitted a task marker but no task with this automation's \
+                                 provenance matched; leaving run failed_will_retry",
+                            );
+                            (
+                                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                                None,
+                                Some(format!(
+                                    "triage emitted `automation: task {marker_id}` but no task \
+                                     with this automation's provenance was found"
+                                )),
+                            )
+                        }
+                    }
+                }
+                TriageDecision::Skip(reason) => {
+                    let reason = if reason.is_empty() {
+                        "no reason given".to_owned()
+                    } else {
+                        reason.clone()
+                    };
+                    (AUTOMATION_OUTCOME_SKIPPED, None, Some(reason))
+                }
+                TriageDecision::NoDecision => (
+                    AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                    None,
+                    Some("triage ended without a decision marker".to_owned()),
+                ),
+                TriageDecision::Ambiguous(n) => (
+                    AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                    None,
+                    Some(format!(
+                        "triage emitted {n} decision markers; expected exactly one"
+                    )),
+                ),
+            };
+
+        match self.work_db.finalize_automation_triage_run(
+            &execution.id,
+            outcome,
+            produced_task_id.as_deref(),
+            detail.as_deref(),
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                execution_id = %execution.id,
+                automation_id = %automation_id,
+                "no automation_runs row matched this triage execution; outcome not recorded",
+            ),
+            Err(err) => tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to finalise automation_runs row for triage execution",
+            ),
+        }
+
+        // Finalise the execution + release pane and cube workspace, mirroring
+        // the PR-completion finalizer's release order. Capture the lease id
+        // before `finish_execution_run` nulls the lease columns.
+        let lease_id = execution.cube_lease_id.clone();
+        match self.work_db.active_run_ids_for_execution(&execution.id) {
+            Ok(run_ids) => {
+                for run_id in run_ids {
+                    if let Err(err) = self.work_db.finish_execution_run(
+                        &execution.id,
+                        &run_id,
+                        "completed",
+                        "completed",
+                        Some(&format!("automation triage: {outcome}")),
+                        None,
+                        /* clear_workspace_lease */ true,
+                        None,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            run_id,
+                            ?err,
+                            "failed to finish triage execution run",
+                        );
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to list active runs for triage finalisation",
+            ),
+        }
+        if let Some(lease_id) = lease_id.as_deref() {
+            if let Err(err) = self.cube_client.release_workspace(lease_id).await {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    ?err,
+                    "triage finalisation: cube workspace release failed",
+                );
+            }
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+        self.publisher
+            .publish(
+                &execution.id,
+                &automation_id,
+                "completed",
+                "automation_triage_completed",
+            )
+            .await;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            automation_id = %automation_id,
+            outcome,
+            produced_task_id = ?produced_task_id,
+            "automation triage finalised",
+        );
+        StopOutcome::AutomationTriage {
+            outcome: outcome.to_owned(),
+        }
+    }
+
+    /// Read the final assistant text of `execution_id`'s transcript, if any.
+    /// Returns `None` when no transcript is recorded/readable or it contains
+    /// no assistant turn — the caller treats that as "no decision".
+    async fn read_final_triage_message(&self, execution_id: &str) -> Option<String> {
+        let path = match self.work_db.transcript_path_for_execution(execution_id) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                tracing::warn!(
+                    execution_id,
+                    "triage finalisation: no transcript path recorded; treating as no decision",
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "triage finalisation: transcript lookup failed",
+                );
+                return None;
+            }
+        };
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let events = crate::transcript_markdown::parse_transcript(&content);
+                events.iter().rev().find_map(|e| match &e.kind {
+                    crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => {
+                        Some(t.clone())
+                    }
+                    _ => None,
+                })
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "triage finalisation: failed to read transcript file",
+                );
+                None
+            }
+        }
+    }
+
     /// Stop hook path, `"pr_recheck"` for the merge-poller's
     /// fallback sweep — so operators can see which path closed a
     /// given chore.
@@ -1790,6 +2003,9 @@ must not be asked to open one",
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,
+            // Unreachable here (this finalizer only runs for `ci_remediation`
+            // kind), but a triage outcome must never mark a CI attempt failed.
+            StopOutcome::AutomationTriage { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -2841,6 +3057,13 @@ pub enum StopOutcome {
     /// task is snapped back to `in_review`, and the execution is
     /// finalised. No nudge is sent.
     SignalAlreadyCleared { pr_url: String },
+    /// Maint task 6: an `automation_triage` execution finished and its
+    /// final message was run through the marker-protocol outcome detector.
+    /// `outcome` is the `automation_runs.outcome` discriminator recorded
+    /// (`produced_task` / `skipped` / `failed_will_retry`). The execution is
+    /// finalised (`completed`) and its pane/workspace released regardless of
+    /// which marker (if any) the agent emitted.
+    AutomationTriage { outcome: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
