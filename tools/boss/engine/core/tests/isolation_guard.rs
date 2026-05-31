@@ -47,6 +47,7 @@ impl TestEngine {
             cwd: temp.path().to_path_buf(),
             db_path,
             worker_pool_size: 1,
+            automation_pool_size: 1,
         };
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
@@ -180,6 +181,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
         cwd: temp.path().to_path_buf(),
         db_path: prod_db,
         worker_pool_size: 1,
+        automation_pool_size: 1,
     };
     let prod_cfg = Arc::new(RuntimeConfig::from_parts(prod_work, None));
     let prod_sock_c = prod_socket.clone();
@@ -203,6 +205,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
         cwd: temp.path().to_path_buf(),
         db_path: test_db,
         worker_pool_size: 1,
+        automation_pool_size: 1,
     };
     let test_cfg = Arc::new(RuntimeConfig::from_parts(test_work, None));
     let test_sock_c = test_socket.clone();

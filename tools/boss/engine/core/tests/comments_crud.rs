@@ -37,6 +37,7 @@ impl TestEngine {
             cwd: temp.path().to_path_buf(),
             db_path: PathBuf::from(":memory:"),
             worker_pool_size: 1,
+            automation_pool_size: 1,
         };
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();

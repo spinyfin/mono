@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
-use crate::coordinator::MAX_WORKER_POOL_SIZE;
+use crate::coordinator::{MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
@@ -21,6 +21,9 @@ pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
     pub worker_pool_size: usize,
+    /// Size of the dedicated automation worker pool. Configured via
+    /// `BOSS_AUTOMATION_POOL_SIZE`; defaults to [`MAX_AUTOMATION_POOL_SIZE`].
+    pub automation_pool_size: usize,
 }
 
 impl WorkConfig {
@@ -43,10 +46,19 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(MAX_WORKER_POOL_SIZE);
+        let automation_pool_size = std::env::var("BOSS_AUTOMATION_POOL_SIZE")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| format!("could not parse BOSS_AUTOMATION_POOL_SIZE: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(MAX_AUTOMATION_POOL_SIZE);
         Ok(Self {
             cwd,
             db_path,
             worker_pool_size,
+            automation_pool_size,
         })
     }
 }
@@ -197,7 +209,7 @@ fn default_db_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd};
+    use super::{MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd};
     use std::path::PathBuf;
 
     #[test]
@@ -246,6 +258,58 @@ mod tests {
             match original_pool {
                 Some(value) => std::env::set_var("BOSS_WORKER_POOL_SIZE", value),
                 None => std::env::remove_var("BOSS_WORKER_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn automation_pool_size_defaults_to_max_when_env_unset() {
+        let original_pool = std::env::var_os("BOSS_AUTOMATION_POOL_SIZE");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        unsafe {
+            std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.automation_pool_size, MAX_AUTOMATION_POOL_SIZE);
+
+        unsafe {
+            match original_pool {
+                Some(value) => std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", value),
+                None => std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn automation_pool_size_reads_from_env() {
+        let original_pool = std::env::var_os("BOSS_AUTOMATION_POOL_SIZE");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        unsafe {
+            std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", "2");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.automation_pool_size, 2);
+
+        unsafe {
+            match original_pool {
+                Some(value) => std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", value),
+                None => std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE"),
             }
             match original_db {
                 Some(value) => std::env::set_var("BOSS_DB_PATH", value),
