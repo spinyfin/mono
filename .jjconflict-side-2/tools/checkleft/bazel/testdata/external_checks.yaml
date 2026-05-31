@@ -1,4 +1,0 @@
-checks:
-  - id: noop-check
-    check: noop-check
-    implementation: generated:noop-check
