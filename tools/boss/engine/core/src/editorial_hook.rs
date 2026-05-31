@@ -512,7 +512,8 @@ struct SpannedValue {
 
 /// The editorial-relevant arguments parsed out of a `gh pr|issue`
 /// command.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 struct GhArgs {
     title: Option<SpannedValue>,
     body: Option<SpannedValue>,
