@@ -1115,6 +1115,22 @@ pub enum FrontendRequest {
         automation_id: String,
         force: bool,
     },
+    /// Create a single maintenance task produced by an automation's triage
+    /// phase (Maint task 6). Called by the triage agent via
+    /// `boss task create --automation <A-id>`. The engine resolves the
+    /// automation, transactionally re-checks its open-task cap (the
+    /// backstop against a misbehaving agent fanning out multiple tasks),
+    /// stamps `tasks.source_automation_id`, inherits the automation's repo,
+    /// and — because the produced task is `autostart` — requests its
+    /// execution (which the dispatcher routes to the automations pool).
+    /// Replies with [`FrontendEvent::WorkItemCreated`] on success, or
+    /// [`FrontendEvent::WorkError`] when the automation is unknown or the
+    /// open-task cap is already reached.
+    CreateAutomationTask {
+        automation_id: String,
+        name: String,
+        description: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

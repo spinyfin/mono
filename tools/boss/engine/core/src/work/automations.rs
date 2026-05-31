@@ -510,4 +510,202 @@ impl WorkDb {
         .map(|opt| opt.flatten())
         .map_err(Into::into)
     }
+
+    /// Create a `ready` `automation_triage` work_execution bound to an
+    /// automation (Maint task 6).
+    ///
+    /// A triage execution's `work_item_id` is the `automations.id`, not a
+    /// task — so it cannot go through the task-centric `insert_execution`
+    /// resolvers (which require the work_item to resolve to a product/task).
+    /// We insert the row directly with the automation's already-resolved
+    /// repo. Downstream: the dispatcher routes it to the automations pool on
+    /// `kind`, the runner renders the triage preamble, and the outcome
+    /// detector finalises the matching `automation_runs` row on Stop. The row
+    /// starts `ready` so the coordinator's normal drain picks it up (and the
+    /// existing `dispatch_not_before` / `pre_start_failure_count` machinery
+    /// retries it transparently on a transient pre-start failure).
+    pub fn create_automation_triage_execution(
+        &self,
+        automation_id: &str,
+        repo_remote_url: &str,
+    ) -> Result<WorkExecution> {
+        let conn = self.connect()?;
+        let id = next_id("exec");
+        let now = now_string();
+        let branch_naming_json =
+            serde_json::to_string(&boss_protocol::BranchNaming::default()).unwrap_or_default();
+        // Column list mirrors `insert_execution`; every column it omits has a
+        // schema DEFAULT (pre_start_failure_count=0, dispatch_not_before=NULL,
+        // transient_failure_count=0, host_id='local', …).
+        conn.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
+                allow_dirty, branch_naming
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6)",
+            params![
+                id,
+                automation_id,
+                boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE,
+                repo_remote_url,
+                now,
+                branch_naming_json,
+            ],
+        )?;
+        query_execution(&conn, &id)?
+            .with_context(|| format!("missing automation triage execution after insert: {id}"))
+    }
+
+    /// Fetch the `automation_runs` row whose triage `work_execution` is
+    /// `triage_execution_id`, if one exists. Used by the outcome detector on
+    /// Stop to map a finished triage execution back to the occurrence it
+    /// fired for. Newest occurrence first as a tie-break (a retried execution
+    /// id is unique, so at most one row normally matches).
+    pub fn automation_run_for_triage_execution(
+        &self,
+        triage_execution_id: &str,
+    ) -> Result<Option<boss_protocol::AutomationRun>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, automation_id, scheduled_for, started_at, finished_at,
+                    triage_execution_id, outcome, produced_task_id, detail
+               FROM automation_runs
+              WHERE triage_execution_id = ?1
+              ORDER BY scheduled_for DESC, started_at DESC
+              LIMIT 1",
+            [triage_execution_id],
+            map_automation_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Finalise the `automation_runs` row for a finished triage execution
+    /// (Maint task 6 outcome detection). Sets the terminal `outcome`,
+    /// `produced_task_id`, `finished_at`, and (when `Some`) `detail`, and
+    /// mirrors the outcome onto `automations.last_outcome`.
+    ///
+    /// Deliberately does NOT touch `next_due_at`: the scheduler already
+    /// advanced the schedule past this occurrence when it fired the triage.
+    /// Returns `false` when no run matches the execution id (the scheduler
+    /// never recorded it — e.g. a manual fire that failed before recording).
+    pub fn finalize_automation_triage_run(
+        &self,
+        triage_execution_id: &str,
+        outcome: &str,
+        produced_task_id: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, automation_id FROM automation_runs
+                  WHERE triage_execution_id = ?1
+                  ORDER BY scheduled_for DESC, started_at DESC LIMIT 1",
+                [triage_execution_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((run_id, automation_id)) = row else {
+            return Ok(false);
+        };
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "UPDATE automation_runs
+                SET outcome = ?2,
+                    produced_task_id = ?3,
+                    detail = COALESCE(?4, detail),
+                    finished_at = ?5
+              WHERE id = ?1",
+            params![
+                run_id,
+                outcome,
+                produced_task_id,
+                detail,
+                now_epoch.to_string()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE automations SET last_outcome = ?2 WHERE id = ?1",
+            params![automation_id, outcome],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Create the single maintenance task produced by an automation's triage
+    /// phase (`boss task create --automation`). Maint task 6.
+    ///
+    /// Runs in one immediate transaction:
+    /// 1. **Open-task-cap re-check** — the backstop against fan-out. The
+    ///    scheduler already gated at fire time, but a misbehaving triage
+    ///    agent could call this repeatedly within one run; re-checking the
+    ///    cap transactionally guarantees at most `open_task_limit` open
+    ///    produced tasks regardless of agent behaviour.
+    /// 2. Insert a product-level chore (`kind='chore'`, `project_id=NULL`)
+    ///    inheriting the automation's repo override, `autostart=true` so
+    ///    phase 2 starts automatically.
+    /// 3. Stamp `source_automation_id` for provenance, backlog exclusion,
+    ///    pool routing, and the open-task-limit denominator.
+    ///
+    /// Returns an error (surfaced to the agent) when the cap is already met,
+    /// so the marker the agent then emits can be reconciled by the detector.
+    pub fn create_automation_task(
+        &self,
+        automation_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Task> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let automation = query_automation(&tx, automation_id)?
+            .with_context(|| format!("unknown automation: {automation_id}"))?;
+
+        let open: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tasks
+              WHERE source_automation_id = ?1
+                AND status IN ('todo', 'ready', 'doing', 'in_review', 'blocked')
+                AND deleted_at IS NULL",
+            [automation_id],
+            |row| row.get(0),
+        )?;
+        if open >= automation.open_task_limit {
+            anyhow::bail!(
+                "automation {automation_id} is at its open-task limit \
+                 ({open}/{}); refusing to create another task (fan-out backstop)",
+                automation.open_task_limit
+            );
+        }
+
+        // `force_duplicate` so a recurring maintenance instruction that
+        // produces same-named tasks across fires is not blocked by the
+        // 60-second recent-duplicate guard.
+        let mut task = insert_chore_in_tx(
+            &tx,
+            CreateChoreInput {
+                product_id: automation.product_id.clone(),
+                name: name.to_owned(),
+                description: description.map(str::to_owned),
+                autostart: true,
+                priority: None,
+                created_via: Some(boss_protocol::CREATED_VIA_ENGINE_AUTO.to_owned()),
+                repo_remote_url: automation.repo_remote_url.clone(),
+                effort_level: None,
+                model_override: None,
+                force_duplicate: true,
+            },
+        )?;
+        tx.execute(
+            "UPDATE tasks SET source_automation_id = ?2 WHERE id = ?1",
+            params![task.id, automation_id],
+        )?;
+        tx.commit()?;
+        task.source_automation_id = Some(automation_id.to_owned());
+        Ok(task)
+    }
 }

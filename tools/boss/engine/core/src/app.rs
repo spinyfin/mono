@@ -2775,15 +2775,24 @@ pub async fn serve(
     // cron/timezone occurrence, enforce the open-task gate, apply catch-up /
     // skip-if-imminent, and write the decision to `automation_runs`. Fires
     // immediately on boot so a daily occurrence elapsed while the engine was
-    // down is caught up without waiting a full interval. The triage
-    // *execution* itself (the `automation_triage` work_execution + outcome
-    // detector) is Maint task 6; until it lands the loop holds each due
-    // occurrence as `failed_will_retry` via `LoggingTriageDispatcher` rather
-    // than firing into the void. With zero automations configured the loop
-    // is inert.
+    // down is caught up without waiting a full interval. With zero automations
+    // configured the loop is inert.
+    //
+    // Maint task 6: the fire seam now dispatches a real `automation_triage`
+    // work_execution via `EngineTriageDispatcher` (creates the execution row
+    // bound to the automation and kicks the coordinator's drain). The existing
+    // `dispatch_not_before` / `pre_start_failure_count` machinery retries a
+    // transient pre-start failure transparently; the completion handler's
+    // outcome detector finalises the run once the worker reaches a decision.
+    let coord_for_automation_triage = server_state.execution_coordinator.clone();
+    let automation_triage_dispatcher: Arc<dyn crate::automation_scheduler::TriageDispatcher> =
+        Arc::new(crate::automation_triage::EngineTriageDispatcher::new(
+            server_state.work_db.clone(),
+            Arc::new(move || coord_for_automation_triage.kick()),
+        ));
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
-        Arc::new(crate::automation_scheduler::LoggingTriageDispatcher),
+        automation_triage_dispatcher,
         crate::automation_scheduler::AUTOMATION_SCHEDULER_INTERVAL,
     );
 
@@ -8358,15 +8367,15 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
-            FrontendRequest::RunAutomation { automation_id, force: _ } => {
-                // The scheduler loop (maintenance-tasks.md T5) and triage
-                // dispatch (T6) are not yet implemented. The engine can verify
-                // the automation exists and that the open-task cap allows a
-                // fire, but it cannot actually enqueue a triage execution yet.
-                // Return a clear "not yet implemented" error so the CLI can
-                // surface it honestly.
-                let automation_exists = match work_db.get_automation(&automation_id) {
-                    Ok(Some(_)) => true,
+            FrontendRequest::RunAutomation { automation_id, force } => {
+                // Manual out-of-schedule triage fire (`boss automation run`).
+                // Respects the open-task cap unless `force`. Mirrors the
+                // scheduler's fire path: dispatch a triage execution, then
+                // record an `automation_runs` row for the occurrence (using
+                // `now` as `scheduled_for`) WITHOUT advancing the cron schedule
+                // (`next_due_at` is left untouched — this is out of band).
+                let automation = match work_db.get_automation(&automation_id) {
+                    Ok(Some(a)) => a,
                     Ok(None) => {
                         send_response(
                             &sink,
@@ -8375,7 +8384,7 @@ async fn handle_frontend_connection(
                                 message: format!("unknown automation: {automation_id}"),
                             },
                         );
-                        false
+                        continue;
                     }
                     Err(err) => {
                         send_response(
@@ -8385,20 +8394,141 @@ async fn handle_frontend_connection(
                                 message: err.to_string(),
                             },
                         );
-                        false
+                        continue;
                     }
                 };
-                if automation_exists {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: "automation triage dispatch not yet implemented \
-                                      (depends on maintenance-tasks.md task 5/6 — \
-                                      scheduler loop and triage execution)"
-                                .to_owned(),
-                        },
-                    );
+
+                if !force {
+                    match work_db.count_open_tasks_for_automation(&automation_id) {
+                        Ok(open) if open >= automation.open_task_limit => {
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: format!(
+                                        "automation {automation_id} is at its open-task limit \
+                                         ({open}/{}); pass --force to fire anyway",
+                                        automation.open_task_limit
+                                    ),
+                                },
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: err.to_string(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                let coord = server_state.execution_coordinator.clone();
+                let dispatcher = crate::automation_triage::EngineTriageDispatcher::new(
+                    work_db.clone(),
+                    Arc::new(move || coord.kick()),
+                );
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                match dispatcher.fire(&automation) {
+                    crate::automation_scheduler::TriageDispatch::Dispatched { execution_id } => {
+                        if let Err(err) = work_db.record_automation_run_and_advance(
+                            crate::work::AutomationFireRecord::builder()
+                                .automation_id(automation_id.clone())
+                                .scheduled_for(now_epoch)
+                                .started_at(now_epoch)
+                                .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                                .triage_execution_id(execution_id)
+                                .build(),
+                        ) {
+                            tracing::warn!(
+                                automation_id = %automation_id,
+                                ?err,
+                                "manual automation run: triage dispatched but failed to record run row",
+                            );
+                        }
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AutomationRunEnqueued { automation_id },
+                        );
+                    }
+                    crate::automation_scheduler::TriageDispatch::TransientFailure { detail } => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("could not enqueue triage: {detail}"),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::CreateAutomationTask {
+                automation_id,
+                name,
+                description,
+            } => {
+                // The triage agent's `boss task create --automation`. Creates
+                // the single produced task (with a transactional open-task-cap
+                // re-check as the fan-out backstop), then — because the task is
+                // `autostart` — requests its execution, which the dispatcher
+                // routes to the automations pool on `source_automation_id`.
+                match work_db.create_automation_task(
+                    &automation_id,
+                    &name,
+                    description.as_deref(),
+                ) {
+                    Ok(task) => {
+                        let item = WorkItem::Chore(task);
+                        let work_item_id_for_dispatch = work_item_id(&item);
+                        let live_states = server_state.live_worker_states.clone();
+                        let dispatch_input = RequestExecutionInput::builder()
+                            .work_item_id(work_item_id_for_dispatch.clone())
+                            .build();
+                        match work_db.request_execution_with_live_check(dispatch_input, |run_id| {
+                            live_states.is_run_live(run_id)
+                        }) {
+                            Ok(_execution) => {
+                                server_state.execution_coordinator.kick();
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    work_item_id = %work_item_id_for_dispatch,
+                                    ?err,
+                                    "CreateAutomationTask: task created but auto-dispatch failed; \
+                                     task will start when re-scanned",
+                                );
+                            }
+                        }
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "automation_task_created",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemCreated { item },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(&sink, &request_id, duplicate_or_work_error(err));
+                    }
                 }
             }
         }

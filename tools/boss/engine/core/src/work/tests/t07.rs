@@ -457,3 +457,168 @@ fn short_ids_are_allocated_per_product() {
     assert_eq!(a2p1.short_id, Some(2));
     assert_eq!(a1p2.short_id, Some(1));
 }
+
+// ── triage execution + outcome detection (Maint task 6) ──────────────────────
+
+fn make_automation(db: &WorkDb, product_id: &str, limit: i64) -> boss_protocol::Automation {
+    db.create_automation(CreateAutomationInput {
+        product_id: product_id.to_owned(),
+        name: "clippy sweep".to_owned(),
+        repo_remote_url: None,
+        trigger: make_schedule_trigger(),
+        standing_instruction: "Fix any clippy warnings.".to_owned(),
+        open_task_limit: limit,
+        catch_up_window_secs: None,
+        enabled: true,
+        created_via: Some("cli".to_owned()),
+    })
+    .unwrap()
+}
+
+/// `create_automation_task` stamps provenance, defaults the produced row to a
+/// product-level autostart chore, and — the fan-out backstop — refuses a
+/// second create once the open-task cap is reached.
+#[test]
+fn create_automation_task_stamps_provenance_and_enforces_cap() {
+    let db = WorkDb::open(temp_db_path("auto-task-cap")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 1);
+
+    let task = db
+        .create_automation_task(&automation.id, "fix clippy in foo", Some("the foo crate"))
+        .unwrap();
+    assert_eq!(task.kind, "chore");
+    assert_eq!(task.project_id, None);
+    assert!(task.autostart);
+    assert_eq!(task.source_automation_id.as_deref(), Some(automation.id.as_str()));
+    assert_eq!(
+        db.count_open_tasks_for_automation(&automation.id).unwrap(),
+        1
+    );
+
+    // Second create must be rejected by the transactional cap re-check.
+    let err = db
+        .create_automation_task(&automation.id, "fix clippy in bar", None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("open-task limit"),
+        "expected cap error, got: {err}"
+    );
+    assert_eq!(
+        db.count_open_tasks_for_automation(&automation.id).unwrap(),
+        1,
+        "rejected create must not insert a row"
+    );
+
+    // The produced task is listed under the automation.
+    let tasks = db.list_tasks_for_automation(&automation.id).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, task.id);
+}
+
+/// A higher cap permits more concurrent produced tasks.
+#[test]
+fn create_automation_task_respects_higher_cap() {
+    let db = WorkDb::open(temp_db_path("auto-task-cap-2")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 2);
+
+    db.create_automation_task(&automation.id, "t1", None).unwrap();
+    db.create_automation_task(&automation.id, "t2", None).unwrap();
+    assert!(
+        db.create_automation_task(&automation.id, "t3", None).is_err(),
+        "third create must trip the cap of 2"
+    );
+}
+
+/// A triage execution binds to the automation (not a task) and starts `ready`
+/// in the `automation_triage` kind with the supplied repo.
+#[test]
+fn create_automation_triage_execution_binds_to_automation() {
+    let db = WorkDb::open(temp_db_path("auto-triage-exec")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 1);
+
+    let exec = db
+        .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+        .unwrap();
+    assert_eq!(exec.work_item_id, automation.id);
+    assert_eq!(exec.kind, boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE);
+    assert_eq!(exec.status, "ready");
+    assert_eq!(exec.repo_remote_url, "git@github.com:spinyfin/mono.git");
+}
+
+/// The outcome detector finalises the run keyed on the triage execution id,
+/// records the produced task, mirrors `last_outcome`, and — crucially — does
+/// NOT rewind `next_due_at` (the scheduler already advanced it at fire time).
+#[test]
+fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
+    let db = WorkDb::open(temp_db_path("auto-triage-finalize")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 1);
+    let exec = db
+        .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+        .unwrap();
+
+    // Scheduler-style fire record: pessimistic failed_will_retry, advance to
+    // the following occurrence.
+    let scheduled_for = 1_700_000_000i64;
+    let following = scheduled_for + 86_400;
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(scheduled_for)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+            .triage_execution_id(exec.id.clone())
+            .next_due_at(following)
+            .build(),
+    )
+    .unwrap();
+
+    // The triage agent created the produced task (real row — `produced_task_id`
+    // is a FK into `tasks`, so a verified id is required).
+    let produced = db
+        .create_automation_task(&automation.id, "fix clippy", None)
+        .unwrap();
+
+    // Detector flips the run to produced_task once the worker emitted the marker.
+    let updated = db
+        .finalize_automation_triage_run(
+            &exec.id,
+            boss_protocol::AUTOMATION_OUTCOME_PRODUCED_TASK,
+            Some(&produced.id),
+            None,
+        )
+        .unwrap();
+    assert!(updated, "a matching run row must be finalised");
+
+    let run = db
+        .automation_run_for_triage_execution(&exec.id)
+        .unwrap()
+        .expect("run row present");
+    assert_eq!(run.outcome, boss_protocol::AUTOMATION_OUTCOME_PRODUCED_TASK);
+    assert_eq!(run.produced_task_id.as_deref(), Some(produced.id.as_str()));
+    assert!(run.finished_at.is_some());
+
+    let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
+    assert_eq!(
+        reloaded.last_outcome.as_deref(),
+        Some(boss_protocol::AUTOMATION_OUTCOME_PRODUCED_TASK)
+    );
+    assert_eq!(
+        reloaded.next_due_at.unwrap().parse::<i64>().unwrap(),
+        following,
+        "finalisation must not rewind the schedule"
+    );
+
+    // Finalising an unknown execution id is a no-op, not an error.
+    assert!(!db
+        .finalize_automation_triage_run(
+            "exec_nonexistent",
+            boss_protocol::AUTOMATION_OUTCOME_SKIPPED,
+            None,
+            Some("x"),
+        )
+        .unwrap());
+}
