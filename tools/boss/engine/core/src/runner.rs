@@ -2892,6 +2892,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));
@@ -3031,6 +3032,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));
@@ -3368,6 +3370,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));
@@ -3523,6 +3526,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 8,
+                automation_pool_size: 3,
             },
             None,
         ));
@@ -3601,6 +3605,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));
@@ -3707,6 +3712,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));
@@ -3844,6 +3850,7 @@ mod pane_spawn_tests {
                 cwd: workspace.path().to_path_buf(),
                 db_path: workspace.path().join("state.db"),
                 worker_pool_size: 1,
+                automation_pool_size: 1,
             },
             None,
         ));

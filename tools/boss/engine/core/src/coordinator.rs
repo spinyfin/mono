@@ -78,6 +78,20 @@ impl ExecutionStartedHook for NoopExecutionStartedHook {
 /// design fixes 8 as the upper bound.
 pub const MAX_WORKER_POOL_SIZE: usize = 8;
 
+/// Hard cap on the automation worker pool. The runtime config can request a
+/// smaller pool via `BOSS_AUTOMATION_POOL_SIZE`, but values above this are
+/// clamped. Fixed at 3 per the Pool model design.
+pub const MAX_AUTOMATION_POOL_SIZE: usize = 3;
+
+/// Worker ID prefix for automation-pool slots. Distinct from the main-pool
+/// `"worker-"` prefix so `pool_for_worker_id` can route releases to the
+/// correct pool without an extra DB round-trip.
+const AUTOMATION_WORKER_ID_PREFIX: &str = "auto-worker-";
+
+/// Execution kind string for automation triage runs. Triage executions
+/// bind to an automation (not a task) and always route to the automation pool.
+pub(crate) const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
+
 /// Upper bound on how long the engine waits for a single
 /// `cube workspace lease` subprocess invocation before declaring the
 /// attempt a timeout failure. The motivating incident
@@ -603,19 +617,30 @@ struct WorkerSlot {
 
 impl WorkerPool {
     pub fn new(size: usize) -> Self {
-        let clamped = if size > MAX_WORKER_POOL_SIZE {
+        Self::new_with_prefix(size, "worker-", MAX_WORKER_POOL_SIZE)
+    }
+
+    /// Construct an automation pool. Slots are named `auto-worker-N` so
+    /// `pool_for_worker_id` can distinguish them from main-pool slots.
+    /// Capped at [`MAX_AUTOMATION_POOL_SIZE`].
+    pub fn new_automation(size: usize) -> Self {
+        Self::new_with_prefix(size, AUTOMATION_WORKER_ID_PREFIX, MAX_AUTOMATION_POOL_SIZE)
+    }
+
+    fn new_with_prefix(size: usize, prefix: &str, hard_cap: usize) -> Self {
+        let clamped = if size > hard_cap {
             tracing::warn!(
                 requested = size,
-                cap = MAX_WORKER_POOL_SIZE,
+                cap = hard_cap,
                 "worker pool size exceeds hard cap; clamping"
             );
-            MAX_WORKER_POOL_SIZE
+            hard_cap
         } else {
             size
         };
         let workers = (0..clamped)
             .map(|index| WorkerSlot {
-                worker_id: format!("worker-{}", index + 1),
+                worker_id: format!("{}{}", prefix, index + 1),
                 execution_id: None,
                 last_workspace_id: None,
             })
@@ -879,6 +904,10 @@ impl RevisionSource for AtomicU64 {
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
+    /// Dedicated pool for automation triage and automation-produced task
+    /// executions. Sized independently from the main pool (default 3) so
+    /// maintenance work never contends with interactive dispatch.
+    automation_pool: WorkerPool,
     host_adapter: Arc<dyn HostAdapter>,
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
@@ -976,6 +1005,7 @@ impl ExecutionCoordinator {
         Self {
             work_db,
             worker_pool,
+            automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
             host_adapter,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink::default()),
@@ -987,6 +1017,19 @@ impl ExecutionCoordinator {
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
         }
     }
+
+    /// Override the automation pool. `app.rs` calls this with a pool sized
+    /// from `BOSS_AUTOMATION_POOL_SIZE`; tests may supply a smaller pool.
+    pub fn set_automation_pool(&mut self, pool: WorkerPool) {
+        self.automation_pool = pool;
+    }
+
+    /// Return a clone of the automation worker pool handle. Used by
+    /// `app.rs` to expose the pool's live state to the Agents-tab UI.
+    pub fn automation_worker_pool(&self) -> WorkerPool {
+        self.automation_pool.clone()
+    }
+
 
     /// Wire the execution-started hook. Production installs the
     /// `WorkerCompletionHandler` here so it can snapshot the bound
@@ -1030,6 +1073,41 @@ impl ExecutionCoordinator {
 
     pub fn worker_pool(&self) -> WorkerPool {
         self.worker_pool.clone()
+    }
+
+    /// Return the pool that should handle `execution`.
+    ///
+    /// `automation_triage` executions always route to the automation pool.
+    /// Regular task executions route to the automation pool when the owning
+    /// task has `source_automation_id IS NOT NULL` (it was produced by an
+    /// automation). All other executions go to the main pool.
+    fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
+        if self.execution_targets_automation_pool(execution) {
+            &self.automation_pool
+        } else {
+            &self.worker_pool
+        }
+    }
+
+    fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
+        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+            return true;
+        }
+        matches!(
+            self.work_db
+                .source_automation_id_for_work_item(&execution.work_item_id),
+            Ok(Some(_))
+        )
+    }
+
+    /// Return the pool that owns `worker_id`. Automation-pool slots are
+    /// identified by the `"auto-worker-"` prefix stamped at construction time.
+    fn pool_for_worker_id<'a>(&'a self, worker_id: &str) -> &'a WorkerPool {
+        if worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
+            &self.automation_pool
+        } else {
+            &self.worker_pool
+        }
     }
 
     pub fn kick(self: &Arc<Self>) {
@@ -1264,23 +1342,52 @@ impl ExecutionCoordinator {
     /// drain stopped so the caller can decide whether to re-enter
     /// immediately (queue empty + pending wakeup) or yield (pool
     /// exhausted).
+    /// Drain the `ready` execution queue, routing each execution to the
+    /// correct pool (main or automation). Per-pool exhaustion is handled
+    /// independently: a full automation pool does not block main-pool
+    /// dispatch and vice-versa.
+    ///
+    /// All `ready` rows are fetched once at the top of each drain pass.
+    /// Executions whose pool is already known to be exhausted are skipped
+    /// for this pass; they remain `ready` and will be picked up on the
+    /// next `kick()` triggered by `release_worker_and_kick`.
     async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
-        loop {
-            let Some(execution) = self.next_ready_execution() else {
+        let executions = match self.work_db.list_ready_executions() {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::error!(?err, "failed to list ready executions");
                 return DrainOutcome::QueueEmpty;
-            };
-            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            }
+        };
 
-            // Stage 1: request_recorded — the execution row is ready
-            // and the scheduler has picked it up. This event closes
-            // the gap between "the row exists" and "the scheduler
-            // saw it" that the motivating incident lived in.
+        if executions.is_empty() {
+            return DrainOutcome::QueueEmpty;
+        }
+
+        let mut main_pool_exhausted = false;
+        let mut auto_pool_exhausted = false;
+
+        for execution in executions {
+            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            let is_automation = self.execution_targets_automation_pool(&execution);
+
+            // Skip executions for pools we already know are full.
+            // They remain `ready` and will be retried on the next kick.
+            if is_automation && auto_pool_exhausted {
+                continue;
+            }
+            if !is_automation && main_pool_exhausted {
+                continue;
+            }
+
+            // Stage 1: request_recorded
             self.dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::RequestRecorded, DispatchOutcome::Ok, &execution.id)
                         .with_work_item(&execution.work_item_id)
                         .with_details(serde_json::json!({
                             "preferred_workspace_id": preferred_workspace_id,
+                            "pool": if is_automation { "automation" } else { "main" },
                         })),
                 )
                 .await;
@@ -1288,44 +1395,44 @@ impl ExecutionCoordinator {
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 preferred_workspace_id = ?preferred_workspace_id,
+                pool = if is_automation { "automation" } else { "main" },
                 "spawn_attempt status=ready -> picked_up"
             );
 
-            let Some(worker_id) = self
-                .worker_pool
+            let pool = self.pool_for_execution(&execution);
+            let Some(worker_id) = pool
                 .claim_worker(&execution.id, preferred_workspace_id.as_deref())
                 .await
             else {
-                // Pool is fully claimed. The execution stays `ready`
-                // and re-kicks when a worker is released; surface the
-                // stall so an unexpectedly small pool is visible in
-                // the engine log instead of failing silently.
-                let pool_capacity = self.worker_pool.capacity().await;
+                // This pool is fully claimed. Record exhaustion and continue
+                // so executions for the other pool can still be dispatched.
+                let pool_capacity = pool.capacity().await;
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     pool_capacity,
+                    pool = if is_automation { "automation" } else { "main" },
                     "spawn_attempt status=ready -> deferred reason=pool_exhausted"
                 );
-                // Invariant: every `tasks.status = 'active'` chore
-                // should be backed by a `running` execution / live
-                // worker. If the pool stalled with active chores that
-                // have no running execution, surface the gap so the
-                // ghost-active state isn't silent — the human can
-                // compare against `bossctl agents list`.
-                let orphans = self
-                    .work_db
-                    .list_active_chores_without_live_run()
-                    .unwrap_or_default();
-                if !orphans.is_empty() {
-                    tracing::warn!(
-                        ghost_active = ?orphans,
-                        pool_capacity,
-                        "active chores without a running execution after pool exhaustion \
-                         — `boss chore list --status active` and `bossctl agents list` will \
-                         diverge until a slot frees up"
-                    );
+
+                // Ghost-active invariant check (main pool only; automation
+                // tasks are excluded from the normal kanban).
+                if !is_automation {
+                    let orphans = self
+                        .work_db
+                        .list_active_chores_without_live_run()
+                        .unwrap_or_default();
+                    if !orphans.is_empty() {
+                        tracing::warn!(
+                            ghost_active = ?orphans,
+                            pool_capacity,
+                            "active chores without a running execution after pool exhaustion \
+                             — `boss chore list --status active` and `bossctl agents list` will \
+                             diverge until a slot frees up"
+                        );
+                    }
                 }
+
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1336,12 +1443,18 @@ impl ExecutionCoordinator {
                         .with_work_item(&execution.work_item_id)
                         .with_details(serde_json::json!({
                             "reason": "pool_exhausted",
+                            "pool": if is_automation { "automation" } else { "main" },
                             "pool_capacity": pool_capacity,
-                            "ghost_active": orphans,
                         })),
                     )
                     .await;
-                return DrainOutcome::PoolExhausted;
+
+                if is_automation {
+                    auto_pool_exhausted = true;
+                } else {
+                    main_pool_exhausted = true;
+                }
+                continue;
             };
 
             self.dispatch_events
@@ -1369,21 +1482,17 @@ impl ExecutionCoordinator {
                         worker_id = %worker_id,
                         "spawn_attempt status=ready -> failed reason=schedule_execution_error"
                     );
-                    self.worker_pool
+                    self.pool_for_worker_id(&worker_id)
                         .release_worker(&worker_id, preferred_workspace_id.as_deref())
                         .await;
                 }
             }
         }
-    }
 
-    fn next_ready_execution(&self) -> Option<WorkExecution> {
-        match self.work_db.list_ready_executions() {
-            Ok(mut executions) => executions.drain(..).next(),
-            Err(err) => {
-                tracing::error!(?err, "failed to list ready executions");
-                None
-            }
+        if main_pool_exhausted || auto_pool_exhausted {
+            DrainOutcome::PoolExhausted
+        } else {
+            DrainOutcome::QueueEmpty
         }
     }
 
@@ -2768,7 +2877,7 @@ impl ExecutionCoordinator {
         worker_id: &str,
         last_workspace_id: Option<&str>,
     ) {
-        self.worker_pool
+        self.pool_for_worker_id(worker_id)
             .release_worker(worker_id, last_workspace_id)
             .await;
         self.rescan_active_dispatch_after_release();
@@ -6900,6 +7009,265 @@ mod tests {
             any.iter().any(|(id, _)| id == &execution_id),
             "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
              got {any:?}",
+        );
+    }
+
+    /// Automation-produced tasks (stamped with `source_automation_id`) must be
+    /// routed to the automation pool, not the main pool.  A normal chore with no
+    /// `source_automation_id` must continue to route to the main pool.
+    #[tokio::test]
+    async fn automation_produced_task_routes_to_automation_pool() {
+        use crate::work::CreateAutomationInput;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Test automation".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "do maintenance".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        // Create an automation-produced chore and stamp source_automation_id.
+        let auto_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Automation chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+                rusqlite::params![automation.id, auto_chore.id],
+            )
+            .unwrap();
+        }
+
+        // Create a regular chore with no source_automation_id.
+        let main_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Regular chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        // Wire in a 1-slot automation pool so we can check idle counts.
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+
+        // Wait for both chores to be dispatched.
+        for _ in 0..200 {
+            let executions = db.list_executions(None).unwrap();
+            if executions
+                .iter()
+                .filter(|e| e.status == "running")
+                .count()
+                == 2
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let executions = db.list_executions(None).unwrap();
+        let running: Vec<_> = executions
+            .iter()
+            .filter(|e| e.status == "running")
+            .collect();
+        assert_eq!(running.len(), 2, "both chores must be running; got {running:?}");
+
+        // The main pool slot should be claimed by the regular chore.
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "main pool slot must be claimed by the regular chore"
+        );
+        // The automation pool slot should be claimed by the automation chore.
+        assert_eq!(
+            coordinator.automation_worker_pool().idle_count().await,
+            0,
+            "automation pool slot must be claimed by the automation-produced chore"
+        );
+
+        let _ = auto_chore;
+        let _ = main_chore;
+    }
+
+    /// Automation pool exhaustion must not block main-pool dispatch.
+    /// When the automation pool is full, regular chores continue to be
+    /// dispatched on the main pool.
+    #[tokio::test]
+    async fn automation_pool_exhaustion_does_not_block_main_pool() {
+        use crate::work::CreateAutomationInput;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Test automation".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "do maintenance".to_owned(),
+                open_task_limit: 5,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        // Two automation-produced chores (pool size will be 1, so the second stays ready).
+        for n in 0..2 {
+            let chore = db
+                .create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: format!("Auto chore {n}"),
+                    description: None,
+                    autostart: true,
+                    priority: None,
+                    created_via: None,
+                    repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
+                    force_duplicate: false,
+                })
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+                rusqlite::params![automation.id, chore.id],
+            )
+            .unwrap();
+        }
+
+        // One regular chore — must still be dispatched even when the automation pool is full.
+        db.create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Regular chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        // Main pool: 1 slot; automation pool: 1 slot.
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+
+        // Wait for at least 2 executions to be running (1 main + 1 automation).
+        for _ in 0..200 {
+            let executions = db.list_executions(None).unwrap();
+            if executions
+                .iter()
+                .filter(|e| e.status == "running")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let executions = db.list_executions(None).unwrap();
+        let running = executions
+            .iter()
+            .filter(|e| e.status == "running")
+            .count();
+        assert_eq!(
+            running, 2,
+            "exactly 2 executions must be running (1 per pool); got {running}"
+        );
+        // The third execution (second auto chore) must remain ready — automation pool full.
+        let ready = executions
+            .iter()
+            .filter(|e| e.status == "ready")
+            .count();
+        assert_eq!(
+            ready, 1,
+            "the second auto chore must be deferred (automation pool full); got {ready} ready"
         );
     }
 }

@@ -271,4 +271,24 @@ impl WorkDb {
         let rows = stmt.query_map([automation_id], map_task_with_source_automation_id)?;
         collect_rows(rows)
     }
+
+    /// Return the `source_automation_id` for `work_item_id`, or `None` if the
+    /// task is not automation-produced (or the id is not a task at all).
+    /// Used by the dispatcher to route automation-produced task executions to
+    /// the automation pool. Returns `Ok(None)` rather than an error when the
+    /// id is not found in `tasks` (e.g. it references a project or product).
+    pub fn source_automation_id_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT source_automation_id FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            [work_item_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten())
+        .map_err(Into::into)
+    }
 }
