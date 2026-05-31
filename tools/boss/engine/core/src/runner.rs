@@ -787,6 +787,10 @@ fn compose_execution_prompt(
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         }
+        // Warn that PR creation is terminal — the engine reaps the worker
+        // immediately after the PR is opened. Workers must finish everything
+        // BEFORE opening the PR; no followup turn is possible.
+        prompt.push_str(&pr_terminal_directive());
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -838,6 +842,23 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
          If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
             .to_string(),
     )
+}
+
+/// Directive that warns workers PR creation is terminal: the engine reaps
+/// them immediately after the PR is opened. No followup turn is possible.
+/// Workers must finish all work — including consuming any in-flight reviews
+/// they started — BEFORE opening the PR. Incident: a worker opened a PR,
+/// then tried to wait for background review subagents and address their
+/// findings as followup commits. The engine terminated the worker the moment
+/// the PR was created, so the review was never consumed. This universal
+/// guidance applies to every execution kind and prevents that pattern.
+fn pr_terminal_directive() -> String {
+    let mut out = String::new();
+    out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    out.push_str("Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n");
+    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr ensure`. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
+    out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
+    out
 }
 
 /// Post-PR CI-monitoring directive (issue #899). A worker that opens a
