@@ -22,6 +22,7 @@ rust_library(
         "src/dep_unblock_sweep.rs",
         "src/design_detector.rs",
         "src/dispatch_events.rs",
+        "src/editorial.rs",
         "src/dispatch_reader.rs",
         "src/effort.rs",
         "src/engine_control.rs",
