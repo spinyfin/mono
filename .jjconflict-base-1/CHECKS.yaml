@@ -1,0 +1,32 @@
+checks:
+  - id: no-generated-artifacts
+    check: forbidden-paths
+    config:
+      rules:
+        - remediation: Generated build output must not be committed. Remove the artifact from the change.
+          when:
+            - added
+            - modified
+            - renamed
+          patterns:
+            - "**/target/**"
+            - "**/node_modules/**"
+            - "**/.build/**"
+            - "bazel-*"
+            - "bazel-*/**"
+
+  - id: oversized-files
+    check: file-size
+    config:
+      max_lines: 500
+      exclude_globs:
+        - "**/*.md"
+        - "**/*.lock"
+        - "**/Package.resolved"
+        - "pnpm-lock.yaml"
+
+  - id: rust-test-rule-coverage
+
+  - id: todo-expiry
+
+  - id: repo-visibility

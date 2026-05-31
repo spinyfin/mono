@@ -1,0 +1,40 @@
+[package]
+name = "boss-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+boss-transcript-markdown = { path = "boss-transcript-markdown" }
+boss-pr-template = { path = "pr-template" }
+async-trait = { workspace = true }
+bon = { workspace = true }
+boss-protocol = { path = "../protocol" }
+clap = { workspace = true, features = ["derive"] }
+fastrand = { workspace = true }
+libc = "0.2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+shlex = { workspace = true }
+rusqlite = { workspace = true }
+regex = { workspace = true }
+keyring = { workspace = true, features = ["apple-native"] }
+reqwest = { workspace = true, features = ["json"] }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+[dev-dependencies]
+boss-client = { path = "../client" }
+tempfile = { workspace = true }
+wiremock = { workspace = true }

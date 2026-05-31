@@ -1,0 +1,258 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "boss",
+    srcs = glob(["src/**/*.rs"]),
+    # `boss shake`'s github_app module loads embedded RSA test fixtures
+    # via `include_str!("../tests/fixtures/…")` inside #[cfg(test)]
+    # blocks. The fixtures aren't reachable from a non-test build, but
+    # `include_str!` is parsed unconditionally — Bazel needs them
+    # staged in the sandbox or the binary fails to compile.
+    compile_data = glob(["tests/fixtures/**"]) + [
+        # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
+        # rules_rust expands $(execpath ...) to an absolute path at compile time.
+        "//tools/boss/installer:build_info_rs",
+    ],
+    # rules_rust does NOT propagate --action_env into the rustc compile
+    # action's cache key or environment. Use rustc_env + --define so that
+    # the cache key changes when the credential values change and rustc
+    # actually sees the vars via option_env!(). Default values are empty
+    # strings (see .bazelrc); the release pipeline overrides via --define.
+    rustc_env = {
+        "BOSS_SHAKE_APP_ID": "$(BOSS_SHAKE_APP_ID)",
+        "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
+        "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
+        # Absolute path to the generated build-info constants file.
+        # rules_rust prefixes $(execpath) values with ${pwd} and resolves
+        # them to absolute filesystem paths before invoking rustc.
+        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
+    },
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/installer:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "boss_test",
+    crate = ":boss",
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for the `boss` CLI's typed-id → product inference.
+# Spawns an in-process engine and drives the `boss` binary as a real
+# subprocess; the data dep stages it into the test's runfiles tree at
+# `$RUNFILES_DIR/_main/tools/boss/cli/boss`.
+rust_test(
+    name = "infer_product_test",
+    srcs = ["tests/infer_product.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for the effort-level / model-override CLI
+# surface (PR #370 schema task). Same shape as `infer_product_test`
+# — drives the `boss` binary against an in-process engine to confirm
+# `--effort` / `--model` round-trip through create/edit/show and
+# `set-default-model` lifecycles.
+rust_test(
+    name = "effort_and_model_test",
+    srcs = ["tests/effort_and_model.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for the creation-time repo resolver (design
+# §Q4 / follow-up chore #6). Same shape as the other CLI integration
+# tests — drives the `boss` binary against an in-process engine to
+# confirm the inference chain (explicit → prompt parser → recent →
+# default → no-input refuse) behaves as designed.
+rust_test(
+    name = "repo_resolution_test",
+    srcs = ["tests/repo_resolution.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# Regression test: boss uninstall with BOSS_INSTALL_ROOT set must not kill
+# the host engine. Drives the boss binary as a subprocess; no engine needed.
+rust_test(
+    name = "uninstall_test",
+    srcs = ["tests/uninstall.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for `boss shake` (the "file a bug against Boss"
+# verb). Uses --dry-run so no `gh` call is made and no real issue is filed.
+rust_test(
+    name = "shake_test",
+    srcs = ["tests/shake.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end integration tests for the friendly-id selector semantics
+# (chore 3 of 5 — "Friendly numeric IDs"). Verifies that 42, #42,
+# boss/42, boss/#42, and primary-id forms all resolve correctly and
+# that wrong-kind errors name the corrective verb.
+rust_test(
+    name = "friendly_id_test",
+    srcs = ["tests/friendly_id.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for the heuristic feedback-loop audit report
+# (design §Q4 follow-up, PR #370). Drives `boss product
+# audit-effort` against an in-process engine with synthetic
+# escalation events filed via the wire surface the sibling
+# escalation-handler task will use.
+rust_test(
+    name = "audit_effort_test",
+    srcs = ["tests/audit_effort.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for `boss product set-external-tracker` and the
+# external-tracker block in `boss product show` (chores 11 + 14 of the
+# external-issue-tracker-sync design). Drives the `boss` binary against
+# an in-process engine and verifies bind → show → unbind → show lifecycle.
+rust_test(
+    name = "external_tracker_test",
+    srcs = ["tests/external_tracker.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for `boss engine ci ...` and `boss engine
+# attempts list` (design Phase 11 #35/#36 of
+# merge-conflict-handling-in-review.md). Drives the `boss` binary
+# against an in-process engine with `ci_remediations` rows seeded via
+# the engine's WorkDb.
+rust_test(
+    name = "engine_ci_verbs_test",
+    srcs = ["tests/engine_ci_verbs.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

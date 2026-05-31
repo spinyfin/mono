@@ -1,0 +1,90 @@
+load("@build_bazel_rules_apple//apple:versioning.bzl", "apple_bundle_version")
+load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:private"])
+
+# The set of binaries bundled inside Boss.app/Contents/Resources/bin/.
+# cube is bundled here so that the engine can find it even when the macOS GUI
+# launchd PATH excludes the user's shell PATH (~/bin, /opt/homebrew/bin, etc.).
+# Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
+# so they continue to resolve cube (and jj, gh, claude, etc.) from PATH — only
+# the engine needs the bundled copy.
+filegroup(
+    name = "bundled_binaries",
+    srcs = [
+        "//tools/boss/engine/core:engine",
+        "//tools/boss/cli:boss",
+        "//tools/boss/bossctl:bossctl",
+        "//tools/boss/event-shim:boss-event",
+        "//tools/cube:cube",
+    ],
+)
+
+filegroup(
+    name = "installer_scripts",
+    srcs = glob(["scripts/*"]),
+)
+
+# Staged payload directory: Boss.app/ tree with bundled binaries in
+# Contents/Resources/bin/ (binaries are included via additional_contents
+# on the macos_application rule in //tools/boss/app-macos:Boss).
+boss_pkg_payload(
+    name = "boss_pkg_payload",
+    app = "//tools/boss/app-macos:Boss",
+)
+
+# Unsigned .pkg installer.  Output: boss_pkg_unsigned/Boss-<sha>.pkg.
+# Requires --config=release to embed the git SHA in the filename; without
+# --stamp the output is Boss-unknown.pkg.
+#
+# Done criteria reference (design doc Q4 Phase 1 + Phase 2):
+#   Phase 1 — Bazel produces the binaries (this rule + boss_pkg_payload)
+#   Phase 2 — workspace-status.sh threads the git SHA into the filename
+boss_pkg_unsigned(
+    name = "boss_pkg_unsigned",
+    distribution = "distribution.xml",
+    payload = ":boss_pkg_payload",
+    scripts = ":installer_scripts",
+)
+
+# Stamped Rust constants file consumed by engine_lib, boss, and bossctl.
+# Emits BOSS_VERSION (from git tags), BOSS_GIT_SHA, and BOSS_BUILD_TIME.
+# Each binary's BUILD rule adds this target to compile_data and references
+# it via $(execpath) in rustc_env → include!(env!("BOSS_BUILD_INFO_RS")).
+build_info_rs(
+    name = "build_info_rs",
+    out = "build_info_generated.rs",
+    visibility = ["//tools/boss:__subpackages__"],
+)
+
+# Human-facing release driver (design doc Q4 Phase 3).
+# Signs, notarizes, and staples the Boss installer .pkg.
+#
+# Full release:
+#   bazel run //tools/boss/installer:release --config=release
+#
+# CI / sign-only (no notarization):
+#   bazel run //tools/boss/installer:release --config=release -- --skip-notary
+#
+# Required env vars: BOSS_DEVELOPER_ID_APPLICATION, BOSS_DEVELOPER_ID_INSTALLER
+# See release.sh header for notarization credentials documentation.
+sh_binary(
+    name = "release",
+    srcs = ["release.sh"],
+    data = [
+        # boss_pkg_unsigned provides the SHA-stamped .pkg filename.
+        ":boss_pkg_unsigned",
+        # boss_pkg_payload provides the staged Boss.app tree (with bundled
+        # binaries) that release.sh signs before rebuilding the .pkg.
+        ":boss_pkg_payload",
+        # Pre/postinstall scripts for pkgbuild --scripts.
+        ":installer_scripts",
+        # Entitlements files for codesign invocations.
+        "entitlements/app.entitlements",
+        "entitlements/engine.entitlements",
+        # Distribution XML for productbuild (per-user domain configuration).
+        "distribution.xml",
+    ],
+    visibility = ["//visibility:public"],
+)

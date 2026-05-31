@@ -1,0 +1,138 @@
+# Cube — Remaining Work
+
+This doc tracks the gap between cube as designed
+([main.md](./main.md)) and cube as implemented today, organised by what
+Boss V2 specifically needs vs the broader cube roadmap.
+
+It is the actionable companion to the design doc: items here are
+candidates for work, not aspirations.
+
+## Status today
+
+What works (current `main`):
+
+- `cube repo add` / `list` / `info`
+- `cube workspace lease` (single-pool, no auto-create) — runs the
+  setup engine after reset; per-repo `flock` serialises lease/release
+- `cube workspace release` (resets via `jj git fetch && jj new main`)
+- `cube workspace status` (delegates to `jj status`)
+- `cube workspace setup` — re-runs `<workspace>/.cube/setup.yaml`
+  against the existing lease, with per-step fingerprint reuse
+- `cube change create` and `cube change info` (records local
+  change-graph metadata against a leased workspace; `change checkout`
+  remains unimplemented)
+- SQLite-backed `repos`, `workspaces`, `changes`, and
+  `workspace_setup` metadata (`store.rs`)
+- Both `cargo build -p cube` and `bazel build //tools/cube` build
+  cleanly
+
+What's stubbed or missing — see the sections below.
+
+The full audit lives in
+[boss `v2-design-risks.md` R4](../../boss/docs/designs/v2-design-risks.md).
+
+## V2 prerequisites
+
+Items that must land before Boss V2 takes a hard dependency on cube.
+All V2 prerequisites have landed — see "Already landed" below. R4's
+"cube prerequisites" are closed.
+
+### Design principle: single global database
+
+Cube's SQLite store is a **machine-global registry** of repos and
+workspaces. Every invocation — from Boss, from an agent, from a
+human — must hit the same `state.db`, so a stray `cube workspace
+list` shows every lease the machine knows about. Resolution
+(`paths.rs`):
+
+1. `CUBE_DATA_DIR` env var (override; pure path — no auto-suffix)
+2. `XDG_DATA_HOME/cube`
+3. `~/.local/share/cube`
+
+There is intentionally **no `--database` CLI flag**. Per-test or
+per-debug isolation is handled via `CUBE_DATA_DIR` at the test
+harness level. Programmatic embedding can use `Store::open_at(path)`
+directly.
+
+### Already landed
+
+- ✓ Fix the `head_commit` template parsing bug — `current_workspace_commit`
+  now uses `--no-graph -r @` (`app.rs:659`); covered by tests in
+  `app.rs` (e.g. line 1075).
+- ✓ Drop the `--database` CLI flag from the prereq list — superseded
+  by the single-global-database principle above.
+- ✓ Add lease lifecycle: TTL (default 1800s, set on `claim_workspace`),
+  `cube workspace heartbeat --lease <id> [--ttl-seconds <n>]` extends
+  the expiry, `cube workspace release --reason <text> --keep-dirty`
+  records reasons and skips reset for crash forensics, `cube workspace
+  force-release` frees a stuck lease without running the workspace
+  reset. Stale leases are reclaimed by `expire_stale_leases` at the
+  start of every `lease`. New columns: `lease_expires_at_epoch_s`,
+  `last_release_reason`.
+- ✓ Add repo-pool `flock` around `claim_workspace` and `release`
+  (`lock.rs`, `paths::repo_lock_path`). Lock files live at
+  `<data_dir>/locks/<repo>.lock` and serialize the lease/release
+  critical sections per repo.
+- ✓ Auto-create workspaces on pool exhaustion. `cube workspace lease`
+  now clones a fresh workspace (from `repo.source` if set, else from
+  `repo.origin`) when no free slot is available, picks the next
+  numeric id (`<prefix>{max+1:03}`), syncs it into the registry, and
+  leases it. Implemented in `app.rs::auto_create_workspace`.
+- ✓ Implement `cube workspace setup` and lease-time provisioning
+  (`setup.rs`, `app.rs::run_setup_for_workspace`). Reads
+  `<workspace>/.cube/setup.yaml`, runs steps under `on-create` /
+  `on-fingerprint-change` / `always` policies, persists per-step
+  fingerprints in the new `workspace_setup` table, and surfaces
+  failures as `SetupStepFailed` (exit code 6) without rolling back
+  the lease so the workspace can be repaired in place.
+
+## Beyond V2 scope
+
+The remaining stacked-change and PR features described in the design
+doc are unbuilt and not required for Boss V2 (which drives `jj` / `gh`
+/ `git` directly inside leased workspaces). They are still cube's
+broader roadmap.
+
+- [ ] **`change checkout`** (`app.rs:542`, `NotImplemented`).
+      `change create` and `change info` are already implemented
+      (`app.rs:474`, `app.rs:545`); only `checkout` remains to round
+      out the local change-graph commands.
+- [ ] **`stack rebase`** (`app.rs:559`, `NotImplemented`). Subtree
+      and linear rebase with descendant rewrite tracking.
+- [ ] **`pr sync`** (`app.rs:566`, `NotImplemented`). Export changes
+      to deterministic Git branches, push, create / update PRs,
+      manage base-branch retargeting.
+- [ ] **`pr merge`** (`app.rs:566`, `NotImplemented`). Stacked merge
+      with branch pinning, descendant retargeting, and reopen-on-orphan
+      recovery — the core value-add over hand-rolled `gh pr merge`.
+- [ ] **`graph`** (`app.rs:573`, `NotImplemented`). Local change
+      graph view.
+- [ ] **`doctor`** (`app.rs:579`, `NotImplemented`). Diagnostic
+      command for stale leases, metadata drift, deleted base branches,
+      and rebase conflicts.
+
+Schema work this implies (`repos`, `workspaces`, and `changes` exist
+today in `store.rs:501-545`; `prs` is still absent):
+
+- [ ] `prs` table for PR ↔ change mapping with branch pinning state
+- [ ] migration story when this schema addition lands
+
+## Known quirks
+
+Smaller items that don't block but should be tracked.
+
+- [ ] `cube workspace release` does not clean up abandoned `jj`
+      changes a worker may have created. Working copy is clean for
+      the next lease (because of `jj new main`), but commit history
+      accretes. Optional cleanup hook on release should prune
+      orphaned non-`main`-descendant changes.
+- [ ] No structured logging / event emission. The integration sketch
+      in R4 contemplates a "workspace `released`" notification on a
+      subscription channel; today, callers must poll
+      `cube workspace list --json`.
+
+## Cross-references
+
+- Design: [tools/cube/docs/main.md](./main.md)
+- Boss V2 dependency: [tools/boss/docs/designs/v2-design-risks.md](../../boss/docs/designs/v2-design-risks.md) — R4
+- Boss V2 plan: [tools/boss/docs/plans/active/v2-implementation.md](../../boss/docs/plans/active/v2-implementation.md)
