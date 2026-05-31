@@ -62,6 +62,11 @@ struct TranscriptView: View {
     @State private var expandedOverrides: [Int: Bool] = [:]
     /// Set by the jump menu; observed by the `ScrollViewReader` to scroll.
     @State private var jumpTarget: Int?
+    /// Whether the scroll view is pinned to the bottom (tail-follow mode).
+    /// Starts true so a live transcript opens at the latest content.
+    @State private var isFollowing: Bool = true
+    /// Toggled by the "Jump to latest" button to re-pin the scroll to bottom.
+    @State private var jumpToBottom: Bool = false
 
     init(
         doc: TranscriptDoc,
@@ -103,6 +108,13 @@ struct TranscriptView: View {
             Spacer()
             if !userTurns.isEmpty {
                 jumpMenu
+            }
+            if doc.isLive && !isFollowing {
+                Button { jumpToBottom = true } label: {
+                    Label("Jump to latest", systemImage: "arrow.down.to.line")
+                }
+                .controlSize(.small)
+                .help("Scroll to the latest content and resume auto-following")
             }
             if doc.isLive, let onRefresh {
                 Button(action: onRefresh) {
@@ -164,9 +176,32 @@ struct TranscriptView: View {
                         .padding(.vertical, 6)
                         Divider()
                     }
+                    // Bottom sentinel: target for tail-follow scrollTo calls.
+                    Color.clear.frame(height: 1).id("transcript-bottom")
                 }
             }
             .textSelection(.enabled)
+            // Detect whether the user is at the bottom so we know whether to
+            // tail-follow. A 20 pt slack prevents spurious flips near the edge.
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                geo.contentOffset.y + geo.containerSize.height >= geo.contentSize.height - 20
+            } action: { _, atBottom in
+                isFollowing = atBottom
+            }
+            // When new segments arrive, auto-scroll only if already following.
+            // initial: true fires once on appear so a live transcript opens at
+            // the latest content without a separate onAppear scroll.
+            .onChange(of: doc.segments.count, initial: true) { _, _ in
+                guard isFollowing && doc.isLive else { return }
+                proxy.scrollTo("transcript-bottom", anchor: .bottom)
+            }
+            // "Jump to latest" button re-pins to the bottom.
+            .onChange(of: jumpToBottom) { _, shouldJump in
+                guard shouldJump else { return }
+                proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                isFollowing = true
+                jumpToBottom = false
+            }
             .onChange(of: jumpTarget) { _, target in
                 guard let target else { return }
                 withAnimation { proxy.scrollTo(target, anchor: .top) }
