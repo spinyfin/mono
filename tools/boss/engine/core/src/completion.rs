@@ -3050,6 +3050,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
+            _: bool,
         ) -> Result<CubeWorkspaceLease> {
             unreachable!("not used in completion tests")
         }
@@ -3185,6 +3186,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
 
@@ -3294,6 +3297,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = db
@@ -4255,6 +4260,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (_e, run) = db
@@ -4413,6 +4420,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         // `start_execution_run` flips the row to `running`. Do not
@@ -4647,6 +4656,8 @@ PR #379. PR #379.";
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = db
@@ -4787,6 +4798,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = db
@@ -5141,6 +5154,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (exec2, run2) = db
@@ -5198,6 +5213,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (exec3, run3) = db
@@ -6451,6 +6468,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = db

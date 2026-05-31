@@ -2878,6 +2878,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
+            _: bool,
         ) -> Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in merge_poller tests")
         }
@@ -5032,7 +5033,7 @@ mod tests {
         async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
             unreachable!()
         }
-        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
         async fn create_change(&self, _: &std::path::PathBuf, _: &str) -> Result<CubeChangeHandle> {
@@ -5099,6 +5100,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (exec, run) = db
@@ -5225,6 +5228,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (exec, _run) = db
