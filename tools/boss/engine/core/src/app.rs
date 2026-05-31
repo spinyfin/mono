@@ -4644,14 +4644,9 @@ async fn handle_frontend_connection(
                             let (dispatched_execution_id, did_dispatch, skip_reason) =
                                 if needs_dispatch {
                                     let live_states = server_state.live_worker_states.clone();
-                                    let dispatch_input = RequestExecutionInput {
-                                        work_item_id: work_item_id_for_event.clone(),
-                                        priority: None,
-                                        preferred_workspace_id: None,
-                                        force: false,
-                                    
-                                        allow_dirty: false,
-                                    };
+                                    let dispatch_input = RequestExecutionInput::builder()
+                                        .work_item_id(work_item_id_for_event.clone())
+                                        .build();
                                     match work_db.request_execution_with_live_check(
                                         dispatch_input,
                                         |run_id| live_states.is_run_live(run_id),
@@ -10203,7 +10198,7 @@ mod tests {
             .register_app_session("session-app".into(), sink)
             .await;
         let err = server_state
-            .send_input_to_worker("never-allocated", "/help\n".into())
+            .send_input_to_worker("never-allocated".into(), "/help\n".into())
             .await
             .expect_err("unknown run should fail");
         assert!(matches!(err, SendInputError::UnknownRun));
@@ -10228,7 +10223,7 @@ mod tests {
         let server_clone = server_state.clone();
         let send = tokio::spawn(async move {
             server_clone
-                .send_input_to_worker("run-send", "/help\n".into())
+                .send_input_to_worker("run-send".into(), "/help\n".into())
                 .await
         });
 
@@ -10280,7 +10275,7 @@ mod tests {
         let server_clone = server_state.clone();
         let send = tokio::spawn(async move {
             server_clone
-                .send_input_to_worker("run-send", "hi\n".into())
+                .send_input_to_worker("run-send".into(), "hi\n".into())
                 .await
         });
 
@@ -10811,14 +10806,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let transcript_dir = tempfile::tempdir().unwrap();
         let transcript_path = transcript_dir.path().join("transcript.jsonl");
@@ -11017,14 +11007,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let run = server_state
             .work_db
@@ -11146,14 +11131,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let run = server_state
             .work_db
@@ -11272,14 +11252,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let run = server_state
             .work_db
@@ -11391,14 +11366,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         // Drive the real `start_execution_run` path so the run is
         // minted with a `run_*` id — production-shaped. Asserting
@@ -11519,14 +11489,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         // Intentionally skip `start_execution_run` — the execution
         // exists but has no `work_runs` row yet, mirroring the
@@ -11619,14 +11584,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let run = server_state
             .work_db
@@ -11803,14 +11763,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let run = server_state
             .work_db
@@ -11957,14 +11912,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -12088,14 +12038,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -12216,14 +12161,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let (execution, _run) = server_state
             .work_db
@@ -12305,14 +12245,9 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -12655,24 +12590,11 @@ mod tests {
         let (db, _, chore_id) = make_work_db_with_chore();
         // Create an execution for the chore.
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore_id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let item = db
             .update_work_item(
@@ -12772,24 +12694,11 @@ mod tests {
         use crate::work::CreateExecutionInput;
         let (db, _, chore_id) = make_work_db_with_chore();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore_id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("running".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind("chore_implementation")
+                .status("running")
+                .build())
             .unwrap();
         let item = db
             .update_work_item(
@@ -13081,14 +12990,9 @@ mod tests {
             .unwrap();
         server_state
             .work_db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build())
             .unwrap()
     }
 
