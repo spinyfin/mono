@@ -224,4 +224,51 @@ impl WorkDb {
         )?;
         Ok(count)
     }
+
+    /// List `automation_runs` rows for an automation, newest first.
+    pub fn list_automation_runs(
+        &self,
+        automation_id: &str,
+    ) -> Result<Vec<boss_protocol::AutomationRun>> {
+        let conn = self.connect()?;
+        let _existing = query_automation(&conn, automation_id)?
+            .with_context(|| format!("unknown automation: {automation_id}"))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, automation_id, scheduled_for, started_at, finished_at,
+                    triage_execution_id, outcome, produced_task_id, detail
+               FROM automation_runs
+              WHERE automation_id = ?1
+              ORDER BY scheduled_for DESC, started_at DESC",
+        )?;
+        let rows = stmt.query_map([automation_id], map_automation_run)?;
+        collect_rows(rows)
+    }
+
+    /// List tasks produced by an automation (`source_automation_id = ?`),
+    /// ordered by `created_at DESC`. Includes non-deleted rows only.
+    pub fn list_tasks_for_automation(
+        &self,
+        automation_id: &str,
+    ) -> Result<Vec<boss_protocol::Task>> {
+        let conn = self.connect()?;
+        let _existing = query_automation(&conn, automation_id)?
+            .with_context(|| format!("unknown automation: {automation_id}"))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at, merge_queue_state,
+                    source_automation_id
+               FROM tasks
+              WHERE source_automation_id = ?1
+                AND deleted_at IS NULL
+              ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([automation_id], map_task_with_source_automation_id)?;
+        collect_rows(rows)
+    }
 }

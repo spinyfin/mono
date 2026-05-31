@@ -8,9 +8,10 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateRevisionInput,
+    AddDependencyInput, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
+    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
+    CreateAutomationInput, CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateRevisionInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
     DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
     FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
@@ -108,6 +109,19 @@ enum Commands {
     Chore {
         #[command(subcommand)]
         command: ChoreCommand,
+    },
+    /// Manage automations: standing, scheduled maintenance instructions that
+    /// periodically triage and spawn work outside the normal backlog.
+    ///
+    /// Automations live in a per-product `A<n>` namespace (`A1`, `A2`, …)
+    /// and run in a dedicated 3-agent pool. The tasks they produce carry
+    /// `source_automation_id` and are surfaced only in the Automations tab
+    /// (excluded from the main kanban).
+    ///
+    /// See `tools/boss/docs/designs/maintenance-tasks.md` for the full design.
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommand,
     },
     Engine {
         #[command(subcommand)]
@@ -468,6 +482,140 @@ impl From<DependDirectionArg> for DependencyDirection {
             DependDirectionArg::Both => DependencyDirection::Both,
         }
     }
+}
+
+/// Subcommands under `boss automation …`.
+///
+/// Automations are standing scheduled instructions in a per-product `A<n>`
+/// namespace. Selectors accept either `A<n>` (requires `--product`) or the
+/// canonical `auto_…` id (product is inferred from the row).
+#[derive(Debug, Subcommand)]
+enum AutomationCommand {
+    /// Create a new automation for a product.
+    ///
+    /// `--schedule` accepts either a preset keyword (`weekday-2pm`, `nightly`,
+    /// `weekly-mon-am`, `hourly`) or a raw 5-field cron expression
+    /// (`"0 14 * * 1-5"`). Raw expressions are validated before being sent to
+    /// the engine. `--timezone` is an IANA name (e.g. `America/Los_Angeles`);
+    /// defaults to `UTC`.
+    Create(AutomationCreateArgs),
+    /// List all automations for a product.
+    List(AutomationListArgs),
+    /// Show details for one automation.
+    Show(AutomationSelectorArgs),
+    /// Update mutable fields on an automation. Only supplied flags are changed.
+    Update(AutomationUpdateArgs),
+    /// Re-enable a disabled automation. Idempotent.
+    Enable(AutomationSelectorArgs),
+    /// Disable an automation so the scheduler skips its fires. Idempotent.
+    Disable(AutomationSelectorArgs),
+    /// Permanently delete an automation and its run history.
+    /// Produced tasks keep their `source_automation_id` and continue through
+    /// their lifecycle normally.
+    Delete(AutomationSelectorArgs),
+    /// Fire an immediate out-of-schedule triage for an automation.
+    ///
+    /// Respects the open-task cap unless `--force` is passed. Requires the
+    /// scheduler loop (maintenance-tasks.md task 5) to be running.
+    Run(AutomationRunArgs),
+    /// List the run history (`automation_runs`) for an automation.
+    Runs(AutomationSelectorArgs),
+    /// List the tasks produced by an automation and their current status.
+    Tasks(AutomationSelectorArgs),
+}
+
+#[derive(Debug, Args)]
+struct AutomationCreateArgs {
+    /// Product to create the automation in.
+    #[arg(long)]
+    product: Option<String>,
+    /// Display name for the automation.
+    #[arg(long)]
+    name: Option<String>,
+    /// The standing instruction passed to the triage agent on every fire.
+    #[arg(long)]
+    instruction: Option<String>,
+    /// Schedule: preset keyword or raw 5-field cron expression.
+    ///
+    /// Preset keywords: `weekday-2pm`, `nightly`, `weekly-mon-am`, `hourly`.
+    /// Raw cron format: `"min hour dom month dow"` (5 fields, space-separated).
+    #[arg(long)]
+    schedule: Option<String>,
+    /// IANA timezone name for the schedule (e.g. `America/Los_Angeles`).
+    /// Defaults to `UTC`.
+    #[arg(long, default_value = "UTC")]
+    timezone: String,
+    /// Explicit target repo for the triage worker lease. Defaults to the
+    /// product's primary repo when omitted.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Maximum number of open produced tasks allowed simultaneously.
+    /// The scheduler skips a fire when the live count reaches this limit.
+    /// Defaults to 1.
+    #[arg(long, default_value_t = 1)]
+    open_task_limit: i64,
+    /// Create the automation in disabled state (will not fire until enabled).
+    #[arg(long)]
+    disabled: bool,
+}
+
+#[derive(Debug, Args)]
+struct AutomationListArgs {
+    /// Product whose automations to list. Required when more than one product
+    /// exists.
+    #[arg(long)]
+    product: Option<String>,
+}
+
+/// Shared selector args used by show, enable, disable, delete, runs, tasks.
+#[derive(Debug, Args)]
+struct AutomationSelectorArgs {
+    /// Automation selector: `A<n>` (e.g. `A1`) or canonical `auto_…` id.
+    selector: String,
+    /// Product context for `A<n>` selectors. Not needed when passing a
+    /// canonical `auto_…` id.
+    #[arg(long)]
+    product: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AutomationUpdateArgs {
+    /// Automation selector: `A<n>` or `auto_…` id.
+    selector: String,
+    /// Product context for `A<n>` selectors.
+    #[arg(long)]
+    product: Option<String>,
+    /// New display name.
+    #[arg(long)]
+    name: Option<String>,
+    /// New standing instruction.
+    #[arg(long)]
+    instruction: Option<String>,
+    /// New schedule: preset keyword or raw 5-field cron expression.
+    #[arg(long)]
+    schedule: Option<String>,
+    /// New IANA timezone name.
+    #[arg(long)]
+    timezone: Option<String>,
+    /// New target repo URL (or `""` to clear and fall back to the product
+    /// primary).
+    #[arg(long)]
+    repo: Option<String>,
+    /// New open-task cap.
+    #[arg(long)]
+    open_task_limit: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct AutomationRunArgs {
+    /// Automation selector: `A<n>` or `auto_…` id.
+    selector: String,
+    /// Product context for `A<n>` selectors.
+    #[arg(long)]
+    product: Option<String>,
+    /// Bypass the open-task cap and fire even when the limit is reached.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2114,6 +2262,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_chore_command(command, &ctx).await
         }
+        Commands::Automation { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_automation_command(command, &ctx).await
+        }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_engine_command(command, &ctx).await
@@ -3473,6 +3625,590 @@ fn print_org_state_human(org_state: &OrgAuthState) {
             println!("  Authorize: {sso_url}");
         }
         OrgAuthState::Unknown => println!("Org access: unknown (probe failed)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automation short-id / selector support
+// ---------------------------------------------------------------------------
+
+/// Parsed form of an automation selector.
+#[derive(Debug)]
+enum AutomationSelector {
+    /// `auto_…` canonical id — used directly without a product lookup.
+    PrimaryId(String),
+    /// `A<n>` or `a<n>` (or plain integer) — short id within a product.
+    ShortId(i64),
+}
+
+fn parse_automation_selector(s: &str) -> Result<AutomationSelector, CliError> {
+    let s = s.trim();
+    if s.starts_with("auto_") {
+        return Ok(AutomationSelector::PrimaryId(s.to_owned()));
+    }
+    // `A<n>` or `a<n>`
+    if s.len() >= 2 {
+        let first = s.as_bytes()[0];
+        if first == b'A' || first == b'a' {
+            if let Ok(n) = s[1..].parse::<i64>() {
+                if n > 0 {
+                    return Ok(AutomationSelector::ShortId(n));
+                }
+            }
+        }
+    }
+    // Plain positive integer → short id
+    if let Ok(n) = s.parse::<i64>() {
+        if n > 0 {
+            return Ok(AutomationSelector::ShortId(n));
+        }
+    }
+    Err(CliError::usage(format!(
+        "automation selector must be A<n> (e.g. A1) or an auto_… id; got {s:?}"
+    )))
+}
+
+/// Resolve an automation selector to a full `Automation` row.
+///
+/// For `auto_…` ids, the product is not needed. For `A<n>` selectors, a
+/// `product` must be provided (resolved by the caller beforehand).
+async fn resolve_automation(
+    client: &mut BossClient,
+    selector: &str,
+    product: Option<&Product>,
+) -> Result<Automation, CliError> {
+    match parse_automation_selector(selector)? {
+        AutomationSelector::PrimaryId(id) => get_automation(client, &id).await,
+        AutomationSelector::ShortId(n) => {
+            let product = product.ok_or_else(|| {
+                CliError::usage(
+                    "A<n> selectors require --product to identify the automation namespace",
+                )
+            })?;
+            let automations = list_automations(client, &product.id).await?;
+            automations
+                .into_iter()
+                .find(|a| a.short_id == Some(n))
+                .ok_or_else(|| {
+                    CliError::not_found(format!(
+                        "no automation A{n} found in product '{}'",
+                        product.slug
+                    ))
+                })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preset → cron compilation
+// ---------------------------------------------------------------------------
+
+/// Well-known schedule preset keywords.
+///
+/// Each preset compiles to a standard 5-field cron expression (min hour dom month dow).
+/// The timezone is supplied separately via `--timezone`.
+const SCHEDULE_PRESETS: &[(&str, &str, &str)] = &[
+    ("weekday-2pm",   "0 14 * * 1-5", "Every weekday at 2:00 pm"),
+    ("nightly",       "0 2 * * *",    "Every day at 2:00 am"),
+    ("weekly-mon-am", "0 9 * * 1",    "Every Monday at 9:00 am"),
+    ("hourly",        "0 * * * *",    "Every hour"),
+];
+
+/// Compile a `--schedule` value to a cron expression.
+///
+/// Accepts either a preset keyword (case-insensitive) or a raw 5-field cron
+/// string. Raw strings are validated: they must have exactly 5 whitespace-
+/// separated fields and each field must contain only cron-legal characters
+/// (`0-9`, `*`, `/`, `-`, `,`, alpha for named months/days).
+fn compile_schedule(schedule: &str) -> Result<String, CliError> {
+    let trimmed = schedule.trim();
+
+    // Check presets first (case-insensitive).
+    if let Some((_, cron, _)) = SCHEDULE_PRESETS
+        .iter()
+        .find(|(k, _, _)| k.eq_ignore_ascii_case(trimmed))
+    {
+        return Ok((*cron).to_owned());
+    }
+
+    // Treat as a raw cron expression and validate.
+    validate_cron_expression(trimmed)
+}
+
+/// Validate a raw 5-field cron expression.
+///
+/// Checks that the string has exactly 5 whitespace-separated fields and each
+/// field contains only characters valid in cron: digits, `*`, `/`, `-`, `,`,
+/// and ASCII alpha (for named days/months like `MON`, `JAN`). Does not check
+/// numeric ranges — the engine (once the cron library is wired up in task 5)
+/// will reject semantically invalid values.
+fn validate_cron_expression(cron: &str) -> Result<String, CliError> {
+    let fields: Vec<&str> = cron.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(CliError::usage(format!(
+            "cron expression must have exactly 5 fields (got {}); \
+             format: \"min hour dom month dow\" (e.g. \"0 14 * * 1-5\")",
+            fields.len()
+        )));
+    }
+    for field in &fields {
+        if field
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '*' | '/' | '-' | ','))
+        {
+            return Err(CliError::usage(format!(
+                "cron field {:?} contains invalid characters; \
+                 allowed: digits, *, /, -, , and alpha (for named months/days)",
+                field
+            )));
+        }
+    }
+    Ok(cron.to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Automation RPC helpers
+// ---------------------------------------------------------------------------
+
+async fn create_automation(
+    client: &mut BossClient,
+    input: CreateAutomationInput,
+) -> Result<Automation, CliError> {
+    match client
+        .send_request(&FrontendRequest::CreateAutomation { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationCreated { automation } => Ok(automation),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation create", &other)),
+    }
+}
+
+async fn list_automations(
+    client: &mut BossClient,
+    product_id: &str,
+) -> Result<Vec<Automation>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListAutomations {
+            product_id: product_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationsList { automations, .. } => Ok(automations),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation list", &other)),
+    }
+}
+
+async fn get_automation(
+    client: &mut BossClient,
+    id: &str,
+) -> Result<Automation, CliError> {
+    match client
+        .send_request(&FrontendRequest::GetAutomation { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationResult { automation } => Ok(automation),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation show", &other)),
+    }
+}
+
+async fn update_automation(
+    client: &mut BossClient,
+    id: &str,
+    patch: AutomationPatch,
+) -> Result<Automation, CliError> {
+    match client
+        .send_request(&FrontendRequest::UpdateAutomation {
+            id: id.to_owned(),
+            patch,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation update", &other)),
+    }
+}
+
+async fn enable_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
+    match client
+        .send_request(&FrontendRequest::EnableAutomation { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation enable", &other)),
+    }
+}
+
+async fn disable_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
+    match client
+        .send_request(&FrontendRequest::DisableAutomation { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationUpdated { automation } => Ok(automation),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation disable", &other)),
+    }
+}
+
+async fn delete_automation(client: &mut BossClient, id: &str) -> Result<(), CliError> {
+    match client
+        .send_request(&FrontendRequest::DeleteAutomation { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationDeleted { .. } => Ok(()),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation delete", &other)),
+    }
+}
+
+async fn list_automation_runs(
+    client: &mut BossClient,
+    automation_id: &str,
+) -> Result<Vec<AutomationRun>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListAutomationRuns {
+            automation_id: automation_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationRunsList { runs, .. } => Ok(runs),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation runs", &other)),
+    }
+}
+
+async fn list_automation_tasks(
+    client: &mut BossClient,
+    automation_id: &str,
+) -> Result<Vec<Task>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListAutomationTasks {
+            automation_id: automation_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AutomationTasksList { tasks, .. } => Ok(tasks),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("automation tasks", &other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers for automations
+// ---------------------------------------------------------------------------
+
+fn print_automations_table(automations: &[Automation]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(["#", "NAME", "SCHEDULE", "ENABLED", "OPEN", "LAST OUTCOME", "NEXT DUE"]);
+    for a in automations {
+        let short = a
+            .short_id
+            .map(|n| format!("A{n}"))
+            .unwrap_or_default();
+        let schedule = match &a.trigger {
+            AutomationTrigger::Schedule { cron, timezone } => {
+                format!("{cron} ({timezone})")
+            }
+        };
+        let enabled = if a.enabled { "yes" } else { "no" };
+        let last_outcome = a.last_outcome.as_deref().unwrap_or("-");
+        let next_due = a.next_due_at.as_deref().unwrap_or("-");
+        table.add_row([
+            &short,
+            a.name.as_str(),
+            &schedule,
+            enabled,
+            last_outcome,
+            next_due,
+        ]);
+    }
+    println!("{table}");
+}
+
+fn print_automation_details(label: &str, a: &Automation) {
+    println!("{label}:");
+    let short = a.short_id.map(|n| format!("A{n}")).unwrap_or_default();
+    println!("  ID:          {} ({})", a.id, short);
+    println!("  Product:     {}", a.product_id);
+    println!("  Name:        {}", a.name);
+    let (cron, tz) = match &a.trigger {
+        AutomationTrigger::Schedule { cron, timezone } => (cron.as_str(), timezone.as_str()),
+    };
+    println!("  Cron:        {cron}");
+    println!("  Timezone:    {tz}");
+    println!("  Instruction: {}", a.standing_instruction);
+    println!("  Enabled:     {}", if a.enabled { "yes" } else { "no" });
+    println!("  Open limit:  {}", a.open_task_limit);
+    if let Some(repo) = &a.repo_remote_url {
+        println!("  Repo:        {repo}");
+    }
+    if let Some(last) = &a.last_fired_at {
+        println!("  Last fired:  {last}");
+    }
+    if let Some(outcome) = &a.last_outcome {
+        println!("  Last outcome:{outcome}");
+    }
+    if let Some(next) = &a.next_due_at {
+        println!("  Next due:    {next}");
+    }
+    println!("  Created:     {}", a.created_at);
+    println!("  Updated:     {}", a.updated_at);
+}
+
+fn print_automation_runs_table(runs: &[AutomationRun]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(["SCHEDULED FOR", "OUTCOME", "STARTED", "PRODUCED TASK", "DETAIL"]);
+    for r in runs {
+        let produced = r.produced_task_id.as_deref().unwrap_or("-");
+        let detail = r.detail.as_deref().unwrap_or("-");
+        table.add_row([
+            r.scheduled_for.as_str(),
+            r.outcome.as_str(),
+            r.started_at.as_str(),
+            produced,
+            detail,
+        ]);
+    }
+    println!("{table}");
+}
+
+// ---------------------------------------------------------------------------
+// Automation command handler
+// ---------------------------------------------------------------------------
+
+async fn run_automation_command(
+    command: AutomationCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    match command {
+        AutomationCommand::Create(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let name = required_text(args.name, "Automation name", ctx)?;
+            let instruction =
+                required_text(args.instruction, "Standing instruction", ctx)?;
+            let schedule_raw = required_text(args.schedule, "Schedule", ctx)?;
+            let cron = compile_schedule(&schedule_raw)?;
+            let trigger = AutomationTrigger::Schedule {
+                cron,
+                timezone: args.timezone,
+            };
+            let automation = create_automation(
+                &mut client,
+                CreateAutomationInput::builder()
+                    .product_id(product.id)
+                    .name(name)
+                    .trigger(trigger)
+                    .standing_instruction(instruction)
+                    .open_task_limit(args.open_task_limit)
+                    .enabled(!args.disabled)
+                    .maybe_repo_remote_url(args.repo)
+                    .created_via(boss_protocol::CREATED_VIA_CLI)
+                    .build(),
+            )
+            .await?;
+            print_entity(ctx, &serde_json::json!({ "automation": automation }), || {
+                print_automation_details("Created automation", &automation);
+            })
+        }
+
+        AutomationCommand::List(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let automations = list_automations(&mut client, &product.id).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "automations": automations }),
+                || {
+                    if automations.is_empty() {
+                        println!("No automations for product '{}'.", product.slug);
+                    } else {
+                        print_automations_table(&automations);
+                    }
+                },
+            )
+        }
+
+        AutomationCommand::Show(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            print_entity(ctx, &serde_json::json!({ "automation": automation }), || {
+                print_automation_details("Automation", &automation);
+            })
+        }
+
+        AutomationCommand::Update(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+
+            // Build a trigger patch only when schedule or timezone changed.
+            let trigger_patch = match (&args.schedule, &args.timezone) {
+                (None, None) => None,
+                _ => {
+                    // Start from the existing trigger so partial updates work.
+                    let AutomationTrigger::Schedule {
+                        cron: existing_cron,
+                        timezone: existing_tz,
+                    } = &automation.trigger;
+                    let cron = if let Some(sched) = &args.schedule {
+                        compile_schedule(sched)?
+                    } else {
+                        existing_cron.clone()
+                    };
+                    let timezone = args.timezone.clone().unwrap_or_else(|| existing_tz.clone());
+                    Some(AutomationTrigger::Schedule { cron, timezone })
+                }
+            };
+
+            let patch = AutomationPatch {
+                name: args.name,
+                repo_remote_url: args.repo,
+                trigger: trigger_patch,
+                standing_instruction: args.instruction,
+                open_task_limit: args.open_task_limit,
+                catch_up_window_secs: None,
+                enabled: None,
+            };
+            let updated = update_automation(&mut client, &automation.id, patch).await?;
+            print_entity(ctx, &serde_json::json!({ "automation": updated }), || {
+                print_automation_details("Updated automation", &updated);
+            })
+        }
+
+        AutomationCommand::Enable(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let updated = enable_automation(&mut client, &automation.id).await?;
+            print_entity(ctx, &serde_json::json!({ "automation": updated }), || {
+                if !ctx.quiet {
+                    println!("Enabled automation {}", automation.id);
+                }
+            })
+        }
+
+        AutomationCommand::Disable(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let updated = disable_automation(&mut client, &automation.id).await?;
+            print_entity(ctx, &serde_json::json!({ "automation": updated }), || {
+                if !ctx.quiet {
+                    println!("Disabled automation {}", automation.id);
+                }
+            })
+        }
+
+        AutomationCommand::Delete(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            delete_automation(&mut client, &automation.id).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "deleted_automation_id": automation.id }),
+                || {
+                    if !ctx.quiet {
+                        println!("Deleted automation {}", automation.id);
+                    }
+                },
+            )
+        }
+
+        AutomationCommand::Run(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            match client
+                .send_request(&FrontendRequest::RunAutomation {
+                    automation_id: automation.id.clone(),
+                    force: args.force,
+                })
+                .await
+                .map_err(CliError::internal)?
+            {
+                FrontendEvent::AutomationRunEnqueued { .. } => {
+                    print_entity(
+                        ctx,
+                        &serde_json::json!({ "automation_id": automation.id, "enqueued": true }),
+                        || {
+                            if !ctx.quiet {
+                                println!("Triage enqueued for automation {}", automation.id);
+                            }
+                        },
+                    )
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("automation run", &other)),
+            }
+        }
+
+        AutomationCommand::Runs(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let runs = list_automation_runs(&mut client, &automation.id).await?;
+            print_entity(ctx, &serde_json::json!({ "runs": runs }), || {
+                if runs.is_empty() {
+                    println!("No runs recorded for automation {}.", automation.id);
+                } else {
+                    print_automation_runs_table(&runs);
+                }
+            })
+        }
+
+        AutomationCommand::Tasks(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let automation =
+                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let tasks = list_automation_tasks(&mut client, &automation.id).await?;
+            let tasks: Vec<Task> = tasks.into_iter().map(with_display_status).collect();
+            print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
+                if tasks.is_empty() {
+                    println!("No tasks produced by automation {}.", automation.id);
+                } else {
+                    print_tasks_table(&tasks, false);
+                }
+            })
+        }
     }
 }
 
@@ -5725,6 +6461,37 @@ async fn resolve_product(
     match_products(&products, &selector)
 }
 
+/// Like [`resolve_product`] but returns `None` when no `--product` was
+/// supplied and resolution is not needed (e.g. when the caller is about
+/// to use a canonical `auto_…` id directly). Only resolves the product
+/// when a `--product` flag is supplied or when there is exactly one
+/// product (auto-selected). Does NOT prompt interactively.
+async fn resolve_optional_product(
+    client: &mut BossClient,
+    selector: Option<String>,
+    _ctx: &RunContext,
+) -> Result<Option<Product>, CliError> {
+    match selector {
+        None => {
+            // Try auto-select when exactly one product exists, so A<n>
+            // selectors work without --product on single-product setups.
+            let products = list_products(client).await?;
+            if products.len() == 1 {
+                Ok(Some(products.into_iter().next().unwrap()))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(sel) => {
+            let products = list_products(client).await?;
+            if products.is_empty() {
+                return Err(CliError::not_found("no products exist"));
+            }
+            Ok(Some(match_products(&products, &sel)?))
+        }
+    }
+}
+
 /// True when `s` looks like a typed engine work-item id. The engine
 /// stamps `prod_…` on products, `proj_…` on projects, and `task_…` on
 /// both tasks and chores (chores share the task prefix at the row
@@ -7370,12 +8137,13 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity,
-        MoveTarget, OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand,
-        ProjectStatus, RepoSelector, RunContext, TaskCommand, TaskStatus, classify_bind_pr,
-        classify_lint_finding, decide_open_design_action, ensure_explicit_product_matches,
-        expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
-        is_typed_work_item_id, lint_summary_line, pick_by_index, short_name_for,
+        AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
+        Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand,
+        ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, RunContext, TaskCommand,
+        TaskStatus, classify_bind_pr, classify_lint_finding, compile_schedule,
+        decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
+        format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
+        lint_summary_line, parse_automation_selector, pick_by_index, short_name_for,
         split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
@@ -9132,5 +9900,271 @@ mod tests {
     fn shake_report_rejects_blank_blob() {
         assert!(split_shake_report("").is_none());
         assert!(split_shake_report("\n\n  \n").is_none());
+    }
+
+    // --- boss automation CLI tests ---
+
+    #[test]
+    fn parses_automation_create_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "automation",
+            "create",
+            "--product",
+            "boss",
+            "--name",
+            "Fix clippy",
+            "--instruction",
+            "Look for clippy warnings",
+            "--schedule",
+            "weekday-2pm",
+            "--timezone",
+            "America/Los_Angeles",
+        ]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Create(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.name.as_deref(), Some("Fix clippy"));
+                assert_eq!(
+                    args.instruction.as_deref(),
+                    Some("Look for clippy warnings")
+                );
+                assert_eq!(args.schedule.as_deref(), Some("weekday-2pm"));
+                assert_eq!(args.timezone, "America/Los_Angeles");
+                assert!(!args.disabled);
+                assert_eq!(args.open_task_limit, 1);
+            }
+            _ => panic!("expected automation create command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_create_with_raw_cron_and_disabled() {
+        let cli = Cli::parse_from([
+            "boss",
+            "automation",
+            "create",
+            "--product",
+            "boss",
+            "--name",
+            "Weekly sweep",
+            "--instruction",
+            "Sweep old branches",
+            "--schedule",
+            "0 9 * * 1",
+            "--disabled",
+            "--open-task-limit",
+            "3",
+        ]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Create(args),
+            } => {
+                assert_eq!(args.schedule.as_deref(), Some("0 9 * * 1"));
+                assert!(args.disabled);
+                assert_eq!(args.open_task_limit, 3);
+            }
+            _ => panic!("expected automation create command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_list_command() {
+        let cli = Cli::parse_from(["boss", "automation", "list", "--product", "boss"]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::List(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected automation list command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_show_command() {
+        let cli = Cli::parse_from(["boss", "automation", "show", "A1", "--product", "boss"]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Show(args),
+            } => {
+                assert_eq!(args.selector, "A1");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected automation show command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_show_with_canonical_id() {
+        let cli =
+            Cli::parse_from(["boss", "automation", "show", "auto_abc123"]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Show(args),
+            } => {
+                assert_eq!(args.selector, "auto_abc123");
+                assert!(args.product.is_none());
+            }
+            _ => panic!("expected automation show command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_update_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "automation",
+            "update",
+            "A2",
+            "--product",
+            "boss",
+            "--name",
+            "New name",
+            "--schedule",
+            "nightly",
+            "--open-task-limit",
+            "2",
+        ]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Update(args),
+            } => {
+                assert_eq!(args.selector, "A2");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.name.as_deref(), Some("New name"));
+                assert_eq!(args.schedule.as_deref(), Some("nightly"));
+                assert_eq!(args.open_task_limit, Some(2));
+            }
+            _ => panic!("expected automation update command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_enable_disable_commands() {
+        let cli_enable =
+            Cli::parse_from(["boss", "automation", "enable", "A1", "--product", "boss"]);
+        let cli_disable =
+            Cli::parse_from(["boss", "automation", "disable", "A1", "--product", "boss"]);
+        assert!(matches!(
+            cli_enable.command,
+            Commands::Automation {
+                command: AutomationCommand::Enable(_)
+            }
+        ));
+        assert!(matches!(
+            cli_disable.command,
+            Commands::Automation {
+                command: AutomationCommand::Disable(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_automation_run_command_with_force() {
+        let cli = Cli::parse_from([
+            "boss",
+            "automation",
+            "run",
+            "A3",
+            "--product",
+            "boss",
+            "--force",
+        ]);
+        match cli.command {
+            Commands::Automation {
+                command: AutomationCommand::Run(args),
+            } => {
+                assert_eq!(args.selector, "A3");
+                assert!(args.force);
+            }
+            _ => panic!("expected automation run command"),
+        }
+    }
+
+    #[test]
+    fn parses_automation_runs_and_tasks_commands() {
+        let cli_runs =
+            Cli::parse_from(["boss", "automation", "runs", "A1", "--product", "boss"]);
+        let cli_tasks =
+            Cli::parse_from(["boss", "automation", "tasks", "A1", "--product", "boss"]);
+        assert!(matches!(
+            cli_runs.command,
+            Commands::Automation {
+                command: AutomationCommand::Runs(_)
+            }
+        ));
+        assert!(matches!(
+            cli_tasks.command,
+            Commands::Automation {
+                command: AutomationCommand::Tasks(_)
+            }
+        ));
+    }
+
+    // --- cron validation tests ---
+
+    #[test]
+    fn compile_schedule_resolves_presets() {
+        assert_eq!(compile_schedule("weekday-2pm").unwrap(), "0 14 * * 1-5");
+        assert_eq!(compile_schedule("nightly").unwrap(), "0 2 * * *");
+        assert_eq!(compile_schedule("weekly-mon-am").unwrap(), "0 9 * * 1");
+        assert_eq!(compile_schedule("hourly").unwrap(), "0 * * * *");
+        // Case-insensitive
+        assert_eq!(compile_schedule("NIGHTLY").unwrap(), "0 2 * * *");
+    }
+
+    #[test]
+    fn compile_schedule_accepts_valid_raw_cron() {
+        assert_eq!(
+            compile_schedule("0 14 * * 1-5").unwrap(),
+            "0 14 * * 1-5"
+        );
+        assert_eq!(compile_schedule("*/15 * * * *").unwrap(), "*/15 * * * *");
+        assert_eq!(
+            compile_schedule("0 9 1,15 * *").unwrap(),
+            "0 9 1,15 * *"
+        );
+    }
+
+    #[test]
+    fn compile_schedule_rejects_wrong_field_count() {
+        assert!(compile_schedule("0 14 * *").is_err()); // 4 fields
+        assert!(compile_schedule("0 14 * * 1-5 2026").is_err()); // 6 fields
+        assert!(compile_schedule("").is_err());
+    }
+
+    #[test]
+    fn compile_schedule_rejects_invalid_chars() {
+        assert!(compile_schedule("0 14 * * 1-5; echo hi").is_err());
+        assert!(compile_schedule("0 14 * * 1$5").is_err());
+    }
+
+    // --- automation selector parsing tests ---
+
+    #[test]
+    fn parse_automation_selector_primary_id() {
+        let sel = parse_automation_selector("auto_abc123").unwrap();
+        assert!(matches!(sel, AutomationSelector::PrimaryId(id) if id == "auto_abc123"));
+    }
+
+    #[test]
+    fn parse_automation_selector_short_id_uppercase() {
+        let sel = parse_automation_selector("A1").unwrap();
+        assert!(matches!(sel, AutomationSelector::ShortId(1)));
+    }
+
+    #[test]
+    fn parse_automation_selector_short_id_lowercase() {
+        let sel = parse_automation_selector("a42").unwrap();
+        assert!(matches!(sel, AutomationSelector::ShortId(42)));
+    }
+
+    #[test]
+    fn parse_automation_selector_rejects_unknown_form() {
+        assert!(parse_automation_selector("randomstring").is_err());
+        assert!(parse_automation_selector("T42").is_err()); // task id — wrong namespace
     }
 }

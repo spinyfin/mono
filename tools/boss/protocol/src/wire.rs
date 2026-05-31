@@ -1095,6 +1095,26 @@ pub enum FrontendRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+    /// List the `automation_runs` history for an automation, newest first.
+    /// Replies with [`FrontendEvent::AutomationRunsList`].
+    ListAutomationRuns {
+        automation_id: String,
+    },
+    /// List tasks that were produced by a specific automation
+    /// (`tasks.source_automation_id = automation_id`), ordered by
+    /// `created_at DESC`. Replies with [`FrontendEvent::AutomationTasksList`].
+    ListAutomationTasks {
+        automation_id: String,
+    },
+    /// Enqueue an out-of-schedule triage fire for an automation.
+    /// `force = true` bypasses the open-task cap. Replies with
+    /// [`FrontendEvent::AutomationRunEnqueued`] when the fire was accepted,
+    /// or [`FrontendEvent::WorkError`] if the cap gate blocks it (and
+    /// `force` was not set).
+    RunAutomation {
+        automation_id: String,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1901,6 +1921,21 @@ pub enum FrontendEvent {
     EditorialActionsList {
         product_id: String,
         actions: Vec<EditorialAction>,
+    },
+    /// Response to [`FrontendRequest::ListAutomationRuns`].
+    AutomationRunsList {
+        automation_id: String,
+        runs: Vec<AutomationRun>,
+    },
+    /// Response to [`FrontendRequest::ListAutomationTasks`].
+    AutomationTasksList {
+        automation_id: String,
+        tasks: Vec<Task>,
+    },
+    /// Response to [`FrontendRequest::RunAutomation`] when the fire was
+    /// accepted and enqueued.
+    AutomationRunEnqueued {
+        automation_id: String,
     },
 }
 
