@@ -78,20 +78,18 @@ mod tests;
 pub use server::{run, serve, process_is_alive};
 
 // Re-import server-internal helpers so child modules can access them via `use super::*`.
-#[allow(unused_imports)]
 use server::{
-    pid_is_alive, reap_worker_process_tree, register_app_session_trust_ok,
-    resolve_status_actor, process_group_signal_target,
-    constant_time_eq, current_parent_pid, is_descendant_of_any, signal_shell_pids,
+    reap_worker_process_tree, register_app_session_trust_ok,
+    resolve_status_actor,
+    constant_time_eq, is_descendant_of_any, signal_shell_pids,
 };
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
-#[allow(unused_imports)]
 use worker_events::{
     dispatch_live_worker_state, dispatch_editorial_on_pretooluse,
     dispatch_probe_on_stop, dispatch_urgent_probe_on_post_tool_use,
     dispatch_probe_if_idle, dispatch_probe_reply_on_stop,
-    extract_last_assistant_text, dispatch_completion_on_stop,
+    dispatch_completion_on_stop,
 };
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
