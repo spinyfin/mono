@@ -225,6 +225,19 @@ enum DispatchAction {
         #[arg(long)]
         include_stalled: bool,
     },
+    /// Pause global dispatch. The engine stops dispatching new executions
+    /// from all sources (auto-dispatch, reconciliation, dependency-gate-clear,
+    /// manual start). Already-running executions are not interrupted. The
+    /// paused state persists across engine restarts. Idempotent — pausing
+    /// while already paused is a no-op.
+    Pause,
+    /// Resume global dispatch. The engine immediately drains any executions
+    /// that queued while paused and resumes normal dispatch. Idempotent —
+    /// resuming while already running is a no-op.
+    Resume,
+    /// Show the current dispatch-pause state (paused/running and, if paused,
+    /// when it was paused).
+    State,
 }
 
 /// Output format for `bossctl agents transcript --format`.
@@ -637,6 +650,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
+        Command::Dispatch {
+            action: DispatchAction::Pause,
+        } => dispatch_set_paused(&cli.socket_path, cli.json, true).await,
+        Command::Dispatch {
+            action: DispatchAction::Resume,
+        } => dispatch_set_paused(&cli.socket_path, cli.json, false).await,
+        Command::Dispatch {
+            action: DispatchAction::State,
+        } => dispatch_state(&cli.socket_path, cli.json).await,
         Command::Metrics {
             action: MetricsAction::List { prefix, state_root },
         } => metrics_list(cli.json, state_root, prefix.as_deref()),
@@ -827,6 +849,81 @@ fn dispatch_ghost_active(
         }
     }
     Ok(())
+}
+
+async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::SetDispatchPaused { paused })
+        .await
+        .context("sending SetDispatchPaused")?;
+    match response {
+        FrontendEvent::DispatchStateResult {
+            paused: new_paused,
+            paused_since_epoch_s,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "paused": new_paused,
+                        "paused_since_epoch_s": paused_since_epoch_s,
+                    })
+                );
+            } else if new_paused {
+                let since_str = paused_since_epoch_s
+                    .map(|s| format!(" (since epoch {s})"))
+                    .unwrap_or_default();
+                println!("dispatch paused{since_str}");
+            } else {
+                println!("dispatch resumed");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected SetDispatchPaused: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::GetDispatchState)
+        .await
+        .context("sending GetDispatchState")?;
+    match response {
+        FrontendEvent::DispatchStateResult {
+            paused,
+            paused_since_epoch_s,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "paused": paused,
+                        "paused_since_epoch_s": paused_since_epoch_s,
+                    })
+                );
+            } else if paused {
+                let since_str = paused_since_epoch_s
+                    .map(|s| format!("  paused_since: epoch {s}"))
+                    .unwrap_or_default();
+                println!("state: paused");
+                if !since_str.is_empty() {
+                    println!("{since_str}");
+                }
+            } else {
+                println!("state: running");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected GetDispatchState: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
 }
 
 fn filter_and_tail<'a>(
