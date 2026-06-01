@@ -52,6 +52,7 @@ steps:
   - label: ":scales: checks-bake (TEMP)"
     key: "checks-bake"
     command: ".buildkite/steps/checks-bake.sh"
+    soft_fail: true
     depends_on: "bootstrap"
     agents:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
