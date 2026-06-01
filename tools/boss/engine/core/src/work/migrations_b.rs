@@ -1300,3 +1300,19 @@ pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Normalise any `tasks.effort_level` rows that were stored as empty string
+/// (`''`) rather than `NULL`. These could exist on databases predating the
+/// typed-write guards (introduced with the effort-and-model design, PR #370):
+/// some write paths formerly produced `''` when clearing the field instead of
+/// letting the column stay `NULL`. The mapper already converts `''` to `None`
+/// at read time so the wire format is unaffected, but canonical storage should
+/// use `NULL` to match the schema intent and to keep SQL queries
+/// (`WHERE effort_level IS NULL`) reliable.
+pub(crate) fn migrate_tasks_empty_effort_to_null(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET effort_level = NULL WHERE effort_level = ''",
+        [],
+    )?;
+    Ok(())
+}

@@ -313,8 +313,12 @@ impl WorkDb {
         // audit table. Ships dark — no behaviour change until a product opts in.
         // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
         migrate_editorial_controls_schema(&conn)?;
+        // Normalise any effort_level rows stored as '' to NULL. The mapper
+        // already converts '' → None at read time, but canonical DB storage
+        // should use NULL (consistent with schema intent and SQL IS NULL queries).
+        migrate_tasks_empty_effort_to_null(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '15')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '16')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

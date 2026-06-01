@@ -2236,3 +2236,71 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Regression: rows with `effort_level = ''` (empty string, produced by
+/// older write paths when clearing the field) should be converted to NULL
+/// by the `migrate_tasks_empty_effort_to_null` migration so canonical
+/// DB storage matches the schema intent and SQL `IS NULL` queries remain
+/// reliable.
+#[test]
+fn migration_normalises_empty_effort_level_to_null() {
+    let path = disk_db_path("effort-empty-to-null");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".into(),
+            description: None,
+            repo_remote_url: Some("git@github.com:test/repo.git".into()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Chore with empty effort".into(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+    // Manually write an empty string to simulate a legacy row.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET effort_level = '' WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT effort_level FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some(""), "pre-condition: row has ''");
+    }
+    drop(db);
+
+    // Re-opening runs the migration which converts '' to NULL.
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    let after: Option<String> = conn
+        .query_row(
+            "SELECT effort_level FROM tasks WHERE id = ?1",
+            [&chore.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(after.is_none(), "empty effort_level should be NULL after migration");
+
+    let _ = std::fs::remove_file(path);
+}
