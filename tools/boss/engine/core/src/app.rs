@@ -5324,18 +5324,35 @@ async fn handle_frontend_connection(
                 kind,
                 state,
             } => {
-                match work_db.list_attention_groups(
-                    &product_id,
-                    project_id.as_deref(),
-                    task_id.as_deref(),
-                    kind.as_deref(),
-                    state.as_deref(),
-                ) {
-                    Ok(groups) => {
+                let listed = work_db
+                    .list_attention_groups(
+                        &product_id,
+                        project_id.as_deref(),
+                        task_id.as_deref(),
+                        kind.as_deref(),
+                        state.as_deref(),
+                    )
+                    .and_then(|groups| {
+                        // Bundle every group's member rows in one reply so the
+                        // Notifications window renders inline controls without a
+                        // round-trip per group. Flattened across groups; the
+                        // client buckets by `group_id`.
+                        let mut members = Vec::new();
+                        for group in &groups {
+                            members.extend(work_db.list_attentions_for_group(&group.id)?);
+                        }
+                        Ok((groups, members))
+                    });
+                match listed {
+                    Ok((groups, members)) => {
                         send_response(
                             &sink,
                             &request_id,
-                            FrontendEvent::AttentionGroupsList { product_id, groups },
+                            FrontendEvent::AttentionGroupsList {
+                                product_id,
+                                groups,
+                                members,
+                            },
                         );
                     }
                     Err(err) => {
@@ -5350,12 +5367,16 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::GetAttentionGroup { id } => {
-                match work_db.get_attention_group(&id) {
-                    Ok(group) => {
+                let fetched = work_db.get_attention_group(&id).and_then(|group| {
+                    let members = work_db.list_attentions_for_group(&group.id)?;
+                    Ok((group, members))
+                });
+                match fetched {
+                    Ok((group, members)) => {
                         send_response(
                             &sink,
                             &request_id,
-                            FrontendEvent::AttentionGroupResult { group },
+                            FrontendEvent::AttentionGroupResult { group, members },
                         );
                     }
                     Err(err) => {
@@ -5408,19 +5429,23 @@ async fn handle_frontend_connection(
                 dismiss,
             } => match work_db.answer_attention(&id, answer, skip, dismiss) {
                 Ok(group) => {
+                    let members = work_db
+                        .list_attentions_for_group(&group.id)
+                        .unwrap_or_default();
                     server_state
                         .publisher
                         .publish_frontend_event_on_product(
                             &group.product_id,
                             FrontendEvent::AttentionGroupUpdated {
                                 group: group.clone(),
+                                members: members.clone(),
                             },
                         )
                         .await;
                     send_response(
                         &sink,
                         &request_id,
-                        FrontendEvent::AttentionGroupUpdated { group },
+                        FrontendEvent::AttentionGroupUpdated { group, members },
                     );
                 }
                 Err(err) => {
@@ -5436,19 +5461,23 @@ async fn handle_frontend_connection(
             FrontendRequest::DismissAttention { id, reason } => {
                 match work_db.dismiss_attention(&id, reason) {
                     Ok(group) => {
+                        let members = work_db
+                            .list_attentions_for_group(&group.id)
+                            .unwrap_or_default();
                         server_state
                             .publisher
                             .publish_frontend_event_on_product(
                                 &group.product_id,
                                 FrontendEvent::AttentionGroupUpdated {
                                     group: group.clone(),
+                                    members: members.clone(),
                                 },
                             )
                             .await;
                         send_response(
                             &sink,
                             &request_id,
-                            FrontendEvent::AttentionGroupUpdated { group },
+                            FrontendEvent::AttentionGroupUpdated { group, members },
                         );
                     }
                     Err(err) => {
@@ -5470,6 +5499,9 @@ async fn handle_frontend_connection(
                     group,
                     produced_work_item_ids,
                 }) => {
+                    let members = work_db
+                        .list_attentions_for_group(&group.id)
+                        .unwrap_or_default();
                     // Live-update the Notifications window + inline doc surface.
                     server_state
                         .publisher
@@ -5477,6 +5509,7 @@ async fn handle_frontend_connection(
                             &group.product_id,
                             FrontendEvent::AttentionGroupActioned {
                                 group: group.clone(),
+                                members: members.clone(),
                             },
                         )
                         .await;
@@ -5497,7 +5530,7 @@ async fn handle_frontend_connection(
                     send_response(
                         &sink,
                         &request_id,
-                        FrontendEvent::AttentionGroupActioned { group },
+                        FrontendEvent::AttentionGroupActioned { group, members },
                     );
                 }
                 Err(err) => {
