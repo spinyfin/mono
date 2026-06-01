@@ -1566,6 +1566,84 @@ fn active_to_todo_execution_returns_none_for_product() {
     );
 }
 
+// ---- live_execution_for_deleted_item ----
+
+#[test]
+fn live_execution_for_deleted_item_returns_none_when_no_execution() {
+    let (db, _, chore_id) = make_work_db_with_chore();
+    let item = db.get_work_item(&chore_id).unwrap();
+    assert!(
+        live_execution_for_deleted_item(&db, &item).is_none(),
+        "must return None when the chore has no executions"
+    );
+}
+
+#[test]
+fn live_execution_for_deleted_item_returns_execution_id_when_running() {
+    use crate::work::CreateExecutionInput;
+    let (db, _, chore_id) = make_work_db_with_chore();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind("chore_implementation")
+                .status("running")
+                .build(),
+        )
+        .unwrap();
+    let item = db.get_work_item(&chore_id).unwrap();
+    assert_eq!(
+        live_execution_for_deleted_item(&db, &item).as_deref(),
+        Some(execution.id.as_str()),
+        "must return the live execution id so the worker can be torn down"
+    );
+}
+
+#[test]
+fn live_execution_for_deleted_item_returns_none_when_terminal() {
+    use crate::work::CreateExecutionInput;
+    for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
+        let (db, _, chore_id) = make_work_db_with_chore();
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind("chore_implementation")
+                .status(status)
+                .build(),
+        )
+        .unwrap();
+        let item = db.get_work_item(&chore_id).unwrap();
+        assert!(
+            live_execution_for_deleted_item(&db, &item).is_none(),
+            "must return None for terminal execution status {status:?}"
+        );
+    }
+}
+
+#[test]
+fn live_execution_for_deleted_item_returns_none_for_product() {
+    use crate::work::CreateProductInput;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    std::mem::forget(dir);
+    let db = Arc::new(WorkDb::open(path).unwrap());
+    let product_item = db
+        .create_product(CreateProductInput {
+            name: "Prod".into(),
+            description: None,
+            repo_remote_url: None,
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let item = WorkItem::Product(product_item);
+    assert!(
+        live_execution_for_deleted_item(&db, &item).is_none(),
+        "must return None for non-task work items"
+    );
+}
+
 // --- chore-update notification helpers ---
 
 #[test]

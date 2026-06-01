@@ -104,7 +104,8 @@ use handler_helpers::{
     transport_default_created_via, work_item_id, validate_external_tracker_config,
     work_item_product_id, task_status_for_id, work_item_needs_dispatch,
     task_transitioned_to_active, terminal_chore_execution, in_review_chore_execution,
-    active_to_todo_execution, task_name_description_for_id, active_chore_run_id,
+    active_to_todo_execution, live_execution_for_deleted_item,
+    task_name_description_for_id, active_chore_run_id,
     build_chore_update_message, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution,
     resolve_transcript_for_tail, segment_to_wire, read_transcript_tail,
 };
