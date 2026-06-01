@@ -1080,10 +1080,11 @@ pub async fn on_ci_in_flight(
 /// Issue #901: a newer in-progress CI run supersedes an older failing
 /// result. When the probe reports `InFlight` for a PR whose chore is
 /// still parked in `blocked: ci_failure` (or `ci_failure_exhausted`)
-/// from a prior run, that failing result is stale — `classify_ci` only
-/// yields `InFlight` when *no* required check is currently failing
-/// (Fail dominates InFlight in the rollup collapse), so the card must
-/// not keep asserting a failure while CI is being re-evaluated. Flip the
+/// from a prior run, that failing result is stale — `classify_ci` yields
+/// `InFlight` whenever any required check is still running, even if an
+/// earlier leaf already failed (`InFlight` dominates `Fail` in the rollup
+/// collapse), so the card must not keep asserting a failure while CI is
+/// being re-evaluated. Flip the
 /// chore back to `in_review` and emit `CiFailureCleared` so the UI drops
 /// the stale "ci failing" badge. The yellow-clock indicator is written
 /// separately by `update_pr_poll_state` (`ci_required_state =
