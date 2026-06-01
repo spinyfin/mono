@@ -523,7 +523,9 @@ pub enum FrontendRequest {
     },
 
     /// Return the count of open tasks produced by an automation.
-    /// "Open" = `status IN (todo, ready, doing, in_review, blocked)`.
+    /// "Open" = any non-terminal status: `todo`, `ready`, `active` (doing),
+    /// `in_review`, `blocked`. Note: the kanban label "doing" maps to the DB
+    /// value `active`; the query uses the stored value.
     /// Replies with [`FrontendEvent::AutomationOpenTaskCount`].
     GetAutomationOpenTaskCount {
         automation_id: String,
