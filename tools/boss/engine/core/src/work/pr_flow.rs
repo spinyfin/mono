@@ -223,7 +223,7 @@ impl WorkDb {
             .saturating_sub(lookback_secs)
             .to_string();
         let mut stmt = conn.prepare(
-            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
              FROM work_executions we
              JOIN tasks t ON t.id = we.work_item_id
              WHERE we.status IN ('abandoned', 'completed', 'failed')
@@ -248,6 +248,9 @@ impl WorkDb {
                 work_item_id: row.get(1)?,
                 repo_remote_url: row.get(2)?,
                 branch_naming,
+                worker_branch_prefix: row
+                    .get::<_, Option<String>>(4)?
+                    .filter(|s| !s.is_empty()),
             })
         })?;
         collect_rows(rows)

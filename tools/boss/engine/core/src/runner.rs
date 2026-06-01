@@ -586,8 +586,11 @@ pub(crate) fn compose_worker_spawn(
     let recovery_branch: Option<String> = if work_item_pr_url(work_item).is_none() {
         match work_db.get_prior_orphaned_execution(&execution.work_item_id, &execution.id) {
             Ok(Some(prior)) => {
-                let branch =
-                    crate::completion::expected_branch_name(&prior.id, &prior.branch_naming);
+                let branch = crate::completion::expected_branch_name(
+                    &prior.id,
+                    &prior.branch_naming,
+                    prior.worker_branch_prefix.as_deref(),
+                );
                 tracing::info!(
                     execution_id = %execution.id,
                     prior_execution_id = %prior.id,
@@ -848,6 +851,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         let expected_branch_new = crate::completion::expected_branch_name(
             &execution.id,
             &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
         );
         prompt.push_str(&format!(
             "## STARTUP RECOVERY\n\
@@ -874,6 +878,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     let expected_branch = crate::completion::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
+        execution.worker_branch_prefix.as_deref(),
     );
     prompt.push_str("Execution context:\n");
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
@@ -3649,6 +3654,7 @@ mod pane_spawn_tests {
         let expected_branch = crate::completion::expected_branch_name(
             "exec-test-1",
             &boss_protocol::BranchNaming::BossExecPrefix,
+            None,
         );
         assert!(
             prompt.contains(&expected_branch),
