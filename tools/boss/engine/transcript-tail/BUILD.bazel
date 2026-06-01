@@ -20,6 +20,7 @@ rust_test(
     name = "transcript-tail_test",
     crate = ":transcript-tail",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

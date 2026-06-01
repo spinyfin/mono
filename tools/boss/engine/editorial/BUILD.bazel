@@ -22,6 +22,7 @@ rust_test(
     name = "editorial_test",
     crate = ":editorial",
     edition = "2024",
+    size = "small",
     deps = [
         "//tools/boss/protocol",
     ] + all_crate_deps(

@@ -20,6 +20,7 @@ rust_test(
     name = "feature-flags_test",
     crate = ":feature-flags",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

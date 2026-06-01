@@ -34,6 +34,7 @@ rust_binary(
 rust_test(
     name = "checkleft_lib_test",
     crate = ":checkleft_lib",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -47,6 +48,7 @@ rust_test(
 rust_test(
     name = "checkleft_bin_test",
     crate = ":checkleft",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -67,6 +69,7 @@ rust_test(
     srcs = ["tests/change_detection_e2e.rs"],
     compile_data = glob(["tests/fixtures/**"]),
     edition = "2024",
+    size = "small",
     deps = [
         ":checkleft_lib",
     ] + all_crate_deps(

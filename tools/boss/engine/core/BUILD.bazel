@@ -320,6 +320,8 @@ rust_test(
     name = "work_crud_test",
     srcs = ["tests/work_crud.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     deps = [
         ":engine_lib",
         "//tools/boss/client",

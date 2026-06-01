@@ -18,6 +18,7 @@ rust_test(
     name = "transcript_markdown_test",
     crate = ":transcript_markdown",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

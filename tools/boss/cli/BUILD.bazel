@@ -45,6 +45,7 @@ rust_binary(
 rust_test(
     name = "boss_test",
     crate = ":boss",
+    size = "small",
     deps = [
         "//tools/boss/client",
         "//tools/boss/protocol",
@@ -66,6 +67,8 @@ rust_test(
     name = "infer_product_test",
     srcs = ["tests/infer_product.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -90,6 +93,8 @@ rust_test(
     name = "effort_and_model_test",
     srcs = ["tests/effort_and_model.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -114,6 +119,8 @@ rust_test(
     name = "repo_resolution_test",
     srcs = ["tests/repo_resolution.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -135,6 +142,7 @@ rust_test(
     name = "uninstall_test",
     srcs = ["tests/uninstall.rs"],
     edition = "2024",
+    size = "small",
     data = [":boss"],
     deps = [] + all_crate_deps(
         normal = True,
@@ -152,6 +160,7 @@ rust_test(
     name = "shake_test",
     srcs = ["tests/shake.rs"],
     edition = "2024",
+    size = "small",
     data = [":boss"],
     deps = [] + all_crate_deps(
         normal = True,
@@ -171,6 +180,8 @@ rust_test(
     name = "friendly_id_test",
     srcs = ["tests/friendly_id.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -195,6 +206,8 @@ rust_test(
     name = "audit_effort_test",
     srcs = ["tests/audit_effort.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -218,6 +231,8 @@ rust_test(
     name = "external_tracker_test",
     srcs = ["tests/external_tracker.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",
@@ -242,6 +257,8 @@ rust_test(
     name = "engine_ci_verbs_test",
     srcs = ["tests/engine_ci_verbs.rs"],
     edition = "2024",
+    size = "small",
+    timeout = "moderate",
     data = [":boss"],
     deps = [
         "//tools/boss/client",

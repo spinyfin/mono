@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:private"])
 macos_unit_test(
     name = "UpdateTests",
     minimum_os_version = "15.0",
+    size = "small",
     deps = [":update_tests_lib"],
 )
 

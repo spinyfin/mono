@@ -22,6 +22,7 @@ rust_test(
     name = "client_test",
     crate = ":client",
     edition = "2024",
+    size = "small",
     deps = [
         "//tools/boss/protocol",
     ] + all_crate_deps(

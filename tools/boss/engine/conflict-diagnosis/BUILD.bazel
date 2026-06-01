@@ -20,6 +20,7 @@ rust_test(
     name = "conflict-diagnosis_test",
     crate = ":conflict-diagnosis",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
