@@ -108,7 +108,29 @@ extension ChatViewModel {
     /// Restore a dismissed group back to open so the human can re-evaluate it.
     /// The engine resets all skipped/dismissed members to open and replies
     /// with `attention_group_updated`, which `upsertAttentionGroup` picks up.
+    ///
+    /// Optimistically updates local state first so the view immediately
+    /// re-derives from the restored state rather than waiting for the async
+    /// engine round-trip. The engine's confirmation overwrites with
+    /// authoritative values (including recomputed group state).
     func restoreAttentionGroup(_ groupID: String) {
+        for (productID, groups) in attentionGroupsByProductID {
+            if let idx = groups.firstIndex(where: { $0.id == groupID }) {
+                var updated = groups[idx]
+                updated.state = "open"
+                var updatedGroups = groups
+                updatedGroups[idx] = updated
+                attentionGroupsByProductID[productID] = updatedGroups
+                break
+            }
+        }
+        if var members = attentionMembersByGroupID[groupID] {
+            for i in members.indices
+                where members[i].answerState == "skipped" || members[i].answerState == "dismissed" {
+                members[i].answerState = "open"
+            }
+            attentionMembersByGroupID[groupID] = members
+        }
         engine.sendRestoreAttentionGroup(id: groupID)
     }
 
