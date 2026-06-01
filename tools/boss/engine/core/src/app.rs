@@ -32,8 +32,8 @@ use crate::protocol::{
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     InterruptWorkerPaneInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
     RevealWorkItemInput, SendToPaneInput, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, magic_wand_dispatch_topic,
-    execution_topic, probe_topic, work_product_topic,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
+    magic_wand_dispatch_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
@@ -352,6 +352,11 @@ struct ServerState {
     /// [`WorkerCompletionHandler::with_staged_pr_urls`] so writes
     /// here and reads in `on_stop` see the same map.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Per-execution deny counter for the editorial PreToolUse loop guard
+    /// (design R3). State is in-memory only; a restart resets it to zero,
+    /// which is the safe direction (worst case a worker gets three fresh
+    /// denies rather than an indefinite block).
+    editorial_deny_tracker: Arc<crate::editorial_hook::DenyTracker>,
     /// Snapshot of the Anthropic API key captured at engine startup.
     /// Used by the live-status summarizer for the per-slot task; the
     /// pane-titlebar summarizer continues to resolve the key
@@ -885,6 +890,7 @@ impl ServerState {
                     crate::live_status_loop::TranscriptPathCache::new(),
                 ),
                 staged_pr_urls,
+                editorial_deny_tracker: Arc::new(crate::editorial_hook::DenyTracker::new()),
                 anthropic_api_key,
                 syspolicyd_health: Arc::new(
                     crate::syspolicyd_monitor::SyspolicydHealth::new(),
@@ -3274,6 +3280,12 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 &incoming.event,
                             );
                             dispatch_live_worker_state(&server_state, &incoming).await;
+                            // Editorial PreToolUse audit: evaluate every
+                            // `gh pr|issue` Bash invocation against the
+                            // product's editorial rules and record the
+                            // decision in `editorial_actions`. Fire-and-
+                            // forget; never blocks the event dispatch.
+                            dispatch_editorial_on_pretooluse(&server_state, &incoming).await;
                             // Urgent probes fire on PostToolUse so
                             // the coordinator can redirect a worker
                             // mid-task without waiting for Stop. The
@@ -3598,6 +3610,171 @@ async fn dispatch_live_worker_state(
             .live_status_manager
             .notify(slot_id, Trigger::ActivityChanged(new));
     }
+}
+
+/// On every `PreToolUse` event whose tool is `Bash` and whose command
+/// matches `gh pr|issue {create,edit,comment,review}` (or `cube pr ensure`),
+/// evaluate the command against the product's editorial rules and write the
+/// decision to `editorial_actions`. Emits a `work_editorial_action` topic
+/// event so subscribers (bossctl, kanban) can observe decisions live.
+///
+/// Fails open on every error: a DB failure, a missing execution row, or an
+/// unresolvable product are all logged and dropped. The editorial controls are
+/// advisory-in-a-partition — never a hard block on the event loop.
+async fn dispatch_editorial_on_pretooluse(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::WorkerEvent;
+    use boss_editorial::CompiledRules;
+    use std::path::Path;
+
+    let WorkerEvent::PreToolUse { tool_name, tool_input, .. } = &incoming.event else {
+        return;
+    };
+    if tool_name != "Bash" {
+        return;
+    }
+    let command = match tool_input.get("command").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Fast path: only evaluate commands that match the editorial hook's scope.
+    if !crate::gh_invocation::is_editorial_candidate(command) {
+        return;
+    }
+
+    let Some(execution_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+
+    // Load the product_id and editorial_rules in one synchronous query.
+    let (product_id, editorial_rules, workspace_path_opt) =
+        match server_state.work_db.get_editorial_context(execution_id) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    ?err,
+                    "editorial_pretooluse: could not load editorial context; skipping",
+                );
+                return;
+            }
+        };
+
+    if product_id.is_empty() {
+        tracing::debug!(
+            execution_id,
+            "editorial_pretooluse: execution has no product; skipping",
+        );
+        return;
+    }
+
+    // Compile the user-supplied rules (baked-ins always apply inside evaluate_gh_pretooluse).
+    let compiled = match CompiledRules::compile(editorial_rules) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "editorial_pretooluse: could not compile editorial rules; skipping",
+            );
+            return;
+        }
+    };
+
+    // Use the workspace path as cwd for --body-file resolution; fall back to
+    // an empty path (evaluate_gh_pretooluse fails-open when the file is unreadable).
+    let cwd_path: std::path::PathBuf = workspace_path_opt
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+
+    let outcome = crate::editorial_hook::evaluate_gh_pretooluse(
+        command,
+        &cwd_path,
+        &compiled,
+        None, // PR template support is a follow-up (chore #9)
+        execution_id,
+        &server_state.editorial_deny_tracker,
+    );
+
+    let action_str = outcome.action.as_str();
+    let reason_str: Option<String> = if outcome.findings.is_empty() {
+        None
+    } else {
+        Some(
+            outcome
+                .findings
+                .iter()
+                .map(|f| f.description.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    };
+
+    // Best-effort PR URL from the staged cache.
+    let pr_url = server_state.staged_pr_urls.get(execution_id);
+
+    // Write to DB.
+    let insert_result = server_state.work_db.insert_editorial_action(
+        &product_id,
+        execution_id,
+        pr_url.as_deref(),
+        command,
+        action_str,
+        reason_str.as_deref(),
+    );
+    let row_id = match insert_result {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                %product_id,
+                ?err,
+                "editorial_pretooluse: DB insert failed",
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        execution_id,
+        %product_id,
+        action = action_str,
+        row_id,
+        "editorial_pretooluse: recorded action",
+    );
+
+    // Build the EditorialAction for the topic event.
+    use crate::work::now_string;
+    let editorial_action = boss_protocol::EditorialAction::builder()
+        .id(row_id.to_string())
+        .product_id(&product_id)
+        .execution_id(execution_id)
+        .maybe_pr_url(pr_url)
+        .tool_command(command)
+        .action(action_str)
+        .reason(reason_str.unwrap_or_default())
+        .created_at(now_string())
+        .build();
+
+    // Emit topic event so subscribers can observe decisions live.
+    let revision = server_state.work_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let topic = editorial_actions_topic(&product_id);
+    let event = FrontendEvent::TopicEvent {
+        topic: topic.clone(),
+        revision,
+        origin_session_id: String::new(),
+        origin_request_id: None,
+        event: TopicEventPayload::WorkEditorialAction {
+            action: editorial_action,
+        },
+    };
+    server_state
+        .topic_broker
+        .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+        .await;
 }
 
 /// On `Stop` hook events, pop a pending probe for the run (if any)
@@ -8791,16 +8968,35 @@ async fn handle_frontend_connection(
                 }
             }
 
-            // Editorial controls — protocol types only; engine implementation is a follow-up.
-            FrontendRequest::SetProductEditorialRules { .. }
-            | FrontendRequest::ListEditorialActions { .. } => {
+            // Editorial controls — protocol types only for SetProductEditorialRules; ListEditorialActions is live.
+            FrontendRequest::SetProductEditorialRules { .. } => {
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: "editorial controls are not yet implemented".into(),
+                        message: "set-editorial-rules is not yet implemented".into(),
                     },
                 );
+            }
+
+            FrontendRequest::ListEditorialActions { product_id, limit } => {
+                match work_db.list_editorial_actions(&product_id, limit, None) {
+                    Ok(actions) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::EditorialActionsList {
+                            product_id,
+                            actions,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
             }
 
             FrontendRequest::ListAutomationRuns { automation_id } => {

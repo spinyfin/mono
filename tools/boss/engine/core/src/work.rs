@@ -74,7 +74,7 @@ pub use boss_protocol::{
     CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult,
+    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult,
     ListDependenciesInput, MagicWandDispatch, MAGIC_WAND_STATUS_APPLIED,
     MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED,
     MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
@@ -168,6 +168,7 @@ impl Clone for WorkDb {
 // ---- module tree (see PR description for the split rationale) ----
 mod attentions;
 mod audit_misc;
+mod editorial;
 mod automations;
 mod blocking;
 mod chain_helpers;

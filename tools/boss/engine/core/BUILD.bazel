@@ -84,6 +84,7 @@ rust_library(
         "src/work/dep_helpers.rs",
         "src/work/dispatch.rs",
         "src/work/dispatch_helpers.rs",
+        "src/work/editorial.rs",
         "src/work/exec_status_helpers.rs",
         "src/work/exec_tail.rs",
         "src/work/executions_runs.rs",

@@ -171,6 +171,17 @@ pub fn is_cube_pr_ensure(command: &str) -> bool {
     CUBE_PR_ENSURE_RE.is_match(&stripped)
 }
 
+/// Fast pre-filter for the editorial PreToolUse audit path. Returns `true`
+/// when `command` could be a `gh pr|issue {create,edit,comment,review}` or
+/// `cube pr ensure` invocation — the two surfaces the editorial hook covers.
+///
+/// This is a cheap substring check; the heavier [`classify`] /
+/// [`is_cube_pr_ensure`] parsing follows only when this returns `true`.
+pub fn is_editorial_candidate(command: &str) -> bool {
+    (command.contains("gh ") && (command.contains(" pr ") || command.contains(" issue ")))
+        || (command.contains("cube ") && command.contains(" pr ") && command.contains("ensure"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
