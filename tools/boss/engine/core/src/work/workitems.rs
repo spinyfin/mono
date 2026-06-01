@@ -167,6 +167,21 @@ impl WorkDb {
                 if rows == 0 {
                     bail!("unknown task: {id}");
                 }
+                // Cascade soft-delete to every revision in the chain
+                // (BFS over parent_task_id links). A live revision is
+                // meaningless once its parent is gone — it can only ever
+                // amend the parent's PR, which no longer exists — and
+                // leaves board noise / dispatch hazards.
+                // Use the same `now` timestamp so restore can identify
+                // which revisions were cascade-deleted alongside this parent.
+                let revision_ids = collect_chain_revision_ids(&*tx, id)?;
+                for rev_id in &revision_ids {
+                    tx.execute(
+                        "UPDATE tasks SET deleted_at = ?2, updated_at = ?2
+                         WHERE id = ?1 AND deleted_at IS NULL",
+                        params![rev_id, now],
+                    )?;
+                }
                 // Q10 (deleted prereq): drop every dependency edge that
                 // names this task as either endpoint. A row with a
                 // tombstoned prerequisite is the worst of both worlds —
@@ -192,12 +207,18 @@ impl WorkDb {
     /// row that is already live succeeds as a no-op. Returns the now-live
     /// work item.
     ///
+    /// Cascade-restore: child revisions whose `deleted_at` matches the
+    /// parent's tombstone timestamp were cascade-deleted by
+    /// [`Self::delete_work_item`] and are restored together with the
+    /// parent in the same transaction. Revisions that were independently
+    /// deleted (different timestamp) are left tombstoned.
+    ///
     /// Note: the dependency edges that `delete_work_item` dropped are
     /// NOT recreated — they were deleted outright, not tombstoned, so a
     /// restored task comes back with no dependency edges. The operator
     /// must re-add any that still matter.
     pub fn restore_work_item(&self, id: &str) -> Result<WorkItem> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
         let canonical =
             resolve_friendly_work_item_id_inner(&conn, id, true)?.unwrap_or_else(|| id.to_owned());
         match classify_id(&canonical)? {
@@ -218,12 +239,60 @@ impl WorkDb {
                 if !exists {
                     bail!("unknown task: {canonical}");
                 }
+                // Capture the parent's current deleted_at before restoring.
+                // Revisions with the same timestamp were cascade-deleted by
+                // delete_work_item and should be restored alongside the parent.
+                let parent_deleted_at: Option<String> = conn
+                    .query_row(
+                        "SELECT deleted_at FROM tasks WHERE id = ?1",
+                        params![canonical],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
                 let now = now_string();
-                conn.execute(
-                    "UPDATE tasks SET deleted_at = NULL, updated_at = ?2
-                     WHERE id = ?1 AND deleted_at IS NOT NULL",
-                    params![canonical, now],
-                )?;
+                {
+                    let tx = conn.transaction()?;
+                    tx.execute(
+                        "UPDATE tasks SET deleted_at = NULL, updated_at = ?2
+                         WHERE id = ?1 AND deleted_at IS NOT NULL",
+                        params![canonical, now],
+                    )?;
+                    // BFS to restore all cascade-deleted revisions that share
+                    // the parent's tombstone timestamp. Revisions deleted
+                    // independently (different deleted_at) are left tombstoned.
+                    if let Some(ref deleted_at) = parent_deleted_at {
+                        let mut frontier = vec![canonical.clone()];
+                        for _ in 0..64 {
+                            if frontier.is_empty() {
+                                break;
+                            }
+                            let mut next = Vec::new();
+                            for ancestor_id in &frontier {
+                                let children: Vec<String> = tx
+                                    .prepare_cached(
+                                        "SELECT id FROM tasks
+                                         WHERE parent_task_id = ?1
+                                           AND kind = 'revision'
+                                           AND deleted_at = ?2",
+                                    )?
+                                    .query_map(params![ancestor_id, deleted_at], |row| row.get(0))?
+                                    .filter_map(|r| r.ok())
+                                    .collect();
+                                for child_id in children {
+                                    tx.execute(
+                                        "UPDATE tasks SET deleted_at = NULL, updated_at = ?2
+                                         WHERE id = ?1",
+                                        params![child_id, now],
+                                    )?;
+                                    next.push(child_id);
+                                }
+                            }
+                            frontier = next;
+                        }
+                    }
+                    tx.commit()?;
+                }
                 query_task(&conn, &canonical)?
                     .map(task_to_item)
                     .with_context(|| format!("unknown task: {canonical}"))

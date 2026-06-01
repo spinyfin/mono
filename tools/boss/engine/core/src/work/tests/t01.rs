@@ -168,6 +168,66 @@ fn restore_work_item_clears_tombstone() {
 }
 
 #[test]
+fn delete_parent_cascades_to_revisions_and_restore_brings_them_back() {
+    let db = WorkDb::open(temp_db_path("cascade-delete-revisions")).unwrap();
+    let product_id = make_revision_product(&db, "cascade-rev");
+    let pr_url = "https://github.com/spinyfin/mono/pull/9001";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
+
+    // Sanity: all three are live before the delete.
+    assert!(db.get_work_item(&parent_id).is_ok());
+    assert!(db.get_work_item(&r1.id).is_ok());
+    assert!(db.get_work_item(&r2.id).is_ok());
+
+    db.delete_work_item(&parent_id).unwrap();
+
+    // Parent and both revisions must now be tombstoned.
+    assert!(db.get_work_item(&parent_id).is_err());
+    assert!(db.get_work_item(&r1.id).is_err());
+    assert!(db.get_work_item(&r2.id).is_err());
+
+    let deleted = db.list_chores(&product_id, None, true).unwrap();
+    assert_eq!(deleted.len(), 1, "parent visible in include-deleted list");
+    assert!(deleted[0].deleted_at.is_some());
+
+    // The revisions also have deleted_at set.
+    let conn = db.connect().unwrap();
+    let r1_deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&r1.id], |r| r.get(0))
+        .unwrap();
+    let r2_deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&r2.id], |r| r.get(0))
+        .unwrap();
+    assert!(r1_deleted_at.is_some(), "r1 must be tombstoned");
+    assert!(r2_deleted_at.is_some(), "r2 must be tombstoned");
+    // All three rows share the same deleted_at timestamp (set in one transaction).
+    assert_eq!(deleted[0].deleted_at, r1_deleted_at);
+    assert_eq!(deleted[0].deleted_at, r2_deleted_at);
+    drop(conn);
+
+    // Restoring the parent brings both revisions back.
+    db.restore_work_item(&parent_id).unwrap();
+
+    assert!(db.get_work_item(&parent_id).is_ok());
+    assert!(db.get_work_item(&r1.id).is_ok());
+    assert!(db.get_work_item(&r2.id).is_ok());
+
+    let conn = db.connect().unwrap();
+    let r1_deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&r1.id], |r| r.get(0))
+        .unwrap();
+    let r2_deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&r2.id], |r| r.get(0))
+        .unwrap();
+    assert!(r1_deleted_at.is_none(), "r1 deleted_at must be cleared");
+    assert!(r2_deleted_at.is_none(), "r2 deleted_at must be cleared");
+}
+
+#[test]
 fn create_many_tasks_inserts_all_in_one_transaction() {
     let path = temp_db_path("create-many-tasks");
     let db = WorkDb::open(path.clone()).unwrap();
