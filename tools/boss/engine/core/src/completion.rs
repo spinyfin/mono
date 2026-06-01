@@ -471,11 +471,14 @@ impl BranchVerifier for CommandBranchVerifier {
     }
 }
 
-/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop
-/// settings used throughout this module, returning the trimmed stdout on
-/// success. `display` is a human-readable rendering of the command and is
-/// reused in both the spawn-failure context and the non-zero-exit error
-/// message (which also carries the captured stderr).
+/// Spawn `gh <args…>` with the engine's standard stdio settings (null
+/// stdin, piped stdout/stderr, `kill_on_drop`) and return the trimmed
+/// stdout on success.
+///
+/// `display` is the human-readable form of the command (e.g.
+/// `"gh pr view 42 -R owner/repo"`); it is interpolated into both the
+/// spawn-failure context and the non-zero-exit error so every call site
+/// produces a consistent message without rebuilding the block by hand.
 async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     let output = Command::new("gh")
         .args(args)
@@ -494,7 +497,6 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
-
 /// Shell out to `gh pr view <pr_number> -R <repo_slug> --json headRefName`
 /// and return the branch name, or an error on failure / empty response.
 async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
