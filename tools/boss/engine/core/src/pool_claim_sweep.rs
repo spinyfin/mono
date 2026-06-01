@@ -100,7 +100,7 @@ pub const LEAK_GRACE_SECS: i64 = 60;
 
 /// Counts from one sweep pass; logged at `info` when any claim was
 /// released.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
 pub struct PoolClaimSweepOutcome {
     /// Leaked claims (terminal execution, no live pane) that were freed.
     pub released: usize,
