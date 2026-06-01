@@ -1,4 +1,5 @@
-//! Shared classifier for `gh pr|issue <subcommand>` Bash invocations.
+//! Shared classifier for `gh pr|issue <subcommand>` and `cube pr ensure`
+//! Bash invocations.
 //!
 //! Two engine surfaces inspect the worker's Bash commands for `gh`
 //! invocations:
@@ -27,6 +28,16 @@
 //! generalised here to capture *any* subcommand (so the PR-URL path can
 //! ask for `view` / `list` too) and any number of env-assignment
 //! prefixes.
+//!
+//! ## `cube pr ensure` coverage
+//!
+//! Workers are instructed to create PRs via `cube pr ensure` rather than
+//! calling `gh pr create` directly. `cube pr ensure` resolves the repo
+//! remote and then shells out to `gh pr create` internally — but that
+//! subprocess is invisible to the PreToolUse hook, which only sees the
+//! outer `cube pr ensure ...` command. [`is_cube_pr_ensure`] detects this
+//! path so the editorial hook can enforce the same rules it applies to a
+//! literal `gh pr create`.
 
 use std::sync::LazyLock;
 
@@ -78,6 +89,26 @@ pub fn classify(command: &str) -> Option<GhInvocation> {
         noun,
         subcommand: caps[2].to_owned(),
     })
+}
+
+/// Matches `cube pr ensure` anywhere it would appear as a real command:
+/// at the start, after env-var assignments, or after a shell delimiter.
+static CUBE_PR_ENSURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cube\s+pr\s+ensure\b",
+    )
+    .expect("cube pr ensure regex compiles")
+});
+
+/// Returns `true` when `command` is a `cube pr ensure` invocation.
+///
+/// Workers are instructed to create PRs via `cube pr ensure` rather than
+/// calling `gh pr create` directly. `cube` shells out to `gh pr create`
+/// internally, making that call invisible to the PreToolUse hook. This
+/// predicate lets the editorial hook intercept the outer `cube pr ensure`
+/// command and apply the same checks it would apply to a `gh pr create`.
+pub fn is_cube_pr_ensure(command: &str) -> bool {
+    CUBE_PR_ENSURE_RE.is_match(command)
 }
 
 #[cfg(test)]
@@ -169,5 +200,40 @@ mod tests {
     fn rejects_token_ending_in_gh() {
         // `highgh pr` must not match — `gh` has to begin a token.
         assert_eq!(classify("highgh pr create"), None);
+    }
+
+    // --- is_cube_pr_ensure ---
+
+    #[test]
+    fn detects_cube_pr_ensure() {
+        assert!(is_cube_pr_ensure("cube pr ensure --branch feat/foo --title 'My PR'"));
+    }
+
+    #[test]
+    fn detects_cube_pr_ensure_after_shell_delimiter() {
+        assert!(is_cube_pr_ensure("jj describe -m 'msg' && cube pr ensure --branch b"));
+    }
+
+    #[test]
+    fn detects_cube_pr_ensure_with_env_prefix() {
+        assert!(is_cube_pr_ensure("GIT_DIR=.git cube pr ensure --branch b"));
+    }
+
+    #[test]
+    fn rejects_cube_pr_list() {
+        // `cube pr list` is not ensure.
+        assert!(!is_cube_pr_ensure("cube pr list"));
+    }
+
+    #[test]
+    fn rejects_non_cube_command() {
+        assert!(!is_cube_pr_ensure("gh pr create --title x"));
+        assert!(!is_cube_pr_ensure("cube workspace lease mono"));
+    }
+
+    #[test]
+    fn rejects_token_ending_in_cube() {
+        // `notcube pr ensure` must not match.
+        assert!(!is_cube_pr_ensure("notcube pr ensure --branch b"));
     }
 }

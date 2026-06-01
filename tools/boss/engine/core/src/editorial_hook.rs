@@ -242,7 +242,8 @@ fn is_enforced_subcommand(sub: &str) -> bool {
     matches!(sub, "create" | "edit" | "comment" | "review")
 }
 
-/// Evaluate one `gh pr|issue` Bash command against the editorial rules.
+/// Evaluate one `gh pr|issue` or `cube pr ensure` Bash command against
+/// the editorial rules.
 ///
 /// - `command` — the worker's Bash command string (`tool_input.command`).
 /// - `cwd` — the worker's working directory, used to resolve a relative
@@ -251,11 +252,20 @@ fn is_enforced_subcommand(sub: &str) -> bool {
 ///   always apply on top).
 /// - `template_body` — the repo's `PULL_REQUEST_TEMPLATE.md` text, or
 ///   `None`. Used only for `template_policy == Enforce` on `pr
-///   create`/`edit`.
+///   create`/`edit` (and always for `cube pr ensure`).
 /// - `execution_id` / `deny_tracker` — the loop-guard state (R3).
 ///
 /// See the module docs for the full step list. Fails open on anything it
 /// cannot inspect.
+///
+/// ## `cube pr ensure` coverage
+///
+/// Workers are instructed to create PRs via `cube pr ensure` rather than
+/// calling `gh pr create` directly. `cube pr ensure` shells out to `gh pr
+/// create` internally, making that call invisible to the PreToolUse hook.
+/// This function intercepts the outer `cube pr ensure` command directly
+/// and applies the same checks as for `gh pr create` (including template
+/// enforcement).
 pub fn evaluate_gh_pretooluse(
     command: &str,
     cwd: &Path,
@@ -264,13 +274,20 @@ pub fn evaluate_gh_pretooluse(
     execution_id: &str,
     deny_tracker: &DenyTracker,
 ) -> EditorialOutcome {
-    // Step 0: only the enforced gh pr|issue subcommands reach the rules.
-    let Some(inv) = gh_invocation::classify(command) else {
-        return EditorialOutcome::allow();
+    // Step 0: classify the command. `cube pr ensure` is treated as
+    // equivalent to `gh pr create` — same template gating, same arg
+    // parsing (both accept --body / --body-file / --title).
+    let apply_template = if gh_invocation::is_cube_pr_ensure(command) {
+        true
+    } else {
+        let Some(inv) = gh_invocation::classify(command) else {
+            return EditorialOutcome::allow();
+        };
+        if !is_enforced_subcommand(&inv.subcommand) {
+            return EditorialOutcome::allow();
+        }
+        inv.noun == GhNoun::Pr && matches!(inv.subcommand.as_str(), "create" | "edit")
     };
-    if !is_enforced_subcommand(&inv.subcommand) {
-        return EditorialOutcome::allow();
-    }
 
     // Step 1: parse the editorial-relevant args.
     let args = parse_gh_args(command);
@@ -294,14 +311,9 @@ pub fn evaluate_gh_pretooluse(
         return EditorialOutcome::allow();
     }
 
-    // Step 3 gating: the template check only applies to PR create/edit.
-    let template_for_call = if inv.noun == GhNoun::Pr
-        && matches!(inv.subcommand.as_str(), "create" | "edit")
-    {
-        template_body
-    } else {
-        None
-    };
+    // Step 3 gating: the template check only applies to PR create/edit
+    // (and to cube pr ensure, which always creates a PR).
+    let template_for_call = if apply_template { template_body } else { None };
 
     // Step 2 + 3: run the evaluator.
     let decision = boss_editorial::evaluate(&body_text, title_text, rules, template_for_call);
