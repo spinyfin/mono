@@ -1114,12 +1114,13 @@ fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 ///   3. For each surviving leaf, run [`normalize_leaf`] to fold the
 ///      two leaf shapes (`CheckRun` and `StatusContext`) into a single
 ///      verdict bucket.
-///   4. If any required leaf is still InFlight → `InFlight` — a
-///      non-terminal rollup is never `Failing`, even when an earlier leaf
-///      already failed (the terminal-failure gate; see below). Else if
-///      any failures were collected → `Failing`. Else if the rollup was
-///      empty, consult `combined_state` from the legacy commit-status
-///      REST API:
+///   4. If any required leaf has terminally failed → `Failing` immediately,
+///      even while other required checks are still running. `Fail` dominates
+///      `InFlight` for terminal failures — hiding a real failure until the
+///      slowest check finishes defeats fast detection. Else if any required
+///      leaf is still InFlight (and no terminal failure) → `InFlight`. Else
+///      if the rollup was empty, consult `combined_state` from the legacy
+///      commit-status REST API:
 ///        - `"pending"` / `"failure"` / `"error"` → `InFlight`
 ///          (required contexts configured but not yet submitted).
 ///        - `"success"` or absent → `Clean` (no required checks).
@@ -1127,17 +1128,15 @@ fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 /// `combined_state` is only consulted when `leaves` is empty; for a
 /// non-empty rollup the leaf data is authoritative.
 ///
-/// Terminal-failure gate (recurring regression — this bug has been
-/// point-patched downstream repeatedly): `InFlight` dominates `Fail`, so
-/// a failing leaf alongside still-running checks reads as `InFlight`, not
-/// `Failing`. Both the CI-remediation spawn (`on_ci_failure_detected`)
-/// and the red "ci failing" card badge (`ci_state_str`) are gated on
-/// `Failing`; firing either before CI terminalizes is wrong, because the
-/// failing check may re-run green or other in-flight checks may add
-/// failures the fix worker should see together. Prior fixes all tried to
-/// clean up *after* a premature `Failing` (clear-on-success, supersede-on-
-/// inflight, UI mutual-exclusion); gating the classification here removes
-/// the premature `Failing` at its source.
+/// Fast-fail design: a terminal failure (e.g. `checkleft` in 4 s) surfaces
+/// `Failing` and spawns remediation immediately, even while a slow check
+/// (e.g. `bazel-test` still running) is in flight. Anti-phantom protection
+/// lives in the reconcile/withdraw path (`on_ci_in_flight_supersedes_failure`,
+/// commit 3): a remediation spawned on a terminal failure that a later CI run
+/// then clears is auto-withdrawn and the badge is reset to the authoritative
+/// state. Do NOT re-add a "wait for all checks terminal" gate here — that was
+/// the regression (T1150 commit 1). Phantom prevention belongs in withdraw,
+/// not in detection delay.
 fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> OpenPrCiStatus {
     use std::collections::BTreeMap;
 
@@ -1194,22 +1193,17 @@ fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> Op
         }
     }
 
-    // Terminal-failure gate (recurring-regression root cause; see the doc
-    // comment above). A rollup is only `Failing` once it is *terminal* —
-    // every required check has reached a terminal conclusion. While any
-    // required check is still in flight (queued, running, or re-running
-    // after an earlier leaf failed), the rollup is `InFlight` and `Failing`
-    // must NOT win, even though a failing leaf is already present.
-    // `InFlight` therefore dominates `Fail`. Collapsing a non-terminal
-    // rollup to `Failing` is what spawned moot "Fix failing CI" revisions
-    // and lit the red "ci failing" badge against CI that had not finished;
-    // the full failure set is re-collected on the sweep where the rollup
-    // terminalizes, so nothing is lost by waiting.
-    if any_in_flight {
-        return OpenPrCiStatus::InFlight;
-    }
+    // Fast-fail: a terminal required-check failure surfaces `Failing`
+    // immediately, even while other required checks are still running.
+    // `Fail` dominates `InFlight` for terminal failures (restoring the
+    // pre-T1150-commit-1 behaviour). Anti-phantom protection lives in the
+    // reconcile/withdraw path, not here — see `on_ci_in_flight_supersedes_failure`.
     if !failures.is_empty() {
         return OpenPrCiStatus::Failing { failures };
+    }
+    // Only InFlight when no terminal failure has occurred yet.
+    if any_in_flight {
+        return OpenPrCiStatus::InFlight;
     }
     // No check-run data in the rollup. Consult the legacy commit-status
     // combined state when available: "pending" means required status
@@ -3874,28 +3868,25 @@ mod tests {
         );
     }
 
-    /// Regression for the recurring "CI shown as failing while in-progress,
-    /// and remediation revisions spawned against non-terminal CI" bug. This
-    /// drives the state machine through the full lifecycle and pins the
-    /// three invariants the prior point-patches kept missing:
+    /// Drives the CI state machine through the full lifecycle and pins three
+    /// invariants:
     ///
-    ///   1. PENDING != FAILING. A non-terminal (`InFlight`) rollup must NOT
-    ///      read as failing: no remediation revision spawned, no
+    ///   1. PENDING != FAILING. A pure `InFlight` rollup (no failing leaf at
+    ///      all) must NOT read as failing: no remediation revision spawned, no
     ///      `ci_failure` signal armed, `ci_attempts_used` stays 0, and the
     ///      persisted `ci_required_state` is `"in_progress"` — never `"fail"`.
-    ///   2. A *terminal* failed rollup is what gates the spawn: the next
-    ///      sweep, once CI terminalizes to `Failing`, spawns exactly one
-    ///      remediation and the attempt counter agrees with the spawned
-    ///      revision (`ci_attempts_used == 1`, an active attempt exists).
+    ///      (Note: a rollup with a *terminal* failing leaf + a still-running
+    ///      check now correctly classifies as `Failing` immediately — see the
+    ///      T1150 fast-fail fix and `fast-check terminal fail + slow check
+    ///      running` matrix case. This test uses a pure in-flight probe with
+    ///      no failing leaves at all.)
+    ///   2. A `Failing` probe spawns exactly one remediation and the attempt
+    ///      counter agrees (`ci_attempts_used == 1`, active attempt exists).
     ///      This is the accounting invariant the bug report saw violated
     ///      (counter 0 while a revision existed).
     ///   3. SUCCESS AFTER FAILING RECONCILES. A clean probe retires the
     ///      attempt, snaps the counter back to 0, and writes
     ///      `ci_required_state = "success"`.
-    ///
-    /// The classification fix lives in `classify_ci` (InFlight dominates
-    /// Fail); this test exercises the sweep dispatch end-to-end so a
-    /// regression in either layer trips it.
     #[tokio::test]
     async fn inflight_ci_does_not_spawn_until_failure_is_terminal_then_reconciles() {
         let dir = tempdir().unwrap();
@@ -3905,9 +3896,8 @@ mod tests {
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
 
-        // --- Pass 1: CI is still running (InFlight). This is the state a
-        // rollup with a failing leaf + a still-running leaf collapses to
-        // after the terminal-failure gate. Nothing must be spawned. ---
+        // --- Pass 1: CI is still running (InFlight) with NO failing leaf yet.
+        // A pure all-in-progress rollup must not spawn a remediation. ---
         probe
             .states
             .lock()
@@ -4493,16 +4483,14 @@ mod tests {
                 combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
-            // Terminal-failure gate (recurring-regression root cause): a
-            // failing leaf alongside a still-running leaf is NON-terminal,
-            // so the rollup is `InFlight`, NOT `Failing`. This is the exact
-            // shape that previously collapsed to `Failing` and spawned a
-            // moot "Fix failing CI" revision / lit the red badge while CI
-            // was still running. `InFlight` dominates `Fail`; the failure
-            // set is re-collected once the rollup terminalizes. If a future
-            // change reintroduces "Fail dominates InFlight", this case fails.
+            // Fast-fail: a terminally-failed required check surfaces `Failing`
+            // immediately, even while another required check is still running.
+            // This is the T1150 regression fix: commit 1 had these two cases
+            // returning `InFlight`, which hid real failures until the slowest
+            // check finished. If a future change reintroduces the "wait for
+            // all terminal" gate, these cases will fail and catch the regression.
             Case {
-                label: "mixed: failure + in-flight → InFlight (non-terminal; wait, do not spawn)",
+                label: "mixed: terminal failure + in-flight → Failing immediately (fast-fail)",
                 rollup: serde_json::json!([
                     failing_check("ci/test", "FAILURE", ""),
                     {
@@ -4513,10 +4501,18 @@ mod tests {
                     },
                 ]),
                 combined_state: None,
-                expect_ci: OpenPrCiStatus::InFlight,
+                expect_ci: OpenPrCiStatus::Failing {
+                    failures: vec![RequiredCheckFailure {
+                        name: "ci/test".into(),
+                        conclusion: "FAILURE".into(),
+                        target_url: "".into(),
+                        provider: CiProvider::Other,
+                        provider_job_id: None,
+                    }],
+                },
             },
             Case {
-                label: "mixed: failure + queued → InFlight (non-terminal; the queued check may also fail)",
+                label: "mixed: terminal failure + queued → Failing immediately (fast-fail)",
                 rollup: serde_json::json!([
                     failing_check("ci/test", "FAILURE", ""),
                     {
@@ -4527,7 +4523,40 @@ mod tests {
                     },
                 ]),
                 combined_state: None,
-                expect_ci: OpenPrCiStatus::InFlight,
+                expect_ci: OpenPrCiStatus::Failing {
+                    failures: vec![RequiredCheckFailure {
+                        name: "ci/test".into(),
+                        conclusion: "FAILURE".into(),
+                        target_url: "".into(),
+                        provider: CiProvider::Other,
+                        provider_job_id: None,
+                    }],
+                },
+            },
+            // Regression test for the exact T1150 scenario: a fast check
+            // (e.g. checkleft in 4s) fails terminally while a slow check
+            // (e.g. bazel-test) is still running. Must surface Failing at once.
+            Case {
+                label: "fast-check terminal fail + slow check running → Failing (T1150 regression)",
+                rollup: serde_json::json!([
+                    failing_check("buildkite/mono/checks", "FAILURE", "https://buildkite.com/acme/mono/builds/99"),
+                    {
+                        "name": "buildkite/mono/bazel-test",
+                        "status": "IN_PROGRESS",
+                        "conclusion": serde_json::Value::Null,
+                        "isRequired": true,
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Failing {
+                    failures: vec![RequiredCheckFailure {
+                        name: "buildkite/mono/checks".into(),
+                        conclusion: "FAILURE".into(),
+                        target_url: "https://buildkite.com/acme/mono/builds/99".into(),
+                        provider: CiProvider::Buildkite,
+                        provider_job_id: None,
+                    }],
+                },
             },
             Case {
                 label: "all terminal, one failure → Failing (terminal gate satisfied)",
