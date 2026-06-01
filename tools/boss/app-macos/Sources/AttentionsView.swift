@@ -291,11 +291,15 @@ private struct AttentionMemberRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+            HStack(alignment: .center, spacing: 6) {
                 stateGlyph
                 Text(title)
                     .font(.subheadline.weight(.medium))
                     .fixedSize(horizontal: false, vertical: true)
+                if group.kind == "followup" {
+                    Spacer(minLength: 4)
+                    decideToggle
+                }
             }
             control
             // yes_no / multiple_choice need a discrete skip; prompt has its
@@ -433,13 +437,12 @@ private struct AttentionMemberRow: View {
                 }
             }
             Picker("", selection: followupBinding) {
-                Text("Decide").tag("")
                 Text("Accept").tag("accept")
                 Text("Reject").tag("reject")
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(maxWidth: 220, alignment: .leading)
+            .frame(maxWidth: 160, alignment: .leading)
         }
     }
 
@@ -460,6 +463,20 @@ private struct AttentionMemberRow: View {
                 }
             }
         )
+    }
+
+    private var decideToggle: some View {
+        Toggle("Decide", isOn: Binding(
+            get: {
+                member.answerState != "answered" &&
+                member.answerState != "skipped" &&
+                member.answerState != "dismissed"
+            },
+            set: { _ in }
+        ))
+        .toggleStyle(.switch)
+        .controlSize(.mini)
+        .font(.caption)
     }
 
     private var skipRow: some View {
