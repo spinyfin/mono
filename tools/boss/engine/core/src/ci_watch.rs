@@ -1093,13 +1093,18 @@ pub async fn on_ci_in_flight(
 /// pair the issue reported.
 ///
 /// Guards:
-///   * An *active* `ci_remediations` attempt owns the slot: its own fix
-///     push is what re-triggered CI, and its in-flight chip legitimately
-///     reads "ci failing (used/budget)" — i.e. "auto-fix running". We
-///     leave that case to the attempt's terminal transition
-///     (`on_ci_resolved` → `CiRemediationSucceeded`, or a fresh
-///     `Failing` probe), so an in-flight remediation is never cleared
-///     here.
+///   * An *active* `ci_remediations` attempt for the **current** head SHA
+///     owns the slot: its own fix push is what re-triggered CI, and its
+///     in-flight chip legitimately reads "ci failing (used/budget)" —
+///     i.e. "auto-fix running". We leave that case to the attempt's
+///     terminal transition (`on_ci_resolved` → `CiRemediationSucceeded`,
+///     or a fresh `Failing` probe), so an in-flight remediation is never
+///     cleared here.
+///   * If the active remediation is for an **old** head SHA (the user
+///     pushed a new commit while the prior fix was still pending),
+///     that remediation is stale — the new CI run is independent of it.
+///     Abandon the stale row and proceed with the supersede so the badge
+///     reflects the current run, not the prior one.
 ///   * The same `auto_pr_maintenance` opt-out as the detect / retire
 ///     paths is respected.
 ///   * Unlike `on_ci_resolved`, we do NOT reset the CI budget counter:
@@ -1107,34 +1112,83 @@ pub async fn on_ci_in_flight(
 ///     consuming the remaining budget. Only a confirmed Clean transition
 ///     earns a fresh budget.
 ///
+/// `current_head_sha` is the probe's `head_ref_oid` for the current
+/// polling cycle. Pass `None` when the head SHA is unavailable — the
+/// function then applies the conservative guard (active remediation ⇒
+/// do not supersede) rather than comparing SHAs.
+///
 /// Returns `true` when the chore actually transitioned back to
 /// `in_review` on this call; `false` (cheap no-op) when there was no
-/// stale failure to supersede, a remediation is active, or the opt-out
-/// is set.
+/// stale failure to supersede, a current-head remediation is active,
+/// or the opt-out is set.
 pub async fn on_ci_in_flight_supersedes_failure(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     labels: &[String],
+    current_head_sha: Option<&str>,
 ) -> bool {
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
     }
 
-    // An active remediation attempt's own re-run must not clear its
-    // in-flight tracking — only a genuinely stale failure (no attempt in
-    // flight) is superseded here.
+    // An active remediation attempt owns the slot — unless it is for an
+    // old head SHA, in which case a new commit was pushed and the prior
+    // attempt is stale. We compare `head_sha_at_trigger` (the SHA that
+    // originally triggered detection) with the probe's current head SHA.
+    //
+    // Three cases:
+    //   a) No active attempt → proceed with the supersede.
+    //   b) Active attempt for the SAME head SHA → the CI-fix worker's own
+    //      push re-triggered CI; the badge is legitimately "auto-fix
+    //      running" — leave it to the attempt's terminal transition.
+    //   c) Active attempt for a DIFFERENT (old) head SHA → a new commit
+    //      landed after the attempt was created; CI is re-running at the
+    //      new head independently of that attempt. Abandon the stale row
+    //      and proceed with the supersede so the badge does not persist
+    //      from a CI run that is no longer current.
     match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
-        Ok(Some(_)) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "ci_watch: InFlight with active remediation; leaving the in-flight badge \
-                 to the attempt's terminal transition",
-            );
-            return false;
+        Ok(Some(active)) => {
+            let stale = match current_head_sha {
+                Some(current) => active.head_sha_at_trigger != current,
+                None => false, // can't compare — apply conservative guard
+            };
+            if stale {
+                // Case (c): abandon the old-head-SHA row so it no longer
+                // drives the "ci failing" badge on app restart, then fall
+                // through to the supersede path.
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = %active.id,
+                    stale_sha = %active.head_sha_at_trigger,
+                    current_sha = ?current_head_sha,
+                    "ci_watch: active remediation is for an old head SHA; \
+                     abandoning stale row and superseding with current InFlight run",
+                );
+                if let Err(err) =
+                    work_db.mark_ci_remediation_abandoned(&active.id, "new_head_sha_inflight")
+                {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %active.id,
+                        ?err,
+                        "ci_watch: failed to abandon stale remediation on head-SHA change",
+                    );
+                }
+                // Fall through — treat as no active attempt.
+            } else {
+                // Case (b): same head SHA → the fix is running; leave it.
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "ci_watch: InFlight with active remediation for current head; \
+                     leaving the in-flight badge to the attempt's terminal transition",
+                );
+                return false;
+            }
         }
-        Ok(None) => {}
+        Ok(None) => {} // Case (a): proceed.
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,

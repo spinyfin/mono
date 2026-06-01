@@ -1994,6 +1994,7 @@ async fn sweep_one(
                             publisher,
                             candidate,
                             &probe_result.labels,
+                            probe_result.head_ref_oid.as_deref(),
                         )
                         .await
                         {

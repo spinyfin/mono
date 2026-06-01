@@ -598,11 +598,14 @@ async fn in_flight_supersedes_stale_ci_failure() {
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
 
     // 2. CI re-runs (InFlight) — the stale failure is superseded.
+    // The attempt was marked failed, so active_ci_remediation returns None;
+    // any head SHA passes.
     let cleared = on_ci_in_flight_supersedes_failure(
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         &[],
+        Some("head-1"),
     )
     .await;
     assert!(cleared, "stale ci_failure must be superseded by InFlight");
@@ -659,14 +662,16 @@ async fn in_flight_supersede_skips_when_active_remediation() {
         "attempt must be active before the supersede check",
     );
 
+    // Same head SHA as the active remediation → the fix worker's own re-run; must not supersede.
     let cleared = on_ci_in_flight_supersedes_failure(
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         &[],
+        Some("head-1"),
     )
     .await;
-    assert!(!cleared, "active remediation must not be superseded");
+    assert!(!cleared, "active remediation for same head must not be superseded");
 
     // In the in_review model the parent stays in_review while the revision runs.
     let (status, reason) = chore_state(&db, &chore);
@@ -689,6 +694,7 @@ async fn in_flight_supersede_noop_when_in_review() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         &[],
+        None,
     )
     .await;
     assert!(!cleared, "an in_review chore has no stale failure to clear");
@@ -715,6 +721,7 @@ async fn in_flight_supersede_skipped_when_pr_has_opt_out_label() {
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         &["boss/no-auto-rebase".to_owned()],
+        Some("head-1"),
     )
     .await;
     assert!(!cleared, "opt-out label must suppress the supersede");
@@ -926,6 +933,133 @@ fn rewind_inflight_observation(
         rusqlite::params![work_item_id, head_sha, when_unix_secs.to_string()],
     )
     .unwrap();
+}
+
+/// Regression for the operator-reported "stale badge from prior run" scenario:
+/// a push to the PR changes the head SHA while the prior run's `ci_remediations`
+/// row is still `pending`. The new CI run is all-in-flight (no failing leaf).
+///
+/// Before the fix, `on_ci_in_flight_supersedes_failure` bailed when it found the
+/// pending row (even though it was for the old head SHA), leaving the macOS badge
+/// stuck at "ci failing". After the fix the stale row is abandoned and
+/// `CiFailureCleared` is emitted so the badge correctly reflects the new run.
+///
+/// This is the scenario the operator described: "they were all in progress, but it
+/// was showing a stale badge. I don't think the original shake was actually based
+/// on things that had one test failing."
+#[tokio::test]
+async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1160";
+    let (product, chore) = make_in_review(&db, "C-stale-badge", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    // --- Step 1: Prior commit (head-A) terminally fails CI and a remediation is created. ---
+    on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-A"),
+        &one_failure(),
+    )
+    .await;
+
+    let prior_attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("a pending remediation row must exist after detection");
+    assert_eq!(
+        prior_attempt.head_sha_at_trigger, "head-A",
+        "remediation row must record the head SHA at trigger",
+    );
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+
+    // --- Step 2: User pushes a new commit (head-B). GitHub restarts CI
+    // from scratch — all checks are now queued / running (InFlight).
+    // NO failing leaf in this new rollup: this is the all-in-progress case.
+    // The prior remediation row is still `pending` (the fix worker hasn't
+    // done anything yet — the push made its revision moot). ---
+    pub_.events.lock().await.clear();
+    pub_.typed_events.lock().await.clear();
+
+    let superseded = on_ci_in_flight_supersedes_failure(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &[],
+        Some("head-B"), // new head SHA — DIFFERENT from the pending row's head_sha_at_trigger
+    )
+    .await;
+
+    assert!(
+        superseded,
+        "InFlight at a new head SHA must supersede the stale remediation and clear the badge",
+    );
+
+    // The stale row must be abandoned — not terminal-failed, not pending.
+    let still_active = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap();
+    assert!(
+        still_active.is_none(),
+        "the stale remediation row must be abandoned, not left pending",
+    );
+
+    // `CiFailureCleared` must be emitted so the macOS badge clears.
+    let typed = pub_.typed_events.lock().await.clone();
+    assert!(
+        typed.iter().any(|(_, ev)| matches!(
+            ev,
+            FrontendEvent::CiFailureCleared { pr_url, .. } if pr_url == pr
+        )),
+        "CiFailureCleared must be emitted when stale remediation is superseded by a new head",
+    );
+
+    // Budget counter is NOT reset — the new run hasn't passed yet.
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        1,
+        "budget counter must not reset until CI actually passes",
+    );
+
+    // --- Step 3: same-head-SHA guard still holds — a fix worker's own CI re-run
+    // at the SAME head SHA must NOT be superseded (or the badge would vanish while
+    // the fix is running). Create a fresh remediation for head-C and then probe
+    // InFlight at head-C — should NOT supersede. ---
+    pub_.events.lock().await.clear();
+    pub_.typed_events.lock().await.clear();
+
+    on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-C"),
+        &one_failure(),
+    )
+    .await;
+
+    let not_superseded = on_ci_in_flight_supersedes_failure(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &[],
+        Some("head-C"), // SAME head SHA as the active remediation
+    )
+    .await;
+
+    assert!(
+        !not_superseded,
+        "active remediation for the same head SHA must NOT be superseded (fix worker's own run)",
+    );
+
+    let typed_after = pub_.typed_events.lock().await.clone();
+    assert!(
+        !typed_after.iter().any(|(_, ev)| matches!(ev, FrontendEvent::CiFailureCleared { .. })),
+        "CiFailureCleared must NOT be emitted when the active remediation is for the same head",
+    );
 }
 
 #[test]
