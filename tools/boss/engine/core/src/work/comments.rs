@@ -465,7 +465,6 @@ impl WorkDb {
         &self,
         dispatch_id: &str,
         current_doc_version: &str,
-        actor: &str,
     ) -> Result<(MagicWandDispatch, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -475,6 +474,9 @@ impl WorkDb {
             .query_row(&sql, [dispatch_id], map_magic_wand_dispatch)
             .optional()?
             .with_context(|| format!("unknown magic_wand dispatch: {dispatch_id}"))?;
+        // Audit author: attribute the description edit to the dispatch
+        // identity. Design § "Magic-wand instance identity".
+        let actor = format!("magic_wand:{}", dispatch.comment_id);
 
         if dispatch.status != MAGIC_WAND_STATUS_RETURNED {
             bail!(
@@ -968,7 +970,7 @@ mod tests {
         .unwrap();
         // Pass a different current_doc_version to trigger a conflict.
         let (updated, conflict) = db
-            .apply_magic_wand_dispatch(&dispatch.id, "v_different", "user:me")
+            .apply_magic_wand_dispatch(&dispatch.id, "v_different")
             .unwrap();
         assert!(conflict);
         assert_eq!(updated.status, "conflict");
@@ -1014,12 +1016,17 @@ mod tests {
 
         // Match: doc_version of dispatch == current_doc_version passed in.
         let (updated, conflict) = db
-            .apply_magic_wand_dispatch(&dispatch.id, "v_current", "user:me")
+            .apply_magic_wand_dispatch(&dispatch.id, "v_current")
             .unwrap();
         assert!(!conflict, "should not conflict when doc_version matches");
         assert_eq!(updated.status, "applied");
-        // Comment is resolved.
-        let comment = db.get_comment(&comment.id).unwrap().unwrap();
-        assert_eq!(comment.status, "resolved");
+        // Comment is resolved with magic_wand:<comment_id> as the actor.
+        let resolved = db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert_eq!(
+            resolved.status_actor.as_deref(),
+            Some(&format!("magic_wand:{}", comment.id) as &str),
+            "status_actor should be magic_wand:<comment_id>"
+        );
     }
 }
