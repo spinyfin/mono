@@ -419,6 +419,69 @@ fn count_open_tasks_counts_only_open_statuses() {
     assert_eq!(db.count_open_tasks_for_automation(&auto.id).unwrap(), 0);
 }
 
+/// Regression: the kanban label "doing" maps to the DB value `active`.
+/// Tasks with status `active` (executing) must be counted as open so the
+/// display and the cap gate both reflect work that is in flight.
+#[test]
+fn count_open_tasks_counts_active_as_open() {
+    let db = WorkDb::open(temp_db_path("auto-count-active")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Active count test".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "test".to_owned(),
+            open_task_limit: 5,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let task = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "active chore from automation".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        rusqlite::params![auto.id, task.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Move to 'active' (the DB value for the kanban "doing" state).
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    // Must count as open — not 0 — so an in-flight task blocks the cap.
+    assert_eq!(
+        db.count_open_tasks_for_automation(&auto.id).unwrap(),
+        1,
+        "task with status='active' (doing) must be counted as open"
+    );
+}
+
 #[test]
 fn short_ids_are_allocated_per_product() {
     let db = WorkDb::open(temp_db_path("auto-short-ids")).unwrap();

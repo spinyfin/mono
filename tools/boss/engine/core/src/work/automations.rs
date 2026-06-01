@@ -242,14 +242,17 @@ impl WorkDb {
     }
 
     /// Count how many tasks produced by `automation_id` are currently open.
-    /// "Open" = `status IN (todo, ready, doing, in_review, blocked)`.
+    /// "Open" = any non-terminal status: `todo`, `ready`, `active` (doing),
+    /// `in_review`, `blocked`. Terminal statuses (`done`, `cancelled`,
+    /// `archived`) are excluded. Note: the kanban label "doing" maps to the
+    /// DB value `active`; the query uses the stored value.
     /// Used by the scheduler to enforce `open_task_limit` at fire time.
     pub fn count_open_tasks_for_automation(&self, automation_id: &str) -> Result<i64> {
         let conn = self.connect()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM tasks
               WHERE source_automation_id = ?1
-                AND status IN ('todo', 'ready', 'doing', 'in_review', 'blocked')
+                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
                 AND deleted_at IS NULL",
             [automation_id],
             |row| row.get(0),
@@ -724,7 +727,7 @@ impl WorkDb {
         let open: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks
               WHERE source_automation_id = ?1
-                AND status IN ('todo', 'ready', 'doing', 'in_review', 'blocked')
+                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
                 AND deleted_at IS NULL",
             [automation_id],
             |row| row.get(0),
