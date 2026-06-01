@@ -40,7 +40,7 @@ pub struct CheckConfig {
     pub check: String,
     pub id: String,
     pub source_path: PathBuf,
-    /// Directory containing the CHECKS.toml that declared this check, relative to repo root.
+    /// Directory containing the CHECKS file that declared this check, relative to repo root.
     /// Empty path means the repo root itself.
     pub config_dir: PathBuf,
     pub origin: CheckConfigOrigin,

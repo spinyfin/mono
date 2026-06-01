@@ -255,12 +255,12 @@ impl Runner {
 
     /// Diff-gated stale-exclusion audit (see [`crate::exclusion`]).
     ///
-    /// Unlike the normal pass, this reports on `CHECKS.toml` files that did *not*
+    /// Unlike the normal pass, this reports on `CHECKS` files that did *not*
     /// change: an exclusion goes stale because a file it depends on changed. For every
     /// changed file we resolve the checks that govern it, ask each built-in check for
     /// its declared exclusions, and re-evaluate only those whose declared dependencies
     /// intersect the changeset. A `Stale` verdict becomes a finding anchored on the
-    /// exclusion's line in the owning `CHECKS.toml`.
+    /// exclusion's line in the owning `CHECKS` file.
     async fn audit_stale_exclusions(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
         // Every path the diff touches, including deletions and rename sources: a stale
         // exclusion is triggered by a change to a file it depends on, and a deletion is
@@ -279,7 +279,7 @@ impl Runner {
         // De-duplicate (check instance, owning config, entry): the same exclusion is
         // reachable through every changed file it depends on, but must be audited once.
         let mut audited: HashSet<(String, PathBuf, String)> = HashSet::new();
-        // Cache CHECKS.toml contents read to locate entry lines.
+        // Cache CHECKS file contents read to locate entry lines.
         let mut config_text_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut findings_by_check: BTreeMap<String, Vec<Finding>> = BTreeMap::new();
 
@@ -388,7 +388,7 @@ impl Runner {
             .collect())
     }
 
-    /// Find the 1-based line of `entry` in the `CHECKS.toml` at `source_path`, reading
+    /// Find the 1-based line of `entry` in the `CHECKS` file at `source_path`, reading
     /// (and caching) the file through the source tree. Returns `None` if the file can't
     /// be read or the entry text isn't found — the finding then points at the file
     /// without a line.
@@ -691,7 +691,7 @@ fn format_config_diagnostic(diagnostic: &ConfigDiagnostic) -> String {
 }
 
 /// Return the 1-based line number of the first line containing `entry`, or `None`.
-/// Used to anchor a stale-exclusion finding on the exact `CHECKS.toml` line that holds
+/// Used to anchor a stale-exclusion finding on the exact `CHECKS` file line that holds
 /// the dead entry (e.g. `"engine/src/app.rs::ServerState"`).
 fn locate_entry_line(contents: &str, entry: &str) -> Option<u32> {
     contents

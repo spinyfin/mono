@@ -51,7 +51,7 @@ struct ParsedConfig {
     exclude_structs: HashSet<String>,
     /// Qualified exclusions: repo-root-relative file path → set of exempt struct names.
     exclude_structs_qualified: HashMap<PathBuf, HashSet<String>>,
-    /// Directory of the CHECKS.toml that owns this config (repo-root-relative).
+    /// Directory of the `CHECKS` file that owns this config (repo-root-relative).
     config_dir: Option<PathBuf>,
     /// Exclusion entries eligible for stale-exclusion auditing.
     auditable_exclusions: Vec<AuditableExclusion>,
@@ -168,7 +168,7 @@ impl ConfiguredCheck for ParsedConfig {
                     "Add `#[derive(bon::Builder)]` (and `#[builder(on(String, into))]` per \
                      the project convention) if the struct does not already have a builder."
                         .to_owned(),
-                    "Permanently exempt a struct by adding it to `exclude_structs` in `CHECKS.toml`."
+                    "Permanently exempt a struct by adding it to `exclude_structs` in the `CHECKS` file."
                         .to_owned(),
                 ];
 

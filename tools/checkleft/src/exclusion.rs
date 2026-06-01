@@ -1,14 +1,14 @@
 //! Stale-exclusion auditing.
 //!
-//! Exclusions in `CHECKS.toml` are write-once, forget-forever: they are added to
+//! Exclusions in a `CHECKS` file are write-once, forget-forever: they are added to
 //! unblock a change and rarely revisited, so the config slowly accretes dead entries
 //! that quietly weaken coverage. The stale-exclusion audit keeps the list honest by
 //! re-evaluating an exclusion whenever a file it depends on changes in the diff: once
 //! the reason the exclusion existed goes away, checkleft surfaces a finding *on the
-//! `CHECKS.toml` entry itself* telling you the exclusion can be removed.
+//! `CHECKS` file entry itself* telling you the exclusion can be removed.
 //!
 //! The audit inverts checkleft's usual model. A normal finding lands on the changed
-//! ("left") side of a diff; a stale-exclusion finding lands on a `CHECKS.toml` that
+//! ("left") side of a diff; a stale-exclusion finding lands on a `CHECKS` file that
 //! did *not* change — it went stale because some *other* file it referenced changed.
 //! To compose with the incremental model without re-scanning the world, the audit is
 //! **diff-gated**: a check declares, per exclusion, the inputs that exclusion depends
@@ -36,7 +36,7 @@ use std::path::PathBuf;
 /// [`depends_on`]: DeclaredExclusion::depends_on
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredExclusion {
-    /// The exclusion entry exactly as written in `CHECKS.toml`. Used both to locate the
+    /// The exclusion entry exactly as written in the `CHECKS` file. Used both to locate the
     /// offending line in the config file (for the finding location) and verbatim in the
     /// finding message, so the author can find and delete it.
     pub entry: String,

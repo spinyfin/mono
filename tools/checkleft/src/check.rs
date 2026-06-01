@@ -46,7 +46,7 @@ pub trait Check: Send + Sync {
 
     fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>>;
 
-    /// Like `configure`, but also passes the CHECKS.toml directory (repo-root-relative).
+    /// Like `configure`, but also passes the CHECKS file directory (repo-root-relative).
     /// Checks that need to scope exclusions to the config subtree should override this.
     /// The default delegates to `configure`, ignoring the scope.
     fn configure_scoped(

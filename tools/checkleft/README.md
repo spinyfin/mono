@@ -108,7 +108,7 @@ checks:
 
 ## Stale-exclusion auditing
 
-Exclusions in `CHECKS.toml` (e.g. a check's `exclude_structs` / `exclude_files`
+Exclusions in a `CHECKS` file (e.g. a check's `exclude_structs` / `exclude_files`
 list) are easy to add and easy to forget. Once the reason an exclusion existed
 goes away — the excluded struct gains a builder, a referenced file is deleted —
 the entry becomes dead weight that quietly weakens coverage.
@@ -116,7 +116,7 @@ the entry becomes dead weight that quietly weakens coverage.
 `checkleft` audits for this. When a file an exclusion depends on changes in the
 diff, the owning check re-evaluates that exclusion as if it were not present; if
 the rule now passes without it, `checkleft` reports a finding **on the
-`CHECKS.toml` entry itself** telling you the exclusion can be removed. The audit
+`CHECKS` file entry itself** telling you the exclusion can be removed. The audit
 is diff-gated (it only re-evaluates exclusions whose dependencies changed) and
 fails safe (an exclusion whose dependency can't be pinned to concrete files is
 never flagged).

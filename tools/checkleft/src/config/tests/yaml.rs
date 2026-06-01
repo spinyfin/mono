@@ -288,3 +288,59 @@ async fn fails_when_external_checks_url_returns_404() {
             .contains("returned 404 Not Found after 5 attempts")
     );
 }
+
+#[test]
+fn parses_forbidden_paths_rules_from_yaml() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: no-generated-artifacts
+    check: forbidden-paths
+    config:
+      rules:
+        - remediation: "Remove the artifact."
+          when:
+            - added
+            - modified
+          patterns:
+            - "**/target/**"
+            - "**/node_modules/**"
+"#,
+    )
+    .expect("write config file");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("no-generated-artifacts").expect("check present");
+    assert_eq!(check.check, "forbidden-paths");
+    let rules = check
+        .config
+        .as_table()
+        .expect("config table")
+        .get("rules")
+        .expect("rules key")
+        .as_array()
+        .expect("rules array");
+    assert_eq!(rules.len(), 1);
+    let rule = rules[0].as_table().expect("rule table");
+    assert_eq!(
+        rule.get("remediation")
+            .expect("remediation")
+            .as_str()
+            .expect("remediation str"),
+        "Remove the artifact."
+    );
+    let when = rule
+        .get("when")
+        .expect("when")
+        .as_array()
+        .expect("when array");
+    assert_eq!(when.len(), 2);
+    assert_eq!(when[0].as_str(), Some("added"));
+    assert_eq!(when[1].as_str(), Some("modified"));
+}
