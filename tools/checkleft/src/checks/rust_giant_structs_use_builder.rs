@@ -32,12 +32,12 @@ const CHECK_ID: &str = "rust-giant-structs-use-builder";
 ///   added to the same file is still flagged. Two entry forms:
 ///
 ///   - **Simple name** (e.g. `"WorkRun"`): scoped to the directory subtree of the
-///     CHECKS.toml that owns this config. A simple name in `tools/boss/CHECKS.toml`
+///     `CHECKS` file that owns this config. A simple name in `tools/boss/CHECKS.yaml`
 ///     exempts `WorkRun` only in files under `tools/boss/`. It will NOT suppress the
 ///     same-named struct in an unrelated subtree.
 ///
 ///   - **Qualified** (e.g. `"protocol/src/types.rs::WorkRun"`): the path is resolved
-///     relative to the CHECKS.toml directory. Exempts `WorkRun` only in that exact file.
+///     relative to the `CHECKS` file directory. Exempts `WorkRun` only in that exact file.
 ///     Use this when you need pinpoint precision or want to grandfather a struct whose
 ///     simple name might collide with something elsewhere.
 ///
@@ -71,7 +71,7 @@ struct ParsedConfig {
     exclude_structs: HashSet<String>,
     /// Qualified exclusions: repo-root-relative file path → set of exempt struct names.
     exclude_structs_qualified: HashMap<PathBuf, HashSet<String>>,
-    /// Directory of the CHECKS.toml that owns this config (repo-root-relative).
+    /// Directory of the `CHECKS` file that owns this config (repo-root-relative).
     /// `None` means no scope: simple-name exclusions apply to any file (backward compat).
     config_dir: Option<PathBuf>,
     /// Exclusion entries eligible for stale-exclusion auditing, each pinned to the single
@@ -84,7 +84,7 @@ struct ParsedConfig {
 
 /// One exclusion entry the stale-exclusion audit can re-evaluate.
 struct AuditableExclusion {
-    /// Raw entry text exactly as written in CHECKS.toml (used to locate it and report it).
+    /// Raw entry text exactly as written in the `CHECKS` file (used to locate it and report it).
     entry: String,
     /// The single file (repo-root-relative) this exclusion depends on.
     path: PathBuf,
@@ -203,7 +203,7 @@ impl ConfiguredCheck for ParsedConfig {
                             "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.",
                             self.builder.crate_name(),
                         ),
-                        "Permanently exempt a file by adding it to `exclude_files` in `CHECKS.toml`.".to_owned(),
+                        "Permanently exempt a file by adding it to `exclude_files` in the `CHECKS` file.".to_owned(),
                     ],
                     suggested_fix: None,
                 });
@@ -332,7 +332,7 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
     let raw_exclude_files = raw.exclude_files.clone().unwrap_or_default();
     for entry in raw.exclude_structs.unwrap_or_default() {
         // Qualified form: `relative/path.rs::StructName`
-        // Path is relative to the CHECKS.toml directory (config_dir).
+        // Path is relative to the CHECKS file directory (config_dir).
         if let Some(sep) = entry.rfind("::") {
             let path_part = &entry[..sep];
             let name_part = entry[sep + 2..].to_owned();

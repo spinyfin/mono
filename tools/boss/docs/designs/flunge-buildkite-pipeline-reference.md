@@ -33,7 +33,7 @@ Computes four booleans — `need_backend`, `need_cli`, `need_frontend`, `need_io
 |---|---|
 | `backend/*` | `need_backend` |
 | `cli/*`, `checks/*`, `tools/checks_bazel/*`, `tools/checks_js_componentizer/*`, `tools/flunge-debug/*`, `tools/release-prod`, `tools/release-main` | `need_cli` |
-| `rbe/*`, `BUILD`, `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`, `Cargo.toml`, `Cargo.lock`, `tools/checks`, `CHECKS.toml`, `*/CHECKS.toml`, `.buildkite/*`, `.github/actions/setup-bazel/*` | both `need_backend` and `need_cli` (shared infra) |
+| `rbe/*`, `BUILD`, `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`, `Cargo.toml`, `Cargo.lock`, `tools/checks`, `CHECKS.yaml`, `*/CHECKS.yaml`, `.buildkite/*`, `.github/actions/setup-bazel/*` | both `need_backend` and `need_cli` (shared infra) |
 | `frontend/*`, `.buildkite/*` | `need_frontend` |
 | `mobile/ios/*` | `need_ios` |
 

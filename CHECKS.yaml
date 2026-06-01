@@ -1,0 +1,49 @@
+checks:
+  - id: docs-link-integrity
+
+  - id: no-generated-artifacts
+    check: forbidden-paths
+    config:
+      rules:
+        - remediation: "Generated build output must not be committed. Remove the artifact from the change."
+          when:
+            - added
+            - modified
+            - renamed
+          patterns:
+            - "**/target/**"
+            - "**/node_modules/**"
+            - "**/.build/**"
+            - "bazel-*"
+            - "bazel-*/**"
+
+  - id: file-size
+    config:
+      max_lines: 3000
+      exclude_files:
+        # Markdown, lockfiles, and generated files — never check these for size
+        - "**/*.md"
+        - "**/*.lock"
+        - "**/package-lock.json"
+        - "**/go.sum"
+        - "**/Package.resolved"
+        - pnpm-lock.yaml
+        - "**/*.pb.rs"
+        # Files currently over the 3000-line limit — TODO: split each below 3000
+        - tools/boss/engine/core/src/completion.rs
+        - tools/boss/engine/core/src/coordinator.rs
+        - tools/boss/engine/core/src/merge_poller.rs
+        - tools/boss/engine/core/src/runner.rs
+        - tools/boss/cli/src/main.rs
+        - tools/boss/protocol/src/types.rs
+        - tools/cube/src/app.rs
+        - tools/boss/app-macos/Sources/ContentView.swift
+    policy:
+      severity: error
+      allow_bypass: true
+
+  - id: rust-test-rule-coverage
+
+  - id: todo-expiry
+
+  - id: repo-visibility
