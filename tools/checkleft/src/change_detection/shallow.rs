@@ -146,12 +146,72 @@ fn import_jj_git(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fetch a specific branch from origin into its tracking ref, bypassing any
+/// single-branch fetch refspec restriction in the clone config.
+///
+/// In single-branch Buildkite shallow clones the configured refspec only covers
+/// the pushed branch (e.g. `+refs/heads/boss/…:refs/remotes/origin/boss/…`).
+/// A plain `git fetch --deepen origin` therefore never creates `origin/main`.
+/// Passing an explicit refspec on the command line overrides the config for that
+/// invocation, creating `refs/remotes/origin/<branch>` unconditionally.
+///
+/// Returns `Ok(true)` when the fetch succeeded, `Ok(false)` when the branch
+/// does not exist on the remote (so the caller can propagate "unreachable").
+fn fetch_origin_branch(root: &Path, branch: &str) -> Result<bool> {
+    let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let output = Command::new("git")
+        .args(["fetch", "--no-tags", "--depth=1", "origin", &refspec])
+        .current_dir(root)
+        .output()?;
+    Ok(output.status.success())
+}
+
+/// Deepen a specific remote branch by N commits using an explicit refspec.
+///
+/// Like `fetch_origin_branch`, using an explicit refspec ensures deepening
+/// works even in single-branch clones whose fetch config would otherwise
+/// only cover the pushed branch.
+fn deepen_branch(root: &Path, branch: &str, n: u32) -> Result<()> {
+    let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let depth_arg = format!("--deepen={n}");
+    run_git(root, &["fetch", "--no-tags", &depth_arg, "origin", &refspec])
+}
+
 /// Try the deepen ladder then full unshallow until `git merge-base <base_ref>
 /// HEAD` succeeds. Returns `true` if reachable, `false` if not (even after
 /// unshallow).
+///
+/// For `origin/<branch>` refs, an explicit targeted fetch is attempted first
+/// to ensure the ref exists locally — necessary in single-branch shallow clones
+/// where `git fetch --deepen origin` would only deepen the currently-checked-out
+/// branch and never create `origin/main`.
 fn deepen_until_reachable(root: &Path, base_ref: &str) -> Result<bool> {
+    // Step 0: For origin/<branch> refs, fetch the branch explicitly.
+    // In single-branch shallow clones, origin/<branch> may not exist at all.
+    // An explicit refspec overrides the clone's restricted fetch config.
+    let origin_branch = base_ref.strip_prefix("origin/");
+    if let Some(branch) = origin_branch {
+        info!(base_ref, "fetching base branch explicitly to bypass single-branch fetch config");
+        if !fetch_origin_branch(root, branch)? {
+            // Branch doesn't exist on the remote; nothing more we can do.
+            info!(base_ref, "explicit fetch failed: branch not present on remote");
+            return Ok(false);
+        }
+        if is_merge_base_reachable(root, base_ref)? {
+            info!(base_ref, "merge-base reachable after explicit fetch");
+            return Ok(true);
+        }
+        // Branch ref now exists but merge-base is still not reachable (the fork
+        // point is deeper than depth=1). Fall through to the deepen ladder.
+        info!(base_ref, "branch fetched; merge-base not yet reachable — deepening");
+    }
+
     for &step in DEEPEN_LADDER {
-        deepen(root, step)?;
+        if let Some(branch) = origin_branch {
+            deepen_branch(root, branch, step)?;
+        } else {
+            deepen(root, step)?;
+        }
         info!(step, "deepened; re-checking merge-base reachability");
         if is_merge_base_reachable(root, base_ref)? {
             info!(base_ref, "merge-base is now reachable");
