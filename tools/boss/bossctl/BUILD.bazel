@@ -29,6 +29,7 @@ rust_test(
     name = "bossctl_test",
     crate = ":bossctl",
     edition = "2024",
+    size = "small",
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",

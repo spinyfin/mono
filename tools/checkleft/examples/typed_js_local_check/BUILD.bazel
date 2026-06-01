@@ -27,6 +27,7 @@ local_check(
 js_test(
     name = "check_test",
     entry_point = "check_test.mjs",
+    size = "small",
     data = [
         "check.mjs",
         "fixture.ts",

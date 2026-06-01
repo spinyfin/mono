@@ -32,6 +32,7 @@ rust_binary(
 rust_test(
     name = "checkleft_package_lib_test",
     crate = ":checkleft_package_lib",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -45,6 +46,7 @@ rust_test(
 rust_test(
     name = "checkleft_package_bin_test",
     crate = ":checkleft_package",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

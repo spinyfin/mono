@@ -18,6 +18,7 @@ rust_test(
     name = "pr-template-test",
     crate = ":pr-template",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

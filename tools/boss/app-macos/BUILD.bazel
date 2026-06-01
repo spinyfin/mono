@@ -38,6 +38,7 @@ swift_library(
 macos_unit_test(
     name = "BossTests",
     minimum_os_version = "15.0",
+    size = "small",
     deps = [":boss_mac_app_tests_lib"],
 )
 

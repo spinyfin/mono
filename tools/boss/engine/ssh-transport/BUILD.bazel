@@ -20,6 +20,7 @@ rust_test(
     name = "ssh-transport_test",
     crate = ":ssh-transport",
     edition = "2024",
+    size = "small",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,

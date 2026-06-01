@@ -24,6 +24,7 @@ npm_package(
 js_test(
     name = "checkleft_exec_js_test",
     entry_point = "javascript/checkleft_exec_test.mjs",
+    size = "small",
     data = [
         ":checkleft_exec_js",
         "javascript/checkleft_exec_child.mjs",
