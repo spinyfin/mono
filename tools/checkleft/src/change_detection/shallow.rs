@@ -36,6 +36,25 @@ const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
 pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<()> {
     let git_root = resolve_git_root(root, kind)?;
 
+    // For PR and push-to-branch scenarios, always refresh the remote tracking
+    // ref before checking depth. Buildkite agents reuse checkout directories
+    // and only fetch the specific PR commit SHA — origin/<base_branch> can be
+    // stale, causing merge-base to be computed against an old tip and pulling
+    // unrelated main-branch changes into the "PR diff". Best-effort: ignore
+    // network failures, missing credentials, etc.
+    match scenario {
+        Scenario::PullRequest { .. } | Scenario::PushToBranch { .. } => {
+            if let Some(branch) = needed_ref.strip_prefix("origin/") {
+                let _ = Command::new("git")
+                    .args(["fetch", "origin", branch, "--no-tags"])
+                    .current_dir(&git_root)
+                    .output();
+                info!(branch, "refreshed remote tracking ref before merge-base");
+            }
+        }
+        _ => {}
+    }
+
     if !is_shallow(&git_root)? {
         return Ok(());
     }
