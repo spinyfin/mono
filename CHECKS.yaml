@@ -38,6 +38,7 @@ checks:
         - tools/boss/protocol/src/types.rs
         - tools/cube/src/app.rs
         - tools/boss/app-macos/Sources/ContentView.swift
+        - tools/boss/app-macos/Sources/ChatViewModel.swift
     policy:
       severity: error
       allow_bypass: true
