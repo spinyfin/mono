@@ -117,24 +117,55 @@ pub const CONFLICT_NO_PUSH_REASON: &str = "no_push_no_stop_condition";
 /// catch-all fired in.
 pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
 
+/// Result of a [`WorkerPaneReleaser::release_pane`] call. Tells the
+/// caller whether a live worker slot was actually found and reaped — the
+/// signal that gates the cube-lease release in [`WorkerCompletionHandler::force_release`].
+///
+/// The distinction exists to close the T981 mid-spawn-cancel collision:
+/// a worker whose pid has not yet materialized has no mapped slot, so the
+/// pane release is a no-op (`NoLiveWorker`). Freeing its cube lease at
+/// that point would hand a still-to-be-occupied workspace back to cube,
+/// which then re-leases it to another execution — two live processes,
+/// one working tree. The lease must stay held until the occupant is
+/// genuinely gone; the in-flight run reaps + releases once its spawn
+/// settles (see `PaneSpawnRunner::run_execution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneReleaseOutcome {
+    /// A mapped worker slot was found: its pane was torn down and its OS
+    /// process tree signalled (SIGTERM, escalating to SIGKILL). The
+    /// workspace is no longer occupied, so the caller may free the lease.
+    Reaped,
+    /// No slot was mapped for the run. Either the worker already released
+    /// (idempotent second call) or — the case this distinction exists for
+    /// — it is still mid-spawn with no pid yet, so nothing could be
+    /// reaped. The caller MUST NOT free the cube lease on this outcome.
+    NoLiveWorker,
+}
+
 /// Asks the registered app session to tear down the libghostty pane
 /// hosting `run_id`. Implementations must be idempotent: a duplicate
 /// call after the slot has been released is a no-op, not an error.
 /// The completion handler calls this after a successful cube lease
 /// release on PR detection so the Workers grid pane disappears.
+///
+/// Returns [`PaneReleaseOutcome`] so the caller can decide whether it is
+/// safe to release the cube lease (only when a live worker was reaped).
 #[async_trait]
 pub trait WorkerPaneReleaser: Send + Sync {
-    async fn release_pane(&self, run_id: &str);
+    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
 }
 
 /// `WorkerPaneReleaser` that does nothing — used when no app session
-/// release is wired (tests, headless runs).
+/// release is wired (tests, headless runs). Reports `Reaped` so the
+/// lease-release path is unchanged for setups without a pane subsystem.
 #[derive(Debug, Default)]
 pub struct NoopWorkerPaneReleaser;
 
 #[async_trait]
 impl WorkerPaneReleaser for NoopWorkerPaneReleaser {
-    async fn release_pane(&self, _run_id: &str) {}
+    async fn release_pane(&self, _run_id: &str) -> PaneReleaseOutcome {
+        PaneReleaseOutcome::Reaped
+    }
 }
 
 /// What GitHub reports about a PR associated with the worker's
@@ -2134,7 +2165,27 @@ must not be asked to open one",
     pub async fn force_release(&self, execution_id: &str) {
         // Pane release first. Idempotent on the registry side; the
         // implementation logs and skips when no slot is mapped.
-        self.pane_releaser.release_pane(execution_id).await;
+        //
+        // The outcome gates the cube release below: only a worker whose
+        // pane was actually found and reaped frees its lease. A worker
+        // still mid-spawn (no slot mapped yet, no pid to reap) reports
+        // `NoLiveWorker` — releasing its lease now would hand a
+        // workspace it is about to occupy back to cube, which re-leases
+        // it into a same-workspace collision (T981). In that case the
+        // lease stays held; the in-flight `run_execution` reaps the
+        // worker once its spawn settles and releases the lease then.
+        if matches!(
+            self.pane_releaser.release_pane(execution_id).await,
+            PaneReleaseOutcome::NoLiveWorker
+        ) {
+            tracing::info!(
+                execution_id,
+                "force_release: no live worker pane mapped (mid-spawn or already released); \
+                 leaving the cube lease held — the in-flight run releases it after reaping, \
+                 so an occupied workspace is never re-leased",
+            );
+            return;
+        }
 
         // Cube release: claim ownership of the lease id atomically by
         // clearing it from the DB row before calling the cube CLI.
@@ -2167,20 +2218,32 @@ must not be asked to open one",
     /// workspace via `force_release`. Does NOT demote the task status —
     /// the `UpdateWorkItem` handler already applied the user's `todo`
     /// patch before this is called.
-    pub async fn cancel_and_release(&self, execution_id: &str) {
+    ///
+    /// `reason` names what triggered the cancel (e.g. the kanban
+    /// `active → todo` drag). It is stamped on the trace record so a
+    /// post-mortem can attribute *what* cancelled an execution — the
+    /// gap that blocked attribution of the T981 mid-spawn cancel, where
+    /// the record carried no initiator at all.
+    pub async fn cancel_and_release(&self, execution_id: &str, reason: &str) {
         match self.work_db.cancel_running_execution(execution_id) {
             Ok(true) => {
-                tracing::info!(execution_id, "cancel_and_release: execution cancelled");
+                tracing::info!(
+                    execution_id,
+                    reason,
+                    "cancel_and_release: execution cancelled",
+                );
             }
             Ok(false) => {
                 tracing::debug!(
                     execution_id,
+                    reason,
                     "cancel_and_release: execution already terminal; proceeding to release",
                 );
             }
             Err(err) => {
                 tracing::warn!(
                     execution_id,
+                    reason,
                     ?err,
                     "cancel_and_release: failed to cancel execution; proceeding to release",
                 );
@@ -3368,12 +3431,30 @@ mod tests {
     #[derive(Default)]
     struct RecordingPaneReleaser {
         calls: Mutex<Vec<String>>,
+        /// When set, `release_pane` reports this instead of the default
+        /// `Reaped` — lets a test simulate a worker still mid-spawn
+        /// (no slot mapped → `NoLiveWorker`) so the lease-release gate
+        /// can be exercised.
+        outcome: std::sync::Mutex<Option<PaneReleaseOutcome>>,
+    }
+
+    impl RecordingPaneReleaser {
+        fn with_outcome(outcome: PaneReleaseOutcome) -> Self {
+            Self {
+                calls: Mutex::default(),
+                outcome: std::sync::Mutex::new(Some(outcome)),
+            }
+        }
     }
 
     #[async_trait]
     impl WorkerPaneReleaser for RecordingPaneReleaser {
-        async fn release_pane(&self, run_id: &str) {
+        async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
             self.calls.lock().await.push(run_id.to_owned());
+            self.outcome
+                .lock()
+                .expect("RecordingPaneReleaser outcome mutex poisoned")
+                .unwrap_or(PaneReleaseOutcome::Reaped)
         }
     }
 
@@ -4200,6 +4281,127 @@ mod tests {
         handler.force_release(&execution_id).await;
         assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
         assert!(cube.release_calls.lock().await.is_empty());
+    }
+
+    /// T981 regression — the lease-release gate. When the pane releaser
+    /// reports `NoLiveWorker` (the worker is still mid-spawn: no slot
+    /// mapped, no pid to reap), `force_release` must NOT free the cube
+    /// lease. Freeing it would hand a workspace the worker is about to
+    /// occupy back to cube, which re-leases it into a same-workspace
+    /// collision. The lease stays held until the in-flight run reaps the
+    /// worker and releases it.
+    #[tokio::test]
+    async fn force_release_mid_spawn_holds_cube_lease() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::with_outcome(
+            PaneReleaseOutcome::NoLiveWorker,
+        ));
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes,
+        );
+
+        handler.force_release(&execution_id).await;
+
+        // Pane release was attempted...
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        // ...but the cube lease was NOT released, and the row still
+        // carries it — the still-occupied workspace stays leased.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "mid-spawn force_release must not release the cube lease",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "lease columns must stay set so the in-flight run owns the eventual release",
+        );
+        assert_eq!(execution.workspace_path.as_deref(), workspace.path().to_str());
+    }
+
+    /// T981 regression — `cancel_and_release` racing the spawn window.
+    /// It cancels the execution row (so the reconciler won't redispatch)
+    /// but, with the worker still mid-spawn, must leave the lease held —
+    /// the in-flight run reaps + releases once its spawn settles.
+    #[tokio::test]
+    async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::with_outcome(
+            PaneReleaseOutcome::NoLiveWorker,
+        ));
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes,
+        );
+
+        handler
+            .cancel_and_release(&execution_id, "test: mid-spawn cancel")
+            .await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status, "cancelled",
+            "the execution row must be cancelled so the reconciler won't redispatch it",
+        );
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "the lease must stay held while the worker is still occupying the workspace",
+        );
+        assert_eq!(
+            execution.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "lease columns must remain so the in-flight run can release after reaping",
+        );
+    }
+
+    /// Companion to the gate test: when a live worker WAS reaped
+    /// (`Reaped`), `cancel_and_release` releases the lease as before — the
+    /// gate only defers on the mid-spawn case.
+    #[tokio::test]
+    async fn cancel_and_release_with_live_worker_releases_lease() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes,
+        );
+
+        handler
+            .cancel_and_release(&execution_id, "test: live worker cancel")
+            .await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "cancelled");
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert!(execution.cube_lease_id.is_none());
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
-    CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
+    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler,
+    WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{
@@ -211,6 +212,13 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         &self.worker_registry
     }
 
+    async fn reap_worker_pane(&self, run_id: &str) {
+        // Delegate to the inherent reaper, discarding the outcome — the
+        // spawn-completion path already knows the worker came up (it just
+        // returned a pid); it calls this purely to kill it.
+        let _ = ServerState::release_worker_pane(self, run_id).await;
+    }
+
     fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
         Some(&self.live_worker_states)
     }
@@ -270,16 +278,19 @@ impl ServerStatePaneReleaser {
 
 #[async_trait]
 impl WorkerPaneReleaser for ServerStatePaneReleaser {
-    async fn release_pane(&self, run_id: &str) {
+    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
         let Some(weak) = self.server.get() else {
             tracing::warn!(run_id, "pane releaser called before server state was bound");
-            return;
+            // No server bound: nothing could be reaped. Treat as
+            // "no live worker" so the caller does not free a lease on
+            // the strength of a release that never happened.
+            return PaneReleaseOutcome::NoLiveWorker;
         };
         let Some(server) = weak.upgrade() else {
             tracing::debug!(run_id, "pane releaser: server state already dropped");
-            return;
+            return PaneReleaseOutcome::NoLiveWorker;
         };
-        server.release_worker_pane(run_id).await;
+        server.release_worker_pane(run_id).await
     }
 }
 
@@ -1112,13 +1123,17 @@ impl ServerState {
     /// release the libghostty pane but leave the live state stuck on
     /// `WaitingForInput`, making the UI think the worker was still
     /// running.
-    pub async fn release_worker_pane(&self, run_id: &str) {
+    pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             tracing::debug!(
                 run_id,
                 "release_worker_pane: no slot mapped (already released or never spawned)",
             );
-            return;
+            // No mapped slot means no pane and no recorded pid to reap —
+            // the worker either already released or has not finished
+            // spawning. Either way the caller must not treat this as a
+            // reap that frees the workspace lease.
+            return PaneReleaseOutcome::NoLiveWorker;
         };
         // Snapshot the worker's recorded shell pid *before* we drop the
         // live-state entry further down — the engine-side reap backstop
@@ -1204,6 +1219,10 @@ impl ServerState {
         // durable source of truth — but a bounded cache is hygienic.
         self.transcript_path_cache.forget(run_id);
         self.broadcast_live_worker_states().await;
+        // A slot was mapped, so a worker had finished spawning: its pane
+        // was torn down and (above) its OS process tree signalled. Report
+        // `Reaped` so the caller may free the workspace lease.
+        PaneReleaseOutcome::Reaped
     }
 
     /// Release every live worker pane the engine knows about. Called

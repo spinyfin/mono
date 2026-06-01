@@ -2615,7 +2615,10 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::completion::{PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser};
+    use crate::completion::{
+        PaneReleaseOutcome, PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler,
+        WorkerPaneReleaser,
+    };
     use crate::coordinator::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
         CubeWorkspaceStatus, ExecutionPublisher,
@@ -5672,7 +5675,9 @@ mod tests {
 
     #[async_trait]
     impl WorkerPaneReleaser for NoopPaneReleaser {
-        async fn release_pane(&self, _run_id: &str) {}
+        async fn release_pane(&self, _run_id: &str) -> PaneReleaseOutcome {
+            PaneReleaseOutcome::Reaped
+        }
     }
 
     struct NoopProbeQueuer;
