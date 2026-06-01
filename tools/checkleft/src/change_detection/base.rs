@@ -136,10 +136,23 @@ pub(crate) fn select_base(
         // ── Row 5: Push to non-default branch ────────────────────────────────
         // Treated as a pre-merge branch: 3-dot against the default branch,
         // same base rule as PR but without an explicit PR signal.
-        Scenario::PushToBranch { .. } => match prober.merge_base(default_branch) {
-            Some(sha) => BaseSelection::Scoped { base_sha: sha },
-            None => BaseSelection::Empty(EmptyReason::NoMergeBase),
-        },
+        //
+        // Use origin/<default_branch> when available so CI agents that reuse
+        // checkout directories (Buildkite) don't see a stale local branch.
+        // The legacy checks.sh always did `git fetch origin main && merge-base
+        // origin/main HEAD`; we mirror that here.
+        Scenario::PushToBranch { .. } => {
+            let remote_ref = format!("origin/{default_branch}");
+            let base_ref = if prober.resolve(&remote_ref).is_some() {
+                remote_ref
+            } else {
+                default_branch.to_owned()
+            };
+            match prober.merge_base(&base_ref) {
+                Some(sha) => BaseSelection::Scoped { base_sha: sha },
+                None => BaseSelection::Empty(EmptyReason::NoMergeBase),
+            }
+        }
 
         // ── Rows 6 & 8: Local / pre-push with detached-HEAD fallback ─────────
         Scenario::Local => select_base_local(prober, default_branch),
@@ -449,7 +462,28 @@ mod tests {
             branch: "feature/foo".to_owned(),
         };
         let env = gha_env("push");
+        // origin/main not present → falls back to local "main"
         let prober = Stub::default().base(DEFAULT, MERGE_BASE_SHA);
+        assert_eq!(
+            select_base(&scenario, &env, &prober, DEFAULT),
+            BaseSelection::Scoped {
+                base_sha: MERGE_BASE_SHA.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn row5_push_to_branch_prefers_origin_ref_over_stale_local() {
+        let scenario = Scenario::PushToBranch {
+            branch: "feature/foo".to_owned(),
+        };
+        let env = gha_env("push");
+        // origin/main is present and fresher; local "main" is stale.
+        // select_base must use origin/main, not local main.
+        let prober = Stub::default()
+            .rev("origin/main", "some_origin_sha") // origin/main resolves
+            .base("origin/main", MERGE_BASE_SHA)
+            .base(DEFAULT, "stale_local_sha");
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),
             BaseSelection::Scoped {
