@@ -116,6 +116,7 @@ private struct AttentionGroupCard: View {
     /// Local drafts for `prompt`-type questions, keyed by attention id. Seeded
     /// from the persisted answer; flushed to the engine on submit.
     @State private var promptDrafts: [String: String] = [:]
+    @State private var showingAssociationPopover = false
 
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var answeredCount: Int { members.filter(\.isAnswered).count }
@@ -181,26 +182,43 @@ private struct AttentionGroupCard: View {
 
     @ViewBuilder
     private var associationLinks: some View {
-        HStack(spacing: 10) {
-            Button {
-                model.revealAttentionAssociation(group)
-            } label: {
-                Label(
-                    model.attentionAssociationLabel(group),
-                    systemImage: group.associationTaskID != nil ? "square.stack.3d.up" : "folder"
-                )
-                .font(.caption)
-            }
-            .buttonStyle(.link)
-
-            if group.kind == "question", group.associationProjectID != nil {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
                 Button {
-                    model.openAttentionDesignDoc(group)
+                    if group.associationTaskID != nil {
+                        showingAssociationPopover = true
+                    } else {
+                        model.revealAttentionAssociation(group)
+                    }
                 } label: {
-                    Label("Design doc", systemImage: "doc.richtext")
-                        .font(.caption)
+                    Label(
+                        model.attentionAssociationLabel(group),
+                        systemImage: group.associationTaskID != nil ? "square.stack.3d.up" : "folder"
+                    )
+                    .font(.caption)
                 }
                 .buttonStyle(.link)
+                .popover(isPresented: $showingAssociationPopover) {
+                    if let task = model.attentionAssociationTask(group) {
+                        WorkCardPopoverView(model: model, task: task)
+                    }
+                }
+
+                if group.kind == "question", group.associationProjectID != nil {
+                    Button {
+                        model.openAttentionDesignDoc(group)
+                    } label: {
+                        Label("Design doc", systemImage: "doc.richtext")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+            if let taskName = model.attentionAssociationTask(group)?.name {
+                Text(taskName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
         }
     }

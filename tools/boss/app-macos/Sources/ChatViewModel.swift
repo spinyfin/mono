@@ -2229,6 +2229,12 @@ final class ChatViewModel: ObservableObject {
         persistProjectFilterIDs()
     }
 
+    /// The task a group is associated with, or `nil` for project associations.
+    func attentionAssociationTask(_ group: AttentionGroup) -> WorkTask? {
+        guard let taskID = group.associationTaskID else { return nil }
+        return task(withID: taskID)
+    }
+
     /// Short display label for a group's association — `"T34"` / `"P12"` /
     /// a project name / `"Open"` when neither resolves.
     func attentionAssociationLabel(_ group: AttentionGroup) -> String {

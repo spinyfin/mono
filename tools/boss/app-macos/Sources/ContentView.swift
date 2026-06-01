@@ -2380,7 +2380,7 @@ private struct AgentActivityDot: View {
     }
 }
 
-private struct WorkCardPopoverView: View {
+struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
 
