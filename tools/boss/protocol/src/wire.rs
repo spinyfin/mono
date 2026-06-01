@@ -125,60 +125,357 @@ impl FrontendEventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
-    Subscribe {
-        topics: Vec<String>,
+    /// Engine-side abandon for a non-terminal `ci_remediations`
+    /// attempt. Distinct from `MarkCiRemediationFailed` (the
+    /// worker-facing "I gave up" surface) in that the caller is
+    /// explicitly stepping away (manual override). Idempotent on rows
+    /// already terminal — returns [`FrontendEvent::WorkError`].
+    AbandonCiRemediation {
+        attempt_id: String,
+        reason: String,
     },
-    Unsubscribe {
-        topics: Vec<String>,
+
+    /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
+    /// with the supplied reason. Distinct from `mark-failed` in that the
+    /// caller is explicitly stepping away (PR closed, parent merged
+    /// externally, manual override) rather than declaring the worker
+    /// gave up. Idempotent; rows already terminal yield a WorkError.
+    AbandonConflictResolution {
+        attempt_id: String,
+        reason: String,
     },
+
+    /// Action an open/partially-answered attention group — produce the
+    /// downstream artifact (one revision, one design task, or a batch
+    /// of new tasks) and transition the group to `actioned`. Replies
+    /// with [`FrontendEvent::AttentionGroupActioned`].
+    ActionAttentionGroup {
+        /// Group id (`atg_…`) or `A<n>` short id.
+        id: String,
+        /// When `true`, mark every unanswered member as `skipped`
+        /// before actioning so the caller doesn't need to touch every
+        /// row explicitly.
+        #[serde(default)]
+        skip_unanswered: bool,
+    },
+
+    /// Declare a `blocks` edge from `dependent` to `prerequisite`.
+    /// Idempotent: re-adding an existing edge is a no-op. Cycles are
+    /// rejected at the engine before insert.
+    AddDependency {
+        #[serde(flatten)]
+        input: AddDependencyInput,
+    },
+
+    /// Record the human's answer for one attention member (`atn_…`).
+    /// Replies with [`FrontendEvent::AttentionGroupUpdated`] carrying
+    /// the group's updated state.
+    AnswerAttention {
+        /// The individual attention id (`atn_…`).
+        id: String,
+        /// The captured answer. Shape depends on the attention's
+        /// `question_type`: `"yes"`/`"no"` for `yes_no`; the chosen
+        /// value for `multiple_choice`; free text for `prompt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        /// Mark this member `skipped` rather than `answered`.
+        #[serde(default)]
+        skip: bool,
+        /// Mark this member `dismissed` without answering.
+        #[serde(default)]
+        dismiss: bool,
+    },
+
+    /// Heuristic feedback-loop audit (design §Q4 follow-up, PR #370).
+    /// Aggregates recorded escalation events for `product_id`
+    /// against the §Q4 marker corpus and returns a snapshot report
+    /// of under-classification rates per marker. Read-only; backs
+    /// the `boss product audit-effort` CLI verb. `window_days`
+    /// trims the event set to a rolling window (events older than
+    /// `now - window` are excluded); `None` means "all recorded
+    /// events." Replies with [`FrontendEvent::EffortAuditReport`].
+    AuditProductEffort {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_days: Option<u32>,
+    },
+
+    /// Cancel a queued or running execution. Marks the execution row
+    /// `cancelled`, releases any cube workspace lease it still holds,
+    /// and tears down the libghostty pane (if one was allocated).
+    /// Idempotent on already-terminal rows (returns `WorkError`).
+    CancelExecution {
+        execution_id: String,
+    },
+
+    /// Worker → engine marker (Phase 9 #30): record the worker's
+    /// post-log triage decision on a `ci_remediations` attempt.
+    /// Canonical values: `tractable`, `flaky_or_infra`, `unfixable`.
+    /// Pure metadata column on the attempt row; no state-machine
+    /// effect — the worker still calls `mark-failed` (`unfixable` /
+    /// give up), `mark-retriggered` (`flaky_or_infra` → re-ran),
+    /// or simply pushes (`tractable` → fix landed) to drive the
+    /// terminal status.
+    ClassifyCiRemediation {
+        attempt_id: String,
+        triage_class: String,
+    },
+
+    /// Apply the magic-wand result: overwrite the work-item description with
+    /// `result_md` after a doc-version CAS check. `current_doc_version` is the
+    /// SHA-256 of the doc's current plain-text projection, computed by the
+    /// macOS renderer. On match with the dispatch's stored `doc_version`, the
+    /// description is overwritten atomically and the dispatch transitions to
+    /// `applied`. On mismatch (the doc was edited between dispatch and apply)
+    /// the dispatch transitions to `conflict` and `conflict = true` is returned
+    /// so the UI can show a reload affordance. User-tier — workers may not call.
+    CommentsApplyMagicWand {
+        dispatch_id: String,
+        /// SHA-256 of the doc's current plain-text projection (for CAS).
+        current_doc_version: String,
+    },
+
+    /// Create an `active` comment on an artifact. Returns the row.
+    CommentsCreate {
+        #[serde(flatten)]
+        input: CreateCommentInput,
+    },
+
+    /// Discard the magic-wand result without modifying the description.
+    /// Transitions the dispatch to `discarded`; the comment stays `active`.
+    CommentsDiscardMagicWand {
+        dispatch_id: String,
+    },
+
+    /// Soft-dismiss: transition a comment to `resolved`.
+    CommentsDismiss {
+        comment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+
+    /// App-or-Boss-session RPC: dispatch a specialised one-shot Claude call
+    /// against the comment's work-item description. The engine inserts an
+    /// `in_flight` dispatch row and spawns an async task; the caller receives
+    /// `MagicWandDispatched` immediately. The result arrives asynchronously on
+    /// the `magic_wand.dispatch.<dispatch_id>` topic as `MagicWandResult` when
+    /// the Claude call completes. Only valid for `artifact_kind = 'work_item'`
+    /// comments (Phase 4 handles `pr_doc`).
+    CommentsDispatchMagicWand {
+        comment_id: String,
+    },
+
+    /// List comments for an artifact. Excludes `resolved` / `dismissed`
+    /// (and `orphaned` unless `include_resolved`) by default.
+    CommentsList {
+        artifact_kind: String,
+        artifact_id: String,
+        #[serde(default)]
+        include_resolved: bool,
+    },
+
+    /// Resolve every active comment on an artifact against the renderer's
+    /// current plain-text projection. The engine runs the
+    /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting
+    /// `last_resolved_with = 'fuzzy'`) and flips unresolvable comments to
+    /// `orphaned`, then returns each comment with its [`CommentResolution`].
+    CommentsResolve {
+        artifact_kind: String,
+        artifact_id: String,
+        /// The doc's current rendered plain-text projection.
+        plain_text: String,
+        #[serde(default)]
+        plain_text_projection_version: i64,
+    },
+
+    /// General status transition (`active` / `resolved` / `orphaned`).
+    /// Re-activation is accepted; hard delete is not exposed.
+    CommentsSetStatus {
+        comment_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+
+    /// Renderer callback after a fuzzy re-resolve: persists the new anchor
+    /// coordinates so subsequent loads exact-match. Records the fuzzy
+    /// outcome on the row.
+    CommentsUpdateAnchor {
+        comment_id: String,
+        anchor: CommentAnchor,
+        new_doc_version: String,
+        #[serde(default)]
+        plain_text_projection_version: i64,
+    },
+
+    /// Create a new attention (question or followup member). The engine
+    /// finds or creates the owning group based on the association and
+    /// source fields in the input. Replies with
+    /// [`FrontendEvent::AttentionCreated`].
+    CreateAttention {
+        #[serde(flatten)]
+        input: CreateAttentionInput,
+    },
+
+    CreateAttentionItem {
+        #[serde(flatten)]
+        input: CreateAttentionItemInput,
+    },
+
+    /// Create a new automation for a product. Replies with
+    /// [`FrontendEvent::AutomationCreated`] on success.
+    CreateAutomation {
+        #[serde(flatten)]
+        input: CreateAutomationInput,
+    },
+
+    /// Create a single maintenance task produced by an automation's triage
+    /// phase (Maint task 6). Called by the triage agent via
+    /// `boss task create --automation <A-id>`. The engine resolves the
+    /// automation, transactionally re-checks its open-task cap (the
+    /// backstop against a misbehaving agent fanning out multiple tasks),
+    /// stamps `tasks.source_automation_id`, inherits the automation's repo,
+    /// and — because the produced task is `autostart` — requests its
+    /// execution (which the dispatcher routes to the automations pool).
+    /// Replies with [`FrontendEvent::WorkItemCreated`] on success, or
+    /// [`FrontendEvent::WorkError`] when the automation is unknown or the
+    /// open-task cap is already reached.
+    CreateAutomationTask {
+        automation_id: String,
+        name: String,
+        description: Option<String>,
+    },
+
+    CreateChore {
+        #[serde(flatten)]
+        input: CreateChoreInput,
+    },
+
+    CreateExecution {
+        #[serde(flatten)]
+        input: CreateExecutionInput,
+    },
+
+    /// Create a `kind = 'investigation'` task. Parallel to
+    /// `CreateChore` but uses `investigation` kind and supports an
+    /// optional `project_id`. Workers dispatched against investigation
+    /// tasks receive a doc-output prelude and open PRs against the
+    /// product's `docs_repo` or `BOSS_USER_DOCS_REPO`.
+    CreateInvestigation {
+        #[serde(flatten)]
+        input: CreateInvestigationInput,
+    },
+
+    /// Batch create N chores in one engine round-trip. See
+    /// `CreateManyTasks` for atomicity semantics.
+    CreateManyChores {
+        #[serde(flatten)]
+        input: CreateManyChoresInput,
+    },
+
+    /// Batch create N tasks in one engine round-trip. Atomic: the
+    /// whole batch is wrapped in a single sqlite transaction and
+    /// rolled back on the first per-item failure. Replies with
+    /// `WorkItemsCreated` carrying the full list of inserted rows.
+    CreateManyTasks {
+        #[serde(flatten)]
+        input: CreateManyTasksInput,
+    },
+
     CreateProduct {
         #[serde(flatten)]
         input: CreateProductInput,
     },
-    ListProducts,
-    ListProjects {
-        product_id: String,
-        /// Phase 3 dep filter (Q6). Restricts the returned list to
-        /// rows that match a dependency-graph predicate before any
-        /// CLI-side filters (status / match / id). Backwards-
-        /// compatible: pre-Phase-3 callers omit the field and get the
-        /// historical behaviour.
-        #[serde(default)]
-        dep_filter: Option<DependencyFilter>,
+
+    CreateProject {
+        #[serde(flatten)]
+        input: CreateProjectInput,
     },
-    ListTasks {
-        product_id: String,
-        project_id: Option<String>,
-        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
-        #[serde(default)]
-        dep_filter: Option<DependencyFilter>,
-        /// When `true`, soft-deleted rows (`deleted_at IS NOT NULL`) are
-        /// included in the result so the operator can find a tombstoned
-        /// task to `restore` it. Defaults to `false` — pre-existing
-        /// callers omit the field and keep the historical live-only view.
-        #[serde(default)]
-        include_deleted: bool,
+
+    /// Create a `kind = 'revision'` task bound to an existing parent task
+    /// whose PR is open and unmerged. The worker's deliverable is a new
+    /// commit on the parent's PR branch — no new PR is opened. Mirrors
+    /// `CreateInvestigation` in structure; gate enforcement and dispatch
+    /// are implemented in Phase 2 and Phase 3 respectively. Ships dark in
+    /// Phase 1: the wire type is parseable but no kind is dispatchable yet.
+    CreateRevision {
+        #[serde(flatten)]
+        input: CreateRevisionInput,
     },
-    ListChores {
-        product_id: String,
-        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
-        #[serde(default)]
-        dep_filter: Option<DependencyFilter>,
-        /// See [`Self::ListTasks::include_deleted`].
-        #[serde(default)]
-        include_deleted: bool,
+
+    CreateRun {
+        #[serde(flatten)]
+        input: CreateRunInput,
     },
-    GetWorkItem {
+
+    CreateTask {
+        #[serde(flatten)]
+        input: CreateTaskInput,
+    },
+
+    /// One-shot diagnostic snapshot of the live-status pipeline.
+    /// Returns the engine build SHA, ANTHROPIC_API_KEY presence, and
+    /// per-slot detail covering trigger / outcome / transcript path —
+    /// see [`crate::LiveStatusDebugReport`]. Wired through to
+    /// `bossctl live-status debug`. Read-only; no side effects.
+    DebugLiveStatusPipeline,
+
+    /// Permanently delete an automation and its run history.
+    /// Replies with [`FrontendEvent::AutomationDeleted`].
+    DeleteAutomation {
         id: String,
     },
-    /// Look up a work item by its per-product short_id (the friendly
-    /// numeric id, e.g. 42 for `#42`). Searches both `tasks` and
-    /// `projects` tables. Replies with `WorkItemResult` on success or
-    /// `WorkError` when no match exists.
-    GetWorkItemByShortId {
-        product_id: String,
-        short_id: i64,
+
+    DeleteWorkItem {
+        id: String,
     },
+
+    /// Set `enabled = false` on an automation. Idempotent.
+    /// Replies with [`FrontendEvent::AutomationUpdated`].
+    DisableAutomation {
+        id: String,
+    },
+
+    /// Dismiss an attention group or a single member without producing a
+    /// downstream artifact. Accepts both `atg_…` group ids and `atn_…`
+    /// member ids; the engine discriminates by prefix. Replies with
+    /// [`FrontendEvent::AttentionGroupUpdated`].
+    DismissAttention {
+        /// `atg_…` to dismiss the whole group; `atn_…` to dismiss one
+        /// member.
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Set `enabled = true` on an automation. Idempotent.
+    /// Replies with [`FrontendEvent::AutomationUpdated`].
+    EnableAutomation {
+        id: String,
+    },
+
+    /// App's reply to a previous `FrontendEvent::EngineRequest`.
+    /// `request_id` echoes the value the engine sent.
+    EngineResponse {
+        request_id: String,
+        response: EngineToAppResponse,
+    },
+
+    /// Resolve and render the full transcript for a completed or
+    /// in-progress execution, keyed on the durable execution id.
+    ///
+    /// The engine reads from `work_runs.transcript_path` (via the
+    /// durable `work_executions` row) rather than the live supervisor
+    /// — this sidesteps the "unknown run" divergence and makes
+    /// historical executions, retries, and remediations all reachable.
+    ///
+    /// Returns [`FrontendEvent::ExecutionTranscriptResult`] on success
+    /// or [`FrontendEvent::ExecutionTranscriptUnavailable`] when the
+    /// transcript file is absent or the execution never recorded one.
+    ExecutionTranscript {
+        execution_id: String,
+    },
+
     /// Look up the work item(s) bound to a GitHub PR number, spanning
     /// the *entire* `tasks` table — every kind (`project_task`,
     /// `chore`, `design`, `investigation`, `revision`) across every
@@ -198,93 +495,170 @@ pub enum FrontendRequest {
     FindWorkItemsByPr {
         pr_number: i64,
     },
-    CreateProject {
-        #[serde(flatten)]
-        input: CreateProjectInput,
+
+    /// Boss-tier RPC: bring the worker pane hosting `run_id` to the
+    /// front in the macOS app. Resolves `run_id → slot_id` via the
+    /// engine's worker registry and forwards a `FocusWorkerPane`
+    /// engine→app request. Used by `bossctl agents focus`. Returns a
+    /// `WorkError` if the run is unknown or has no allocated pane.
+    FocusWorkerPane {
+        run_id: String,
     },
-    CreateTask {
-        #[serde(flatten)]
-        input: CreateTaskInput,
-    },
-    CreateChore {
-        #[serde(flatten)]
-        input: CreateChoreInput,
-    },
-    /// Batch create N tasks in one engine round-trip. Atomic: the
-    /// whole batch is wrapped in a single sqlite transaction and
-    /// rolled back on the first per-item failure. Replies with
-    /// `WorkItemsCreated` carrying the full list of inserted rows.
-    CreateManyTasks {
-        #[serde(flatten)]
-        input: CreateManyTasksInput,
-    },
-    /// Batch create N chores in one engine round-trip. See
-    /// `CreateManyTasks` for atomicity semantics.
-    CreateManyChores {
-        #[serde(flatten)]
-        input: CreateManyChoresInput,
-    },
-    UpdateWorkItem {
-        id: String,
-        patch: WorkItemPatch,
-    },
-    DeleteWorkItem {
+
+    /// Fetch one attention group by id (`atg_…` or `A<n>` short id).
+    /// Replies with [`FrontendEvent::AttentionGroupResult`].
+    GetAttentionGroup {
         id: String,
     },
-    /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
-    /// tombstone on a soft-deleted task, making it visible again. The
-    /// `id` accepts a canonical `task_…` id or a friendly short id
-    /// (`T43`); the engine resolves the friendly form against
-    /// soft-deleted rows too, so a tombstoned task is still findable.
-    /// Idempotent — restoring an already-live row succeeds as a no-op.
-    /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
-    RestoreWorkItem {
-        id: String,
-    },
-    GetWorkTree {
-        product_id: String,
-    },
-    ReorderProjectTasks {
-        project_id: String,
-        task_ids: Vec<String>,
-    },
-    CreateExecution {
-        #[serde(flatten)]
-        input: CreateExecutionInput,
-    },
-    RequestExecution {
-        #[serde(flatten)]
-        input: RequestExecutionInput,
-    },
-    ListExecutions {
-        work_item_id: Option<String>,
-    },
-    GetExecution {
-        id: String,
-    },
-    CreateRun {
-        #[serde(flatten)]
-        input: CreateRunInput,
-    },
-    ListRuns {
-        execution_id: String,
-    },
-    GetRun {
-        id: String,
-    },
-    CreateAttentionItem {
-        #[serde(flatten)]
-        input: CreateAttentionItemInput,
-    },
-    ListAttentionItems {
-        execution_id: String,
-    },
+
     GetAttentionItem {
         id: String,
     },
-    ListAttentionItemsForWorkItem {
+
+    /// Fetch a single automation by its canonical `auto_…` id.
+    /// Replies with [`FrontendEvent::AutomationResult`] or
+    /// [`FrontendEvent::WorkError`] when not found.
+    GetAutomation {
+        id: String,
+    },
+
+    /// Return the count of open tasks produced by an automation.
+    /// "Open" = `status IN (todo, ready, doing, in_review, blocked)`.
+    /// Replies with [`FrontendEvent::AutomationOpenTaskCount`].
+    GetAutomationOpenTaskCount {
+        automation_id: String,
+    },
+
+    /// Read-only: snapshot a work item's CI attempt budget — the
+    /// `tasks.ci_attempt_budget` override, the product's default, the
+    /// effective value the engine uses, and the live
+    /// `tasks.ci_attempts_used` counter. Backs the
+    /// `boss engine ci budget show <work-item-id>` verb.
+    GetCiBudget { work_item_id: String },
+
+    /// Read-only: fetch a single `ci_remediations` row by id. Returns
+    /// [`FrontendEvent::CiRemediation`] on success and
+    /// [`FrontendEvent::WorkError`] when the id is unknown.
+    GetCiRemediation { attempt_id: String },
+
+    /// Read-only: fetch a single attempt row by id. Returns
+    /// [`FrontendEvent::ConflictResolution`] on success and
+    /// [`FrontendEvent::WorkError`] when the id is unknown.
+    GetConflictResolution { attempt_id: String },
+
+    /// One-shot snapshot of the engine's user-visible configuration
+    /// health — currently a single ANTHROPIC_API_KEY presence bit plus
+    /// any rendered [`EngineHealthIssue`]s the UI should surface as a
+    /// banner / settings-pane warning. Read-only; no side effects.
+    /// Replies with [`FrontendEvent::EngineHealthResult`]. The macOS
+    /// app calls this on session start so a missing API key cannot
+    /// silently break summarization the way it did before #699.
+    GetEngineHealth,
+
+    /// Ask the engine to identify itself. Replies with
+    /// [`FrontendEvent::EngineVersionResult`] carrying the build SHA,
+    /// build time, and binary-content fingerprint of the running
+    /// engine binary. Used by the macOS app on attach to detect
+    /// whether the running engine matches the app's bundled engine; if
+    /// they differ the app stops the old engine and spawns the new one
+    /// from the bundle, ensuring the user always gets the version that
+    /// shipped with the app they launched.
+    GetEngineVersion,
+
+    GetExecution {
+        id: String,
+    },
+
+    GetRun {
+        id: String,
+    },
+
+    /// Snapshot of every registered per-installation setting and its
+    /// current value. Used by the macOS Settings window to render the
+    /// current state on open. Replies with
+    /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
+    GetSettings,
+
+    /// Per-work-item runtime snapshot — single-item flavour of the
+    /// `task_runtimes` block carried in `WorkTree`. Used by
+    /// `boss chore show` / `boss task show` to enrich the rendered work
+    /// item with the active execution and run ids without re-fetching
+    /// the entire product tree. Replies with
+    /// [`FrontendEvent::TaskRuntimeResult`]. Returns the same
+    /// `TaskRuntime` shape `WorkTree` uses; every `Option` is `None`
+    /// when the work item has no executions yet.
+    GetTaskRuntime {
         work_item_id: String,
     },
+
+    GetWorkItem {
+        id: String,
+    },
+
+    /// Look up a work item by its per-product short_id (the friendly
+    /// numeric id, e.g. 42 for `#42`). Searches both `tasks` and
+    /// `projects` tables. Replies with `WorkItemResult` on success or
+    /// `WorkError` when no match exists.
+    GetWorkItemByShortId {
+        product_id: String,
+        short_id: i64,
+    },
+
+    GetWorkTree {
+        product_id: String,
+    },
+
+    /// Abort an in-progress device-flow authorization. The engine
+    /// stops the poll loop and transitions to `Disconnected`. No-op
+    /// if no flow is in progress.
+    GitHubAuthCancel,
+
+    /// Delete the stored OAuth token and return to `Disconnected`.
+    /// The deletion is local only (no server-side revocation).
+    GitHubAuthDisconnect,
+
+    /// Begin the GitHub OAuth device-flow authorization for github.com.
+    /// The engine starts the flow, requests a device code, and pushes
+    /// [`FrontendEvent::GitHubAuthState`] events as the flow advances.
+    /// If a flow is already in progress this is a no-op.
+    GitHubAuthStart,
+
+    /// Request the current GitHub auth state. The engine replies
+    /// immediately with a [`FrontendEvent::GitHubAuthState`] push
+    /// reflecting the latest known state.
+    GitHubAuthStatus,
+
+    /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
+    /// equivalent to the human pressing Esc inside that pane.
+    /// Resolves `run_id → slot_id` and forwards an
+    /// `InterruptWorkerPane` engine→app request. Cancels the worker's
+    /// in-flight turn without killing the run. Used by `bossctl
+    /// agents interrupt`. Returns a `WorkError` if the run is unknown
+    /// or has no allocated pane.
+    InterruptWorkerPane {
+        run_id: String,
+    },
+
+    /// App sends this when its window becomes active (user switching back
+    /// from another app, e.g. after reviewing a PR on GitHub). The engine
+    /// schedules an immediate pass of every PR-state reconciler so the
+    /// kanban reflects upstream changes without waiting for the next
+    /// periodic tick. Engine-side quiescing (15 s window) prevents
+    /// repeated GitHub API calls on rapid focus-toggle events.
+    /// Replies with [`FrontendEvent::PrReconcilersKicked`].
+    KickPrReconcilers,
+
+    /// Manually link a work item to a specific upstream tracker issue.
+    /// The engine stores `kind`/`canonical_id` on the row; `raw` and
+    /// `web_url` are populated on the next reconcile tick via
+    /// `fetch_item`. Replies with [`FrontendEvent::WorkItemUpdated`]
+    /// carrying the updated row, or [`FrontendEvent::WorkError`] if the
+    /// work item or tracker kind is not found.
+    LinkWorkItemExternalRef {
+        #[serde(flatten)]
+        input: LinkExternalRefInput,
+    },
+
     /// List attention groups for a product, with optional filters.
     /// Replies with [`FrontendEvent::AttentionGroupsList`].
     ListAttentionGroups {
@@ -303,78 +677,277 @@ pub enum FrontendRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
     },
-    /// Fetch one attention group by id (`atg_…` or `A<n>` short id).
-    /// Replies with [`FrontendEvent::AttentionGroupResult`].
-    GetAttentionGroup {
-        id: String,
+
+    ListAttentionItems {
+        execution_id: String,
     },
-    /// Create a new attention (question or followup member). The engine
-    /// finds or creates the owning group based on the association and
-    /// source fields in the input. Replies with
-    /// [`FrontendEvent::AttentionCreated`].
-    CreateAttention {
+
+    ListAttentionItemsForWorkItem {
+        work_item_id: String,
+    },
+
+    /// List the `automation_runs` history for an automation, newest first.
+    /// Replies with [`FrontendEvent::AutomationRunsList`].
+    ListAutomationRuns {
+        automation_id: String,
+    },
+
+    /// List all automations for a product, ordered `created_at ASC`.
+    /// Replies with [`FrontendEvent::AutomationsList`].
+    ListAutomations {
+        product_id: String,
+    },
+
+    /// List tasks that were produced by a specific automation
+    /// (`tasks.source_automation_id = automation_id`), ordered by
+    /// `created_at DESC`. Replies with [`FrontendEvent::AutomationTasksList`].
+    ListAutomationTasks {
+        automation_id: String,
+    },
+
+    ListChores {
+        product_id: String,
+        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
+        /// See [`Self::ListTasks::include_deleted`].
+        #[serde(default)]
+        include_deleted: bool,
+    },
+
+    /// Read-only: list `ci_remediations` rows. The CLI surface is
+    /// `boss engine ci list` (design Phase 11 #35). Filters are AND-ed;
+    /// an empty `status` list matches every status. Ordering is
+    /// `created_at DESC, id DESC` so the freshest attempt is first.
+    ListCiRemediations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+
+    /// Read-only: list `conflict_resolutions` rows. The CLI surface is
+    /// `boss engine conflicts list` (design Phase 5 / #13). Filters are
+    /// AND-ed; an empty `status` list matches every status. Ordering is
+    /// `created_at DESC, id DESC` so the freshest attempt is first.
+    ListConflictResolutions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+
+    /// Return the prerequisite and/or dependent edges for one work
+    /// item. `direction` defaults to `both`.
+    ListDependencies {
         #[serde(flatten)]
-        input: CreateAttentionInput,
+        input: ListDependenciesInput,
     },
-    /// Record the human's answer for one attention member (`atn_…`).
-    /// Replies with [`FrontendEvent::AttentionGroupUpdated`] carrying
-    /// the group's updated state.
-    AnswerAttention {
-        /// The individual attention id (`atn_…`).
-        id: String,
-        /// The captured answer. Shape depends on the attention's
-        /// `question_type`: `"yes"`/`"no"` for `yes_no`; the chosen
-        /// value for `multiple_choice`; free text for `prompt`.
+
+    /// Resolved counterpart of [`Self::ListDependencies`]: returns
+    /// the same incoming / outgoing split, but each entry carries the
+    /// peer's status and name already joined in. Used by `boss
+    /// <kind> show` so the human / JSON renderer needs one round-trip
+    /// instead of N+1.
+    ListDependenciesDetailed {
+        #[serde(flatten)]
+        input: ListDependenciesInput,
+    },
+
+    /// List recorded editorial-action audit rows for a product, ordered
+    /// `created_at DESC` (freshest first). `limit` caps the result set;
+    /// defaults to 50 when absent. Returns
+    /// [`FrontendEvent::EditorialActionsList`].
+    ListEditorialActions {
+        product_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        answer: Option<String>,
-        /// Mark this member `skipped` rather than `answered`.
-        #[serde(default)]
-        skip: bool,
-        /// Mark this member `dismissed` without answering.
-        #[serde(default)]
-        dismiss: bool,
+        limit: Option<u32>,
     },
-    /// Action an open/partially-answered attention group — produce the
-    /// downstream artifact (one revision, one design task, or a batch
-    /// of new tasks) and transition the group to `actioned`. Replies
-    /// with [`FrontendEvent::AttentionGroupActioned`].
-    ActionAttentionGroup {
-        /// Group id (`atg_…`) or `A<n>` short id.
-        id: String,
-        /// When `true`, mark every unanswered member as `skipped`
-        /// before actioning so the caller doesn't need to touch every
-        /// row explicitly.
-        #[serde(default)]
-        skip_unanswered: bool,
-    },
-    /// Dismiss an attention group or a single member without producing a
-    /// downstream artifact. Accepts both `atg_…` group ids and `atn_…`
-    /// member ids; the engine discriminates by prefix. Replies with
-    /// [`FrontendEvent::AttentionGroupUpdated`].
-    DismissAttention {
-        /// `atg_…` to dismiss the whole group; `atn_…` to dismiss one
-        /// member.
-        id: String,
+
+    /// Read-only: list rows from any of the three attempt subsystems
+    /// (`conflict_resolutions`, `rebase_attempts`, `ci_remediations`),
+    /// projected through the [`EngineAttemptListEntry`] shape with a
+    /// `kind` discriminator. Design Phase 11 #36.
+    ///
+    /// `kinds` is the set of `kind` values to include; an empty vec
+    /// matches all three. `status` is AND-ed across all included
+    /// kinds (each row is filtered by its own table's `status`
+    /// column). Ordering: `created_at DESC` across the merged set.
+    ListEngineAttempts {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kinds: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
-    /// App self-identifies as the singleton app session. The engine
-    /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
-    /// engine's parent). After registration, `EngineRequest` events
-    /// flow to this session only.
-    RegisterAppSession,
-    /// App tells the engine which pid is the Boss session's shell.
-    /// Used to populate the second trust root for Boss-only RPCs.
-    /// Only the registered app session may call this.
-    RegisterBossSession {
-        shell_pid: i32,
+
+    ListExecutions {
+        work_item_id: Option<String>,
     },
-    /// App's reply to a previous `FrontendEvent::EngineRequest`.
-    /// `request_id` echoes the value the engine sent.
-    EngineResponse {
-        request_id: String,
-        response: EngineToAppResponse,
+
+    /// Snapshot of every registered engine feature flag and its current
+    /// value. Backs the macOS app's Feature Flags debug pane (incident
+    /// 001 AI #5). Replies with [`FrontendEvent::FeatureFlagsList`].
+    /// Read-only; no side effects.
+    ListFeatureFlags,
+
+    /// Snapshot of which slots currently have the live-status
+    /// summarizer disabled. The UI uses this to render the toggle
+    /// state on the Agents-tab worker row.
+    ListLiveStatusDisabledSlots,
+
+    ListProducts,
+
+    ListProjects {
+        product_id: String,
+        /// Phase 3 dep filter (Q6). Restricts the returned list to
+        /// rows that match a dependency-graph predicate before any
+        /// CLI-side filters (status / match / id). Backwards-
+        /// compatible: pre-Phase-3 callers omit the field and get the
+        /// historical behaviour.
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
     },
+
+    ListRuns {
+        execution_id: String,
+    },
+
+    ListTasks {
+        product_id: String,
+        project_id: Option<String>,
+        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
+        /// When `true`, soft-deleted rows (`deleted_at IS NOT NULL`) are
+        /// included in the result so the operator can find a tombstoned
+        /// task to `restore` it. Defaults to `false` — pre-existing
+        /// callers omit the field and keep the historical live-only view.
+        #[serde(default)]
+        include_deleted: bool,
+    },
+
+    /// Snapshot of every allocated worker slot's live state — what
+    /// model it's running, what activity (working / waiting / idle /
+    /// errored / terminated), most recent tool, etc. Source of truth
+    /// for the kanban Doing-icon and the per-pane titlebar pill.
+    /// Subscribers can also listen on the `worker.live_states` topic
+    /// for push updates whenever any slot's state changes.
+    ListWorkerLiveStates,
+
+    /// Worker → engine marker (Phase 9 #30): flip a non-terminal
+    /// `ci_remediations` attempt to `failed` with a reason. Mirrors
+    /// [`Self::MarkConflictResolutionFailed`] — the worker calls
+    /// this when it classifies the failure as `unfixable` (or
+    /// otherwise gives up without pushing). The parent stays
+    /// `blocked: ci_failure`.
+    MarkCiRemediationFailed {
+        attempt_id: String,
+        reason: String,
+    },
+
+    /// Worker → engine marker (Phase 9 #30): record that the worker
+    /// re-triggered the failing build via the per-provider CLI
+    /// (`bk build retry` / `gh run rerun --failed`). `new_id` is the
+    /// provider-emitted identifier for the new run/build (Buildkite
+    /// returns a fresh build id; GHA reuses the original run id).
+    /// The engine stamps it as a debug breadcrumb; the merge-poller's
+    /// CI probe observes the re-run's outcome on the next sweep.
+    /// `retrigger`-kind attempts stay `running` after this call
+    /// because their terminal status is set by the next probe; no
+    /// status flip happens here.
+    MarkCiRemediationRetriggered {
+        attempt_id: String,
+        new_id: String,
+    },
+
+    /// Worker → engine marker (Phase 9 #30, reconciled 2026-05-17 layered
+    /// design call): the worker rebased onto base HEAD, force-pushed,
+    /// and CI came back green without changing any code. Flip the
+    /// attempt to `succeeded` with `consumes_budget = 0` and refund
+    /// the detection-side `ci_attempts_used` bump. Idempotent — a
+    /// second call on the already-`succeeded` row is a no-op.
+    MarkCiRemediationSucceededViaRebase {
+        attempt_id: String,
+    },
+
+    /// Worker-facing escape hatch for the merge-conflict resolution
+    /// flow: flip a `conflict_resolutions` attempt to `failed` with a
+    /// reason. The CLI surface is `boss engine conflicts mark-failed
+    /// <attempt-id> --reason <r>` — workers call it when they hit one
+    /// of the stop conditions (semantic obsolescence, product decision
+    /// required, architectural mismatch) and decide not to push. See
+    /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
+    /// Q4 / Q11.
+    MarkConflictResolutionFailed {
+        attempt_id: String,
+        reason: String,
+    },
+
+    /// User-initiated "Merge When Ready" for a Review-lane task's PR.
+    /// The engine resolves the task's PR, determines the repo's merge
+    /// mechanism, and fires the appropriate GitHub operation:
+    /// - repo has a merge queue → enqueue the PR
+    /// - no merge queue, checks passing → merge directly
+    /// - no merge queue, checks pending → enable auto-merge
+    ///
+    /// Pre-flight guards: the task must be a task/chore (not a project),
+    /// have `status == "in_review"`, and carry a non-empty `pr_url`.
+    /// Any failure returns [`FrontendEvent::WorkError`]. On success,
+    /// replies with [`FrontendEvent::MergeWhenReadyAccepted`] and kicks
+    /// the PR-reconciler so the kanban reflects the new state promptly.
+    MergeWhenReady {
+        work_item_id: String,
+    },
+
+    /// Bulk snapshot of every registered counter and gauge, bypassing
+    /// the 30s flush-staleness window. Used by the macOS app's Metrics
+    /// debug pane to render a full listing in one round-trip instead of
+    /// one `MetricsShowLive` call per metric. Replies with
+    /// [`FrontendEvent::MetricsListLiveResult`]. Includes stale
+    /// (rehydrated from `state.db` but no current handle) entries so
+    /// the pane can surface historical counters that no longer exist in
+    /// the running binary.
+    MetricsListLive,
+
+    /// Reset one or all counter / gauge values to zero — both
+    /// in-memory and in `state.db` — in a single atomic step.
+    /// `name = None` means "reset everything". Routes through engine
+    /// RPC so the in-memory atomic and the database row are cleared in
+    /// lockstep; a direct SQLite write would leave the atomic stale
+    /// until the next flush. Replies with
+    /// [`FrontendEvent::MetricsResetDone`].
+    MetricsReset { name: Option<String> },
+
+    /// Read a single metric's current in-memory value, bypassing the
+    /// 30s flush-staleness window. Used by `bossctl metrics show
+    /// --live`. The engine replies with
+    /// [`FrontendEvent::MetricsShowLiveResult`]; `entry` is `None`
+    /// when no counter or gauge with `name` is registered.
+    MetricsShowLive { name: String },
+
+    /// App asks the engine to lease a workspace for the given Review-
+    /// column work item, fetch the PR branch, and create a fresh jj
+    /// commit off `<branch>@origin`. The engine replies with
+    /// [`FrontendEvent::ReviewTerminalReady`] on success or
+    /// [`FrontendEvent::WorkError`] on failure.
+    OpenReviewTerminal {
+        work_item_id: String,
+    },
+
     /// Boss-tier RPC: queue a probe prompt for `run_id`. By default
     /// the engine holds the text until the next `Stop` hook event for
     /// that run, then writes it into the worker's pty as if it were
@@ -401,57 +974,7 @@ pub enum FrontendRequest {
         #[serde(default)]
         urgent: bool,
     },
-    /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
-    /// and release the cube workspace its execution still holds.
-    /// Used by `bossctl agents stop`. Idempotent — duplicate requests
-    /// (or one racing with completion-detection) collapse to a no-op
-    /// on the second pass.
-    StopRun {
-        run_id: String,
-    },
-    /// Boss-tier RPC: bring the worker pane hosting `run_id` to the
-    /// front in the macOS app. Resolves `run_id → slot_id` via the
-    /// engine's worker registry and forwards a `FocusWorkerPane`
-    /// engine→app request. Used by `bossctl agents focus`. Returns a
-    /// `WorkError` if the run is unknown or has no allocated pane.
-    FocusWorkerPane {
-        run_id: String,
-    },
-    /// Boss-tier RPC: write `text` into the worker pane hosting
-    /// `run_id` as if the user typed it. Resolves `run_id → slot_id`
-    /// via the worker registry and forwards a `SendToPane` engine→app
-    /// request, which the app routes through the same libghostty
-    /// surface a real keystroke takes. Used by `bossctl agents send`.
-    /// Returns `WorkError` if the run is unknown, has no allocated
-    /// pane, or the app rejects the injection.
-    SendInputToWorker {
-        run_id: String,
-        text: String,
-    },
-    /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
-    /// equivalent to the human pressing Esc inside that pane.
-    /// Resolves `run_id → slot_id` and forwards an
-    /// `InterruptWorkerPane` engine→app request. Cancels the worker's
-    /// in-flight turn without killing the run. Used by `bossctl
-    /// agents interrupt`. Returns a `WorkError` if the run is unknown
-    /// or has no allocated pane.
-    InterruptWorkerPane {
-        run_id: String,
-    },
-    /// Snapshot of every allocated worker slot's live state — what
-    /// model it's running, what activity (working / waiting / idle /
-    /// errored / terminated), most recent tool, etc. Source of truth
-    /// for the kanban Doing-icon and the per-pane titlebar pill.
-    /// Subscribers can also listen on the `worker.live_states` topic
-    /// for push updates whenever any slot's state changes.
-    ListWorkerLiveStates,
-    /// Cancel a queued or running execution. Marks the execution row
-    /// `cancelled`, releases any cube workspace lease it still holds,
-    /// and tears down the libghostty pane (if one was allocated).
-    /// Idempotent on already-terminal rows (returns `WorkError`).
-    CancelExecution {
-        execution_id: String,
-    },
+
     /// Boss-only RPC: mark the execution backing `run_id` as the
     /// terminal `orphaned` status and preserve its cube workspace
     /// lease so a fresh execution can resume against the same branch.
@@ -463,6 +986,258 @@ pub enum FrontendRequest {
     ReapRun {
         run_id: String,
     },
+
+    /// Append an effort-level escalation event (design §Q5, PR
+    /// #370 follow-up). Wire surface used by the sibling
+    /// escalation-handler task; this task ships the row format and
+    /// the read path. Engine assigns `id` and `created_at`; the
+    /// caller passes the row's original / new level and the §Q4
+    /// markers the heuristic recorded against the row at creation.
+    /// Replies with [`FrontendEvent::EffortEscalationRecorded`].
+    RecordEffortEscalation {
+        work_item_id: String,
+        original_level: crate::EffortLevel,
+        new_level: crate::EffortLevel,
+        markers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+    },
+
+    /// App self-identifies as the singleton app session. The engine
+    /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
+    /// engine's parent). After registration, `EngineRequest` events
+    /// flow to this session only.
+    RegisterAppSession,
+
+    /// App tells the engine which pid is the Boss session's shell.
+    /// Used to populate the second trust root for Boss-only RPCs.
+    /// Only the registered app session may call this.
+    RegisterBossSession {
+        shell_pid: i32,
+    },
+
+    /// App notifies the engine that a review terminal window has closed
+    /// and the associated workspace lease should be released. This is
+    /// fire-and-forget: the engine logs failures but does not reply.
+    ReleaseReviewTerminal {
+        lease_id: String,
+    },
+
+    /// Drop the `(dependent, prerequisite, relation)` edge. No-op if
+    /// the edge does not exist (mirrors `boss <kind> delete` on an
+    /// already-archived row).
+    RemoveDependency {
+        #[serde(flatten)]
+        input: RemoveDependencyInput,
+    },
+
+    ReorderProjectTasks {
+        project_id: String,
+        task_ids: Vec<String>,
+    },
+
+    RequestExecution {
+        #[serde(flatten)]
+        input: RequestExecutionInput,
+    },
+
+    /// Read-only: resolve a project's design-doc pointer into the
+    /// structured [`ResolveProjectDesignDocOutput`] the UI consumes.
+    /// Engine-side this is `WorkDb::resolve_project_design_doc`
+    /// composed with a cheap check against the engine's in-flight
+    /// execution list to populate
+    /// [`ProjectDesignDocState::Resolved::workspace_path`].
+    /// No DB writes; no topic events.
+    ResolveProjectDesignDoc { project_id: String },
+
+    /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
+    /// tombstone on a soft-deleted task, making it visible again. The
+    /// `id` accepts a canonical `task_…` id or a friendly short id
+    /// (`T43`); the engine resolves the friendly form against
+    /// soft-deleted rows too, so a tombstoned task is still findable.
+    /// Idempotent — restoring an already-live row succeeds as a no-op.
+    /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
+    RestoreWorkItem {
+        id: String,
+    },
+
+    /// User-facing reset for an `in_review` PR that has been blocked
+    /// by the CI auto-fix flow. Accepts either a work-item id or a
+    /// `ci_remediations` attempt id (the engine resolves an attempt id
+    /// to its parent's `work_item_id`). Resets `tasks.ci_attempts_used`
+    /// to 0 and, when the parent is `blocked: ci_failure_exhausted`,
+    /// flips it back to `in_review` so the next merge-poller sweep
+    /// re-fires the auto-fix path. Design Phase 11 #35; see also Q11.
+    RetryCiRemediation {
+        /// Either a `ci_remediations` attempt id (`cir_…`) or a
+        /// work-item id. The engine handles both shapes.
+        selector: String,
+    },
+
+    /// Reset a terminal-failure attempt back to `pending` so the
+    /// dispatcher re-spawns a worker. Only valid for rows whose status
+    /// is `failed` or `abandoned`; calling on a non-terminal row
+    /// (`pending` / `running`) is rejected. The parent work item is
+    /// re-flipped to `blocked: merge_conflict` and the new
+    /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
+    RetryConflictResolution { attempt_id: String },
+
+    /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
+    /// specific work item's card and play a short transient highlight.
+    /// `id` accepts a canonical id (`task_…`, `proj_…`) or a
+    /// short-id form (`T607`). Idempotent — repeat calls re-pulse
+    /// without animation overlap. Replies with [`FrontendEvent::WorkItemRevealed`]
+    /// on success or [`FrontendEvent::WorkError`] on failure (item not
+    /// found, item deleted, app not running, unknown id format).
+    RevealWorkItem {
+        id: String,
+    },
+
+    /// Enqueue an out-of-schedule triage fire for an automation.
+    /// `force = true` bypasses the open-task cap. Replies with
+    /// [`FrontendEvent::AutomationRunEnqueued`] when the fire was accepted,
+    /// or [`FrontendEvent::WorkError`] if the cap gate blocks it (and
+    /// `force` was not set).
+    RunAutomation {
+        automation_id: String,
+        force: bool,
+    },
+
+    /// Boss-tier RPC: write `text` into the worker pane hosting
+    /// `run_id` as if the user typed it. Resolves `run_id → slot_id`
+    /// via the worker registry and forwards a `SendToPane` engine→app
+    /// request, which the app routes through the same libghostty
+    /// surface a real keystroke takes. Used by `bossctl agents send`.
+    /// Returns `WorkError` if the run is unknown, has no allocated
+    /// pane, or the app rejects the injection.
+    SendInputToWorker {
+        run_id: String,
+        text: String,
+    },
+
+    /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`
+    /// override. Pass `Some(n)` (clamped server-side to `0..=10`) or
+    /// `None` (clear → product default applies). Backs
+    /// `boss engine ci budget set`.
+    SetCiBudget {
+        work_item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<i64>,
+    },
+
+    /// Toggle one feature flag on or off. The engine updates the
+    /// in-memory map and rewrites the on-disk file atomically; the
+    /// new value is visible to consumer-side `is_enabled` calls the
+    /// moment this request returns. The reply
+    /// ([`FrontendEvent::FeatureFlagSet`]) confirms the persisted
+    /// state and is the round-trip "the engine has reloaded" signal
+    /// the debug pane uses to render the toggle as committed.
+    SetFeatureFlag { name: String, enabled: bool },
+
+    /// Per-slot toggle for the live-status summarizer. When
+    /// `enabled = false`, the engine stops calling the summarizer for
+    /// `slot_id` and clears any existing `live_status`; the UI falls
+    /// back to the static pane_summary. Persisted in the engine
+    /// metadata table so the choice survives engine restarts.
+    /// Idempotent — toggling to the current state is a benign no-op.
+    SetLiveStatusEnabled {
+        slot_id: u8,
+        enabled: bool,
+    },
+
+    /// Set (or clear) a product's `default_model` per the
+    /// effort-and-model-estimation design (PR #370). `model` is a
+    /// claude model slug stored verbatim; `None` clears the column.
+    /// The engine does NOT validate the slug — claude is the source
+    /// of truth on what `--model` accepts (design §Q3). Returns the
+    /// updated product wrapped in `WorkItemUpdated`.
+    SetProductDefaultModel {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
+    /// Set (or clear) a product's editorial rules. `rules = None` in
+    /// the input clears the stored blob; the product reverts to the
+    /// engine defaults (strip known Boss identifiers, no template
+    /// enforcement). Returns [`FrontendEvent::WorkItemUpdated`] carrying
+    /// the updated product row, or [`FrontendEvent::WorkError`] if the
+    /// product is not found.
+    SetProductEditorialRules {
+        #[serde(flatten)]
+        input: SetProductEditorialRulesInput,
+    },
+
+    /// Bind (or unbind) an external tracker on a product. When `unset`
+    /// is `true`, both `external_tracker_kind` and
+    /// `external_tracker_config` are cleared. Otherwise both `kind` and
+    /// `config` must be present; the engine passes `config` through the
+    /// tracker impl's `validate_config` before persisting. Replies with
+    /// [`FrontendEvent::WorkItemUpdated`] carrying the updated product
+    /// row, or [`FrontendEvent::WorkError`] on validation failure.
+    SetProductExternalTracker {
+        #[serde(flatten)]
+        input: SetProductExternalTrackerInput,
+    },
+
+    /// Set (or clear) a project's design-doc pointer. Persists the
+    /// three `projects.design_doc_*` columns per
+    /// [`SetProjectDesignDocInput`]'s semantics and replies with the
+    /// updated `Project` row wrapped in a `WorkItemUpdated` event —
+    /// same shape `UpdateWorkItem` returns for any other property
+    /// edit, so existing kanban subscribers refresh without special
+    /// casing. Publishes a `work_invalidated` topic event on the
+    /// project's product so other connected clients see the change.
+    SetProjectDesignDoc {
+        #[serde(flatten)]
+        input: SetProjectDesignDocInput,
+    },
+
+    /// Set one per-installation setting. The engine persists to
+    /// `settings.toml` atomically; consumer-side reads see the new
+    /// value the moment this returns. The reply
+    /// ([`FrontendEvent::SettingSet`]) confirms the persisted value.
+    SetSetting { key: String, enabled: bool },
+
+    /// Token-authenticated shutdown. The engine writes a random token
+    /// to `~/Library/Application Support/Boss/engine-control.token`
+    /// (mode 0600) at startup; callers that want to ask the engine to
+    /// exit cleanly read the token file and send it here. The engine
+    /// validates the token verbatim and, on match, replies with
+    /// [`FrontendEvent::ShutdownAccepted`] then triggers the same
+    /// graceful-shutdown path SIGTERM takes. A mismatch replies with
+    /// [`FrontendEvent::ShutdownRejected`] and records an audit entry.
+    ///
+    /// Replaces SIGTERM as the everyday "restart engine" gesture — see
+    /// issue #705. The macOS app, `boss engine stop`, and bossctl all
+    /// take this route; SIGTERM remains the OS-shutdown fallback.
+    Shutdown {
+        token: String,
+    },
+
+    /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
+    /// and release the cube workspace its execution still holds.
+    /// Used by `bossctl agents stop`. Idempotent — duplicate requests
+    /// (or one racing with completion-detection) collapse to a no-op
+    /// on the second pass.
+    StopRun {
+        run_id: String,
+    },
+
+    Subscribe {
+        topics: Vec<String>,
+    },
+
+    /// Trigger an immediate reconcile pass for a single product's external
+    /// tracker binding. Runs the same per-product logic as the periodic
+    /// loop but synchronously in response to an explicit request. Useful
+    /// for `boss product sync-external-tracker <selector>`. Replies with
+    /// [`FrontendEvent::ExternalTrackerSyncStarted`] when the pass starts,
+    /// or [`FrontendEvent::WorkError`] if the product has no binding.
+    SyncProductExternalTracker {
+        product_id: String,
+    },
+
     /// Tail the most recent transcript chunk for `run_id`. `run_id`
     /// may be either an `exec_*` (execution) or `run_*` (work_runs)
     /// id — `bossctl agents transcript` passes the execution id (the
@@ -489,341 +1264,7 @@ pub enum FrontendRequest {
         run_id: String,
         lines: usize,
     },
-    /// Snapshot the cube workspace pool. Proxies to
-    /// `cube --json workspace list`; the engine adds no editorial — the
-    /// returned vector mirrors cube's view, optionally annotated with
-    /// the engine's own knowledge of which leases back which executions.
-    WorkspacePoolSummary,
-    /// Declare a `blocks` edge from `dependent` to `prerequisite`.
-    /// Idempotent: re-adding an existing edge is a no-op. Cycles are
-    /// rejected at the engine before insert.
-    AddDependency {
-        #[serde(flatten)]
-        input: AddDependencyInput,
-    },
-    /// Drop the `(dependent, prerequisite, relation)` edge. No-op if
-    /// the edge does not exist (mirrors `boss <kind> delete` on an
-    /// already-archived row).
-    RemoveDependency {
-        #[serde(flatten)]
-        input: RemoveDependencyInput,
-    },
-    /// Return the prerequisite and/or dependent edges for one work
-    /// item. `direction` defaults to `both`.
-    ListDependencies {
-        #[serde(flatten)]
-        input: ListDependenciesInput,
-    },
-    /// Resolved counterpart of [`Self::ListDependencies`]: returns
-    /// the same incoming / outgoing split, but each entry carries the
-    /// peer's status and name already joined in. Used by `boss
-    /// <kind> show` so the human / JSON renderer needs one round-trip
-    /// instead of N+1.
-    ListDependenciesDetailed {
-        #[serde(flatten)]
-        input: ListDependenciesInput,
-    },
-    /// Per-slot toggle for the live-status summarizer. When
-    /// `enabled = false`, the engine stops calling the summarizer for
-    /// `slot_id` and clears any existing `live_status`; the UI falls
-    /// back to the static pane_summary. Persisted in the engine
-    /// metadata table so the choice survives engine restarts.
-    /// Idempotent — toggling to the current state is a benign no-op.
-    SetLiveStatusEnabled {
-        slot_id: u8,
-        enabled: bool,
-    },
-    /// Snapshot of which slots currently have the live-status
-    /// summarizer disabled. The UI uses this to render the toggle
-    /// state on the Agents-tab worker row.
-    ListLiveStatusDisabledSlots,
-    /// One-shot diagnostic snapshot of the live-status pipeline.
-    /// Returns the engine build SHA, ANTHROPIC_API_KEY presence, and
-    /// per-slot detail covering trigger / outcome / transcript path —
-    /// see [`crate::LiveStatusDebugReport`]. Wired through to
-    /// `bossctl live-status debug`. Read-only; no side effects.
-    DebugLiveStatusPipeline,
-    /// Create a `kind = 'investigation'` task. Parallel to
-    /// `CreateChore` but uses `investigation` kind and supports an
-    /// optional `project_id`. Workers dispatched against investigation
-    /// tasks receive a doc-output prelude and open PRs against the
-    /// product's `docs_repo` or `BOSS_USER_DOCS_REPO`.
-    CreateInvestigation {
-        #[serde(flatten)]
-        input: CreateInvestigationInput,
-    },
-    /// Create a `kind = 'revision'` task bound to an existing parent task
-    /// whose PR is open and unmerged. The worker's deliverable is a new
-    /// commit on the parent's PR branch — no new PR is opened. Mirrors
-    /// `CreateInvestigation` in structure; gate enforcement and dispatch
-    /// are implemented in Phase 2 and Phase 3 respectively. Ships dark in
-    /// Phase 1: the wire type is parseable but no kind is dispatchable yet.
-    CreateRevision {
-        #[serde(flatten)]
-        input: CreateRevisionInput,
-    },
-    /// Set (or clear) a project's design-doc pointer. Persists the
-    /// three `projects.design_doc_*` columns per
-    /// [`SetProjectDesignDocInput`]'s semantics and replies with the
-    /// updated `Project` row wrapped in a `WorkItemUpdated` event —
-    /// same shape `UpdateWorkItem` returns for any other property
-    /// edit, so existing kanban subscribers refresh without special
-    /// casing. Publishes a `work_invalidated` topic event on the
-    /// project's product so other connected clients see the change.
-    SetProjectDesignDoc {
-        #[serde(flatten)]
-        input: SetProjectDesignDocInput,
-    },
-    /// Read-only: resolve a project's design-doc pointer into the
-    /// structured [`ResolveProjectDesignDocOutput`] the UI consumes.
-    /// Engine-side this is `WorkDb::resolve_project_design_doc`
-    /// composed with a cheap check against the engine's in-flight
-    /// execution list to populate
-    /// [`ProjectDesignDocState::Resolved::workspace_path`].
-    /// No DB writes; no topic events.
-    ResolveProjectDesignDoc { project_id: String },
-    /// Worker-facing escape hatch for the merge-conflict resolution
-    /// flow: flip a `conflict_resolutions` attempt to `failed` with a
-    /// reason. The CLI surface is `boss engine conflicts mark-failed
-    /// <attempt-id> --reason <r>` — workers call it when they hit one
-    /// of the stop conditions (semantic obsolescence, product decision
-    /// required, architectural mismatch) and decide not to push. See
-    /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
-    /// Q4 / Q11.
-    MarkConflictResolutionFailed {
-        attempt_id: String,
-        reason: String,
-    },
-    /// Worker → engine marker (Phase 9 #30): record the worker's
-    /// post-log triage decision on a `ci_remediations` attempt.
-    /// Canonical values: `tractable`, `flaky_or_infra`, `unfixable`.
-    /// Pure metadata column on the attempt row; no state-machine
-    /// effect — the worker still calls `mark-failed` (`unfixable` /
-    /// give up), `mark-retriggered` (`flaky_or_infra` → re-ran),
-    /// or simply pushes (`tractable` → fix landed) to drive the
-    /// terminal status.
-    ClassifyCiRemediation {
-        attempt_id: String,
-        triage_class: String,
-    },
-    /// Worker → engine marker (Phase 9 #30): flip a non-terminal
-    /// `ci_remediations` attempt to `failed` with a reason. Mirrors
-    /// [`Self::MarkConflictResolutionFailed`] — the worker calls
-    /// this when it classifies the failure as `unfixable` (or
-    /// otherwise gives up without pushing). The parent stays
-    /// `blocked: ci_failure`.
-    MarkCiRemediationFailed {
-        attempt_id: String,
-        reason: String,
-    },
-    /// Worker → engine marker (Phase 9 #30): record that the worker
-    /// re-triggered the failing build via the per-provider CLI
-    /// (`bk build retry` / `gh run rerun --failed`). `new_id` is the
-    /// provider-emitted identifier for the new run/build (Buildkite
-    /// returns a fresh build id; GHA reuses the original run id).
-    /// The engine stamps it as a debug breadcrumb; the merge-poller's
-    /// CI probe observes the re-run's outcome on the next sweep.
-    /// `retrigger`-kind attempts stay `running` after this call
-    /// because their terminal status is set by the next probe; no
-    /// status flip happens here.
-    MarkCiRemediationRetriggered {
-        attempt_id: String,
-        new_id: String,
-    },
-    /// Worker → engine marker (Phase 9 #30, reconciled 2026-05-17 layered
-    /// design call): the worker rebased onto base HEAD, force-pushed,
-    /// and CI came back green without changing any code. Flip the
-    /// attempt to `succeeded` with `consumes_budget = 0` and refund
-    /// the detection-side `ci_attempts_used` bump. Idempotent — a
-    /// second call on the already-`succeeded` row is a no-op.
-    MarkCiRemediationSucceededViaRebase {
-        attempt_id: String,
-    },
-    /// Read-only: list `conflict_resolutions` rows. The CLI surface is
-    /// `boss engine conflicts list` (design Phase 5 / #13). Filters are
-    /// AND-ed; an empty `status` list matches every status. Ordering is
-    /// `created_at DESC, id DESC` so the freshest attempt is first.
-    ListConflictResolutions {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        product_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        status: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        work_item_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Read-only: fetch a single attempt row by id. Returns
-    /// [`FrontendEvent::ConflictResolution`] on success and
-    /// [`FrontendEvent::WorkError`] when the id is unknown.
-    GetConflictResolution { attempt_id: String },
-    /// Reset a terminal-failure attempt back to `pending` so the
-    /// dispatcher re-spawns a worker. Only valid for rows whose status
-    /// is `failed` or `abandoned`; calling on a non-terminal row
-    /// (`pending` / `running`) is rejected. The parent work item is
-    /// re-flipped to `blocked: merge_conflict` and the new
-    /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
-    RetryConflictResolution { attempt_id: String },
-    /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
-    /// with the supplied reason. Distinct from `mark-failed` in that the
-    /// caller is explicitly stepping away (PR closed, parent merged
-    /// externally, manual override) rather than declaring the worker
-    /// gave up. Idempotent; rows already terminal yield a WorkError.
-    AbandonConflictResolution {
-        attempt_id: String,
-        reason: String,
-    },
-    /// Set (or clear) a product's `default_model` per the
-    /// effort-and-model-estimation design (PR #370). `model` is a
-    /// claude model slug stored verbatim; `None` clears the column.
-    /// The engine does NOT validate the slug — claude is the source
-    /// of truth on what `--model` accepts (design §Q3). Returns the
-    /// updated product wrapped in `WorkItemUpdated`.
-    SetProductDefaultModel {
-        product_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-    },
-    /// Heuristic feedback-loop audit (design §Q4 follow-up, PR #370).
-    /// Aggregates recorded escalation events for `product_id`
-    /// against the §Q4 marker corpus and returns a snapshot report
-    /// of under-classification rates per marker. Read-only; backs
-    /// the `boss product audit-effort` CLI verb. `window_days`
-    /// trims the event set to a rolling window (events older than
-    /// `now - window` are excluded); `None` means "all recorded
-    /// events." Replies with [`FrontendEvent::EffortAuditReport`].
-    AuditProductEffort {
-        product_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        window_days: Option<u32>,
-    },
-    /// Append an effort-level escalation event (design §Q5, PR
-    /// #370 follow-up). Wire surface used by the sibling
-    /// escalation-handler task; this task ships the row format and
-    /// the read path. Engine assigns `id` and `created_at`; the
-    /// caller passes the row's original / new level and the §Q4
-    /// markers the heuristic recorded against the row at creation.
-    /// Replies with [`FrontendEvent::EffortEscalationRecorded`].
-    RecordEffortEscalation {
-        work_item_id: String,
-        original_level: crate::EffortLevel,
-        new_level: crate::EffortLevel,
-        markers: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        rule_id: Option<String>,
-    },
-    /// Snapshot of every registered engine feature flag and its current
-    /// value. Backs the macOS app's Feature Flags debug pane (incident
-    /// 001 AI #5). Replies with [`FrontendEvent::FeatureFlagsList`].
-    /// Read-only; no side effects.
-    ListFeatureFlags,
-    /// Toggle one feature flag on or off. The engine updates the
-    /// in-memory map and rewrites the on-disk file atomically; the
-    /// new value is visible to consumer-side `is_enabled` calls the
-    /// moment this request returns. The reply
-    /// ([`FrontendEvent::FeatureFlagSet`]) confirms the persisted
-    /// state and is the round-trip "the engine has reloaded" signal
-    /// the debug pane uses to render the toggle as committed.
-    SetFeatureFlag { name: String, enabled: bool },
-    /// Ask the engine to identify itself. Replies with
-    /// [`FrontendEvent::EngineVersionResult`] carrying the build SHA,
-    /// build time, and binary-content fingerprint of the running
-    /// engine binary. Used by the macOS app on attach to detect
-    /// whether the running engine matches the app's bundled engine; if
-    /// they differ the app stops the old engine and spawns the new one
-    /// from the bundle, ensuring the user always gets the version that
-    /// shipped with the app they launched.
-    GetEngineVersion,
-    /// One-shot snapshot of the engine's user-visible configuration
-    /// health — currently a single ANTHROPIC_API_KEY presence bit plus
-    /// any rendered [`EngineHealthIssue`]s the UI should surface as a
-    /// banner / settings-pane warning. Read-only; no side effects.
-    /// Replies with [`FrontendEvent::EngineHealthResult`]. The macOS
-    /// app calls this on session start so a missing API key cannot
-    /// silently break summarization the way it did before #699.
-    GetEngineHealth,
-    /// Snapshot of every registered per-installation setting and its
-    /// current value. Used by the macOS Settings window to render the
-    /// current state on open. Replies with
-    /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
-    GetSettings,
-    /// Set one per-installation setting. The engine persists to
-    /// `settings.toml` atomically; consumer-side reads see the new
-    /// value the moment this returns. The reply
-    /// ([`FrontendEvent::SettingSet`]) confirms the persisted value.
-    SetSetting { key: String, enabled: bool },
-    /// Read a single metric's current in-memory value, bypassing the
-    /// 30s flush-staleness window. Used by `bossctl metrics show
-    /// --live`. The engine replies with
-    /// [`FrontendEvent::MetricsShowLiveResult`]; `entry` is `None`
-    /// when no counter or gauge with `name` is registered.
-    MetricsShowLive { name: String },
-    /// Bulk snapshot of every registered counter and gauge, bypassing
-    /// the 30s flush-staleness window. Used by the macOS app's Metrics
-    /// debug pane to render a full listing in one round-trip instead of
-    /// one `MetricsShowLive` call per metric. Replies with
-    /// [`FrontendEvent::MetricsListLiveResult`]. Includes stale
-    /// (rehydrated from `state.db` but no current handle) entries so
-    /// the pane can surface historical counters that no longer exist in
-    /// the running binary.
-    MetricsListLive,
-    /// Reset one or all counter / gauge values to zero — both
-    /// in-memory and in `state.db` — in a single atomic step.
-    /// `name = None` means "reset everything". Routes through engine
-    /// RPC so the in-memory atomic and the database row are cleared in
-    /// lockstep; a direct SQLite write would leave the atomic stale
-    /// until the next flush. Replies with
-    /// [`FrontendEvent::MetricsResetDone`].
-    MetricsReset { name: Option<String> },
-    /// App sends this when its window becomes active (user switching back
-    /// from another app, e.g. after reviewing a PR on GitHub). The engine
-    /// schedules an immediate pass of every PR-state reconciler so the
-    /// kanban reflects upstream changes without waiting for the next
-    /// periodic tick. Engine-side quiescing (15 s window) prevents
-    /// repeated GitHub API calls on rapid focus-toggle events.
-    /// Replies with [`FrontendEvent::PrReconcilersKicked`].
-    KickPrReconcilers,
-    /// Per-work-item runtime snapshot — single-item flavour of the
-    /// `task_runtimes` block carried in `WorkTree`. Used by
-    /// `boss chore show` / `boss task show` to enrich the rendered work
-    /// item with the active execution and run ids without re-fetching
-    /// the entire product tree. Replies with
-    /// [`FrontendEvent::TaskRuntimeResult`]. Returns the same
-    /// `TaskRuntime` shape `WorkTree` uses; every `Option` is `None`
-    /// when the work item has no executions yet.
-    GetTaskRuntime {
-        work_item_id: String,
-    },
-    /// Bind (or unbind) an external tracker on a product. When `unset`
-    /// is `true`, both `external_tracker_kind` and
-    /// `external_tracker_config` are cleared. Otherwise both `kind` and
-    /// `config` must be present; the engine passes `config` through the
-    /// tracker impl's `validate_config` before persisting. Replies with
-    /// [`FrontendEvent::WorkItemUpdated`] carrying the updated product
-    /// row, or [`FrontendEvent::WorkError`] on validation failure.
-    SetProductExternalTracker {
-        #[serde(flatten)]
-        input: SetProductExternalTrackerInput,
-    },
-    /// Trigger an immediate reconcile pass for a single product's external
-    /// tracker binding. Runs the same per-product logic as the periodic
-    /// loop but synchronously in response to an explicit request. Useful
-    /// for `boss product sync-external-tracker <selector>`. Replies with
-    /// [`FrontendEvent::ExternalTrackerSyncStarted`] when the pass starts,
-    /// or [`FrontendEvent::WorkError`] if the product has no binding.
-    SyncProductExternalTracker {
-        product_id: String,
-    },
-    /// Manually link a work item to a specific upstream tracker issue.
-    /// The engine stores `kind`/`canonical_id` on the row; `raw` and
-    /// `web_url` are populated on the next reconcile tick via
-    /// `fetch_item`. Replies with [`FrontendEvent::WorkItemUpdated`]
-    /// carrying the updated row, or [`FrontendEvent::WorkError`] if the
-    /// work item or tracker kind is not found.
-    LinkWorkItemExternalRef {
-        #[serde(flatten)]
-        input: LinkExternalRefInput,
-    },
+
     /// Remove the external-tracker binding from a work item. Clears the
     /// `external_ref_*` columns without touching other fields. Replies with
     /// [`FrontendEvent::WorkItemUpdated`] carrying the updated row, or
@@ -831,352 +1272,28 @@ pub enum FrontendRequest {
     UnlinkWorkItemExternalRef {
         work_item_id: String,
     },
-    /// Read-only: list `ci_remediations` rows. The CLI surface is
-    /// `boss engine ci list` (design Phase 11 #35). Filters are AND-ed;
-    /// an empty `status` list matches every status. Ordering is
-    /// `created_at DESC, id DESC` so the freshest attempt is first.
-    ListCiRemediations {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        product_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        status: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        work_item_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Read-only: fetch a single `ci_remediations` row by id. Returns
-    /// [`FrontendEvent::CiRemediation`] on success and
-    /// [`FrontendEvent::WorkError`] when the id is unknown.
-    GetCiRemediation { attempt_id: String },
-    /// User-facing reset for an `in_review` PR that has been blocked
-    /// by the CI auto-fix flow. Accepts either a work-item id or a
-    /// `ci_remediations` attempt id (the engine resolves an attempt id
-    /// to its parent's `work_item_id`). Resets `tasks.ci_attempts_used`
-    /// to 0 and, when the parent is `blocked: ci_failure_exhausted`,
-    /// flips it back to `in_review` so the next merge-poller sweep
-    /// re-fires the auto-fix path. Design Phase 11 #35; see also Q11.
-    RetryCiRemediation {
-        /// Either a `ci_remediations` attempt id (`cir_…`) or a
-        /// work-item id. The engine handles both shapes.
-        selector: String,
-    },
-    /// Engine-side abandon for a non-terminal `ci_remediations`
-    /// attempt. Distinct from `MarkCiRemediationFailed` (the
-    /// worker-facing "I gave up" surface) in that the caller is
-    /// explicitly stepping away (manual override). Idempotent on rows
-    /// already terminal — returns [`FrontendEvent::WorkError`].
-    AbandonCiRemediation {
-        attempt_id: String,
-        reason: String,
-    },
-    /// Read-only: snapshot a work item's CI attempt budget — the
-    /// `tasks.ci_attempt_budget` override, the product's default, the
-    /// effective value the engine uses, and the live
-    /// `tasks.ci_attempts_used` counter. Backs the
-    /// `boss engine ci budget show <work-item-id>` verb.
-    GetCiBudget { work_item_id: String },
-    /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`
-    /// override. Pass `Some(n)` (clamped server-side to `0..=10`) or
-    /// `None` (clear → product default applies). Backs
-    /// `boss engine ci budget set`.
-    SetCiBudget {
-        work_item_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        budget: Option<i64>,
-    },
-    /// Read-only: list rows from any of the three attempt subsystems
-    /// (`conflict_resolutions`, `rebase_attempts`, `ci_remediations`),
-    /// projected through the [`EngineAttemptListEntry`] shape with a
-    /// `kind` discriminator. Design Phase 11 #36.
-    ///
-    /// `kinds` is the set of `kind` values to include; an empty vec
-    /// matches all three. `status` is AND-ed across all included
-    /// kinds (each row is filtered by its own table's `status`
-    /// column). Ordering: `created_at DESC` across the merged set.
-    ListEngineAttempts {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        kinds: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        product_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        status: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        work_item_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
-    /// specific work item's card and play a short transient highlight.
-    /// `id` accepts a canonical id (`task_…`, `proj_…`) or a
-    /// short-id form (`T607`). Idempotent — repeat calls re-pulse
-    /// without animation overlap. Replies with [`FrontendEvent::WorkItemRevealed`]
-    /// on success or [`FrontendEvent::WorkError`] on failure (item not
-    /// found, item deleted, app not running, unknown id format).
-    RevealWorkItem {
-        id: String,
-    },
-    /// Token-authenticated shutdown. The engine writes a random token
-    /// to `~/Library/Application Support/Boss/engine-control.token`
-    /// (mode 0600) at startup; callers that want to ask the engine to
-    /// exit cleanly read the token file and send it here. The engine
-    /// validates the token verbatim and, on match, replies with
-    /// [`FrontendEvent::ShutdownAccepted`] then triggers the same
-    /// graceful-shutdown path SIGTERM takes. A mismatch replies with
-    /// [`FrontendEvent::ShutdownRejected`] and records an audit entry.
-    ///
-    /// Replaces SIGTERM as the everyday "restart engine" gesture — see
-    /// issue #705. The macOS app, `boss engine stop`, and bossctl all
-    /// take this route; SIGTERM remains the OS-shutdown fallback.
-    Shutdown {
-        token: String,
-    },
-    /// Begin the GitHub OAuth device-flow authorization for github.com.
-    /// The engine starts the flow, requests a device code, and pushes
-    /// [`FrontendEvent::GitHubAuthState`] events as the flow advances.
-    /// If a flow is already in progress this is a no-op.
-    GitHubAuthStart,
-    /// Abort an in-progress device-flow authorization. The engine
-    /// stops the poll loop and transitions to `Disconnected`. No-op
-    /// if no flow is in progress.
-    GitHubAuthCancel,
-    /// Delete the stored OAuth token and return to `Disconnected`.
-    /// The deletion is local only (no server-side revocation).
-    GitHubAuthDisconnect,
-    /// Request the current GitHub auth state. The engine replies
-    /// immediately with a [`FrontendEvent::GitHubAuthState`] push
-    /// reflecting the latest known state.
-    GitHubAuthStatus,
 
-    // --- Comments in the markdown viewer (design:
-    // comments-in-markdown-viewer.md, Phase 2). All user-tier. ---
-    /// Create an `active` comment on an artifact. Returns the row.
-    CommentsCreate {
-        #[serde(flatten)]
-        input: CreateCommentInput,
-    },
-    /// List comments for an artifact. Excludes `resolved` / `dismissed`
-    /// (and `orphaned` unless `include_resolved`) by default.
-    CommentsList {
-        artifact_kind: String,
-        artifact_id: String,
-        #[serde(default)]
-        include_resolved: bool,
-    },
-    /// Resolve every active comment on an artifact against the renderer's
-    /// current plain-text projection. The engine runs the
-    /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting
-    /// `last_resolved_with = 'fuzzy'`) and flips unresolvable comments to
-    /// `orphaned`, then returns each comment with its [`CommentResolution`].
-    CommentsResolve {
-        artifact_kind: String,
-        artifact_id: String,
-        /// The doc's current rendered plain-text projection.
-        plain_text: String,
-        #[serde(default)]
-        plain_text_projection_version: i64,
-    },
-    /// Soft-dismiss: transition a comment to `resolved`.
-    CommentsDismiss {
-        comment_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<String>,
-    },
-    /// General status transition (`active` / `resolved` / `orphaned`).
-    /// Re-activation is accepted; hard delete is not exposed.
-    CommentsSetStatus {
-        comment_id: String,
-        status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<String>,
-    },
-    /// Renderer callback after a fuzzy re-resolve: persists the new anchor
-    /// coordinates so subsequent loads exact-match. Records the fuzzy
-    /// outcome on the row.
-    CommentsUpdateAnchor {
-        comment_id: String,
-        anchor: CommentAnchor,
-        new_doc_version: String,
-        #[serde(default)]
-        plain_text_projection_version: i64,
-    },
-    /// User-initiated "Merge When Ready" for a Review-lane task's PR.
-    /// The engine resolves the task's PR, determines the repo's merge
-    /// mechanism, and fires the appropriate GitHub operation:
-    /// - repo has a merge queue → enqueue the PR
-    /// - no merge queue, checks passing → merge directly
-    /// - no merge queue, checks pending → enable auto-merge
-    ///
-    /// Pre-flight guards: the task must be a task/chore (not a project),
-    /// have `status == "in_review"`, and carry a non-empty `pr_url`.
-    /// Any failure returns [`FrontendEvent::WorkError`]. On success,
-    /// replies with [`FrontendEvent::MergeWhenReadyAccepted`] and kicks
-    /// the PR-reconciler so the kanban reflects the new state promptly.
-    MergeWhenReady {
-        work_item_id: String,
+    Unsubscribe {
+        topics: Vec<String>,
     },
 
-    // --- Magic wand (Phase 3: engine-owned docs). ---
-    /// App-or-Boss-session RPC: dispatch a specialised one-shot Claude call
-    /// against the comment's work-item description. The engine inserts an
-    /// `in_flight` dispatch row and spawns an async task; the caller receives
-    /// `MagicWandDispatched` immediately. The result arrives asynchronously on
-    /// the `magic_wand.dispatch.<dispatch_id>` topic as `MagicWandResult` when
-    /// the Claude call completes. Only valid for `artifact_kind = 'work_item'`
-    /// comments (Phase 4 handles `pr_doc`).
-    CommentsDispatchMagicWand {
-        comment_id: String,
-    },
-    /// Apply the magic-wand result: overwrite the work-item description with
-    /// `result_md` after a doc-version CAS check. `current_doc_version` is the
-    /// SHA-256 of the doc's current plain-text projection, computed by the
-    /// macOS renderer. On match with the dispatch's stored `doc_version`, the
-    /// description is overwritten atomically and the dispatch transitions to
-    /// `applied`. On mismatch (the doc was edited between dispatch and apply)
-    /// the dispatch transitions to `conflict` and `conflict = true` is returned
-    /// so the UI can show a reload affordance. User-tier — workers may not call.
-    CommentsApplyMagicWand {
-        dispatch_id: String,
-        /// SHA-256 of the doc's current plain-text projection (for CAS).
-        current_doc_version: String,
-    },
-    /// Discard the magic-wand result without modifying the description.
-    /// Transitions the dispatch to `discarded`; the comment stays `active`.
-    CommentsDiscardMagicWand {
-        dispatch_id: String,
-    },
-
-    /// App asks the engine to lease a workspace for the given Review-
-    /// column work item, fetch the PR branch, and create a fresh jj
-    /// commit off `<branch>@origin`. The engine replies with
-    /// [`FrontendEvent::ReviewTerminalReady`] on success or
-    /// [`FrontendEvent::WorkError`] on failure.
-    OpenReviewTerminal {
-        work_item_id: String,
-    },
-    /// App notifies the engine that a review terminal window has closed
-    /// and the associated workspace lease should be released. This is
-    /// fire-and-forget: the engine logs failures but does not reply.
-    ReleaseReviewTerminal {
-        lease_id: String,
-    },
-    /// Resolve and render the full transcript for a completed or
-    /// in-progress execution, keyed on the durable execution id.
-    ///
-    /// The engine reads from `work_runs.transcript_path` (via the
-    /// durable `work_executions` row) rather than the live supervisor
-    /// — this sidesteps the "unknown run" divergence and makes
-    /// historical executions, retries, and remediations all reachable.
-    ///
-    /// Returns [`FrontendEvent::ExecutionTranscriptResult`] on success
-    /// or [`FrontendEvent::ExecutionTranscriptUnavailable`] when the
-    /// transcript file is absent or the execution never recorded one.
-    ExecutionTranscript {
-        execution_id: String,
-    },
-
-    // --- Automations CRUD (maintenance-tasks.md T2) ---
-    /// Create a new automation for a product. Replies with
-    /// [`FrontendEvent::AutomationCreated`] on success.
-    CreateAutomation {
-        #[serde(flatten)]
-        input: CreateAutomationInput,
-    },
-    /// List all automations for a product, ordered `created_at ASC`.
-    /// Replies with [`FrontendEvent::AutomationsList`].
-    ListAutomations {
-        product_id: String,
-    },
-    /// Fetch a single automation by its canonical `auto_…` id.
-    /// Replies with [`FrontendEvent::AutomationResult`] or
-    /// [`FrontendEvent::WorkError`] when not found.
-    GetAutomation {
-        id: String,
-    },
     /// Apply an `AutomationPatch` to an automation. `None` fields are
     /// left unchanged. Replies with [`FrontendEvent::AutomationUpdated`].
     UpdateAutomation {
         id: String,
         patch: AutomationPatch,
     },
-    /// Set `enabled = true` on an automation. Idempotent.
-    /// Replies with [`FrontendEvent::AutomationUpdated`].
-    EnableAutomation {
+
+    UpdateWorkItem {
         id: String,
-    },
-    /// Set `enabled = false` on an automation. Idempotent.
-    /// Replies with [`FrontendEvent::AutomationUpdated`].
-    DisableAutomation {
-        id: String,
-    },
-    /// Permanently delete an automation and its run history.
-    /// Replies with [`FrontendEvent::AutomationDeleted`].
-    DeleteAutomation {
-        id: String,
-    },
-    /// Return the count of open tasks produced by an automation.
-    /// "Open" = `status IN (todo, ready, doing, in_review, blocked)`.
-    /// Replies with [`FrontendEvent::AutomationOpenTaskCount`].
-    GetAutomationOpenTaskCount {
-        automation_id: String,
+        patch: WorkItemPatch,
     },
 
-    // --- Editorial controls (editorial-controls-for-agent-authored-prs-and-github-comments.md) ---
-    /// Set (or clear) a product's editorial rules. `rules = None` in
-    /// the input clears the stored blob; the product reverts to the
-    /// engine defaults (strip known Boss identifiers, no template
-    /// enforcement). Returns [`FrontendEvent::WorkItemUpdated`] carrying
-    /// the updated product row, or [`FrontendEvent::WorkError`] if the
-    /// product is not found.
-    SetProductEditorialRules {
-        #[serde(flatten)]
-        input: SetProductEditorialRulesInput,
-    },
-    /// List recorded editorial-action audit rows for a product, ordered
-    /// `created_at DESC` (freshest first). `limit` caps the result set;
-    /// defaults to 50 when absent. Returns
-    /// [`FrontendEvent::EditorialActionsList`].
-    ListEditorialActions {
-        product_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// List the `automation_runs` history for an automation, newest first.
-    /// Replies with [`FrontendEvent::AutomationRunsList`].
-    ListAutomationRuns {
-        automation_id: String,
-    },
-    /// List tasks that were produced by a specific automation
-    /// (`tasks.source_automation_id = automation_id`), ordered by
-    /// `created_at DESC`. Replies with [`FrontendEvent::AutomationTasksList`].
-    ListAutomationTasks {
-        automation_id: String,
-    },
-    /// Enqueue an out-of-schedule triage fire for an automation.
-    /// `force = true` bypasses the open-task cap. Replies with
-    /// [`FrontendEvent::AutomationRunEnqueued`] when the fire was accepted,
-    /// or [`FrontendEvent::WorkError`] if the cap gate blocks it (and
-    /// `force` was not set).
-    RunAutomation {
-        automation_id: String,
-        force: bool,
-    },
-    /// Create a single maintenance task produced by an automation's triage
-    /// phase (Maint task 6). Called by the triage agent via
-    /// `boss task create --automation <A-id>`. The engine resolves the
-    /// automation, transactionally re-checks its open-task cap (the
-    /// backstop against a misbehaving agent fanning out multiple tasks),
-    /// stamps `tasks.source_automation_id`, inherits the automation's repo,
-    /// and — because the produced task is `autostart` — requests its
-    /// execution (which the dispatcher routes to the automations pool).
-    /// Replies with [`FrontendEvent::WorkItemCreated`] on success, or
-    /// [`FrontendEvent::WorkError`] when the automation is unknown or the
-    /// open-task cap is already reached.
-    CreateAutomationTask {
-        automation_id: String,
-        name: String,
-        description: Option<String>,
-    },
+    /// Snapshot the cube workspace pool. Proxies to
+    /// `cube --json workspace list`; the engine adds no editorial — the
+    /// returned vector mirrors cube's view, optionally annotated with
+    /// the engine's own knowledge of which leases back which executions.
+    WorkspacePoolSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2634,5 +2751,47 @@ mod feature_flags_wire_tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sorted_request_variants_test {
+    /// Asserts that `FrontendRequest` variants are in alphabetical order.
+    ///
+    /// This test fails when a variant is inserted out of order. If you are
+    /// adding a new variant, insert it in the correct alphabetical position
+    /// in the enum — do NOT append it to the end.  Keeping variants sorted
+    /// spreads concurrent additions across the file and cuts merge conflicts.
+    #[test]
+    fn frontend_request_variants_are_alphabetically_sorted() {
+        let src = include_str!("wire.rs");
+        let variants: Vec<&str> = src
+            .lines()
+            .skip_while(|l| !l.contains("pub enum FrontendRequest {"))
+            .skip(1)
+            .take_while(|l| *l != "}")
+            .filter_map(|l| {
+                let t = l.trim();
+                if t.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    // Extract just the variant name (up to the first
+                    // non-alphanumeric character: space, `{`, or `,`).
+                    t.split_once(|c: char| !c.is_alphanumeric())
+                        .map(|(name, _)| name)
+                        .or(Some(t))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut expected = variants.clone();
+        expected.sort_by_key(|s| s.to_ascii_lowercase());
+
+        assert_eq!(
+            variants,
+            expected,
+            "FrontendRequest variants are not in alphabetical order. \
+             Insert new variants in sorted position (do not append to the end)."
+        );
     }
 }
