@@ -182,6 +182,18 @@ pub trait WorkerSpawner: Send + Sync {
     fn non_opus_auto_mode(&self) -> bool {
         false
     }
+
+    /// Tear down the libghostty pane and reap the OS process tree for
+    /// `run_id` (the execution id). Used by the spawn flow to reap a
+    /// worker that was cancelled *during* its spawn window: at cancel
+    /// time the pid had not yet materialized, so the cancel path could
+    /// not reap it and deliberately left the cube lease held. Once the
+    /// spawn returns and the pid is registered, the runner calls this to
+    /// kill the just-spawned worker before the coordinator releases the
+    /// deferred lease. Default no-op for test spawners that don't host
+    /// real panes; production `ServerState` delegates to
+    /// [`crate::app::ServerState::release_worker_pane`].
+    async fn reap_worker_pane(&self, _run_id: &str) {}
 }
 
 /// Render the worker-config files, ask the app to spawn a pane,

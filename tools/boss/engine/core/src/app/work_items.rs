@@ -522,7 +522,12 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 {
                     let handler = server_state.completion_handler.clone();
                     tokio::spawn(async move {
-                        handler.cancel_and_release(&execution_id).await;
+                        handler
+                            .cancel_and_release(
+                                &execution_id,
+                                "kanban drag: active → todo (dragged back to Backlog)",
+                            )
+                            .await;
                     });
                 }
                 // Kanban drop-into-Doing (and any other human

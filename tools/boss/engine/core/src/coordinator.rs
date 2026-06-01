@@ -19,7 +19,7 @@ use crate::dispatch_events::{
 };
 use crate::host_adapter::{HostAdapter, LocalHostAdapter};
 use crate::metrics::Registry;
-use crate::runner::{ExecutionRunner, RunOutcome};
+use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{
     CreateAttentionItemInput, CreateExecutionInput, PreStartFailureOutcome, WorkDb, WorkExecution,
     WorkItem, WorkRun,
@@ -2586,6 +2586,73 @@ impl ExecutionCoordinator {
         );
 
         match run_outcome {
+            // Mid-spawn cancel (T981): the worker was cancelled while it
+            // was still spawning. The runner has already reaped the
+            // just-spawned pane; our job is to release the cube lease the
+            // cancel path deliberately left held (so a still-occupied
+            // workspace was never handed back to cube) and to skip the
+            // normal completion recording — the row is already
+            // `cancelled`, so `finish_execution_run` would reject it.
+            Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
+                // Claim ownership of the lease atomically before calling
+                // cube, mirroring `force_release`: whichever path clears
+                // the workspace columns first owns the release, so a
+                // concurrent `force_release` and this branch can't issue
+                // a duplicate cube release against the same lease.
+                let released = match self.work_db.clear_execution_workspace(&execution.id) {
+                    Ok(Some(lease_id)) => {
+                        match self.host_adapter.release_workspace(&lease_id).await {
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::error!(
+                                    ?err,
+                                    execution_id = %execution.id,
+                                    run_id = %run.id,
+                                    lease_id = %lease_id,
+                                    "failed to release deferred lease after mid-spawn cancel",
+                                );
+                                false
+                            }
+                        }
+                    }
+                    // Already cleared by a racing force_release that saw
+                    // the slot mapped and reaped + released itself.
+                    Ok(None) => false,
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            execution_id = %execution.id,
+                            "failed to clear workspace columns after mid-spawn cancel",
+                        );
+                        false
+                    }
+                };
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id = %worker_id,
+                    released_workspace = released,
+                    "reconciled mid-spawn cancel: worker pane reaped, deferred lease released",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "cancelled_during_spawn": true,
+                                "released_workspace": released,
+                            })),
+                    )
+                    .await;
+                // The pane was already torn down by the runner (which
+                // also released the pool slot), and `defer_pool_slot_release`
+                // is false for this outcome (slot_id = None), so the tail
+                // below frees the pool slot idempotently.
+            }
             Ok(outcome) => {
                 // Capture the resolved spawn knobs (effort level,
                 // claude effort value, model) before `outcome` moves
@@ -3493,6 +3560,15 @@ mod tests {
         /// fills this in — tests that want to assert on the
         /// dispatcher's effort/model surfacing set it explicitly.
         spawn_config: Option<crate::effort::SpawnConfig>,
+        /// When `true`, simulate the T981 mid-spawn cancel: cancel the
+        /// execution row (via `work_db`, mirroring the real cancel path
+        /// that ran while the spawn was in flight) and report
+        /// `RunWaitState::CancelledDuringSpawn`. The coordinator must
+        /// then release the deferred lease and skip completion recording.
+        cancelled_during_spawn: bool,
+        /// Handle used by the `cancelled_during_spawn` path to cancel the
+        /// row before returning. `None` for the default fake.
+        work_db: Option<Arc<WorkDb>>,
     }
 
     impl Default for FakeExecutionRunner {
@@ -3503,6 +3579,8 @@ mod tests {
                 pending: false,
                 slot_id: None,
                 spawn_config: None,
+                cancelled_during_spawn: false,
+                work_db: None,
             }
         }
     }
@@ -3528,6 +3606,25 @@ mod tests {
             }
             if self.fail {
                 return Err(anyhow!("worker prompt failed"));
+            }
+
+            if self.cancelled_during_spawn {
+                // Mirror the real race: the cancel landed while the
+                // spawn round-trip was in flight, marking the row
+                // cancelled. The runner (having reaped the pane) reports
+                // CancelledDuringSpawn so the coordinator releases the
+                // lease the cancel path left held.
+                if let Some(db) = &self.work_db {
+                    db.cancel_running_execution(&execution.id)
+                        .expect("cancel row in fake mid-spawn cancel");
+                }
+                return Ok(RunOutcome {
+                    wait_state: RunWaitState::CancelledDuringSpawn,
+                    result_summary: Some("cancelled during spawn".to_owned()),
+                    attention: None,
+                    slot_id: None,
+                    spawn_config: None,
+                });
             }
 
             Ok(RunOutcome {
@@ -5643,6 +5740,81 @@ mod tests {
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    }
+
+    /// T981 regression — the coordinator's mid-spawn cancel handling.
+    /// When the runner reports `CancelledDuringSpawn` (it reaped the
+    /// just-spawned pane), the coordinator must release the cube lease
+    /// the cancel path deliberately left held, and must NOT drive the
+    /// row to `waiting_human` (the row is already terminal). This is the
+    /// downstream half of "the lease is not released until the process
+    /// exits": the in-flight run is the sole releaser for a mid-spawn
+    /// cancel.
+    #[tokio::test]
+    async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Sort struct definitions".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            cancelled_during_spawn: true,
+            work_db: Some(db.clone()),
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner)
+                .with_pre_start_retry_delays(vec![]),
+        );
+        coordinator.kick();
+
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        // The runner cancels the row inside the spawn; wait for that
+        // terminal status to settle.
+        wait_for_execution_status(db.as_ref(), &execution_id, "cancelled").await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status, "cancelled",
+            "the row stays cancelled — the coordinator must not move it to waiting_human",
+        );
+        // The deferred lease must have been released exactly once, and
+        // the row's lease columns cleared (ownership claimed atomically).
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "the deferred cube lease must be released after the mid-spawn cancel",
+        );
+        assert!(
+            execution.cube_lease_id.is_none(),
+            "lease columns must be cleared once the deferred lease is released",
+        );
+        // The pool slot is returned so dispatch can proceed.
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
     }
 

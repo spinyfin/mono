@@ -40,6 +40,15 @@ pub enum RunWaitState {
     WaitingReview,
     /// Worker is awaiting merge of an approved PR. Workspace retained.
     WaitingMerge,
+    /// The execution was cancelled (kanban drag to Backlog, force-stop)
+    /// *during* its spawn window — after the worker pane came up but
+    /// before the run could be recorded. The runner has already reaped
+    /// the just-spawned pane; the coordinator must release the cube
+    /// lease the cancel path deliberately left held and skip the normal
+    /// completion recording (the row is already terminal). See
+    /// [`PaneSpawnRunner::run_execution`] and the T981 mid-spawn-cancel
+    /// collision this closes.
+    CancelledDuringSpawn,
 }
 
 impl RunWaitState {
@@ -50,13 +59,19 @@ impl RunWaitState {
             RunWaitState::WaitingHuman => "waiting_human",
             RunWaitState::WaitingReview => "waiting_review",
             RunWaitState::WaitingMerge => "waiting_merge",
+            // The row is already `cancelled`; the coordinator never
+            // drives a status transition for this variant. Report the
+            // terminal status for completeness.
+            RunWaitState::CancelledDuringSpawn => "cancelled",
         }
     }
 
     pub fn release_workspace(self) -> bool {
         matches!(
             self,
-            RunWaitState::Terminal | RunWaitState::WaitingDependency
+            RunWaitState::Terminal
+                | RunWaitState::WaitingDependency
+                | RunWaitState::CancelledDuringSpawn
         )
     }
 }
@@ -431,6 +446,53 @@ impl ExecutionRunner for PaneSpawnRunner {
             model = %spawn_config.model,
             "pane spawned for execution",
         );
+
+        // Mid-spawn cancel reconciliation (T981). A cancel / force-stop
+        // can land while we were awaiting the `SpawnWorkerPane`
+        // round-trip: it marks the execution row `cancelled` but, with
+        // no pid yet materialized, cannot reap the worker and
+        // deliberately leaves the cube lease held (see
+        // `WorkerCompletionHandler::force_release`). Now that the spawn
+        // has returned — pid registered, slot mapped, live state stamped
+        // — reap the just-spawned pane so it cannot outlive its
+        // cancellation, and signal the coordinator to release the lease
+        // the cancel path left for us. Without this the worker survives
+        // unreaped in a workspace the engine believes is free.
+        match self.work_db.get_execution(&execution.id) {
+            Ok(exec) if exec.status == "cancelled" => {
+                tracing::warn!(
+                    worker_id,
+                    execution_id = %execution.id,
+                    slot_id = started.slot_id,
+                    shell_pid = started.shell_pid,
+                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
+                );
+                spawner.reap_worker_pane(&execution.id).await;
+                return Ok(RunOutcome {
+                    wait_state: RunWaitState::CancelledDuringSpawn,
+                    result_summary: Some(format!(
+                        "Execution cancelled during spawn; reaped worker pane in slot {} (shell pid {}).",
+                        started.slot_id, started.shell_pid,
+                    )),
+                    attention: None,
+                    // The pane is already torn down — don't ask the
+                    // coordinator to keep the pool slot claimed for it.
+                    slot_id: None,
+                    spawn_config: Some(spawn_config),
+                });
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // A read failure here is non-fatal: fall through to the
+                // normal completion path. The worst case is the existing
+                // pre-fix behaviour, not a regression.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "post-spawn cancel re-check failed; proceeding with normal completion",
+                );
+            }
+        }
 
         Ok(RunOutcome {
             wait_state: RunWaitState::WaitingHuman,
@@ -3345,8 +3407,8 @@ mod pane_spawn_tests {
     };
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::work::{
-        CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel,
-        Task, WorkExecution, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
+        CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem,
     };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -3358,6 +3420,9 @@ mod pane_spawn_tests {
         registry: WorkerRegistry,
         live_states: LiveWorkerStateRegistry,
         last: StdMutex<Option<SpawnWorkerPaneInput>>,
+        /// Run ids passed to `reap_worker_pane` — lets the mid-spawn
+        /// cancel test assert the runner reaped the just-spawned pane.
+        reaped: StdMutex<Vec<String>>,
     }
 
     impl CapturingSpawner {
@@ -3366,6 +3431,7 @@ mod pane_spawn_tests {
                 registry: WorkerRegistry::new(),
                 live_states: LiveWorkerStateRegistry::new(),
                 last: StdMutex::new(None),
+                reaped: StdMutex::new(Vec::new()),
             }
         }
 
@@ -3375,6 +3441,10 @@ mod pane_spawn_tests {
                 .unwrap()
                 .clone()
                 .expect("expected SpawnWorkerPane to be sent")
+        }
+
+        fn reaped_run_ids(&self) -> Vec<String> {
+            self.reaped.lock().unwrap().clone()
         }
     }
 
@@ -3406,6 +3476,13 @@ mod pane_spawn_tests {
 
         fn worker_registry(&self) -> &WorkerRegistry {
             &self.registry
+        }
+
+        async fn reap_worker_pane(&self, run_id: &str) {
+            self.reaped.lock().unwrap().push(run_id.to_owned());
+            // Mirror production teardown enough for the test: drop the
+            // slot mapping so a follow-up release is a no-op.
+            let _ = self.registry.take_slot_for_run(run_id);
         }
 
         fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
@@ -4166,6 +4243,115 @@ mod pane_spawn_tests {
             state.execution_id.as_deref(),
             Some("exec-test-1"),
             "execution_id should match the WorkExecution row id"
+        );
+    }
+
+    /// T981 regression — the mid-spawn cancel reconciliation. When the
+    /// execution row is cancelled while the `SpawnWorkerPane` round-trip
+    /// is in flight, `run_execution` must, on return, (i) reap the
+    /// just-spawned pane (the pid is now known, so the reap is no longer
+    /// a no-op) and (ii) report `CancelledDuringSpawn` so the coordinator
+    /// releases the cube lease the cancel path deliberately left held.
+    /// Without this the worker survives unreaped in a workspace the
+    /// engine believes is free, which is what produced the duplicate
+    /// dispatch into a shared workspace.
+    #[tokio::test]
+    async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+                automation_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Sort struct definitions".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let ready = work_db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind("chore_implementation")
+                    .status("ready")
+                    .build(),
+            )
+            .unwrap();
+        // Start the run (ready → running, lease attached) — this is the
+        // exact state the row is in when the spawn round-trip is in
+        // flight — then cancel it, mirroring a kanban drag-to-Backlog
+        // landing inside the spawn window.
+        let (execution, _run) = work_db
+            .start_execution_run(
+                &ready.id,
+                "worker-1",
+                "foo",
+                "lease-1",
+                "foo-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        assert!(work_db.cancel_running_execution(&execution.id).unwrap());
+
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db.clone(), flags);
+        runner.set_server_state(weak);
+
+        let chore_item = work_db.get_work_item(&chore.id).unwrap();
+        let outcome = runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &chore_item,
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.wait_state,
+            RunWaitState::CancelledDuringSpawn,
+            "a cancel that races the spawn window must yield CancelledDuringSpawn",
+        );
+        assert!(
+            outcome.slot_id.is_none(),
+            "the pane was reaped, so the coordinator must not keep the pool slot claimed",
+        );
+        assert_eq!(
+            spawner.reaped_run_ids().as_slice(),
+            [execution.id.as_str()],
+            "the runner must reap the just-spawned pane for the cancelled execution",
         );
     }
 
