@@ -18,6 +18,7 @@
 //! / routing (PR 3) and live-status + transcript readback (PR 4) build on
 //! top. The trait stays stable across local and remote.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,8 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
+use crate::host_registry::Host;
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
     CubeWorkspaceStatus,
@@ -814,5 +817,121 @@ impl HostAdapter for SshHostAdapter {
             slot_id: None,
             spawn_config: Some(spawn_config),
         })
+    }
+}
+
+// ── HostAdapterProvider ─────────────────────────────────────────────────────────
+
+/// Resolves the [`HostAdapter`] the coordinator should use for a host the
+/// scheduler just selected. This is the seam that replaces the single
+/// hardcoded `LocalHostAdapter` in the dispatch loop: the local host
+/// returns the existing local adapter unchanged, and every other
+/// (SSH-reachable) host gets an [`SshHostAdapter`] over a persistent
+/// `ControlMaster` connection.
+#[async_trait]
+pub trait HostAdapterProvider: Send + Sync {
+    /// Return (or lazily build) the adapter for `host`. Errors surface as
+    /// a pre-start failure in the dispatch loop, leaving the execution
+    /// recoverable on a later kick.
+    async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>>;
+}
+
+/// The default provider: hands back the one local adapter for every host.
+/// Used by tests and local-only deployments — when no remote hosts are
+/// registered the scheduler only ever picks `local`, so the host argument
+/// is irrelevant. Production swaps in [`SshHostAdapterProvider`].
+pub struct LocalHostAdapterProvider {
+    local: Arc<dyn HostAdapter>,
+}
+
+impl LocalHostAdapterProvider {
+    pub fn new(local: Arc<dyn HostAdapter>) -> Self {
+        Self { local }
+    }
+}
+
+#[async_trait]
+impl HostAdapterProvider for LocalHostAdapterProvider {
+    async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
+        Ok(Arc::clone(&self.local))
+    }
+}
+
+/// Production provider: returns the local adapter for `host_id = "local"`
+/// and builds (and caches) an [`SshHostAdapter`] for every other host.
+///
+/// Each remote host gets one `ControlMaster` connection, opened on first
+/// use and reused for the engine's lifetime — matching the SSH-transport
+/// lifecycle from PR1. The cache keys on host id; a stale entry from a
+/// host that has since been disabled/removed is harmless because the
+/// scheduler stops selecting it.
+pub struct SshHostAdapterProvider {
+    /// The coordinator's own local adapter, returned verbatim for `local`.
+    local: Arc<dyn HostAdapter>,
+    /// Backing store for the shared prompt-composition path inside
+    /// [`SshHostAdapter`].
+    work_db: Arc<WorkDb>,
+    /// Engine runtime config, threaded into each built `SshHostAdapter`
+    /// for parity with the local `PaneSpawnRunner`.
+    cfg: Arc<RuntimeConfig>,
+    /// Absolute path of the engine's local events socket — the target of
+    /// the per-run reverse `ssh -R` forward.
+    events_socket_path: PathBuf,
+    /// Engine-owned directory holding the per-host `ControlMaster` sockets.
+    control_socket_dir: PathBuf,
+    /// Lazily-built remote adapters, one per host id.
+    cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
+}
+
+impl SshHostAdapterProvider {
+    pub fn new(
+        local: Arc<dyn HostAdapter>,
+        work_db: Arc<WorkDb>,
+        cfg: Arc<RuntimeConfig>,
+        events_socket_path: PathBuf,
+        control_socket_dir: PathBuf,
+    ) -> Self {
+        Self {
+            local,
+            work_db,
+            cfg,
+            events_socket_path,
+            control_socket_dir,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl HostAdapterProvider for SshHostAdapterProvider {
+    async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>> {
+        if host.id == "local" {
+            return Ok(Arc::clone(&self.local));
+        }
+
+        let mut cache = self.cache.lock().await;
+        if let Some(adapter) = cache.get(&host.id) {
+            return Ok(Arc::clone(adapter));
+        }
+
+        let ssh_target = host.ssh_target.as_deref().with_context(|| {
+            format!(
+                "host '{}' has no ssh_target; cannot build an SSH adapter",
+                host.id
+            )
+        })?;
+        let transport = SshTransport::new(&host.id, ssh_target, &self.control_socket_dir);
+        transport
+            .open_control_master()
+            .await
+            .with_context(|| format!("opening ControlMaster to host '{}'", host.id))?;
+        let adapter: Arc<dyn HostAdapter> = Arc::new(SshHostAdapter::new(
+            transport,
+            Arc::clone(&self.work_db),
+            Arc::clone(&self.cfg),
+            self.events_socket_path.clone(),
+        ));
+        cache.insert(host.id.clone(), Arc::clone(&adapter));
+        Ok(adapter)
     }
 }

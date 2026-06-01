@@ -112,6 +112,20 @@ pub trait ExecutionRunner: Send + Sync {
     ) -> Result<RunOutcome>;
 }
 
+/// Absolute path of the engine's local events socket — where worker hook
+/// shims connect. Honours the `BOSS_EVENTS_SOCKET` override and otherwise
+/// falls back to the stable `~/Library/Application Support/Boss` location.
+/// Shared by the local `PaneSpawnRunner` and the remote
+/// `SshHostAdapterProvider` (the target of each remote run's reverse
+/// `ssh -R` forward), so both agree on one path.
+pub fn engine_events_socket_path() -> PathBuf {
+    if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
+        return override_path.into();
+    }
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/Boss/events.sock")
+}
+
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
 /// per-lease worker config files, asks the macOS app to host a
 /// worker pane, and registers the returned shell pid against the
@@ -156,11 +170,7 @@ impl PaneSpawnRunner {
     }
 
     fn events_socket_path(&self) -> PathBuf {
-        if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
-            return override_path.into();
-        }
-        let home = std::env::var_os("HOME").unwrap_or_default();
-        PathBuf::from(home).join("Library/Application Support/Boss/events.sock")
+        engine_events_socket_path()
     }
 
     fn boss_event_binary(&self) -> PathBuf {

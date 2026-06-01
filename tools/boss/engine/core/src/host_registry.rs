@@ -5,11 +5,12 @@
 /// new columns on `work_executions`. No scheduler change; everything
 /// still runs locally. Auto-discovers capabilities for the `local` host
 /// on every engine startup via `uname` + `gh auth status`.
+use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::work::WorkDb;
 
@@ -379,6 +380,102 @@ impl WorkDb {
             bail!("capability '{}' not found on host '{}'", capability, host_id);
         }
         Ok(())
+    }
+
+    // ── Host-scheduling reads (consumed by the coordinator dispatch loop) ──────
+
+    /// Read an execution's `pinned_host_id` (the design's "pin escape
+    /// hatch"). `None` when unpinned or on rows that predate the column.
+    pub fn execution_pinned_host(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT pinned_host_id FROM work_executions WHERE id = ?1",
+            params![execution_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("execution_pinned_host query")
+        .map(Option::flatten)
+    }
+
+    /// Pin an execution to a specific host (or clear the pin with
+    /// `None`). When set, [`crate::host_scheduling::select_host`] bypasses
+    /// the capability filter and routes the execution only to that host.
+    pub fn set_execution_pinned_host(
+        &self,
+        execution_id: &str,
+        host_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pinned_host_id = ?2 WHERE id = ?1",
+            params![execution_id, host_id],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// The host a `work_runs` row was attributed to. Used by tests and
+    /// (later) the host-badge surface to confirm where a run executed.
+    pub fn run_host(&self, run_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT host_id FROM work_runs WHERE id = ?1",
+            params![run_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .context("run_host query")
+    }
+
+    /// Count live worker runs grouped by host. Feeds the free-slots gate
+    /// in [`crate::host_scheduling::select_host`]. Only `active` runs are
+    /// counted — terminal runs have already freed their slot. The local
+    /// host is *not* gated by this count (the worker pool bounds local
+    /// concurrency), so the coordinator overrides its slot to free.
+    pub fn active_runs_per_host(&self) -> Result<HashMap<String, i64>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT host_id, COUNT(*) FROM work_runs WHERE status = 'active' GROUP BY host_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (host_id, count) = row?;
+            out.insert(host_id, count);
+        }
+        Ok(out)
+    }
+
+    /// Union of required capabilities recorded against any of the given
+    /// subject ids (a chore plus its product / project). Subject ids are
+    /// globally unique across kinds, so the lookup matches on id alone.
+    /// Empty when nothing has been tagged — the common case today, which
+    /// leaves every enabled host capability-eligible.
+    pub fn required_capabilities_for_subject_ids(
+        &self,
+        subject_ids: &[&str],
+    ) -> Result<BTreeSet<String>> {
+        if subject_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let conn = self.connect()?;
+        let placeholders = vec!["?"; subject_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT capability FROM work_capability_requirements
+             WHERE subject_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(subject_ids.iter()), |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
     }
 }
 

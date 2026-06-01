@@ -953,6 +953,14 @@ impl ServerState {
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
 
         let completion_handler_for_coordinator = completion_handler.clone();
+        // Distributed-execution PR3 inputs for the SSH-capable host-adapter
+        // provider: the engine's local events socket (target of each remote
+        // run's reverse `ssh -R` forward), the engine-owned control-socket
+        // dir, and a config handle. Resolved out here so the move-closure
+        // below can consume them.
+        let cfg_for_provider = cfg.clone();
+        let provider_events_socket = crate::runner::engine_events_socket_path();
+        let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -970,6 +978,25 @@ impl ServerState {
             // `work_executions.pr_head_before`.
             execution_coordinator_inner
                 .set_execution_started_hook(completion_handler_for_coordinator.clone());
+            // Install the SSH-capable provider so the dispatch loop can
+            // build a per-host adapter (local vs SSH-remote) for whichever
+            // host the scheduler selects. `local` returns the coordinator's
+            // own local adapter verbatim, so the common local-only path is
+            // unchanged; remote hosts get an `SshHostAdapter` over a cached
+            // ControlMaster. Skipped (default local-only provider retained)
+            // only when no engine-owned control-socket dir resolves.
+            if let Some(control_dir) = provider_control_dir {
+                let local_adapter = execution_coordinator_inner.host_adapter();
+                execution_coordinator_inner.set_host_adapter_provider(Arc::new(
+                    crate::host_adapter::SshHostAdapterProvider::new(
+                        local_adapter,
+                        work_db.clone(),
+                        cfg_for_provider,
+                        provider_events_socket,
+                        control_dir,
+                    ),
+                ));
+            }
             let execution_coordinator = Arc::new(execution_coordinator_inner);
 
             ServerState {

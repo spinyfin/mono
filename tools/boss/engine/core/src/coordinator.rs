@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,7 +17,11 @@ use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
-use crate::host_adapter::{HostAdapter, LocalHostAdapter};
+use crate::host_adapter::{
+    HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider,
+};
+use crate::host_registry::Host;
+use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{
@@ -1041,7 +1045,17 @@ pub struct ExecutionCoordinator {
     /// executions. Sized independently from the main pool (default 3) so
     /// maintenance work never contends with interactive dispatch.
     automation_pool: WorkerPool,
+    /// The local-host adapter. Retained as the `local` special case and
+    /// the backing adapter for the default provider; the dispatch loop
+    /// resolves the per-execution adapter through `host_adapter_provider`.
     host_adapter: Arc<dyn HostAdapter>,
+    /// Builds the right [`HostAdapter`] for the host the scheduler selects
+    /// (local vs SSH-remote). Defaults to [`LocalHostAdapterProvider`]
+    /// (every host → the local adapter), which preserves the historical
+    /// local-only behaviour; production installs an
+    /// [`crate::host_adapter::SshHostAdapterProvider`] via
+    /// [`Self::set_host_adapter_provider`].
+    host_adapter_provider: Arc<dyn HostAdapterProvider>,
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
     /// no-op so legacy tests and short-lived callers don't need to
@@ -1135,11 +1149,14 @@ impl ExecutionCoordinator {
         // on "counter not registered" in a test context.
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
+        let host_adapter_provider: Arc<dyn HostAdapterProvider> =
+            Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {
             work_db,
             worker_pool,
             automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
             host_adapter,
+            host_adapter_provider,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink::default()),
             scheduling_active: AtomicBool::new(false),
@@ -1155,6 +1172,21 @@ impl ExecutionCoordinator {
     /// from `BOSS_AUTOMATION_POOL_SIZE`; tests may supply a smaller pool.
     pub fn set_automation_pool(&mut self, pool: WorkerPool) {
         self.automation_pool = pool;
+    }
+
+    /// The local-host adapter. `app.rs` reads this to seed the production
+    /// [`crate::host_adapter::SshHostAdapterProvider`] (which returns it
+    /// verbatim for `host_id = "local"`).
+    pub fn host_adapter(&self) -> Arc<dyn HostAdapter> {
+        Arc::clone(&self.host_adapter)
+    }
+
+    /// Install the host-adapter provider used to build per-host adapters
+    /// in the dispatch loop. `app.rs` wires the SSH-capable provider so
+    /// the coordinator can route to registered remote hosts; tests inject
+    /// recording/fake providers to assert routing.
+    pub fn set_host_adapter_provider(&mut self, provider: Arc<dyn HostAdapterProvider>) {
+        self.host_adapter_provider = provider;
     }
 
     /// Return a clone of the automation worker pool handle. Used by
@@ -1695,6 +1727,109 @@ impl ExecutionCoordinator {
         Some(WorkItem::Chore(task))
     }
 
+    /// Pick the host this execution should run on. Honours the pin escape
+    /// hatch (`work_executions.pinned_host_id`) and the capability filter,
+    /// then ranks the survivors by branch affinity / free slots — see
+    /// [`crate::host_scheduling::select_host`].
+    ///
+    /// The local host is never slot-gated here: the worker pool already
+    /// bounded local concurrency before dispatch reached this point, and
+    /// `hosts.local.pool_size` defaults to 1, so double-gating on it would
+    /// throttle local dispatch to a single concurrent worker. We therefore
+    /// report the local slot as always-free (`active_runs = 0`) and let
+    /// only remote hosts be gated by their `work_runs` active count.
+    ///
+    /// Returns the selected [`Host`] or an error describing why nothing was
+    /// eligible (consumed by the caller as a recoverable pre-start
+    /// failure).
+    fn select_host_for_execution(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+    ) -> Result<Host> {
+        let pinned = self
+            .work_db
+            .execution_pinned_host(&execution.id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "host-selection: failed to read pinned host; treating as unpinned",
+                );
+                None
+            });
+
+        // Capability requirements union over the chore + its product +
+        // its project. Empty today (no writer yet), which leaves every
+        // enabled host capability-eligible — preserving local behaviour.
+        let product_id = work_item_product_id(work_item);
+        let project_id = work_item_project_id(work_item);
+        let mut subject_ids: Vec<&str> = vec![execution.work_item_id.as_str(), product_id.as_str()];
+        if let Some(pid) = project_id.as_deref() {
+            subject_ids.push(pid);
+        }
+        let required_capabilities = self
+            .work_db
+            .required_capabilities_for_subject_ids(&subject_ids)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "host-selection: failed to read capability requirements; treating as none",
+                );
+                BTreeSet::new()
+            });
+
+        let hosts = self
+            .work_db
+            .list_hosts()
+            .context("host-selection: list hosts")?;
+        let active = self.work_db.active_runs_per_host().unwrap_or_default();
+
+        let slots: Vec<HostSlot> = hosts
+            .iter()
+            .map(|host| {
+                let capabilities = self
+                    .work_db
+                    .list_host_capabilities(&host.id)
+                    .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
+                    .unwrap_or_default();
+                let active_runs = if host.id == "local" {
+                    0
+                } else {
+                    *active.get(&host.id).unwrap_or(&0)
+                };
+                HostSlot {
+                    host: host.clone(),
+                    capabilities,
+                    active_runs,
+                    // Branch-affinity tiebreaker is deferred (PR4): the
+                    // affinity key is the PR branch, which is unset until
+                    // the first run pushes. Free-slots-first is the
+                    // design's documented v1 fallback for the first run.
+                    had_prior_run_on_branch: false,
+                }
+            })
+            .collect();
+
+        let requirements = ChoreRequirements {
+            required_capabilities,
+            pinned_host_id: pinned,
+        };
+        let (picked, report) = host_scheduling::select_host(&requirements, &slots);
+        match picked {
+            Some(host_id) => hosts
+                .into_iter()
+                .find(|h| h.id == host_id)
+                .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
+            None => Err(anyhow!(
+                "no eligible host for execution {}: {}",
+                execution.id,
+                summarize_ineligibility(&report),
+            )),
+        }
+    }
+
     async fn schedule_execution(
         self: &Arc<Self>,
         execution: &WorkExecution,
@@ -1750,19 +1885,62 @@ impl ExecutionCoordinator {
             .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))?;
         let task = execution_task_summary(execution, &work_item);
 
+        // Host selection (distributed-execution PR3): pick the host this
+        // execution should run on, then build the matching adapter (local
+        // vs SSH-remote) and route the whole dispatch through it. A
+        // no-eligible-host result is a recoverable pre-start failure — it
+        // backs off and raises an attention item rather than hot-looping,
+        // and a later kick retries once a host comes online / tags change.
+        let selected_host = match self.select_host_for_execution(execution, &work_item) {
+            Ok(host) => host,
+            Err(err) => {
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    "no_eligible_host",
+                    "No eligible host for execution",
+                    &err,
+                )?;
+                return Err(err);
+            }
+        };
+        let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    "host_adapter_unavailable",
+                    "Could not build host adapter",
+                    &err,
+                )?;
+                return Err(err);
+            }
+        };
+        tracing::info!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            host_id = %selected_host.id,
+            "host-selection: routing execution to host",
+        );
+
         // Mirror the argv `ensure_repo` actually drives so the dispatch-event
         // `cube_command` is reproducible from a terminal: a bare resolver
         // slug goes positionally (`repo ensure <name>`), a URL via `--origin`.
         let ensure_args = crate::repo_slug::repo_ensure_args(&execution.repo_remote_url);
         let repo = match tokio::time::timeout(
             CUBE_REPO_ENSURE_TIMEOUT,
-            self.host_adapter.ensure_repo(&execution.repo_remote_url),
+            adapter.ensure_repo(&execution.repo_remote_url),
         )
         .await
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
-                let ensure_repr = self.host_adapter.command_repr(&ensure_args);
+                let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1792,7 +1970,7 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
-                let ensure_repr = self.host_adapter.command_repr(&ensure_args);
+                let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1822,19 +2000,19 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        self.maybe_probe_cold_repo(execution).await;
+        self.maybe_probe_cold_repo(execution, &adapter).await;
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Ok, &execution.id)
                     .with_work_item(&execution.work_item_id)
                     .with_worker(worker_id)
                     .with_cube_repo(&repo.repo_id)
-                    .with_cube_invocation(self.host_adapter.command_repr(&ensure_args)),
+                    .with_cube_invocation(adapter.command_repr(&ensure_args)),
             )
             .await;
 
         let lease = match self
-            .lease_workspace_with_fallback(execution, worker_id, &repo, &task)
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
             .await
         {
             Ok(lease) => lease,
@@ -1875,13 +2053,13 @@ impl ExecutionCoordinator {
                     .with_cube_repo(&repo.repo_id)
                     .with_cube_lease(&lease.lease_id)
                     .with_cube_workspace(&lease.workspace_id)
-                    .with_cube_invocation(self.host_adapter.command_repr(&lease_args)),
+                    .with_cube_invocation(adapter.command_repr(&lease_args)),
                 )
                 .await;
         }
         let change_title = execution_change_title(execution, &work_item);
         let workspace_path_str = lease.workspace_path.display().to_string();
-        let change_repr: Option<(String, String)> = self.host_adapter.command_repr(&[
+        let change_repr: Option<(String, String)> = adapter.command_repr(&[
             "--json",
             "change",
             "create",
@@ -1890,15 +2068,13 @@ impl ExecutionCoordinator {
             "--title",
             &change_title,
         ]);
-        let change = match self
-            .host_adapter
+        let change = match adapter
             .create_change(&lease.workspace_path, &change_title)
             .await
         {
             Ok(change) => change,
             Err(err) => {
-                if let Err(release_err) = self.host_adapter.release_workspace(&lease.lease_id).await
-                {
+                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(
                         ?release_err,
                         lease_id = %lease.lease_id,
@@ -1949,13 +2125,14 @@ impl ExecutionCoordinator {
             )
             .await;
 
-        match self.work_db.start_execution_run(
+        match self.work_db.start_execution_run_on_host(
             &execution.id,
             worker_id,
             &repo.repo_id,
             &lease.lease_id,
             &lease.workspace_id,
             &lease.workspace_path.display().to_string(),
+            &selected_host.id,
         ) {
             Ok((execution, run)) => {
                 let worker_id_owned = worker_id.to_owned();
@@ -2020,13 +2197,21 @@ impl ExecutionCoordinator {
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator
-                        .run_execution(execution, run, work_item, worker_id_owned, lease, change)
+                        .run_execution(
+                            execution,
+                            run,
+                            work_item,
+                            worker_id_owned,
+                            lease,
+                            change,
+                            adapter,
+                        )
                         .await;
                 });
                 Ok(())
             }
             Err(err) => {
-                let release_result = self.host_adapter.release_workspace(&lease.lease_id).await;
+                let release_result = adapter.release_workspace(&lease.lease_id).await;
                 if let Err(release_err) = release_result {
                     tracing::error!(
                         ?release_err,
@@ -2076,7 +2261,11 @@ impl ExecutionCoordinator {
     /// error to the caller. A failed `list_repos` round-trip is logged
     /// at WARN and the URL is still marked seen so we don't retry the
     /// probe every dispatch — engine restart re-probes per R4.
-    async fn maybe_probe_cold_repo(self: &Arc<Self>, execution: &WorkExecution) {
+    async fn maybe_probe_cold_repo(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        adapter: &Arc<dyn HostAdapter>,
+    ) {
         let origin = execution.repo_remote_url.clone();
         {
             let mut seen = self.repo_cold_probe_seen.lock().await;
@@ -2085,7 +2274,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        let repos = match self.host_adapter.list_repos().await {
+        let repos = match adapter.list_repos().await {
             Ok(repos) => repos,
             Err(err) => {
                 tracing::warn!(
@@ -2165,8 +2354,9 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
         workspace_id: &str,
+        adapter: &Arc<dyn HostAdapter>,
     ) {
-        let snapshot = match self.host_adapter.list_workspaces().await {
+        let snapshot = match adapter.list_workspaces().await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(
@@ -2214,8 +2404,7 @@ impl ExecutionCoordinator {
             "boss engine: reclaiming stale lease for UI-crash resume of execution {} (workspace {workspace_id})",
             execution.id,
         );
-        match self
-            .host_adapter
+        match adapter
             .force_release_lease(&stale_lease_id, Some(reason.as_str()))
             .await
         {
@@ -2285,6 +2474,7 @@ impl ExecutionCoordinator {
         worker_id: &str,
         repo: &CubeRepoHandle,
         task: &str,
+        adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
         let allow_dirty = execution.allow_dirty;
@@ -2318,7 +2508,7 @@ impl ExecutionCoordinator {
         // logged and we fall through to the normal lease attempt rather
         // than blocking the resume.
         if let Some(workspace_id) = prefer.filter(|_| !execution.prefer_is_soft) {
-            self.reclaim_stale_lease_for_resume(execution, worker_id, workspace_id)
+            self.reclaim_stale_lease_for_resume(execution, worker_id, workspace_id, adapter)
                 .await;
         }
 
@@ -2333,7 +2523,7 @@ impl ExecutionCoordinator {
         if allow_dirty {
             attempt1_args.push("--allow-dirty");
         }
-        let attempt1_repr = self.host_adapter.command_repr(&attempt1_args);
+        let attempt1_repr = adapter.command_repr(&attempt1_args);
 
         // First attempt: use the preferred workspace if the caller
         // pinned one. Emit `cube_workspace_lease_attempted` *before*
@@ -2362,7 +2552,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
-            .invoke_lease(repo, task, prefer, allow_dirty, CUBE_LEASE_TIMEOUT)
+            .invoke_lease(repo, task, prefer, allow_dirty, CUBE_LEASE_TIMEOUT, adapter)
             .await
         {
             Ok(lease) => {
@@ -2425,7 +2615,7 @@ impl ExecutionCoordinator {
         let attempt2_args = vec![
             "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
         ];
-        let attempt2_repr = self.host_adapter.command_repr(&attempt2_args);
+        let attempt2_repr = adapter.command_repr(&attempt2_args);
 
         self.dispatch_events
             .emit(
@@ -2450,7 +2640,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, false, CUBE_LEASE_TIMEOUT)
+            .invoke_lease(repo, task, None, false, CUBE_LEASE_TIMEOUT, adapter)
             .await
         {
             Ok(lease) => {
@@ -2505,11 +2695,11 @@ impl ExecutionCoordinator {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         timeout: Duration,
+        adapter: &Arc<dyn HostAdapter>,
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
-            self.host_adapter
-                .lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty),
+            adapter.lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty),
         )
         .await
         {
@@ -2674,6 +2864,7 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_execution(
         self: Arc<Self>,
         execution: WorkExecution,
@@ -2682,6 +2873,7 @@ impl ExecutionCoordinator {
         worker_id: String,
         lease: CubeWorkspaceLease,
         change: CubeChangeHandle,
+        adapter: Arc<dyn HostAdapter>,
     ) {
         // Keep the cube lease alive for the lifetime of the run. Without
         // this, the lease ages past `DEFAULT_LEASE_TTL_SECS` (30 min) in
@@ -2696,7 +2888,7 @@ impl ExecutionCoordinator {
         // run and accidentally extend a lease the engine has already
         // released downstream.
         let heartbeat = HeartbeatGuard::spawn(
-            Arc::clone(&self.host_adapter),
+            Arc::clone(&adapter),
             lease.lease_id.clone(),
             execution.id.clone(),
             run.id.clone(),
@@ -2711,8 +2903,7 @@ impl ExecutionCoordinator {
                 .await;
         }
 
-        let run_outcome = self
-            .host_adapter
+        let run_outcome = adapter
             .spawn_worker(
                 &worker_id,
                 &execution,
@@ -2753,7 +2944,7 @@ impl ExecutionCoordinator {
                 // a duplicate cube release against the same lease.
                 let released = match self.work_db.clear_execution_workspace(&execution.id) {
                     Ok(Some(lease_id)) => {
-                        match self.host_adapter.release_workspace(&lease_id).await {
+                        match adapter.release_workspace(&lease_id).await {
                             Ok(()) => true,
                             Err(err) => {
                                 tracing::error!(
@@ -2841,7 +3032,7 @@ impl ExecutionCoordinator {
                     run
                 };
                 if let Err(err) = self
-                    .record_run_completion(&execution, &run, &lease, &worker_id, outcome)
+                    .record_run_completion(&execution, &run, &lease, &worker_id, outcome, &adapter)
                     .await
                 {
                     tracing::error!(
@@ -2884,7 +3075,7 @@ impl ExecutionCoordinator {
                     .await;
             }
             Err(err) => {
-                let released = match self.host_adapter.release_workspace(&lease.lease_id).await {
+                let released = match adapter.release_workspace(&lease.lease_id).await {
                     Ok(()) => true,
                     Err(release_err) => {
                         tracing::error!(
@@ -3266,10 +3457,11 @@ impl ExecutionCoordinator {
         lease: &CubeWorkspaceLease,
         worker_id: &str,
         outcome: RunOutcome,
+        adapter: &Arc<dyn HostAdapter>,
     ) -> Result<()> {
         let release_workspace = outcome.wait_state.release_workspace();
         let released = if release_workspace {
-            match self.host_adapter.release_workspace(&lease.lease_id).await {
+            match adapter.release_workspace(&lease.lease_id).await {
                 Ok(()) => true,
                 Err(err) => {
                     tracing::error!(
@@ -3344,6 +3536,44 @@ fn work_item_product_id(item: &WorkItem) -> String {
         WorkItem::Project(p) => p.product_id.clone(),
         WorkItem::Task(t) | WorkItem::Chore(t) => t.product_id.clone(),
     }
+}
+
+/// The owning project id for capability-requirement lookup, if any. A
+/// project is its own subject; a product has none.
+fn work_item_project_id(item: &WorkItem) -> Option<String> {
+    match item {
+        WorkItem::Project(p) => Some(p.id.clone()),
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.project_id.clone(),
+        WorkItem::Product(_) => None,
+    }
+}
+
+/// Render a one-line, human-readable summary of why no host was eligible,
+/// for the no-eligible-host pre-start failure / attention item.
+fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
+    use host_scheduling::IneligibilityReason as R;
+    if report.is_empty() {
+        return "no hosts are registered".to_owned();
+    }
+    let per_host: Vec<String> = report
+        .iter()
+        .map(|h| {
+            let reasons: Vec<String> = h
+                .reasons
+                .iter()
+                .map(|r| match r {
+                    R::Disabled => "disabled".to_owned(),
+                    R::NoFreeSlots => "no free slots".to_owned(),
+                    R::NotPinned => "not the pinned host".to_owned(),
+                    R::MissingCapabilities(missing) => {
+                        format!("missing capabilities [{}]", missing.join(", "))
+                    }
+                })
+                .collect();
+            format!("{}: {}", h.host_id, reasons.join(", "))
+        })
+        .collect();
+    per_host.join("; ")
 }
 
 /// One failing-check record after parsing `ci_remediations.failed_checks`
@@ -3502,8 +3732,9 @@ mod tests {
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
         CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionCoordinator,
-        ExecutionPublisher, FrontendEvent, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-        WorkerPool, pick_worst_failing_check, slot_id_from_worker_id, worker_id_for_slot,
+        ExecutionPublisher, FrontendEvent, Host, HostAdapter, HostAdapterProvider,
+        MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkerPool, pick_worst_failing_check,
+        slot_id_from_worker_id, worker_id_for_slot,
     };
 
     #[test]
@@ -3946,6 +4177,182 @@ mod tests {
         assert_eq!(cube.create_calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
+    }
+
+    /// Host-adapter provider that records every host the dispatch loop
+    /// asks it to build an adapter for, then returns a single fixed inner
+    /// adapter. Lets a routing test assert *which* host was selected
+    /// without standing up a full SSH-remote adapter double — the inner
+    /// adapter still drives the FakeCubeClient-backed lease/change/spawn.
+    struct RecordingHostAdapterProvider {
+        inner: Arc<dyn HostAdapter>,
+        requested: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HostAdapterProvider for RecordingHostAdapterProvider {
+        async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>> {
+            self.requested.lock().await.push(host.id.clone());
+            Ok(Arc::clone(&self.inner))
+        }
+    }
+
+    /// PR3 routing: an execution pinned to a registered remote host is
+    /// dispatched through that host's adapter (the dispatch loop asks the
+    /// provider for `zakalwe`, not `local`) and the run is attributed to
+    /// the pinned host via `work_runs.host_id`.
+    #[tokio::test]
+    async fn pinned_execution_routes_to_remote_host_and_persists_host_id() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        // Register a remote host with spare slots so it survives the
+        // free-slots gate.
+        db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Pinned cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Pin the ready execution to the remote host.
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coordinator_inner = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        let provider = Arc::new(RecordingHostAdapterProvider {
+            inner: coordinator_inner.host_adapter(),
+            requested: Mutex::new(Vec::new()),
+        });
+        coordinator_inner.set_host_adapter_provider(provider.clone());
+        let coordinator = Arc::new(coordinator_inner);
+
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution.id, "running").await;
+
+        // The dispatch loop resolved the adapter for the pinned host —
+        // and never for `local`.
+        let requested = provider.requested.lock().await.clone();
+        assert!(
+            requested.iter().any(|h| h == "zakalwe"),
+            "expected the provider to be asked for the pinned host, got {requested:?}",
+        );
+        assert!(
+            !requested.iter().any(|h| h == "local"),
+            "pinned execution must not route through local, got {requested:?}",
+        );
+
+        // The run is attributed to the pinned host.
+        let run_ids = db.active_run_ids_for_execution(&execution.id).unwrap();
+        assert_eq!(run_ids.len(), 1, "exactly one active run expected");
+        assert_eq!(
+            db.run_host(&run_ids[0]).unwrap().as_deref(),
+            Some("zakalwe"),
+            "work_runs.host_id must record the selected host",
+        );
+    }
+
+    /// PR3 routing: an execution pinned to a host that is registered but
+    /// disabled finds no eligible host. The dispatch records a
+    /// `no_eligible_host` pre-start failure (leaving the row recoverable)
+    /// and never starts a run.
+    #[tokio::test]
+    async fn pin_to_disabled_host_yields_no_eligible_host() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Pinned to disabled".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        // No retry delays → a single pre-start failure is terminal, so the
+        // assertion doesn't race a backoff timer.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker available");
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(result.is_err(), "no eligible host must fail the dispatch");
+
+        // No worker run was ever started, and no cube work happened.
+        assert!(db.active_run_ids_for_execution(&execution.id).unwrap().is_empty());
+        assert_eq!(cube.ensure_calls.lock().await.len(), 0);
+        // The failure surfaced as a `no_eligible_host` attention item.
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == "no_eligible_host"),
+            "expected a no_eligible_host attention item, got {:?}",
+            items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
+        );
     }
 
     /// `cube_default_workspace_root_for_test` mirrors the production
@@ -5547,7 +5954,13 @@ mod tests {
         };
 
         let result = coordinator
-            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task")
+            .lease_workspace_with_fallback(
+                &resume,
+                "worker-resume",
+                &repo,
+                "task",
+                &coordinator.host_adapter,
+            )
             .await;
         assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
@@ -5628,7 +6041,13 @@ mod tests {
         };
 
         let _ = coordinator
-            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task")
+            .lease_workspace_with_fallback(
+                &resume,
+                "worker-resume",
+                &repo,
+                "task",
+                &coordinator.host_adapter,
+            )
             .await;
 
         let releases = cube.force_release_calls.lock().await;
