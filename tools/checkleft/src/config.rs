@@ -285,8 +285,13 @@ impl ConfigResolver {
 
     fn apply_local_config(&self, resolved: &mut ResolvedChecks, relative_dir: &Path) {
         let config_abs_dir = self.root.join(relative_dir);
-        let Some(config_path) = resolve_checks_file_path(&config_abs_dir) else {
-            return;
+        let config_path = match resolve_checks_file_path(&config_abs_dir) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(diagnostic) => {
+                resolved.push_diagnostic(diagnostic);
+                return;
+            }
         };
         info!(path = %config_path.display(), "loading checks config");
         let config_relative_path = config_path
@@ -770,7 +775,7 @@ fn apply_external_checks_file(
 }
 
 fn discover_root_external_checks_url_for_prefetch(root: &Path) -> Result<Option<String>> {
-    let Some(config_path) = resolve_checks_file_path(root) else {
+    let Ok(Some(config_path)) = resolve_checks_file_path(root) else {
         return Ok(None);
     };
     let relative_path = config_path
@@ -1045,18 +1050,39 @@ fn external_checks_retry_delay(attempt: u32, status: StatusCode) -> Duration {
     base_delay.saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
 }
 
-fn resolve_checks_file_path(dir: &Path) -> Option<PathBuf> {
+fn resolve_checks_file_path(dir: &Path) -> Result<Option<PathBuf>, ConfigDiagnostic> {
     let yaml_path = dir.join(CHECKS_FILE_NAME_YAML);
-    if yaml_path.exists() {
-        return Some(yaml_path);
-    }
-
     let toml_path = dir.join(CHECKS_FILE_NAME_TOML);
-    if toml_path.exists() {
-        return Some(toml_path);
+    let yaml_exists = yaml_path.exists();
+    let toml_exists = toml_path.exists();
+
+    if yaml_exists && toml_exists {
+        return Err(ConfigDiagnostic {
+            check_id: CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            message: format!(
+                "both {} and {} exist in the same directory — keep exactly one",
+                yaml_path.display(),
+                toml_path.display(),
+            ),
+            location: Location {
+                path: yaml_path,
+                line: None,
+                column: None,
+            },
+            remediation: Some(
+                "Remove one of the two config files so checkleft knows which one to load."
+                    .to_owned(),
+            ),
+        });
     }
 
-    None
+    if yaml_exists {
+        return Ok(Some(yaml_path));
+    }
+    if toml_exists {
+        return Ok(Some(toml_path));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

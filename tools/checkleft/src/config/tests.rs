@@ -661,3 +661,58 @@ config = { max_lines = [1, 2 }
             .contains("failed to parse checks config")
     );
 }
+
+#[test]
+fn coexisting_yaml_and_toml_produces_violation() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        "checks:\n  - id: file-size\n",
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"file-size\"\n",
+    )
+    .expect("write CHECKS.toml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert_eq!(diagnostics.len(), 1, "expected exactly one coexistence diagnostic");
+    assert_eq!(diagnostics[0].check_id, "checks-config");
+    assert!(
+        diagnostics[0].message.contains("CHECKS.yaml") && diagnostics[0].message.contains("CHECKS.toml"),
+        "diagnostic message should name both files: {}",
+        diagnostics[0].message
+    );
+    assert!(
+        diagnostics[0].message.contains("keep exactly one"),
+        "diagnostic message should instruct the user to keep one: {}",
+        diagnostics[0].message
+    );
+}
+
+#[test]
+fn single_config_file_produces_no_coexistence_violation() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"file-size\"\n",
+    )
+    .expect("write CHECKS.toml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.is_empty(),
+        "expected no diagnostics for a single config file, got: {diagnostics:?}"
+    );
+}
