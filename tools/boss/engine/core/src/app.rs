@@ -8410,7 +8410,6 @@ async fn handle_frontend_connection(
                 match work_db.apply_magic_wand_dispatch(
                     &dispatch_id,
                     &current_doc_version,
-                    "user",
                 ) {
                     Ok((dispatch, conflict)) => {
                         if !conflict {
