@@ -520,6 +520,39 @@ impl WorkDb {
         cube_workspace_id: &str,
         workspace_path: &str,
     ) -> Result<(WorkExecution, WorkRun)> {
+        // Default to the local host. The distributed-execution dispatch
+        // path (`schedule_execution`) calls `start_execution_run_on_host`
+        // with the host the scheduler picked; every other caller is a
+        // local-only run and inherits the `'local'` default.
+        self.start_execution_run_on_host(
+            execution_id,
+            agent_id,
+            cube_repo_id,
+            cube_lease_id,
+            cube_workspace_id,
+            workspace_path,
+            "local",
+        )
+    }
+
+    /// Host-aware variant of [`Self::start_execution_run`]. Persists the
+    /// scheduler-selected `host_id` onto both the new `work_runs` row and
+    /// the `work_executions` row (per the distributed-execution design's
+    /// "Storage Additions": the execution's `host_id` is "populated when a
+    /// run first picks a host"; `work_runs.host_id` is the durable
+    /// per-run attribution). `host_id = "local"` reproduces the historical
+    /// behaviour exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_execution_run_on_host(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: &str,
+        cube_lease_id: &str,
+        cube_workspace_id: &str,
+        workspace_path: &str,
+        host_id: &str,
+    ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id)?
@@ -539,6 +572,7 @@ impl WorkDb {
                  cube_lease_id = ?3,
                  cube_workspace_id = ?4,
                  workspace_path = ?5,
+                 host_id = ?7,
                  started_at = COALESCE(started_at, ?6),
                  finished_at = NULL
              WHERE id = ?1",
@@ -548,7 +582,8 @@ impl WorkDb {
                 cube_lease_id,
                 cube_workspace_id,
                 workspace_path,
-                now
+                now,
+                host_id
             ],
         )?;
 
@@ -594,9 +629,9 @@ impl WorkDb {
         tx.execute(
             "INSERT INTO work_runs (
                 id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
-                artifacts_path, created_at, started_at, finished_at
-             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL)",
-            params![run_id, execution_id, agent_id, now],
+                artifacts_path, created_at, started_at, finished_at, host_id
+             ) VALUES (?1, ?2, ?3, 'active', NULL, NULL, NULL, NULL, ?4, ?4, NULL, ?5)",
+            params![run_id, execution_id, agent_id, now, host_id],
         )?;
 
         let execution = query_execution(&tx, execution_id)?
