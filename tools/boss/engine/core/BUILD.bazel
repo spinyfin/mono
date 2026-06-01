@@ -44,6 +44,7 @@ rust_library(
         "src/live_status.rs",
         "src/live_status_loop.rs",
         "src/live_status_redact.rs",
+        "src/magic_wand.rs",
         "src/live_worker_state.rs",
         "src/merge_poller.rs",
         "src/merge_when_ready.rs",
@@ -306,6 +307,26 @@ rust_test(
 rust_test(
     name = "comments_crud_test",
     srcs = ["tests/comments_crud.rs"],
+    edition = "2024",
+    size = "small",
+    timeout = "moderate",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
+    name = "magic_wand_dispatch_test",
+    srcs = ["tests/magic_wand_dispatch.rs"],
     edition = "2024",
     size = "small",
     timeout = "moderate",

@@ -36,6 +36,7 @@ pub mod ipc_log;
 pub mod live_status;
 pub mod live_status_loop;
 pub mod live_status_redact;
+pub mod magic_wand;
 pub mod live_worker_state;
 pub mod merge_poller;
 pub mod merge_when_ready;

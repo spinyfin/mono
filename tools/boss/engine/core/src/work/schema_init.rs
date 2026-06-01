@@ -292,6 +292,8 @@ impl WorkDb {
         // other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comments-in-markdown-viewer.md
         migrate_work_comments_table(&conn)?;
+        // Comments Phase 3: magic-wand dispatch audit trail.
+        migrate_magic_wand_dispatches_table(&conn)?;
         // Automations foundation (maintenance-tasks.md): `automations`,
         // `automation_runs`, `automation_short_id_sequences` tables plus
         // `tasks.source_automation_id` provenance column. Purely additive —
@@ -309,7 +311,7 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
         migrate_editorial_controls_schema(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '14')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '15')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
