@@ -245,12 +245,18 @@ private struct AutomationDetailView: View {
                         LabeledContent("Last outcome", value: outcome)
                     }
                     if let nextDue = automation.nextDueAt {
-                        LabeledContent("Next fire", value: formatTimestamp(nextDue))
+                        LabeledContent("Next fire") {
+                            Text(AutomationTime.relative(nextDue, now: Date()))
+                                .help(AutomationTime.absolute(nextDue) ?? nextDue)
+                        }
                     } else if automation.enabled {
                         LabeledContent("Next fire", value: "Pending")
                     }
                     if let lastFired = automation.lastFiredAt {
-                        LabeledContent("Last fired", value: formatTimestamp(lastFired))
+                        LabeledContent("Last fired") {
+                            Text(AutomationTime.relative(lastFired, now: Date()))
+                                .help(AutomationTime.absolute(lastFired) ?? lastFired)
+                        }
                     }
                     let openCount = model.openTaskCountByAutomationID[automation.id] ?? 0
                     LabeledContent("Open tasks", value: "\(openCount) / \(automation.openTaskLimit)")
@@ -326,16 +332,59 @@ private struct AutomationDetailView: View {
         }
     }
 
-    private func formatTimestamp(_ iso: String) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: iso) {
-            let rel = RelativeDateTimeFormatter()
-            rel.unitsStyle = .full
-            return rel.localizedString(for: date, relativeTo: Date())
+}
+
+/// Pure helpers for rendering an automation's scheduling timestamps
+/// ("Next fire", "Last fired"). The engine stores both `next_due_at`
+/// and `last_fired_at` as UTC epoch seconds serialised to a string
+/// (e.g. "1780295100"), which is unreadable raw — so the primary
+/// display is a relative form ("in 21 minutes", "2 hours ago") with the
+/// absolute local time relegated to a hover tooltip. Kept free of
+/// SwiftUI so the formatting contract can be unit-tested without
+/// hosting a view (mirrors `WorkerStaleness`).
+enum AutomationTime {
+    /// Parse the engine's timestamp. Both fields are UTC epoch seconds
+    /// as a string; an RFC 3339 / ISO 8601 string is accepted as a
+    /// fallback in case a surface ever feeds this differently.
+    static func parse(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return nil }
+        if let epoch = Int64(trimmed) {
+            return Date(timeIntervalSince1970: TimeInterval(epoch))
         }
-        return iso
+        for formatter in isoFormatters {
+            if let date = formatter.date(from: trimmed) { return date }
+        }
+        return nil
     }
+
+    /// Human-readable relative form ("in 21 minutes", "2 hours ago").
+    /// Falls back to the raw string when unparseable so a future format
+    /// change degrades to the old behaviour rather than rendering blank.
+    static func relative(_ raw: String, now: Date) -> String {
+        guard let date = parse(raw) else { return raw }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: now)
+    }
+
+    /// Absolute local time ("Jun 1, 2026 at 3:45 PM") for the secondary
+    /// tooltip detail. Returns `nil` when unparseable.
+    static func absolute(_ raw: String) -> String? {
+        guard let date = parse(raw) else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private nonisolated(unsafe) static let isoFormatters: [ISO8601DateFormatter] = {
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return [plain, fractional]
+    }()
 }
 
 private struct AutomationDetailSection<Content: View>: View {
