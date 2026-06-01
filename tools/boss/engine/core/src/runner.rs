@@ -378,8 +378,25 @@ impl ExecutionRunner for PaneSpawnRunner {
         // `--settings`. `write_workspace_files` writes the same path.
         let worker_settings_path =
             crate::worker_setup::worker_settings_path(workspace_path);
+        // Re-prepend BOSS_BIN_DIR to PATH in the worker's first shell line,
+        // mirroring the Boss/coordinator pane (see BossPaneModel.swift and
+        // the feba26d2 fix). `spawn_flow` already sets PATH with
+        // BOSS_BIN_DIR ahead of a sanitized PATH in the pane *surface*
+        // env, but the worker pane runs a login shell whose init scripts
+        // (.zprofile, .zshrc) rebuild PATH from /etc/paths and the user's
+        // dotfiles — which re-prepends `~/bin`, where a `repobin` shim of
+        // `cube` / `boss` / `bossctl` typically lives. That shim is
+        // independently versioned and has drifted from the bundled CLI
+        // (e.g. it lacks `cube pr ensure`), so a worker that resolves the
+        // shim instead of the bundled binary silently breaks. BOSS_BIN_DIR
+        // itself survives init (init scripts don't unset custom env vars),
+        // so we re-prepend it here: this line runs *after* init completes
+        // and *before* claude launches, so claude — and every tool-issued
+        // `cube`/`boss` subshell it spawns — inherits the bundled-first
+        // PATH. The `[ -n "$BOSS_BIN_DIR" ]` guard is a no-op in dev /
+        // bazel-run mode where BOSS_BIN_DIR is unset.
         let initial_input = format!(
-            "unset ANTHROPIC_API_KEY; {}",
+            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
             spawn_config.claude_invocation(
                 spawner.non_opus_auto_mode(),
                 Some(&worker_settings_path),
@@ -3659,9 +3676,15 @@ mod pane_spawn_tests {
             "expected initial_input to read from prompt file, got: {:?}",
             input.initial_input
         );
+        // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
+        // bundled `cube`/`boss`/`bossctl` win over any `~/bin` repobin
+        // shim the login-shell init re-prepends), then unsets the API key
+        // and invokes claude. See the comment at the construction site.
         assert!(
-            input.initial_input.starts_with("unset ANTHROPIC_API_KEY; claude"),
-            "expected initial_input to unset ANTHROPIC_API_KEY and invoke claude, got: {:?}",
+            input
+                .initial_input
+                .starts_with("[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude"),
+            "expected initial_input to re-prepend BOSS_BIN_DIR, unset ANTHROPIC_API_KEY, and invoke claude, got: {:?}",
             input.initial_input
         );
     }
@@ -3765,11 +3788,11 @@ mod pane_spawn_tests {
         assert_eq!(
             input.initial_input,
             format!(
-                "unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::effort::ENGINE_DEFAULT_MODEL,
                 settings_path.display(),
             ),
-            "untagged row should spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
+            "untagged row should re-prepend BOSS_BIN_DIR to PATH, then spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
         );
 
         // No addendum prepended — the existing implementation framing
