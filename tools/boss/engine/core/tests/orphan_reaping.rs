@@ -50,6 +50,7 @@ async fn serve_exits_when_watched_parent_dies() -> Result<()> {
         db_path,
         worker_pool_size: 1,
         automation_pool_size: 1,
+        review_pool_size: 1,
     };
     let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
@@ -99,6 +100,7 @@ async fn serve_without_parent_watch_is_unaffected_by_subprocess_death() -> Resul
         db_path,
         worker_pool_size: 1,
         automation_pool_size: 1,
+        review_pool_size: 1,
     };
     let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 

@@ -44,6 +44,7 @@ impl TestEngine {
             db_path: db_path.clone(),
             worker_pool_size: 1,
             automation_pool_size: 1,
+            review_pool_size: 1,
         };
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 

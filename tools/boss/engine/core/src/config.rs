@@ -3,7 +3,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
-use crate::coordinator::{MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
+use crate::coordinator::{
+    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+};
 
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
@@ -24,6 +26,10 @@ pub struct WorkConfig {
     /// Size of the dedicated automation worker pool. Configured via
     /// `BOSS_AUTOMATION_POOL_SIZE`; defaults to [`MAX_AUTOMATION_POOL_SIZE`].
     pub automation_pool_size: usize,
+    /// Size of the dedicated review worker pool. Configured via
+    /// `BOSS_REVIEW_POOL_SIZE`; defaults to [`DEFAULT_REVIEW_POOL_SIZE`]
+    /// (deliberately small to bound always-Opus review spend).
+    pub review_pool_size: usize,
 }
 
 impl WorkConfig {
@@ -54,11 +60,20 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(MAX_AUTOMATION_POOL_SIZE);
+        let review_pool_size = std::env::var("BOSS_REVIEW_POOL_SIZE")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| format!("could not parse BOSS_REVIEW_POOL_SIZE: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
         Ok(Self {
             cwd,
             db_path,
             worker_pool_size,
             automation_pool_size,
+            review_pool_size,
         })
     }
 }
@@ -209,7 +224,10 @@ fn default_db_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd};
+    use super::{
+        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
+        resolve_runtime_cwd,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -310,6 +328,45 @@ mod tests {
             match original_pool {
                 Some(value) => std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", value),
                 None => std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    // Default-and-override are checked in a single test (rather than the
+    // two-test pattern used elsewhere) so the two cases can't run in
+    // parallel and race on the shared process-global `BOSS_REVIEW_POOL_SIZE`:
+    // `config::tests` all land in the multi-threaded `engine_lib_test_rest`
+    // shard.
+    #[test]
+    fn review_pool_size_defaults_and_reads_from_env() {
+        let original_pool = std::env::var_os("BOSS_REVIEW_POOL_SIZE");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+
+        // Unset → falls back to the small default.
+        unsafe {
+            std::env::remove_var("BOSS_REVIEW_POOL_SIZE");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.review_pool_size, DEFAULT_REVIEW_POOL_SIZE);
+
+        // Set → the env value wins.
+        unsafe {
+            std::env::set_var("BOSS_REVIEW_POOL_SIZE", "1");
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.review_pool_size, 1);
+
+        unsafe {
+            match original_pool {
+                Some(value) => std::env::set_var("BOSS_REVIEW_POOL_SIZE", value),
+                None => std::env::remove_var("BOSS_REVIEW_POOL_SIZE"),
             }
             match original_db {
                 Some(value) => std::env::set_var("BOSS_DB_PATH", value),

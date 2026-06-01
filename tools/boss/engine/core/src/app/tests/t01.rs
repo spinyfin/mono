@@ -265,6 +265,7 @@ async fn engine_health_report_is_empty_when_api_key_present() {
         db_path: temp.path().join("state.db"),
         worker_pool_size: 1,
         automation_pool_size: 1,
+        review_pool_size: 1,
     };
     let agent = crate::config::AgentConfig {
         anthropic_api_key: Some("sk-test".to_owned()),
@@ -1120,6 +1121,7 @@ fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
             db_path: temp.path().join("state.db"),
             worker_pool_size: 1,
             automation_pool_size: 1,
+            review_pool_size: 1,
         },
         None,
     ));

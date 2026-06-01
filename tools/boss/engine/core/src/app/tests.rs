@@ -38,6 +38,7 @@ fn test_server_state() -> Arc<ServerState> {
             db_path: temp.path().join("state.db"),
             worker_pool_size: 1,
             automation_pool_size: 1,
+            review_pool_size: 1,
         },
         None,
     ));
