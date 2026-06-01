@@ -75,6 +75,8 @@ mod work_items;
 /// Bundling these into one struct keeps the dispatch match a thin
 /// alphabetical table of `Variant => module::handler(ctx, r)` arms so
 /// concurrent PRs adding new requests don't all collide at the tail.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct Dispatch {
     server_state: Arc<ServerState>,
     work_db: Arc<WorkDb>,
@@ -4345,14 +4347,14 @@ async fn handle_frontend_connection(
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
 
-        let ctx = Dispatch {
-            server_state: server_state.clone(),
-            work_db: work_db.clone(),
-            sink: sink.clone(),
-            session_id: session_id.clone(),
-            request_id: request_id.clone(),
-            peer_pid,
-        };
+        let ctx = Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(work_db.clone())
+            .sink(sink.clone())
+            .session_id(session_id.clone())
+            .request_id(request_id.clone())
+            .maybe_peer_pid(peer_pid)
+            .build();
         match request {
             r @ FrontendRequest::AbandonCiRemediation { .. } => {
                 ci_remediation::handle_abandon_ci_remediation(ctx, r).await
