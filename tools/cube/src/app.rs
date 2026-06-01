@@ -1419,11 +1419,13 @@ fn run_workspace(
             // dir — out of the worker's jj snapshot so they never get
             // committed into a PR. Done before setup runs, so a setup step
             // that drops such a file is already covered.
+            //
+            // Note: an upstream writer that creates `logs/<workspace>.log`
+            // was reported in issue #1174 but could not be located in this
+            // codebase after a full audit of cube, boss-engine, event-shim,
+            // app-macos, and bossctl. The exclude guard below is the actual
+            // protection; no cube-owned code creates the file.
             ensure_boss_infra_excluded(&workspace.workspace_path, &workspace.workspace_id);
-            // Redirect writes: pre-create a symlink from the in-checkout log
-            // path to an external location so host tooling that creates
-            // logs/<workspace>.log writes outside the jj snapshot (issue #1174).
-            redirect_workspace_log(&workspace.workspace_path, &workspace.workspace_id);
 
             let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
 
@@ -2810,76 +2812,6 @@ fn ensure_boss_infra_excluded(workspace_path: &Path, workspace_id: &str) {
     }
 }
 
-/// Redirect the per-workspace infra log file outside the checkout.
-///
-/// Some host/Boss tooling creates an empty `logs/<workspace>.log` inside the
-/// leased workspace at setup time (issue #1174). By pre-creating a symlink
-/// from the in-checkout path to an external location under the cube data dir,
-/// any write that tooling makes lands outside the jj snapshot. The symlink
-/// itself is already covered by the `.git/info/exclude` guard installed by
-/// [`ensure_boss_infra_excluded`].
-///
-/// Best-effort: any failure (data-dir resolution, external dir creation,
-/// `logs/` dir creation, symlink creation) is printed as a warning and
-/// silently skipped so a filesystem edge case never breaks a lease.
-///
-/// No-op when:
-/// - the cube data dir cannot be determined
-/// - `logs/<workspace>.log` already exists (regular file or symlink)
-/// - the `logs/` directory already exists as a file (corrupted state)
-pub(crate) fn redirect_workspace_log(workspace_path: &Path, workspace_id: &str) {
-    let log_filename = format!("{workspace_id}.log");
-    let in_checkout = workspace_path.join("logs").join(&log_filename);
-
-    // Already present as any kind of filesystem object — leave it alone.
-    // The .git/info/exclude guard handles whatever is there.
-    if in_checkout.exists() || in_checkout.is_symlink() {
-        return;
-    }
-
-    // Determine the external target: <cube_data_dir>/workspace-logs/<workspace_id>/
-    let external_dir = match paths::data_dir() {
-        Ok(dir) => dir.join("workspace-logs").join(workspace_id),
-        Err(e) => {
-            eprintln!(
-                "warning: cube could not determine data dir for workspace log redirect \
-                 ({workspace_id}): {e}"
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = fs::create_dir_all(&external_dir) {
-        eprintln!(
-            "warning: cube could not create external log dir {} for workspace {workspace_id}: {e}",
-            external_dir.display()
-        );
-        return;
-    }
-
-    let external_target = external_dir.join(&log_filename);
-
-    // Ensure the in-checkout `logs/` parent directory exists.
-    let logs_dir = workspace_path.join("logs");
-    if let Err(e) = fs::create_dir_all(&logs_dir) {
-        eprintln!(
-            "warning: cube could not create workspace logs dir {} for {workspace_id}: {e}",
-            logs_dir.display()
-        );
-        return;
-    }
-
-    // Symlink: <workspace>/logs/<workspace_id>.log -> <external_target>
-    #[cfg(unix)]
-    if let Err(e) = std::os::unix::fs::symlink(&external_target, &in_checkout) {
-        eprintln!(
-            "warning: cube could not create log redirect symlink {} -> {}: {e}",
-            in_checkout.display(),
-            external_target.display()
-        );
-    }
-}
-
 fn reset_workspace(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -3918,7 +3850,7 @@ mod tests {
         RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
         is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
         parse_github_owner_repo, parse_github_remote, parse_github_slug, parse_origin,
-        redirect_workspace_log, render_boss_infra_exclude_block, resolve_body_file,
+        render_boss_infra_exclude_block, resolve_body_file,
         run_with_context, run_with_dependencies, upsert_managed_exclude,
     };
 
@@ -11389,79 +11321,4 @@ github\tssh://org-1@github.com/spinyfin/mono.git
         assert!(!workspace.join(".git").exists());
     }
 
-    #[test]
-    fn redirect_workspace_log_creates_symlink_to_external_location() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let workspace = tempdir.path().join("mono-agent-004");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-
-        // Point the cube data dir to a location inside the tempdir so we can
-        // inspect it without touching the real data dir.
-        let data_dir = tempdir.path().join("cube-data");
-        // SAFETY: test-only; no other threads read CUBE_DATA_DIR concurrently.
-        unsafe { std::env::set_var("CUBE_DATA_DIR", &data_dir) };
-
-        redirect_workspace_log(&workspace, "mono-agent-004");
-
-        unsafe { std::env::remove_var("CUBE_DATA_DIR") };
-
-        let symlink_path = workspace.join("logs").join("mono-agent-004.log");
-        assert!(symlink_path.is_symlink(), "expected a symlink at {}", symlink_path.display());
-
-        let target = std::fs::read_link(&symlink_path).expect("read symlink");
-        assert!(
-            target.starts_with(&data_dir),
-            "symlink target {} must be under the external data dir {}",
-            target.display(),
-            data_dir.display()
-        );
-        assert!(
-            target.ends_with("mono-agent-004.log"),
-            "symlink target {} must end with the workspace log filename",
-            target.display()
-        );
-    }
-
-    #[test]
-    fn redirect_workspace_log_is_noop_when_file_already_exists() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let workspace = tempdir.path().join("mono-agent-004");
-        let logs_dir = workspace.join("logs");
-        std::fs::create_dir_all(&logs_dir).expect("logs dir");
-        let existing = logs_dir.join("mono-agent-004.log");
-        std::fs::write(&existing, b"pre-existing").expect("write");
-
-        let data_dir = tempdir.path().join("cube-data");
-        unsafe { std::env::set_var("CUBE_DATA_DIR", &data_dir) };
-
-        redirect_workspace_log(&workspace, "mono-agent-004");
-
-        unsafe { std::env::remove_var("CUBE_DATA_DIR") };
-
-        // The pre-existing regular file must not be overwritten.
-        assert!(!existing.is_symlink(), "must not replace a regular file with a symlink");
-        assert_eq!(std::fs::read(&existing).unwrap(), b"pre-existing");
-    }
-
-    #[test]
-    fn redirect_workspace_log_is_noop_when_symlink_already_present() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let workspace = tempdir.path().join("mono-agent-004");
-        let logs_dir = workspace.join("logs");
-        std::fs::create_dir_all(&logs_dir).expect("logs dir");
-        let link = logs_dir.join("mono-agent-004.log");
-        let target = tempdir.path().join("elsewhere.log");
-        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
-
-        let data_dir = tempdir.path().join("cube-data");
-        unsafe { std::env::set_var("CUBE_DATA_DIR", &data_dir) };
-
-        redirect_workspace_log(&workspace, "mono-agent-004");
-
-        unsafe { std::env::remove_var("CUBE_DATA_DIR") };
-
-        // Existing symlink must not be replaced.
-        let after = std::fs::read_link(&link).expect("symlink still present");
-        assert_eq!(after, target, "symlink target must be unchanged");
-    }
 }
