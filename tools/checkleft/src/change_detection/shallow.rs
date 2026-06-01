@@ -10,77 +10,70 @@ use super::scenario::Scenario;
 
 /// Successive `--deepen=<N>` increments tried before falling back to full
 /// `--unshallow`. Each step adds N commits to the existing shallow depth.
-const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
+pub const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
 
 /// Ensure the local git repo has enough history to compute a base for
 /// `needed_ref`.
 ///
+/// # Return value
+///
+/// Returns `Ok(true)` when the needed history is available, `Ok(false)` when
+/// the ref is permanently unreachable after all deepening/unshallowing attempts
+/// (caller decides how to handle this), or `Err` for genuine git failures
+/// (network errors, git not found, jj import failure, etc.).
+///
 /// # Behaviour
 ///
-/// - Not shallow → returns `Ok(())` immediately.
-/// - Merge-queue/push scenarios only need `HEAD^1`; a single
-///   `--deepen=1` is sufficient and no reachability re-test is needed.
+/// - Not shallow → returns `Ok(true)` immediately.
+/// - Merge-queue/push-to-default scenarios only need `HEAD^1`; a single
+///   `--deepen=1` is sufficient and always succeeds (returning `Ok(true)`).
 /// - PR/branch/local scenarios need the merge-base against `needed_ref`;
 ///   the bounded ladder `--deepen=50 → 250 → 1000` is tried with a
 ///   reachability check after each step, then `--unshallow` as last resort.
-/// - If the base is **still unreachable** after all attempts, returns a
-///   precise, actionable error. **Never silently falls back to the repo tip** —
-///   that silent mis-scoping is the exact failure mode this project exists to
-///   prevent.
+///   Returns `Ok(false)` if the ref is still unreachable after all attempts.
 ///
 /// # jj colocated repos
 ///
 /// jj's colocated git repo is what is shallow. We operate on the underlying
 /// git repo via the `.git` directory at the workspace root and then run
 /// `jj git import` to sync jj's op log after deepening.
-pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<()> {
+pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<bool> {
     let git_root = resolve_git_root(root, kind)?;
 
     if !is_shallow(&git_root)? {
-        return Ok(());
+        return Ok(true);
     }
 
     info!(needed_ref, "repo is shallow; deepening history");
 
-    match scenario {
+    let reached = match scenario {
         // ── Merge-queue / push-to-default: only HEAD^1 is needed ─────────────
         // A single --deepen=1 brings the parent commit into local history.
         // No merge-base computation is required for these scenarios.
         Scenario::MergeQueue | Scenario::PushToDefault => {
             deepen(&git_root, 1)?;
             info!("deepened by 1 to reach HEAD^1 for merge-queue/push-to-default scenario");
+            true
         }
 
         // ── PR / push-to-branch / local: need the merge-base against needed_ref
-        // Try the bounded ladder then full unshallow before erroring.
+        // Try the bounded ladder then full unshallow before reporting unreachable.
         // PushToBranch needs merge-base(origin/<default_branch>, HEAD), so it
         // requires the same treatment as PR and Local — not just HEAD^1.
         Scenario::PullRequest { .. } | Scenario::PushToBranch { .. } | Scenario::Local => {
-            let reached = deepen_until_reachable(&git_root, needed_ref)?;
-            if !reached {
-                bail!(
-                    "base ref `{needed_ref}` is unreachable even after unshallowing the \
-                     repository.\n\
-                     Tried: --deepen={}, --deepen={}, --deepen={}, --unshallow\n\
-                     The base branch may not have been fetched. Run:\n\
-                     \n    git fetch origin {}\n\n\
-                     then re-run checkleft.",
-                    DEEPEN_LADDER[0],
-                    DEEPEN_LADDER[1],
-                    DEEPEN_LADDER[2],
-                    strip_origin_prefix(needed_ref),
-                );
-            }
+            deepen_until_reachable(&git_root, needed_ref)?
+        }
+    };
+
+    if reached {
+        // In jj colocated repos: sync jj's op log so jj commands see the deepened
+        // history. See design Q3 — jj git import is needed after git-level fetches.
+        if kind == VcsKind::Jujutsu {
+            import_jj_git(&git_root)?;
         }
     }
 
-    // In jj colocated repos: sync jj's op log so jj commands see the deepened
-    // history. See design Q3 — jj git import is needed after git-level fetches.
-    if kind == VcsKind::Jujutsu {
-        import_jj_git(&git_root)?;
-    }
-
-    Ok(())
+    Ok(reached)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -177,12 +170,6 @@ fn deepen_until_reachable(root: &Path, base_ref: &str) -> Result<bool> {
     info!("deepen ladder exhausted; unshallowing fully");
     unshallow(root)?;
     is_merge_base_reachable(root, base_ref)
-}
-
-/// Strip `origin/` prefix from a ref name for use in the user-facing remedy
-/// message. `origin/main` → `main`; `main` → `main`.
-fn strip_origin_prefix(r: &str) -> &str {
-    r.strip_prefix("origin/").unwrap_or(r)
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -288,6 +275,10 @@ mod tests {
     }
 
     // ── strip_origin_prefix ───────────────────────────────────────────────────
+
+    fn strip_origin_prefix(r: &str) -> &str {
+        r.strip_prefix("origin/").unwrap_or(r)
+    }
 
     #[test]
     fn strip_origin_prefix_removes_origin_slash() {
@@ -444,39 +435,29 @@ mod tests {
         drop(remote_dir);
     }
 
-    // ── ensure_history: unreachable after all attempts → clear error ──────────
+    // ── ensure_history: unreachable after all attempts → Ok(false) ─────────────
 
     #[test]
-    fn ensure_history_errors_when_base_permanently_unreachable() {
+    fn ensure_history_returns_false_when_base_permanently_unreachable() {
         // A shallow clone where the remote doesn't have the requested ref at all.
         let (remote_dir, clone) = make_shallow_clone(3);
         let clone_path = clone.path();
 
         // "origin/totally-nonexistent-branch" is not present on the remote,
         // so after all deepen attempts + unshallow, merge-base still fails.
-        let result = ensure_history(
+        // ensure_history now returns Ok(false) so the caller can decide how
+        // to handle the unreachable case (error for PR, empty for push, etc.).
+        let reached = ensure_history(
             clone_path,
             VcsKind::Git,
             "origin/totally-nonexistent-branch",
             &Scenario::PullRequest {
                 base_branch: "origin/totally-nonexistent-branch".to_owned(),
             },
-        );
+        )
+        .expect("ensure_history must not return Err for unreachable (only Ok(false))");
 
-        let err = result.expect_err("expected an error for permanently unreachable base");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("origin/totally-nonexistent-branch"),
-            "error must name the ref: {msg}"
-        );
-        assert!(
-            msg.contains("git fetch origin"),
-            "error must include the remedy: {msg}"
-        );
-        assert!(
-            msg.contains("--unshallow"),
-            "error must list --unshallow in what was tried: {msg}"
-        );
+        assert!(!reached, "permanently unreachable ref must yield reached=false");
 
         drop(remote_dir);
     }

@@ -134,7 +134,47 @@ pub fn resolve_change_plan(
         Scenario::MergeQueue | Scenario::PushToDefault => "HEAD^1".to_owned(),
     };
 
-    ensure_history(root, kind, &needed_ref, &scenario)?;
+    let base_reachable = ensure_history(root, kind, &needed_ref, &scenario)?;
+    if !base_reachable {
+        match &scenario {
+            // Push-to-branch: when the default branch history can't be reached in a
+            // shallow CI clone, produce an empty changeset rather than failing.
+            // A PR build would have an explicit base ref from CI and would correctly
+            // scope to changed files; a push build without a base should run nothing.
+            Scenario::PushToBranch { .. } => {
+                info!(
+                    needed_ref,
+                    "base ref unreachable on push-to-branch shallow build; \
+                     yielding empty changeset to avoid false-positive diff-from-scratch"
+                );
+                return Ok(ChangePlan::Empty { reason: EmptyReason::NoMergeBase });
+            }
+            // For PR and local scenarios: bail with an actionable error so the user
+            // knows exactly what to do. Never silently fall back to the repo tip —
+            // that mis-scoping is the exact failure mode this project exists to prevent.
+            Scenario::PullRequest { .. } | Scenario::Local => {
+                anyhow::bail!(
+                    "base ref `{needed_ref}` is unreachable even after unshallowing the \
+                     repository.\n\
+                     Tried: --deepen={}, --deepen={}, --deepen={}, --unshallow\n\
+                     The base branch may not have been fetched. Run:\n\
+                     \n    git fetch origin {}\n\n\
+                     then re-run checkleft.",
+                    crate::change_detection::shallow::DEEPEN_LADDER[0],
+                    crate::change_detection::shallow::DEEPEN_LADDER[1],
+                    crate::change_detection::shallow::DEEPEN_LADDER[2],
+                    needed_ref.strip_prefix("origin/").unwrap_or(&needed_ref),
+                );
+            }
+            // MergeQueue and PushToDefault only need HEAD^1; deepen=1 always
+            // succeeds for non-root commits, so base_reachable is always true here.
+            Scenario::MergeQueue | Scenario::PushToDefault => {
+                unreachable!(
+                    "MergeQueue/PushToDefault deepen by 1 for HEAD^1, which is always reachable"
+                );
+            }
+        }
+    }
 
     let head_prober = GitHeadProber::new(root);
     let base_selection = select_base(&scenario, env, &head_prober, &default_branch);

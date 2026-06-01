@@ -807,6 +807,106 @@ fn base_ref_override_still_scopes_via_merge_base() {
     assert_eq!(scoped_paths(&vcs, &plan), vec!["feature.rs"]);
 }
 
+// ══ Row 10 — Push-to-branch shallow clone with no accessible base ═══════════════
+
+/// Row 10. Regression for the "oversized-files flags unmodified files" bug:
+/// when a Buildkite push build checks out the branch at shallow depth and
+/// `origin/main` was never fetched, checkleft must produce an empty changeset
+/// rather than diffing from scratch (which treats all tree files as Added with
+/// +full-size/-0 deltas, generating false-positive oversized-files warnings).
+///
+/// Test topology:
+/// ```text
+///   C1 ── C2 (main tip, NOT fetched)
+///    \
+///     B1 (boss branch tip, HEAD — only this is in the shallow clone)
+/// ```
+///
+/// After the fix, resolve_change_plan must return `ChangePlan::Empty` so that
+/// the changeset is empty and no checks produce false positives.
+#[test]
+fn push_to_branch_shallow_no_origin_main_yields_empty_not_diff_from_scratch() {
+    let remote_dir = init_repo("main");
+    let remote = remote_dir.path().to_owned();
+
+    // Build the remote: main has two commits, boss branch forks from the first.
+    let fork = commit(&remote, "base.txt", "base\n", "C1: base");
+    // A second commit on main that adds a new file — simulates files added to
+    // main after the boss branch was created from a stale workspace.
+    commit(&remote, "only_on_main.rs", "fn main_only() {}\n", "C2: main-only");
+    // Boss branch from the fork point (C1), adds the actual PR change.
+    git(&remote, &["checkout", "-b", "boss/exec_test", &fork]);
+    commit(&remote, "boss_change.rs", "fn boss() {}\n", "B1: boss change");
+
+    // Shallow clone: fetch ONLY the boss branch at depth=1. origin/main is
+    // deliberately not fetched, simulating a single-branch Buildkite CI checkout
+    // where the default branch was never fetched alongside the PR branch.
+    //
+    // Critically, we configure the remote's fetch refspec to cover only the
+    // boss branch (not the wildcard +refs/heads/*). This means subsequent
+    // `git fetch origin` calls (inside ensure_history's deepen loop) will
+    // deepen only the boss branch and never fetch origin/main — matching the
+    // behaviour of a `git clone --depth=1 --single-branch --branch boss/exec_test`
+    // Buildkite checkout.
+    let clone_dir = tempdir().expect("tempdir clone");
+    let clone = clone_dir.path().to_owned();
+    git(&clone, &["init", "-b", "boss/exec_test"]);
+    git(&clone, &["config", "user.email", "test@checkleft.example"]);
+    git(&clone, &["config", "user.name", "Checkleft Test"]);
+    git(
+        &clone,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    // Override the fetch refspec to cover ONLY the boss branch (not all of
+    // refs/heads/*). This prevents `git fetch origin` from pulling in main.
+    git(&clone, &[
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/boss/exec_test:refs/remotes/origin/boss/exec_test",
+    ]);
+    // Fetch only the boss branch — intentionally omit origin/main.
+    git(&clone, &["fetch", "--depth=1", "origin", "boss/exec_test"]);
+    git(&clone, &["checkout", "-b", "boss/exec_test", "FETCH_HEAD"]);
+    // Verify that origin/main truly does not exist locally so this is a real test.
+    assert_eq!(
+        git_out(&clone, &["rev-parse", "--is-shallow-repository"]),
+        "true",
+        "clone must be shallow for this test to be meaningful"
+    );
+
+    let vcs = detect(&clone);
+
+    // Simulate a Buildkite push build on a non-default branch (not a PR).
+    let env = CiEnvironment {
+        buildkite: true,
+        buildkite_pull_request: Some("false".to_owned()),
+        buildkite_branch: Some("boss/exec_test".to_owned()),
+        buildkite_pipeline_default_branch: Some("main".to_owned()),
+        ci: true,
+        ..Default::default()
+    };
+
+    let plan = resolve_change_plan(&env, &vcs, &auto())
+        .expect("push-to-branch with no base must not error — it should return Empty");
+
+    assert_eq!(
+        plan,
+        ChangePlan::Empty {
+            reason: EmptyReason::NoMergeBase
+        },
+        "push-to-branch with unreachable origin/main must yield Empty (not a \
+         diff-from-scratch that flags all tree files as Added), got {plan:?}"
+    );
+
+    // Verify the resulting changeset is empty — no false-positive Added files.
+    assert!(
+        scoped_paths(&vcs, &plan).is_empty(),
+        "changeset must be empty: no files should be flagged as changed"
+    );
+
+    drop(remote_dir);
+}
+
 // ══ jj-colocated variant ═══════════════════════════════════════════════════════
 
 fn jj_available() -> bool {
