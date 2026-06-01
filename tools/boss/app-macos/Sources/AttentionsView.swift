@@ -236,33 +236,22 @@ private struct AttentionGroupCard: View {
         }
     }
 
+    @ViewBuilder
     private var footer: some View {
-        HStack(spacing: 10) {
-            Button(role: .destructive) {
-                model.dismissAttentionGroup(group.id)
-            } label: {
-                Text("Dismiss")
+        if group.kind != "followup" {
+            HStack(spacing: 10) {
+                Spacer(minLength: 0)
+                Button {
+                    submit()
+                } label: {
+                    Text("Submit answers")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSubmit)
+                .help(canSubmit
+                      ? "Action this group — unanswered items are skipped"
+                      : "Answer or accept at least one item first")
             }
-            .buttonStyle(.bordered)
-
-            Spacer(minLength: 0)
-
-            if answeredCount > 0 {
-                Text("\(answeredCount) selected")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Button {
-                submit()
-            } label: {
-                Text(group.kind == "followup" ? "Create selected" : "Submit answers")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canSubmit)
-            .help(canSubmit
-                  ? "Action this group — unanswered items are skipped"
-                  : "Answer or accept at least one item first")
         }
     }
 
@@ -310,14 +299,12 @@ private struct AttentionMemberRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 6) {
-                stateGlyph
+                if group.kind != "followup" {
+                    stateGlyph
+                }
                 Text(title)
                     .font(.subheadline.weight(.medium))
                     .fixedSize(horizontal: false, vertical: true)
-                if group.kind == "followup" {
-                    Spacer(minLength: 4)
-                    decideToggle
-                }
             }
             control
             // yes_no / multiple_choice need a discrete skip; prompt has its
@@ -475,26 +462,16 @@ private struct AttentionMemberRow: View {
             },
             set: { value in
                 switch value {
-                case "accept": model.acceptFollowup(member.id)
-                case "reject": model.skipAttention(member.id)
+                case "accept":
+                    model.acceptFollowup(member.id)
+                    model.actionAttentionGroup(group.id)
+                case "reject":
+                    model.skipAttention(member.id)
+                    model.dismissAttentionGroup(group.id)
                 default: break
                 }
             }
         )
-    }
-
-    private var decideToggle: some View {
-        Toggle("Decide", isOn: Binding(
-            get: {
-                member.answerState != "answered" &&
-                member.answerState != "skipped" &&
-                member.answerState != "dismissed"
-            },
-            set: { _ in }
-        ))
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .font(.caption)
     }
 
     private var skipRow: some View {
