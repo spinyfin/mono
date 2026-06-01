@@ -76,10 +76,15 @@ final class ChatViewModel: ObservableObject {
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
     @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
-    /// Product IDs for which a dismissed-groups list response is currently
-    /// in flight. Used by `applyAttentionGroupsList` to route the response
-    /// to the dismissed-merge path rather than the open-replace path.
-    private var pendingDismissedGroupLoads: Set<String> = []
+    /// Count of in-flight dismissed-groups list responses per product ID.
+    /// Used by `applyAttentionGroupsList` to route the response to the
+    /// dismissed-merge path rather than the open-replace path. A counter
+    /// (not a Set) because product selection and work-tree receipt each call
+    /// `loadDismissedAttentionGroups`, so two dismissed requests can be in
+    /// flight simultaneously for the same product — a Set would lose the
+    /// second slot and misroute its response as an open-list, replacing the
+    /// open groups with dismissed ones.
+    private var pendingDismissedGroupLoads: [String: Int] = [:]
     /// Historical execution rows keyed by task id. Populated on demand when
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
@@ -2182,7 +2187,11 @@ final class ChatViewModel: ObservableObject {
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let isDismissedBatch = pendingDismissedGroupLoads.remove(productID) != nil
+        let isDismissedBatch = pendingDismissedGroupLoads[productID, default: 0] > 0
+        if isDismissedBatch {
+            let remaining = (pendingDismissedGroupLoads[productID] ?? 1) - 1
+            pendingDismissedGroupLoads[productID] = remaining > 0 ? remaining : nil
+        }
         let prior = attentionGroupsByProductID[productID] ?? []
         let incomingIDs = Set(groups.map(\.id))
 
@@ -2284,7 +2293,7 @@ final class ChatViewModel: ObservableObject {
     /// Called alongside `sendListAttentionGroups` so the "Rejected" section
     /// is populated on product select and app reconnect.
     private func loadDismissedAttentionGroups(for productID: String) {
-        pendingDismissedGroupLoads.insert(productID)
+        pendingDismissedGroupLoads[productID, default: 0] += 1
         engine.sendListAttentionGroups(productId: productID, state: "dismissed")
     }
 
