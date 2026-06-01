@@ -2,15 +2,33 @@
 id = "docs-link-integrity"
 
 [[checks]]
+id = "no-generated-artifacts"
+check = "forbidden-paths"
+
+[[checks.config.rules]]
+remediation = "Generated build output must not be committed. Remove the artifact from the change."
+when = ["added", "modified", "renamed"]
+patterns = [
+  "**/target/**",
+  "**/node_modules/**",
+  "**/.build/**",
+  "bazel-*",
+  "bazel-*/**",
+]
+
+[[checks]]
 id = "file-size"
 
 [checks.config]
 max_lines = 3000
 exclude_files = [
-  # Lockfiles and generated files — never check these for size
-  "Cargo.lock",
+  # Markdown, lockfiles, and generated files — never check these for size
+  "**/*.md",
+  "**/*.lock",
   "**/package-lock.json",
   "**/go.sum",
+  "**/Package.resolved",
+  "pnpm-lock.yaml",
   "**/*.pb.rs",
   # Grandfathered oversized files — TODO: split each below 3000
   "tools/boss/engine/core/src/completion.rs",
@@ -24,3 +42,12 @@ exclude_files = [
 [checks.policy]
 severity = "error"
 allow_bypass = true
+
+[[checks]]
+id = "rust-test-rule-coverage"
+
+[[checks]]
+id = "todo-expiry"
+
+[[checks]]
+id = "repo-visibility"
