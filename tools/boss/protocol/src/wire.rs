@@ -62,6 +62,13 @@ pub fn magic_wand_dispatch_topic(dispatch_id: &str) -> String {
     format!("magic_wand.dispatch.{dispatch_id}")
 }
 
+/// Per-product editorial-actions topic. The engine pushes a
+/// [`TopicEventPayload::WorkEditorialAction`] on this topic after every
+/// PreToolUse hook decision so the UI can badge product cards.
+pub fn editorial_actions_topic(product_id: &str) -> String {
+    format!("editorial_actions.{product_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendRequestEnvelope {
     pub request_id: String,
@@ -2141,6 +2148,12 @@ pub enum TopicEventPayload {
         execution_id: String,
         work_item_id: String,
         status: String,
+    },
+    /// An editorial hook decision was recorded for a product's execution.
+    /// Emitted to the `"editorial_actions.<product_id>"` topic so the UI
+    /// can badge product cards when actions accumulate.
+    WorkEditorialAction {
+        action: EditorialAction,
     },
 }
 

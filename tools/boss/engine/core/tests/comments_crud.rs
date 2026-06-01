@@ -253,6 +253,9 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
         TopicEventPayload::ExecutionInvalidated { .. } => {
             panic!("unexpected execution invalidation on comment topic")
         }
+        TopicEventPayload::WorkEditorialAction { .. } => {
+            panic!("unexpected editorial action on comment topic")
+        }
     }
 
     Ok(())

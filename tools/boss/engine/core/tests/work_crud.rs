@@ -535,6 +535,9 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
         TopicEventPayload::ExecutionInvalidated { .. } => {
             panic!("unexpected execution invalidation on work topic")
         }
+        TopicEventPayload::WorkEditorialAction { .. } => {
+            panic!("unexpected editorial action on work topic")
+        }
     }
 
     Ok(())
@@ -624,6 +627,9 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
         }
         TopicEventPayload::ExecutionInvalidated { .. } => {
             panic!("unexpected execution invalidation on work topic")
+        }
+        TopicEventPayload::WorkEditorialAction { .. } => {
+            panic!("unexpected editorial action on work topic")
         }
     }
 
