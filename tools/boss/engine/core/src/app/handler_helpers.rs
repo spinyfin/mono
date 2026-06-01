@@ -890,6 +890,50 @@ pub(super) fn active_to_todo_execution(
     }
 }
 
+/// If `item` is a task or chore whose latest execution is still live
+/// (non-terminal), return that execution's id so a caller deleting the
+/// work item can tear down the worker. A live execution
+/// (`ready` / `running` / `waiting_*`) is still holding a worker pool
+/// slot and possibly a leased cube workspace; deleting the backing row
+/// must stop it, or the agent keeps running with no work item behind
+/// it. Terminal executions (`completed` / `failed` / `abandoned` /
+/// `cancelled` / `orphaned`) need no teardown.
+///
+/// Note: this must be read *before* `delete_work_item` tombstones the
+/// task row — `latest_execution_for_work_item` queries the
+/// `work_executions` table by `work_item_id`, which the soft-delete
+/// does not touch, but loading the `WorkItem` itself goes through paths
+/// that filter out `deleted_at` rows. The delete handler captures the
+/// `WorkItem` before deleting and passes it here.
+pub(super) fn live_execution_for_deleted_item(
+    work_db: &WorkDb,
+    item: &WorkItem,
+) -> Option<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return None,
+    };
+    match work_db.latest_execution_for_work_item(&task.id) {
+        Ok(Some(execution))
+            if !matches!(
+                execution.status.as_str(),
+                "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
+            ) =>
+        {
+            Some(execution.id)
+        }
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %task.id,
+                ?err,
+                "live_execution_for_deleted_item: failed to look up latest execution",
+            );
+            None
+        }
+    }
+}
+
 /// Return `(name, description)` for a task/chore id, or `None` when
 /// the id does not name a task/chore or cannot be read from the DB.
 /// Used by the `UpdateWorkItem` handler to snapshot the spec before an

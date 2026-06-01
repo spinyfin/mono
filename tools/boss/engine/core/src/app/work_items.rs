@@ -725,6 +725,28 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
     match work_db.get_work_item(&id) {
         Ok(item) => match work_db.delete_work_item(&id) {
             Ok(()) => {
+                // If the deleted task/chore had a live worker, deleting
+                // the row must also stop that worker — otherwise the
+                // agent keeps running (holding a slot, possibly editing
+                // files / opening a PR) for a task that no longer
+                // exists. Cancel its execution row so the orphan sweep
+                // and reconciler won't re-dispatch it, then release the
+                // pane and leased cube workspace. We use
+                // `cancel_and_release` rather than `force_stop_execution`
+                // because there is no task to demote back to `todo` —
+                // the row is already tombstoned. Idempotent: terminal
+                // executions return `None` and never reach this branch.
+                if let Some(execution_id) = live_execution_for_deleted_item(&work_db, &item) {
+                    let handler = server_state.completion_handler.clone();
+                    tokio::spawn(async move {
+                        handler
+                            .cancel_and_release(
+                                &execution_id,
+                                "work item deleted while a worker was active",
+                            )
+                            .await;
+                    });
+                }
                 let product_id = work_item_product_id(&item);
                 let revision = publish_work_invalidation(
                     &server_state,
