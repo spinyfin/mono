@@ -598,7 +598,7 @@ impl WorkDb {
             "UPDATE task_blocked_signals
                 SET cleared_at = ?2
               WHERE work_item_id = ?1
-                AND reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
                 AND cleared_at IS NULL",
             params![work_item_id, now],
         )?;
@@ -647,7 +647,7 @@ impl WorkDb {
             "UPDATE task_blocked_signals
                 SET cleared_at = ?2
               WHERE work_item_id = ?1
-                AND reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
                 AND cleared_at IS NULL",
             params![work_item_id, now],
         )?;
@@ -896,6 +896,21 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // A fresh remediation attempt supersedes any prior flaky-retrigger
+        // verdict for this work item: the failure is being looked at again,
+        // so the stale `ci_flaky_retriggered` tag must not linger.
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = ?3
+                AND cleared_at IS NULL",
+            params![
+                input.work_item_id,
+                now,
+                boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
+            ],
+        )?;
         let inserted = query_ci_remediation(&tx, &id)?
             .with_context(|| format!("unknown ci_remediation after insert: {id}"))?;
         tx.commit()?;
@@ -1741,6 +1756,102 @@ impl WorkDb {
         let updated = query_ci_remediation(&tx, attempt_id)?;
         tx.commit()?;
         Ok(updated)
+    }
+
+    /// Record that a CI-remediation worker classified the failure as
+    /// flaky/infra and re-triggered the failing job instead of pushing a
+    /// code change (`boss engine ci mark-retriggered`). Two atomic effects:
+    ///
+    /// 1. Flip a non-terminal (`pending`/`running`) attempt to the terminal
+    ///    `retriggered` status, COALESCE `triage_class = 'flaky_or_infra'`
+    ///    (the retrigger *is* the flaky verdict, even if the worker never
+    ///    called `classify`), and stamp `finished_at`. Making the row
+    ///    terminal stops the on-Stop catch-all
+    ///    (`finalize_ci_remediation_attempt`) from re-marking it `failed`
+    ///    and re-entering the probe loop.
+    /// 2. Upsert the `ci_flaky_retriggered` blocked signal on the parent —
+    ///    WITHOUT moving the parent to `status='blocked'`. The signal both
+    ///    surfaces a flake tag on the task card and is consulted by the
+    ///    completion path to park the worker instead of nudging it for a
+    ///    diff that will never exist.
+    ///
+    /// Idempotent: a row already terminal returns `Ok(None)` and writes
+    /// nothing (so the signal is not re-armed on a duplicate marker).
+    pub fn mark_ci_remediation_retriggered(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status       = 'retriggered',
+                    triage_class = COALESCE(triage_class, 'flaky_or_infra'),
+                    finished_at  = COALESCE(finished_at, ?2)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?
+            .with_context(|| format!("unknown ci_remediation after retrigger: {attempt_id}"))?;
+        upsert_task_blocked_signal(
+            &tx,
+            &updated.work_item_id,
+            boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED,
+            Some(attempt_id),
+            &now,
+        )?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    /// Does the work item carry an active (`cleared_at IS NULL`)
+    /// `ci_flaky_retriggered` signal? Consulted by the completion path's
+    /// on-Stop nudge gate: a parent whose last CI failure was deflected to
+    /// infra and re-triggered must be parked (awaiting CI retry / human
+    /// decision), not probed for a code change.
+    pub fn has_active_ci_flaky_retrigger_signal(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_blocked_signals
+              WHERE work_item_id = ?1
+                AND reason = ?2
+                AND cleared_at IS NULL",
+            params![
+                work_item_id,
+                boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Clear any active `ci_flaky_retriggered` signal for `work_item_id`,
+    /// stamping `cleared_at`. Called when a fresh remediation attempt
+    /// supersedes the prior flaky verdict (a new red push), so a stale
+    /// flake tag does not linger past the state it described. Returns the
+    /// number of rows cleared (0 when none was active). Idempotent.
+    pub fn clear_ci_flaky_retrigger_signal(&self, work_item_id: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = ?3
+                AND cleared_at IS NULL",
+            params![
+                work_item_id,
+                now,
+                boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
+            ],
+        )?;
+        Ok(rows)
     }
 
     /// Mark a `fix`-kind attempt as a "succeeded via rebase only" run —

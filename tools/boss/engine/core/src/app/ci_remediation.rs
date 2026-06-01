@@ -112,6 +112,7 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
 
 pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -121,31 +122,78 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
         unreachable!()
     };
     {
-        // The retrigger marker doesn't change the row's status —
-        // the merge-poller observes the re-run's outcome on the
-        // next sweep. We just log + echo so the worker has a
-        // confirmation receipt.
-        match work_db.get_ci_remediation(&attempt_id) {
+        // The retrigger marker is the worker's "this is flaky/infra, I
+        // re-ran the failing job, there is nothing to push" verdict. The
+        // engine flips the attempt to the terminal `retriggered` status and
+        // stamps the `ci_flaky_retriggered` signal on the parent. That
+        // signal (a) surfaces a flake tag on the task card and (b) tells the
+        // completion path to park the worker — awaiting the CI retry / a
+        // human decision — instead of re-probing it for a diff that will
+        // never exist (the stuck-loop bug). The merge-poller still observes
+        // the re-run's outcome on its next sweep and clears the signal when
+        // CI goes green.
+        match work_db.mark_ci_remediation_retriggered(&attempt_id) {
             Ok(Some(attempt)) => {
                 tracing::info!(
                     attempt_id = %attempt.id,
                     work_item_id = %attempt.work_item_id,
                     new_id = %new_id,
-                    "mark_ci_remediation_retriggered: worker re-ran the failing build",
+                    "mark_ci_remediation_retriggered: flaky/infra verdict recorded; parent parked awaiting CI retry",
                 );
+                server_state
+                    .publisher
+                    .publish_frontend_event_on_product(
+                        &attempt.product_id,
+                        FrontendEvent::CiRemediationFlakyRetriggered {
+                            product_id: attempt.product_id.clone(),
+                            work_item_id: attempt.work_item_id.clone(),
+                            attempt_id: attempt.id.clone(),
+                            pr_url: attempt.pr_url.clone(),
+                            new_run_id: new_id.clone(),
+                        },
+                    )
+                    .await;
                 send_response(
                     &sink,
                     &request_id,
-                    FrontendEvent::CiRemediationRetriggered { attempt, new_id },
+                    FrontendEvent::CiRemediationRetriggered {
+                        attempt,
+                        new_id,
+                    },
                 );
             }
-            Ok(None) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
-                },
-            ),
+            // Already terminal (idempotent re-marker) or unknown id.
+            // Distinguish the two so the worker's receipt is honest: echo
+            // the existing row on a duplicate, error on a forged id.
+            Ok(None) => match work_db.get_ci_remediation(&attempt_id) {
+                Ok(Some(attempt)) => {
+                    tracing::info!(
+                        attempt_id = %attempt.id,
+                        status = %attempt.status,
+                        new_id = %new_id,
+                        "mark_ci_remediation_retriggered: attempt already terminal; echoing receipt",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiRemediationRetriggered { attempt, new_id },
+                    );
+                }
+                Ok(None) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
+                    },
+                ),
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
             Err(err) => send_response(
                 &sink,
                 &request_id,

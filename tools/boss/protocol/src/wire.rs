@@ -1883,6 +1883,25 @@ pub enum FrontendEvent {
         attempts_used: i64,
         budget: i64,
     },
+    /// Activity-feed push / notification: a CI-remediation worker
+    /// classified the failure as flaky/infra and re-triggered the failing
+    /// job rather than pushing a code change (`boss engine ci
+    /// mark-retriggered`). The engine has stamped the
+    /// `ci_flaky_retriggered` signal on the parent and will NOT keep
+    /// probing the worker for a diff — the task is now "awaiting CI retry /
+    /// human decision." `new_run_id` is the provider id of the re-triggered
+    /// run the human can watch; the recommended human action is
+    /// `boss engine ci retry <work-item-id>` (or to intervene). Distinct
+    /// from `CiRemediationSucceeded` (CI is not yet green) and from
+    /// `CiRemediationFailed` (the worker did not give up — it deflected to
+    /// infra).
+    CiRemediationFlakyRetriggered {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        new_run_id: String,
+    },
     /// Soft alert (design §Phase 12 #39): a PR's required CI has been
     /// `InFlight` continuously for the duration named in `level`
     /// without producing a definitive result — most commonly because

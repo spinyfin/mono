@@ -372,6 +372,18 @@ pub const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
 /// review worker pool. See design: automated-reviewer-pass-on-every-agent-authored-pr.md
 pub const EXECUTION_KIND_PR_REVIEW: &str = "pr_review";
 
+/// `task_blocked_signals.reason` literal stamped when a CI-remediation worker
+/// classifies a failure as flaky/infra and re-triggers the failing job rather
+/// than pushing a code change (`boss engine ci mark-retriggered`). Unlike the
+/// `ci_failure` reasons this signal does NOT move the parent to
+/// `status='blocked'`: the verdict is "the agent attributed the failure to
+/// infra, re-ran CI, and there is nothing to push." It surfaces a flake tag on
+/// the task card and tells the completion path to park the worker (awaiting the
+/// CI retry / a human decision) instead of probing it for a diff that will
+/// never exist. Cleared when the PR's CI resolves or a fresh remediation
+/// attempt supersedes the verdict.
+pub const BLOCKED_REASON_CI_FLAKY_RETRIGGERED: &str = "ci_flaky_retriggered";
+
 
 
 /// Trigger specification for an automation. The `schedule` variant is
