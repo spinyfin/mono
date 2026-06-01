@@ -897,24 +897,27 @@ fn product_worker_branch_prefix_canonicalises_trailing_slash() {
 }
 
 #[test]
-fn execution_freezes_legacy_worker_branch_prefix() {
-    // The legacy `worker_branch_prefix` field is still frozen onto the
-    // execution row at creation for backward compatibility. It is no
-    // longer used by `expected_branch_name`; branch naming is driven by
-    // `branch_naming` (snapshotted from editorial_rules at spawn time).
+fn execution_honors_product_worker_branch_prefix() {
+    // The product's `worker_branch_prefix` is frozen onto the execution
+    // row at creation and drives branch naming under the default
+    // `BossExecPrefix` strategy: the worker pushes to
+    // `<prefix>exec_<id>` (e.g. `bduff/exec_<id>`), not `boss/exec_<id>`.
+    // Regression test for #1141, where the configured prefix was being
+    // ignored at branch-creation time.
     let path = temp_db_path("prefix-denormalise");
     let db = WorkDb::open(path.clone()).unwrap();
     let (_, execution) = product_task_execution_with_prefix(&db, Some("bduff/"));
-    // The legacy prefix is still denormalised onto the execution row.
+    // The prefix is denormalised onto the execution row.
     assert_eq!(execution.worker_branch_prefix.as_deref(), Some("bduff/"));
-    // When no editorial_rules are configured, branch_naming defaults to
-    // BossExecPrefix — the branch is boss/{exec_id}, not bduff/{exec_id}.
+    // No editorial_rules configured → branch_naming defaults to
+    // BossExecPrefix, under which the frozen prefix replaces `boss/`.
     assert_eq!(execution.branch_naming, BranchNaming::BossExecPrefix);
     let branch = crate::completion::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
+        execution.worker_branch_prefix.as_deref(),
     );
-    assert_eq!(branch, format!("boss/{}", execution.id));
+    assert_eq!(branch, format!("bduff/{}", execution.id));
     let _ = std::fs::remove_file(path);
 }
 
@@ -930,6 +933,7 @@ fn execution_without_product_prefix_defaults_to_boss() {
     let branch = crate::completion::expected_branch_name(
         &execution.id,
         &execution.branch_naming,
+        execution.worker_branch_prefix.as_deref(),
     );
     assert_eq!(branch, format!("boss/{}", execution.id));
     let _ = std::fs::remove_file(path);

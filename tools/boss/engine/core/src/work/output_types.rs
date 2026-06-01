@@ -60,6 +60,14 @@ pub struct LatePrCandidate {
     /// [`BranchNaming::BossExecPrefix`] for rows created before this column
     /// existed (i.e. `NULL` in the DB).
     pub branch_naming: BranchNaming,
+    /// Worker branch-name prefix snapshotted from the product's
+    /// `worker_branch_prefix` column at execution spawn time. Carried
+    /// alongside `branch_naming` so the late-PR sweep reconstructs the
+    /// exact branch name via [`crate::completion::expected_branch_name`]
+    /// — under the default `BossExecPrefix` strategy this is what turns
+    /// `boss/exec_<id>` into the product's configured `<prefix>exec_<id>`.
+    /// `None` → the engine default `boss/`.
+    pub worker_branch_prefix: Option<String>,
 }
 
 /// Raw external-ref data as stored in the `tasks` table. Returned by

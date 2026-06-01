@@ -216,28 +216,47 @@ pub const DEFAULT_WORKER_BRANCH_PREFIX: &str = "boss/";
 /// Engine-supplied branch name a worker must push to when opening
 /// the PR for an execution. The exact shape depends on the execution's
 /// [`BranchNaming`] strategy (snapshotted from the product's
-/// `editorial_rules.branch_naming` at spawn time):
+/// `editorial_rules.branch_naming` at spawn time) and on the execution's
+/// frozen `worker_branch_prefix` (snapshotted from the product's
+/// `Product::worker_branch_prefix` column):
 ///
-/// - [`BranchNaming::BossExecPrefix`] (default): `boss/<execution_id>` —
-///   today's `boss/exec_<id>` form; unique per execution by construction.
+/// - [`BranchNaming::BossExecPrefix`] (default): `<prefix><execution_id>`,
+///   where `<prefix>` is `worker_branch_prefix` when the product set one
+///   (e.g. `bduff/` → `bduff/exec_<id>`) and `boss/` otherwise. This is the
+///   knob exposed by `boss product … --worker-branch-prefix`; the execution
+///   id is kept verbatim so the branch is unique per execution by
+///   construction.
 /// - [`BranchNaming::OpaqueHash`]: `boss/<sha256(execution_id)[..8]>` —
 ///   omits the execution id from the branch name while remaining unique
 ///   within a repo (32 bits of hash space).
 /// - [`BranchNaming::CustomPrefix`]: `<prefix>/<sha256(execution_id)[..8]>` —
 ///   user-supplied prefix instead of `boss/`, same opaque hash suffix.
 ///
+/// `worker_branch_prefix` only affects the default `BossExecPrefix`
+/// strategy: a non-default `branch_naming` is the richer, explicitly
+/// configured editorial rule and takes precedence over the plain prefix
+/// column. The two knobs also differ in slash convention —
+/// `worker_branch_prefix` already carries its trailing `/` (it is
+/// concatenated verbatim), whereas `CustomPrefix { prefix }` inserts a `/`.
+///
 /// In every strategy the branch name is derived deterministically from
-/// `execution_id` so the detector can reconstruct it from `state.db`
-/// alone — no local jj reads, no shared-store contamination.
+/// `execution_id` (and the frozen prefix) so the detector can reconstruct
+/// it from `state.db` alone — no local jj reads, no shared-store
+/// contamination.
 ///
 /// See `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` §5 for
 /// the uniqueness rationale. Cross-repo hash collisions (R6) are not
 /// collisions: the `gh pr list --head` query is always scoped to the
 /// product's `repo_remote_url`.
-pub fn expected_branch_name(execution_id: &str, branch_naming: &BranchNaming) -> String {
+pub fn expected_branch_name(
+    execution_id: &str,
+    branch_naming: &BranchNaming,
+    worker_branch_prefix: Option<&str>,
+) -> String {
     match branch_naming {
         BranchNaming::BossExecPrefix => {
-            format!("{DEFAULT_WORKER_BRANCH_PREFIX}{execution_id}")
+            let prefix = worker_branch_prefix.unwrap_or(DEFAULT_WORKER_BRANCH_PREFIX);
+            format!("{prefix}{execution_id}")
         }
         BranchNaming::OpaqueHash => {
             let hash = opaque_hash(execution_id);
@@ -1109,8 +1128,11 @@ impl WorkerCompletionHandler {
         // and we fall through to `detect_pr` to reconstruct the URL
         // via the GitHub API.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch =
-                expected_branch_name(execution_id, &execution.branch_naming);
+            let expected_branch = expected_branch_name(
+                execution_id,
+                &execution.branch_naming,
+                execution.worker_branch_prefix.as_deref(),
+            );
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
                 Ok(ref slug) => {
@@ -1319,8 +1341,11 @@ impl WorkerCompletionHandler {
             return StopOutcome::FallbackDisabledByFlag;
         }
 
-        let expected_branch =
-            expected_branch_name(&execution.id, &execution.branch_naming);
+        let expected_branch = expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
         PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
@@ -1511,8 +1536,11 @@ must not be asked to open one",
         // invocation (e.g. reading a chore description that referenced
         // an old PR number) and must be discarded.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch =
-                expected_branch_name(execution_id, &execution.branch_naming);
+            let expected_branch = expected_branch_name(
+                execution_id,
+                &execution.branch_naming,
+                execution.worker_branch_prefix.as_deref(),
+            );
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
                 Ok(ref slug) => {
@@ -1671,8 +1699,11 @@ must not be asked to open one",
             return StopOutcome::FallbackDisabledByFlag;
         }
 
-        let expected_branch =
-            expected_branch_name(&execution.id, &execution.branch_naming);
+        let expected_branch = expected_branch_name(
+            &execution.id,
+            &execution.branch_naming,
+            execution.worker_branch_prefix.as_deref(),
+        );
         PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
@@ -1725,6 +1756,7 @@ must not be asked to open one",
         let expected_branch = expected_branch_name(
             &candidate.execution_id,
             &candidate.branch_naming,
+            candidate.worker_branch_prefix.as_deref(),
         );
         let pr_status = match self
             .pr_detector
@@ -4018,7 +4050,7 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -4142,7 +4174,7 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
 
         // Detector intentionally returns Err — if recheck called it,
         // recheck would surface `DetectorFailed`. With the staged
@@ -4320,7 +4352,7 @@ mod tests {
         // The expected branch is `boss/<exec-id>` (BossExecPrefix), but
         // the PR's head branch is `bduff/<exec-id>` — same suffix, only
         // the prefix differs.
-        let expected = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix);
+        let expected = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None);
         let suffix = branch_work_item_suffix(&expected);
         let divergent_branch = format!("bduff/{suffix}");
         assert_ne!(divergent_branch, expected, "test must exercise a real prefix divergence");
@@ -4990,11 +5022,11 @@ mod tests {
              the fan-out bug from incident 001 was exactly the case where they got the same one",
         );
         assert!(
-            alice_url.contains(&expected_branch_name(&alice_exec, &BranchNaming::BossExecPrefix)),
+            alice_url.contains(&expected_branch_name(&alice_exec, &BranchNaming::BossExecPrefix, None)),
             "alice's bound URL must derive from her own execution id, got {alice_url}",
         );
         assert!(
-            bob_url.contains(&expected_branch_name(&bob_exec, &BranchNaming::BossExecPrefix)),
+            bob_url.contains(&expected_branch_name(&bob_exec, &BranchNaming::BossExecPrefix, None)),
             "bob's bound URL must derive from his own execution id, got {bob_url}",
         );
     }
@@ -5273,7 +5305,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].expected_branch,
-            expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix),
+            expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None),
             "detect_pr must be invoked with the execution's deterministic branch name",
         );
     }
@@ -7206,6 +7238,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             work_item_id: chore_id.clone(),
             repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
             branch_naming: BranchNaming::BossExecPrefix,
+            worker_branch_prefix: None,
         };
         let outcome = handler.recheck_for_pr_late(&candidate).await;
 
@@ -7243,6 +7276,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             work_item_id: chore_id.clone(),
             repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
             branch_naming: BranchNaming::BossExecPrefix,
+            worker_branch_prefix: None,
         };
         let outcome = handler.recheck_for_pr_late(&candidate).await;
 
@@ -8426,15 +8460,45 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[test]
     fn boss_exec_prefix_produces_classic_branch_name() {
         let exec_id = "exec_18b44d2630b1df80_66";
-        let branch = expected_branch_name(exec_id, &BranchNaming::BossExecPrefix);
+        let branch = expected_branch_name(exec_id, &BranchNaming::BossExecPrefix, None);
         assert_eq!(branch, "boss/exec_18b44d2630b1df80_66");
         assert!(branch.contains(exec_id), "BossExecPrefix must embed the full execution id");
     }
 
     #[test]
+    fn boss_exec_prefix_honors_product_worker_branch_prefix() {
+        // Regression for #1141: a product configured with
+        // `worker_branch_prefix = "bduff/"` must produce
+        // `bduff/exec_<id>`, not the hardcoded `boss/exec_<id>`. The
+        // prefix carries its own trailing `/` and is concatenated
+        // verbatim, and the full execution id is preserved.
+        let exec_id = "exec_18b44d2630b1df80_66";
+        let branch =
+            expected_branch_name(exec_id, &BranchNaming::BossExecPrefix, Some("bduff/"));
+        assert_eq!(branch, "bduff/exec_18b44d2630b1df80_66");
+    }
+
+    #[test]
+    fn non_default_branch_naming_takes_precedence_over_worker_branch_prefix() {
+        // A non-default editorial `branch_naming` is the richer, explicit
+        // rule and wins over the plain `worker_branch_prefix` column, which
+        // only shapes the default `BossExecPrefix` strategy.
+        let exec_id = "exec_18b44d2630b1df80_66";
+        let opaque =
+            expected_branch_name(exec_id, &BranchNaming::OpaqueHash, Some("bduff/"));
+        assert!(opaque.starts_with("boss/"), "OpaqueHash ignores worker_branch_prefix");
+        let custom = expected_branch_name(
+            exec_id,
+            &BranchNaming::CustomPrefix { prefix: "lnkd".to_owned() },
+            Some("bduff/"),
+        );
+        assert!(custom.starts_with("lnkd/"), "CustomPrefix ignores worker_branch_prefix");
+    }
+
+    #[test]
     fn opaque_hash_produces_8_hex_char_suffix_under_boss_prefix() {
         let exec_id = "exec_18b44d2630b1df80_66";
-        let branch = expected_branch_name(exec_id, &BranchNaming::OpaqueHash);
+        let branch = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, None);
         // Must start with "boss/" and have an 8-char hex suffix.
         assert!(branch.starts_with("boss/"), "OpaqueHash branch must start with boss/");
         let suffix = branch.strip_prefix("boss/").unwrap();
@@ -8450,15 +8514,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[test]
     fn opaque_hash_is_deterministic_for_same_execution_id() {
         let exec_id = "exec_18b44d2630b1df80_66";
-        let a = expected_branch_name(exec_id, &BranchNaming::OpaqueHash);
-        let b = expected_branch_name(exec_id, &BranchNaming::OpaqueHash);
+        let a = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, None);
+        let b = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, None);
         assert_eq!(a, b, "OpaqueHash must be deterministic for the same execution id");
     }
 
     #[test]
     fn opaque_hash_differs_for_different_execution_ids() {
-        let a = expected_branch_name("exec_aaaa0000_01", &BranchNaming::OpaqueHash);
-        let b = expected_branch_name("exec_bbbb1111_02", &BranchNaming::OpaqueHash);
+        let a = expected_branch_name("exec_aaaa0000_01", &BranchNaming::OpaqueHash, None);
+        let b = expected_branch_name("exec_bbbb1111_02", &BranchNaming::OpaqueHash, None);
         assert_ne!(a, b, "distinct execution ids must produce distinct OpaqueHash branches");
     }
 
@@ -8468,6 +8532,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let branch = expected_branch_name(
             exec_id,
             &BranchNaming::CustomPrefix { prefix: "bduff".to_owned() },
+            None,
         );
         assert!(branch.starts_with("bduff/"), "CustomPrefix branch must start with the given prefix");
         let suffix = branch.strip_prefix("bduff/").unwrap();
@@ -8483,10 +8548,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[test]
     fn custom_prefix_with_same_exec_id_differs_from_opaque_hash() {
         let exec_id = "exec_18b44d2630b1df80_66";
-        let opaque = expected_branch_name(exec_id, &BranchNaming::OpaqueHash);
+        let opaque = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, None);
         let custom = expected_branch_name(
             exec_id,
             &BranchNaming::CustomPrefix { prefix: "bduff".to_owned() },
+            None,
         );
         // Same hash suffix but different prefix → different branch names.
         assert_ne!(opaque, custom);
@@ -8607,7 +8673,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         db.force_branch_naming_for_test(&execution_id, &BranchNaming::OpaqueHash)
             .unwrap();
 
-        let expected_hash_branch = expected_branch_name(&execution_id, &BranchNaming::OpaqueHash);
+        let expected_hash_branch = expected_branch_name(&execution_id, &BranchNaming::OpaqueHash, None);
         let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/77"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
