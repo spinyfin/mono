@@ -865,6 +865,8 @@ impl HostAdapterProvider for LocalHostAdapterProvider {
 /// lifecycle from PR1. The cache keys on host id; a stale entry from a
 /// host that has since been disabled/removed is harmless because the
 /// scheduler stops selecting it.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct SshHostAdapterProvider {
     /// The coordinator's own local adapter, returned verbatim for `local`.
     local: Arc<dyn HostAdapter>,
@@ -880,6 +882,7 @@ pub struct SshHostAdapterProvider {
     /// Engine-owned directory holding the per-host `ControlMaster` sockets.
     control_socket_dir: PathBuf,
     /// Lazily-built remote adapters, one per host id.
+    #[builder(default = Mutex::new(HashMap::new()))]
     cache: Mutex<HashMap<String, Arc<dyn HostAdapter>>>,
 }
 
