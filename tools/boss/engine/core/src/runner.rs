@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_slug};
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
-use crate::coordinator::slot_id_from_worker_id;
+use crate::coordinator::{pool_model_override_for_worker_id, slot_id_from_worker_id};
 use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
@@ -362,6 +362,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             spawn_config,
         } = compose_worker_spawn(
             &self.work_db,
+            worker_id,
             execution,
             work_item,
             workspace_path,
@@ -560,6 +561,7 @@ pub(crate) struct ComposedWorkerSpawn {
 /// reuses it without a libghostty pane or a `WorkerSpawner`.
 pub(crate) fn compose_worker_spawn(
     work_db: &WorkDb,
+    worker_id: &str,
     execution: &WorkExecution,
     work_item: &WorkItem,
     workspace_path: &Path,
@@ -745,6 +747,7 @@ pub(crate) fn compose_worker_spawn(
     let spawn_config = resolve_spawn_config(
         row_effort,
         row_model_override.as_deref(),
+        pool_model_override_for_worker_id(worker_id),
         product_default_model.as_deref(),
     );
     // Per-level prompt addendum lands at the very top of the file
