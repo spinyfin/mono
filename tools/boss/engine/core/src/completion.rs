@@ -1013,12 +1013,11 @@ impl WorkerCompletionHandler {
         let outcome = self.on_stop_inner(execution_id).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
-        if let Ok(execution) = self.work_db.get_execution(execution_id) {
-            if execution.kind == ExecutionKind::CiRemediation {
+        if let Ok(execution) = self.work_db.get_execution(execution_id)
+            && execution.kind == ExecutionKind::CiRemediation {
                 self.finalize_ci_remediation_attempt(&execution, &outcome)
                     .await;
             }
-        }
         outcome
     }
 
@@ -1305,8 +1304,7 @@ impl WorkerCompletionHandler {
                         .as_deref()
                         .filter(|s| !s.is_empty())
                         .is_some()
-                {
-                    if let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution) {
+                    && let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution) {
                         tracing::info!(
                             execution_id,
                             %bound_pr_url,
@@ -1316,7 +1314,6 @@ impl WorkerCompletionHandler {
                         );
                         return StopOutcome::AwaitingInput;
                     }
-                }
                 // No bound `chore.pr_url`, or the snapshot/fetch was
                 // unavailable. Fall through to the existing
                 // branch-keyed cold-path detector (new-PR flow).
@@ -2041,8 +2038,8 @@ must not be asked to open one",
                 "failed to list active runs for triage finalisation",
             ),
         }
-        if let Some(lease_id) = lease_id.as_deref() {
-            if let Err(err) = self.cube_client.release_workspace(lease_id).await {
+        if let Some(lease_id) = lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
                     execution_id = %execution.id,
                     lease_id,
@@ -2050,7 +2047,6 @@ must not be asked to open one",
                     "triage finalisation: cube workspace release failed",
                 );
             }
-        }
         self.pane_releaser.release_pane(&execution.id).await;
         self.publisher
             .publish(
@@ -2153,8 +2149,8 @@ must not be asked to open one",
         // The worker contributed a PR — reset any accumulated nudge
         // count so a later unrelated nudge cycle starts clean.
         self.nudge_breaker.forget(execution_id);
-        if let Some(lease_id) = completion.released_lease_id.as_deref() {
-            if let Err(err) = self.cube_client.release_workspace(lease_id).await {
+        if let Some(lease_id) = completion.released_lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
                     execution_id,
                     source,
@@ -2163,7 +2159,6 @@ must not be asked to open one",
                     "pr completion: cube release failed"
                 );
             }
-        }
         self.pane_releaser.release_pane(execution_id).await;
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
@@ -2188,9 +2183,9 @@ must not be asked to open one",
         // completed work item is a `kind=design` task with a project.
         // Errors are logged inside the detector — they must not surface
         // here because they'd mask the successful PR transition.
-        if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
-            if task.kind == TaskKind::Design {
-                if let Some(ref project_id) = task.project_id {
+        if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item
+            && task.kind == TaskKind::Design
+                && let Some(ref project_id) = task.project_id {
                     if merged {
                         // Worker merged directly during its session; update
                         // the branch to main (base_ref_name unknown here,
@@ -2232,8 +2227,6 @@ must not be asked to open one",
                         self.publish_attentions_created(&group, &created).await;
                     }
                 }
-            }
-        }
 
         // Followups: any completing implementation worker may emit a
         // `FOLLOWUPS:` block near the end of its run. Parse the transcript
@@ -2621,15 +2614,14 @@ must not be asked to open one",
             );
             // Publish work-item-changed so the UI refreshes. Requires
             // looking up the execution's work_item_id + product_id.
-            if let Ok(execution) = self.work_db.get_execution(execution_id) {
-                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+            if let Ok(execution) = self.work_db.get_execution(execution_id)
+                && let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
                     let product_id = work_item_product_id(&work_item);
                     let wid = work_item_id(&work_item);
                     self.publisher
                         .publish_work_item_changed(&product_id, &wid, "worker_force_stopped")
                         .await;
                 }
-            }
         }
 
         self.force_release(execution_id).await;
@@ -3050,8 +3042,8 @@ must not be asked to open one",
         };
 
         // --- Conflict signal check ---
-        if let Some(ref attempt) = conflict_attempt {
-            if open_status.mergeability != OpenPrMergeability::Conflict {
+        if let Some(ref attempt) = conflict_attempt
+            && open_status.mergeability != OpenPrMergeability::Conflict {
                 tracing::info!(
                     execution_id,
                     attempt_id = %attempt.id,
@@ -3066,8 +3058,8 @@ must not be asked to open one",
                     Ok(Some(succeeded)) => {
                         // Release old-style cube lease on the attempt (null for
                         // new Phase 3 revision-backed attempts).
-                        if let Some(lease_id) = succeeded.cube_lease_id.as_deref() {
-                            if let Err(err) =
+                        if let Some(lease_id) = succeeded.cube_lease_id.as_deref()
+                            && let Err(err) =
                                 self.cube_client.release_workspace(lease_id).await
                             {
                                 tracing::debug!(
@@ -3078,7 +3070,6 @@ must not be asked to open one",
                                      (likely already released)",
                                 );
                             }
-                        }
                         self.publisher
                             .publish_frontend_event_on_product(
                                 &product_id,
@@ -3148,11 +3139,10 @@ must not be asked to open one",
                     other => other,
                 });
             }
-        }
 
         // --- CI signal check ---
-        if let Some(ref attempt) = ci_attempt {
-            if ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci) {
+        if let Some(ref attempt) = ci_attempt
+            && ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci) {
                 tracing::info!(
                     execution_id,
                     attempt_id = %attempt.id,
@@ -3227,7 +3217,6 @@ must not be asked to open one",
                     other => other,
                 });
             }
-        }
 
         None
     }

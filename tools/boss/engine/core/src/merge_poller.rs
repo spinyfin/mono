@@ -2538,8 +2538,8 @@ async fn mark_merged(
     );
     // Auto-populate the project's design-doc pointer on merge for
     // `kind=design` tasks. Errors are logged inside the detector.
-    if updated.kind == TaskKind::Design {
-        if let Some(ref project_id) = updated.project_id {
+    if updated.kind == TaskKind::Design
+        && let Some(ref project_id) = updated.project_id {
             design_detector::on_design_pr_merged(
                 work_db,
                 &updated.id,
@@ -2550,7 +2550,6 @@ async fn mark_merged(
             )
             .await;
         }
-    }
     true
 }
 
