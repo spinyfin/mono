@@ -22,6 +22,19 @@ pub(crate) fn execution_kind_for_work_item(
                 "chore" => "chore_implementation".to_owned(),
                 "design" => "project_design".to_owned(),
                 "revision" => "revision_implementation".to_owned(),
+                // Investigation tasks must keep their investigation kind on
+                // every (re)dispatch. The first dispatch routes through
+                // `reconcile_dispatchable_tasks`, which passes the
+                // `investigation_implementation` kind explicitly; but the
+                // redispatch path (`abandon_stale_and_redispatch` in
+                // `request_execution_in_tx_with_live_check`) re-derives the
+                // kind from the work item via this function. Without this arm
+                // a redispatched investigation silently downgraded to
+                // `task_implementation`, so the worker got the generic
+                // implementation prelude (not the doc-output one) and the
+                // investigation PR-association path never ran — leaving the
+                // card stranded in Doing with a null `pr_url`.
+                "investigation" => "investigation_implementation".to_owned(),
                 _ => "task_implementation".to_owned(),
             }
         }
