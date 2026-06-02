@@ -239,18 +239,6 @@ fn head_parent_or_empty(prober: &dyn HeadProber) -> BaseSelection {
     }
 }
 
-/// Extract the target branch from a Buildkite gh-readonly-queue branch name.
-///
-/// `gh-readonly-queue/main/pr-42-sha-abc` → `Some("main")`
-fn parse_bk_queue_target(branch: &str) -> Option<String> {
-    branch
-        .strip_prefix("gh-readonly-queue/")?
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -590,30 +578,5 @@ mod tests {
             select_base(&scenario, &env, &prober, DEFAULT),
             BaseSelection::Empty(EmptyReason::DetachedHeadNoParent)
         );
-    }
-
-    // ── parse_bk_queue_target ─────────────────────────────────────────────────
-
-    #[test]
-    fn parse_bk_queue_target_extracts_target_branch() {
-        assert_eq!(
-            parse_bk_queue_target("gh-readonly-queue/main/pr-42-abc"),
-            Some("main".to_owned())
-        );
-        assert_eq!(
-            parse_bk_queue_target("gh-readonly-queue/master/pr-7"),
-            Some("master".to_owned())
-        );
-        assert_eq!(
-            parse_bk_queue_target("gh-readonly-queue/develop/pr-1-sha"),
-            Some("develop".to_owned())
-        );
-    }
-
-    #[test]
-    fn parse_bk_queue_target_returns_none_for_non_queue_branch() {
-        assert_eq!(parse_bk_queue_target("main"), None);
-        assert_eq!(parse_bk_queue_target("feature/my-pr"), None);
-        assert_eq!(parse_bk_queue_target("gh-readonly-queue/"), None);
     }
 }

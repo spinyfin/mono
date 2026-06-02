@@ -2232,14 +2232,6 @@ fn parse_github_remote(remote_list_output: &str) -> Option<(String, String)> {
     None
 }
 
-/// Parse the first recognisable `owner/repo` slug from `jj git remote list` output.
-///
-/// Thin wrapper over [`parse_github_remote`] for callers that only need the
-/// slug, not the remote name.
-fn parse_github_owner_repo(remote_list_output: &str) -> Option<String> {
-    parse_github_remote(remote_list_output).map(|(_, slug)| slug)
-}
-
 /// Verify that a just-pushed branch actually reached GitHub.
 ///
 /// Reads the branch head sha from GitHub's API (the authoritative source)
@@ -3909,7 +3901,7 @@ mod tests {
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY,
         RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
         is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
-        parse_github_owner_repo, parse_github_remote, parse_github_slug, parse_origin,
+        parse_github_remote, parse_github_slug, parse_origin,
         render_boss_infra_exclude_block, resolve_body_file, run_with_context,
         run_with_dependencies, upsert_managed_exclude,
     };
@@ -10714,7 +10706,7 @@ steps:
         );
     }
 
-    // --- parse_github_slug / parse_github_owner_repo tests ---
+    // --- parse_github_slug tests ---
 
     #[test]
     fn parse_github_slug_handles_ssh_url() {
@@ -10743,35 +10735,6 @@ steps:
     #[test]
     fn parse_github_slug_returns_none_for_non_github_url() {
         assert_eq!(parse_github_slug("git@bitbucket.org:user/repo.git"), None);
-    }
-
-    #[test]
-    fn parse_github_owner_repo_extracts_from_jj_remote_list() {
-        let output = "origin\tgit@github.com:spinyfin/mono.git\n";
-        assert_eq!(
-            parse_github_owner_repo(output),
-            Some("spinyfin/mono".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_github_owner_repo_handles_space_separated_output() {
-        let output = "origin  https://github.com/spinyfin/mono.git\n";
-        assert_eq!(
-            parse_github_owner_repo(output),
-            Some("spinyfin/mono".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_github_owner_repo_returns_none_when_no_github_remote() {
-        let output = "origin  git@bitbucket.org:user/repo.git\n";
-        assert_eq!(parse_github_owner_repo(output), None);
-    }
-
-    #[test]
-    fn parse_github_owner_repo_returns_none_for_empty_output() {
-        assert_eq!(parse_github_owner_repo(""), None);
     }
 
     #[test]
