@@ -9,39 +9,44 @@
 //! issues return exit 4, lint warnings return exit 5 — and distinct JSON shapes that
 //! are each easier to parse.
 //!
-//! # Invoking buildifier
+//! # Resolving buildifier
 //!
-//! `buildifier_path` accepts either a single binary path OR a full `bazel run`
-//! invocation. When a `bazel run` form is used, checkleft automatically inserts
-//! a `--` separator so buildifier's own flags are not interpreted as Bazel flags:
+//! Two mutually-exclusive config keys control how buildifier is located:
 //!
-//!   bazel run @buildifier_prebuilt//:buildifier -- --mode=check --format=json ...
+//! - `buildifier_path` — a direct path or binary name on PATH (e.g. `"bin/buildifier"`,
+//!   `"buildifier"`). Used as-is; no Bazel involvement.
 //!
-//! Bazel writes build-progress output to stderr; checkleft only parses stdout so
-//! bazel chatter does not corrupt the JSON.
+//! - `buildifier_target` — a Bazel label (e.g. `"@buildifier_prebuilt//:buildifier"`).
+//!   checkleft builds the target with `bazel build`, then resolves its executable path
+//!   via `bazel cquery --output=starlark`, and execs THAT binary directly — no
+//!   `bazel run` and thus no held Bazel lock.
 //!
-//! # Sample CHECKS.yaml entry
+//! Exactly one key may be set. If neither is configured, `buildifier_target` defaults
+//! to `"@buildifier_prebuilt//:buildifier"`, which works out-of-the-box in any Bazel
+//! workspace that depends on the `buildifier_prebuilt` module.
+//!
+//! # Sample CHECKS.yaml entries
 //!
 //! ```yaml
 //! - id: buildifier
-//!   config:
-//!     # Single binary (repobin, PATH, absolute path):
-//!     buildifier_path: "bin/buildifier"
-//!     # Or a bazel run invocation (works in any repo with buildifier_prebuilt):
-//!     # buildifier_path: "bazel run @buildifier_prebuilt//:buildifier"
-//!     # check_format: true   # set false to skip formatting pass
-//!     # check_lint: true     # set false to skip lint pass
-//! ```
+//!   # No config needed — defaults to @buildifier_prebuilt//:buildifier via bazel target resolution.
 //!
-//! The default when no `buildifier_path` is configured is
-//! `"bazel run @buildifier_prebuilt//:buildifier"`, which works out-of-the-box in
-//! any Bazel workspace that depends on the `buildifier_prebuilt` module.
+//! - id: buildifier
+//!   config:
+//!     # Direct path (repobin, PATH, absolute path) — no Bazel required:
+//!     buildifier_path: "bin/buildifier"
+//!
+//! - id: buildifier
+//!   config:
+//!     # Explicit Bazel target — built and resolved to binary, then exec'd directly:
+//!     buildifier_target: "@buildifier_prebuilt//:buildifier"
+//! ```
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
@@ -74,26 +79,41 @@ impl Check for BuildifierCheck {
 
 #[derive(Debug, Deserialize)]
 struct BuildifierConfigRaw {
-    #[serde(default = "default_buildifier_invocation")]
-    buildifier_path: String,
+    #[serde(default)]
+    buildifier_path: Option<String>,
+    #[serde(default)]
+    buildifier_target: Option<String>,
     #[serde(default = "default_true")]
     check_format: bool,
     #[serde(default = "default_true")]
     check_lint: bool,
 }
 
-fn default_buildifier_invocation() -> String {
-    "bazel run @buildifier_prebuilt//:buildifier".to_owned()
-}
-
 fn default_true() -> bool {
     true
 }
 
+/// How buildifier is located and invoked.
+#[derive(Debug)]
+enum BuildifierInvocation {
+    /// Direct path or binary name — exec'd as-is, no Bazel involved.
+    DirectPath(String),
+    /// Bazel label — built via `bazel build`, then executable path resolved via
+    /// `bazel cquery --output=starlark`, then exec'd directly (no `bazel run`).
+    BazelTarget(String),
+}
+
+impl BuildifierInvocation {
+    fn display_label(&self) -> &str {
+        match self {
+            Self::DirectPath(p) => p,
+            Self::BazelTarget(t) => t,
+        }
+    }
+}
+
 struct BuildifierConfig {
-    /// The buildifier invocation string: either a single binary path (e.g. `"bin/buildifier"`)
-    /// or a multi-token `bazel run` form (e.g. `"bazel run @buildifier_prebuilt//:buildifier"`).
-    buildifier_invocation: String,
+    invocation: BuildifierInvocation,
     check_format: bool,
     check_lint: bool,
 }
@@ -103,22 +123,25 @@ fn parse_config(config: &toml::Value) -> Result<BuildifierConfig> {
         .clone()
         .try_into()
         .context("invalid buildifier check config")?;
+
+    let invocation = match (raw.buildifier_path, raw.buildifier_target) {
+        (Some(_), Some(_)) => bail!(
+            "buildifier check config error: `buildifier_path` and `buildifier_target` are \
+             mutually exclusive — set exactly one, or neither (to use the default target \
+             `@buildifier_prebuilt//:buildifier`)"
+        ),
+        (Some(path), None) => BuildifierInvocation::DirectPath(path),
+        (None, Some(target)) => BuildifierInvocation::BazelTarget(target),
+        (None, None) => {
+            BuildifierInvocation::BazelTarget("@buildifier_prebuilt//:buildifier".to_owned())
+        }
+    };
+
     Ok(BuildifierConfig {
-        buildifier_invocation: raw.buildifier_path,
+        invocation,
         check_format: raw.check_format,
         check_lint: raw.check_lint,
     })
-}
-
-/// Returns `true` when the invocation string is a `bazel run <target>` command.
-///
-/// Such invocations require a `--` separator before buildifier's own flags so
-/// that Bazel does not consume them as its own startup/command options.
-fn is_bazel_run(invocation: &str) -> bool {
-    let mut tokens = invocation.split_whitespace();
-    let prog = tokens.next().unwrap_or("");
-    let sub = tokens.next().unwrap_or("");
-    (prog == "bazel" || prog.ends_with("/bazel")) && sub == "run"
 }
 
 // ── ConfiguredCheck impl ─────────────────────────────────────────────────────
@@ -134,6 +157,8 @@ impl ConfiguredCheck for BuildifierConfig {
         }
 
         let mut findings = Vec::new();
+        // Resolved on first use — avoids spawning bazel when no Starlark files are touched.
+        let mut resolved_binary: Option<String> = None;
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -147,12 +172,23 @@ impl ConfiguredCheck for BuildifierConfig {
                 continue;
             };
 
+            // Resolve the binary on first file that actually needs processing.
+            let binary_str = match resolved_binary.as_deref() {
+                Some(b) => b.to_owned(),
+                None => {
+                    let path = resolve_invocation(&self.invocation)?;
+                    let s = path.to_string_lossy().into_owned();
+                    resolved_binary = Some(s.clone());
+                    s
+                }
+            };
+
             if self.check_format {
-                match run_format_check(&self.buildifier_invocation, &changed_file.path, &contents) {
+                match run_format_check(&binary_str, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
                     Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
-                        &self.buildifier_invocation,
+                        self.invocation.display_label(),
                         BuildifierError::SpawnFailed(&e),
                     )),
                     Err(RunError::Internal(e)) => {
@@ -163,7 +199,7 @@ impl ConfiguredCheck for BuildifierConfig {
                         );
                         findings.push(error_finding(
                             &changed_file.path,
-                            &self.buildifier_invocation,
+                            self.invocation.display_label(),
                             BuildifierError::Internal(&e),
                         ));
                     }
@@ -171,11 +207,11 @@ impl ConfiguredCheck for BuildifierConfig {
             }
 
             if self.check_lint {
-                match run_lint_check(&self.buildifier_invocation, &changed_file.path, &contents) {
+                match run_lint_check(&binary_str, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
                     Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
-                        &self.buildifier_invocation,
+                        self.invocation.display_label(),
                         BuildifierError::SpawnFailed(&e),
                     )),
                     Err(RunError::Internal(e)) => {
@@ -186,7 +222,7 @@ impl ConfiguredCheck for BuildifierConfig {
                         );
                         findings.push(error_finding(
                             &changed_file.path,
-                            &self.buildifier_invocation,
+                            self.invocation.display_label(),
                             BuildifierError::Internal(&e),
                         ));
                     }
@@ -201,6 +237,88 @@ impl ConfiguredCheck for BuildifierConfig {
     }
 }
 
+/// Resolves the buildifier invocation to an executable path.
+///
+/// For `DirectPath`, returns the path as-is (may be a name on PATH or an absolute path).
+/// For `BazelTarget`, builds the target and resolves its executable via `bazel cquery`.
+fn resolve_invocation(invocation: &BuildifierInvocation) -> Result<PathBuf> {
+    match invocation {
+        BuildifierInvocation::DirectPath(path) => Ok(PathBuf::from(path)),
+        BuildifierInvocation::BazelTarget(target) => {
+            let repo_root = std::env::current_dir()
+                .context("failed to get current working directory for bazel target resolution")?;
+            resolve_bazel_target_executable(&repo_root, target)
+        }
+    }
+}
+
+/// Builds `target` and resolves its executable path via `bazel cquery --output=starlark`.
+/// Returns an absolute path to the built binary.
+fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
+    // Build the target first.
+    let build_output = Command::new("bazel")
+        .arg("build")
+        .arg("--color=no")
+        .arg("--curses=no")
+        .arg("--noshow_progress")
+        .arg("--show_result=0")
+        .arg("--ui_event_filters=-info")
+        .arg(target)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to spawn `bazel build {target}`"))?;
+
+    if !build_output.status.success() {
+        let stderr = String::from_utf8_lossy(&build_output.stderr);
+        bail!(
+            "`bazel build {target}` failed (exit {}): {}",
+            build_output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    // Resolve the executable path via cquery.
+    let cquery_output = Command::new("bazel")
+        .arg("cquery")
+        .arg("--color=no")
+        .arg("--curses=no")
+        .arg("--noshow_progress")
+        .arg(target)
+        .arg("--output=starlark")
+        .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to spawn `bazel cquery {target}`"))?;
+
+    if !cquery_output.status.success() {
+        let stderr = String::from_utf8_lossy(&cquery_output.stderr);
+        bail!(
+            "`bazel cquery {target}` failed (exit {}): {}",
+            cquery_output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let raw = String::from_utf8_lossy(&cquery_output.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+
+    if raw.is_empty() {
+        bail!(
+            "bazel target `{target}` does not produce an executable \
+             (cquery returned an empty path)"
+        );
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo_root.join(path))
+    }
+}
+
 /// Represents the kind of failure that occurred when running buildifier.
 enum BuildifierError<'a> {
     /// buildifier could not be spawned (binary not found, not executable, etc.).
@@ -209,7 +327,7 @@ enum BuildifierError<'a> {
     Internal(&'a anyhow::Error),
 }
 
-fn error_finding(file_path: &Path, buildifier_invocation: &str, err: BuildifierError<'_>) -> Finding {
+fn error_finding(file_path: &Path, display_label: &str, err: BuildifierError<'_>) -> Finding {
     match err {
         BuildifierError::SpawnFailed(e) => Finding {
             severity: Severity::Warning,
@@ -220,7 +338,7 @@ fn error_finding(file_path: &Path, buildifier_invocation: &str, err: BuildifierE
                 column: None,
             }),
             remediations: vec![format!(
-                "Ensure buildifier is installed and reachable as `{buildifier_invocation}`."
+                "Ensure buildifier is installed and reachable as `{display_label}`."
             )],
             suggested_fix: None,
         },
@@ -271,13 +389,13 @@ enum RunError {
 /// Runs the format pass (`--mode=check --format=json`) and returns a finding if the file
 /// needs reformatting.
 fn run_format_check(
-    buildifier_invocation: &str,
+    binary: &str,
     file_path: &Path,
     contents: &[u8],
 ) -> std::result::Result<Vec<Finding>, RunError> {
     let path_flag = format!("-path={}", file_path.to_string_lossy());
     let output = invoke_buildifier(
-        buildifier_invocation,
+        binary,
         &["--mode=check", "--format=json", &path_flag, "-"],
         contents,
     )?;
@@ -288,53 +406,42 @@ fn run_format_check(
 ///
 /// `--format=json` requires `--mode=check`; without it buildifier exits with an error.
 fn run_lint_check(
-    buildifier_invocation: &str,
+    binary: &str,
     file_path: &Path,
     contents: &[u8],
 ) -> std::result::Result<Vec<Finding>, RunError> {
     let path_flag = format!("-path={}", file_path.to_string_lossy());
     let output = invoke_buildifier(
-        buildifier_invocation,
+        binary,
         &["--mode=check", "--lint=warn", "--format=json", &path_flag, "-"],
         contents,
     )?;
     parse_lint_output(&output.stdout, file_path).map_err(RunError::Internal)
 }
 
-/// Spawns the buildifier process described by `invocation` and returns its output.
-///
-/// `invocation` may be a single binary path (`"bin/buildifier"`) or a multi-token
-/// `bazel run` command (`"bazel run @buildifier_prebuilt//:buildifier"`).
-/// When a `bazel run` form is detected, `--` is automatically inserted before
-/// `buildifier_args` so that Bazel does not consume them as its own flags.
-///
-/// Only `stdout` is used to parse buildifier's JSON; Bazel's build-progress chatter
-/// goes to `stderr` and is never passed to the JSON parser.
+/// Spawns buildifier at `binary` with `buildifier_args` and pipes `contents` to its stdin.
 fn invoke_buildifier(
-    invocation: &str,
+    binary: &str,
     buildifier_args: &[&str],
     contents: &[u8],
 ) -> std::result::Result<Output, RunError> {
-    let mut tokens = invocation.split_whitespace();
-    let program = tokens
-        .next()
-        .ok_or_else(|| RunError::Internal(anyhow::anyhow!("buildifier_path is empty")))?;
-    let invocation_args: Vec<&str> = tokens.collect();
-
-    let mut cmd = Command::new(program);
-    cmd.args(&invocation_args);
-    if is_bazel_run(invocation) {
-        // Bazel requires `--` before the run target's own flags.
-        cmd.arg("--");
+    if binary.is_empty() {
+        return Err(RunError::Internal(anyhow::anyhow!(
+            "buildifier binary path is empty"
+        )));
     }
+
+    let mut cmd = Command::new(binary);
     cmd.args(buildifier_args);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RunError::SpawnFailed(anyhow::Error::new(e).context(format!("failed to spawn `{invocation}`"))))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        RunError::SpawnFailed(
+            anyhow::Error::new(e).context(format!("failed to spawn buildifier `{binary}`")),
+        )
+    })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -447,12 +554,58 @@ mod tests {
     use std::path::Path;
 
     use tempfile::tempdir;
+    use toml::toml;
 
-    use super::{BuildifierCheck, is_bazel_run, is_buildifier_file, parse_format_output, parse_lint_output};
+    use super::{BuildifierCheck, is_buildifier_file, parse_format_output, parse_lint_output};
     use crate::check::Check;
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::Severity;
     use crate::source_tree::LocalSourceTree;
+
+    // ── config parsing tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn config_defaults_to_buildifier_target() {
+        let check = BuildifierCheck;
+        let config = check.configure(&toml::Value::Table(Default::default())).unwrap();
+        // Verify it configures without error — the default is @buildifier_prebuilt//:buildifier.
+        drop(config);
+    }
+
+    #[test]
+    fn config_explicit_buildifier_path_accepted() {
+        let check = BuildifierCheck;
+        check
+            .configure(&toml::Value::Table(toml! {
+                buildifier_path = "bin/buildifier"
+            }))
+            .expect("explicit buildifier_path should be accepted");
+    }
+
+    #[test]
+    fn config_explicit_buildifier_target_accepted() {
+        let check = BuildifierCheck;
+        check
+            .configure(&toml::Value::Table(toml! {
+                buildifier_target = "@buildifier_prebuilt//:buildifier"
+            }))
+            .expect("explicit buildifier_target should be accepted");
+    }
+
+    #[test]
+    fn config_both_keys_rejected() {
+        let check = BuildifierCheck;
+        let result = check.configure(&toml::Value::Table(toml! {
+            buildifier_path = "bin/buildifier"
+            buildifier_target = "@buildifier_prebuilt//:buildifier"
+        }));
+        assert!(result.is_err(), "expected an error when both keys are set");
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("mutually exclusive"),
+            "expected mutually-exclusive error, got: {msg}"
+        );
+    }
 
     // ── format JSON parser tests ─────────────────────────────────────────────
 
@@ -575,23 +728,6 @@ mod tests {
         );
     }
 
-    // ── bazel run detection ──────────────────────────────────────────────────
-
-    #[test]
-    fn is_bazel_run_recognises_bazel_run_invocations() {
-        assert!(is_bazel_run("bazel run @buildifier_prebuilt//:buildifier"));
-        assert!(is_bazel_run("bazel run //tools:buildifier"));
-        assert!(is_bazel_run("/usr/local/bin/bazel run @foo//:bar"));
-    }
-
-    #[test]
-    fn is_bazel_run_rejects_single_binary_paths() {
-        assert!(!is_bazel_run("buildifier"));
-        assert!(!is_bazel_run("bin/buildifier"));
-        assert!(!is_bazel_run("/usr/local/bin/buildifier"));
-        assert!(!is_bazel_run("bazel build //..."));
-    }
-
     // ── file-kind filter ─────────────────────────────────────────────────────
 
     #[test]
@@ -693,7 +829,7 @@ mod tests {
                     old_path: None,
                 }]),
                 &tree,
-                &toml::Value::Table(toml::toml! {
+                &toml::Value::Table(toml! {
                     check_format = false
                     check_lint = false
                 }),

@@ -43,8 +43,6 @@ checks:
       allow_bypass: true
 
   - id: buildifier
-    config:
-      buildifier_path: "bin/buildifier"
     policy:
       severity: error
 
