@@ -42,11 +42,13 @@ struct ContentView: View {
             } detail: {
                 detail
             }
-            // Always remove the default sidebarToggle so it never appears on
-            // non-Work tabs. A custom toggle button in the .toolbar block below
-            // shows only when navigationMode == .work, giving Work its toggle
-            // back without the conditional-removal dynamic that proved unreliable.
-            .toolbar(removing: .sidebarToggle)
+            // Remove the system sidebarToggle only on non-Work tabs. On the Work
+            // tab, the system-provided toggle handles both expanded and collapsed
+            // states natively, giving exactly one toggle button in either state
+            // without a state-conditional custom button (the root cause of the
+            // T479/T612 recurrence: suppressing one button in one collapse state
+            // always left the other button visible in the opposite state).
+            .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
 
@@ -157,19 +159,6 @@ struct ContentView: View {
             model.startIfNeeded()
         }
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                if model.navigationMode == .work && workColumnVisibility == .detailOnly {
-                    Button {
-                        withAnimation {
-                            workColumnVisibility = workColumnVisibility == .detailOnly ? .all : .detailOnly
-                        }
-                    } label: {
-                        Image(systemName: "sidebar.left")
-                    }
-                    .help("Toggle Sidebar")
-                }
-            }
-
             ToolbarItem(placement: .navigation) {
                 Picker("Mode", selection: Binding(
                     get: { model.navigationMode },
