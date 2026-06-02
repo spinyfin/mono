@@ -19,6 +19,7 @@ pub struct CubeConfig {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
@@ -33,6 +34,13 @@ pub struct WorkConfig {
 }
 
 impl WorkConfig {
+    /// Start building a [`WorkConfig`]. `cwd` and `db_path` are required; all
+    /// pool sizes default to 1 so call sites (especially tests) don't have to
+    /// be updated every time a new pool field is added.
+    pub fn builder() -> WorkConfigBuilder {
+        WorkConfigBuilder::new()
+    }
+
     pub fn load_from_env() -> Result<Self> {
         let cwd = resolve_runtime_cwd()?;
         let db_path = match std::env::var_os("BOSS_DB_PATH") {
@@ -68,13 +76,66 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
-        Ok(Self {
-            cwd,
-            db_path,
-            worker_pool_size,
-            automation_pool_size,
-            review_pool_size,
-        })
+        Ok(WorkConfig::builder()
+            .cwd(cwd)
+            .db_path(db_path)
+            .worker_pool_size(worker_pool_size)
+            .automation_pool_size(automation_pool_size)
+            .review_pool_size(review_pool_size)
+            .build())
+    }
+}
+
+/// Builder for [`WorkConfig`]. Pool sizes default to 1; `cwd` and `db_path`
+/// must be set before [`build`](WorkConfigBuilder::build).
+#[derive(Debug, Clone, Default)]
+pub struct WorkConfigBuilder {
+    cwd: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    worker_pool_size: Option<usize>,
+    automation_pool_size: Option<usize>,
+    review_pool_size: Option<usize>,
+}
+
+impl WorkConfigBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn db_path(mut self, db_path: impl Into<PathBuf>) -> Self {
+        self.db_path = Some(db_path.into());
+        self
+    }
+
+    pub fn worker_pool_size(mut self, size: usize) -> Self {
+        self.worker_pool_size = Some(size);
+        self
+    }
+
+    pub fn automation_pool_size(mut self, size: usize) -> Self {
+        self.automation_pool_size = Some(size);
+        self
+    }
+
+    pub fn review_pool_size(mut self, size: usize) -> Self {
+        self.review_pool_size = Some(size);
+        self
+    }
+
+    /// Build the [`WorkConfig`]. Panics if `cwd` or `db_path` were not set.
+    pub fn build(self) -> WorkConfig {
+        WorkConfig {
+            cwd: self.cwd.expect("WorkConfig::builder requires cwd"),
+            db_path: self.db_path.expect("WorkConfig::builder requires db_path"),
+            worker_pool_size: self.worker_pool_size.unwrap_or(1),
+            automation_pool_size: self.automation_pool_size.unwrap_or(1),
+            review_pool_size: self.review_pool_size.unwrap_or(1),
+        }
     }
 }
 
