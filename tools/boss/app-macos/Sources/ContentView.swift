@@ -1905,6 +1905,9 @@ struct WorkBoardCardView: View {
                             // The full text is accessible via the detail popover.
                             .lineLimit(task.kind == "revision" ? 2 : nil)
                             .truncationMode(.tail)
+                            // Reserve trailing space so the last line of the
+                            // description never overlaps the T-id overlay.
+                            .padding(.trailing, task.shortID != nil ? 44 : 0)
                     }
                     if let blockedBy, !blockedBy.isEmpty {
                         let prefix = task.status == "blocked" ? "Blocked by" : "Waiting on:"
@@ -1934,6 +1937,7 @@ struct WorkBoardCardView: View {
                         .truncationMode(.tail)
                         .help(liveStatus)
                         .accessibilityLabel("Live status: \(liveStatus)")
+                        .padding(.trailing, task.shortID != nil ? 44 : 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
