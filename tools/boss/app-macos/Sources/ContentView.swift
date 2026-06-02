@@ -586,7 +586,15 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .padding(24)
             } else if model.selectedProduct != nil {
-                workBoard()
+                VStack(spacing: 0) {
+                    if let query = model.activeWorkSearchQuery {
+                        WorkFilterBanner(query: query) {
+                            model.workSearchText = ""
+                            isSearchExpanded = false
+                        }
+                    }
+                    workBoard()
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Select a product")
@@ -1623,6 +1631,54 @@ private struct WorkDragRefusalBanner: View {
                 )
         )
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Persistent banner shown across the top of the kanban whenever a search
+/// filter is active. Non-matching cards are hidden while a search is in
+/// effect, and without a standing indicator a stale query reads as an
+/// empty or complete board — a card looks deleted when it is merely
+/// filtered out (issue #1248). The banner states the view is filtered,
+/// echoes the active query, and offers a one-click Clear affordance.
+private struct WorkFilterBanner: View {
+    let query: String
+    let onClear: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .foregroundStyle(Color.accentColor)
+                .font(.callout)
+            (
+                Text("Filtered view — showing matches for ")
+                    .foregroundStyle(.secondary)
+                    + Text("“\(query)”")
+                    .foregroundStyle(.primary)
+                    .fontWeight(.semibold)
+            )
+            .font(.callout)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Button(action: onClear) {
+                Label("Clear filter", systemImage: "xmark.circle.fill")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+            .help("Clear the search filter and show all cards")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(Color.accentColor.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.35))
+                .frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Board is filtered by search query \(query). Activate to clear the filter.")
     }
 }
 
