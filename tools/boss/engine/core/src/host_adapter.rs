@@ -742,6 +742,7 @@ impl HostAdapter for SshHostAdapter {
             spawn_config,
         } = compose_worker_spawn(
             &self.work_db,
+            _worker_id,
             execution,
             work_item,
             workspace_path,

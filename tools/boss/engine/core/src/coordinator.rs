@@ -986,6 +986,25 @@ pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
     None
 }
 
+/// Returns the pool-level model override for the given `worker_id`, or `None`
+/// for the main pool (which has no override and falls through to the effort-
+/// driven default).
+///
+/// Both the automation pool (`auto-worker-N`) and the review pool (`review-N`)
+/// always pin to Opus, per the automated-reviewer design §5: "the review pool
+/// sets its override to Opus unconditionally … reuses the automation pool's
+/// override mechanism." Returning a `'static str` avoids an allocation —
+/// callers pass this directly to [`crate::effort::resolve_spawn_config`].
+pub fn pool_model_override_for_worker_id(worker_id: &str) -> Option<&'static str> {
+    if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX)
+        || worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX)
+    {
+        Some("opus")
+    } else {
+        None
+    }
+}
+
 /// Derive the canonical worker-id string for a pane slot id.
 /// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
 /// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
@@ -3935,7 +3954,7 @@ mod tests {
         ExecutionCoordinator, ExecutionPublisher, FrontendEvent, Host, HostAdapter,
         HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
         MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, pick_worst_failing_check,
-        slot_id_from_worker_id, worker_id_for_slot,
+        pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
     };
 
     #[test]
@@ -6805,6 +6824,37 @@ mod tests {
         assert_eq!(slot_id_from_worker_id("worker-0"), None);
         assert_eq!(slot_id_from_worker_id("worker-abc"), None);
         assert_eq!(slot_id_from_worker_id("agent-1"), None);
+    }
+
+    #[test]
+    fn pool_model_override_for_worker_id_returns_opus_for_review_and_automation() {
+        // Review and automation pools always pin to Opus per the automated-reviewer
+        // design §5. Main-pool workers have no override and fall through to the
+        // effort-driven default.
+        for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
+            let wid = format!("review-{ordinal}");
+            assert_eq!(
+                pool_model_override_for_worker_id(&wid),
+                Some("opus"),
+                "review pool worker {wid:?} must return opus override"
+            );
+        }
+        for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
+            let wid = format!("auto-worker-{ordinal}");
+            assert_eq!(
+                pool_model_override_for_worker_id(&wid),
+                Some("opus"),
+                "automation pool worker {wid:?} must return opus override"
+            );
+        }
+        for ordinal in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
+            let wid = format!("worker-{ordinal}");
+            assert_eq!(
+                pool_model_override_for_worker_id(&wid),
+                None,
+                "main pool worker {wid:?} must return no override"
+            );
+        }
     }
 
     #[tokio::test]
