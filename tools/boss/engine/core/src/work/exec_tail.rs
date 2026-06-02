@@ -37,8 +37,7 @@ impl WorkDb {
     pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         let cancelled = if !execution_status_is_terminal(&execution.status) {
             let affected = tx.execute(
@@ -62,8 +61,7 @@ impl WorkDb {
     ) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         // Cancel the execution only if it is still non-terminal.
         let exec_cancelled = if !execution_status_is_terminal(&execution.status) {
@@ -99,8 +97,7 @@ impl WorkDb {
     pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let prior = execution.cube_lease_id.clone();
         if prior.is_some() {
             tx.execute(
