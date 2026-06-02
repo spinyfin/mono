@@ -1,11 +1,11 @@
-# This file is intentionally malformed for spike demonstration purposes.
+# This file is intentionally malformed for testing the buildifier check.
 #
-# buildifier --lint=warn would flag it for:
+# buildifier --lint=warn flags it for:
 #   - module-docstring: no module-level docstring (must be first statement)
 #   - function-docstring: _impl has no docstring
-#   - no-effect: the string concatenation on line 11 produces a value that is discarded
+#   - no-effect: the string concatenation on line 12 produces a value that is discarded
 #
-# buildifier --mode=check would also flag the formatting issues below
+# buildifier --mode=check also flags the formatting issues below
 # (e.g. trailing whitespace, argument style).
 
 def _my_rule_impl(ctx):

@@ -1,38 +1,38 @@
-/// Spike: buildifier check for checkleft.
-///
-/// Runs `buildifier` on each changed Starlark file in the changeset and converts its
-/// output to checkleft findings.  Only files buildifier understands are inspected —
-/// others pass through silently, satisfying the "does NOT scan unchanged files"
-/// requirement from the spike brief.
-///
-/// # Sample CHECKS.toml entry
-///
-/// ```toml
-/// [[checks]]
-/// id = "buildifier"
-/// check = "buildifier"
-///
-/// [checks.config]
-/// # Path to the buildifier binary; defaults to "buildifier" found on PATH.
-/// # buildifier_path = "buildifier"
-///
-/// # Set either to false to disable that sub-check:
-/// # check_format = true
-/// # check_lint   = true
-/// ```
+//! Buildifier check for checkleft.
+//!
+//! Runs `buildifier` on each changed Starlark file in the changeset and converts its
+//! JSON output to checkleft findings. Requires buildifier 7+ (`--format=json` support).
+//! Only files buildifier understands are inspected; unchanged files are never touched.
+//!
+//! Two passes are run per file: a format pass (`--mode=check`) and a lint pass
+//! (`--lint=warn`). Separate invocations give cleaner exit-code semantics — format
+//! issues return exit 4, lint warnings return exit 5 — and distinct JSON shapes that
+//! are each easier to parse.
+//!
+//! # Sample CHECKS.yaml entry
+//!
+//! ```yaml
+//! - id: buildifier
+//!   config:
+//!     # Path to the buildifier binary. Defaults to "buildifier" on PATH.
+//!     buildifier_path: "bin/buildifier"
+//!     # check_format: true   # set false to skip formatting pass
+//!     # check_lint: true     # set false to skip lint pass
+//! ```
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use regex::Regex;
 use serde::Deserialize;
 
 use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+
+// ── public check ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
 pub struct BuildifierCheck;
@@ -116,34 +116,25 @@ impl ConfiguredCheck for BuildifierConfig {
                 continue;
             };
 
-            match run_buildifier_on_file(
-                &self.buildifier_path,
-                &changed_file.path,
-                &contents,
-                self.check_format,
-                self.check_lint,
-            ) {
-                Ok(file_findings) => findings.extend(file_findings),
-                Err(e) => {
-                    // Buildifier not found or failed to spawn — surface as a warning rather
-                    // than aborting the whole check run.
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        message: format!(
-                            "could not run buildifier on `{}`: {e}",
-                            changed_file.path.display()
-                        ),
-                        location: Some(Location {
-                            path: changed_file.path.clone(),
-                            line: None,
-                            column: None,
-                        }),
-                        remediations: vec![format!(
-                            "Ensure buildifier is installed and reachable as `{}`.",
-                            self.buildifier_path
-                        )],
-                        suggested_fix: None,
-                    });
+            if self.check_format {
+                match run_format_check(&self.buildifier_path, &changed_file.path, &contents) {
+                    Ok(file_findings) => findings.extend(file_findings),
+                    Err(e) => findings.push(spawn_error_finding(
+                        &changed_file.path,
+                        &self.buildifier_path,
+                        &e,
+                    )),
+                }
+            }
+
+            if self.check_lint {
+                match run_lint_check(&self.buildifier_path, &changed_file.path, &contents) {
+                    Ok(file_findings) => findings.extend(file_findings),
+                    Err(e) => findings.push(spawn_error_finding(
+                        &changed_file.path,
+                        &self.buildifier_path,
+                        &e,
+                    )),
                 }
             }
         }
@@ -152,6 +143,26 @@ impl ConfiguredCheck for BuildifierConfig {
             check_id: "buildifier".to_owned(),
             findings,
         })
+    }
+}
+
+fn spawn_error_finding(
+    file_path: &Path,
+    buildifier_path: &str,
+    e: &anyhow::Error,
+) -> Finding {
+    Finding {
+        severity: Severity::Warning,
+        message: format!("could not run buildifier on `{}`: {e}", file_path.display()),
+        location: Some(Location {
+            path: file_path.to_path_buf(),
+            line: None,
+            column: None,
+        }),
+        remediations: vec![format!(
+            "Ensure buildifier is installed and reachable as `{buildifier_path}`."
+        )],
+        suggested_fix: None,
     }
 }
 
@@ -168,35 +179,42 @@ pub(crate) fn is_buildifier_file(path: &Path) -> bool {
     }
 }
 
-// ── buildifier invocation ─────────────────────────────────────────────────────
+// ── buildifier invocations ────────────────────────────────────────────────────
 
-/// Feeds `contents` to buildifier via stdin (using `-path` so error messages reference
-/// the original repo-relative `file_path`) and returns findings.
-fn run_buildifier_on_file(
+/// Runs the format pass (`--mode=check --format=json`) and returns a finding if the file
+/// needs reformatting.
+fn run_format_check(
     buildifier_path: &str,
     file_path: &Path,
     contents: &[u8],
-    check_format: bool,
-    check_lint: bool,
 ) -> Result<Vec<Finding>> {
-    // -path tells buildifier the "display name" of the stdin content so its warnings
-    // reference the original path rather than "<stdin>".
     let path_flag = format!("-path={}", file_path.to_string_lossy());
+    let output = invoke_buildifier(
+        buildifier_path,
+        &["--mode=check", "--format=json", &path_flag, "-"],
+        contents,
+    )?;
+    parse_format_output(&output.stdout, file_path)
+}
 
-    let mut args: Vec<&str> = Vec::new();
-    if check_format {
-        // --mode=check: exit 4 when the file would need reformatting; no stdout output.
-        args.push("--mode=check");
-    }
-    if check_lint {
-        // --lint=warn: emit lint warnings to stderr; exit 5 when warnings are present.
-        args.push("--lint=warn");
-    }
-    args.push(&path_flag);
-    args.push("-"); // read from stdin
+/// Runs the lint pass (`--lint=warn --format=json`) and returns one finding per warning.
+fn run_lint_check(
+    buildifier_path: &str,
+    file_path: &Path,
+    contents: &[u8],
+) -> Result<Vec<Finding>> {
+    let path_flag = format!("-path={}", file_path.to_string_lossy());
+    let output = invoke_buildifier(
+        buildifier_path,
+        &["--lint=warn", "--format=json", &path_flag, "-"],
+        contents,
+    )?;
+    parse_lint_output(&output.stdout, file_path)
+}
 
+fn invoke_buildifier(buildifier_path: &str, args: &[&str], contents: &[u8]) -> Result<Output> {
     let mut child = Command::new(buildifier_path)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -209,80 +227,93 @@ fn run_buildifier_on_file(
             .context("failed to write to buildifier stdin")?;
     }
 
-    let output = child
+    child
         .wait_with_output()
-        .context("failed to wait for buildifier")?;
+        .context("failed to wait for buildifier")
+}
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+// ── JSON output parsing ───────────────────────────────────────────────────────
+
+/// Parses `--mode=check --format=json` output and returns a finding if the file is
+/// not formatted.
+pub(crate) fn parse_format_output(stdout: &[u8], file_path: &Path) -> Result<Vec<Finding>> {
+    let json: BuildifierOutput =
+        serde_json::from_slice(stdout).context("failed to parse buildifier format JSON output")?;
 
     let mut findings = Vec::new();
-
-    // Lint warnings arrive on stderr.
-    if check_lint {
-        findings.extend(parse_buildifier_warnings(&stderr, file_path));
+    for file in json.files {
+        if !file.formatted.unwrap_or(true) {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                message: "file needs buildifier formatting".to_owned(),
+                location: Some(Location {
+                    path: file_path.to_path_buf(),
+                    line: None,
+                    column: None,
+                }),
+                remediations: vec![format!(
+                    "Run `buildifier {}` to auto-format.",
+                    file_path.display()
+                )],
+                suggested_fix: None,
+            });
+        }
     }
-
-    // Exit 4 means --mode=check detected reformatting is required.
-    // Exit 5 means lint warnings are present (covered by the stderr parse above).
-    if check_format && exit_code == 4 {
-        findings.push(Finding {
-            severity: Severity::Warning,
-            message: "file needs buildifier formatting".to_owned(),
-            location: Some(Location {
-                path: file_path.to_path_buf(),
-                line: None,
-                column: None,
-            }),
-            remediations: vec![format!(
-                "Run `buildifier {}` to auto-format.",
-                file_path.display()
-            )],
-            suggested_fix: None,
-        });
-    }
-
     Ok(findings)
 }
 
-// ── output parser ─────────────────────────────────────────────────────────────
+/// Parses `--lint=warn --format=json` output and returns one finding per warning.
+pub(crate) fn parse_lint_output(stdout: &[u8], file_path: &Path) -> Result<Vec<Finding>> {
+    let json: BuildifierOutput =
+        serde_json::from_slice(stdout).context("failed to parse buildifier lint JSON output")?;
 
-/// Parses buildifier lint warning lines from stderr into [`Finding`]s.
-///
-/// Buildifier emits one line per warning:
-/// ```text
-/// path/to/file.bzl:LINE:COL: CATEGORY: message text
-/// ```
-pub(crate) fn parse_buildifier_warnings(stderr: &str, file_path: &Path) -> Vec<Finding> {
-    // Matches: <anything>:<digits>:<digits>: <word-or-hyphenated-category>: <rest>
-    // The path portion is intentionally loose (.+) to handle paths with colons.
-    let re = match Regex::new(r"^.+:(\d+):(\d+): (\w[\w-]*: .+)$") {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    stderr
-        .lines()
-        .filter_map(|line| {
-            let caps = re.captures(line)?;
-            let lineno: u32 = caps[1].parse().ok()?;
-            let colno: u32 = caps[2].parse().ok()?;
-            let message = caps[3].to_owned();
-            Some(Finding {
+    let mut findings = Vec::new();
+    for file in json.files {
+        for warning in file.warnings.unwrap_or_default() {
+            findings.push(Finding {
                 severity: Severity::Warning,
-                message,
+                message: format!("{}: {}", warning.category, warning.message),
                 location: Some(Location {
                     path: file_path.to_path_buf(),
-                    line: Some(lineno),
-                    column: Some(colno),
+                    line: Some(warning.start.line),
+                    column: Some(warning.start.column),
                 }),
                 remediations: vec![
                     "Run `buildifier --lint=fix` to auto-fix, or resolve manually.".to_owned(),
                 ],
                 suggested_fix: None,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(findings)
+}
+
+// ── JSON types ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct BuildifierOutput {
+    #[serde(default)]
+    files: Vec<BuildifierFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildifierFile {
+    formatted: Option<bool>,
+    #[serde(default)]
+    warnings: Option<Vec<BuildifierWarning>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildifierWarning {
+    start: BuildifierPosition,
+    category: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildifierPosition {
+    line: u32,
+    column: u32,
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -294,51 +325,94 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{BuildifierCheck, is_buildifier_file, parse_buildifier_warnings};
+    use super::{BuildifierCheck, is_buildifier_file, parse_format_output, parse_lint_output};
     use crate::check::Check;
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::Severity;
     use crate::source_tree::LocalSourceTree;
 
-    // ── parser unit tests (no buildifier binary required) ────────────────────
+    // ── format JSON parser tests ─────────────────────────────────────────────
 
     #[test]
-    fn parses_single_warning_line() {
-        let findings = parse_buildifier_warnings(
-            "some/file.bzl:10:5: warning: module-docstring not found\n",
-            Path::new("some/file.bzl"),
-        );
+    fn format_output_detects_unformatted_file() {
+        let json = br#"{"success":false,"files":[{"filename":"foo.bzl","formatted":false}]}"#;
+        let findings = parse_format_output(json, Path::new("foo.bzl")).unwrap();
         assert_eq!(findings.len(), 1);
-        let f = &findings[0];
-        assert_eq!(f.severity, Severity::Warning);
-        assert!(
-            f.message.contains("module-docstring"),
-            "unexpected message: {}",
-            f.message
-        );
-        let loc = f.location.as_ref().unwrap();
-        assert_eq!(loc.line, Some(10));
-        assert_eq!(loc.column, Some(5));
-        assert_eq!(loc.path, Path::new("some/file.bzl"));
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("formatting"), "unexpected: {}", findings[0].message);
+        assert!(findings[0].location.as_ref().unwrap().line.is_none());
     }
 
     #[test]
-    fn parses_multiple_warning_lines() {
-        let output = concat!(
-            "BUILD:1:1: warning: module-docstring not found\n",
-            "BUILD:5:3: warning: function-docstring missing\n",
-        );
-        let findings = parse_buildifier_warnings(output, Path::new("BUILD"));
+    fn format_output_no_finding_when_formatted() {
+        let json = br#"{"success":true,"files":[{"filename":"foo.bzl","formatted":true}]}"#;
+        let findings = parse_format_output(json, Path::new("foo.bzl")).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn format_output_no_finding_when_formatted_absent() {
+        // `formatted` absent → treated as true (already formatted)
+        let json = br#"{"success":true,"files":[{"filename":"foo.bzl"}]}"#;
+        let findings = parse_format_output(json, Path::new("foo.bzl")).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    // ── lint JSON parser tests ───────────────────────────────────────────────
+
+    #[test]
+    fn lint_output_parses_single_warning() {
+        let json = br#"{
+            "success": false,
+            "files": [{
+                "filename": "foo.bzl",
+                "warnings": [{
+                    "filename": "foo.bzl",
+                    "start": {"line": 10, "column": 5},
+                    "end": {"line": 10, "column": 5},
+                    "category": "module-docstring",
+                    "actionable": true,
+                    "message": "The file has no module docstring."
+                }]
+            }]
+        }"#;
+        let findings = parse_lint_output(json, Path::new("foo.bzl")).unwrap();
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.message.contains("module-docstring"), "unexpected: {}", f.message);
+        let loc = f.location.as_ref().unwrap();
+        assert_eq!(loc.line, Some(10));
+        assert_eq!(loc.column, Some(5));
+    }
+
+    #[test]
+    fn lint_output_parses_multiple_warnings() {
+        let json = br#"{
+            "success": false,
+            "files": [{
+                "filename": "BUILD",
+                "warnings": [
+                    {"start": {"line": 1, "column": 1}, "end": {"line": 1, "column": 1},
+                     "category": "module-docstring", "actionable": true,
+                     "message": "missing docstring"},
+                    {"start": {"line": 5, "column": 3}, "end": {"line": 5, "column": 3},
+                     "category": "no-effect", "actionable": true,
+                     "message": "expression has no effect"}
+                ]
+            }]
+        }"#;
+        let findings = parse_lint_output(json, Path::new("BUILD")).unwrap();
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].location.as_ref().unwrap().line, Some(1));
         assert_eq!(findings[1].location.as_ref().unwrap().line, Some(5));
     }
 
     #[test]
-    fn ignores_non_matching_lines() {
-        let output = "\nnot a warning\nbuildifier: could not parse\n";
-        let findings = parse_buildifier_warnings(output, Path::new("file.bzl"));
-        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    fn lint_output_no_findings_when_warnings_absent() {
+        let json = br#"{"success":true,"files":[{"filename":"foo.bzl"}]}"#;
+        let findings = parse_lint_output(json, Path::new("foo.bzl")).unwrap();
+        assert!(findings.is_empty());
     }
 
     // ── file-kind filter ─────────────────────────────────────────────────────
