@@ -245,6 +245,69 @@ final class EndToEndUpdateTests: XCTestCase {
                      "installer discovery must skip blocklisted versions")
     }
 
+    // MARK: - User-initiated reinstall of a blocked version
+
+    /// Regression test for the "Install & Relaunch opens browser" bug: when a version
+    /// was previously blocklisted (failed its watchdog launch and was rolled back), the
+    /// stager stages it again on the next availability check, setting downloadState to
+    /// .readyToInstall. But `newestReadyUpdate` skips blocklisted versions, so
+    /// `installStagedAndRelaunch` finds nothing and falls back to the browser.
+    ///
+    /// The fix: `newestReadyUpdateIgnoringBlocklist` finds the staged version for a
+    /// user-initiated install, then `unblockVersion` clears the block so the install
+    /// can proceed. The watchdog re-blocklists if the version fails again.
+    func testUserInitiatedInstallOfBlockedVersionSucceeds() throws {
+        plantInstalledBundle(marker: "old-1.0.27")
+        plantReadyVersion("1.0.28", marker: "new-1.0.28")
+        let installer = makeInstaller()
+
+        // Simulate the rollback path: block 1.0.28 as if its watchdog failed.
+        installer.blockVersion(v("1.0.28"))
+        XCTAssertTrue(installer.isBlocked(v("1.0.28")), "1.0.28 must be blocklisted")
+
+        // Normal discovery skips blocklisted versions — this is what causes the bug.
+        XCTAssertNil(installer.newestReadyUpdate(currentVersion: v("1.0.27")),
+                     "newestReadyUpdate must skip blocked 1.0.28 (normal automatic path)")
+
+        // The user-initiated path discovers the staged version despite the block.
+        let candidate = installer.newestReadyUpdateIgnoringBlocklist(currentVersion: v("1.0.27"))
+        XCTAssertNotNil(candidate, "newestReadyUpdateIgnoringBlocklist must find blocked 1.0.28")
+        XCTAssertEqual(candidate?.version, v("1.0.28"))
+
+        // Clearing the block lets the normal swap proceed.
+        installer.unblockVersion(v("1.0.28"))
+        XCTAssertFalse(installer.isBlocked(v("1.0.28")), "1.0.28 must no longer be blocked")
+
+        let ready = installer.newestReadyUpdate(currentVersion: v("1.0.27"))
+        XCTAssertNotNil(ready, "newestReadyUpdate must find 1.0.28 after unblocking")
+        XCTAssertEqual(ready?.version, v("1.0.28"))
+
+        // Full swap applies correctly.
+        let plan = try unwrapSwap(
+            installer.planSwap(for: ready!, currentVersion: v("1.0.27"), relaunch: false))
+        try installer.applySwap(plan)
+        XCTAssertEqual(markerAt(installBundle), "new-1.0.28",
+                       "new bundle must be at the install location after user-initiated reinstall")
+    }
+
+    /// Verifies that `unblockVersion` is idempotent and that blocking/unblocking a
+    /// version that was never blocked does not corrupt the blocklist.
+    func testUnblockNonBlockedVersionIsNoop() {
+        let installer = makeInstaller()
+        installer.blockVersion(v("1.0.28"))
+        installer.blockVersion(v("1.0.29"))
+        XCTAssertTrue(installer.isBlocked(v("1.0.28")))
+        XCTAssertTrue(installer.isBlocked(v("1.0.29")))
+
+        installer.unblockVersion(v("1.0.28"))
+        XCTAssertFalse(installer.isBlocked(v("1.0.28")), "1.0.28 must be unblocked")
+        XCTAssertTrue(installer.isBlocked(v("1.0.29")), "1.0.29 must still be blocked")
+
+        // Unblocking an already-unblocked version is a no-op.
+        installer.unblockVersion(v("1.0.28"))
+        XCTAssertFalse(installer.isBlocked(v("1.0.28")))
+    }
+
     // MARK: - Install location: ~/Applications (user-writable)
 
     /// Verifies that the full swap path is available when the install parent is user-writable

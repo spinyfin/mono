@@ -170,10 +170,25 @@ public struct UpdateInstaller: Sendable {
 
     // MARK: Discovery
 
+    /// The filesystem path of the directory that holds staged updates. Used for diagnostics.
+    public var updatesDirectoryPath: String { updatesDirectory.path }
+
     /// The newest `.ready` staged version strictly greater than `currentVersion`
     /// whose bundle is present and which is not blocklisted; `nil` if none qualifies.
     public func newestReadyUpdate(currentVersion: VersionTuple) -> ReadyUpdate? {
-        let blocked = blockedVersions()
+        newestReadyUpdate(currentVersion: currentVersion, ignoringBlocklist: false)
+    }
+
+    /// Like `newestReadyUpdate` but also considers versions that are blocklisted. Used
+    /// exclusively by the user-initiated "Install & Relaunch" path when a prior
+    /// watchdog rollback blocked the version the user is trying to install again.
+    /// The caller must call `unblockVersion` before proceeding with a swap.
+    public func newestReadyUpdateIgnoringBlocklist(currentVersion: VersionTuple) -> ReadyUpdate? {
+        newestReadyUpdate(currentVersion: currentVersion, ignoringBlocklist: true)
+    }
+
+    private func newestReadyUpdate(currentVersion: VersionTuple, ignoringBlocklist: Bool) -> ReadyUpdate? {
+        let blocked = ignoringBlocklist ? [] : blockedVersions()
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: updatesDirectory,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -328,6 +343,19 @@ public struct UpdateInstaller: Sendable {
         var state = loadState()
         if !state.blocklist.contains(version.description) {
             state.blocklist.append(version.description)
+            saveState(state)
+        }
+    }
+
+    /// Remove `version` from the blocklist so a subsequent swap can proceed. Used by
+    /// the user-initiated "Install & Relaunch" path to allow retrying a version that
+    /// previously failed its watchdog launch. The watchdog will re-blocklist the
+    /// version if it fails again.
+    public func unblockVersion(_ version: VersionTuple) {
+        var state = loadState()
+        let before = state.blocklist.count
+        state.blocklist.removeAll { $0 == version.description }
+        if state.blocklist.count != before {
             saveState(state)
         }
     }

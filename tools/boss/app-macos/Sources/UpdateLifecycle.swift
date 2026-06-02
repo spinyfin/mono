@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 import UpdateCore
+import os.log
+
+private let lifecycleLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
 /// App-lifecycle glue for the self-updater's install/swap step (design doc §4, T7).
 ///
@@ -114,22 +117,53 @@ enum UpdateLifecycle {
     // MARK: - Implementation
 
     private static func applySwapIfNeeded(relaunch: Bool, userInitiated: Bool = false) -> Bool {
-        guard userInitiated || isAutomaticMode else { return false }
-        guard !isDevBuild, let running = runningVersion else { return false }
+        guard userInitiated || isAutomaticMode else {
+            lifecycleLog.debug("update swap skipped: not automatic mode and not user-initiated (relaunch=\(relaunch, privacy: .public))")
+            return false
+        }
+        guard !isDevBuild else {
+            lifecycleLog.debug("update swap skipped: dev build")
+            return false
+        }
+        guard let running = runningVersion else {
+            lifecycleLog.error("update swap skipped: could not determine running version from bundle")
+            return false
+        }
+
         let installer = installer()
-        guard let ready = installer.newestReadyUpdate(currentVersion: running) else { return false }
+
+        // For a user-initiated install, also consider versions that were previously
+        // blocklisted (failed a prior watchdog launch). The background automatic swap
+        // skips them permanently, but when the user explicitly requests "Install &
+        // Relaunch" they are intentionally retrying. The watchdog will roll back again
+        // if the new version still cannot launch cleanly.
+        var ready = installer.newestReadyUpdate(currentVersion: running)
+        if ready == nil && userInitiated {
+            if let candidate = installer.newestReadyUpdateIgnoringBlocklist(currentVersion: running) {
+                lifecycleLog.info(
+                    "update install: user-initiated install of previously-blocked version \(candidate.version, privacy: .public); clearing block")
+                installer.unblockVersion(candidate.version)
+                ready = candidate
+            }
+        }
+
+        guard let ready else {
+            lifecycleLog.info(
+                "update swap skipped: no staged update found in \(installer.updatesDirectoryPath, privacy: .sensitive) newer than running \(running, privacy: .public) (relaunch=\(relaunch, privacy: .public) userInitiated=\(userInitiated, privacy: .public))")
+            return false
+        }
 
         switch installer.planSwap(for: ready, currentVersion: running, relaunch: relaunch) {
         case .swap(let plan):
             do {
                 try installer.applySwap(plan)
             } catch {
-                NSLog("[update] swap failed (relaunch=\(relaunch)): \(error)")
+                lifecycleLog.error("update swap failed (relaunch=\(relaunch, privacy: .public)): \(error, privacy: .public)")
                 return false
             }
 
             guard relaunch else {
-                NSLog("[update] swapped in \(plan.version) on quit; will run on next launch")
+                lifecycleLog.info("update: swapped in \(plan.version, privacy: .public) on quit; will run on next launch")
                 return false
             }
 
@@ -137,7 +171,7 @@ enum UpdateLifecycle {
             guard let script = helperScriptURL() else {
                 // Swap already applied; without the helper we can't relaunch, but the
                 // next manual launch will run the new version. Don't exit.
-                NSLog("[update] swapped in \(plan.version) but relaunch-helper.sh is missing from the bundle")
+                lifecycleLog.error("update: swapped in \(plan.version, privacy: .public) but relaunch-helper.sh is missing from the bundle")
                 return false
             }
             let invocation = installer.helperInvocation(
@@ -148,20 +182,23 @@ enum UpdateLifecycle {
             do {
                 try proc.run()
             } catch {
-                NSLog("[update] failed to spawn relaunch helper: \(error)")
+                lifecycleLog.error("update: failed to spawn relaunch helper: \(error, privacy: .public)")
                 return false
             }
-            NSLog("[update] swapped in \(plan.version); relaunching via helper")
+            lifecycleLog.info("update: swapped in \(plan.version, privacy: .public); relaunching via helper (pid=\(getpid(), privacy: .public))")
             return true
 
         case .notWritable(let installURL, let stagedURL):
             // /Applications-without-write: degrade gracefully (design §4). The UI
             // surfaces (T3/T4) reveal the staged bundle in Finder; here we only log.
-            NSLog("[update] \(ready.version) ready but \(installURL.path) is not writable; staged at \(stagedURL.path)")
+            lifecycleLog.warning(
+                "update swap skipped: \(ready.version, privacy: .public) is staged but \(installURL.path, privacy: .sensitive) is not writable; staged at \(stagedURL.path, privacy: .sensitive)")
             return false
 
         case .blocked(let version):
-            NSLog("[update] \(version) is blocklisted (failed a prior launch); not swapping")
+            // Should only be reached if the plan's version was blocklisted between the
+            // `ready` discovery above and the `planSwap` call (extremely unlikely).
+            lifecycleLog.warning("update swap skipped: \(version, privacy: .public) is blocklisted (failed a prior launch)")
             return false
 
         case .upToDate:
