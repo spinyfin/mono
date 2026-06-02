@@ -2446,3 +2446,142 @@ fn migration_normalises_empty_effort_level_to_null() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// `mark_ci_remediation_retriggered` flips the attempt to the terminal
+/// `retriggered` status, records the flaky verdict, and stamps the
+/// `ci_flaky_retriggered` signal on the parent WITHOUT moving it to
+/// `status='blocked'`. The signal is what the completion path consults to
+/// park the worker instead of looping. Idempotent on a re-marker.
+#[test]
+fn mark_ci_remediation_retriggered_records_flaky_signal_without_blocking() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "flaky");
+    let pr = "https://github.com/spinyfin/mono/pull/71";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    let attempt = db
+        .insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 71,
+            head_branch: "boss/exec".into(),
+            head_sha_at_trigger: "head-1".into(),
+            attempt_kind: "retrigger".into(),
+            consumes_budget: 0,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("insert");
+
+    // No flaky signal before the marker.
+    assert!(!db.has_active_ci_flaky_retrigger_signal(&chore).unwrap());
+
+    let updated = db
+        .mark_ci_remediation_retriggered(&attempt.id)
+        .unwrap()
+        .expect("retrigger flip");
+    assert_eq!(updated.status, "retriggered");
+    assert_eq!(updated.triage_class.as_deref(), Some("flaky_or_infra"));
+    assert!(updated.finished_at.is_some());
+
+    // Signal is active and FK-linked to the attempt.
+    assert!(db.has_active_ci_flaky_retrigger_signal(&chore).unwrap());
+    let signals = db.active_blocked_signals(&chore).unwrap();
+    let flaky = signals
+        .iter()
+        .find(|s| s.reason == "ci_flaky_retriggered")
+        .expect("flaky signal present");
+    assert_eq!(flaky.attempt_id.as_deref(), Some(attempt.id.as_str()));
+
+    // The parent is NOT moved to blocked — it stays in_review.
+    let task = match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_eq!(task.status, "in_review");
+    assert!(task.blocked_reason.is_none());
+
+    // The attempt is now terminal, so `active_ci_remediation_for_work_item`
+    // (pending/running only) no longer returns it — the on-Stop catch-all
+    // finalizer becomes a no-op and cannot re-mark it failed.
+    assert!(db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .is_none());
+
+    // Idempotent: a duplicate marker is a no-op (row already terminal).
+    assert!(db.mark_ci_remediation_retriggered(&attempt.id).unwrap().is_none());
+    assert_eq!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .filter(|s| s.reason == "ci_flaky_retriggered")
+            .count(),
+        1,
+        "duplicate marker must not double-arm the signal",
+    );
+}
+
+/// The `ci_flaky_retriggered` signal is cleared both when CI resolves
+/// (`clear_ci_failure_signal_only`) and when a fresh remediation attempt
+/// supersedes the verdict (`insert_ci_remediation`).
+#[test]
+fn ci_flaky_retrigger_signal_clears_on_resolve_and_supersede() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "flaky-clear");
+    let pr = "https://github.com/spinyfin/mono/pull/72";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    let arm = |head: &str| -> String {
+        let a = db
+            .insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product_id.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 72,
+                head_branch: "boss/exec".into(),
+                head_sha_at_trigger: head.into(),
+                attempt_kind: "retrigger".into(),
+                consumes_budget: 0,
+                failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .expect("insert");
+        db.mark_ci_remediation_retriggered(&a.id).unwrap().expect("flip");
+        a.id
+    };
+
+    // Path 1: CI resolves while the parent stayed in_review.
+    arm("head-a");
+    assert!(db.has_active_ci_flaky_retrigger_signal(&chore).unwrap());
+    assert!(db.clear_ci_failure_signal_only(&chore).unwrap());
+    assert!(!db.has_active_ci_flaky_retrigger_signal(&chore).unwrap());
+
+    // Path 2: a fresh remediation attempt supersedes the stale verdict.
+    arm("head-b");
+    assert!(db.has_active_ci_flaky_retrigger_signal(&chore).unwrap());
+    db.insert_ci_remediation(CiRemediationInsertInput {
+        product_id: product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: pr.into(),
+        pr_number: 72,
+        head_branch: "boss/exec".into(),
+        head_sha_at_trigger: "head-c".into(),
+        attempt_kind: "fix".into(),
+        consumes_budget: 1,
+        failed_checks: "[]".into(),
+        failure_kind: "pr_branch_ci".into(),
+        before_commit_sha: None,
+    })
+    .unwrap()
+    .expect("fresh insert");
+    assert!(
+        !db.has_active_ci_flaky_retrigger_signal(&chore).unwrap(),
+        "a new remediation attempt must supersede the stale flaky verdict",
+    );
+}

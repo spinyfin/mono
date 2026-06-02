@@ -1077,6 +1077,41 @@ impl WorkerCompletionHandler {
             return self.finalize_automation_triage(&execution).await;
         }
 
+        // Flaky/infra retrigger park (issue #1205): a `ci_remediation`
+        // worker that diagnosed the CI failure as infra and re-ran the job
+        // (`mark-retriggered`) stamped the `ci_flaky_retriggered` signal on
+        // the parent. There is nothing to push, so we MUST NOT fall through
+        // to PR detection or the nudge loop — every probe would just
+        // re-derive the same verdict and burn worker turns. Park the worker
+        // awaiting the CI retry / a human decision. The merge-poller clears
+        // the signal and snaps the parent to Review once CI goes green.
+        if execution.kind == "ci_remediation" {
+            match self
+                .work_db
+                .has_active_ci_flaky_retrigger_signal(&execution.work_item_id)
+            {
+                Ok(true) => {
+                    let pr_url = self.resolve_bound_pr_url(&execution).unwrap_or_default();
+                    tracing::info!(
+                        execution_id,
+                        work_item_id = %execution.work_item_id,
+                        %pr_url,
+                        "stop event: parent carries ci_flaky_retriggered signal — parking worker (awaiting CI retry / human decision), not nudging",
+                    );
+                    return StopOutcome::FlakyRetriggered { pr_url };
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "stop event: flaky-retrigger signal check failed; proceeding with normal completion",
+                    );
+                }
+            }
+        }
+
         // Primary path: a PR URL was already captured from a
         // `PostToolUse` Bash hook event (`gh pr create` /
         // `gh pr view` / `gh pr edit` stdout) while the worker was
@@ -2274,6 +2309,11 @@ must not be asked to open one",
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,
+            // Worker re-triggered a flaky/infra failure — the attempt was
+            // already flipped to terminal `retriggered` by mark-retriggered,
+            // so there is no running row to retire here, and this is
+            // explicitly NOT a failure.
+            StopOutcome::FlakyRetriggered { .. } => false,
             // Unreachable here (this finalizer only runs for `ci_remediation`
             // kind), but a triage outcome must never mark a CI attempt failed.
             StopOutcome::AutomationTriage { .. } => false,
@@ -3425,6 +3465,15 @@ pub enum StopOutcome {
     /// task is snapped back to `in_review`, and the execution is
     /// finalised. No nudge is sent.
     SignalAlreadyCleared { pr_url: String },
+    /// A CI-remediation worker classified the failure as flaky/infra and
+    /// re-triggered the failing job (`boss engine ci mark-retriggered`),
+    /// which stamped the `ci_flaky_retriggered` signal on the parent.
+    /// There is genuinely nothing to push, so the completion path parks
+    /// the worker — awaiting the CI retry or a human decision — instead of
+    /// probing it for a diff. No nudge is sent; the execution is left
+    /// `waiting_human`. This is the fix for the stuck-loop bug where the
+    /// engine re-derived the same flaky verdict on every probe.
+    FlakyRetriggered { pr_url: String },
     /// Maint task 6: an `automation_triage` execution finished and its
     /// final message was run through the marker-protocol outcome detector.
     /// `outcome` is the `automation_runs.outcome` discriminator recorded
@@ -6645,6 +6694,77 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })),
             "an AttentionItemCreated event must be published; got {typed:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn ci_remediation_with_flaky_retrigger_signal_parks_without_nudging() {
+        // Issue #1205: the worker diagnosed the CI failure as flaky/infra
+        // and re-ran the job (`mark-retriggered`), which armed the
+        // `ci_flaky_retriggered` signal. On the next Stop the completion
+        // path must park the worker (no nudge, no diff probe) — the stuck
+        // loop is the bug. It must also NOT mark the (already-terminal)
+        // attempt failed.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id, attempt_id) =
+            ci_remediation_fixture(workspace.path());
+        // The worker's marker: flip the attempt terminal + arm the signal.
+        db.mark_ci_remediation_retriggered(&attempt_id)
+            .unwrap()
+            .expect("retrigger flip");
+
+        // Detector finds no PR on the remediation exec's own branch — the
+        // same false miss that would otherwise drive the nudge loop.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        // Probe it several times: every Stop must park, never nudge.
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            outcomes.push(handler.on_stop(&execution_id).await);
+        }
+
+        assert!(
+            probes.snapshot().is_empty(),
+            "a flaky-retriggered worker must never be nudged; got {:?}",
+            probes.snapshot(),
+        );
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, StopOutcome::FlakyRetriggered { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/88"),
+                "every Stop must park as FlakyRetriggered; got {outcome:?}",
+            );
+        }
+
+        // The catch-all finalizer must NOT mark the attempt failed — it is
+        // terminal `retriggered`, not a give-up.
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "retriggered");
+        assert!(
+            attempt.failure_reason.is_none(),
+            "retrigger is not a failure; got {:?}",
+            attempt.failure_reason,
+        );
+
+        // No breaker attention item is filed — parking here is the normal,
+        // expected outcome, not a tripped circuit breaker.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "flaky park must not masquerade as a breaker trip",
+        );
+        let _ = chore_id;
     }
 
     #[tokio::test]

@@ -1742,6 +1742,9 @@ async fn sweep_pending_pr(
         // is also only reachable via on-Stop, not recheck_for_pr.
         | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::SignalAlreadyCleared { .. }
+        // FlakyRetriggered is only reachable via the on-Stop path (it gates
+        // on `execution.kind == "ci_remediation"`), never from a recheck.
+        | StopOutcome::FlakyRetriggered { .. }
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
@@ -1793,6 +1796,9 @@ async fn sweep_late_pr(
         // exhaustiveness. SignalAlreadyCleared is only reachable via on-Stop.
         | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::SignalAlreadyCleared { .. }
+        // FlakyRetriggered is only reachable via the on-Stop path (it gates
+        // on `execution.kind == "ci_remediation"`), never from a recheck.
+        | StopOutcome::FlakyRetriggered { .. }
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
