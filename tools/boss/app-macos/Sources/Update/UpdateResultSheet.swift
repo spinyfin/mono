@@ -166,17 +166,24 @@ struct UpdateResultSheet: View {
                 }
                 .disabled(true)
 
+            case .installFailed(let v, _) where v == update.version:
+                Button("Install Failed") {}
+                    .disabled(true)
+
             case .readyToInstall(let v) where v == update.version:
                 Button("Install & Relaunch") {
                     if UpdateLifecycle.installStagedAndRelaunch() {
                         // Swap applied + helper spawned; quit so it can relaunch us.
                         NSApplication.shared.terminate(nil)
                     } else {
-                        // Not writable (/Applications without admin) or swap failed —
-                        // fall back to the manual download so the user isn't stuck.
-                        NSWorkspace.shared.open(update.assetURL)
+                        // Install failed (bundle not writable or swap failed).
+                        // Surface a terminal error in the dialog — no browser fallback.
+                        updateModel.markInstallFailed(
+                            version: v,
+                            reason: "The app bundle could not be updated. Make sure Boss is installed in /Applications and try again."
+                        )
+                        // Keep the sheet open so the error is visible.
                     }
-                    dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
 
@@ -206,14 +213,19 @@ struct UpdateResultSheet: View {
             return "Boss \(update.version) downloaded and verified. Install & Relaunch to apply it now."
         case .failed(let v, let reason) where v == update.version:
             return "Download failed: \(reason)"
+        case .installFailed(let v, let reason) where v == update.version:
+            return "Install failed: \(reason)"
         default:
             return nil
         }
     }
 
     private func downloadFailed(for update: AvailableUpdate) -> Bool {
-        if case .failed(let v, _) = updateModel.downloadState, v == update.version { return true }
-        return false
+        switch updateModel.downloadState {
+        case .failed(let v, _) where v == update.version: return true
+        case .installFailed(let v, _) where v == update.version: return true
+        default: return false
+        }
     }
 
     // MARK: - Changelog helpers

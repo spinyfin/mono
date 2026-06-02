@@ -47,6 +47,10 @@ public enum UpdateDownloadState: Equatable, Sendable {
     case readyToInstall(version: VersionTuple)
     /// The download or one of its integrity checks failed.
     case failed(version: VersionTuple, reason: String)
+    /// The in-place install step failed after staging succeeded (e.g. bundle not writable,
+    /// swap failed). The staged bundle remains on disk. This is a terminal state — the
+    /// dialog shows an error and does not open a browser.
+    case installFailed(version: VersionTuple, reason: String)
 }
 
 // MARK: - UpdateStager
@@ -333,6 +337,14 @@ public final class UpdateModel: ObservableObject {
     }
 
     // MARK: - Download / stage
+
+    /// Records that the in-place install+relaunch step failed with the given reason.
+    /// Called by the UI so the model reflects the terminal error and the sheet shows
+    /// a clear failure state — no browser fallback.
+    public func markInstallFailed(version: VersionTuple, reason: String) {
+        modelLog.error("update install: failed version=\(version.description, privacy: .public) reason=\(reason, privacy: .public)")
+        downloadState = .installFailed(version: version, reason: reason)
+    }
 
     /// User-initiated download of the currently-available update (the result sheet /
     /// badge "Download" button). Stages regardless of mode — the user explicitly
