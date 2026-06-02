@@ -2219,3 +2219,83 @@ fn migration_from_v4_adds_tasks_repo_remote_url() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Regression (issue #1251): a redispatched investigation must keep its
+/// `investigation_implementation` execution kind. The first dispatch
+/// routes through the reconcile path (which passes the kind explicitly),
+/// but the `abandon_stale_and_redispatch` branch of
+/// `request_execution_in_tx_with_live_check` re-derives the kind from the
+/// work item via `execution_kind_for_work_item`. That helper used to lack
+/// an `investigation` arm, so the fresh execution silently downgraded to
+/// `task_implementation` — the worker then got the generic implementation
+/// prelude instead of the doc-output one and the card stranded in Doing
+/// with a null `pr_url`.
+#[test]
+fn redispatch_preserves_investigation_execution_kind() {
+    let path = temp_db_path("investigation-redispatch-kind");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            // No code repo on the product; the investigation carries its
+            // own docs-repo resolution, mirroring the reported scenario.
+            repo_remote_url: None,
+            design_repo: None,
+            docs_repo: Some("git@github.com:spinyfin/docs.git".to_owned()),
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let investigation = db
+        .create_investigation(boss_protocol::CreateInvestigationInput {
+            product_id: product.id.clone(),
+            autostart: true,
+            force_duplicate: false,
+            name: "Root-cause: lint gap".to_owned(),
+            created_via: None,
+            description: None,
+            effort_level: None,
+            model_override: None,
+            priority: None,
+            project_id: None,
+            repo_remote_url: None,
+        })
+        .unwrap();
+
+    // First dispatch: a live worker is assumed, so the execution is
+    // created fresh with the investigation kind.
+    let first = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        first.kind, "investigation_implementation",
+        "first dispatch should carry the investigation kind"
+    );
+
+    // The original worker is now gone. Re-issuing RequestExecution with an
+    // `is_live` oracle that reports the slot dead drives the
+    // abandon-and-redispatch path: the stale row is abandoned and a fresh
+    // ready execution is created. It must keep the investigation kind.
+    let redispatched = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_ne!(
+        redispatched.id, first.id,
+        "redispatch should create a fresh execution, not reuse the stale one"
+    );
+    assert_eq!(
+        redispatched.kind, "investigation_implementation",
+        "redispatched investigation must NOT downgrade to task_implementation"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
