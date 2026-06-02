@@ -44,6 +44,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
@@ -149,22 +150,46 @@ impl ConfiguredCheck for BuildifierConfig {
             if self.check_format {
                 match run_format_check(&self.buildifier_invocation, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
-                    Err(e) => findings.push(spawn_error_finding(
+                    Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
                         &self.buildifier_invocation,
-                        &e,
+                        BuildifierError::SpawnFailed(&e),
                     )),
+                    Err(RunError::Internal(e)) => {
+                        warn!(
+                            path = %changed_file.path.display(),
+                            error = %e,
+                            "buildifier format check internal error"
+                        );
+                        findings.push(error_finding(
+                            &changed_file.path,
+                            &self.buildifier_invocation,
+                            BuildifierError::Internal(&e),
+                        ));
+                    }
                 }
             }
 
             if self.check_lint {
                 match run_lint_check(&self.buildifier_invocation, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
-                    Err(e) => findings.push(spawn_error_finding(
+                    Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
                         &self.buildifier_invocation,
-                        &e,
+                        BuildifierError::SpawnFailed(&e),
                     )),
+                    Err(RunError::Internal(e)) => {
+                        warn!(
+                            path = %changed_file.path.display(),
+                            error = %e,
+                            "buildifier lint check internal error"
+                        );
+                        findings.push(error_finding(
+                            &changed_file.path,
+                            &self.buildifier_invocation,
+                            BuildifierError::Internal(&e),
+                        ));
+                    }
                 }
             }
         }
@@ -176,23 +201,47 @@ impl ConfiguredCheck for BuildifierConfig {
     }
 }
 
-fn spawn_error_finding(
-    file_path: &Path,
-    buildifier_invocation: &str,
-    e: &anyhow::Error,
-) -> Finding {
-    Finding {
-        severity: Severity::Warning,
-        message: format!("could not run buildifier on `{}`: {e}", file_path.display()),
-        location: Some(Location {
-            path: file_path.to_path_buf(),
-            line: None,
-            column: None,
-        }),
-        remediations: vec![format!(
-            "Ensure buildifier is available via `{buildifier_invocation}`."
-        )],
-        suggested_fix: None,
+/// Represents the kind of failure that occurred when running buildifier.
+enum BuildifierError<'a> {
+    /// buildifier could not be spawned (binary not found, not executable, etc.).
+    SpawnFailed(&'a anyhow::Error),
+    /// buildifier ran but checkleft encountered an internal error (e.g. JSON parse failure).
+    Internal(&'a anyhow::Error),
+}
+
+fn error_finding(file_path: &Path, buildifier_invocation: &str, err: BuildifierError<'_>) -> Finding {
+    match err {
+        BuildifierError::SpawnFailed(e) => Finding {
+            severity: Severity::Warning,
+            message: format!("could not run buildifier on `{}`: {e}", file_path.display()),
+            location: Some(Location {
+                path: file_path.to_path_buf(),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![format!(
+                "Ensure buildifier is installed and reachable as `{buildifier_invocation}`."
+            )],
+            suggested_fix: None,
+        },
+        BuildifierError::Internal(e) => Finding {
+            severity: Severity::Warning,
+            message: format!(
+                "could not run buildifier on `{}`: {e}",
+                file_path.display()
+            ),
+            location: Some(Location {
+                path: file_path.to_path_buf(),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![
+                "This is an internal checkleft error, not an environment problem. \
+                 Please file a bug against checkleft."
+                    .to_owned(),
+            ],
+            suggested_fix: None,
+        },
     }
 }
 
@@ -211,35 +260,45 @@ pub(crate) fn is_buildifier_file(path: &Path) -> bool {
 
 // ── buildifier invocations ────────────────────────────────────────────────────
 
+/// Classifies a buildifier run error so callers can produce the right finding.
+enum RunError {
+    /// buildifier binary could not be spawned — the user's environment is likely misconfigured.
+    SpawnFailed(anyhow::Error),
+    /// buildifier ran, but checkleft encountered an unexpected internal error.
+    Internal(anyhow::Error),
+}
+
 /// Runs the format pass (`--mode=check --format=json`) and returns a finding if the file
 /// needs reformatting.
 fn run_format_check(
     buildifier_invocation: &str,
     file_path: &Path,
     contents: &[u8],
-) -> Result<Vec<Finding>> {
+) -> std::result::Result<Vec<Finding>, RunError> {
     let path_flag = format!("-path={}", file_path.to_string_lossy());
     let output = invoke_buildifier(
         buildifier_invocation,
         &["--mode=check", "--format=json", &path_flag, "-"],
         contents,
     )?;
-    parse_format_output(&output.stdout, file_path)
+    parse_format_output(&output.stdout, file_path).map_err(RunError::Internal)
 }
 
-/// Runs the lint pass (`--lint=warn --format=json`) and returns one finding per warning.
+/// Runs the lint pass (`--mode=check --lint=warn --format=json`) and returns one finding per warning.
+///
+/// `--format=json` requires `--mode=check`; without it buildifier exits with an error.
 fn run_lint_check(
     buildifier_invocation: &str,
     file_path: &Path,
     contents: &[u8],
-) -> Result<Vec<Finding>> {
+) -> std::result::Result<Vec<Finding>, RunError> {
     let path_flag = format!("-path={}", file_path.to_string_lossy());
     let output = invoke_buildifier(
         buildifier_invocation,
-        &["--lint=warn", "--format=json", &path_flag, "-"],
+        &["--mode=check", "--lint=warn", "--format=json", &path_flag, "-"],
         contents,
     )?;
-    parse_lint_output(&output.stdout, file_path)
+    parse_lint_output(&output.stdout, file_path).map_err(RunError::Internal)
 }
 
 /// Spawns the buildifier process described by `invocation` and returns its output.
@@ -255,11 +314,11 @@ fn invoke_buildifier(
     invocation: &str,
     buildifier_args: &[&str],
     contents: &[u8],
-) -> Result<Output> {
+) -> std::result::Result<Output, RunError> {
     let mut tokens = invocation.split_whitespace();
     let program = tokens
         .next()
-        .ok_or_else(|| anyhow::anyhow!("buildifier_path is empty"))?;
+        .ok_or_else(|| RunError::Internal(anyhow::anyhow!("buildifier_path is empty")))?;
     let invocation_args: Vec<&str> = tokens.collect();
 
     let mut cmd = Command::new(program);
@@ -275,17 +334,17 @@ fn invoke_buildifier(
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn `{invocation}`"))?;
+        .map_err(|e| RunError::SpawnFailed(anyhow::Error::new(e).context(format!("failed to spawn `{invocation}`"))))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(contents)
-            .context("failed to write to buildifier stdin")?;
+            .map_err(|e| RunError::Internal(anyhow::Error::new(e).context("failed to write to buildifier stdin")))?;
     }
 
     child
         .wait_with_output()
-        .context("failed to wait for buildifier")
+        .map_err(|e| RunError::Internal(anyhow::Error::new(e).context("failed to wait for buildifier")))
 }
 
 // ── JSON output parsing ───────────────────────────────────────────────────────
@@ -293,8 +352,12 @@ fn invoke_buildifier(
 /// Parses `--mode=check --format=json` output and returns a finding if the file is
 /// not formatted.
 pub(crate) fn parse_format_output(stdout: &[u8], file_path: &Path) -> Result<Vec<Finding>> {
-    let json: BuildifierOutput =
-        serde_json::from_slice(stdout).context("failed to parse buildifier format JSON output")?;
+    let json: BuildifierOutput = serde_json::from_slice(stdout).with_context(|| {
+        format!(
+            "failed to parse buildifier format JSON output; raw stdout: {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    })?;
 
     let mut findings = Vec::new();
     for file in json.files {
@@ -318,10 +381,14 @@ pub(crate) fn parse_format_output(stdout: &[u8], file_path: &Path) -> Result<Vec
     Ok(findings)
 }
 
-/// Parses `--lint=warn --format=json` output and returns one finding per warning.
+/// Parses `--mode=check --lint=warn --format=json` output and returns one finding per warning.
 pub(crate) fn parse_lint_output(stdout: &[u8], file_path: &Path) -> Result<Vec<Finding>> {
-    let json: BuildifierOutput =
-        serde_json::from_slice(stdout).context("failed to parse buildifier lint JSON output")?;
+    let json: BuildifierOutput = serde_json::from_slice(stdout).with_context(|| {
+        format!(
+            "failed to parse buildifier lint JSON output; raw stdout: {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    })?;
 
     let mut findings = Vec::new();
     for file in json.files {
@@ -469,6 +536,43 @@ mod tests {
         let json = br#"{"success":true,"files":[{"filename":"foo.bzl"}]}"#;
         let findings = parse_lint_output(json, Path::new("foo.bzl")).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn lint_output_no_findings_when_warnings_empty() {
+        // Regression: combined --mode=check --lint=warn output for a clean file has
+        // `"warnings":[]` rather than the field being absent.
+        let json = br#"{"success":true,"files":[{"filename":"foo.bzl","formatted":true,"valid":true,"warnings":[]}]}"#;
+        let findings = parse_lint_output(json, Path::new("foo.bzl")).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn lint_output_combined_mode_check_shape_with_warning() {
+        // Regression: buildifier --mode=check --lint=warn --format=json output for
+        // lib/rust/broker-robinhood/BUILD.bazel — the "load" warning was parsed incorrectly
+        // before the lint invocation was fixed to include --mode=check.
+        let json = br#"{"success":false,"files":[{"filename":"lib/rust/broker-robinhood/BUILD.bazel","formatted":false,"valid":true,"warnings":[{"start":{"line":2,"column":37},"end":{"line":2,"column":48},"category":"load","actionable":true,"autoFixable":true,"message":"Loaded symbol \"rust_binary\" is unused. Please remove it.\nTo disable the warning, add '@unused' in a comment.","url":"https://github.com/bazelbuild/buildtools/blob/main/WARNINGS.md#load"}]}]}"#;
+        let findings =
+            parse_lint_output(json, Path::new("lib/rust/broker-robinhood/BUILD.bazel")).unwrap();
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(f.message.contains("load"), "unexpected: {}", f.message);
+        assert_eq!(f.location.as_ref().unwrap().line, Some(2));
+        assert_eq!(f.location.as_ref().unwrap().column, Some(37));
+    }
+
+    #[test]
+    fn lint_parse_error_includes_raw_stdout() {
+        // When JSON parsing fails, the error message must include the raw stdout so the
+        // failure is diagnosable without re-running buildifier.
+        let garbage = b"buildifier: cannot specify --format without --mode=check\n";
+        let err = parse_lint_output(garbage, Path::new("foo.bzl")).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("cannot specify --format"),
+            "raw stdout must appear in error: {msg}"
+        );
     }
 
     // ── bazel run detection ──────────────────────────────────────────────────
