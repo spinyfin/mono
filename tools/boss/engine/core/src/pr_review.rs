@@ -25,6 +25,8 @@
 //! extracts and parses this block. The `ReviewResult` is the sole
 //! deliverable; the reviewer must not emit any other action.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 /// Severity of a review finding — drives the engine's revision-warrant
@@ -87,7 +89,8 @@ pub enum ReviewFindingConfidence {
 ///
 /// Every finding must name a file and state concretely what to change.
 /// Vague findings ("consider improving error handling") are not acceptable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ReviewFinding {
     pub severity: ReviewFindingSeverity,
     pub category: ReviewFindingCategory,
@@ -125,7 +128,8 @@ pub struct RegressionCheck {
 /// parses it, and applies the severity gate to decide whether to create a
 /// revision on the producing task. `revision_warranted = false` with no
 /// qualifying findings → PR proceeds to human Review unimpeded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ReviewResult {
     /// URL of the PR that was reviewed.
     pub pr_url: String,
@@ -153,6 +157,77 @@ impl ReviewResult {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+}
+
+/// Render the CLAUDE.md for a reviewer worker (design §9 of P992).
+///
+/// Reviewer workers operate **read-only**: they read PR diffs and workspace
+/// files but must not write, push, or post to GitHub. This CLAUDE.md
+/// prominently states that mandate and omits PR-creation / VCS-push
+/// guidance entirely (those actions are also blocked by the reviewer denylist,
+/// so this is the belt that accompanies that suspenders layer).
+pub fn render_reviewer_claude_md(workspace_path: &Path, lease_id: &str) -> String {
+    let workspace = workspace_path.display();
+    let lease = lease_id;
+    format!(
+        "# Boss reviewer rules\n\
+         \n\
+         You are running inside a Boss-managed **reviewer** session. The engine\n\
+         spawned you in a leased cube workspace to review a PR read-only.\n\
+         \n\
+         ## Read-only mandate (HARD CONSTRAINT)\n\
+         \n\
+         **You MUST NOT change the PR or its branch in any way.**\n\
+         \n\
+         Forbidden actions (tool calls for these are denied):\n\
+         \n\
+         - Writing or editing any file (`Edit`, `Write`).\n\
+         - Committing or pushing (`jj git push`, `git push`).\n\
+         - Opening, merging, closing, editing, or commenting on a PR\n\
+           (`gh pr create/merge/close/edit/comment/review`).\n\
+         - Interacting with GitHub issues in any write capacity.\n\
+         - Running `cube pr ensure` or any Boss PR helper.\n\
+         \n\
+         Anything you would \"fix\", describe as a finding in the\n\
+         `ReviewResult` JSON instead. Your feedback stays inside Boss —\n\
+         **it is never posted to GitHub**.\n\
+         \n\
+         Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
+         `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
+         `gh pr list`, and similar read-only operations.\n\
+         \n\
+         ## Your workspace\n\
+         \n\
+         - Workspace path: `{workspace}`\n\
+         - Cube lease id: `{lease}`\n\
+         \n\
+         Lease held for the lifetime of this run. Do not lease, release,\n\
+         or mutate cube state.\n\
+         \n\
+         ## VCS (read-only)\n\
+         \n\
+         Use `jj` for read-only navigation. Do not push or modify history.\n\
+         \n\
+         - `jj log`, `jj show`, `jj diff` — browse history and diffs.\n\
+         - `gh pr diff <url>` — fetch the PR diff.\n\
+         - `gh pr view <url>` — read the PR description.\n\
+         \n\
+         ## Boundaries\n\
+         \n\
+         - Do not modify files outside this workspace. Sibling workspaces\n\
+           under `~/Documents/dev/workspaces/` belong to other workers.\n\
+         - Do not modify cube's database, lease state, or workspace registry.\n\
+         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
+           Never read, write, or touch it.\n\
+           `bossctl` is coordinator-only.\n\
+         \n\
+         ## Coordinator\n\
+         \n\
+         The coordinator may probe this session between turns. Treat probes\n\
+         as questions from a human reviewer — short, specific answers.\n",
+        workspace = workspace,
+        lease = lease,
+    )
 }
 
 /// Compose the initial-prompt for a `pr_review` execution (design §2).
