@@ -3,9 +3,9 @@ use super::*;
 pub(crate) fn execution_kind_for_work_item(
     conn: &Connection,
     work_item_id: &str,
-) -> Result<String> {
+) -> Result<ExecutionKind> {
     Ok(match classify_id(work_item_id)? {
-        ItemKind::Product => "product_design".to_owned(),
+        ItemKind::Product => ExecutionKind::ProductDesign,
         // Project ids no longer host their own executions — the
         // project's design phase lives on its auto-created
         // `kind = 'design'` task. We keep this arm returning
@@ -13,16 +13,17 @@ pub(crate) fn execution_kind_for_work_item(
         // `RequestExecution` still get a sensible execution kind for
         // logging, but the dispatch loop never actually creates
         // executions against project ids any more.
-        ItemKind::Project => "project_design".to_owned(),
+        ItemKind::Project => ExecutionKind::ProjectDesign,
         ItemKind::Task => {
             let task = query_task(conn, work_item_id)?
                 .filter(|task| task.deleted_at.is_none())
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
-            match task.kind.as_str() {
-                "chore" => "chore_implementation".to_owned(),
-                "design" => "project_design".to_owned(),
-                "revision" => "revision_implementation".to_owned(),
-                _ => "task_implementation".to_owned(),
+            match task.kind {
+                TaskKind::Chore => ExecutionKind::ChoreImplementation,
+                TaskKind::Design => ExecutionKind::ProjectDesign,
+                TaskKind::Revision => ExecutionKind::RevisionImplementation,
+                TaskKind::Investigation => ExecutionKind::InvestigationImplementation,
+                TaskKind::ProjectTask | TaskKind::Task => ExecutionKind::TaskImplementation,
             }
         }
     })
@@ -157,9 +158,12 @@ pub(crate) fn resolve_repo_for_work_item(
         )
         .optional()?;
 
-    let Some((override_repo, product_id, kind)) = row else {
+    let Some((override_repo, product_id, kind_str)) = row else {
         return Ok(None);
     };
+    let kind: TaskKind = kind_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown task kind in DB row {work_item_id}: {kind_str}"))?;
 
     if let Some(url) = override_repo.as_deref().filter(|s| !s.is_empty()) {
         return Ok(Some(url.to_owned()));
@@ -168,12 +172,12 @@ pub(crate) fn resolve_repo_for_work_item(
     let product = query_product(conn, &product_id)?.with_context(|| {
         format!("orphan task {work_item_id}: parent product {product_id} missing")
     })?;
-    if kind == "design" {
+    if kind == TaskKind::Design {
         if let Some(url) = product.design_repo.as_deref().filter(|s| !s.is_empty()) {
             return Ok(Some(url.to_owned()));
         }
     }
-    if kind == "investigation" {
+    if kind == TaskKind::Investigation {
         // Investigation deliverables go to the product's docs_repo; if
         // unset the worker falls back to BOSS_USER_DOCS_REPO (resolved
         // at spawn time by the dispatcher). Returning None here is
