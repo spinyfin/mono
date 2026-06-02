@@ -498,4 +498,81 @@ impl WorkDb {
         )?;
         Ok(n > 0)
     }
+
+    /// Return the stored upstream title and body for Behavior 8 drift detection.
+    ///
+    /// Returns `Ok(None)` when either column is `NULL` — this happens for items
+    /// imported before the Behavior 8 migration. The reconciler establishes the
+    /// baseline on the next pass without auto-syncing in that case.
+    pub fn reconciler_get_upstream_content(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        let result = conn
+            .query_row(
+                "SELECT external_ref_upstream_title, external_ref_upstream_body
+                 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| {
+                    let title: Option<String> = row.get(0)?;
+                    let body: Option<String> = row.get(1)?;
+                    Ok(title.zip(body))
+                },
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Persist the upstream title and body as the drift-detection baseline
+    /// without modifying the task name or description.
+    ///
+    /// Called on the first reconcile tick for items imported before the
+    /// Behavior 8 migration (`external_ref_upstream_title IS NULL`).
+    pub fn reconciler_set_upstream_content_baseline(
+        &self,
+        work_item_id: &str,
+        upstream_title: &str,
+        upstream_body: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+             SET external_ref_upstream_title = ?2,
+                 external_ref_upstream_body  = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![work_item_id, upstream_title, upstream_body],
+        )?;
+        Ok(())
+    }
+
+    /// Update a work item's `name` and `description` from upstream and record
+    /// the new upstream title/body as the Behavior 8 sync baseline.
+    ///
+    /// Returns `true` if the row was found and updated, `false` if soft-deleted
+    /// or not found (idempotent-safe).
+    pub fn reconciler_update_name_and_description(
+        &self,
+        work_item_id: &str,
+        new_name: &str,
+        new_description: &str,
+        upstream_title: &str,
+        upstream_body: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE tasks
+             SET name                        = ?2,
+                 description                 = ?3,
+                 external_ref_upstream_title = ?4,
+                 external_ref_upstream_body  = ?5,
+                 updated_at                  = ?6
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![work_item_id, new_name, new_description, upstream_title, upstream_body, now],
+        )?;
+        Ok(n > 0)
+    }
 }

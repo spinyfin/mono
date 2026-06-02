@@ -224,12 +224,19 @@ impl WorkDb {
     ///
     /// Also bumps `external_ref_synced_at` within the same transaction so the
     /// row is fully ready for the reconciler immediately after commit.
+    ///
+    /// `upstream_title` and `upstream_body` are the raw upstream issue title
+    /// and body (not the formatted description). They seed the Behavior 8
+    /// drift-detection baseline so the reconciler can later tell apart
+    /// operator edits from upstream changes on the first reconcile after import.
     pub fn import_chore_with_external_ref(
         &self,
         input: CreateChoreInput,
         kind: &str,
         canonical_id: &str,
         raw: &serde_json::Value,
+        upstream_title: &str,
+        upstream_body: &str,
     ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -239,14 +246,16 @@ impl WorkDb {
         let now = now_string();
         tx.execute(
             "UPDATE tasks
-             SET external_ref_kind         = ?2,
-                 external_ref_canonical_id = ?3,
-                 external_ref_raw          = ?4,
-                 external_ref_synced_at    = ?5,
-                 external_ref_unbound_at   = NULL,
-                 updated_at                = ?5
+             SET external_ref_kind              = ?2,
+                 external_ref_canonical_id      = ?3,
+                 external_ref_raw               = ?4,
+                 external_ref_synced_at         = ?5,
+                 external_ref_unbound_at        = NULL,
+                 external_ref_upstream_title    = ?6,
+                 external_ref_upstream_body     = ?7,
+                 updated_at                     = ?5
              WHERE id = ?1 AND deleted_at IS NULL",
-            params![chore.id, kind, canonical_id, raw_json, now],
+            params![chore.id, kind, canonical_id, raw_json, now, upstream_title, upstream_body],
         )?;
         tx.commit()?;
         Ok(chore)

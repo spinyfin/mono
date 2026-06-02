@@ -1316,3 +1316,28 @@ pub(crate) fn migrate_tasks_empty_effort_to_null(conn: &Connection) -> Result<()
     )?;
     Ok(())
 }
+
+/// Adds `external_ref_upstream_title` and `external_ref_upstream_body` columns
+/// to the `tasks` table. These store the upstream title and raw body as seen at
+/// the last successful reconcile, forming the baseline the reconciler uses to
+/// distinguish operator-side edits from upstream-side changes (Behavior 8).
+///
+/// `NULL` on existing rows means "no baseline yet"; the reconciler will
+/// establish the baseline on its next pass without auto-syncing.
+pub(crate) fn migrate_external_tracker_upstream_content(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "external_ref_upstream_title",
+            "ALTER TABLE tasks ADD COLUMN external_ref_upstream_title TEXT",
+        ),
+        (
+            "external_ref_upstream_body",
+            "ALTER TABLE tasks ADD COLUMN external_ref_upstream_body TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
