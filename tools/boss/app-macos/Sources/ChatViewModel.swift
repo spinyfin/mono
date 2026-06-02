@@ -679,6 +679,21 @@ final class ChatViewModel: ObservableObject {
         return computed
     }
 
+    /// The active board search query with surrounding whitespace removed,
+    /// or `nil` when no search filter is in effect. Single source of truth
+    /// for both the filter logic below and the persistent "filtered view"
+    /// banner so the two can never disagree about whether the board is
+    /// showing a subset (issue #1248).
+    var activeWorkSearchQuery: String? {
+        let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty ? nil : query
+    }
+
+    /// True while a free-text search is hiding non-matching cards. Drives
+    /// the kanban filter banner so a stale search can't be mistaken for an
+    /// empty or complete board.
+    var isWorkSearchActive: Bool { activeWorkSearchQuery != nil }
+
     private func computeVisibleWorkItems() -> [WorkTask] {
         guard let productID = currentSelectedProductID else { return [] }
 
