@@ -137,10 +137,7 @@ pub struct WorkerSetupInput {
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     if input.worker_kind == WorkerKind::Reviewer {
-        return crate::pr_review::render_reviewer_claude_md(
-            &input.workspace_path,
-            &input.lease_id,
-        );
+        return crate::pr_review::render_reviewer_claude_md(&input.lease_id);
     }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
@@ -2352,9 +2349,13 @@ mod tests {
             rendered.contains("Read-only mandate"),
             "reviewer CLAUDE.md must contain read-only mandate section",
         );
-        // Must contain workspace and lease info.
-        assert!(rendered.contains(input.workspace_path.to_str().unwrap()));
+        // Must contain lease id but NOT workspace path (workspace locations are
+        // not stable — cube can place workspaces anywhere).
         assert!(rendered.contains(&input.lease_id));
+        assert!(
+            !rendered.contains(input.workspace_path.to_str().unwrap()),
+            "reviewer CLAUDE.md must not hardcode workspace path",
+        );
         // Must NOT contain the standard PR-required delivery mandate from
         // the implementation worker CLAUDE.md.
         assert!(

@@ -25,8 +25,6 @@
 //! extracts and parses this block. The `ReviewResult` is the sole
 //! deliverable; the reviewer must not emit any other action.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
 /// Severity of a review finding — drives the engine's revision-warrant
@@ -166,9 +164,7 @@ impl ReviewResult {
 /// prominently states that mandate and omits PR-creation / VCS-push
 /// guidance entirely (those actions are also blocked by the reviewer denylist,
 /// so this is the belt that accompanies that suspenders layer).
-pub fn render_reviewer_claude_md(workspace_path: &Path, lease_id: &str) -> String {
-    let workspace = workspace_path.display();
-    let lease = lease_id;
+pub fn render_reviewer_claude_md(lease_id: &str) -> String {
     format!(
         "# Boss reviewer rules\n\
          \n\
@@ -198,7 +194,6 @@ pub fn render_reviewer_claude_md(workspace_path: &Path, lease_id: &str) -> Strin
          \n\
          ## Your workspace\n\
          \n\
-         - Workspace path: `{workspace}`\n\
          - Cube lease id: `{lease}`\n\
          \n\
          Lease held for the lifetime of this run. Do not lease, release,\n\
@@ -214,8 +209,8 @@ pub fn render_reviewer_claude_md(workspace_path: &Path, lease_id: &str) -> Strin
          \n\
          ## Boundaries\n\
          \n\
-         - Do not modify files outside this workspace. Sibling workspaces\n\
-           under `~/Documents/dev/workspaces/` belong to other workers.\n\
+         - Do not modify files outside your workspace. Other workspaces\n\
+           belong to other workers.\n\
          - Do not modify cube's database, lease state, or workspace registry.\n\
          - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
            Never read, write, or touch it.\n\
@@ -225,8 +220,7 @@ pub fn render_reviewer_claude_md(workspace_path: &Path, lease_id: &str) -> Strin
          \n\
          The coordinator may probe this session between turns. Treat probes\n\
          as questions from a human reviewer — short, specific answers.\n",
-        workspace = workspace,
-        lease = lease,
+        lease = lease_id,
     )
 }
 
