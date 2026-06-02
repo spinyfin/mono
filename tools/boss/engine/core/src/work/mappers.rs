@@ -255,6 +255,18 @@ pub(crate) fn map_task_with_external_ref_and_parent(
     Ok(task)
 }
 
+/// Like [`map_task_with_external_ref_and_parent`] but also reads column 36
+/// carrying `source_automation_id`. Used in `get_work_tree` so automation-
+/// produced tasks carry their provenance to the client (icon display + kanban
+/// filtering both key off this field).
+pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(
+    row: &Row<'_>,
+) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_external_ref_and_parent(row)?;
+    task.source_automation_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
 pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
     let branch_naming: BranchNaming = row
         .get::<_, Option<String>>(22)?
