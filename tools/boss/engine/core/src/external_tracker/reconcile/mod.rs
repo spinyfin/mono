@@ -179,7 +179,8 @@ pub fn register_metrics(registry: &Registry) {
 
 /// Per-pass aggregate outcome.  Returned by [`run_one_pass`] for the caller
 /// (spawn loop, CLI verb) to emit into logs / metrics.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PassOutcome {
     pub products_processed: usize,
     pub products_skipped: usize,
