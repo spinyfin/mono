@@ -27,6 +27,69 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which review rubric to apply to a PR.
+///
+/// The reviewer renders a scope-specific initial prompt so the rubric is
+/// always appropriate to the PR's content — the code rubric (correctness,
+/// regressions, architecture, tests) does not apply to a pure docs delivery.
+///
+/// Callers should use [`classify_changed_files`] to derive this from the
+/// list of files in the PR diff, falling back to [`ReviewScope::Code`] when
+/// the file list is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewScope {
+    /// Standard code PR — apply the full code rubric.
+    Code,
+    /// Docs-only PR (every changed file is a documentation file) — apply
+    /// the light rubric (structure, completeness, required-sections) and
+    /// skip the code rubric entirely.
+    DocsOnly,
+}
+
+/// Classify a list of changed file paths as docs-only or code.
+///
+/// Returns [`ReviewScope::DocsOnly`] if every path in `files` is a
+/// documentation file (`.md`, `.mdx`, `.rst`, `.txt`, or any path that
+/// lives under a `docs/` directory at any depth). Returns
+/// [`ReviewScope::Code`] if any path is a source, build, or config file,
+/// or if `files` is empty (an empty diff defaults to the code rubric).
+///
+/// # Examples
+///
+/// ```
+/// use boss_engine::pr_review::{classify_changed_files, ReviewScope};
+///
+/// assert_eq!(
+///     classify_changed_files(&["docs/design.md", "README.md"]),
+///     ReviewScope::DocsOnly,
+/// );
+/// assert_eq!(
+///     classify_changed_files(&["src/lib.rs", "docs/design.md"]),
+///     ReviewScope::Code,
+/// );
+/// assert_eq!(classify_changed_files(&[]), ReviewScope::Code);
+/// ```
+pub fn classify_changed_files(files: &[&str]) -> ReviewScope {
+    if files.is_empty() {
+        return ReviewScope::Code;
+    }
+    if files.iter().all(|f| is_docs_file(f)) {
+        ReviewScope::DocsOnly
+    } else {
+        ReviewScope::Code
+    }
+}
+
+fn is_docs_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".txt")
+        || lower.starts_with("docs/")
+        || lower.contains("/docs/")
+}
+
 /// Severity of a review finding — drives the engine's revision-warrant
 /// decision (design §3: any `critical`/`high`, or any `regression`,
 /// creates a revision regardless of `revision_warranted`).
@@ -224,7 +287,7 @@ pub fn render_reviewer_claude_md(lease_id: &str) -> String {
     )
 }
 
-/// Compose the initial-prompt for a `pr_review` execution (design §2).
+/// Compose the initial-prompt for a `pr_review` execution (design §2, §12).
 ///
 /// `task_name` and `task_description` are the producing task's title and
 /// description — they tell the reviewer what the PR was *supposed* to do,
@@ -232,11 +295,24 @@ pub fn render_reviewer_claude_md(lease_id: &str) -> String {
 ///
 /// `pr_url` is the PR to review. The reviewer fetches the diff via
 /// `gh pr diff` and reads changed files for context.
+///
+/// `scope` controls which rubric is rendered:
+/// - [`ReviewScope::Code`] — the full code rubric (correctness, regressions,
+///   architecture, tests, edge cases), plus a fallback note to switch to the
+///   docs rubric if all changed files turn out to be documentation files.
+/// - [`ReviewScope::DocsOnly`] — only the light docs rubric (structure,
+///   completeness, required-sections). The code rubric is omitted entirely.
+///
+/// When the engine cannot pre-classify the PR (no file list available),
+/// pass [`ReviewScope::Code`]; the self-detection fallback in the code rubric
+/// section covers that case.
 pub fn render_reviewer_initial_prompt(
     task_name: &str,
     task_description: &str,
     pr_url: &str,
+    scope: ReviewScope,
 ) -> String {
+    let rubric = render_rubric_section(&scope);
     format!(
         "# PR review\n\
          \n\
@@ -266,47 +342,7 @@ pub fn render_reviewer_initial_prompt(
          4. Produce the `ReviewResult` JSON (schema below) in a fenced \
             ` ```json ` block as the **last thing in your final message**.\n\
          \n\
-         ## Review rubric — code PR\n\
-         \n\
-         Apply a **high bar**: push back only on real problems, not \
-         stylistic preferences. Every finding must name a file (and \
-         function/line/hunk where possible) and state **concretely what to \
-         change**. Vague findings are not acceptable.\n\
-         \n\
-         Review for:\n\
-         \n\
-         - **Critical correctness** — logic errors, broken invariants, \
-           mishandled errors, race conditions. (`category: \"correctness\"`)\n\
-         - **Inadvertent regressions** *(first-class, explicit check)* — \
-           diff against `main` and flag anything dropped that is unrelated \
-           to the PR's stated purpose. Conflict-resolution and forward-port \
-           PRs get extra scrutiny here. This is the T793 check: a live \
-           feature silently removed during a forward-port must be caught. \
-           (`category: \"regression\"`)\n\
-         - **Architectural issues** — wrong layer, missed reuse, abstraction \
-           that fights the codebase's conventions. (`category: \
-           \"architecture\"`)\n\
-         - **Code quality/readability** — fails to match surrounding style, \
-           naming issues, dead/confusing code. (`category: \"readability\"`)\n\
-         - **Test coverage gaps** — untested new behaviour, missing \
-           edge-case tests. (`category: \"tests\"`)\n\
-         - **Edge cases/gotchas** — boundary conditions, nullability, \
-           concurrency, failure modes. (`category: \"edgecase\"`)\n\
-         \n\
-         ## Docs-only PR rubric\n\
-         \n\
-         If the diff contains **only** Markdown/documentation files (`.md`, \
-         design docs, READMEs, etc.) with no source-code changes, switch to \
-         the light rubric:\n\
-         \n\
-         - Structure and completeness of the document.\n\
-         - Internal consistency (no contradictions within the doc).\n\
-         - Required-sections check for design docs (problem/goals/approach \
-           headings present).\n\
-         \n\
-         Do NOT apply the code rubric (tests, regressions, architecture) to \
-         a pure docs PR.\n\
-         \n\
+         {rubric}\n\
          ## Speed/comprehensiveness balance\n\
          \n\
          Prefer **fast, high-signal feedback** over exhaustive analysis. \
@@ -368,7 +404,76 @@ pub fn render_reviewer_initial_prompt(
         task_name = task_name,
         task_description = task_description,
         pr_url = pr_url,
+        rubric = rubric,
     )
+}
+
+fn render_rubric_section(scope: &ReviewScope) -> String {
+    match scope {
+        ReviewScope::Code => {
+            "## Review rubric — code PR\n\
+             \n\
+             Apply a **high bar**: push back only on real problems, not \
+             stylistic preferences. Every finding must name a file (and \
+             function/line/hunk where possible) and state **concretely what to \
+             change**. Vague findings are not acceptable.\n\
+             \n\
+             Review for:\n\
+             \n\
+             - **Critical correctness** — logic errors, broken invariants, \
+               mishandled errors, race conditions. (`category: \"correctness\"`)\n\
+             - **Inadvertent regressions** *(first-class, explicit check)* — \
+               diff against `main` and flag anything dropped that is unrelated \
+               to the PR's stated purpose. Conflict-resolution and forward-port \
+               PRs get extra scrutiny here. This is the T793 check: a live \
+               feature silently removed during a forward-port must be caught. \
+               (`category: \"regression\"`)\n\
+             - **Architectural issues** — wrong layer, missed reuse, abstraction \
+               that fights the codebase's conventions. (`category: \
+               \"architecture\"`)\n\
+             - **Code quality/readability** — fails to match surrounding style, \
+               naming issues, dead/confusing code. (`category: \"readability\"`)\n\
+             - **Test coverage gaps** — untested new behaviour, missing \
+               edge-case tests. (`category: \"tests\"`)\n\
+             - **Edge cases/gotchas** — boundary conditions, nullability, \
+               concurrency, failure modes. (`category: \"edgecase\"`)\n\
+             \n\
+             **Docs-only fallback:** if you determine that every changed file \
+             is a documentation file (`.md`, `.mdx`, `.rst`, design docs, \
+             READMEs) with no source-code changes, switch to the light docs \
+             rubric below and skip the code rubric above.\n\
+             \n\
+             - Structure and completeness of the document.\n\
+             - Internal consistency (no contradictions within the doc).\n\
+             - Required-sections check for design docs (problem/goals/approach \
+               headings present).\n\
+             \n"
+                .to_owned()
+        }
+        ReviewScope::DocsOnly => {
+            "## Review rubric — docs-only PR\n\
+             \n\
+             This PR contains only documentation files. Apply the **light \
+             rubric** — skip code-review concerns (correctness, regressions, \
+             architecture, tests) entirely.\n\
+             \n\
+             Review for:\n\
+             \n\
+             - **Structure and completeness** — is the document well-organised \
+               and does it cover what it claims to cover?\n\
+             - **Internal consistency** — no contradictions within the doc; \
+               claims made in one section are consistent with claims in another.\n\
+             - **Required-sections check** — for design docs, verify that the \
+               expected headings are present: Problem / Goal, Goals, Chosen \
+               approach (or equivalent). Flag any that are absent or \
+               substantively empty.\n\
+             \n\
+             Do NOT apply the code rubric (correctness, regressions, \
+             architecture, tests, edge cases) to this docs-only PR.\n\
+             \n"
+                .to_owned()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +542,7 @@ mod tests {
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
+            ReviewScope::Code,
         );
         assert!(prompt.contains("https://github.com/org/repo/pull/99"));
         assert!(prompt.contains("Fix the auth bug"));
@@ -450,22 +556,109 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_initial_prompt_contains_docs_rubric() {
+    fn code_scope_prompt_contains_code_rubric_and_docs_fallback() {
+        let prompt = render_reviewer_initial_prompt(
+            "Fix the auth bug",
+            "Auth middleware drops sessions on timeout.",
+            "https://github.com/org/repo/pull/99",
+            ReviewScope::Code,
+        );
+        assert!(prompt.contains("code PR"));
+        assert!(prompt.contains("Docs-only fallback"));
+        assert!(prompt.contains("light docs rubric"));
+        // Code rubric categories must be present.
+        assert!(prompt.contains("correctness"));
+        assert!(prompt.contains("regressions"));
+        assert!(prompt.contains("architecture"));
+        assert!(prompt.contains("tests"));
+    }
+
+    #[test]
+    fn docs_only_scope_prompt_contains_docs_rubric_and_no_code_rubric() {
         let prompt = render_reviewer_initial_prompt(
             "Add design doc",
             "Write a design doc for feature X.",
             "https://github.com/org/repo/pull/100",
+            ReviewScope::DocsOnly,
         );
-        assert!(prompt.contains("Docs-only"));
+        assert!(prompt.contains("docs-only PR"));
         assert!(prompt.contains("light rubric"));
-        assert!(prompt.contains("Markdown"));
+        assert!(prompt.contains("Internal consistency"));
+        assert!(prompt.contains("Required-sections check"));
+        // Code rubric must NOT appear in docs-only prompt.
+        assert!(!prompt.contains("code PR"));
+        assert!(!prompt.contains("T793"));
     }
 
     #[test]
     fn reviewer_initial_prompt_states_speed_balance() {
-        let prompt = render_reviewer_initial_prompt("T", "D", "https://github.com/pr/1");
+        let prompt =
+            render_reviewer_initial_prompt("T", "D", "https://github.com/pr/1", ReviewScope::Code);
         assert!(prompt.contains("fast, high-signal"));
         assert!(prompt.contains("scrutiny budget"));
+    }
+
+    // --- classify_changed_files ---
+
+    #[test]
+    fn classify_empty_files_returns_code() {
+        assert_eq!(classify_changed_files(&[]), ReviewScope::Code);
+    }
+
+    #[test]
+    fn classify_all_md_files_returns_docs_only() {
+        assert_eq!(
+            classify_changed_files(&["README.md", "docs/design.md", "CHANGELOG.md"]),
+            ReviewScope::DocsOnly,
+        );
+    }
+
+    #[test]
+    fn classify_mixed_returns_code() {
+        assert_eq!(
+            classify_changed_files(&["README.md", "src/lib.rs"]),
+            ReviewScope::Code,
+        );
+    }
+
+    #[test]
+    fn classify_mdx_and_rst_count_as_docs() {
+        assert_eq!(
+            classify_changed_files(&["docs/guide.mdx", "notes.rst"]),
+            ReviewScope::DocsOnly,
+        );
+    }
+
+    #[test]
+    fn classify_docs_dir_prefix_counts_as_docs() {
+        assert_eq!(
+            classify_changed_files(&["docs/architecture/overview.txt"]),
+            ReviewScope::DocsOnly,
+        );
+    }
+
+    #[test]
+    fn classify_docs_subdir_in_path_counts_as_docs() {
+        assert_eq!(
+            classify_changed_files(&["tools/boss/docs/designs/foo.md"]),
+            ReviewScope::DocsOnly,
+        );
+    }
+
+    #[test]
+    fn classify_rs_file_alone_returns_code() {
+        assert_eq!(
+            classify_changed_files(&["tools/boss/engine/src/lib.rs"]),
+            ReviewScope::Code,
+        );
+    }
+
+    #[test]
+    fn classify_build_file_with_docs_returns_code() {
+        assert_eq!(
+            classify_changed_files(&["docs/guide.md", "BUILD.bazel"]),
+            ReviewScope::Code,
+        );
     }
 
     #[test]
