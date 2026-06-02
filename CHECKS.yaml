@@ -45,6 +45,8 @@ checks:
   - id: buildifier
     config:
       buildifier_path: "bin/buildifier"
+    policy:
+      severity: error
 
   - id: rust-test-rule-coverage
 
