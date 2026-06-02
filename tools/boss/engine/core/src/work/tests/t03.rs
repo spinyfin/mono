@@ -2272,7 +2272,7 @@ fn redispatch_preserves_investigation_execution_kind() {
         )
         .unwrap();
     assert_eq!(
-        first.kind, "investigation_implementation",
+        first.kind, ExecutionKind::InvestigationImplementation,
         "first dispatch should carry the investigation kind"
     );
 
@@ -2293,7 +2293,7 @@ fn redispatch_preserves_investigation_execution_kind() {
         "redispatch should create a fresh execution, not reuse the stale one"
     );
     assert_eq!(
-        redispatched.kind, "investigation_implementation",
+        redispatched.kind, ExecutionKind::InvestigationImplementation,
         "redispatched investigation must NOT downgrade to task_implementation"
     );
 
