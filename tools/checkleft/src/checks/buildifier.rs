@@ -509,7 +509,10 @@ pub(crate) fn parse_lint_output(stdout: &[u8], file_path: &Path) -> Result<Vec<F
                     column: Some(warning.start.column),
                 }),
                 remediations: vec![
-                    "Run `buildifier --lint=fix` to auto-fix, or resolve manually.".to_owned(),
+                    format!(
+                        "Run `buildifier --lint=fix {}` to auto-fix, or resolve manually.",
+                        file_path.display()
+                    ),
                 ],
                 suggested_fix: None,
             });
