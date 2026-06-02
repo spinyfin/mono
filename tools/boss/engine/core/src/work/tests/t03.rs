@@ -175,7 +175,7 @@ fn records_failed_execution_start_attempt() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -235,7 +235,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -325,7 +325,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -2020,7 +2020,7 @@ fn create_via_round_trip_per_source() {
         .unwrap();
     let design_task = project_tasks
         .iter()
-        .find(|t| t.kind == "design")
+        .find(|t| t.kind == TaskKind::Design)
         .expect("project create should auto-spawn a design task");
     assert_eq!(design_task.created_via, CREATED_VIA_ENGINE_AUTO);
 

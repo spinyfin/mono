@@ -2884,7 +2884,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None, false)
                 .await?
                 .into_iter()
-                .find(|t| t.kind == "design")
+                .find(|t| t.kind == boss_protocol::TaskKind::Design)
                 .map(with_display_status);
 
             print_entity(
