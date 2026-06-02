@@ -131,7 +131,14 @@ pub struct WorkerSetupInput {
 }
 
 /// Render the worker-facing CLAUDE.md.
+///
+/// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific CLAUDE.md
+/// that prominently states the read-only mandate and omits PR-creation
+/// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput) -> String {
+    if input.worker_kind == WorkerKind::Reviewer {
+        return render_reviewer_claude_md(input);
+    }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
     let draft_directive = if input.draft_pr_mode {
@@ -276,6 +283,78 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          The coordinator may probe this session between turns. Treat probes\n\
          as questions from a human reviewer — short, specific answers.\n\
          {draft_directive}"
+    )
+}
+
+/// Render the CLAUDE.md for a reviewer worker (design §9 of P992).
+///
+/// Reviewer workers operate **read-only**: they read PR diffs and workspace
+/// files but must not write, push, or post to GitHub. This CLAUDE.md
+/// prominently states that mandate and omits PR-creation / VCS-push
+/// guidance entirely (those actions are also blocked by the denylist in
+/// [`reviewer_deny_rules`], so this is the belt that accompanies that
+/// suspenders layer).
+fn render_reviewer_claude_md(input: &WorkerSetupInput) -> String {
+    let workspace = input.workspace_path.display();
+    let lease = &input.lease_id;
+    format!(
+        "# Boss reviewer rules\n\
+         \n\
+         You are running inside a Boss-managed **reviewer** session. The engine\n\
+         spawned you in a leased cube workspace to review a PR read-only.\n\
+         \n\
+         ## Read-only mandate (HARD CONSTRAINT)\n\
+         \n\
+         **You MUST NOT change the PR or its branch in any way.**\n\
+         \n\
+         Forbidden actions (tool calls for these are denied):\n\
+         \n\
+         - Writing or editing any file (`Edit`, `Write`).\n\
+         - Committing or pushing (`jj git push`, `git push`).\n\
+         - Opening, merging, closing, editing, or commenting on a PR\n\
+           (`gh pr create/merge/close/edit/comment/review`).\n\
+         - Interacting with GitHub issues in any write capacity.\n\
+         - Running `cube pr ensure` or any Boss PR helper.\n\
+         \n\
+         Anything you would \"fix\", describe as a finding in the\n\
+         `ReviewResult` JSON instead. Your feedback stays inside Boss —\n\
+         **it is never posted to GitHub**.\n\
+         \n\
+         Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
+         `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
+         `gh pr list`, and similar read-only operations.\n\
+         \n\
+         ## Your workspace\n\
+         \n\
+         - Workspace path: `{workspace}`\n\
+         - Cube lease id: `{lease}`\n\
+         \n\
+         Lease held for the lifetime of this run. Do not lease, release,\n\
+         or mutate cube state.\n\
+         \n\
+         ## VCS (read-only)\n\
+         \n\
+         Use `jj` for read-only navigation. Do not push or modify history.\n\
+         \n\
+         - `jj log`, `jj show`, `jj diff` — browse history and diffs.\n\
+         - `gh pr diff <url>` — fetch the PR diff.\n\
+         - `gh pr view <url>` — read the PR description.\n\
+         \n\
+         ## Boundaries\n\
+         \n\
+         - Do not modify files outside this workspace. Sibling workspaces\n\
+           under `~/Documents/dev/workspaces/` belong to other workers.\n\
+         - Do not modify cube's database, lease state, or workspace registry.\n\
+         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
+           Never read, write, or touch it.\n\
+           `bossctl` is coordinator-only.\n\
+         \n\
+         ## Coordinator\n\
+         \n\
+         The coordinator may probe this session between turns. Treat probes\n\
+         as questions from a human reviewer — short, specific answers.\n",
+        workspace = workspace,
+        lease = lease,
     )
 }
 
@@ -2330,6 +2409,53 @@ mod tests {
             !rendered.contains("--draft"),
             "CLAUDE.md must NOT include --draft directive when draft_pr_mode is false",
         );
+    }
+
+    #[test]
+    fn reviewer_claude_md_states_read_only_mandate() {
+        let mut input = sample_input();
+        input.worker_kind = WorkerKind::Reviewer;
+        let rendered = render_claude_md(&input);
+        // Must contain the read-only mandate section.
+        assert!(
+            rendered.contains("Read-only mandate"),
+            "reviewer CLAUDE.md must contain read-only mandate section",
+        );
+        // Must contain workspace and lease info.
+        assert!(rendered.contains(input.workspace_path.to_str().unwrap()));
+        assert!(rendered.contains(&input.lease_id));
+        // Must NOT contain the standard PR-required delivery mandate from
+        // the implementation worker CLAUDE.md.
+        assert!(
+            !rendered.contains("Pull requests are the deliverable"),
+            "reviewer CLAUDE.md must not include the standard PR-required reminder",
+        );
+        // Must not instruct the reviewer to create a PR — the tool is listed
+        // only as a *forbidden* action, not as a delivery requirement.
+        assert!(
+            !rendered.contains("A task is not complete until a PR exists"),
+            "reviewer CLAUDE.md must not include the implementation PR mandate",
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_md_mentions_allowed_read_only_tools() {
+        let mut input = sample_input();
+        input.worker_kind = WorkerKind::Reviewer;
+        let rendered = render_claude_md(&input);
+        assert!(rendered.contains("gh pr diff"), "must mention gh pr diff");
+        assert!(rendered.contains("gh pr view"), "must mention gh pr view");
+        assert!(rendered.contains("jj log"), "must mention jj log");
+    }
+
+    #[test]
+    fn standard_claude_md_is_unchanged_by_reviewer_branch() {
+        // Verify the reviewer kind change does not affect standard workers.
+        let input = sample_input(); // WorkerKind::Standard
+        let rendered = render_claude_md(&input);
+        assert!(rendered.contains("Pull requests are the deliverable"));
+        assert!(rendered.contains("cube pr ensure"));
+        assert!(rendered.contains("LOCAL MIRROR"));
     }
 
     #[test]
