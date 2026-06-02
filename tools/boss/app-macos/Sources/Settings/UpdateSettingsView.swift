@@ -76,6 +76,8 @@ struct UpdateSettingsView: View {
             return "Boss \(version) downloaded — will install on quit or relaunch."
         case .failed(let version, let reason):
             return "Download of Boss \(version) failed: \(reason)"
+        case .installFailed(let version, let reason):
+            return "Install of Boss \(version) failed: \(reason)"
         }
     }
 
@@ -86,7 +88,7 @@ struct UpdateSettingsView: View {
             ProgressView().controlSize(.small)
         case .readyToInstall:
             Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green)
-        case .failed:
+        case .failed, .installFailed:
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .idle:
             EmptyView()
