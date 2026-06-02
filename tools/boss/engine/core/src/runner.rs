@@ -768,7 +768,12 @@ pub(crate) fn compose_worker_spawn(
                     .build(),
             )
         } else {
-            crate::pr_review::render_reviewer_initial_prompt(task_name, task_description, pr_url)
+            crate::pr_review::render_reviewer_initial_prompt(
+                task_name,
+                task_description,
+                pr_url,
+                crate::pr_review::ReviewScope::Code,
+            )
         }
     } else {
         compose_execution_prompt(
