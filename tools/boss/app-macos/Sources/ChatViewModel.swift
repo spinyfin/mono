@@ -998,12 +998,20 @@ final class ChatViewModel: ObservableObject {
 
     /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
     /// Switches to the Work tab, selects the task's product, clears
-    /// project filters, and queues a scroll. If the task's product is
-    /// not the one currently loaded, the scroll is deferred until the
-    /// `workTree` event for that product arrives.
+    /// every active board filter, and queues a scroll. If the task's
+    /// product is not the one currently loaded, the scroll is deferred
+    /// until the `workTree` event for that product arrives.
+    ///
+    /// Reveal's contract is "show me this card", so it must override any
+    /// filter that would hide the target — a stale search query, a
+    /// blocked-only / chores-only toggle, a project filter, or chores
+    /// being hidden — all of which can exclude the card and make the
+    /// scroll silently land on nothing (#1249). We reset the board to its
+    /// unfiltered state before scrolling so the revealed card is
+    /// guaranteed visible.
     func revealWorkCard(_ taskID: String, productID: String) {
         setNavigationMode(.work)
-        selectedProjectFilterIDs = []
+        clearWorkFiltersForReveal()
         selectedWorkCardID = taskID
         let isProductSwitch = currentSelectedProductID != productID
         if isProductSwitch {
@@ -1019,6 +1027,20 @@ final class ChatViewModel: ObservableObject {
                 self?.revealHighlightID = nil
             }
         }
+    }
+
+    /// Reset every board filter that could hide a reveal target so the
+    /// full work board for the product is shown. Each assignment is a
+    /// no-op when the filter is already in its neutral state, so this is
+    /// cheap to call unconditionally. Keep this in sync with
+    /// `computeVisibleWorkItems` — any new narrowing filter added there
+    /// must be neutralized here too, or reveal can silently fail again.
+    private func clearWorkFiltersForReveal() {
+        selectedProjectFilterIDs = []
+        workSearchText = ""
+        showBlockedOnly = false
+        filterToChoresOnly = false
+        includeChores = true
     }
 
     private func triggerRevealScroll(_ taskID: String) {
