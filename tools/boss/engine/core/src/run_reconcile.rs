@@ -40,7 +40,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{ExecutionKind, WorkExecution};
+use boss_protocol::WorkExecution;
+#[cfg(test)]
+use boss_protocol::ExecutionKind;
 
 use crate::coordinator::{CubeClient, CubeWorkspaceStatus};
 

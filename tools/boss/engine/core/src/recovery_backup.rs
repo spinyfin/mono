@@ -58,7 +58,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use boss_protocol::{ExecutionKind, WorkExecution};
+use boss_protocol::WorkExecution;
+#[cfg(test)]
+use boss_protocol::ExecutionKind;
 
 /// Environment override for the recovery directory. Set by tests to
 /// redirect captures into a tempdir; an operator can also point it at an

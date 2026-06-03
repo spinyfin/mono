@@ -108,16 +108,11 @@ const AUTOMATION_WORKER_ID_PREFIX: &str = "auto-worker-";
 /// `pool_for_worker_id` can route releases to the review pool.
 const REVIEW_WORKER_ID_PREFIX: &str = "review-";
 
-/// Execution kind string for automation triage runs. Triage executions
-/// bind to an automation (not a task) and always route to the automation pool.
-/// Re-exported from `boss_protocol` so the runner (preamble) and completion
-/// handler (outcome detector) share one source of truth.
-pub(crate) use boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE;
-
 /// Execution kind string for reviewer agent runs. A `pr_review` execution
 /// reviews a worker's PR read-only and always routes to the dedicated review
 /// pool. Re-exported from `boss_protocol` so routing and the (future)
 /// completion handler share one source of truth.
+#[cfg(test)]
 pub(crate) use boss_protocol::EXECUTION_KIND_PR_REVIEW;
 
 /// Upper bound on how long the engine waits for a single
