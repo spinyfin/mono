@@ -116,6 +116,12 @@ struct ContentView: View {
             model.paneInterruptHandler = { [workspace = workersWorkspace] slotId in
                 workspace.interruptWorkerPane(slotId: slotId)
             }
+            // Forward pool-config pushes from the engine so WorkersWorkspaceModel
+            // always uses the engine's live pool sizes rather than independently-
+            // maintained constants that drift when pool sizes change.
+            model.panePoolConfigHandler = { [workspace = workersWorkspace] workerSlots, automationSlots, reviewSlots in
+                workspace.configureSlots(workerCount: workerSlots, automationCount: automationSlots, reviewCount: reviewSlots)
+            }
             // Install the Boss-pane shell-pid provider so the engine can
             // authenticate Boss-tier RPCs (e.g. `bossctl agents reap`).
             // The closure is re-evaluated on every call, so it picks up

@@ -86,6 +86,19 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             .await;
         tracing::info!(session_id = %session_id, "app session registered");
         send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
+        // Push pool sizes immediately after registration so the app's
+        // WorkersWorkspaceModel can configure its slot ranges before the
+        // engine dispatches any SpawnWorkerPane. This is the single source
+        // of truth: the engine's runtime pool config drives the app's
+        // capacity check, so they can never be independently out of sync.
+        send_push(
+            &sink,
+            FrontendEvent::EnginePoolConfig {
+                worker_slots: server_state.worker_pool_size,
+                automation_slots: server_state.automation_pool_size,
+                review_slots: server_state.review_pool_size,
+            },
+        );
     }
 }
 

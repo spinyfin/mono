@@ -456,6 +456,14 @@ struct ServerState {
     /// pane-titlebar summarizer continues to resolve the key
     /// per-spawn via `cfg.agent()`.
     anthropic_api_key: Option<String>,
+    /// Live pool sizes clamped at engine startup. Pushed to the macOS
+    /// app as `EnginePoolConfig` on every `RegisterAppSession` so the
+    /// app's `WorkersWorkspaceModel` slot ranges always mirror the
+    /// engine's actual allocation limits, not independently-maintained
+    /// constants that drift when pool sizes change.
+    worker_pool_size: u8,
+    automation_pool_size: u8,
+    review_pool_size: u8,
     /// Shared verdict from the `syspolicyd` CPU monitor. The sampler loop
     /// (spawned in `serve`) writes it; [`build_engine_health_report`]
     /// reads it to raise a banner when the daemon wedges and stalls all
@@ -794,6 +802,12 @@ impl ServerState {
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let automation_pool = WorkerPool::new_automation(cfg.work.automation_pool_size);
         let review_pool = WorkerPool::new_review(cfg.work.review_pool_size);
+        // Capture clamped pool sizes before they move into the coordinator so
+        // we can embed them into ServerState and push EnginePoolConfig to the
+        // macOS app on every RegisterAppSession.
+        let worker_pool_size = cfg.work.worker_pool_size as u8;
+        let automation_pool_size = cfg.work.automation_pool_size as u8;
+        let review_pool_size = cfg.work.review_pool_size as u8;
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
         let publisher_impl = Arc::new(BrokerExecutionPublisher {
@@ -1025,6 +1039,9 @@ impl ServerState {
                 staged_pr_urls,
                 editorial_deny_tracker: Arc::new(crate::editorial_hook::DenyTracker::new()),
                 anthropic_api_key,
+                worker_pool_size,
+                automation_pool_size,
+                review_pool_size,
                 syspolicyd_health: Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()),
                 next_session_id: AtomicU64::new(1),
                 work_revision,

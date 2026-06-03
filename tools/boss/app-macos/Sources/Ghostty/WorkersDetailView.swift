@@ -77,7 +77,7 @@ struct WorkersDetailView: View {
                     Text(pool.label(
                         mainCount: WorkersWorkspaceModel.workerSlotCount,
                         automationCount: WorkersWorkspaceModel.automationSlotCount,
-                        reviewCount: WorkersWorkspaceModel.reviewSlotCount
+                        reviewCount: workspace.reviewSlotCount
                     )).tag(pool)
                 }
             }
