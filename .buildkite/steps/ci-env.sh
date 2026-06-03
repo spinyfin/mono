@@ -9,13 +9,14 @@ bazel() {
   local subcommand="$1"
   shift
 
-  local bazelrc_args=()
-  [[ -f ".ci.${OS_TYPE}.startup.bazelrc" ]] &&
-   	bazelrc_args=(--bazelrc=".ci.${OS_TYPE}.startup.bazelrc")
+  local bazelrc_arg=""
+  if [[ -f ".ci.${OS_TYPE}.startup.bazelrc" ]]; then
+    bazelrc_arg="--bazelrc=.ci.${OS_TYPE}.startup.bazelrc"
+  fi
 
   command bazel \
-   	"${bazelrc_args[@]}" \
-    	"$subcommand" \
-    	--config="ci-${OS_TYPE}" \
-    	"$@"
+    $bazelrc_arg \
+    "$subcommand" \
+    --config="ci-${OS_TYPE}" \
+    "$@"
 }
