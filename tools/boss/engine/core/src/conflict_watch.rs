@@ -561,6 +561,7 @@ async fn maybe_spawn_conflict_revision(
             model_override: None,
             force_duplicate: false,
             created_via: Some(created_via),
+            autostart: true,
         },
         pr_checker,
     ) {

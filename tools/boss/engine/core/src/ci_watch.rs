@@ -627,6 +627,7 @@ async fn maybe_spawn_ci_revision(
             model_override: None,
             force_duplicate: false,
             created_via: Some(created_via),
+            autostart: true,
         },
         pr_checker,
     ) {

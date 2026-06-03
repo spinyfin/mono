@@ -448,6 +448,7 @@ fn revision_input(parent_id: &str) -> CreateRevisionInput {
         model_override: None,
         force_duplicate: false,
         created_via: None,
+        autostart: true,
     }
 }
 
