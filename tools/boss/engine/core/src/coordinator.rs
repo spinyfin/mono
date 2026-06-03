@@ -5836,6 +5836,103 @@ mod tests {
         );
     }
 
+    /// A `pr_review` spawn failure must NOT demote the work item back to
+    /// `todo`. The PrReview exception in the pane-spawn failure handler
+    /// skips `demote_active_work_item_to_todo` so the kanban card stays
+    /// in its current state (here: `active`, as it would be just after an
+    /// implementation run that produced a PR). The symmetrical chore path
+    /// (`pane_spawn_failure_raises_attention_item_and_dispatch_event`) DOES
+    /// demote — this test pins the carve-out in the opposite direction.
+    #[tokio::test]
+    async fn pane_spawn_failure_for_pr_review_does_not_demote_work_item() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        // Create the chore with autostart=false so `rescan_active_dispatch`
+        // never re-queues it after the PrReview execution fails. Only the
+        // PrReview execution we inject below reaches the dispatcher.
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Reviewed chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Simulate the post-implementation state: the chore is `active`
+        // (auto-advanced by `start_execution_run` when the implementation
+        // run began) and a PrReview execution was just enqueued by the
+        // completion handler. `autostart = 0` is already set, so the
+        // rescan sweep skips this chore even after the review pool frees up.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'active', updated_at = '1' WHERE id = ?1",
+                rusqlite::params![chore.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO work_executions
+                   (id, work_item_id, kind, status, repo_remote_url, priority, created_at)
+                 VALUES (?1, ?2, ?3, 'ready', ?4, 0, '1')",
+                rusqlite::params![
+                    "exec-pr-review-1",
+                    chore.id,
+                    EXECUTION_KIND_PR_REVIEW,
+                    "git@github.com:spinyfin/mono.git"
+                ],
+            )
+            .unwrap();
+        }
+
+        let cube = Arc::new(FakeCubeClient::default());
+        // fail=true simulates the pane-spawn failure path (libghostty IPC
+        // error, prompt composition failure, etc.) for the pr_review
+        // execution. The coordinator must NOT call demote_active_work_item_to_todo.
+        let runner = Arc::new(FakeExecutionRunner {
+            fail: true,
+            ..FakeExecutionRunner::default()
+        });
+        // The coordinator already has a review pool (DEFAULT_REVIEW_POOL_SIZE
+        // slots) by default — no extra setup needed; the PrReview execution
+        // routes there automatically.
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), "exec-pr-review-1", ExecutionStatus::Failed).await;
+
+        let item = db.get_work_item(&chore.id).unwrap();
+        let status = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t.status,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_ne!(
+            status, "todo",
+            "pr_review spawn failure must not demote the work item to `todo`; \
+             got `{status}` — the skip-demote guard for pr_review is absent or broken",
+        );
+    }
+
     /// The `pane_spawned: ok` event must carry the resolved spawn
     /// knobs (effort level, claude effort value, model) so
     /// `bossctl dispatch diagnose <exec-id>` can answer "what did
