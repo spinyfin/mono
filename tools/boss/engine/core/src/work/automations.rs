@@ -111,6 +111,38 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Like [`list_automations`] but also returns each automation's current
+    /// open-task count in one round-trip using a correlated subquery.
+    pub fn list_automations_with_open_task_counts(
+        &self,
+        product_id: &str,
+    ) -> Result<Vec<(boss_protocol::Automation, i64)>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        let sql = format!(
+            "SELECT id, short_id, product_id, name, repo_remote_url,
+                    trigger_kind, trigger_config, standing_instruction,
+                    open_task_limit, catch_up_window_secs, enabled,
+                    created_via, created_at, updated_at,
+                    last_fired_at, last_outcome, next_due_at,
+                    (SELECT COUNT(*) FROM tasks
+                      WHERE source_automation_id = automations.id
+                        AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
+                        AND deleted_at IS NULL) AS open_task_count
+             FROM automations
+             WHERE product_id = ?1
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([product_id], |row| {
+            let automation = map_automation(row)?;
+            let count: i64 = row.get(17)?;
+            Ok((automation, count))
+        })?;
+        collect_rows(rows)
+    }
+
     /// Fetch a single automation by its canonical id.
     pub fn get_automation(&self, id: &str) -> Result<Option<boss_protocol::Automation>> {
         let conn = self.connect()?;

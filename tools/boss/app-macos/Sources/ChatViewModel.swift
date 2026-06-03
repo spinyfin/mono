@@ -2225,11 +2225,13 @@ final class ChatViewModel: ObservableObject {
         case .executionTranscriptUnavailable(let executionId, let reason):
             transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
         // MARK: Automation events
-        case .automationsList(let productID, let automations):
+        case .automationsList(let productID, let automations, let openTaskCounts):
             automationsByProductID[productID] = automations
             automationsFetchStateByProductID[productID] = .loaded
+            for (id, count) in openTaskCounts {
+                openTaskCountByAutomationID[id] = count
+            }
             for automation in automations {
-                engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
                 engine.sendListAutomationRuns(automationId: automation.id)
             }
         case .automationCreated(let automation):

@@ -252,7 +252,8 @@ enum EngineEvent {
     case executionTranscriptUnavailable(executionId: String, reason: String)
     // MARK: Automation events (maintenance-tasks.md T7)
     /// Response to `list_automations` — all automations for a product.
-    case automationsList(productID: String, automations: [AppAutomation])
+    /// `openTaskCounts` maps automation id → open-task count, batched inline.
+    case automationsList(productID: String, automations: [AppAutomation], openTaskCounts: [String: Int])
     /// Response to `create_automation` — the newly created automation.
     case automationCreated(automation: AppAutomation)
     /// Response to `get_automation` — a single automation row.
@@ -1568,8 +1569,14 @@ final class EngineClient: @unchecked Sendable {
                 let productID = payload["product_id"] as? String ?? ""
                 let raw = payload["automations"] as? [[String: Any]] ?? []
                 let automations = raw.compactMap(parseAutomation)
+                var openTaskCounts: [String: Int] = [:]
+                if let rawCounts = payload["open_task_counts"] as? [String: Any] {
+                    for (id, val) in rawCounts {
+                        openTaskCounts[id] = (val as? NSNumber)?.intValue ?? 0
+                    }
+                }
                 if !productID.isEmpty {
-                    emit(.automationsList(productID: productID, automations: automations))
+                    emit(.automationsList(productID: productID, automations: automations, openTaskCounts: openTaskCounts))
                 }
             case "automation_created":
                 if let automationPayload = payload["automation"] as? [String: Any],

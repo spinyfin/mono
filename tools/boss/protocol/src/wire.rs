@@ -2163,6 +2163,11 @@ pub enum FrontendEvent {
     AutomationsList {
         product_id: String,
         automations: Vec<Automation>,
+        /// Open-task count keyed by automation id, batched in the same
+        /// round-trip via a correlated subquery. Absent (empty map) on old
+        /// engines that do not populate this field.
+        #[serde(default)]
+        open_task_counts: std::collections::HashMap<String, i64>,
     },
     /// Response to [`FrontendRequest::GetAutomation`].
     AutomationResult {
