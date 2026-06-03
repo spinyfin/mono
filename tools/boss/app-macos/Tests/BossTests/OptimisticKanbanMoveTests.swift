@@ -41,6 +41,44 @@ final class OptimisticKanbanMoveTests: XCTestCase {
 
     // MARK: - Reconciliation after engine confirmation
 
+    func testWorkItemUpdatedAppliesIncrementalUpdateForChore() {
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        model.attemptMoveTask(task.id, to: .doing)
+
+        // Engine confirms the move via work_item_updated alone — no full tree fetch.
+        let confirmedTask = makeTask(status: "active", id: task.id)
+        model.applyEventForTest(.workItemUpdated(item: .chore(confirmedTask)))
+
+        // Override is cleared and the in-memory store is updated, without a work tree.
+        XCTAssertEqual(model.effectiveBoardColumn(for: confirmedTask), .doing,
+                       "card must be in Doing after work_item_updated without a tree refresh")
+        XCTAssertTrue(model.workItems(in: .doing).map(\.id).contains(task.id),
+                      "card must appear in Doing after incremental update")
+        XCTAssertFalse(model.workItems(in: .backlog).map(\.id).contains(task.id),
+                       "card must not remain in Backlog after incremental update")
+    }
+
+    func testWorkItemUpdatedAppliesIncrementalUpdateForProjectTask() {
+        let model = makeModel()
+        let project = makeProject()
+        model.projectsByProductID = ["prod_test": [project]]
+        let task = makeProjectTask(status: "todo", projectID: project.id)
+        model.tasksByProjectID = [project.id: [task]]
+
+        model.attemptMoveTask(task.id, to: .doing)
+
+        let confirmedTask = makeProjectTask(status: "active", id: task.id, projectID: project.id)
+        model.applyEventForTest(.workItemUpdated(item: .task(confirmedTask)))
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: confirmedTask), .doing,
+                       "project task must be in Doing after work_item_updated")
+        XCTAssertTrue(model.workItems(in: .doing).map(\.id).contains(task.id),
+                      "project task must appear in Doing after incremental update")
+    }
+
     func testReconcileDropsOverrideWhenTreeConfirms() {
         let model = makeModel()
         let task = makeTask(status: "todo")
@@ -183,6 +221,43 @@ final class OptimisticKanbanMoveTests: XCTestCase {
             createdAt: "2026-06-01T00:00:00Z",
             updatedAt: "2026-06-01T00:00:00Z",
             autostart: autostart
+        )
+    }
+
+    private func makeProjectTask(
+        status: String,
+        id: String? = nil,
+        projectID: String
+    ) -> WorkTask {
+        WorkTask(
+            id: id ?? "task_\(UUID().uuidString)",
+            productID: "prod_test",
+            projectID: projectID,
+            kind: "task",
+            name: "Test Project Task",
+            description: "",
+            status: status,
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-06-01T00:00:00Z",
+            updatedAt: "2026-06-01T00:00:00Z"
+        )
+    }
+
+    private func makeProject() -> WorkProject {
+        WorkProject(
+            id: "proj_test",
+            productID: "prod_test",
+            name: "Test Project",
+            slug: "test",
+            description: "",
+            goal: "",
+            status: "active",
+            priority: "medium",
+            createdAt: "2026-06-01T00:00:00Z",
+            updatedAt: "2026-06-01T00:00:00Z"
         )
     }
 
