@@ -223,11 +223,20 @@ impl ReviewResult {
 /// Extract and parse the first `ReviewResult` from a reviewer's final
 /// assistant message (design §3 of P992, task 8).
 ///
-/// Searches for a fenced ` ```json ` block, tries to parse the content as
-/// `ReviewResult`, and returns the first successful parse. Returns `None`
-/// when no parseable block is found (reviewer may have crashed or emitted
-/// malformed JSON — the caller should fall back to advancing without revision).
+/// Tries three strategies in order, returning the first successful parse:
+///
+/// 1. Fenced ` ```json ` block — the canonical happy-path shape.
+/// 2. Plain ` ``` ` block (no language tag).
+/// 3. Bare/unfenced JSON — scans for the last balanced `{…}` object in the
+///    text and validates it against the `ReviewResult` schema. This handles the
+///    observed failure mode where the model emits valid JSON inline after prose
+///    without a code fence (e.g. "Key findings below.\n\n{ … }").
+///
+/// Returns `None` when no parseable `ReviewResult` is found (reviewer may
+/// have crashed or emitted malformed output — the caller should fall back to
+/// advancing without revision).
 pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
+    // Strategy 1: ```json fenced blocks
     let mut rest = text;
     while let Some(fence_start) = rest.find("```json") {
         let after_fence = &rest[fence_start + 7..];
@@ -239,6 +248,91 @@ pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
             }
         }
         rest = &rest[fence_start + 7..];
+    }
+
+    // Strategy 2: plain ``` fenced blocks (no language tag)
+    let mut rest = text;
+    while let Some(fence_start) = rest.find("```") {
+        let after_fence = &rest[fence_start + 3..];
+        // Skip if this is actually a ```json or ```jsonc block (already handled)
+        let peek = after_fence.trim_start_matches('\n');
+        if peek.starts_with("json") {
+            rest = &rest[fence_start + 3..];
+            continue;
+        }
+        let trimmed = after_fence.trim_start_matches('\n');
+        if let Some(end) = trimmed.find("```") {
+            let json_str = trimmed[..end].trim();
+            if let Ok(result) = ReviewResult::from_json(json_str) {
+                return Some(result);
+            }
+        }
+        rest = &rest[fence_start + 3..];
+    }
+
+    // Strategy 3: bare/unfenced JSON — find the last balanced { … } object
+    // that validates as a ReviewResult. Scanning from the end handles the
+    // common "prose then trailing JSON" shape.
+    extract_review_result_from_bare_json(text)
+}
+
+/// Scan `text` for balanced `{…}` objects and return the last one that parses
+/// as a valid `ReviewResult`. Returns `None` if none found.
+fn extract_review_result_from_bare_json(text: &str) -> Option<ReviewResult> {
+    let bytes = text.as_bytes();
+    let mut last_result: Option<ReviewResult> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(json_str) = extract_balanced_object(&text[i..]) {
+                if let Ok(result) = ReviewResult::from_json(json_str) {
+                    last_result = Some(result);
+                }
+                // Advance past this object to find any later one
+                i += json_str.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    last_result
+}
+
+/// Given a string starting with `{`, return the slice covering the balanced
+/// `{…}` object (handling nested braces and string literals). Returns `None`
+/// if the input doesn't start with `{` or the braces are unbalanced.
+fn extract_balanced_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     None
 }
@@ -453,7 +547,9 @@ pub fn render_reviewer_initial_prompt(
          4. Read changed files and surrounding context using `Read`, `cat`, \
             `grep`, `jj show`, etc. — no writes.\n\
          5. Produce the `ReviewResult` JSON (schema below) in a fenced \
-            ` ```json ` block as the **last thing in your final message**.\n\
+            ` ```json ` block as the **very last thing in your final message**. \
+            No prose, commentary, or text of any kind may follow the closing ` ``` `. \
+            Do NOT emit the JSON bare or inline — it must be inside a ` ```json ` fence.\n\
          \n\
          {rubric}\n\
          ## Speed/comprehensiveness balance\n\
@@ -466,11 +562,15 @@ pub fn render_reviewer_initial_prompt(
          and mark it `low` severity and `low` confidence — the revising \
          worker decides whether to apply it.\n\
          \n\
-         ## Required output\n\
+         ## Required output — CRITICAL\n\
          \n\
-         Emit exactly one `ReviewResult` JSON in a ` ```json ` fenced block \
-         as the last thing in your response. No other terminal action is \
-         permitted.\n\
+         Your final message MUST end with exactly one `ReviewResult` JSON \
+         in a fenced ` ```json ` block. This is the LAST content in your \
+         message — nothing follows the closing ` ``` `. Do NOT emit bare \
+         JSON, inline JSON, or JSON in any other fence type. The engine \
+         extracts this block by looking for the ` ```json ` fence; if the \
+         block is absent or malformed, all your findings will be silently \
+         discarded. No other terminal action is permitted.\n\
          \n\
          Schema:\n\
          \n\
@@ -866,6 +966,61 @@ mod tests {
         );
         let result = extract_review_result(&text).expect("should parse");
         assert!(result.revision_warranted);
+    }
+
+    #[test]
+    fn extract_review_result_parses_plain_fenced_block() {
+        let json = make_review_result_json(false, serde_json::json!([]));
+        let text = format!("Here is the result:\n\n```\n{json}\n```\n");
+        let result = extract_review_result(&text).expect("should parse plain fence");
+        assert_eq!(result.pr_url, "https://github.com/org/repo/pull/1");
+    }
+
+    #[test]
+    fn extract_review_result_parses_bare_json_after_prose() {
+        // Regression fixture for T1304 / PR #1320 shape:
+        // "## Review summary … Key findings below.\n\n{ … }"
+        let json = make_review_result_json(true, serde_json::json!([
+            {
+                "severity": "high",
+                "category": "correctness",
+                "file": "src/lib.rs",
+                "title": "missing null check",
+                "detail": "foo can be null here",
+                "confidence": "high"
+            }
+        ]));
+        let text = format!(
+            "## Review summary\n\nI reviewed the PR carefully.\n\
+             \nKey findings below.\n\n{json}"
+        );
+        let result = extract_review_result(&text).expect("should parse bare JSON after prose");
+        assert!(result.revision_warranted);
+        assert_eq!(result.findings.len(), 1);
+    }
+
+    #[test]
+    fn extract_review_result_parses_trailing_bare_json() {
+        let json = make_review_result_json(false, serde_json::json!([]));
+        let text = format!("Some prose up front.\n\n{json}");
+        let result = extract_review_result(&text).expect("should parse trailing bare JSON");
+        assert!(!result.revision_warranted);
+    }
+
+    #[test]
+    fn extract_review_result_prefers_last_valid_result_in_bare_scan() {
+        // If there are multiple JSON-like objects, the last valid ReviewResult wins.
+        let json1 = make_review_result_json(false, serde_json::json!([]));
+        let json2 = make_review_result_json(true, serde_json::json!([]));
+        let text = format!("First: {json1}\n\nSecond: {json2}");
+        let result = extract_review_result(&text).expect("should parse");
+        assert!(result.revision_warranted, "should use the last valid result");
+    }
+
+    #[test]
+    fn extract_review_result_ignores_non_review_result_json_objects() {
+        let text = r#"Some context {"key": "value", "unrelated": true} then prose."#;
+        assert!(extract_review_result(text).is_none());
     }
 
     // --- passes_severity_gate ---
