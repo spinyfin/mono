@@ -5,18 +5,18 @@ exports_files(["Cargo.toml"])
 
 rust_library(
     name = "checkleft_lib",
-    crate_name = "checkleft",
     srcs = glob(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
+    crate_name = "checkleft",
     crate_root = "src/lib.rs",
     edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ],
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_binary(
@@ -24,38 +24,38 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/main.rs",
     edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//tools/checkleft/bazel:__pkg__"],
     deps = [
         ":checkleft_lib",
     ] + all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "checkleft_lib_test",
-    crate = ":checkleft_lib",
     size = "small",
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
+    crate = ":checkleft_lib",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )
 
 rust_test(
     name = "checkleft_bin_test",
-    crate = ":checkleft",
     size = "small",
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
+    crate = ":checkleft",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )
 
@@ -66,18 +66,18 @@ rust_test(
 # GitHub event payloads under tests/fixtures are embedded via include_str!.
 rust_test(
     name = "change_detection_e2e_test",
+    size = "small",
     srcs = ["tests/change_detection_e2e.rs"],
     compile_data = glob(["tests/fixtures/**"]),
     edition = "2024",
-    size = "small",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":checkleft_lib",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )

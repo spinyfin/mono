@@ -5,16 +5,16 @@ package(default_visibility = ["//visibility:private"])
 
 macos_unit_test(
     name = "UpdateTests",
-    minimum_os_version = "15.0",
     size = "small",
+    minimum_os_version = "15.0",
     deps = [":update_tests_lib"],
 )
 
 swift_library(
     name = "update_tests_lib",
-    module_name = "UpdateTests",
+    testonly = True,
     srcs = glob(["*.swift"]),
     copts = [],
-    deps = ["//tools/boss/app-macos/Sources/UpdateCore:UpdateCore"],
-    testonly = True,
+    module_name = "UpdateTests",
+    deps = ["//tools/boss/app-macos/Sources/UpdateCore"],
 )
