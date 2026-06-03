@@ -137,9 +137,11 @@ async fn b8_no_op_when_nothing_changed() {
 }
 
 /// Behavior 8 import baseline: items imported via `import_chore_with_external_ref`
-/// have their upstream title/body stored so a second-tick no-op is correct.
+/// have their drift-detection checksums stored so a second-tick no-op is correct.
 #[tokio::test]
 async fn b8_import_stores_upstream_baseline() {
+    use crate::work::content_checksum;
+
     let db = super::in_memory_db();
     super::setup_product_with_tracker(&db);
 
@@ -150,14 +152,14 @@ async fn b8_import_stores_upstream_baseline() {
     register_metrics(&metrics);
     run_one_pass(&db, &registry, &metrics, &super::noop_pub(), &super::ambient_resolver()).await;
 
-    // Confirm the upstream content columns were written during import.
-    let stored = db
-        .reconciler_get_upstream_content(
-            &db.find_by_external_ref("spy", "spy#103").unwrap().unwrap().id,
-        )
-        .unwrap();
-    assert!(stored.is_some(), "upstream content baseline should be set after import");
-    let (title, body) = stored.unwrap();
-    assert_eq!(title, "Baseline Title");
-    assert_eq!(body, "Body of issue 103");
+    // Confirm the checksum columns were written during import.
+    let task = db.find_by_external_ref("spy", "spy#103").unwrap().unwrap();
+    let stored = db.reconciler_get_content_checksums(&task.id).unwrap();
+    assert!(stored.is_some(), "content checksums should be set after import");
+    let (upstream_checksum, _boss_checksum) = stored.unwrap();
+    assert_eq!(
+        upstream_checksum,
+        content_checksum("Baseline Title", "Body of issue 103"),
+        "upstream checksum should match SHA-256 of canonical title+body"
+    );
 }

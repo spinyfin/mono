@@ -25,7 +25,7 @@ use super::{
 };
 use super::credentials::{TrackerCredentialError, TrackerCredentialResolver};
 use crate::metrics::Registry;
-use crate::work::WorkDb;
+use crate::work::{content_checksum, WorkDb};
 
 // ── Work-invalidation publisher ───────────────────────────────────────────────
 
@@ -1017,46 +1017,48 @@ async fn reconcile_existing(
         });
     }
 
-    // Behavior 8: upstream title/body drift — compare current upstream content
-    // against the stored baseline and auto-sync or flag conflicts.
+    // Behavior 8: upstream title/body drift — compare SHA-256 checksums of the
+    // current upstream content against the stored baseline and auto-sync or
+    // flag conflicts. Checksums avoid storing full content while preserving all
+    // three distinctions: upstream-only changed, both changed, nothing changed.
     //
     // Policy:
     //   • Only upstream changed → auto-sync (title and description).
     //   • Both sides changed → warn and emit a metric; operator must reconcile.
     //   • No baseline (pre-migration import) → establish baseline silently.
     //   • Only boss changed → operator edit; leave it alone.
-    match work_db.reconciler_get_upstream_content(work_item_id) {
+    match work_db.reconciler_get_content_checksums(work_item_id) {
         Err(e) => {
-            warn!(work_item_id, error = %e, "reconciler_get_upstream_content failed (Behavior 8)");
+            warn!(work_item_id, error = %e, "reconciler_get_content_checksums failed (Behavior 8)");
         }
         Ok(None) => {
-            // Pre-migration item: no baseline yet. Record the current upstream
-            // content as the baseline without auto-syncing (we can't tell if the
-            // boss side has been edited since import).
-            if let Err(e) = work_db.reconciler_set_upstream_content_baseline(
+            // Pre-migration item: no baseline yet. Record checksums of the
+            // current upstream and boss content without auto-syncing (we can't
+            // tell if the boss side has been edited since import).
+            if let Err(e) = work_db.reconciler_set_content_checksums_baseline(
                 work_item_id,
                 &upstream.title,
                 &upstream.body,
+                &task.name,
+                &task.description,
             ) {
                 warn!(
                     work_item_id,
                     error = %e,
-                    "reconciler_set_upstream_content_baseline failed (Behavior 8)"
+                    "reconciler_set_content_checksums_baseline failed (Behavior 8)"
                 );
             }
         }
-        Ok(Some((stored_title, stored_body))) => {
-            let upstream_title_changed = upstream.title != stored_title;
-            let upstream_body_changed = upstream.body != stored_body;
+        Ok(Some((stored_upstream_checksum, stored_boss_checksum))) => {
+            let current_upstream_checksum = content_checksum(&upstream.title, &upstream.body);
+            let upstream_changed = current_upstream_checksum != stored_upstream_checksum;
 
-            if upstream_title_changed || upstream_body_changed {
+            if upstream_changed {
                 // Check whether the boss side has diverged from the last-synced baseline.
-                let expected_desc =
-                    format!("> Imported from {}\n\n{}", upstream.upstream_url, stored_body);
-                let boss_title_changed = task.name != stored_title;
-                let boss_body_changed = task.description != expected_desc;
+                let current_boss_checksum = content_checksum(&task.name, &task.description);
+                let boss_changed = current_boss_checksum != stored_boss_checksum;
 
-                if !boss_title_changed && !boss_body_changed {
+                if !boss_changed {
                     // Only the upstream changed → auto-sync name and description.
                     let new_name = upstream.title.clone();
                     let new_desc = format!(
@@ -1103,7 +1105,6 @@ async fn reconcile_existing(
                         work_item_id,
                         canonical_id = %upstream.upstream_ref.canonical_id,
                         upstream_title = %upstream.title,
-                        stored_upstream_title = %stored_title,
                         boss_name = %task.name,
                         "Behavior 8: upstream title/body drift detected but boss side was also \
                          edited — skipping auto-sync; operator must reconcile manually"
