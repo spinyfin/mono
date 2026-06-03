@@ -328,12 +328,15 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
 /// prominently states that mandate and omits PR-creation / VCS-push
 /// guidance entirely (those actions are also blocked by the reviewer denylist,
 /// so this is the belt that accompanies that suspenders layer).
-pub fn render_reviewer_claude_md(lease_id: &str) -> String {
+///
+/// The workspace is already checked out to the PR head SHA, so the reviewer
+/// can read files directly without `gh pr diff` for every lookup.
+pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String {
     format!(
         "# Boss reviewer rules\n\
          \n\
          You are running inside a Boss-managed **reviewer** session. The engine\n\
-         spawned you in a leased cube workspace to review a PR read-only.\n\
+         spawned you in a leased cube workspace checked out to the PR head.\n\
          \n\
          ## Read-only mandate (HARD CONSTRAINT)\n\
          \n\
@@ -353,12 +356,18 @@ pub fn render_reviewer_claude_md(lease_id: &str) -> String {
          **it is never posted to GitHub**.\n\
          \n\
          Allowed read-only tools: `grep`, `find`, `cat`, `head`, `tail`,\n\
-         `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
+         `Read`, `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
          `gh pr list`, and similar read-only operations.\n\
          \n\
          ## Your workspace\n\
          \n\
+         - Workspace path: `{workspace_path}`\n\
          - Cube lease id: `{lease}`\n\
+         \n\
+         The workspace is already checked out to the PR head. You can read\n\
+         changed files and surrounding context directly — use `Read`, `cat`,\n\
+         `grep`, etc. on files in `{workspace_path}`. No need to use\n\
+         `git show <sha>:<path>` or fetch files via `gh`.\n\
          \n\
          Lease held for the lifetime of this run. Do not lease, release,\n\
          or mutate cube state.\n\
@@ -368,7 +377,7 @@ pub fn render_reviewer_claude_md(lease_id: &str) -> String {
          Use `jj` for read-only navigation. Do not push or modify history.\n\
          \n\
          - `jj log`, `jj show`, `jj diff` — browse history and diffs.\n\
-         - `gh pr diff <url>` — fetch the PR diff.\n\
+         - `gh pr diff <url>` — fetch the PR diff (useful for the annotated diff view).\n\
          - `gh pr view <url>` — read the PR description.\n\
          \n\
          ## Boundaries\n\
@@ -385,6 +394,7 @@ pub fn render_reviewer_claude_md(lease_id: &str) -> String {
          The coordinator may probe this session between turns. Treat probes\n\
          as questions from a human reviewer — short, specific answers.\n",
         lease = lease_id,
+        workspace_path = workspace_path,
     )
 }
 
@@ -436,11 +446,13 @@ pub fn render_reviewer_initial_prompt(
          \n\
          ## Review steps\n\
          \n\
-         1. Get the diff: `gh pr diff {pr_url}`\n\
-         2. Get the PR description: `gh pr view {pr_url}`\n\
-         3. Read changed files as needed for context (use `cat`, `grep`, `jj \
-            show`, etc. — no writes).\n\
-         4. Produce the `ReviewResult` JSON (schema below) in a fenced \
+         1. Your workspace is already checked out to the PR head — you can \
+            read any file in the workspace directly with `Read`, `cat`, `grep`, etc.\n\
+         2. Get the diff: `gh pr diff {pr_url}`\n\
+         3. Get the PR description: `gh pr view {pr_url}`\n\
+         4. Read changed files and surrounding context using `Read`, `cat`, \
+            `grep`, `jj show`, etc. — no writes.\n\
+         5. Produce the `ReviewResult` JSON (schema below) in a fenced \
             ` ```json ` block as the **last thing in your final message**.\n\
          \n\
          {rubric}\n\
