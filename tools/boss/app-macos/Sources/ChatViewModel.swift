@@ -2835,10 +2835,7 @@ final class ChatViewModel: ObservableObject {
         case .task(let updatedTask), .chore(let updatedTask):
             // When the engine confirms an optimistic move, drop the origin record
             // so a subsequent work_error from an unrelated operation won't bounce
-            // a card that is already confirmed. The optimistic override itself
-            // stays until reconcileOptimisticOverrides clears it after the full
-            // work-tree arrives — removing it here would cause a flicker because
-            // tasksByProjectID still holds the old status.
+            // a card that is already confirmed.
             if let targetColumn = optimisticColumnByTaskID[updatedTask.id],
                updatedTask.boardColumn == targetColumn {
                 pendingMoveOriginByTaskID.removeValue(forKey: updatedTask.id)
@@ -2847,9 +2844,54 @@ final class ChatViewModel: ObservableObject {
                 bounceBackOptimisticMoves(message: nil)
             }
             maybeFireReviewNotification(for: updatedTask)
-            engine.sendGetWorkTree(productId: updatedTask.productID)
+            // Apply the update directly to the in-memory store instead of
+            // fetching the full work tree. The payload already carries the
+            // updated task, so a second round-trip is unnecessary.
+            let isChore: Bool
+            if case .chore = item { isChore = true } else { isChore = false }
+            applyIncrementalTaskUpdate(updatedTask, isChore: isChore)
+            // Reconcile optimistic overrides now that the local store reflects
+            // the confirmed state — the update above already wrote the new
+            // status, so the real column matches the optimistic target.
+            reconcileOptimisticOverrides(from: [updatedTask])
         }
         workErrorMessage = nil
+    }
+
+    /// Apply a single task or chore update to the in-memory store without
+    /// fetching the full work tree. Routes the task into the correct bucket
+    /// based on its current `projectID` and `kind`, removing any stale entry
+    /// from other buckets first (handles the rare case where these change).
+    private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
+        let productID = updatedTask.productID
+        if isChore {
+            var chores = choresByProductID[productID] ?? []
+            chores.removeAll { $0.id == updatedTask.id }
+            chores.append(updatedTask)
+            choresByProductID[productID] = chores.sorted(by: taskSort)
+        } else {
+            // Remove from all task buckets so a rare projectID/kind change
+            // doesn't leave a stale entry behind.
+            for key in Array(tasksByProjectID.keys) {
+                tasksByProjectID[key]?.removeAll { $0.id == updatedTask.id }
+            }
+            var revisions = productLevelRevisionsByProductID[productID] ?? []
+            revisions.removeAll { $0.id == updatedTask.id }
+            var productLevelItems = productLevelTasksByProductID[productID] ?? []
+            productLevelItems.removeAll { $0.id == updatedTask.id }
+
+            if let projectID = updatedTask.projectID {
+                var tasks = tasksByProjectID[projectID] ?? []
+                tasks.append(updatedTask)
+                tasksByProjectID[projectID] = tasks.sorted(by: taskSort)
+            } else if updatedTask.kind == "revision" {
+                revisions.append(updatedTask)
+                productLevelRevisionsByProductID[productID] = revisions.sorted(by: taskSort)
+            } else {
+                productLevelItems.append(updatedTask)
+                productLevelTasksByProductID[productID] = productLevelItems.sorted(by: taskSort)
+            }
+        }
     }
 
     /// Fire a review notification when `updatedTask` enters `in_review`
