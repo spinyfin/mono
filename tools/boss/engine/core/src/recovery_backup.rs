@@ -60,7 +60,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use boss_protocol::WorkExecution;
 #[cfg(test)]
-use boss_protocol::ExecutionKind;
+use boss_protocol::{ExecutionKind, ExecutionStatus};
 
 /// Environment override for the recovery directory. Set by tests to
 /// redirect captures into a tempdir; an operator can also point it at an
@@ -392,7 +392,7 @@ mod tests {
             .id("exec_test_1")
             .work_item_id("task_1")
             .kind(ExecutionKind::ChoreImplementation)
-            .status("orphaned")
+            .status(ExecutionStatus::Orphaned)
             .repo_remote_url("https://github.com/test/repo")
             .maybe_workspace_path(workspace_path)
             .created_at("0")

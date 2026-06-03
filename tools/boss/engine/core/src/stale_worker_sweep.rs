@@ -63,7 +63,7 @@ use boss_protocol::{WorkItemPatch, WorkerActivity};
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
-use crate::work::{WorkDb, execution_status_is_terminal};
+use crate::work::WorkDb;
 
 /// No hook event for this long while a worker is `working` with no tool
 /// in flight ⇒ presumed wedged. 30 minutes is deliberately generous: a
@@ -208,7 +208,7 @@ pub async fn run_one_pass(
 
         // Skip executions already in a terminal DB state (completion
         // path may have raced the sweep).
-        if execution_status_is_terminal(&execution.status) {
+        if execution.status.is_terminal() {
             continue;
         }
 
@@ -365,7 +365,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::runner::{ExecutionRunner, RunOutcome};
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch};
+    use crate::work::{CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch};
     use boss_protocol::WorkExecution;
 
     // A staleness threshold whose cutoff lands in the *future*, so any
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(outcome.reaped, 1, "stale idle worker must be reaped");
 
         let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(exec.status, "orphaned");
+        assert_eq!(exec.status, ExecutionStatus::Orphaned);
 
         let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
         assert!(
@@ -661,7 +661,7 @@ mod tests {
 
         assert_eq!(outcome.reaped, 0, "fresh worker must not be reaped");
         assert_eq!(outcome.fresh_skipped, 1);
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, "ready");
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
     }
 
     /// A `working` slot WITH a tool in flight (e.g. a long foreground

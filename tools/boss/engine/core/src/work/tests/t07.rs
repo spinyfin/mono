@@ -607,7 +607,7 @@ fn create_automation_triage_execution_binds_to_automation() {
         .unwrap();
     assert_eq!(exec.work_item_id, automation.id);
     assert_eq!(exec.kind, ExecutionKind::AutomationTriage);
-    assert_eq!(exec.status, "ready");
+    assert_eq!(exec.status, ExecutionStatus::Ready);
     assert_eq!(exec.repo_remote_url, "git@github.com:spinyfin/mono.git");
 }
 

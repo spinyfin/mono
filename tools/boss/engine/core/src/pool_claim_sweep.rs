@@ -80,7 +80,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::work::{WorkDb, execution_status_is_terminal};
+use crate::work::WorkDb;
 
 /// How often the pool-claim reconciler runs. 60s mirrors the dead-pid
 /// and stale-worker sweeps — fast enough that a leaked automation slot
@@ -221,7 +221,7 @@ pub async fn run_one_pass(
                 }
             };
 
-            if !execution_status_is_terminal(&execution.status) {
+            if !execution.status.is_terminal() {
                 // Legitimately held: claimed at dispatch with the spawn
                 // still in flight, or a live run. Not our job.
                 outcome.non_terminal_skipped += 1;

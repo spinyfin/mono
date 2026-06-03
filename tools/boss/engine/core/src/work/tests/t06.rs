@@ -298,7 +298,7 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
         .unwrap();
@@ -338,7 +338,7 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
         .unwrap();
@@ -360,7 +360,7 @@ fn mark_execution_redundant_sets_status_abandoned() {
     db.mark_execution_redundant(&exec_a_id).unwrap();
 
     let exec = db.get_execution(&exec_a_id).unwrap();
-    assert_eq!(exec.status, "abandoned");
+    assert_eq!(exec.status, ExecutionStatus::Abandoned);
     assert!(exec.finished_at.is_some(), "finished_at must be set");
 }
 
@@ -427,7 +427,7 @@ fn bind_pr_to_active_task_transitions_to_in_review() {
 
     // Execution itself should still be abandoned (not touched by bind).
     let exec = db.get_execution(&exec_id).unwrap();
-    assert_eq!(exec.status, "abandoned");
+    assert_eq!(exec.status, ExecutionStatus::Abandoned);
 }
 
 #[test]
@@ -1841,7 +1841,7 @@ fn request_execution_for_revision_task_produces_revision_implementation_kind() {
         Some(pr_url),
         "revision execution must carry the chain-root's PR URL so the worker knows which branch to push to",
     );
-    assert_eq!(exec.status, "ready");
+    assert_eq!(exec.status, ExecutionStatus::Ready);
 }
 
 /// Regression: re-dispatch of a revision task (orphan-sweep path) must
@@ -1904,7 +1904,7 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
         Some(pr_url),
         "re-dispatched revision must carry the chain-root's PR URL",
     );
-    assert_eq!(second_exec.status, "ready");
+    assert_eq!(second_exec.status, ExecutionStatus::Ready);
 }
 
 // ── Conflict-resolution revision: stop re-dispatch once the attempt retires ──
@@ -2183,7 +2183,7 @@ fn assert_started_execution_keeps_base_in_review(db: &WorkDb, base_id: &str) {
             |_| false,
         )
         .unwrap();
-    assert_eq!(exec.status, "ready");
+    assert_eq!(exec.status, ExecutionStatus::Ready);
     db.start_execution_run(
         &exec.id,
         "worker-1",

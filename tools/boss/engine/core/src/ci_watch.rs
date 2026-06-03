@@ -34,7 +34,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent};
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent};
 #[cfg(test)]
 use boss_protocol::TaskKind;
 use serde::Serialize;
@@ -520,7 +520,7 @@ pub async fn on_ci_failure_detected(
                 match work_db.create_execution(CreateExecutionInput::builder()
                     .work_item_id(candidate.work_item_id.clone())
                     .kind(ExecutionKind::CiRemediation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .build()) {
                     Ok(_) => publisher.kick_scheduler(),
                     Err(err) => {
@@ -1528,7 +1528,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
     match work_db.create_execution(CreateExecutionInput::builder()
         .work_item_id(attempt.work_item_id.clone())
         .kind(ExecutionKind::CiRemediation)
-        .status("ready")
+        .status(ExecutionStatus::Ready)
         .build()) {
         Ok(_) => {
             publisher.kick_scheduler();

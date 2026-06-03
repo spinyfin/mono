@@ -42,7 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use boss_protocol::WorkExecution;
 #[cfg(test)]
-use boss_protocol::ExecutionKind;
+use boss_protocol::{ExecutionKind, ExecutionStatus};
 
 use crate::coordinator::{CubeClient, CubeWorkspaceStatus};
 
@@ -327,7 +327,7 @@ mod tests {
             .id(id)
             .work_item_id(format!("task-{id}"))
             .kind(ExecutionKind::ChoreImplementation)
-            .status("running")
+            .status(ExecutionStatus::Running)
             .repo_remote_url("git@example.com:foo.git")
             .cube_repo_id("foo")
             .cube_lease_id(lease_id)

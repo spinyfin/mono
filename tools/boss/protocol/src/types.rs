@@ -424,6 +424,99 @@ impl std::str::FromStr for ExecutionKind {
     }
 }
 
+/// Discriminator for the `work_executions.status` column. Exhaustive
+/// match enforces that every callsite handles new variants explicitly —
+/// adding a new status here produces a compile error at every status-keyed
+/// branch that must reason about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Queued,
+    Ready,
+    WaitingDependency,
+    Running,
+    WaitingHuman,
+    WaitingReview,
+    WaitingMerge,
+    Completed,
+    Failed,
+    Abandoned,
+    Cancelled,
+    Orphaned,
+}
+
+impl ExecutionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Ready => "ready",
+            Self::WaitingDependency => "waiting_dependency",
+            Self::Running => "running",
+            Self::WaitingHuman => "waiting_human",
+            Self::WaitingReview => "waiting_review",
+            Self::WaitingMerge => "waiting_merge",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+            Self::Cancelled => "cancelled",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Abandoned | Self::Cancelled | Self::Orphaned
+        )
+    }
+
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Running | Self::WaitingHuman)
+    }
+
+    pub fn can_reconcile(&self) -> bool {
+        matches!(self, Self::Queued | Self::Ready | Self::WaitingDependency)
+    }
+}
+
+impl Default for ExecutionStatus {
+    fn default() -> Self {
+        Self::Queued
+    }
+}
+
+impl std::fmt::Display for ExecutionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExecutionStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "ready" => Ok(Self::Ready),
+            "waiting_dependency" => Ok(Self::WaitingDependency),
+            "running" => Ok(Self::Running),
+            "waiting_human" => Ok(Self::WaitingHuman),
+            "waiting_review" => Ok(Self::WaitingReview),
+            "waiting_merge" => Ok(Self::WaitingMerge),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "abandoned" => Ok(Self::Abandoned),
+            "cancelled" => Ok(Self::Cancelled),
+            "orphaned" => Ok(Self::Orphaned),
+            other => Err(format!(
+                "unknown execution status: `{other}`; expected one of: \
+                 queued, ready, waiting_dependency, running, waiting_human, \
+                 waiting_review, waiting_merge, completed, failed, abandoned, \
+                 cancelled, orphaned"
+            )),
+        }
+    }
+}
+
 /// `work_executions.kind` discriminator for an automation triage execution
 /// (Maint task 6). Kept as a constant alias; prefer `ExecutionKind::AutomationTriage`
 /// in new code.
@@ -1055,7 +1148,7 @@ pub struct CreateExecutionInput {
     pub priority: Option<i64>,
     pub repo_remote_url: Option<String>,
     pub started_at: Option<String>,
-    pub status: Option<String>,
+    pub status: Option<ExecutionStatus>,
     pub workspace_path: Option<String>,
 }
 
@@ -2722,7 +2815,7 @@ pub struct TaskRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
 
-    pub execution_status: Option<String>,
+    pub execution_status: Option<ExecutionStatus>,
     pub run_status: Option<String>,
 }
 
@@ -2939,7 +3032,7 @@ pub struct WorkExecution {
     pub priority: i64,
 
     pub repo_remote_url: String,
-    pub status: String,
+    pub status: ExecutionStatus,
     /// Number of times the engine has auto-resumed this work item's
     /// chain of executions because a worker stalled or died on a
     /// *transient* Claude API error (socket closed, connection reset,

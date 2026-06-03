@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boss_protocol::RequestExecutionInput;
+use boss_protocol::{ExecutionStatus, RequestExecutionInput};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -219,7 +219,7 @@ pub async fn run_one_pass(
         // clobber a live in-flight workspace and create a duplicate worker on the
         // same row.
         if let Some(live) = &live_execution
-            && live.status == "waiting_human" {
+            && live.status == ExecutionStatus::WaitingHuman {
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     execution_id = %live.id,
@@ -256,7 +256,7 @@ pub async fn run_one_pass(
         // Only redispatch if we got a fresh ready execution. If the
         // existing non-terminal execution was live (claimed), the call
         // returns the existing execution with status != 'ready'.
-        if new_execution.status != "ready" {
+        if new_execution.status != ExecutionStatus::Ready {
             continue;
         }
 
@@ -303,7 +303,7 @@ mod tests {
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::runner::{ExecutionRunner, RunOutcome};
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch};
+    use crate::work::{CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch};
     use boss_protocol::WorkExecution;
 
     // ─── stubs ───────────────────────────────────────────────────────────────
@@ -465,7 +465,7 @@ mod tests {
 
         let executions = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
-            executions.iter().any(|e| e.status == "ready"),
+            executions.iter().any(|e| e.status == ExecutionStatus::Ready),
             "expected a ready execution after redispatch"
         );
     }
@@ -596,7 +596,7 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        db.force_execution_status_for_test(&work_item_id, "waiting_human")
+        db.force_execution_status_for_test(&work_item_id, ExecutionStatus::WaitingHuman)
             .unwrap();
 
         let db = Arc::new(db);
@@ -622,7 +622,7 @@ mod tests {
         assert!(
             executions
                 .iter()
-                .any(|e| e.id == execution.id && e.status == "waiting_human"),
+                .any(|e| e.id == execution.id && e.status == ExecutionStatus::WaitingHuman),
             "waiting_human execution must not be abandoned by the sweep"
         );
     }

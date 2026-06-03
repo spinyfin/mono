@@ -54,7 +54,7 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
-        let cancelled = if !execution_status_is_terminal(&execution.status) {
+        let cancelled = if !execution.status.is_terminal() {
             let affected = tx.execute(
                 "UPDATE work_executions
                  SET status      = 'cancelled',
@@ -79,7 +79,7 @@ impl WorkDb {
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         // Cancel the execution only if it is still non-terminal.
-        let exec_cancelled = if !execution_status_is_terminal(&execution.status) {
+        let exec_cancelled = if !execution.status.is_terminal() {
             let affected = tx.execute(
                 "UPDATE work_executions
                  SET status     = 'cancelled',

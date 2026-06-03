@@ -30,8 +30,8 @@ use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateRunInput, FrontendEvent, FrontendRequest,
-    RequestExecutionInput, WorkItem, WorkItemPatch,
+    CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent,
+    FrontendRequest, RequestExecutionInput, WorkItem, WorkItemPatch,
 };
 
 // linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
@@ -223,7 +223,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
     assert_eq!(cancelled.id, execution_id);
-    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some(), "cancel must stamp finished_at");
 
     // Active → todo: the kanban card returns to To-Do because the
@@ -784,7 +784,7 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
     assert_eq!(reaped.id, execution_id);
-    assert_eq!(reaped.status, "orphaned");
+    assert_eq!(reaped.status, ExecutionStatus::Orphaned);
     assert!(reaped.finished_at.is_some(), "reap must stamp finished_at");
     // Workspace columns preserved — that's the whole contract.
     assert_eq!(reaped.cube_lease_id.as_deref(), Some("lease-REAP"));

@@ -32,36 +32,17 @@ pub(crate) fn execution_kind_for_work_item(
 pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,
-    status: &str,
+    status: ExecutionStatus,
 ) -> Result<WorkExecution> {
     let updated = conn.execute(
         "UPDATE work_executions SET status = ?2 WHERE id = ?1",
-        params![execution_id, status],
+        params![execution_id, status.as_str()],
     )?;
     if updated == 0 {
         bail!("unknown execution: {execution_id}");
     }
 
     query_execution(conn, execution_id).require("execution", execution_id)
-}
-
-pub(crate) fn can_reconcile_execution_status(status: &str) -> bool {
-    matches!(status, "queued" | "ready" | "waiting_dependency")
-}
-
-pub(crate) fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
-    )
-}
-
-/// A *live* execution status: a worker may currently be attached and
-/// driving it. Mirrors the status filter in
-/// [`query_live_execution_for_work_item`] and
-/// [`WorkDb::get_live_execution_for_work_item`]; keep the three in sync.
-pub(crate) fn execution_status_is_live(status: &str) -> bool {
-    matches!(status, "running" | "waiting_human")
 }
 
 pub(crate) fn task_accepts_execution(task: &Task) -> bool {
@@ -330,80 +311,42 @@ mod tests {
             .build()
     }
 
-    // ── can_reconcile_execution_status ──────────────────────────────────────
+    // ── ExecutionStatus::can_reconcile ──────────────────────────────────────
 
     #[test]
     fn can_reconcile_only_pre_dispatch_statuses() {
-        for status in ["queued", "ready", "waiting_dependency"] {
-            assert!(
-                can_reconcile_execution_status(status),
-                "{status} should be reconcilable"
-            );
+        use ExecutionStatus::*;
+        for status in [Queued, Ready, WaitingDependency] {
+            assert!(status.can_reconcile(), "{status} should be reconcilable");
         }
-        for status in [
-            "running",
-            "waiting_human",
-            "completed",
-            "failed",
-            "abandoned",
-            "cancelled",
-            "orphaned",
-            "",
-        ] {
-            assert!(
-                !can_reconcile_execution_status(status),
-                "{status} should not be reconcilable"
-            );
+        for status in [Running, WaitingHuman, Completed, Failed, Abandoned, Cancelled, Orphaned] {
+            assert!(!status.can_reconcile(), "{status} should not be reconcilable");
         }
     }
 
-    // ── execution_status_is_terminal ────────────────────────────────────────
+    // ── ExecutionStatus::is_terminal ────────────────────────────────────────
 
     #[test]
     fn terminal_statuses_are_the_finished_set() {
-        for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
-            assert!(
-                execution_status_is_terminal(status),
-                "{status} should be terminal"
-            );
+        use ExecutionStatus::*;
+        for status in [Completed, Failed, Abandoned, Cancelled, Orphaned] {
+            assert!(status.is_terminal(), "{status} should be terminal");
         }
-        for status in [
-            "queued",
-            "ready",
-            "running",
-            "waiting_human",
-            "waiting_dependency",
-            "",
-        ] {
-            assert!(
-                !execution_status_is_terminal(status),
-                "{status} should not be terminal"
-            );
+        for status in [Queued, Ready, Running, WaitingHuman, WaitingDependency] {
+            assert!(!status.is_terminal(), "{status} should not be terminal");
         }
     }
 
-    // ── execution_status_is_live ────────────────────────────────────────────
+    // ── ExecutionStatus::is_live ────────────────────────────────────────────
 
     #[test]
     fn live_statuses_are_running_and_waiting_human() {
-        for status in ["running", "waiting_human"] {
-            assert!(execution_status_is_live(status), "{status} should be live");
+        use ExecutionStatus::*;
+        for status in [Running, WaitingHuman] {
+            assert!(status.is_live(), "{status} should be live");
         }
-        for status in [
-            "queued",
-            "ready",
-            "waiting_dependency",
-            "completed",
-            "failed",
-            "abandoned",
-            "cancelled",
-            "orphaned",
-            "",
-        ] {
-            assert!(
-                !execution_status_is_live(status),
-                "{status} should not be live"
-            );
+        for status in [Queued, Ready, WaitingDependency, Completed, Failed, Abandoned, Cancelled, Orphaned] {
+            assert!(!status.is_live(), "{status} should not be live");
         }
     }
 

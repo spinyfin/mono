@@ -22,7 +22,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution_status_is_terminal(&existing.status) {
+        if existing.status.is_terminal() {
             bail!(
                 "execution {execution_id} is already in terminal status `{}` and cannot be cancelled",
                 existing.status
@@ -83,7 +83,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution_status_is_terminal(&existing.status) {
+        if existing.status.is_terminal() {
             bail!(
                 "execution {execution_id} is already in terminal status `{}` and cannot be reaped as orphaned",
                 existing.status
@@ -149,7 +149,7 @@ impl WorkDb {
         let dead = query_execution(&tx, dead_execution_id).require("execution", dead_execution_id)?;
 
         let now = now_string();
-        if !execution_status_is_terminal(&dead.status) {
+        if !dead.status.is_terminal() {
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'orphaned',
@@ -429,7 +429,7 @@ impl WorkDb {
                             &mut result,
                             &task.id,
                             ExecutionKind::ChoreImplementation,
-                            "ready",
+                            ExecutionStatus::Ready,
                         )?;
                     }
                 }
@@ -442,7 +442,7 @@ impl WorkDb {
                             &mut result,
                             &task.id,
                             ExecutionKind::InvestigationImplementation,
-                            "ready",
+                            ExecutionStatus::Ready,
                         )?;
                     }
                 }
@@ -487,9 +487,9 @@ impl WorkDb {
                     continue;
                 }
                 let desired_status = if Some(index) == first_incomplete {
-                    "ready"
+                    ExecutionStatus::Ready
                 } else {
-                    "waiting_dependency"
+                    ExecutionStatus::WaitingDependency
                 };
                 let execution_kind = match task.kind {
                     TaskKind::Design => ExecutionKind::ProjectDesign,
@@ -560,7 +560,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != "ready" {
+        if execution.status != ExecutionStatus::Ready {
             bail!(
                 "execution {execution_id} is not ready and cannot start a run from status `{}`",
                 execution.status
@@ -750,7 +750,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != "ready" {
+        if execution.status != ExecutionStatus::Ready {
             bail!(
                 "execution {execution_id} is not ready and cannot fail startup from status `{}`",
                 execution.status
@@ -811,7 +811,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != "ready" {
+        if execution.status != ExecutionStatus::Ready {
             bail!(
                 "execution {execution_id} is not ready and cannot record pre-start failure \
                  from status `{}`",
@@ -882,7 +882,7 @@ impl WorkDb {
         &self,
         execution_id: &str,
         run_id: &str,
-        execution_status: &str,
+        execution_status: ExecutionStatus,
         run_status: &str,
         result_summary: Option<&str>,
         error_text: Option<&str>,
@@ -892,7 +892,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != "running" {
+        if execution.status != ExecutionStatus::Running {
             bail!(
                 "execution {execution_id} is not running and cannot finish a run from status `{}`",
                 execution.status
@@ -911,7 +911,7 @@ impl WorkDb {
         }
 
         let now = now_string();
-        let execution_finished_at = if execution_status_is_terminal(execution_status) {
+        let execution_finished_at = if execution_status.is_terminal() {
             Some(now.as_str())
         } else {
             None
@@ -929,7 +929,7 @@ impl WorkDb {
              WHERE id = ?1",
             params![
                 execution_id,
-                execution_status,
+                execution_status.as_str(),
                 clear_workspace_lease,
                 execution_finished_at,
             ],
@@ -1342,11 +1342,15 @@ impl WorkDb {
     }
 
     #[cfg(test)]
-    pub fn force_execution_status_for_test(&self, work_item_id: &str, status: &str) -> Result<()> {
+    pub fn force_execution_status_for_test(
+        &self,
+        work_item_id: &str,
+        status: ExecutionStatus,
+    ) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE work_executions SET status = ?2 WHERE work_item_id = ?1",
-            params![work_item_id, status],
+            params![work_item_id, status.as_str()],
         )?;
         Ok(())
     }

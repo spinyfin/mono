@@ -1594,7 +1594,7 @@ fn in_review_chore_execution_returns_execution_id_when_in_review() {
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(boss_protocol::ExecutionStatus::Ready)
                 .build(),
         )
         .unwrap();
@@ -1712,7 +1712,7 @@ fn active_to_todo_execution_returns_execution_id() {
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status("running")
+                .status(boss_protocol::ExecutionStatus::Running)
                 .build(),
         )
         .unwrap();
@@ -1778,7 +1778,7 @@ fn live_execution_for_deleted_item_returns_execution_id_when_running() {
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status("running")
+                .status(boss_protocol::ExecutionStatus::Running)
                 .build(),
         )
         .unwrap();
@@ -1792,14 +1792,21 @@ fn live_execution_for_deleted_item_returns_execution_id_when_running() {
 
 #[test]
 fn live_execution_for_deleted_item_returns_none_when_terminal() {
+    use boss_protocol::ExecutionStatus;
     use crate::work::CreateExecutionInput;
-    for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
+    for status in [
+        ExecutionStatus::Completed,
+        ExecutionStatus::Failed,
+        ExecutionStatus::Abandoned,
+        ExecutionStatus::Cancelled,
+        ExecutionStatus::Orphaned,
+    ] {
         let (db, _, chore_id) = make_work_db_with_chore();
         db.create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
-                .status(status)
+                .status(status.clone())
                 .build(),
         )
         .unwrap();
@@ -2156,8 +2163,7 @@ async fn execution_transcript_no_path_returns_unavailable() {
     );
     // The handler would return ExecutionTranscriptUnavailable.
     // Verify the DB layer returns None and is_live is false.
-    let is_live = execution.finished_at.is_none()
-        && matches!(execution.status.as_str(), "running" | "waiting_human");
+    let is_live = execution.finished_at.is_none() && execution.status.is_live();
     assert!(!is_live, "ready execution should not be live");
 }
 
@@ -2272,8 +2278,7 @@ async fn execution_transcript_live_flag() {
         )
         .unwrap();
 
-    let is_live = live_exec.finished_at.is_none()
-        && matches!(live_exec.status.as_str(), "running" | "waiting_human");
+    let is_live = live_exec.finished_at.is_none() && live_exec.status.is_live();
     assert!(is_live, "a running execution must be flagged as live");
 }
 

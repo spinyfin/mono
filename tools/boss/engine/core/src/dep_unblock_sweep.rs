@@ -184,7 +184,8 @@ mod tests {
 
     use super::*;
     use crate::work::{
-        AddDependencyInput, CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch,
+        AddDependencyInput, CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb,
+        WorkItemPatch,
     };
 
     fn open_db() -> (TempDir, WorkDb) {
@@ -472,11 +473,11 @@ mod tests {
 
         // dep should now be `todo` with a `ready` execution (post-fix normal path).
         // Simulate the pre-fix stuck state: dep is `todo`, execution is `waiting_dependency`.
-        db.force_execution_status_for_test(&dep_id, "waiting_dependency").unwrap();
+        db.force_execution_status_for_test(&dep_id, ExecutionStatus::WaitingDependency).unwrap();
 
         let executions_before = db.list_executions(Some(&dep_id)).unwrap();
         assert_eq!(executions_before.len(), 1);
-        assert_eq!(executions_before[0].status, "waiting_dependency", "setup check");
+        assert_eq!(executions_before[0].status, ExecutionStatus::WaitingDependency, "setup check");
 
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
@@ -485,7 +486,7 @@ mod tests {
 
         let executions_after = db.list_executions(Some(&dep_id)).unwrap();
         assert_eq!(executions_after.len(), 1);
-        assert_eq!(executions_after[0].status, "ready", "execution must be promoted to ready");
+        assert_eq!(executions_after[0].status, ExecutionStatus::Ready, "execution must be promoted to ready");
     }
 
     /// Part B: sweep must NOT promote a `todo` task that still has gating prereqs.

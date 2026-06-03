@@ -2781,7 +2781,8 @@ mod tests {
     };
     use crate::work::{
         AddDependencyInput, ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput,
-        CreateProductInput, CreateProjectInput, CreateTaskInput, WorkDb, WorkItem, WorkItemPatch,
+        CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem,
+        WorkItemPatch,
     };
 
     struct StubProbe {
@@ -6152,7 +6153,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .repo_remote_url("git@github.com:foo/bar.git")
                 .build())
             .unwrap();
@@ -6160,7 +6161,7 @@ mod tests {
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
             .unwrap();
         db.finish_execution_run(
-            &exec.id, &run.id, "waiting_human", "completed", None, None, false, None,
+            &exec.id, &run.id, ExecutionStatus::WaitingHuman, "completed", None, None, false, None,
         )
         .unwrap();
         // Simulate orphan sweep abandoning exec_A.
@@ -6268,7 +6269,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .repo_remote_url("git@github.com:foo/bar.git")
                 .build())
             .unwrap();
@@ -6333,7 +6334,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         // The worker execution is now terminal and no longer live.
-        assert_eq!(db.get_execution(&exec_id).unwrap().status, "cancelled");
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Cancelled);
         assert!(
             db.get_live_execution_for_work_item(&chore, "")
                 .unwrap()
@@ -6372,7 +6373,7 @@ mod tests {
             "no worker-stop without a handler, got: {outcome:?}",
         );
         // Execution untouched — still live.
-        assert_eq!(db.get_execution(&exec_id).unwrap().status, "running");
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
     }
 
     // ----- parse_dequeue_events_response (merge-queue reason case T770/T771) -----

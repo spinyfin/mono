@@ -618,7 +618,7 @@ pub(crate) fn insert_execution(
     )?;
     let id = next_id("exec");
     let now = now_string();
-    let status = input.status.unwrap_or_else(|| "queued".to_owned());
+    let status = input.status.unwrap_or_default();
     let cube_repo_id = normalize_optional_text(input.cube_repo_id);
     let cube_lease_id = normalize_optional_text(input.cube_lease_id);
     let cube_workspace_id = normalize_optional_text(input.cube_workspace_id);
@@ -650,7 +650,7 @@ pub(crate) fn insert_execution(
             id,
             input.work_item_id,
             input.kind.as_str(),
-            status,
+            status.as_str(),
             repo_remote_url,
             cube_repo_id,
             cube_lease_id,
