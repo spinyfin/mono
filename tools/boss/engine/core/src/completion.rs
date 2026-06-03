@@ -3712,8 +3712,11 @@ fn work_item_product_id(item: &WorkItem) -> String {
 /// the initial PR) are in scope for v1; revisions, CI-remediations, and
 /// conflict-resolution workers are intentionally excluded until the reviewer
 /// loop (tasks 8/9) is wired for the full update cycle.
-fn is_primary_implementation_kind(kind: &str) -> bool {
-    matches!(kind, "chore_implementation" | "task_implementation")
+fn is_primary_implementation_kind(kind: &ExecutionKind) -> bool {
+    matches!(
+        kind,
+        ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
+    )
 }
 
 #[cfg(test)]
