@@ -163,6 +163,37 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Apply the headers every GitHub API call needs: the `github+json`
+/// Accept type, the pinned REST API version, and our identifying
+/// User-Agent. Returns the builder so calls can chain naturally after
+/// `.post(&url).bearer_auth(token)`.
+fn github_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+}
+
+/// On a non-2xx response, read the body and `bail!` with
+/// `{context} returned {status}: {body}`, optionally followed by a
+/// `hint` line. On success the response is returned for further
+/// decoding.
+async fn ensure_success(
+    resp: reqwest::Response,
+    context: &str,
+    hint: Option<&str>,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        match hint {
+            Some(hint) => bail!("{context} returned {status}: {body}\n{hint}"),
+            None => bail!("{context} returned {status}: {body}"),
+        }
+    }
+    Ok(resp)
+}
+
 /// Exchange the App JWT for a short-lived installation access token.
 async fn fetch_installation_token(
     api_base: &str,
@@ -175,21 +206,12 @@ async fn fetch_installation_token(
         api_base.trim_end_matches('/'),
         installation_id
     );
-    let resp = client
-        .post(&url)
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(jwt))
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("installation token exchange returned {status}: {body}");
-    }
+    let resp = ensure_success(resp, "installation token exchange", None).await?;
     let parsed: InstallationTokenResponse = resp
         .json()
         .await
@@ -234,22 +256,13 @@ async fn create_issue(
         body: &attributed_body,
         labels: &effective_labels,
     };
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(token))
         .json(&payload)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("issue create returned {status}: {body}");
-    }
+    let resp = ensure_success(resp, "issue create", None).await?;
     resp.json::<IssueResponse>()
         .await
         .context("decode issue-create response")
@@ -303,25 +316,18 @@ pub async fn add_issue_to_project(
             "contentId": issue_node_id,
         }),
     };
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(token))
         .json(&payload)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!(
-            "add-to-project returned {status}: {body}\n\
-             hint: confirm the GitHub App has Projects read/write permission"
-        );
-    }
+    let resp = ensure_success(
+        resp,
+        "add-to-project",
+        Some("hint: confirm the GitHub App has Projects read/write permission"),
+    )
+    .await?;
 
     let parsed: GraphqlResponse = resp
         .json()
