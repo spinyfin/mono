@@ -475,3 +475,69 @@ pub(crate) fn lookup_last_status_actor(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── slugify ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slugify_lowercases_and_collapses_separators() {
+        assert_eq!(slugify("  Hello,  World!! "), "hello-world");
+    }
+
+    #[test]
+    fn slugify_simple_word_passes_through_lowercased() {
+        assert_eq!(slugify("Dispatcher"), "dispatcher");
+    }
+
+    #[test]
+    fn slugify_collapses_runs_of_non_alphanumerics_to_single_dash() {
+        assert_eq!(slugify("a___b---c   d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn slugify_trims_leading_and_trailing_dashes() {
+        assert_eq!(slugify("--foo--"), "foo");
+        assert_eq!(slugify("!!!bar???"), "bar");
+    }
+
+    #[test]
+    fn slugify_keeps_internal_digits() {
+        assert_eq!(slugify("Boss Engine v2"), "boss-engine-v2");
+    }
+
+    #[test]
+    fn slugify_all_punctuation_yields_empty_string() {
+        assert_eq!(slugify("!!! ??? ..."), "");
+    }
+
+    // ── classify_id ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_id_recognises_each_prefix() {
+        assert!(matches!(
+            classify_id("prod_abc").unwrap(),
+            ItemKind::Product
+        ));
+        assert!(matches!(
+            classify_id("proj_abc").unwrap(),
+            ItemKind::Project
+        ));
+        assert!(matches!(classify_id("task_abc").unwrap(), ItemKind::Task));
+    }
+
+    #[test]
+    fn classify_id_rejects_unknown_prefix() {
+        // `ItemKind` has no `Debug`, so match rather than `unwrap_err()`.
+        match classify_id("exec_abc") {
+            Ok(_) => panic!("expected an error for an unknown prefix"),
+            Err(err) => assert!(
+                err.to_string().contains("unknown work item id format"),
+                "unexpected error: {err}"
+            ),
+        }
+        assert!(classify_id("").is_err());
+    }
+}
