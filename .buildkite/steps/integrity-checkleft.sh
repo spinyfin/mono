@@ -9,10 +9,12 @@
 # root as its working directory — same rationale as checks.sh.
 set -euo pipefail
 
+source ci_env.sh
+
 echo "--- [integrity-checkleft] starting"
 
 echo "--- [integrity-checkleft] installing repobin tools into bin/"
-bazel build --config=ci //tools/repobin:repobin
+bazel build //tools/repobin:repobin
 
 export REPOBIN_BAZEL_FLAGS="--config=ci"
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
@@ -20,4 +22,3 @@ export REPOBIN_BAZEL_FLAGS="--config=ci"
 echo "--- [integrity-checkleft] running checkleft --all"
 bin/checkleft run --all
 
-echo "[integrity-checkleft] ok"

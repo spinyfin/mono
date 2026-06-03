@@ -13,6 +13,8 @@
 # and boss-release.sh.
 set -euo pipefail
 
+source ci_env.sh
+
 echo "--- [integrity-bazel] starting"
 echo "[integrity-bazel] agent: $(uname -a)"
 echo "[integrity-bazel] bazelisk: $(bazelisk version 2>&1 | head -1)"
@@ -52,9 +54,9 @@ PLIST_EOF
 fi
 
 echo "--- [integrity-bazel] bazel build //..."
-bazel build --config=ci --verbose_failures --keep_going //...
+bazel build --verbose_failures --keep_going //...
 
 echo "--- [integrity-bazel] bazel test //..."
-bazel test --config=ci --test_output=errors --keep_going //...
+bazel test --test_output=errors --keep_going //...
 
 echo "[integrity-bazel] ok"

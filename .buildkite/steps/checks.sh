@@ -10,14 +10,13 @@
 # execs the binary directly, preserving the caller's cwd.
 set -euo pipefail
 
+source ci_env.sh
+
 echo "--- [checks] starting"
 
 echo "--- [checks] installing repobin tools into bin/"
-bazel build --config=ci //tools/repobin:repobin
+bazel build //tools/repobin:repobin
 
-export REPOBIN_BAZEL_FLAGS="--config=ci"
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
 
 bin/checkleft run
-
-echo "[checks] ok"

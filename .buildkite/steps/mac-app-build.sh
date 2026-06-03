@@ -5,6 +5,8 @@
 # depends on //tools/boss/app-macos:Boss and therefore requires macOS.
 set -euo pipefail
 
+source ci_env.sh
+
 echo "--- [mac-app-build] starting"
 echo "[mac-app-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
@@ -49,12 +51,12 @@ PLIST_EOF
   ar rcs "${XCFW}/macos-arm64/GhosttyKit.a" /tmp/ghosttykit_stub.o
 fi
 
-bazel build --config=ci //tools/boss/app-macos/... //tools/boss/installer/...
+bazel build //tools/boss/app-macos/... //tools/boss/installer/...
 # Run every macOS Swift test target, not just BossTests, so the UpdateCore
 # module's tests (UpdateChecker / UpdateDownloader — the self-update download,
 # verification, quarantine-strip, and staging logic) gate merges too. The `...`
 # wildcard picks up both //tools/boss/app-macos:BossTests and
 # //tools/boss/app-macos/Tests/UpdateCore:UpdateTests.
-bazel test --config=ci --test_output=errors //tools/boss/app-macos/...
+bazel test --test_output=errors //tools/boss/app-macos/...
 
 echo "[mac-app-build] ok"
