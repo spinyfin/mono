@@ -1,58 +1,51 @@
-# Feasibility: source `checkleft` from a prebuilts repo like `buildifier`
+# Feasibility: distributing `checkleft` as a prebuilt binary for external consumers
 
 **Status:** investigation only — no code changes. Deliverable is this writeup.
 **Date:** 2026-06-03
-**Scope:** Can `checkleft` be obtained as a prebuilt binary the way `buildifier` is, instead of being built from source in-repo? Produce a concrete recipe and a go/no-go.
+**Scope:** External repos currently build `checkleft` from its published cargo crate at every consumer / CI run, which is slow. Can `checkleft` be published as a prebuilt binary that external repos download instead of compile? Produce a concrete recipe and a go/no-go.
 
-All claims below were verified against the current checkout at `/Users/brianduff/Documents/dev/workspaces/mono-agent-002`, not from memory. File citations are inline.
+All claims below were verified against the current checkout at `/Users/brianduff/Documents/dev/workspaces/mono-agent-002` and against live GitHub data. File citations are inline.
 
 ---
 
 ## TL;DR
 
-**Recommendation: No-go on a full buildifier-style prebuilts pipeline for now.** `buildifier` is a third-party, single-file, statically-linked Go binary published by an upstream project and rarely bumped. `checkleft` is a ~64 MB in-repo Rust binary with C build dependencies (tree-sitter, wasmtime/cranelift) *and* a Node runtime dependency, that changes frequently and has no upstream publisher. The two key mismatches are (1) we'd have to build and publish every platform ourselves, and (2) because `checkleft` lives in this repo and changes often, a prebuilt binary is perpetually at risk of lagging `HEAD` — a problem `buildifier` simply does not have. Bazel's build cache already amortizes the compile cost that prebuilding would save.
+**Recommendation: Go.** The cost of publishing is modest — one new Buildkite release step building two platform binaries and attaching them as GitHub Release assets to the existing `checkleft-v*` tags. The benefit to every external consumer is substantial: replacing a multi-minute cold `cargo build`/`cargo install` (wasmtime + cranelift dominate compile time) with a sub-second binary download. The main gotcha is Linux linking: the Linux binary should be built against musl (`x86_64-unknown-linux-musl`) to avoid glibc version skew across consumer distros. macOS arm64 poses no signing requirement for a CLI tool.
 
-If the real pain is "cold first build is slow," the cheap fix is the Bazel remote cache (already wired via `--config=ci`), not a prebuilts pipeline. A prebuilt only earns its keep if we need to run `checkleft` *outside* this monorepo (a repo with no Rust toolchain) — and even then the minimal mechanism is `http_file` + `select()` over the **already-existing** `checkleft-v*` tags, not a new bespoke module.
+For Bazel consumers the consumption recipe mirrors the in-house `ghostty_kit` pattern (`http_file` + `select()`, sha256-pinned). For non-Bazel consumers `cargo-binstall` can already consume GitHub Release assets with no extra work on our side, and a plain `curl | install` shell snippet covers everything else.
 
 ---
 
-## 1. How `buildifier`-from-prebuilts works today
+## 1. Reference model — how prebuilts are published and consumed
 
-`buildifier` is **not** sourced from a prebuilts repo we own. It comes from a public Bazel Central Registry (BCR) module:
+### 1a. `buildifier` (third-party BCR module)
 
-- `MODULE.bazel` declares it as a registry dependency:
+`buildifier` is the canonical Bazel example of a prebuilt external tool. It comes from the public Bazel Central Registry:
+
+- `MODULE.bazel` pins the version:
   ```python
   bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
   ```
-- The `buildifier_prebuilt` module (resolved from BCR) downloads precompiled binaries from the upstream **`github.com/bazelbuild/buildtools`** GitHub releases. From `MODULE.bazel.lock`, the pinned per-platform download URLs are:
+- The `buildifier_prebuilt` BCR module downloads pre-compiled binaries from the upstream `github.com/bazelbuild/buildtools` GitHub releases. `MODULE.bazel.lock` contains the resolved per-platform download URLs and SHA256s:
   ```
-  buildtools/releases/download/v7.3.1/buildifier-darwin-amd64
-  buildtools/releases/download/v7.3.1/buildifier-darwin-arm64
-  buildtools/releases/download/v7.3.1/buildifier-linux-amd64
-  buildtools/releases/download/v7.3.1/buildifier-linux-arm64
-  buildtools/releases/download/v7.3.1/buildifier-windows-amd64.exe
+  https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-darwin-amd64
+  https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-darwin-arm64
+  https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64
+  https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-arm64
+  https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-windows-amd64.exe
   ```
-  (plus the matching `buildozer-*` set). Each lands in a per-platform repo such as `buildifier_darwin_arm64`, `buildifier_linux_amd64`.
+  Each lands in a per-platform Bazel repo (`buildifier_darwin_arm64`, `buildifier_linux_amd64`, etc.). SHA256s: darwin-amd64 `375f823...`, darwin-arm64 `5a6afc6...`, linux-amd64 `5474cc5...` (from `MODULE.bazel.lock`).
+- **Platform selection** is automatic: the module registers Bazel toolchains and exposes a single alias `@buildifier_prebuilt//:buildifier` that resolves against the exec platform. Consumers never name the platform.
+- **Publisher**: the upstream `bazelbuild/buildtools` project, via its own CI. This mono repo is a pure consumer — we don't build or publish `buildifier`.
 
-**Platform selection.** The module registers Bazel toolchains and exposes a single alias, `@buildifier_prebuilt//:buildifier`, that resolves to the correct per-platform binary via toolchain/`config_setting` resolution against the exec platform (macOS arm64 vs Linux x86_64). Consumers never name the platform — they just reference the alias.
+`buildifier` is a ~7 MB statically-linked Go binary. It is a third-party tool with rare version bumps. **Neither of these properties holds for `checkleft`**, which is why the in-house analog below is more relevant.
 
-**Version / SHA pinning.** The version (`7.3.1`) is pinned in `MODULE.bazel`. The per-platform `sha256` integrity hashes live in the upstream registry module and are frozen into `MODULE.bazel.lock`. Bumping = change the `bazel_dep` version and re-resolve the lockfile.
+### 1b. `ghostty_kit` — in-house prebuilt (the direct template)
 
-**Who publishes the binary.** Nobody in this repo. Upstream `bazelbuild/buildtools` CI compiles the Go binaries and attaches them to its GitHub releases. The mono repo is a pure *consumer* of an already-published, third-party artifact.
+The mono repo already publishes and consumes one self-built prebuilt artifact: the GhosttyKit xcframework. This is the model a `checkleft` prebuilt would follow exactly.
 
-**How it's wired into the repo's tooling.**
-- `REPOBIN.toml` maps the `buildifier` tool name to the prebuilt target:
-  ```toml
-  [tools.buildifier]
-  target = "@buildifier_prebuilt//:buildifier"
-  ```
-- `checkleft`'s own buildifier check defaults to the same target — see `tools/checkleft/src/checks/buildifier.rs`: "If neither is configured, `buildifier_target` defaults to `@buildifier_prebuilt//:buildifier`."
-
-### The closer in-house analog: `ghostty_kit`
-
-Because `checkleft` is **not** on any public registry, the more relevant template is the one prebuilt artifact this repo already owns and publishes itself: the GhosttyKit xcframework.
-
-- `MODULE.bazel` (bottom) consumes it via `http_archive`, sha256-pinned, from a GitHub-releases prebuilts repo we control:
+- **Hosting**: `github.com/spinyfin/ghostty-prebuilts` GitHub releases.
+- **Consumption** (`MODULE.bazel`, bottom of file):
   ```python
   http_archive(
       name = "ghostty_kit",
@@ -61,147 +54,211 @@ Because `checkleft` is **not** on any public registry, the more relevant templat
       urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-b0f827665/GhosttyKit-b0f827665.tar.gz"],
   )
   ```
-- The publish recipe is a manual runbook, `tools/boss/docs/runbooks/update-ghostty-prebuilt.md`: build the artifact locally → `tar` it → `gh release create --repo spinyfin/ghostty-prebuilts ...` → update the `urls`/`sha256` in `MODULE.bazel` → open a PR.
+  SHA256 is frozen in `MODULE.bazel`; changing the prebuilt means updating both `urls` and `sha256`.
+- **Publish recipe**: `tools/boss/docs/runbooks/update-ghostty-prebuilt.md` — build locally → tar → `gh release create --repo spinyfin/ghostty-prebuilts` → update `MODULE.bazel` → open a PR. This is a manual runbook today.
 
-This — "we build it, publish to GitHub releases, http_archive it with a pinned sha256" — is the actual shape any `checkleft` prebuilt would take, since there is no upstream publisher to lean on.
-
----
-
-## 2. What `checkleft` is today
-
-`checkleft` is a **Rust binary built from source inside this repo**, not a downloaded artifact.
-
-- Build target: `//tools/checkleft:checkleft`, a `rust_binary` in `tools/checkleft/BUILD.bazel` (crate root `src/main.rs`, plus a `checkleft_lib` library and test targets).
-- Crate: `checkleft` v`0.1.0-alpha.8` (`tools/checkleft/Cargo.toml`).
-- `REPOBIN.toml` maps it to the source target (contrast with `buildifier`):
-  ```toml
-  [tools.checkleft]
-  target = "//tools/checkleft:checkleft"
-  [tools.checks]
-  target = "//tools/checkleft:checkleft"
-  ```
-
-**How it's invoked.** Always via `repobin`, which builds the Bazel target and then `exec`s the binary with the *caller's* cwd preserved (so `CHECKS.*` config files are found — `bazel run` would set cwd to the runfiles tree and miss them). See:
-- `.buildkite/steps/checks.sh` — PR pipeline, diff-scoped: `bin/checkleft run`.
-- `.buildkite/steps/integrity-checkleft.sh` — integrity pipeline, full repo: `bin/checkleft run --all`, run on a **Linux** agent.
-- Both first `bazel build //tools/repobin:repobin`, then `repobin install --bin-dir bin/ --no-defaults`, then call `bin/checkleft`.
-
-**Platforms it must run on.** Two, per `.buildkite/pipeline-integrity.yml`:
-- **macOS arm64** — developer machines and the `macos-arm64` agent (Zakalwe-1).
-- **Linux x86_64** — the `bazel-any` queue runs `integrity-checkleft` and the PR `checks` step.
-
-This is the same two-platform matrix buildifier needs (minus windows and linux-arm64).
-
-**Build inputs / dependency profile** (`tools/checkleft/Cargo.toml`) — this is where it diverges sharply from buildifier:
-- `wasmtime = "42.0.1"` with `cranelift` + `component-model` + `runtime` — a full WebAssembly JIT. This dominates binary size and compile time.
-- `tree-sitter`, `tree-sitter-java`, `tree-sitter-starlark` — C grammars; require a **C toolchain** at build time.
-- `reqwest` + `rustls`, `syn`, `tokio`, `serde`, `globset`, `regex`, etc.
-- The built binary is **~64 MB** (measured: `bazel-out/darwin_arm64-fastbuild/bin/tools/checkleft/checkleft`). For comparison, a `buildifier` release binary is a single ~7 MB static Go executable.
-
-**Runtime dependency beyond the binary (the important gotcha).** `checkleft` is **not** a hermetic single binary:
-- For JS/TS external checks in *source mode* it shells out to a pinned Node/pnpm/`jco` toolchain checked into `tools/checks_js_componentizer/` (`README.md`: it runs `corepack pnpm install --frozen-lockfile` then `node scripts/build_check.mjs ...`, copying the checked-in toolchain into a per-user cache under `~/.cache/checkleft/`).
-- It also shells out to `buildifier` (its own buildifier check), itself resolved from the prebuilt module or PATH.
-
-So even a perfect prebuilt `checkleft` binary still depends on files that live in the repo checkout (the JS toolchain dir) and on `buildifier` being resolvable.
-
-**What makes it harder to prebuild than buildifier:**
-1. No upstream publisher — we'd build and publish every platform ourselves.
-2. C build deps (tree-sitter, wasmtime/cranelift) mean cross-compiling (e.g. a Linux binary from a Mac) is non-trivial; the clean path is building each platform on its own native agent.
-3. 64 MB artifact vs 7 MB — bigger to host, download, and cache-bust.
-4. The Node runtime dependency is not captured by the binary and must still ship in the repo.
-5. **It lives in *this* repo and changes frequently** — see below.
-
-**Release status today.** `checkleft-v*` **git tags exist** (`checkleft-v0.1.0-alpha.3` … `-alpha.8`, confirmed via `gh api repos/spinyfin/mono/tags`), but there are **no `checkleft` GitHub *releases* and no binary assets** — every GitHub release on `spinyfin/mono` is `boss-v1.0.N` (confirmed via `gh release list`). The tags are version markers; the only packaging that exists is **source**, not binary (see §3).
+The `checkleft` recipe would differ in two ways: (a) the release step fires from CI (not a manual runbook), since `checkleft` tags fire per-version; and (b) we need **two** per-platform binaries (macOS arm64, Linux x86_64) rather than one single-platform xcframework.
 
 ---
 
-## 3. Can it follow the same pattern?
+## 2. Current external consumption (the thing being replaced)
 
-Mapping the buildifier/ghostty recipe onto `checkleft`, step by step, and what would have to be built:
+External repos that want to run `checkleft` build it from the published cargo crate. The crate is `checkleft` v`0.1.0-alpha.8` (`tools/checkleft/Cargo.toml`); it is published to crates.io with `homepage = "https://github.com/spinyfin/mono"` and `documentation = "https://docs.rs/checkleft"`. The typical install path for an external consumer is:
 
-| Buildifier ingredient | Checkleft equivalent — does it exist? |
-|---|---|
-| Upstream that builds per-platform binaries | **Missing.** No upstream; we'd own it. |
-| Per-platform binaries on GitHub releases | **Missing.** `checkleft-v*` tags exist but carry no binary assets. |
-| A publish/release job | **Missing.** Only a *source* packager exists (below). |
-| Bazel rule to download + select by platform | **Missing.** Would mirror `ghostty_kit`/`buildifier_prebuilt`. |
-| Version + sha256 pin | Straightforward once the above exist. |
-| `REPOBIN.toml` repoint | One-line change. |
-
-### What already exists and partly helps
-
-`tools/checkleft_package/` (`checkleft-package`) produces a **self-contained source tarball** (`checkleft-<version>-source.tgz`) — it flattens the workspace-inherited `Cargo.toml` into a standalone manifest, stages `src`/`api`/license/`Cargo.lock`, and generates standalone `MODULE.bazel`/`BUILD.bazel` so `checkleft` can be *built* outside the monorepo (`tools/checkleft_package/README.md`). This is aimed at crates.io/docs.rs-style source distribution. **It does not emit a compiled binary** — so it is not a prebuilt and does not solve the "skip the build" goal, though it confirms the team already thinks about shipping checkleft externally.
-
-### The missing pieces, concretely
-
-**(a) A place to host binaries.** Cheapest: attach assets to the **already-existing `checkleft-v*` tags** on `spinyfin/mono` (no new repo). Alternative: a dedicated `spinyfin/checkleft-prebuilts` repo, mirroring `spinyfin/ghostty-prebuilts`.
-
-**(b) A publish/release path.** A new Buildkite step modeled on `.buildkite/steps/boss-release.sh`, but it must build on **both** platforms (boss-release is macOS-only):
-- On the `macos-arm64` queue: `bazel build //tools/checkleft:checkleft` → rename to `checkleft-darwin-arm64` → `shasum -a 256`.
-- On the `bazel-any` (Linux) queue: same → `checkleft-linux-amd64`.
-- Attach both binaries (+ their sha256s) to a `checkleft-v<version>` GitHub release.
-No cross-compilation needed if each platform builds natively. This is the single largest piece of new machinery.
-
-**(c) Bazel wiring to consume.** Two options:
-- *Minimal (ghostty pattern):* one `http_file` per platform, sha256-pinned, plus a `select()`/alias `BUILD` target that picks by `@platforms//os` + `@platforms//cpu`, exposed as `@checkleft_prebuilt//:checkleft`. Mark the file executable via a tiny genrule/`sh_binary` wrapper.
-- *Full (buildifier pattern):* a small module extension/repo rule that registers per-platform repos and a toolchain. More code; only worth it if we also want clean toolchain semantics.
-
-**(d) Version pin.** A version constant + per-platform sha256s in `MODULE.bazel` (exactly like `ghostty_kit`), bumped per release.
-
-**(e) Repoint the tool.** Change `REPOBIN.toml`:
-```toml
-[tools.checkleft]
-target = "@checkleft_prebuilt//:checkleft"   # was //tools/checkleft:checkleft
+```sh
+cargo install checkleft
 ```
 
-### Blockers and gotchas
+or a CI step that runs `cargo install --locked checkleft@0.1.0-alpha.8`.
 
-1. **Chicken-and-egg / staleness (the big one).** `checkleft` is developed *in this repo* and changes often. A prebuilt binary always lags `HEAD`. A PR that modifies `checkleft` itself would then be checked by an *older* prebuilt unless the release fires first — and `integrity-checkleft --all` exists precisely to catch repo drift, which a stale prebuilt would mask or misreport. `buildifier` has none of this because it is third-party and bumped maybe once a year. This is a conceptual mismatch, not just an engineering cost.
-2. **Node runtime dep persists.** A prebuilt binary does not eliminate the `tools/checks_js_componentizer/` Node toolchain dependency for JS/TS source-mode checks — that's read from the repo checkout at runtime. Prebuilding the binary neither captures nor breaks it, but it means "prebuilt checkleft" is not "checkleft with zero repo deps."
-3. **Two-platform release agents.** The release job needs both a macOS arm64 and a Linux x86_64 agent. Both queues already exist, so this is wiring, not new infra.
-4. **Bootstrap.** The release job still builds `checkleft` from source — so the source build path must stay healthy regardless.
-5. **64 MB asset** per platform per release adds up on a frequently-tagged tool.
+**Why this is slow** — `checkleft`'s dependency profile, from `tools/checkleft/Cargo.toml`:
 
-### Why it might not be worth it
+- `wasmtime = "42.0.1"` with features `cranelift`, `component-model`, `runtime` — a full WebAssembly JIT compiler. Cranelift is the dominant compile-time cost; it alone brings in hundreds of generated source files and takes several minutes to compile from scratch.
+- `tree-sitter`, `tree-sitter-java`, `tree-sitter-starlark` — C grammars that require a C toolchain via the `cc` build-script crate.
+- `reqwest`, `rustls`, `syn`, `tokio`, `serde`, `globset`, `regex`, etc.
 
-- **Bazel already caches the build.** First build is slow (64 MB Rust + wasmtime/cranelift compile), but `--config=ci` uses the remote cache and `repobin` reuses the local Bazel cache, so steady-state cost is a cache hit. Prebuilding mainly saves the *cold-cache first build* — a narrow win.
-- **Frequent change makes the prebuilt a recurring footgun** (gotcha #1), unlike buildifier.
-- **Ongoing maintenance**: a two-platform release pipeline + a consumption rule + per-release version/sha bumps is real recurring cost for a tool that already builds and caches fine in-repo.
+The resulting binary is **~64 MB** on arm64. Cold-cache `cargo install` time for this dependency profile is **5–10 minutes** on a fast machine, dominated by the wasmtime/cranelift build. Every new CI agent, every GitHub Actions runner without a warmed `~/.cargo` cache, and every developer on a fresh machine pays this cost in full.
+
+There is no shortcut available to a pure cargo consumer: the wasmtime crate does not ship prebuilt C libraries that cargo can link against, and `cargo install` has no mechanism analogous to `cargo-binstall` for bypassing compilation.
 
 ---
 
-## 4. Recommendation
+## 3. Feasibility of publishing `checkleft` as a prebuilt
 
-**No-go on the full buildifier-style prebuilts route for in-mono use.** The cost/benefit is inverted relative to buildifier: checkleft is heavier to package, has no upstream publisher, retains a repo-resident Node dependency, and — decisively — lives in this repo and changes frequently, so a prebuilt would chronically lag source. Bazel's cache already removes the cost prebuilding would save.
+### 3a. Where the binaries would live
 
-### Cheapest viable alternatives (in order)
+The cheapest option is to attach binary assets to the **already-existing `checkleft-v*` tags** on `spinyfin/mono` (confirmed via `gh api repos/spinyfin/mono/tags`: tags `checkleft-v0.1.0-alpha.3` through `-alpha.8` exist but currently have **no GitHub Releases and no binary assets** — only source code is packaged today via `tools/checkleft_package/`).
 
-1. **Verify the cache first.** If the motivation is "checkleft is slow to get," confirm CI is getting Bazel remote-cache hits on `//tools/checkleft:checkleft` under `--config=ci`. This likely already eliminates the cost with zero new machinery. *Do this before building anything.*
-2. **Warm the local cache for devs.** If developers feel cold-build pain locally, prime via the remote cache (or a one-time `bazel build //tools/checkleft:checkleft` in a bootstrap/direnv hook). Keeps a single source of truth; no staleness risk.
-3. **Prebuilt only for *external* (non-mono) consumers.** A prebuilt genuinely helps only when checkleft must run in a repo with no Rust toolchain. In that case the *minimal* mechanism is:
-   - Extend the **existing** release machinery: a Buildkite step modeled on `boss-release.sh` that builds on both `macos-arm64` and `bazel-any` (Linux), and attaches `checkleft-darwin-arm64` + `checkleft-linux-amd64` (with sha256s) to the **already-existing `checkleft-v*` tags**.
-   - Consume via `http_file` + `select()` (the `ghostty_kit` shape), sha256-pinned in `MODULE.bazel`, exposed as `@checkleft_prebuilt//:checkleft`.
-   - Repoint only the *external* consumers — keep `//tools/checkleft:checkleft` as the in-mono source of truth so the staleness problem never bites the repo that owns the code.
+Alternatively, a dedicated `spinyfin/checkleft-prebuilts` repo (mirroring `spinyfin/ghostty-prebuilts`) keeps release artifacts separate from the mono repo's release list. Either works; the mono repo approach is simpler to start with.
 
-### Concrete step list (only if "go")
+### 3b. How per-platform binaries are produced
 
-1. Add a `checkleft-release` Buildkite step (template: `.buildkite/steps/boss-release.sh`) that:
-   a. resolves the next `checkleft-v*` version,
-   b. builds `//tools/checkleft:checkleft` on `macos-arm64` → `checkleft-darwin-arm64`,
-   c. builds it on `bazel-any` (Linux) → `checkleft-linux-amd64`,
-   d. computes sha256 for each,
-   e. `gh release create checkleft-v<version> --repo spinyfin/mono <assets>`.
-2. Add a `@checkleft_prebuilt` repo: per-platform `http_file` + a `select()`-based executable alias keyed on `@platforms//{os,cpu}`; wire it into `MODULE.bazel` with pinned version + sha256s (mirror `ghostty_kit`).
-3. Repoint `REPOBIN.toml` `[tools.checkleft]`/`[tools.checks]` to `@checkleft_prebuilt//:checkleft`.
-4. Add a freshness guard: a CI check that fails if the prebuilt's version is behind `tools/checkleft/Cargo.toml`, so the staleness footgun is loud rather than silent.
-5. Document the bump procedure as a runbook (template: `tools/boss/docs/runbooks/update-ghostty-prebuilt.md`).
+No cross-compilation is needed. Build each platform natively on the corresponding Buildkite queue:
 
-Steps 1–2 are the bulk of the work; step 4 is non-optional given gotcha #1.
+- **macOS arm64** — `macos-arm64` queue (Zakalwe-1): `bazel build //tools/checkleft:checkleft` → copy output to `checkleft-darwin-arm64`.
+- **Linux x86_64** — `bazel-any` queue: same build → `checkleft-linux-x86_64`.
+
+Both queues already exist (`.buildkite/pipeline-integrity.yml`). The release step is modeled on `.buildkite/steps/boss-release.sh` but much simpler: no credentials, no macOS app signing — just `bazel build`, collect the binary, `gh release create ... checkleft-v<version>`, `gh release upload`.
+
+A CI-triggered release pattern (triggered when `checkleft-v*` tags are pushed, same as the `boss-v*` boss release) means the prebuilt is always synchronized with the tagged source version.
+
+### 3c. How Bazel consumers downstream pin and fetch
+
+A Bazel consumer adds to their `MODULE.bazel`:
+
+```python
+http_file(
+    name = "checkleft_darwin_arm64",
+    urls = ["https://github.com/spinyfin/mono/releases/download/checkleft-v0.1.0-alpha.8/checkleft-darwin-arm64"],
+    sha256 = "<sha256>",
+    executable = True,
+)
+
+http_file(
+    name = "checkleft_linux_x86_64",
+    urls = ["https://github.com/spinyfin/mono/releases/download/checkleft-v0.1.0-alpha.8/checkleft-linux-x86_64"],
+    sha256 = "<sha256>",
+    executable = True,
+)
+```
+
+With a small `BUILD.bazel` exposing a `select()`-based alias:
+
+```python
+alias(
+    name = "checkleft",
+    actual = select({
+        "@platforms//os:macos": "@checkleft_darwin_arm64//file",
+        "@platforms//os:linux": "@checkleft_linux_x86_64//file",
+    }),
+)
+```
+
+This is exactly the `ghostty_kit` shape adapted for a two-platform binary. Consumers reference `@checkleft_prebuilt//:checkleft` and never name the platform. Bumping = update URLs + sha256s.
+
+For a full BCR-style toolchain-registration approach (so the binary can be used as a Bazel toolchain rather than a plain file), a module extension wrapping the above is possible but is extra complexity unlikely to be worth it for an external CLI tool.
+
+### 3d. How non-Bazel consumers fetch
+
+External repos not using Bazel have several options, in order of consumer effort:
+
+**`cargo-binstall` (zero publish-side work needed):** `cargo-binstall` already knows how to find GitHub Release assets for crates published to crates.io, matching by platform and architecture. Once we publish binary assets with names following the cargo-binstall convention (`checkleft-{version}-{target}.tar.gz` or the fallback naming), external consumers replace `cargo install checkleft` with `cargo binstall checkleft` and get a binary download instead of a compile. This is the cheapest path for non-Bazel consumers.
+
+**`cargo-dist`:** cargo-dist is a tool that automates producing per-platform release artifacts and a GitHub Actions release workflow. Running `cargo dist init` in the `checkleft` crate context and configuring it to emit Linux and macOS arm64 artifacts gives the release CI side for free. cargo-dist also generates installer scripts (`install.sh`) for non-cargo environments. The tradeoff: cargo-dist assumes a standalone Cargo workspace and needs some adaptation to work from the mono repo's `checkleft_package` source tarball rather than directly from the workspace.
+
+**Plain `curl` / shell install (the escape hatch):** Any repo's CI can install the binary directly:
+
+```sh
+CHECKLEFT_VERSION="0.1.0-alpha.8"
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+[[ "$ARCH" == "x86_64" ]] && ARCH="x86_64" || ARCH="arm64"
+curl -fsSL "https://github.com/spinyfin/mono/releases/download/checkleft-v${CHECKLEFT_VERSION}/checkleft-${OS}-${ARCH}" \
+  -o /usr/local/bin/checkleft && chmod +x /usr/local/bin/checkleft
+```
+
+This requires no tooling on the consumer side. The downsides are: no SHA verification unless the script also fetches and checks a sidecar `.sha256` file, and no integration with dependency management.
+
+---
+
+## 4. Blockers and gotchas
+
+### Linux linking: musl vs glibc (the most important gotcha)
+
+A Linux binary built by the `bazel-any` queue agent links against that agent's glibc version. Any consumer running an older glibc (common on LTS distros: Ubuntu 20.04 ships glibc 2.31; many CI images are older still) gets `GLIBC_2.3X not found` at runtime.
+
+**Fix:** Build the Linux binary against musl libc using the `x86_64-unknown-linux-musl` Rust target. A musl binary is statically linked against libc and runs on any Linux kernel ≥ 3.2 regardless of the system glibc version. `rules_rust` supports musl targets; the Buildkite step would need to install `musl-tools` (or use a musl-prepped Docker image) and pass `--platforms=@rules_rust//rust/platform:x86_64-unknown-linux-musl` (or the `cargo build --target x86_64-unknown-linux-musl` equivalent if going the non-Bazel release path).
+
+This is the single technically mandatory change versus a naive "just build and upload." Failing to address it means the Linux prebuilt works on the build agent but breaks on a significant fraction of consumer environments.
+
+### macOS signing and notarization
+
+macOS Gatekeeper blocks unsigned binaries downloaded from the internet unless the consumer explicitly xattr-removes the quarantine flag (`xattr -d com.apple.quarantine ./checkleft`) or the binary is notarized. For developer CLI tools used in CI or invoked from scripts, quarantine is not applied (only files received via browser download are quarantined). **This is not a blocker for CI use.** If the binary is ever distributed for interactive developer download via a link in a README, notarization becomes relevant, but for the primary use case (CI consumption) it is not.
+
+### wasmtime and dynamic libraries
+
+`wasmtime` with the `cranelift` feature links statically on Linux when using musl; on macOS it links against system frameworks (`libSystem.dylib`, `Security.framework`, etc.) which are guaranteed present on any macOS version ≥ 12. Tree-sitter's C grammars compile to static `.a` archives. There are no surprising runtime `.dylib` / `.so` dependencies beyond the OS itself — confirmed by the existing `bazel-out/darwin_arm64-fastbuild/bin/tools/checkleft/checkleft` binary in-repo.
+
+### Supply-chain / version pinning
+
+Each release asset should be accompanied by a `checkleft-<platform>.sha256` sidecar file (or a checksums manifest). Bazel consumers already pin via `sha256` in `MODULE.bazel`. Non-Bazel consumers using the `curl` recipe should be instructed to verify the SHA; cargo-binstall verifies checksums automatically.
+
+### Version pinning in external repos
+
+External repos pin a specific checkleft version. When checkleft releases a new version, consumers must update their pin. This is equivalent to bumping any other tool dependency and is not unique to prebuilts — `cargo install` consumers already pin a version string. Prebuilts have no worse pinning story than the cargo path.
+
+### The Node runtime dependency
+
+`checkleft` shells out to a Node/pnpm toolchain for JS/TS external checks; this toolchain is checked into `tools/checks_js_componentizer/` in the mono repo. External consumers currently rely on the `checkleft_package` source distribution, which stages a standalone copy of this toolchain into the archive (per `tools/checkleft_package/README.md`). A prebuilt binary distribution must either (a) bundle the JS toolchain alongside the binary (a tarball containing the binary + the toolchain directory), or (b) document that JS/TS check support requires the source package. If the external consumer only runs the non-JS checks, (b) is fine. This should be called out clearly in the release notes.
+
+---
+
+## 5. Recommendation
+
+**Go. Publish prebuilt binaries as GitHub Release assets on the existing `checkleft-v*` tags.**
+
+### Publish-side recipe (concrete steps)
+
+1. **Add a `checkleft-release` Buildkite step** that fires when a `checkleft-v*` tag is pushed (same pattern as the `boss-v*` trigger in `.buildkite/pipeline.yml`). The step:
+   a. On `macos-arm64` queue: `bazel build //tools/checkleft:checkleft` → copy to `checkleft-darwin-arm64` → `shasum -a 256 > checkleft-darwin-arm64.sha256`.
+   b. On `bazel-any` queue: same build with `--platforms=@rules_rust//rust/platform:x86_64-unknown-linux-musl` → `checkleft-linux-x86_64` → `checkleft-linux-x86_64.sha256`. (Requires `musl-tools` or a musl-capable Docker image on the agent.)
+   c. `gh release create checkleft-v<version> --repo spinyfin/mono <all four files>`.
+
+2. **Document the consume path** — add `CONSUMING.md` (or extend `tools/checkleft/README.md`) with the Bazel `http_file`/`select()` snippet and the `cargo-binstall checkleft` one-liner.
+
+### Consume-side recipe for external Bazel repos
+
+```python
+# MODULE.bazel
+http_file(
+    name = "checkleft_darwin_arm64",
+    urls = ["https://github.com/spinyfin/mono/releases/download/checkleft-v0.1.0-alpha.8/checkleft-darwin-arm64"],
+    sha256 = "<sha256>",
+    executable = True,
+)
+http_file(
+    name = "checkleft_linux_x86_64",
+    urls = ["https://github.com/spinyfin/mono/releases/download/checkleft-v0.1.0-alpha.8/checkleft-linux-x86_64"],
+    sha256 = "<sha256>",
+    executable = True,
+)
+```
+
+```python
+# BUILD.bazel (in a tools/ package of the consuming repo)
+alias(
+    name = "checkleft",
+    actual = select({
+        "@platforms//os:macos": "@checkleft_darwin_arm64//file",
+        "@platforms//os:linux": "@checkleft_linux_x86_64//file",
+    }),
+    visibility = ["//visibility:public"],
+)
+```
+
+### Consume-side recipe for non-Bazel repos
+
+```sh
+# install via cargo-binstall (fastest)
+cargo binstall checkleft@0.1.0-alpha.8
+
+# or direct download (CI, no cargo)
+CHECKLEFT_VERSION="0.1.0-alpha.8"
+ASSET="checkleft-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+curl -fsSL "https://github.com/spinyfin/mono/releases/download/checkleft-v${CHECKLEFT_VERSION}/${ASSET}" \
+  -o /tmp/checkleft
+# verify SHA (fetch the matching .sha256 sidecar and compare)
+chmod +x /tmp/checkleft && mv /tmp/checkleft /usr/local/bin/checkleft
+```
+
+### Why the full cargo-dist route is overkill for now
+
+cargo-dist generates a full release CI workflow and an install manifest, which is useful when distributing to end users via README. For the primary external-consumer use case (other CI pipelines), the GitHub Release asset approach is sufficient. cargo-dist can be adopted later if the distribution audience grows beyond internal repos.
 
 ---
 
 ## Open Questions
 
-- **What is the actual motivation?** "Cold-build latency in CI/dev" vs "run checkleft in a non-mono repo with no Rust toolchain" lead to opposite answers (alternative #1/#2 vs #3). The work item doesn't say.
-- **Is the Bazel remote cache already serving `//tools/checkleft:checkleft` under `--config=ci`?** If yes, the latency case for prebuilding largely evaporates. Not measured in this investigation.
-- **Do the `checkleft-v*` tags drive any existing publish (e.g. crates.io via `checkleft_package`)?** If so, a binary-release step should slot alongside it rather than duplicate the tag scheme.
+- **Does the `bazel-any` queue agent support musl builds today** (i.e., is `musl-tools` installed, or does a musl-capable container image need to be provisioned)? If not, this is the main setup cost for the Linux binary.
+- **Should binary assets live on `spinyfin/mono` releases or in a dedicated `spinyfin/checkleft-prebuilts` repo?** The mono-repo approach is simpler; a dedicated repo avoids mixing `boss-v*` and `checkleft-v*` on the same release list.
+- **Does the Node/JS toolchain need to be bundled?** This depends on whether external consumers want JS/TS check support. If yes, the release artifact becomes a tarball (binary + `checks_js_componentizer/` tree) rather than a bare binary.
