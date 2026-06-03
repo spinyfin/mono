@@ -11,6 +11,11 @@ use crate::coordinator::{
 /// "~3 cycles at worst" mental model from P992 design §7.
 pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
 
+/// Default threshold for the no-op / trivial-diff skip gate (P992 design §8).
+/// Zero means "skip only when the effective diff is literally empty (0 changed
+/// lines)"; operators can raise this to also skip small cosmetic-only pushes.
+pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -48,6 +53,16 @@ pub struct WorkConfig {
     /// [`DEFAULT_MAX_REVIEW_CYCLES`] (3). P992 design §7.
     #[builder(default = DEFAULT_MAX_REVIEW_CYCLES)]
     pub max_review_cycles: usize,
+    /// Minimum number of changed lines (additions + deletions) required to
+    /// trigger a reviewer pass when `last_reviewed_sha` is set. Pushes whose
+    /// effective diff (new head vs. last-reviewed head) totals fewer lines
+    /// than this threshold are skipped as trivial. Zero (the default) means
+    /// skip only when the diff is completely empty; operators can raise it to
+    /// also skip small cosmetic pushes. Configured via
+    /// `BOSS_MIN_REVIEW_CHANGED_LINES`; defaults to
+    /// [`DEFAULT_MIN_REVIEW_CHANGED_LINES`] (0). P992 design §8.
+    #[builder(default = DEFAULT_MIN_REVIEW_CHANGED_LINES)]
+    pub min_review_changed_lines: u64,
 }
 
 impl WorkConfig {
@@ -94,6 +109,15 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
+        let min_review_changed_lines = std::env::var("BOSS_MIN_REVIEW_CHANGED_LINES")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().with_context(|| {
+                    format!("could not parse BOSS_MIN_REVIEW_CHANGED_LINES: {raw}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -101,6 +125,7 @@ impl WorkConfig {
             .automation_pool_size(automation_pool_size)
             .review_pool_size(review_pool_size)
             .max_review_cycles(max_review_cycles)
+            .min_review_changed_lines(min_review_changed_lines)
             .build())
     }
 }
@@ -251,8 +276,8 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
-        MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
+        DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
+        MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
     };
     use std::path::PathBuf;
 
@@ -393,6 +418,43 @@ mod tests {
             match original_pool {
                 Some(value) => std::env::set_var("BOSS_REVIEW_POOL_SIZE", value),
                 None => std::env::remove_var("BOSS_REVIEW_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    // Combined default+override test to avoid parallelism races on the
+    // shared BOSS_MIN_REVIEW_CHANGED_LINES env var.
+    #[test]
+    fn min_review_changed_lines_defaults_and_reads_from_env() {
+        let original_lines = std::env::var_os("BOSS_MIN_REVIEW_CHANGED_LINES");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+
+        unsafe {
+            std::env::remove_var("BOSS_MIN_REVIEW_CHANGED_LINES");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(
+            config.min_review_changed_lines,
+            DEFAULT_MIN_REVIEW_CHANGED_LINES
+        );
+
+        unsafe {
+            std::env::set_var("BOSS_MIN_REVIEW_CHANGED_LINES", "10");
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.min_review_changed_lines, 10);
+
+        unsafe {
+            match original_lines {
+                Some(value) => std::env::set_var("BOSS_MIN_REVIEW_CHANGED_LINES", value),
+                None => std::env::remove_var("BOSS_MIN_REVIEW_CHANGED_LINES"),
             }
             match original_db {
                 Some(value) => std::env::set_var("BOSS_DB_PATH", value),

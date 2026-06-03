@@ -450,6 +450,17 @@ pub trait BranchVerifier: Send + Sync {
     /// the chore's bound PR before falling through to the
     /// `PROBE_NO_PR` nudge.
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns the total number of changed lines (additions + deletions)
+    /// between `base` and `head` in `repo_slug`. Used by the no-op /
+    /// trivial-diff skip gate (P992 design §8) to detect pure rebases and
+    /// trivially-small pushes that don't warrant a fresh reviewer pass.
+    async fn fetch_diff_line_count(
+        &self,
+        repo_slug: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<u64>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -470,6 +481,15 @@ impl BranchVerifier for CommandBranchVerifier {
 
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         fetch_pr_head_oid_cmd(repo_slug, pr_number).await
+    }
+
+    async fn fetch_diff_line_count(
+        &self,
+        repo_slug: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<u64> {
+        fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 }
 
@@ -545,6 +565,30 @@ async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String
         return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
     }
     Ok(head_oid)
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return
+/// the total number of changed lines (additions + deletions) across all files
+/// in the comparison. Returns `0` when the diff is empty (pure rebase with no
+/// file-content changes). Used by the no-op skip gate (P992 design §8).
+async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let stdout = run_gh(
+        &[
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            "(.files // []) | map(.additions + .deletions) | add // 0",
+        ],
+        &format!("gh api {endpoint}"),
+    )
+    .await?;
+    let total: u64 = stdout.trim().parse().with_context(|| {
+        format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim())
+    })?;
+    Ok(total)
 }
 
 /// Parse the PR number from a canonical GitHub PR URL
@@ -905,6 +949,14 @@ pub struct WorkerCompletionHandler {
     /// wires in the value from `WorkConfig` via
     /// [`Self::with_max_review_cycles`].
     max_review_cycles: usize,
+    /// Minimum changed-line count required to trigger a reviewer pass when
+    /// `last_reviewed_sha` is set (P992 design §8). Pushes whose effective
+    /// diff (new head vs. last-reviewed head) totals fewer lines than this
+    /// threshold are skipped as trivial. Zero (the conservative default)
+    /// means skip only when the diff is literally empty (pure rebase with
+    /// no file-content changes). Production wires in the value from
+    /// `WorkConfig` via [`Self::with_min_review_changed_lines`].
+    min_review_changed_lines: u64,
 }
 
 impl WorkerCompletionHandler {
@@ -938,6 +990,7 @@ impl WorkerCompletionHandler {
             nudge_breaker: Arc::new(NudgeBreaker::new()),
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
+            min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
         }
     }
 
@@ -962,6 +1015,14 @@ impl WorkerCompletionHandler {
     /// tests that need to exercise the cycle-bound path set it low.
     pub fn with_max_review_cycles(mut self, max: usize) -> Self {
         self.max_review_cycles = max;
+        self
+    }
+
+    /// Override the trivial-diff skip threshold (P992 design §8).
+    /// Production wires in `WorkConfig.min_review_changed_lines` via `app.rs`;
+    /// tests that exercise the trivial-diff path set it to a small value.
+    pub fn with_min_review_changed_lines(mut self, min: u64) -> Self {
+        self.min_review_changed_lines = min;
         self
     }
 
@@ -2269,6 +2330,113 @@ must not be asked to open one",
         }
     }
 
+    /// Evaluate the no-op / trivial-diff skip gate for the automated reviewer
+    /// (P992 design §8).
+    ///
+    /// Returns `Some(reason)` when the reviewer pass should be skipped,
+    /// or `None` when a full review is warranted.
+    ///
+    /// Rules, in order:
+    /// 1. If `review_cycle == 0` or `last_reviewed_sha` is `None` → first
+    ///    review → never skip (design: "first review of a PR is never skipped
+    ///    by the trivial rule").
+    /// 2. If the current PR head OID equals `last_reviewed_sha` → skip
+    ///    (`"sha_unchanged"`): the worker pushed the exact same commit.
+    /// 3. If the effective diff between `last_reviewed_sha` and the current
+    ///    head is 0 changed lines → skip (`"empty_diff"`): pure rebase with
+    ///    no file-content changes.
+    /// 4. If `min_review_changed_lines > 0` and the diff is below that
+    ///    threshold → skip (`"trivial_diff"`): cosmetically small push.
+    ///
+    /// API errors during steps 2–4 are logged and treated as "don't skip"
+    /// so the reviewer still runs on uncertainty.
+    async fn check_noop_skip(
+        &self,
+        pr_url: &str,
+        producing: &crate::work::WorkExecution,
+        review_cycle: i64,
+        last_reviewed_sha: Option<&str>,
+    ) -> Option<&'static str> {
+        let Some(last_sha) = last_reviewed_sha else {
+            return None; // first review
+        };
+        if review_cycle == 0 {
+            return None; // first review (belt-and-suspenders; last_sha is None when cycle=0)
+        }
+
+        // Parse repo slug and PR number for GitHub API calls.
+        let repo_slug = match parse_repo_slug(&producing.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(err) => {
+                tracing::warn!(
+                    repo_remote_url = %producing.repo_remote_url,
+                    ?err,
+                    "pr_review noop gate: cannot parse repo slug; proceeding with review",
+                );
+                return None;
+            }
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(
+                pr_url,
+                "pr_review noop gate: cannot parse PR number; proceeding with review",
+            );
+            return None;
+        };
+
+        // Fetch current PR head SHA.
+        let current_head = match self
+            .branch_verifier
+            .fetch_pr_head_oid(&repo_slug, pr_number)
+            .await
+        {
+            Ok(sha) => sha,
+            Err(err) => {
+                tracing::warn!(
+                    pr_url,
+                    ?err,
+                    "pr_review noop gate: cannot fetch PR head OID; proceeding with review",
+                );
+                return None;
+            }
+        };
+
+        // Rule 2: exact SHA match — nothing changed since last review.
+        if current_head == last_sha {
+            return Some("sha_unchanged");
+        }
+
+        // Rules 3 & 4: compare effective diff between last-reviewed head and
+        // current head. Fail open on API errors.
+        let diff_lines = match self
+            .branch_verifier
+            .fetch_diff_line_count(&repo_slug, last_sha, &current_head)
+            .await
+        {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(
+                    pr_url,
+                    last_reviewed_sha = last_sha,
+                    current_head = %current_head,
+                    ?err,
+                    "pr_review noop gate: cannot fetch diff line count; proceeding with review",
+                );
+                return None;
+            }
+        };
+
+        if diff_lines == 0 {
+            return Some("empty_diff");
+        }
+
+        if self.min_review_changed_lines > 0 && diff_lines < self.min_review_changed_lines {
+            return Some("trivial_diff");
+        }
+
+        None
+    }
+
     /// Stop hook path, `"pr_recheck"` for the merge-poller's
     /// fallback sweep — so operators can see which path closed a
     /// given chore.
@@ -2301,25 +2469,50 @@ must not be asked to open one",
                                 &self.work_db,
                             )) =>
                 {
-                    // P992 task 9: cycle bound check.
+                    // P992 tasks 9 & 10: read cycle state once — used by both
+                    // the no-op gate (task 10) and the cycle-bound check (task 9).
                     let max_cycles = self.max_review_cycles;
-                    let cycle_bound_reached = match self
+                    let (review_cycle, last_reviewed_sha) = match self
                         .work_db
                         .get_task_review_cycle_state(&producing.work_item_id)
                     {
-                        Ok((cycle, _)) => cycle as usize >= max_cycles,
+                        Ok(state) => state,
                         Err(err) => {
-                            // Treat as "bound not reached" so the reviewer still
-                            // runs; a stale or missing row is not a reason to skip.
+                            // Fail open: treat as cycle=0, no prior SHA so both
+                            // gates pass through (don't skip on uncertainty).
                             tracing::warn!(
                                 execution_id,
                                 work_item_id = %producing.work_item_id,
                                 ?err,
                                 "could not read review_cycle; assuming bound not reached",
                             );
-                            false
+                            (0i64, None)
                         }
                     };
+
+                    // P992 task 10: no-op / trivial-diff skip gate. Runs before
+                    // the cycle-bound check so a pure rebase doesn't consume a
+                    // cycle slot or surface an attention item.
+                    let noop_skip_reason = self
+                        .check_noop_skip(
+                            &pr_url,
+                            producing,
+                            review_cycle,
+                            last_reviewed_sha.as_deref(),
+                        )
+                        .await;
+
+                    if let Some(skip_reason) = noop_skip_reason {
+                        tracing::info!(
+                            execution_id,
+                            work_item_id = %producing.work_item_id,
+                            skip_reason,
+                            "pr_review noop skip: advancing to in_review without reviewer pass",
+                        );
+                        false
+                    } else {
+                    // P992 task 9: cycle bound check.
+                    let cycle_bound_reached = (review_cycle as usize) >= max_cycles;
 
                     if cycle_bound_reached {
                         tracing::info!(
@@ -2383,6 +2576,7 @@ must not be asked to open one",
                             }
                         }
                     }
+                    } // closes the `} else {` for the noop skip gate
                 }
                 Ok(_) => false, // non-reviewer-triggering execution; advance to in_review as normal
                 Err(err) => {
@@ -4048,11 +4242,15 @@ mod tests {
     }
 
     /// Configurable branch verifier for tests. Returns a fixed
-    /// `headRefName` (or error) and a fixed `headRefOid` (or error)
-    /// without shelling out to `gh`.
+    /// `headRefName` (or error), a fixed `headRefOid` (or error), and a
+    /// fixed diff line count (or error) without shelling out to `gh`.
     struct StubBranchVerifier {
         result: Result<String, String>,
         head_oid_result: Mutex<Result<String, String>>,
+        /// Line count returned by `fetch_diff_line_count`. Defaults to
+        /// `999` (non-trivial) so tests that don't exercise the skip gate
+        /// never accidentally trigger a skip.
+        diff_line_count_result: Mutex<Result<u64, String>>,
     }
 
     impl StubBranchVerifier {
@@ -4065,6 +4263,7 @@ mod tests {
             Arc::new(Self {
                 result: Ok(branch.to_owned()),
                 head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
+                diff_line_count_result: Mutex::new(Ok(999)),
             })
         }
 
@@ -4073,6 +4272,13 @@ mod tests {
         /// head has (or has not) moved during the worker's run.
         async fn set_head_oid(&self, oid: Result<String, String>) {
             *self.head_oid_result.lock().await = oid;
+        }
+
+        /// Override the diff line count returned by `fetch_diff_line_count`.
+        /// Tests that exercise the no-op / trivial-diff skip gate use this to
+        /// simulate a pure rebase (0 lines) or trivially small change.
+        async fn set_diff_line_count(&self, count: Result<u64, String>) {
+            *self.diff_line_count_result.lock().await = count;
         }
     }
 
@@ -4089,6 +4295,19 @@ mod tests {
             let guard = self.head_oid_result.lock().await;
             match &*guard {
                 Ok(oid) => Ok(oid.clone()),
+                Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            }
+        }
+
+        async fn fetch_diff_line_count(
+            &self,
+            _repo_slug: &str,
+            _base: &str,
+            _head: &str,
+        ) -> Result<u64> {
+            let guard = self.diff_line_count_result.lock().await;
+            match &*guard {
+                Ok(count) => Ok(*count),
                 Err(msg) => Err(anyhow::anyhow!(msg.clone())),
             }
         }
@@ -9319,6 +9538,259 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert!(
             !calls[0].expected_branch.contains(&execution_id),
             "opaque-hash branch must not embed the execution id",
+        );
+    }
+
+    // ── P992 task 10: no-op / trivial-diff skip gate ──────────────────────────
+    //
+    // Helper that creates a fixture with `last_reviewed_sha` already set on the
+    // chore (simulating a prior review cycle) and stages a PR URL, then returns
+    // everything needed to drive `on_stop` in a test.
+    fn noop_skip_fixture(
+        workspace_path: &Path,
+        last_reviewed_sha: Option<&str>,
+    ) -> (
+        Arc<WorkDb>,
+        String, // chore_id
+        String, // execution_id
+        Arc<crate::pr_url_capture::StagedPrUrlCache>,
+        String, // expected_branch
+    ) {
+        const PR_URL: &str = "https://github.com/spinyfin/mono/pull/88";
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace_path);
+        if let Some(sha) = last_reviewed_sha {
+            db.increment_task_review_cycle(&chore_id, Some(sha))
+                .expect("failed to set last_reviewed_sha");
+        }
+        let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged.record_if_unset(&execution_id, PR_URL);
+        let branch = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None);
+        (db, chore_id, execution_id, staged, branch)
+    }
+
+    /// First review of a PR is never skipped by the trivial rule (design §8).
+    /// When `last_reviewed_sha` is `None` (review_cycle = 0) the gate must
+    /// pass through and enqueue the reviewer regardless of the head OID or
+    /// diff size.
+    #[tokio::test]
+    async fn noop_skip_gate_first_review_never_skipped() {
+        let workspace = tempdir().unwrap();
+        // last_reviewed_sha = None → first review
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), None);
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        // Return a 0-line diff — if the gate were applied, this would trigger a skip.
+        // The first-review guard must prevent that.
+        verifier.set_diff_line_count(Ok(0)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "first review must never be skipped; expected ReviewerEnqueued, got {outcome:?}",
+        );
+    }
+
+    /// When the current PR head SHA equals `last_reviewed_sha` the gate skips
+    /// the reviewer and advances the task directly to in_review.
+    #[tokio::test]
+    async fn noop_skip_gate_skips_when_sha_unchanged() {
+        const SAME_SHA: &str = "sha_abc123";
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some(SAME_SHA));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        // Current head == last_reviewed_sha → skip.
+        verifier.set_head_oid(Ok(SAME_SHA.to_owned())).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "sha_unchanged must skip reviewer; expected PrDetected, got {outcome:?}",
+        );
+    }
+
+    /// When the effective diff between last-reviewed and current head is zero
+    /// lines (pure rebase with no file-content changes) the gate skips the
+    /// reviewer.
+    #[tokio::test]
+    async fn noop_skip_gate_skips_on_empty_diff() {
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some("sha_old"));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        // Different head SHA (new commit) but 0 changed lines → pure rebase.
+        verifier.set_head_oid(Ok("sha_new".to_owned())).await;
+        verifier.set_diff_line_count(Ok(0)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "empty diff must skip reviewer; expected PrDetected, got {outcome:?}",
+        );
+    }
+
+    /// When `min_review_changed_lines > 0` and the diff is below the threshold
+    /// the gate skips the reviewer (trivial-diff path).
+    #[tokio::test]
+    async fn noop_skip_gate_skips_trivial_diff_when_threshold_set() {
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some("sha_old"));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        verifier.set_head_oid(Ok("sha_new".to_owned())).await;
+        // 5 changed lines, threshold is 10 → trivial → skip.
+        verifier.set_diff_line_count(Ok(5)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier)
+        .with_min_review_changed_lines(10);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "trivial diff below threshold must skip reviewer; expected PrDetected, got {outcome:?}",
+        );
+    }
+
+    /// When `min_review_changed_lines > 0` and the diff meets the threshold
+    /// the reviewer is enqueued normally.
+    #[tokio::test]
+    async fn noop_skip_gate_does_not_skip_when_diff_meets_threshold() {
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some("sha_old"));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        verifier.set_head_oid(Ok("sha_new".to_owned())).await;
+        // 10 changed lines, threshold is 10 → not trivial → review.
+        verifier.set_diff_line_count(Ok(10)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier)
+        .with_min_review_changed_lines(10);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "diff at threshold must not skip reviewer; expected ReviewerEnqueued, got {outcome:?}",
+        );
+    }
+
+    /// The default `min_review_changed_lines = 0` must NOT skip a small but
+    /// non-empty diff (only empty diffs and SHA matches are skipped by default).
+    #[tokio::test]
+    async fn noop_skip_gate_default_does_not_skip_nonzero_diff() {
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some("sha_old"));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        verifier.set_head_oid(Ok("sha_new".to_owned())).await;
+        // 1 changed line — with the conservative default (0 threshold) this
+        // must NOT be treated as trivial.
+        verifier.set_diff_line_count(Ok(1)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier);
+        // min_review_changed_lines uses the default (0 = disabled)
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "1-line diff with default threshold must not skip; expected ReviewerEnqueued, got {outcome:?}",
+        );
+    }
+
+    /// If `fetch_pr_head_oid` fails the gate fails open (proceeds with review),
+    /// so a transient GitHub API error never silently suppresses a reviewer pass.
+    #[tokio::test]
+    async fn noop_skip_gate_fails_open_on_head_oid_error() {
+        let workspace = tempdir().unwrap();
+        let (db, _chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), Some("sha_old"));
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        // Simulate a GitHub API failure when fetching the PR head OID.
+        verifier
+            .set_head_oid(Err("simulated API error".to_owned()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "API error in noop gate must fail open (enqueue reviewer); got {outcome:?}",
         );
     }
 }
