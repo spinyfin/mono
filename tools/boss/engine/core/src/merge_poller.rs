@@ -1702,16 +1702,17 @@ async fn sweep_pending_pr(
                 "merge poller: recovered missed PR-open (PR already merged) for waiting_human worker",
             );
         }
-        // P992 task 7: the PR was detected and an independent reviewer pass
-        // was enqueued; the producing task is held in active. Count this as a
-        // recovery since the producing execution is finalized and progressing.
+        // P992: the PR was detected, the producing task advanced to in_review,
+        // and an independent reviewer pass was enqueued to run asynchronously.
+        // Count this as a recovery since the producing execution is finalized
+        // and the task is now in Review.
         StopOutcome::ReviewerEnqueued { pr_url } => {
             outcome.pr_recheck_recovered += 1;
             tracing::info!(
                 execution_id,
                 pr_url = %pr_url,
-                "merge poller: recovered missed PR-open; reviewer enqueued, \
-                 producing task held for review pass",
+                "merge poller: recovered missed PR-open; task advanced to \
+                 in_review, reviewer pass running asynchronously",
             );
         }
         // Quiet branches — still no PR, transient detector failure,
