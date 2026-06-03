@@ -26,50 +26,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
-
 use crate::coordinator::{CubeClient, CubeRepoSummary};
-
-/// Parse a github.com remote URL into its borrowed `(owner, repo)` path
-/// segments. This is the shared core behind the three call-site adapters
-/// that each used to re-implement the same algorithm:
-///
-/// - [`crate::completion::parse_repo_slug`] (SSH + HTTPS → `owner/repo`),
-/// - [`crate::pr_url_capture::parse_product_slug`] (same, lowercased),
-/// - `attentions_detector::parse_owner_repo_from_pr_url` (PR-URL variant).
-///
-/// Both remote shapes are accepted:
-///
-/// - SSH:   `git@github.com:owner/repo.git`
-/// - HTTPS: `https://github.com/owner/repo[/...][.git][/]`
-///
-/// The algorithm trims surrounding whitespace, strips a trailing `/` and a
-/// trailing `.git`, splits on the literal `github.com`, trims the leading
-/// `:`/`/` host separators, then takes the first two non-empty
-/// `/`-delimited segments. Any path components after `owner/repo` (e.g.
-/// `/pull/123`) are ignored.
-///
-/// Returns a granular `anyhow` error so [`crate::completion::parse_repo_slug`]
-/// can surface its original messages verbatim; callers that only want an
-/// `Option` use `.ok()`.
-pub fn parse_github_owner_repo(url: &str) -> Result<(&str, &str)> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let (_, after_host) = trimmed
-        .split_once("github.com")
-        .ok_or_else(|| anyhow!("not a github.com URL: {url}"))?;
-    let after_host = after_host.trim_start_matches([':', '/']);
-    let mut parts = after_host.splitn(3, '/');
-    let owner = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("missing owner segment: {url}"))?;
-    let repo = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("missing repo segment: {url}"))?;
-    Ok((owner, repo))
-}
 
 /// True when `value` is a bare cube repo slug rather than a git remote
 /// URL, scp-style remote, or filesystem path. URLs and remotes always
@@ -168,63 +125,6 @@ mod tests {
             workspace_prefix: format!("{repo_id}-"),
             source: None,
         }
-    }
-
-    #[test]
-    fn parse_github_owner_repo_handles_every_shape() {
-        // SSH form, with the `.git` suffix stripped.
-        assert_eq!(
-            parse_github_owner_repo("git@github.com:spinyfin/mono.git").unwrap(),
-            ("spinyfin", "mono")
-        );
-        // HTTPS with `.git`.
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/spinyfin/mono.git").unwrap(),
-            ("spinyfin", "mono")
-        );
-        // Plain HTTPS.
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/spinyfin/mono").unwrap(),
-            ("spinyfin", "mono")
-        );
-        // Trailing slash.
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/spinyfin/mono/").unwrap(),
-            ("spinyfin", "mono")
-        );
-        // PR URL with extra path segments — only the first two are taken.
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/spinyfin/mono/pull/991").unwrap(),
-            ("spinyfin", "mono")
-        );
-        // Surrounding whitespace is trimmed.
-        assert_eq!(
-            parse_github_owner_repo("  https://github.com/spinyfin/mono  ").unwrap(),
-            ("spinyfin", "mono")
-        );
-    }
-
-    #[test]
-    fn parse_github_owner_repo_rejects_malformed() {
-        // Not a github.com host.
-        assert!(parse_github_owner_repo("git@gitlab.com:foo/bar.git").is_err());
-        assert!(parse_github_owner_repo("https://gitlab.com/foo/bar").is_err());
-        assert!(parse_github_owner_repo("not a url").is_err());
-        // github.com host but missing the repo segment.
-        assert!(parse_github_owner_repo("https://github.com/spinyfin").is_err());
-        // Granular messages are preserved for `parse_repo_slug`'s callers.
-        assert!(
-            parse_github_owner_repo("https://gitlab.com/foo/bar")
-                .unwrap_err()
-                .to_string()
-                .contains("not a github.com URL")
-        );
-        assert!(
-            parse_github_owner_repo("https://github.com/spinyfin")
-                .unwrap_err()
-                .to_string()
-                .contains("missing repo segment")
-        );
     }
 
     #[test]

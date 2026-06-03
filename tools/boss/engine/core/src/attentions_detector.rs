@@ -249,7 +249,7 @@ fn sibling_manifest_path(doc_path: &str) -> Option<String> {
 
 /// `https://github.com/OWNER/REPO/pull/123` → `("OWNER", "REPO")`.
 fn parse_owner_repo_from_pr_url(pr_url: &str) -> Option<(String, String)> {
-    let (owner, repo) = crate::repo_slug::parse_github_owner_repo(pr_url).ok()?;
+    let (owner, repo) = boss_github::repo_slug::parse_github_owner_repo(pr_url).ok()?;
     Some((owner.to_owned(), repo.to_owned()))
 }
 
