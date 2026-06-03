@@ -1,7 +1,7 @@
 # ==========================================
 # CI GARBAGE COLLECTION
 # ==========================================
-build:ci --experimental_disk_cache_gc_max_size=3000GB
+build:ci --experimental_disk_cache_gc_max_size=3T
 build:ci --experimental_disk_cache_gc_max_age=60d
 build:ci --experimental_disk_cache_gc_idle_delay=5m
 
