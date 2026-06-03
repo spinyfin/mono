@@ -12,7 +12,7 @@ build:ci --color=yes
 build:ci --curses=no
 build:ci --show_progress_rate_limit=5.0
 startup:ci --max_idle_secs=259200
-build:ci --experimental_repository_disable_download
+build:ci --repository_disable_download
 
 
 # Linux cache configuration
