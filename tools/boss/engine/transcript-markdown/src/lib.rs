@@ -73,12 +73,16 @@ pub struct RenderOpts {
     /// Maximum bytes from a single `tool_result` before the output is
     /// truncated and `truncated` is set on the segment.
     pub max_result_bytes: usize,
+    /// When true, `tool_use` and `tool_result` segments are omitted from
+    /// the output, leaving only user/assistant/thinking/system turns.
+    pub hide_tools: bool,
 }
 
 impl Default for RenderOpts {
     fn default() -> Self {
         Self {
             max_result_bytes: 8 * 1024,
+            hide_tools: false,
         }
     }
 }
@@ -419,6 +423,9 @@ fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<Transc
         }
 
         TranscriptEventKind::ToolUse { name, input } => {
+            if opts.hide_tools {
+                return None;
+            }
             let markdown = render_tool_use(name, input);
             Some(
                 TranscriptSegment::builder()
@@ -432,6 +439,9 @@ fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<Transc
         }
 
         TranscriptEventKind::ToolResult { output, is_error } => {
+            if opts.hide_tools {
+                return None;
+            }
             render_tool_result_segment(event, output, *is_error, opts)
         }
 
@@ -648,9 +658,8 @@ fn segment_header(seg: &TranscriptSegment) -> String {
 
 /// Render transcript events as plain text for the CLI `agents transcript`
 /// command (format=text).
-pub fn render_text(events: &[TranscriptEvent]) -> String {
-    let opts = RenderOpts::default();
-    let segs = events_to_segments(events, &opts);
+pub fn render_text(events: &[TranscriptEvent], opts: &RenderOpts) -> String {
+    let segs = events_to_segments(events, opts);
     let mut out = String::new();
     for seg in &segs {
         let header = segment_header(seg);
@@ -1073,7 +1082,7 @@ mod tests {
             timestamp: None,
             model: None,
         }];
-        let opts = RenderOpts { max_result_bytes: 1024 };
+        let opts = RenderOpts { max_result_bytes: 1024, ..RenderOpts::default() };
         let segs = events_to_segments(&events, &opts);
         assert!(segs[0].collapsible);
         let t = segs[0].truncated.as_ref().expect("truncated should be set");
@@ -1183,11 +1192,28 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}"
         ));
-        let text = render_text(&events);
+        let text = render_text(&events, &RenderOpts::default());
         assert!(text.contains("=== User ==="), "got: {text}");
         assert!(text.contains("hi"), "got: {text}");
         assert!(text.contains("=== Assistant ==="), "got: {text}");
         assert!(text.contains("hello"), "got: {text}");
+    }
+
+    #[test]
+    fn render_text_hide_tools_omits_tool_segments() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"run ls\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n",
+            "{\"type\":\"tool_result\",\"toolUseId\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"file.txt\"}],\"isError\":false}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}"
+        );
+        let events = parse_transcript(jsonl);
+        let opts = RenderOpts { hide_tools: true, ..RenderOpts::default() };
+        let text = render_text(&events, &opts);
+        assert!(!text.contains("Bash"), "tool_use should be hidden, got: {text}");
+        assert!(!text.contains("file.txt"), "tool_result should be hidden, got: {text}");
+        assert!(text.contains("run ls"), "got: {text}");
+        assert!(text.contains("done"), "got: {text}");
     }
 
     // ── safe_truncate_len ─────────────────────────────────────────────────────

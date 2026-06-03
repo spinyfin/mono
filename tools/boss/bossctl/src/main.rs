@@ -345,6 +345,11 @@ enum AgentsAction {
         /// formatted markdown via the engine's transcript converter.
         #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
         format: TranscriptFormat,
+        /// Hide tool_use and tool_result segments, showing only user/assistant
+        /// turns. Applies to `text` and `markdown` formats; has no effect on
+        /// `jsonl` (which always emits raw lines).
+        #[arg(long, default_value_t = false)]
+        no_tools: bool,
     },
     /// Mark an execution as `orphaned` (terminal) without releasing
     /// its cube workspace lease. Used to recover from a Boss app
@@ -590,8 +595,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Interrupt { agent },
         } => agents_interrupt(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
-            action: AgentsAction::Transcript { agent, lines, format },
-        } => agents_transcript(&cli.socket_path, cli.json, agent, lines, format).await,
+            action: AgentsAction::Transcript { agent, lines, format, no_tools },
+        } => agents_transcript(&cli.socket_path, cli.json, agent, lines, format, no_tools).await,
         Command::Agents {
             action: AgentsAction::Reap { run_id },
         } => agents_reap(&cli.socket_path, cli.json, run_id).await,
@@ -1617,6 +1622,7 @@ async fn agents_transcript(
     agent: String,
     lines: usize,
     format: TranscriptFormat,
+    no_tools: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1655,6 +1661,10 @@ async fn agents_transcript(
             lines: tail,
             truncated,
         } => {
+            let render_opts = boss_engine::transcript_markdown::RenderOpts {
+                hide_tools: no_tools,
+                ..Default::default()
+            };
             if format == TranscriptFormat::Text || format == TranscriptFormat::Markdown {
                 let joined = tail.join("\n");
                 let events =
@@ -1662,11 +1672,11 @@ async fn agents_transcript(
                 let rendered = if format == TranscriptFormat::Markdown {
                     let segments = boss_engine::transcript_markdown::events_to_segments(
                         &events,
-                        &Default::default(),
+                        &render_opts,
                     );
                     boss_engine::transcript_markdown::segments_to_markdown(&segments)
                 } else {
-                    boss_engine::transcript_markdown::render_text(&events)
+                    boss_engine::transcript_markdown::render_text(&events, &render_opts)
                 };
                 if json {
                     println!(
