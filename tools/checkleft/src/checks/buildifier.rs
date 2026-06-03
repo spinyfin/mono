@@ -19,7 +19,8 @@
 //! - `buildifier_target` — a Bazel label (e.g. `"@buildifier_prebuilt//:buildifier"`).
 //!   checkleft builds the target with `bazel build`, then resolves its executable path
 //!   via `bazel cquery --output=starlark`, and execs THAT binary directly — no
-//!   `bazel run` and thus no held Bazel lock.
+//!   `bazel run` and thus no held Bazel lock. The resolved path is cached for the
+//!   process lifetime so subsequent files in the same run skip the Bazel overhead.
 //!
 //! Exactly one key may be set. If neither is configured, `buildifier_target` defaults
 //! to `"@buildifier_prebuilt//:buildifier"`, which works out-of-the-box in any Bazel
@@ -44,7 +45,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -116,6 +117,9 @@ struct BuildifierConfig {
     invocation: BuildifierInvocation,
     check_format: bool,
     check_lint: bool,
+    /// Cached resolved binary path — populated at most once per process (first Starlark file
+    /// encountered). Avoids re-running `bazel build` + `bazel cquery` on every `run()` call.
+    resolved_binary: OnceLock<String>,
 }
 
 fn parse_config(config: &toml::Value) -> Result<BuildifierConfig> {
@@ -141,6 +145,7 @@ fn parse_config(config: &toml::Value) -> Result<BuildifierConfig> {
         invocation,
         check_format: raw.check_format,
         check_lint: raw.check_lint,
+        resolved_binary: OnceLock::new(),
     })
 }
 
@@ -157,8 +162,6 @@ impl ConfiguredCheck for BuildifierConfig {
         }
 
         let mut findings = Vec::new();
-        // Resolved on first use — avoids spawning bazel when no Starlark files are touched.
-        let mut resolved_binary: Option<String> = None;
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -172,19 +175,21 @@ impl ConfiguredCheck for BuildifierConfig {
                 continue;
             };
 
-            // Resolve the binary on first file that actually needs processing.
-            let binary_str = match resolved_binary.as_deref() {
-                Some(b) => b.to_owned(),
-                None => {
-                    let path = resolve_invocation(&self.invocation)?;
-                    let s = path.to_string_lossy().into_owned();
-                    resolved_binary = Some(s.clone());
-                    s
-                }
+            // Resolve the binary at most once per process — avoids re-running `bazel build`
+            // + `bazel cquery` on every invocation. The `buildifier_path` case is already a
+            // direct path; the expense is in BazelTarget resolution.
+            // We use get_or_init (stable) by resolving first then storing; a benign race where
+            // two threads both resolve results in the same binary path and one value wins.
+            let binary_str: &str = if let Some(s) = self.resolved_binary.get() {
+                s
+            } else {
+                let path = resolve_invocation(&self.invocation)?;
+                let s = path.to_string_lossy().into_owned();
+                self.resolved_binary.get_or_init(|| s)
             };
 
             if self.check_format {
-                match run_format_check(&binary_str, &changed_file.path, &contents) {
+                match run_format_check(binary_str, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
                     Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
@@ -207,7 +212,7 @@ impl ConfiguredCheck for BuildifierConfig {
             }
 
             if self.check_lint {
-                match run_lint_check(&binary_str, &changed_file.path, &contents) {
+                match run_lint_check(binary_str, &changed_file.path, &contents) {
                     Ok(file_findings) => findings.extend(file_findings),
                     Err(RunError::SpawnFailed(e)) => findings.push(error_finding(
                         &changed_file.path,
