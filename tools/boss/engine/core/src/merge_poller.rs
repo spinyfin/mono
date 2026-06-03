@@ -1341,6 +1341,12 @@ pub struct SweepOutcome {
     /// violation where a parent rests `blocked` with no signal while its
     /// PR conflicts/fails (the T795 / PR #1077 strand).
     pub stranded_blocked_recanonicalized: usize,
+    /// Number of tasks advanced from `active` to `in_review` by the
+    /// reviewer-fallback sweep: tasks held in Doing (P992 `PendingReview`)
+    /// whose `pr_review` execution either finished without advancing them
+    /// or has been running past the stale threshold. Ensures the hold
+    /// always resolves so no card is stranded in Doing forever.
+    pub reviewer_fallback_advanced: usize,
 }
 
 impl SweepOutcome {
@@ -1555,6 +1561,25 @@ pub async fn run_one_pass(
         }
         check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
     }
+
+    // P992 reviewer-fallback sweep: tasks held in `active` (PendingReview)
+    // while waiting for an AI reviewer pass that has since finished or timed
+    // out. Ensures the hold always resolves so no card is stranded in Doing.
+    // Timeout: 10 minutes — long enough for the reviewer to complete normally,
+    // short enough that the user never waits longer than one poller cycle
+    // past the timeout for the card to move to Review.
+    let reviewer_stale_secs: u64 = 10 * 60;
+    let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
+            Vec::new()
+        }
+    };
+    for (task_id, product_id, pr_url) in &stalled_candidates {
+        sweep_stalled_reviewer(work_db, publisher, task_id, product_id, pr_url, &mut outcome).await;
+    }
+
     outcome
 }
 
@@ -1702,17 +1727,16 @@ async fn sweep_pending_pr(
                 "merge poller: recovered missed PR-open (PR already merged) for waiting_human worker",
             );
         }
-        // P992: the PR was detected, the producing task advanced to in_review,
-        // and an independent reviewer pass was enqueued to run asynchronously.
-        // Count this as a recovery since the producing execution is finalized
-        // and the task is now in Review.
+        // P992 task 7: the PR was detected and an independent reviewer pass
+        // was enqueued; the producing task is held in active. Count this as a
+        // recovery since the producing execution is finalized and progressing.
         StopOutcome::ReviewerEnqueued { pr_url } => {
             outcome.pr_recheck_recovered += 1;
             tracing::info!(
                 execution_id,
                 pr_url = %pr_url,
-                "merge poller: recovered missed PR-open; task advanced to \
-                 in_review, reviewer pass running asynchronously",
+                "merge poller: recovered missed PR-open; reviewer enqueued, \
+                 producing task held for review pass",
             );
         }
         // Quiet branches — still no PR, transient detector failure,
@@ -2602,6 +2626,46 @@ pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
     let tail = stripped.rsplit_once("/pull/")?.1;
     let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
     n.parse::<i64>().ok()
+}
+
+/// P992 reviewer-fallback: advance a task from `active` to `in_review` when
+/// its AI reviewer pass has either finished without advancing it (missed Stop
+/// hook) or has been running past the stale threshold (timeout). Ensures the
+/// `PendingReview` hold always resolves so no card is stranded in Doing.
+async fn sweep_stalled_reviewer(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    task_id: &str,
+    product_id: &str,
+    pr_url: &str,
+    outcome: &mut SweepOutcome,
+) {
+    match work_db.advance_pending_review_task_to_in_review(task_id) {
+        Ok(true) => {
+            tracing::info!(
+                task_id,
+                pr_url,
+                "merge poller: reviewer-fallback advanced task from active to in_review \
+                 (reviewer finished or timed out without firing its Stop hook)",
+            );
+            publisher
+                .publish_work_item_changed(product_id, task_id, "reviewer_fallback_advanced")
+                .await;
+            outcome.reviewer_fallback_advanced += 1;
+        }
+        Ok(false) => {
+            // Task was already past `active` — no-op; a concurrent sweep or the
+            // reviewer's own Stop hook already advanced it.
+        }
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: reviewer-fallback failed to advance task to in_review",
+            );
+        }
+    }
 }
 
 /// merged or developed a conflict while the engine was offline gets

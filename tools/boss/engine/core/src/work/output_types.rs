@@ -4,15 +4,18 @@ use super::*;
 /// `InReview` is the typical case (open PR, ready for human review);
 /// `Done` is used when the PR was already merged at the time the
 /// worker's Stop event fired, so we skip the review column entirely.
-///
-/// Note (P992): the producing task advances to `in_review` on PR-open even
-/// when an independent reviewer pass is enqueued — the reviewer runs
-/// asynchronously and never holds the task in Doing. There is therefore no
-/// "hold the task in its current column" target.
+/// `PendingReview` (P992) is used when an independent reviewer pass
+/// is enqueued: the task's `pr_url` is stamped but its status is *not*
+/// advanced — the task stays in the Doing column until the reviewer resolves
+/// (or the fallback timeout fires).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerPrCompletionTarget {
     InReview,
     Done,
+    /// Task `pr_url` is stamped; task `status` is unchanged. The independent
+    /// reviewer pass (P992) drives the subsequent `active → in_review`
+    /// transition once the review pass resolves (or the timeout fires).
+    PendingReview,
 }
 
 /// Outcome of [`WorkDb::set_run_transcript_path_if_unset`]. The third
