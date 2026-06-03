@@ -256,6 +256,7 @@ BUILD_FLAGS=(
   --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
   --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"
   --define=BOSS_SHAKE_PRIVATE_KEY_PEM="$BOSS_SHAKE_PRIVATE_KEY_PEM"
+  --config=ci
 )
 
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"

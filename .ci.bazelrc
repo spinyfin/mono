@@ -1,0 +1,21 @@
+# ==========================================
+# CI STORAGE & CACHE (4TB SSD)
+# ==========================================
+build:ci --repository_cache=/mnt/ssd/bazel/repo_cache
+build:ci --disk_cache=/mnt/ssd/bazel/disk_cache
+
+# ==========================================
+# CI GARBAGE COLLECTION
+# ==========================================
+build:ci --experimental_disk_cache_gc_max_size=3000GB
+build:ci --experimental_disk_cache_gc_max_age=60d
+build:ci --experimental_disk_cache_gc_idle_delay=5m
+
+# ==========================================
+# CI ENVIRONMENT OPTIMIZATIONS
+# ==========================================
+build:ci --color=yes
+build:ci --curses=no
+build:ci --show_progress_rate_limit=5.0
+startup:ci --max_idle_secs=259200
+build:ci --experimental_repository_disable_download

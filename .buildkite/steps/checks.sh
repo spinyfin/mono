@@ -13,7 +13,9 @@ set -euo pipefail
 echo "--- [checks] starting"
 
 echo "--- [checks] installing repobin tools into bin/"
-bazel build --config=ci-linux-disk-cache //tools/repobin:repobin
+bazel build --config=ci //tools/repobin:repobin
+
+export REPOBIN_BAZEL_FLAGS="--config=ci"
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
 
 bin/checkleft run
