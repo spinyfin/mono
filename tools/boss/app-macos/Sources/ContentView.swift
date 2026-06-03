@@ -1950,9 +1950,6 @@ struct WorkBoardCardView: View {
                             // The full text is accessible via the detail popover.
                             .lineLimit(task.kind == "revision" ? 2 : nil)
                             .truncationMode(.tail)
-                            // Reserve trailing space so the last line of the
-                            // description never overlaps the T-id overlay.
-                            .padding(.trailing, task.shortID != nil ? 44 : 0)
                     }
                     if let blockedBy, !blockedBy.isEmpty {
                         let prefix = task.status == "blocked" ? "Blocked by" : "Waiting on:"
@@ -1982,7 +1979,6 @@ struct WorkBoardCardView: View {
                         .truncationMode(.tail)
                         .help(liveStatus)
                         .accessibilityLabel("Live status: \(liveStatus)")
-                        .padding(.trailing, task.shortID != nil ? 44 : 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -2144,24 +2140,24 @@ struct WorkBoardCardView: View {
                 }
             }
 
+            if let id = task.shortID {
+                HStack {
+                    Spacer(minLength: 0)
+                    Text("T" + String(id))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("T" + String(id))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+
             if !inReviewRevisions.isEmpty {
                 Divider()
                     .padding(.vertical, 2)
                 ForEach(inReviewRevisions) { revision in
                     RevisionRollupLine(revision: revision)
                 }
-            }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if let id = task.shortID {
-                Text("T" + String(id))
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("T" + String(id))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.trailing, 12)
-                    .padding(.bottom, 10)
             }
         }
         .padding(.horizontal, 12)
