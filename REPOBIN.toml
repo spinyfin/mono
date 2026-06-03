@@ -1,5 +1,8 @@
 version = 1
 
+[tools.buildifier]
+target = "@buildifier_prebuilt//:buildifier"
+
 [tools.boss]
 target = "//tools/boss/cli:boss"
 

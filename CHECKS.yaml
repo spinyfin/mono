@@ -42,6 +42,10 @@ checks:
       severity: error
       allow_bypass: true
 
+  - id: buildifier
+    policy:
+      severity: error
+
   - id: rust-test-rule-coverage
 
   - id: todo-expiry
