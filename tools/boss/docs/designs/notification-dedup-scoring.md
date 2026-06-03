@@ -95,12 +95,12 @@ Keep exact dedup as the first line. When (and only when) a notification would be
         │                                                       │
         ▼                                                       ▼
   exact dedup first  ─── grouping_key / content_key       bucket open groups by
-  (unchanged)             match? → join existing,          (product, kind, association)
+  (unchanged)             match? → join existing,          (product[, kind])
         │                 no LLM, return                         │
         │ would create a NEW group                               ▼  per bucket, bounded
         ▼  (flag on?)                                       pick canonical (oldest/lowest A#)
-  prefilter open groups (same product/kind/assoc,          compare each other vs canonical
-  recency window) → top-K candidate set                          │
+  prefilter open groups (same product, recency             compare each other vs canonical
+  window) → top-K candidate set (cross-task)                          │
         │                                                        ▼
         ▼                                                  LLM dedup decision (batched)
   LLM dedup decision (candidate vs top-K)                        │
@@ -120,12 +120,13 @@ Keep exact dedup as the first line. When (and only when) a notification would be
 
 The engine owns everything. The single LLM step is the dedup decision; it is a pure transform (no writes). Exact dedup runs first and unchanged. The flag gates both paths.
 
-### 1. The unit of dedup is the `AttentionGroup` (the card)
+### 1. The unit of dedup is the `AttentionGroup` (the card); the scope spans tasks within a product
 
 A user perceives one Notifications card = one notification. That card is an `AttentionGroup`; its content lives in the `Attention` members. So:
 
 - **Dedup, score, and provenance are group-level.** The candidate is a *would-be group* (with its initial members); the canonical is an existing group.
-- **The LLM reasons over rendered content**, not raw keys: for each group we build a compact text rendering (kind, association, and each member's `prompt_text` / `proposed_name` + `proposed_description` / `rationale`). This is what an agent "flagged," in words.
+- **The comparison scope is all open groups within a product — NOT partitioned by originating task or association.** The primary target case is *different tasks* raising the same concern: task A and task B each flag "missing index on `created_at`" with different phrasings, different anchors, different grouping keys — and each is associated with a different task. Partitioning the comparison set by association (task/project) makes this case structurally invisible and defeats the feature's purpose. Cross-product dedup remains a non-goal; the correction is purely intra-product, cross-task.
+- **The LLM reasons over rendered content**, not raw keys: for each group we build a compact text rendering (kind, association, and each member's `prompt_text` / `proposed_name` + `proposed_description` / `rationale`). The `association` field appears in the rendering as context for the LLM — it is not used to filter or partition the candidate set.
 - **Member-level exact dedup is unchanged.** When a candidate *does* share a grouping key with an existing group, `reconcile_attentions`'s `content_key` path still handles it with no LLM. The LLM only runs when exact matching would otherwise spawn a *new* group.
 
 ### 2. Data model — score + provenance
@@ -241,21 +242,21 @@ The creation-time decision is **frequent** (potentially every notification) and 
 #### Creation-time (1 candidate vs top-K)
 
 1. **Exact dedup first** (unchanged). The LLM only runs if a *new* group would be created — most repeat flags never reach it.
-2. **Cheap prefilter** to a bounded **top-K** (e.g. K ≤ 8): restrict to open / partially-answered groups in the **same product**, prefer the **same `kind`** and **same association** (project/task), within a **recency window** (e.g. groups created/last-touched in the last N days), ranked by a lexical-overlap score (shared significant tokens between candidate rendering and each existing rendering). Only the top-K renderings go to the LLM.
+2. **Cheap prefilter** to a bounded **top-K** (e.g. K ≤ 16): restrict to open / partially-answered groups in the **same product** within a **recency window** (e.g. groups created/last-touched in the last N days). **The motivating duplicates are deliberately low-lexical-overlap** (different phrasings, different anchors, different source runs — the reason we use an LLM at all), so a pure lexical prefilter would rank genuine cross-task dups below same-association, same-phrasing groups and push them out of the top-K. For the prefilter: (a) same-association or same-kind groups may rank marginally higher as a *mild tiebreaker*, never a hard filter; (b) the primary ranking lever going forward is a semantic (embedding) prefilter — already noted as a future optimization; until then, widen K and use lexical overlap only as a secondary signal. **Cross-task, cross-association groups must have a real chance of entering the top-K.** Only the top-K renderings go to the LLM.
 3. **Skip entirely** if the prefilter set is empty (no LLM call) — the candidate is novel; create it.
 
-This is **O(open-groups-in-product)** for the prefilter (a single indexed query + cheap scoring) and **exactly one** LLM call with a bounded input. No pairwise explosion.
+This is **O(open-groups-in-product)** for the prefilter (a single indexed query + ranking) and **exactly one** LLM call with a bounded input. No pairwise explosion.
 
 #### Startup sweep (bounded, bucketed)
 
 The naive "compare all pairs" is O(n²). Instead:
 
-1. **Bucket** open groups by `(product_id, kind, association)`. Cross-bucket pairs are never compared (a question in project X is not a dup of a followup in task Y).
+1. **Bucket** open groups by `(product_id[, kind])`. **`association` (task/project) is explicitly NOT part of the bucket key** — the primary target case is different tasks raising the same concern, and a per-task partition makes that case structurally invisible. Cross-product pairs are never compared (a notification in product A is not a dup of one in product B — that exclusion is correct and stays). Whether to further sub-bucket by `kind` is a tractability choice; note that the same concern can surface under different kinds, so `kind` may be at most a secondary ranking factor, not a hard partition that could miss cross-kind dups.
 2. Within each bucket, **pick a deterministic canonical** (lowest `short_id`, i.e. oldest A-number; ties broken by `created_at`, then `id`).
-3. **Compare each non-canonical member of the bucket against the canonical(s)** in one batched LLM call per bucket (candidate-vs-set, reusing the same contract). For buckets large enough to matter, cap the bucket size considered per sweep and `log()` any remainder rather than silently dropping it.
+3. **Compare each non-canonical member of the bucket against the canonical(s)** in one batched LLM call per bucket (candidate-vs-set, reusing the same contract). Apply a recency window (groups created/last-touched in the last N days) and cap the bucket size considered per sweep; `log()` any remainder rather than silently dropping it.
 4. Fold losers into their canonical (cluster fold: `score += loser_count`, one `attention_merges` row per loser, retire each loser).
 
-Buckets keyed on `(product, kind, association)` are small in practice (a handful of open cards per project), so per-sweep cost is bounded and the sweep is "rarely needed" as the project expects.
+Removing `association` from the bucket key means product-level buckets are larger than per-task buckets would be. Tractability is maintained via: (a) the recency window, (b) per-bucket caps, and (c) the embeddings prefilter as the primary scaling lever once available (see R6). **Do NOT reintroduce a per-task/association partition to keep cost down** — that is exactly what breaks the feature.
 
 ### 5. Canonical-edit-on-merge — bounded + recorded
 
@@ -325,7 +326,7 @@ Boss has no general feature-flag framework — config is environment-driven (`Wo
 
 **R5 — Editing under a human's feet.** Bounded to append-only, open-members-only, length-capped, recorded. *Open:* is even append-to-rationale too much for v1 — should canonical-edit-on-merge be deferred entirely and v1 ship score-only folds? (See task breakdown: the edit task is separable and could be `future`.)
 
-**R6 — Sweep cost on large products.** Bucketing keeps it bounded in practice, but a product with many open cards in one `(kind, association)` bucket could be expensive. Mitigation: per-bucket cap + `log()` remainder. *Open:* what cap, and should over-cap buckets defer to a follow-up sweep rather than being dropped?
+**R6 — Sweep cost on large products (wider scope).** With `association` removed from the bucket key, product-level buckets are larger — all open groups across all tasks in a product land in one `(product[, kind])` bucket. Mitigations: (a) a recency window (groups created/updated within the last N days) keeps buckets bounded even for active products; (b) per-bucket cap + `log()` of remainder prevents unbounded LLM calls per sweep; (c) the embeddings prefilter (future optimization, already captured as a non-v1-blocker) is the primary scaling lever — once available, it narrows the comparison set to semantically-near candidates before the LLM call, making O(bucket) tractable without reintroducing a task partition. **Do NOT reintroduce a per-task/association partition to keep cost down** — that breaks the feature. *Open:* recency window duration and per-bucket cap value; whether over-cap buckets defer to a follow-up sweep pass rather than being silently dropped.
 
 **R7 — Structured-output substrate extension.** `pane_summary.rs` currently does plain-text completion; this needs a forced-tool-call / JSON-schema-constrained variant. Low risk (well-trodden API feature) but it is net-new substrate code. *Open:* build it as a small reusable `structured_call` helper alongside `claude_short_summary` so the [`auto-populate`](auto-populate-project-tasks-on-design-pr-merge.md) Planner (which needs the same) can share it.
 
@@ -343,13 +344,13 @@ PR-sized tasks in dependency order. Effort hints: `trivial | small | medium | la
 
 3. **Structured-output dedup-decision substrate + contract** (`boss-protocol`, `boss-engine`). Define `DedupInput` / `DedupDecision` / `NotificationBrief` / `CanonicalEdit` / `Confidence` in `boss-protocol`; add a reusable `structured_call` helper alongside `pane_summary::claude_short_summary` (forced tool call / JSON-schema-constrained output, typed outcomes modeled on `SummarizerOutcome`); implement `decide_dedup(DedupInput) -> Result<DedupDecision>` with the system prompt, model-tier constant (default Haiku), `max_tokens` bound, and engine-side validation (canonical id ∈ input set; else not-a-dup). No callers yet. **Effort:** `large`. **Depends on:** none (but the prefilter/rendering helpers in task 4 consume its types).
 
-4. **Comparison-set prefilter + rendering helpers** (`boss-engine`). The `NotificationBrief` renderer (group → prose) and the creation-time prefilter (same product/kind/association, recency window, lexical-overlap top-K). Pure, unit-testable; shared by creation and sweep. **Effort:** `medium`. **Depends on:** 3 (for the `NotificationBrief` type).
+4. **Comparison-set prefilter + rendering helpers** (`boss-engine`). The `NotificationBrief` renderer (group → prose, including association as context) and the creation-time prefilter (same product, recency window, widened top-K with same-association as a mild tiebreaker only — cross-task pairs must enter the top-K). Pure, unit-testable; shared by creation and sweep. **Effort:** `medium`. **Depends on:** 3 (for the `NotificationBrief` type).
 
 5. **Dedup-at-creation path** (`boss-engine`). Hook into `create_attention` / `reconcile_attentions` at the "would create a new group" point: when flag on and exact dedup misses, run prefilter → `decide_dedup`; on a High/Medium duplicate, fold (atomic `score += 1`, `attention_merges` row with `trigger='creation'`, suppress the candidate group, return the canonical) inside the existing transaction; else create normally. Fail-safe on any LLM error. **Effort:** `large`. **Depends on:** 1, 2, 3, 4.
 
 6. **Canonical-edit-on-merge (bounded + recorded)** (`boss-engine`). Apply `DedupDecision.proposed_edits` under the bounds (append-only to `rationale` / `proposed_description`, open-members-only, length caps), record before/after in `attention_merges.edits_applied`, drop+`log()` over-budget edits. Consumed by both the creation and sweep folds. *Separable — could ship as `future` (score-only folds in v1) per R5.* **Effort:** `medium`. **Depends on:** 1, 5.
 
-7. **Startup sweep** (`boss-engine`). Boot-time one-shot background task (flag-gated), `merge_poller`-style: bucket open groups by `(product, kind, association)`, deterministic canonical (lowest `short_id`), batched per-bucket `decide_dedup`, cluster-fold losers (`score += n`, retire via `merged_into_group_id` + `state='dismissed'`, one `attention_merges` row each), per-bucket cap with `log()` remainder. Idempotent via the pair-unique index + retired-loser exclusion + deterministic canonical. **Effort:** `large`. **Depends on:** 1, 2, 3, 4 (6 if edits-on-sweep wanted).
+7. **Startup sweep** (`boss-engine`). Boot-time one-shot background task (flag-gated), `merge_poller`-style: bucket open groups by `(product[, kind])` — **not** by association/task, so cross-task dups are visible within each bucket — apply recency window, deterministic canonical (lowest `short_id`), batched per-bucket `decide_dedup`, cluster-fold losers (`score += n`, retire via `merged_into_group_id` + `state='dismissed'`, one `attention_merges` row each), per-bucket cap with `log()` remainder. Idempotent via the pair-unique index + retired-loser exclusion + deterministic canonical. **Effort:** `large`. **Depends on:** 1, 2, 3, 4 (6 if edits-on-sweep wanted).
 
 8. **UI priority surfacing** (`app-macos`). `score` badge on cards (`score > 1`), score-desc-then-recency ordering of open groups, and a merge-provenance affordance ("edited by merge" marker + folded-count detail reading `attention_merges`). Thin client over the score field + a provenance read. **Effort:** `medium`. **Depends on:** 1 (score in protocol/events); benefits from 5/7 producing real scores but does not block on them.
 
