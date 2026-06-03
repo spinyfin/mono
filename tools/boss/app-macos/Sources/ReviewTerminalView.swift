@@ -15,20 +15,13 @@ struct ReviewTerminalContent: Codable, Hashable, Identifiable {
 
     var id: String { workItemID }
 
-    /// Formatted window title: "Review: T<n> - <name>" when both are
-    /// available; falls back gracefully when either is missing.
+    /// Formatted window title: "Terminal — <name>" when the task name is
+    /// available; falls back to just "Terminal" when it is not.
     var windowTitle: String {
-        let prefix = "Review"
-        switch (taskShortID, taskName) {
-        case let (shortID?, name?) where !name.isEmpty:
-            return "\(prefix): T\(shortID) - \(name)"
-        case let (shortID?, _):
-            return "\(prefix): T\(shortID)"
-        case let (_, name?) where !name.isEmpty:
-            return "\(prefix): \(name)"
-        default:
-            return "\(prefix): \(workItemID)"
+        if let name = taskName, !name.isEmpty {
+            return "Terminal \u{2014} \(name)"
         }
+        return "Terminal"
     }
 }
 
@@ -83,10 +76,10 @@ struct ReviewTerminalView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: .black))
-                .navigationTitle("Review: \(taskName)")
+                .navigationTitle("Terminal \u{2014} \(taskName)")
             case .ready(let content):
                 ReviewTerminalSurface(content: content)
-                    .navigationTitle("Review: \(content.workItemID)")
+                    .navigationTitle(content.windowTitle)
             }
         }
         .onAppear {
