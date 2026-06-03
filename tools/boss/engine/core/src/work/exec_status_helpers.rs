@@ -308,3 +308,154 @@ pub(crate) fn default_slug(base_slug: &str) -> String {
         base_slug.to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `Task` for the `task_accepts_execution` cases.
+    /// Only `status`, `autostart`, and `deleted_at` drive the function;
+    /// every other field carries a fixed placeholder.
+    fn task(status: &str, autostart: bool, deleted_at: Option<&str>) -> Task {
+        Task::builder()
+            .id("task_test")
+            .product_id("prod_test")
+            .kind(TaskKind::Task)
+            .name("Test task")
+            .description("desc")
+            .status(status)
+            .autostart(autostart)
+            .maybe_deleted_at(deleted_at.map(str::to_owned))
+            .created_at("2026-01-01T00:00:00Z")
+            .updated_at("2026-01-01T00:00:00Z")
+            .build()
+    }
+
+    // ── can_reconcile_execution_status ──────────────────────────────────────
+
+    #[test]
+    fn can_reconcile_only_pre_dispatch_statuses() {
+        for status in ["queued", "ready", "waiting_dependency"] {
+            assert!(
+                can_reconcile_execution_status(status),
+                "{status} should be reconcilable"
+            );
+        }
+        for status in [
+            "running",
+            "waiting_human",
+            "completed",
+            "failed",
+            "abandoned",
+            "cancelled",
+            "orphaned",
+            "",
+        ] {
+            assert!(
+                !can_reconcile_execution_status(status),
+                "{status} should not be reconcilable"
+            );
+        }
+    }
+
+    // ── execution_status_is_terminal ────────────────────────────────────────
+
+    #[test]
+    fn terminal_statuses_are_the_finished_set() {
+        for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
+            assert!(
+                execution_status_is_terminal(status),
+                "{status} should be terminal"
+            );
+        }
+        for status in [
+            "queued",
+            "ready",
+            "running",
+            "waiting_human",
+            "waiting_dependency",
+            "",
+        ] {
+            assert!(
+                !execution_status_is_terminal(status),
+                "{status} should not be terminal"
+            );
+        }
+    }
+
+    // ── execution_status_is_live ────────────────────────────────────────────
+
+    #[test]
+    fn live_statuses_are_running_and_waiting_human() {
+        for status in ["running", "waiting_human"] {
+            assert!(execution_status_is_live(status), "{status} should be live");
+        }
+        for status in [
+            "queued",
+            "ready",
+            "waiting_dependency",
+            "completed",
+            "failed",
+            "abandoned",
+            "cancelled",
+            "orphaned",
+            "",
+        ] {
+            assert!(
+                !execution_status_is_live(status),
+                "{status} should not be live"
+            );
+        }
+    }
+
+    // ── task_accepts_execution ──────────────────────────────────────────────
+
+    #[test]
+    fn task_accepts_execution_rejects_soft_deleted() {
+        // A deleted task is rejected even when its status would otherwise pass.
+        assert!(!task_accepts_execution(&task(
+            "active",
+            true,
+            Some("2026-01-01T00:00:00Z")
+        )));
+    }
+
+    #[test]
+    fn task_accepts_execution_rejects_non_dispatchable_statuses() {
+        for status in ["done", "archived", "cancelled", "in_review"] {
+            assert!(
+                !task_accepts_execution(&task(status, true, None)),
+                "{status} should not accept execution"
+            );
+        }
+    }
+
+    #[test]
+    fn task_accepts_execution_honours_autostart_optout_only_in_todo() {
+        // autostart=false parks the task only while it sits in `todo`.
+        assert!(!task_accepts_execution(&task("todo", false, None)));
+        // Once active, autostart no longer gates (it is cleared at start).
+        assert!(task_accepts_execution(&task("active", false, None)));
+    }
+
+    #[test]
+    fn task_accepts_execution_allows_active_and_autostart_todo() {
+        assert!(task_accepts_execution(&task("active", true, None)));
+        assert!(task_accepts_execution(&task("todo", true, None)));
+        // `blocked` is intentionally allowed through so the reconciler can
+        // create `waiting_dependency` rows for dependency-gated tasks.
+        assert!(task_accepts_execution(&task("blocked", true, None)));
+    }
+
+    // ── default_slug ────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_slug_replaces_empty_with_item() {
+        assert_eq!(default_slug(""), "item");
+    }
+
+    #[test]
+    fn default_slug_echoes_non_empty_input() {
+        assert_eq!(default_slug("my-product"), "my-product");
+    }
+}
