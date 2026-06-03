@@ -10,6 +10,25 @@ pub(crate) fn collect_rows<T>(
     Ok(values)
 }
 
+/// Parse a text column into `T`, surfacing a parse failure as a loud
+/// `FromSqlConversionFailure` keyed to the source column index rather
+/// than silently dropping the value. Used by the `map_*` row mappers for
+/// enum/string columns whose value set is enforced in engine code, not by
+/// SQL: an out-of-set value is data corruption that must fail the read.
+fn parse_text_column<T>(col: usize, raw: &str) -> rusqlite::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    raw.parse::<T>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            col,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })
+}
+
 pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
     let external_tracker_kind: Option<String> =
         row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty());
@@ -113,29 +132,13 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {
         None | Some("") => None,
-        Some(s) => match s.parse::<EffortLevel>() {
-            Ok(level) => Some(level),
-            Err(err) => {
-                // The column is constrained in code, not by SQL. A row
-                // carrying an out-of-set value is engine-side data
-                // corruption: surface it loudly rather than silently
-                // dropping the level.
-                return Err(rusqlite::Error::FromSqlConversionFailure(
-                    19,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
-                ));
-            }
-        },
+        // The column is constrained in code, not by SQL. A row carrying an
+        // out-of-set value is engine-side data corruption: surface it loudly
+        // rather than silently dropping the level.
+        Some(s) => Some(parse_text_column::<EffortLevel>(19, s)?),
     };
     let kind_raw: String = row.get(3)?;
-    let kind = kind_raw.parse::<TaskKind>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let kind = parse_text_column::<TaskKind>(3, &kind_raw)?;
     Ok(Task {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -290,21 +293,9 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
     let kind_raw: String = row.get(2)?;
-    let kind = kind_raw.parse::<ExecutionKind>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let kind = parse_text_column::<ExecutionKind>(2, &kind_raw)?;
     let status_raw: String = row.get(3)?;
-    let status = status_raw.parse::<ExecutionStatus>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        )
-    })?;
+    let status = parse_text_column::<ExecutionStatus>(3, &status_raw)?;
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
@@ -365,7 +356,6 @@ pub(crate) fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentio
 pub(crate) fn map_effort_escalation(
     row: &Row<'_>,
 ) -> rusqlite::Result<boss_protocol::EffortEscalation> {
-    use std::str::FromStr;
     let id: String = row.get(0)?;
     let product_id: String = row.get(1)?;
     let work_item_id: String = row.get(2)?;
@@ -378,13 +368,8 @@ pub(crate) fn map_effort_escalation(
     // insert time; on read we treat schema-level corruption as a
     // row-level error so an unexpected value doesn't silently
     // poison the audit.
-    let original_level =
-        boss_protocol::EffortLevel::from_str(&original_level_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into())
-        })?;
-    let new_level = boss_protocol::EffortLevel::from_str(&new_level_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
-    })?;
+    let original_level = parse_text_column::<boss_protocol::EffortLevel>(3, &original_level_str)?;
+    let new_level = parse_text_column::<boss_protocol::EffortLevel>(4, &new_level_str)?;
     let markers: Vec<String> = serde_json::from_str(&markers_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
     })?;
