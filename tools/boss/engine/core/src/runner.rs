@@ -15,7 +15,9 @@ use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
-use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy, WorkItemBinding};
+use boss_protocol::{EditorialRules, ExecutionKind, TemplatePolicy, WorkItemBinding};
+#[cfg(test)]
+use boss_protocol::TaskKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {

@@ -18,9 +18,11 @@ use boss_protocol::{
     OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskKind, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
+#[cfg(test)]
+use boss_protocol::TaskKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;

@@ -26,7 +26,9 @@
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
 
-use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent, TaskKind};
+use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, FrontendEvent};
+#[cfg(test)]
+use boss_protocol::{ExecutionKind, TaskKind};
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};

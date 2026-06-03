@@ -34,7 +34,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent, TaskKind};
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent};
+#[cfg(test)]
+use boss_protocol::TaskKind;
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};

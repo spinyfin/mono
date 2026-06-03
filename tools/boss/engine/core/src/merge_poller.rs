@@ -54,7 +54,9 @@ use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
 use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
-use boss_protocol::{self, ExecutionKind, TaskKind};
+use boss_protocol::{self, TaskKind};
+#[cfg(test)]
+use boss_protocol::ExecutionKind;
 
 /// Review-gating state of a PR at probe time. Derived from
 /// GitHub's `reviewDecision` field and the `reviews` array.
