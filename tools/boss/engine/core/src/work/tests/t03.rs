@@ -138,7 +138,7 @@ fn rescan_skips_gated_active_chore_silently() {
     // (if any) is the gated one, and rescan didn't insert another.
     let dependent_execs = db.list_executions(Some(&dependent.id)).unwrap();
     assert!(
-        dependent_execs.iter().all(|exec| exec.status != "ready"),
+        dependent_execs.iter().all(|exec| exec.status != ExecutionStatus::Ready),
         "no ready exec should be created for the gated dependent, got {dependent_execs:?}",
     );
 }
@@ -176,7 +176,7 @@ fn records_failed_execution_start_attempt() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
 
@@ -188,7 +188,7 @@ fn records_failed_execution_start_attempt() {
             "cube workspace lease failed",
         )
         .unwrap();
-    assert_eq!(execution.status, "failed");
+    assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
     assert!(execution.cube_lease_id.is_none());
     assert!(execution.workspace_path.is_none());
@@ -236,7 +236,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
 
@@ -255,7 +255,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         .finish_execution_run(
             &execution.id,
             &run.id,
-            "waiting_human",
+            ExecutionStatus::WaitingHuman,
             "completed",
             Some("Implemented the first pass."),
             None,
@@ -272,7 +272,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         )
         .unwrap();
 
-    assert_eq!(execution.status, "waiting_human");
+    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     assert_eq!(
         execution.workspace_path.as_deref(),
@@ -326,7 +326,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
 
@@ -345,7 +345,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         .finish_execution_run(
             &execution.id,
             &run.id,
-            "failed",
+            ExecutionStatus::Failed,
             "failed",
             None,
             Some("agent run failed"),
@@ -354,7 +354,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         )
         .unwrap();
 
-    assert_eq!(execution.status, "failed");
+    assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
     assert!(execution.cube_lease_id.is_none());
     assert!(execution.workspace_path.is_none());
@@ -932,7 +932,7 @@ fn auto_unblock_creates_ready_execution() {
     let executions = db.list_executions(Some(&dep.id)).unwrap();
     assert_eq!(executions.len(), 1, "must have exactly one execution");
     assert_eq!(
-        executions[0].status, "ready",
+        executions[0].status, ExecutionStatus::Ready,
         "auto-unblock must promote execution to ready so coordinator can dispatch"
     );
     let _ = std::fs::remove_file(path);
@@ -1626,9 +1626,9 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
 
     db.reconcile_product_executions(&product.id).unwrap();
     let exec_a = db.list_executions(Some(&a.id)).unwrap().pop().unwrap();
-    assert_eq!(exec_a.status, "waiting_dependency");
+    assert_eq!(exec_a.status, ExecutionStatus::WaitingDependency);
     let exec_b = db.list_executions(Some(&b.id)).unwrap().pop().unwrap();
-    assert_eq!(exec_b.status, "ready");
+    assert_eq!(exec_b.status, ExecutionStatus::Ready);
 
     // Move B to done. Reconcile then promotes A's execution to ready.
     db.update_work_item(
@@ -1641,7 +1641,7 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
     .unwrap();
     db.reconcile_product_executions(&product.id).unwrap();
     let exec_a_after = db.list_executions(Some(&a.id)).unwrap().pop().unwrap();
-    assert_eq!(exec_a_after.status, "ready");
+    assert_eq!(exec_a_after.status, ExecutionStatus::Ready);
     let _ = std::fs::remove_file(path);
 }
 
@@ -1821,7 +1821,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
             .build())
         .expect("RequestExecution should succeed when all prereqs are done");
 
-    assert_eq!(execution.status, "ready", "execution must be ready");
+    assert_eq!(execution.status, ExecutionStatus::Ready, "execution must be ready");
 
     // The task's kanban status must be cleared to 'todo' so
     // start_execution_run can advance it to 'active'.

@@ -88,7 +88,6 @@ use crate::transient_error::{
 };
 use crate::work::{
     ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb,
-    execution_status_is_terminal,
 };
 
 /// How often the sweep runs.
@@ -232,7 +231,7 @@ pub async fn run_one_pass(
         };
         // Terminal executions are settled (completion path / dead-PID
         // sweep / a prior recovery pass handled them).
-        if execution_status_is_terminal(&execution.status) {
+        if execution.status.is_terminal() {
             continue;
         }
 
@@ -615,7 +614,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::transient_error::RecoveryPolicy;
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch};
+    use crate::work::{CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch};
     use boss_protocol::WorkExecution;
 
     // ─── stubs ────────────────────────────────────────────────────────
@@ -886,7 +885,7 @@ mod tests {
         assert_eq!(nudger.nudged_ids().await, vec![exec_id.clone()]);
 
         // Execution is still running (not orphaned).
-        assert_eq!(db.get_execution(&exec_id).unwrap().status, "running");
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
 
         // One transient_recovery_nudge dispatch event.
         let events = sink.events().await;
@@ -938,10 +937,10 @@ mod tests {
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         let dead = execs.iter().find(|e| e.id == exec_id).unwrap();
-        assert_eq!(dead.status, "orphaned");
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
         let fresh = execs
             .iter()
-            .find(|e| e.id != exec_id && e.status == "ready")
+            .find(|e| e.id != exec_id && e.status == ExecutionStatus::Ready)
             .expect("expected a fresh ready execution");
         assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
         assert_eq!(fresh.transient_failure_count, 1);
@@ -990,10 +989,10 @@ mod tests {
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         let dead = execs.iter().find(|e| e.id == dead_id).unwrap();
-        assert_eq!(dead.status, "orphaned");
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
         let fresh = execs
             .iter()
-            .find(|e| e.id != dead_id && e.status == "ready")
+            .find(|e| e.id != dead_id && e.status == ExecutionStatus::Ready)
             .expect("expected a fresh ready execution");
         assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
         assert_eq!(fresh.transient_failure_count, 1);
@@ -1048,7 +1047,7 @@ mod tests {
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
-            !execs.iter().any(|e| e.id != dead_id && e.status == "ready"),
+            !execs.iter().any(|e| e.id != dead_id && e.status == ExecutionStatus::Ready),
             "permanent error must not create a resume execution",
         );
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1143,7 +1142,7 @@ mod tests {
         assert_eq!(outcome.resumed, 0);
         assert_eq!(outcome.escalated, 0);
         assert_eq!(outcome.no_error_skipped, 1);
-        assert_eq!(db.get_execution(&dead_id).unwrap().status, "running");
+        assert_eq!(db.get_execution(&dead_id).unwrap().status, ExecutionStatus::Running);
         assert!(sink.events().await.is_empty());
     }
 

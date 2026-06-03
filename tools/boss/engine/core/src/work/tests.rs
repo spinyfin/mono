@@ -91,7 +91,7 @@ fn product_task_execution_with_prefix(
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(task.id.clone())
             .kind(ExecutionKind::TaskImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
     (product, execution)
@@ -194,7 +194,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(task.id)
         .kind(ExecutionKind::TaskImplementation)
-        .status("ready")
+        .status(ExecutionStatus::Ready)
         .build())
     .unwrap()
 }
@@ -311,7 +311,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
         .unwrap();
@@ -328,7 +328,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
     db.finish_execution_run(
         &exec.id,
         &run.id,
-        "waiting_human",
+        ExecutionStatus::WaitingHuman,
         "completed",
         None,
         None,

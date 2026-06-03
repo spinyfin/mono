@@ -75,7 +75,7 @@ pub use boss_protocol::{
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
     EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult,
+    ExecutionReconcileResult, ExecutionStatus,
     ListDependenciesInput, MagicWandDispatch, MAGIC_WAND_STATUS_APPLIED,
     MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED,
     MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,

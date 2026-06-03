@@ -51,7 +51,7 @@ use boss_protocol::{WorkItemPatch, WorkerActivity};
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::work::{WorkDb, execution_status_is_terminal};
+use crate::work::WorkDb;
 
 /// Grace period after `started_at` (epoch seconds) during which we
 /// skip PID probing. Guards against racing a fresh dispatch whose pane
@@ -156,7 +156,7 @@ pub async fn run_one_pass(
 
         // Skip executions already in a terminal DB state (completion
         // path may have raced the sweep).
-        if execution_status_is_terminal(&execution.status) {
+        if execution.status.is_terminal() {
             continue;
         }
 
@@ -367,7 +367,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::runner::{ExecutionRunner, RunOutcome};
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch};
+    use crate::work::{CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch};
     use boss_protocol::WorkExecution;
 
     // ─── stubs ───────────────────────────────────────────────────────────────
@@ -577,7 +577,7 @@ mod tests {
         assert!(sink.events().await.is_empty());
 
         let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(exec.status, "ready", "execution must be untouched when PID alive");
+        assert_eq!(exec.status, ExecutionStatus::Ready, "execution must be untouched when PID alive");
     }
 
     /// A slot with shell_pid == 0 (PID not yet reported by the app) is
@@ -788,7 +788,7 @@ mod tests {
         // Execution must be terminal (`orphaned`) in the DB.
         let exec = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            exec.status, "orphaned",
+            exec.status, ExecutionStatus::Orphaned,
             "execution must be marked orphaned after dead-PID reap",
         );
 

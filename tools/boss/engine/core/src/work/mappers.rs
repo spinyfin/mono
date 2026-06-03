@@ -297,11 +297,19 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         )
     })?;
+    let status_raw: String = row.get(3)?;
+    let status = status_raw.parse::<ExecutionStatus>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
         kind,
-        status: row.get(3)?,
+        status,
         repo_remote_url: row.get(4)?,
         cube_repo_id: row.get(5)?,
         cube_lease_id: row.get(6)?,

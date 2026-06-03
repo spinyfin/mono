@@ -488,7 +488,7 @@ fn work_tree_includes_runtime_status_per_task() {
         .find(|r| r.work_item_id == chore_idle.id)
         .expect("missing idle runtime entry");
     // The reconcile creates a `ready` execution before any run.
-    assert_eq!(runtime_idle.execution_status.as_deref(), Some("ready"));
+    assert_eq!(runtime_idle.execution_status, Some(ExecutionStatus::Ready));
     assert_eq!(runtime_idle.run_status, None);
 
     let runtime_running = tree
@@ -496,7 +496,7 @@ fn work_tree_includes_runtime_status_per_task() {
         .iter()
         .find(|r| r.work_item_id == chore_running.id)
         .expect("missing running runtime entry");
-    assert_eq!(runtime_running.execution_status.as_deref(), Some("running"));
+    assert_eq!(runtime_running.execution_status, Some(ExecutionStatus::Running));
     assert_eq!(runtime_running.run_status.as_deref(), Some("active"));
     assert!(
         runtime_running.current_run_id.is_some(),
@@ -559,7 +559,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
     // work_runs row has been created yet.
     db.reconcile_product_executions(&product.id).unwrap();
     let after_ready = db.get_task_runtime(&chore.id).unwrap();
-    assert_eq!(after_ready.execution_status.as_deref(), Some("ready"));
+    assert_eq!(after_ready.execution_status, Some(ExecutionStatus::Ready));
     assert!(after_ready.execution_id.is_some());
     assert!(
         after_ready.current_run_id.is_none(),
@@ -580,7 +580,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
         )
         .unwrap();
     let after_run = db.get_task_runtime(&chore.id).unwrap();
-    assert_eq!(after_run.execution_status.as_deref(), Some("running"));
+    assert_eq!(after_run.execution_status, Some(ExecutionStatus::Running));
     assert_eq!(
         after_run.execution_id.as_deref(),
         Some(execution.id.as_str())
@@ -884,7 +884,7 @@ fn creates_and_lists_execution_entities() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(task.id.clone())
             .kind(ExecutionKind::TaskImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .cube_repo_id("cube_repo_mono")
             .workspace_path("/tmp/mono-agent-001")
             .build())
@@ -1130,16 +1130,16 @@ fn reconciles_missing_executions_for_product_tree() {
     let first_execution = db.list_executions(Some(&first_task.id)).unwrap();
     assert_eq!(first_execution.len(), 1);
     assert_eq!(first_execution[0].kind, ExecutionKind::TaskImplementation);
-    assert_eq!(first_execution[0].status, "ready");
+    assert_eq!(first_execution[0].status, ExecutionStatus::Ready);
 
     let second_execution = db.list_executions(Some(&second_task.id)).unwrap();
     assert_eq!(second_execution.len(), 1);
-    assert_eq!(second_execution[0].status, "waiting_dependency");
+    assert_eq!(second_execution[0].status, ExecutionStatus::WaitingDependency);
 
     let chore_execution = db.list_executions(Some(&chore.id)).unwrap();
     assert_eq!(chore_execution.len(), 1);
     assert_eq!(chore_execution[0].kind, ExecutionKind::ChoreImplementation);
-    assert_eq!(chore_execution[0].status, "ready");
+    assert_eq!(chore_execution[0].status, ExecutionStatus::Ready);
 
     let second_pass = db.reconcile_product_executions(&product.id).unwrap();
     assert!(second_pass.created.is_empty());
@@ -1225,10 +1225,10 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
     assert!(result.created.is_empty());
     assert_eq!(result.updated.len(), 1);
     assert_eq!(result.updated[0].work_item_id, second_task.id);
-    assert_eq!(result.updated[0].status, "ready");
+    assert_eq!(result.updated[0].status, ExecutionStatus::Ready);
 
     let second_execution = db.list_executions(Some(&second_task.id)).unwrap();
-    assert_eq!(second_execution[0].status, "ready");
+    assert_eq!(second_execution[0].status, ExecutionStatus::Ready);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1301,7 +1301,7 @@ fn reconcile_waits_for_product_repo_remote_url() {
 
     let task_execution = db.list_executions(Some(&task_id)).unwrap();
     assert_eq!(task_execution.len(), 1);
-    assert_eq!(task_execution[0].status, "ready");
+    assert_eq!(task_execution[0].status, ExecutionStatus::Ready);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1354,7 +1354,7 @@ fn reconcile_dispatches_chore_against_repo_override() {
         executions[0].repo_remote_url, "git@github.com:myorg/nimbus.git",
         "the row should carry the chore's override, not the product default",
     );
-    assert_eq!(executions[0].status, "ready");
+    assert_eq!(executions[0].status, ExecutionStatus::Ready);
 
     // No sticky attention items raised for a resolvable row.
     assert!(
@@ -1609,7 +1609,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
 
@@ -1623,7 +1623,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
             "/tmp/mono-agent-001",
         )
         .unwrap();
-    assert_eq!(execution.status, "running");
+    assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     assert_eq!(
@@ -1791,7 +1791,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
     // Drive the chore into the Doing column by starting the run —
@@ -1811,7 +1811,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     }
 
     let cancelled = db.cancel_execution(&execution.id).unwrap();
-    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some());
 
     // Active → todo so the kanban card returns to the To-Do lane.
@@ -1856,7 +1856,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("running")
+            .status(ExecutionStatus::Running)
             .build())
         .unwrap();
     // The worker opened a PR before the human asked to cancel.
@@ -1939,7 +1939,7 @@ fn start_execution_does_not_downgrade_done_chores() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build())
         .unwrap();
 
@@ -2013,7 +2013,7 @@ fn reconcile_dispatches_active_chore_with_no_execution() {
     // A ready execution should now exist for the chore.
     let executions = db.list_executions(Some(&chore.id)).unwrap();
     assert_eq!(executions.len(), 1, "expected exactly one execution");
-    assert_eq!(executions[0].status, "ready");
+    assert_eq!(executions[0].status, ExecutionStatus::Ready);
 
     let _ = std::fs::remove_file(path);
 }
@@ -2062,7 +2062,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(chore.id.clone())
         .kind(ExecutionKind::ChoreImplementation)
-        .status("failed")
+        .status(ExecutionStatus::Failed)
         .build())
     .unwrap();
 
@@ -2076,7 +2076,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
         "expected the failed exec plus a fresh ready one"
     );
     let latest = executions.last().unwrap();
-    assert_eq!(latest.status, "ready");
+    assert_eq!(latest.status, ExecutionStatus::Ready);
 }
 
 /// Reconcile must NOT redispatch when a non-terminal execution
@@ -2123,7 +2123,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(chore.id.clone())
         .kind(ExecutionKind::ChoreImplementation)
-        .status("waiting_human")
+        .status(ExecutionStatus::WaitingHuman)
         .build())
     .unwrap();
 
@@ -2182,7 +2182,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("waiting_human")
+            .status(ExecutionStatus::WaitingHuman)
             .build())
         .unwrap();
 
@@ -2197,10 +2197,10 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
         .iter()
         .find(|e| e.id == stale.id)
         .expect("original stale exec should still be visible");
-    assert_eq!(stale_after.status, "abandoned");
+    assert_eq!(stale_after.status, ExecutionStatus::Abandoned);
     let latest = executions.last().unwrap();
     assert_ne!(latest.id, stale.id);
-    assert_eq!(latest.status, "ready");
+    assert_eq!(latest.status, ExecutionStatus::Ready);
 }
 
 /// Helper: product + chore + a started run on `host_id`, returning the

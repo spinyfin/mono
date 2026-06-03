@@ -88,7 +88,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                     // item), just refresh the row and skip
                     // force-dispatch — there's no second
                     // worker to spawn.
-                    if execution.status == "ready" {
+                    if execution.status == ExecutionStatus::Ready {
                         let coordinator = server_state.execution_coordinator.clone();
                         let execution_id = execution.id.clone();
                         match coordinator.force_dispatch(&execution_id).await {
@@ -784,8 +784,7 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
                 return;
             }
         };
-        let is_live = execution.finished_at.is_none()
-            && matches!(execution.status.as_str(), "running" | "waiting_human");
+        let is_live = execution.finished_at.is_none() && execution.status.is_live();
         let transcript_path = match work_db.transcript_path_for_execution(&execution_id) {
             Ok(Some(path)) => path,
             Ok(None) => {

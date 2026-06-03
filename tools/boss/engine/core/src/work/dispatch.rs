@@ -228,9 +228,7 @@ impl WorkDb {
             //     reports the slot is gone → yes (stale row).
             let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
             let needs_dispatch = match &existing {
-                Some(existing) => {
-                    execution_status_is_terminal(&existing.status) || !is_live(&existing.id)
-                }
+                Some(existing) => existing.status.is_terminal() || !is_live(&existing.id),
                 None => true,
             };
             if !needs_dispatch {
@@ -253,7 +251,7 @@ impl WorkDb {
             // a fresh workspace that has no patch.
             let is_orphaned_predecessor = existing
                 .as_ref()
-                .map(|prev| prev.status == "orphaned")
+                .map(|prev| prev.status == ExecutionStatus::Orphaned)
                 .unwrap_or(false);
             let preferred_workspace_id = existing
                 .as_ref()
@@ -324,7 +322,7 @@ impl WorkDb {
                 continue;
             }
             let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
-                Some(existing) => execution_status_is_terminal(&existing.status),
+                Some(existing) => existing.status.is_terminal(),
                 None => true,
             };
             if !needs_dispatch {

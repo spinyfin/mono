@@ -355,7 +355,7 @@ async fn register_remote_worker_slot(
     }
     // Don't resurrect a finished run from a late or duplicate hook.
     let execution = server_state.work_db.get_execution(run_id).ok()?;
-    if remote_execution_is_settled(&execution.status) {
+    if execution.status.is_terminal() {
         return None;
     }
     let (slot_id, freshly_allocated) = server_state
@@ -395,15 +395,6 @@ async fn register_remote_worker_slot(
     Some(slot_id)
 }
 
-/// Terminal execution statuses — a hook for one of these is a stray
-/// late/duplicate delivery and must not allocate a fresh slot. Mirrors
-/// the set used by [`crate::work::WorkDb::list_reattachable_remote_runs`].
-fn remote_execution_is_settled(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
-    )
-}
 
 /// The work item's explicit model override, if it carries one (only
 /// tasks/chores do). Used to label a remote worker's live state.

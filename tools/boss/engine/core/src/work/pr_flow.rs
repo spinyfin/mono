@@ -28,10 +28,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution_status_is_terminal(&execution.status) {
+        if execution.status.is_terminal() {
             return Ok(None);
         }
-        if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+        if !execution.status.is_live() {
             bail!(
                 "execution {execution_id} cannot complete from worker PR signal in status `{}`",
                 execution.status

@@ -15,7 +15,7 @@ use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
-use boss_protocol::{EditorialRules, ExecutionKind, TemplatePolicy, WorkItemBinding};
+use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TemplatePolicy, WorkItemBinding};
 #[cfg(test)]
 use boss_protocol::TaskKind;
 
@@ -55,17 +55,17 @@ pub enum RunWaitState {
 }
 
 impl RunWaitState {
-    pub fn execution_status(self) -> &'static str {
+    pub fn execution_status(self) -> ExecutionStatus {
         match self {
-            RunWaitState::Terminal => "completed",
-            RunWaitState::WaitingDependency => "waiting_dependency",
-            RunWaitState::WaitingHuman => "waiting_human",
-            RunWaitState::WaitingReview => "waiting_review",
-            RunWaitState::WaitingMerge => "waiting_merge",
+            RunWaitState::Terminal => ExecutionStatus::Completed,
+            RunWaitState::WaitingDependency => ExecutionStatus::WaitingDependency,
+            RunWaitState::WaitingHuman => ExecutionStatus::WaitingHuman,
+            RunWaitState::WaitingReview => ExecutionStatus::WaitingReview,
+            RunWaitState::WaitingMerge => ExecutionStatus::WaitingMerge,
             // The row is already `cancelled`; the coordinator never
             // drives a status transition for this variant. Report the
             // terminal status for completeness.
-            RunWaitState::CancelledDuringSpawn => "cancelled",
+            RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
         }
     }
 
@@ -495,7 +495,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // the cancel path left for us. Without this the worker survives
         // unreaped in a workspace the engine believes is free.
         match self.work_db.get_execution(&execution.id) {
-            Ok(exec) if exec.status == "cancelled" => {
+            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
                 tracing::warn!(
                     worker_id,
                     execution_id = %execution.id,
@@ -2300,7 +2300,7 @@ mod compose_prompt_tests {
             .id("exec_abc123_01")
             .work_item_id("task-1")
             .kind(ExecutionKind::ChoreImplementation)
-            .status("pending")
+            .status(ExecutionStatus::Running)
             .repo_remote_url("git@github.com:org/repo.git")
             .workspace_path("/tmp/workspace")
             .created_at("2026-05-15T00:00:00Z")
@@ -2596,7 +2596,7 @@ mod compose_prompt_tests {
             .id("exec_abc123_01")
             .work_item_id("task-1")
             .kind(ExecutionKind::ChoreImplementation)
-            .status("pending")
+            .status(ExecutionStatus::Running)
             .repo_remote_url(remote.to_string())
             .workspace_path("/tmp/workspace")
             .created_at("2026-05-15T00:00:00Z")
@@ -2884,7 +2884,7 @@ mod compose_prompt_tests {
             .id("exec_rev_01")
             .work_item_id("task-1")
             .kind(ExecutionKind::RevisionImplementation)
-            .status("pending")
+            .status(ExecutionStatus::Running)
             .repo_remote_url("git@github.com:org/repo.git")
             .workspace_path("/tmp/workspace")
             .pr_url(pr_url)
@@ -3604,7 +3604,7 @@ mod pane_spawn_tests {
             .id("exec-test-1")
             .work_item_id("task-1")
             .kind(ExecutionKind::ChoreImplementation)
-            .status("running")
+            .status(ExecutionStatus::Running)
             .repo_remote_url("git@example.com:foo.git")
             .cube_repo_id("foo")
             .cube_lease_id("lease-1")
@@ -4399,7 +4399,7 @@ mod pane_spawn_tests {
                 CreateExecutionInput::builder()
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .build(),
             )
             .unwrap();

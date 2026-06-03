@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::{ExecutionKind, FrontendEvent, TaskKind};
+use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind};
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -1583,7 +1583,7 @@ impl ExecutionCoordinator {
             .work_db
             .get_execution(execution_id)
             .with_context(|| format!("failed to look up execution {execution_id}"))?;
-        if execution.status != "ready" {
+        if execution.status != ExecutionStatus::Ready {
             return Err(anyhow!(
                 "execution {execution_id} is in status {status:?}, not ready — cannot force-dispatch",
                 status = execution.status,
@@ -2356,7 +2356,7 @@ impl ExecutionCoordinator {
                     .publish(
                         &execution.id,
                         &execution.work_item_id,
-                        &execution.status,
+                        execution.status.as_str(),
                         "execution_started",
                     )
                     .await;
@@ -3036,7 +3036,7 @@ impl ExecutionCoordinator {
                 let publisher = self.publisher.clone();
                 let execution_id = execution.id.clone();
                 let work_item_id = execution.work_item_id.clone();
-                let status = execution.status.clone();
+                let status_str = execution.status.as_str();
                 let product_id = match self.work_db.get_work_item(&work_item_id) {
                     Ok(item) => Some(work_item_product_id(&item)),
                     Err(err) => {
@@ -3053,7 +3053,7 @@ impl ExecutionCoordinator {
                         .publish(
                             &execution_id,
                             &work_item_id,
-                            &status,
+                            status_str,
                             "execution_start_failed",
                         )
                         .await;
@@ -3333,7 +3333,7 @@ impl ExecutionCoordinator {
                 match self.work_db.finish_execution_run(
                     &execution.id,
                     &run.id,
-                    "failed",
+                    ExecutionStatus::Failed,
                     "failed",
                     None,
                     Some(error_text.as_str()),
@@ -3397,7 +3397,7 @@ impl ExecutionCoordinator {
                             .publish(
                                 &execution.id,
                                 &execution.work_item_id,
-                                &execution.status,
+                                execution.status.as_str(),
                                 "execution_run_failed",
                             )
                             .await;
@@ -3720,7 +3720,7 @@ impl ExecutionCoordinator {
             .publish(
                 &execution.id,
                 &execution.work_item_id,
-                &execution.status,
+                execution.status.as_str(),
                 "execution_run_completed",
             )
             .await;
@@ -3935,6 +3935,7 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
+    use boss_protocol::ExecutionStatus;
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
         CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW,
@@ -4303,7 +4304,11 @@ mod tests {
         }
     }
 
-    async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: &str) {
+    async fn wait_for_execution_status(
+        db: &WorkDb,
+        execution_id: &str,
+        expected: ExecutionStatus,
+    ) {
         for _ in 0..100 {
             let execution = db.get_execution(execution_id).unwrap();
             if execution.status == expected {
@@ -4396,12 +4401,12 @@ mod tests {
         wait_for_execution_status(
             db.as_ref(),
             &db.list_executions(Some(&chore.id)).unwrap()[0].id,
-            "running",
+            ExecutionStatus::Running,
         )
         .await;
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        assert_eq!(execution.status, "running");
+        assert_eq!(execution.status, ExecutionStatus::Running);
         assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
         assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
@@ -4495,7 +4500,7 @@ mod tests {
         let coordinator = Arc::new(coordinator_inner);
 
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution.id, "running").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
         // The dispatch loop resolved the adapter for the pinned host —
         // and never for `local`.
@@ -4691,8 +4696,8 @@ mod tests {
 
         let exec_a = db.list_executions(Some(&chore_a.id)).unwrap().pop().unwrap();
         let exec_b = db.list_executions(Some(&chore_b.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &exec_a.id, "running").await;
-        wait_for_execution_status(db.as_ref(), &exec_b.id, "running").await;
+        wait_for_execution_status(db.as_ref(), &exec_a.id, ExecutionStatus::Running).await;
+        wait_for_execution_status(db.as_ref(), &exec_b.id, ExecutionStatus::Running).await;
 
         // Two ensure_repo calls (one per execution), but list_repos
         // was deduplicated to exactly one round-trip.
@@ -4789,7 +4794,7 @@ mod tests {
         ));
         coordinator.kick();
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "running").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
         assert_eq!(*cube.list_repos_calls.lock().await, 1);
         let items = db.list_attention_items(&execution.id).unwrap();
@@ -4894,7 +4899,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "completed");
@@ -4953,7 +4958,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         // Slot 1 still belongs to the (notionally) live pane. Only
         // `release_worker_pane` (driven by completion / force release
@@ -5050,7 +5055,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.agent_id, "worker-1");
@@ -5097,10 +5102,10 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let execution = db.get_execution(&execution.id).unwrap();
-        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
         assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "completed");
@@ -5155,12 +5160,12 @@ mod tests {
         wait_for_execution_status(
             db.as_ref(),
             &db.list_executions(Some(&chore.id)).unwrap()[0].id,
-            "failed",
+            ExecutionStatus::Failed,
         )
         .await;
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        assert_eq!(execution.status, "failed");
+        assert_eq!(execution.status, ExecutionStatus::Failed);
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(
@@ -5228,7 +5233,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         // Slice out only the bytes written after the test started so
         // we don't trip over events emitted by other parallel tests
@@ -5416,7 +5421,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         // The execution went all the way through the lease + change
         // creation. `rescan_active_dispatch_after_release` will
@@ -5594,7 +5599,7 @@ mod tests {
         coord.set_automation_pool(WorkerPool::new_automation(1));
         let coordinator = Arc::new(coord);
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &triage_exec.id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &triage_exec.id, ExecutionStatus::Failed).await;
 
         // The automation run must now show `failed_gave_up`, not `failed_will_retry`.
         let run_after = db
@@ -5665,7 +5670,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
 
         let events = recording.events_for(&execution_id).await;
         let pane_event = events
@@ -5742,7 +5747,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         let attention_items = db.list_attention_items(&execution_id).unwrap();
         assert_eq!(
@@ -5862,10 +5867,10 @@ mod tests {
 
         coordinator.kick();
         // Wait for permanent failure — after 1 retry (2 total attempts)
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "failed");
+        assert_eq!(execution.status, ExecutionStatus::Failed);
         assert_eq!(
             execution.pre_start_failure_count, 2,
             "expected 2 pre-start failures (initial + 1 retry); got {}",
@@ -5959,10 +5964,10 @@ mod tests {
 
         coordinator.kick();
         // On the retry the lease succeeds → execution reaches `running`.
-        wait_for_execution_status(db.as_ref(), &execution_id, "running").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "running");
+        assert_eq!(execution.status, ExecutionStatus::Running);
         assert_eq!(
             execution.pre_start_failure_count, 1,
             "expected exactly 1 pre-start failure before the successful attempt; got {}",
@@ -6049,7 +6054,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         // Exactly one cube lease invocation: the engine must not retry
         // with a different workspace when a preferred workspace is set.
@@ -6352,7 +6357,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
 
         // Two cube lease invocations: first fails, second succeeds.
         let calls = cube.lease_calls.lock().await;
@@ -6487,7 +6492,7 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
         let events = recording.events_for(&execution_id).await;
         let attempt_count = events
@@ -6565,12 +6570,12 @@ mod tests {
         wait_for_execution_status(
             db.as_ref(),
             &db.list_executions(Some(&chore.id)).unwrap()[0].id,
-            "failed",
+            ExecutionStatus::Failed,
         )
         .await;
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        assert_eq!(execution.status, "failed");
+        assert_eq!(execution.status, ExecutionStatus::Failed);
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
@@ -6631,11 +6636,11 @@ mod tests {
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         // The runner cancels the row inside the spawn; wait for that
         // terminal status to settle.
-        wait_for_execution_status(db.as_ref(), &execution_id, "cancelled").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Cancelled).await;
 
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, "cancelled",
+            execution.status, ExecutionStatus::Cancelled,
             "the row stays cancelled — the coordinator must not move it to waiting_human",
         );
         // The deferred lease must have been released exactly once, and
@@ -6967,7 +6972,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(early_execution.status, "ready");
+        assert_eq!(early_execution.status, ExecutionStatus::Ready);
     }
 
     #[tokio::test]
@@ -7016,7 +7021,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let calls = cube.lease_calls.lock().await;
         assert_eq!(calls.len(), 1);
@@ -7080,7 +7085,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let events = publisher.events.lock().await;
         let reasons: Vec<&str> = events
@@ -7158,7 +7163,7 @@ mod tests {
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         // Work-item invalidation should have fired with the chore's
         // product id and the chore's work-item id. Reason wording
@@ -7269,7 +7274,7 @@ mod tests {
             let executions = db.list_executions(None).unwrap();
             if executions
                 .iter()
-                .filter(|execution| execution.status == "running")
+                .filter(|execution| execution.status == ExecutionStatus::Running)
                 .count()
                 == 1
             {
@@ -7282,7 +7287,7 @@ mod tests {
         assert_eq!(
             executions
                 .iter()
-                .filter(|execution| execution.status == "running")
+                .filter(|execution| execution.status == ExecutionStatus::Running)
                 .count(),
             1,
             "pool cap = 1 must keep exactly one execution `running`",
@@ -7297,14 +7302,14 @@ mod tests {
         assert_eq!(
             executions
                 .iter()
-                .filter(|execution| execution.status == "ready")
+                .filter(|execution| execution.status == ExecutionStatus::Ready)
                 .count(),
             1,
         );
         assert_eq!(
             executions
                 .iter()
-                .filter(|execution| execution.status == "waiting_dependency")
+                .filter(|execution| execution.status == ExecutionStatus::WaitingDependency)
                 .count(),
             2,
         );
@@ -7376,7 +7381,7 @@ mod tests {
             let executions = db.list_executions(None).unwrap();
             if executions
                 .iter()
-                .filter(|execution| execution.status == "running")
+                .filter(|execution| execution.status == ExecutionStatus::Running)
                 .count()
                 == 1
             {
@@ -7399,13 +7404,13 @@ mod tests {
             let runs = db.list_runs(&executions[0].id).unwrap();
             match status.as_str() {
                 "active" => {
-                    assert_eq!(executions[0].status, "running");
+                    assert_eq!(executions[0].status, ExecutionStatus::Running);
                     assert_eq!(runs.len(), 1, "active chore must have a run record");
                     assert_eq!(runs[0].status, "active");
                     active_with_run += 1;
                 }
                 "todo" => {
-                    assert_eq!(executions[0].status, "ready");
+                    assert_eq!(executions[0].status, ExecutionStatus::Ready);
                     assert!(
                         runs.is_empty(),
                         "todo chore must not have a run record yet, got {runs:?}",
@@ -7527,7 +7532,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(real.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .repo_remote_url("git@github.com:spinyfin/mono.git")
                 .build())
             .unwrap();
@@ -7575,7 +7580,7 @@ mod tests {
         // pulled out of the Doing column.
         let ghost_b_execs = db.list_executions(Some(&ghost_b.id)).unwrap();
         assert_eq!(ghost_b_execs.len(), 1);
-        assert_eq!(ghost_b_execs[0].status, "abandoned");
+        assert_eq!(ghost_b_execs[0].status, ExecutionStatus::Abandoned);
 
         // The real chore stays `active` with its `running` execution
         // intact — heal is conservative.
@@ -7585,7 +7590,7 @@ mod tests {
         }
         let real_execs = db.list_executions(Some(&real.id)).unwrap();
         assert_eq!(real_execs.len(), 1);
-        assert_eq!(real_execs[0].status, "running");
+        assert_eq!(real_execs[0].status, ExecutionStatus::Running);
     }
 
     /// Regression coverage for PR #228. Default-sized pool
@@ -7651,7 +7656,7 @@ mod tests {
             let executions = db.list_executions(None).unwrap();
             if executions
                 .iter()
-                .filter(|execution| execution.status == "running")
+                .filter(|execution| execution.status == ExecutionStatus::Running)
                 .count()
                 == 5
             {
@@ -7663,7 +7668,7 @@ mod tests {
         let executions = db.list_executions(None).unwrap();
         let running = executions
             .iter()
-            .filter(|execution| execution.status == "running")
+            .filter(|execution| execution.status == ExecutionStatus::Running)
             .count();
         assert_eq!(
             running, 5,
@@ -7742,7 +7747,7 @@ mod tests {
         // scheduler and grow the pool unnecessarily.
         for _ in 0..200 {
             let busy_exec = db.list_executions(Some(&busy.id)).unwrap().pop().unwrap();
-            if busy_exec.status == "running" {
+            if busy_exec.status == ExecutionStatus::Running {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -7776,7 +7781,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            if queued_after.status == "running" {
+            if queued_after.status == ExecutionStatus::Running {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -7788,7 +7793,7 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(
-            queued_after.status, "running",
+            queued_after.status, ExecutionStatus::Running,
             "force-launched execution should be dispatched immediately",
         );
         assert_eq!(
@@ -7873,7 +7878,7 @@ mod tests {
         db.create_execution(CreateExecutionInput::builder()
             .work_item_id(stuck.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("failed")
+            .status(ExecutionStatus::Failed)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .build())
         .unwrap();
@@ -7894,7 +7899,7 @@ mod tests {
             let executions = db.list_executions(Some(&stuck.id)).unwrap();
             if executions
                 .iter()
-                .any(|exec| matches!(exec.status.as_str(), "running" | "waiting_human"))
+                .any(|exec| exec.status.is_live())
             {
                 return;
             }
@@ -7969,7 +7974,7 @@ mod tests {
         db.create_execution(CreateExecutionInput::builder()
             .work_item_id(parked.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
-            .status("failed")
+            .status(ExecutionStatus::Failed)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .build())
         .unwrap();
@@ -7989,7 +7994,7 @@ mod tests {
         wait_for_execution_status(
             db.as_ref(),
             &db.list_executions(Some(&warm.id)).unwrap()[0].id,
-            "waiting_human",
+            ExecutionStatus::WaitingHuman,
         )
         .await;
         // Give the post-release rescan a clear window in which to
@@ -8003,7 +8008,7 @@ mod tests {
             1,
             "autostart=false parked chore must not be redispatched, got {parked_execs:?}",
         );
-        assert_eq!(parked_execs[0].status, "failed");
+        assert_eq!(parked_execs[0].status, ExecutionStatus::Failed);
     }
 
     #[tokio::test]
@@ -8148,7 +8153,7 @@ mod tests {
         // assert the row reaches `waiting_human`.
         coordinator.kick();
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
-        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
     }
 
     /// Regression for the 2026-05-12 "`@` got re-pointed mid-flight"
@@ -8274,7 +8279,7 @@ mod tests {
         // is running. (No `kick()` has been called.)
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            "ready",
+            ExecutionStatus::Ready,
             "precondition: row must be `ready` before the heartbeat fires",
         );
 
@@ -8286,7 +8291,7 @@ mod tests {
         // Within a few intervals the heartbeat should kick the
         // scheduler, drain the row, and move it through to
         // `waiting_human` via the fake runner.
-        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
     }
 
     /// `stranded_ready_executions` is the read-side helper the heartbeat
@@ -8451,7 +8456,7 @@ mod tests {
             let executions = db.list_executions(None).unwrap();
             if executions
                 .iter()
-                .filter(|e| e.status == "running")
+                .filter(|e| e.status == ExecutionStatus::Running)
                 .count()
                 == 2
             {
@@ -8463,7 +8468,7 @@ mod tests {
         let executions = db.list_executions(None).unwrap();
         let running: Vec<_> = executions
             .iter()
-            .filter(|e| e.status == "running")
+            .filter(|e| e.status == ExecutionStatus::Running)
             .collect();
         assert_eq!(running.len(), 2, "both chores must be running; got {running:?}");
 
@@ -8565,7 +8570,7 @@ mod tests {
         // Wait for the execution to reach running.
         for _ in 0..200 {
             let execs = db.list_executions(None).unwrap();
-            if execs.iter().any(|e| e.status == "running") {
+            if execs.iter().any(|e| e.status == ExecutionStatus::Running) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -8689,7 +8694,7 @@ mod tests {
             let executions = db.list_executions(None).unwrap();
             if executions
                 .iter()
-                .filter(|e| e.status == "running")
+                .filter(|e| e.status == ExecutionStatus::Running)
                 .count()
                 >= 2
             {
@@ -8701,7 +8706,7 @@ mod tests {
         let executions = db.list_executions(None).unwrap();
         let running = executions
             .iter()
-            .filter(|e| e.status == "running")
+            .filter(|e| e.status == ExecutionStatus::Running)
             .count();
         assert_eq!(
             running, 2,
@@ -8710,7 +8715,7 @@ mod tests {
         // The third execution (second auto chore) must remain ready — automation pool full.
         let ready = executions
             .iter()
-            .filter(|e| e.status == "ready")
+            .filter(|e| e.status == ExecutionStatus::Ready)
             .count();
         assert_eq!(
             ready, 1,
@@ -8742,7 +8747,7 @@ mod tests {
             .created_at("1")
             .kind(ExecutionKind::PrReview)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build();
         assert!(coord.execution_targets_review_pool(&review_exec));
 
@@ -8765,7 +8770,7 @@ mod tests {
             .created_at("1")
             .kind(ExecutionKind::ChoreImplementation)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .build();
         assert!(!coord.execution_targets_review_pool(&chore_exec));
         let wid2 = coord
@@ -8898,7 +8903,7 @@ mod tests {
             let execs = db.list_executions(None).unwrap();
             if execs
                 .iter()
-                .any(|e| e.status == "running" && e.kind != ExecutionKind::PrReview)
+                .any(|e| e.status == ExecutionStatus::Running && e.kind != ExecutionKind::PrReview)
             {
                 break;
             }
@@ -8908,7 +8913,7 @@ mod tests {
         let execs = db.list_executions(None).unwrap();
         let main_running = execs
             .iter()
-            .filter(|e| e.status == "running" && e.kind != ExecutionKind::PrReview)
+            .filter(|e| e.status == ExecutionStatus::Running && e.kind != ExecutionKind::PrReview)
             .count();
         assert_eq!(
             main_running, 1,
@@ -8917,7 +8922,7 @@ mod tests {
         // The pr_review must stay ready — review pool was full.
         let review_ready = execs
             .iter()
-            .filter(|e| e.kind == ExecutionKind::PrReview && e.status == "ready")
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.status == ExecutionStatus::Ready)
             .count();
         assert_eq!(
             review_ready, 1,

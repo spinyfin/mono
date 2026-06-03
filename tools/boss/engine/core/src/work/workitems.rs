@@ -902,7 +902,7 @@ impl WorkDb {
                 continue;
             }
             let needs_promotion = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
-                Some(exec) => exec.status == "waiting_dependency",
+                Some(exec) => exec.status == ExecutionStatus::WaitingDependency,
                 None => true,
             };
             if !needs_promotion {
@@ -910,7 +910,7 @@ impl WorkDb {
             }
             let kind = execution_kind_for_work_item(&tx, &work_item_id)?;
             let mut result = ExecutionReconcileResult::default();
-            reconcile_work_item_execution(&tx, &mut result, &work_item_id, kind, "ready")?;
+            reconcile_work_item_execution(&tx, &mut result, &work_item_id, kind, ExecutionStatus::Ready)?;
             if !result.created.is_empty() || !result.updated.is_empty() {
                 tracing::info!(
                     work_item_id = %work_item_id,

@@ -51,7 +51,7 @@ use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
     AUTOMATION_OUTCOME_SKIPPED, Attention, AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
     CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput,
-    ExecutionKind, FrontendEvent, TaskKind,
+    ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -1156,7 +1156,7 @@ impl WorkerCompletionHandler {
         };
 
         // Already completed/failed/cancelled — nothing more to do.
-        if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+        if !execution.status.is_live() {
             return StopOutcome::AlreadyTerminal;
         }
 
@@ -1354,7 +1354,7 @@ impl WorkerCompletionHandler {
         // genuinely-terminal worker sessions, which in the engine's
         // execution lifecycle are stamped `waiting_human` (set by
         // `finish_execution_run` after `PaneSpawnRunner` returns).
-        if execution.status != "waiting_human" {
+        if execution.status != ExecutionStatus::WaitingHuman {
             tracing::debug!(
                 execution_id,
                 status = %execution.status,
@@ -1666,7 +1666,7 @@ must not be asked to open one",
             Ok(execution) => execution,
             Err(_) => return StopOutcome::UnknownExecution,
         };
-        if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+        if !execution.status.is_live() {
             return StopOutcome::AlreadyTerminal;
         }
         // P992 task 7: reviewer executions never open a PR; skip the
@@ -1780,7 +1780,7 @@ must not be asked to open one",
         // staged URL was missed. Skipping for `running` keeps the
         // fallback off in-flight workers even when the poller's
         // candidate query picks them up by race.
-        if execution.status != "waiting_human" {
+        if execution.status != ExecutionStatus::WaitingHuman {
             tracing::debug!(
                 execution_id,
                 status = %execution.status,
@@ -2094,7 +2094,7 @@ must not be asked to open one",
                     if let Err(err) = self.work_db.finish_execution_run(
                         &execution.id,
                         &run_id,
-                        "completed",
+                        ExecutionStatus::Completed,
                         "completed",
                         Some(&format!("automation triage: {outcome}")),
                         None,
@@ -2641,7 +2641,7 @@ must not be asked to open one",
                             CreateExecutionInput::builder()
                                 .work_item_id(producing.work_item_id.clone())
                                 .kind(ExecutionKind::PrReview)
-                                .status("ready")
+                                .status(ExecutionStatus::Ready)
                                 .repo_remote_url(producing.repo_remote_url.clone())
                                 .build(),
                         ) {
@@ -2740,7 +2740,7 @@ must not be asked to open one",
             .publish(
                 &completion.execution.id,
                 &completion.execution.work_item_id,
-                &completion.execution.status,
+                completion.execution.status.as_str(),
                 publish_reason,
             )
             .await;
@@ -3219,7 +3219,7 @@ must not be asked to open one",
             .publish(
                 &execution.id,
                 &execution.work_item_id,
-                &execution.status,
+                execution.status.as_str(),
                 "worker_awaiting_pr",
             )
             .await;
@@ -3392,7 +3392,7 @@ must not be asked to open one",
             .publish(
                 &execution.id,
                 &execution.work_item_id,
-                &execution.status,
+                execution.status.as_str(),
                 "worker_nudge_breaker_parked",
             )
             .await;
@@ -4818,7 +4818,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
 
@@ -4838,7 +4838,7 @@ mod tests {
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned worker pane"),
                 None,
@@ -4916,7 +4916,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::CiRemediation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (execution, run) = db
@@ -4933,7 +4933,7 @@ mod tests {
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned worker pane"),
                 None,
@@ -4982,7 +4982,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.cube_lease_id.is_none());
         assert!(execution.workspace_path.is_none());
         assert!(execution.finished_at.is_some());
@@ -5437,7 +5437,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
         assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
         assert!(
             cube.release_calls.lock().await.is_empty(),
@@ -5507,7 +5507,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
         assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
@@ -5727,7 +5727,7 @@ mod tests {
 
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, "cancelled",
+            execution.status, ExecutionStatus::Cancelled,
             "the execution row must be cancelled so the reconciler won't redispatch it",
         );
         assert!(
@@ -5767,7 +5767,7 @@ mod tests {
             .await;
 
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "cancelled");
+        assert_eq!(execution.status, ExecutionStatus::Cancelled);
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert!(execution.cube_lease_id.is_none());
     }
@@ -5857,7 +5857,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.cube_lease_id.is_none());
         assert_eq!(
             cube.release_calls.lock().await.as_slice(),
@@ -6077,7 +6077,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (_e, run) = db
@@ -6086,7 +6086,7 @@ mod tests {
         db.finish_execution_run(
             &exec.id,
             &run.id,
-            "waiting_human",
+            ExecutionStatus::WaitingHuman,
             "completed",
             Some("spawned worker pane"),
             None,
@@ -6225,7 +6225,7 @@ mod tests {
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         // `start_execution_run` flips the row to `running`. Do not
@@ -6241,7 +6241,7 @@ mod tests {
                 workspace_path.to_str().unwrap(),
             )
             .unwrap();
-        assert_eq!(execution.status, "running");
+        assert_eq!(execution.status, ExecutionStatus::Running);
         (db, product.id, chore.id, execution.id)
     }
 
@@ -6375,7 +6375,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
         assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
         assert!(
             cube.release_calls.lock().await.is_empty(),
@@ -6452,7 +6452,7 @@ PR #379. PR #379.";
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (execution, run) = db
@@ -6469,7 +6469,7 @@ PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned worker pane"),
                 None,
@@ -6520,7 +6520,7 @@ PR #379. PR #379.";
 
         let exec_after = db.get_execution(&execution.id).unwrap();
         assert_eq!(
-            exec_after.status, "waiting_human",
+            exec_after.status, ExecutionStatus::WaitingHuman,
             "execution must stay in waiting_human so a follow-up Stop can re-check",
         );
         assert_eq!(
@@ -6581,7 +6581,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (execution, run) = db
@@ -6598,7 +6598,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned worker pane"),
                 None,
@@ -6749,7 +6749,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         // Execution finalised — lease released, pane torn down.
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.cube_lease_id.is_none());
         assert_eq!(
             cube.release_calls.lock().await.as_slice(),
@@ -6926,7 +6926,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore2.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (exec2, run2) = db
@@ -6943,7 +6943,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &exec2.id,
                 &run2.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 None,
                 None,
@@ -6972,7 +6972,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore3.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .build())
             .unwrap();
         let (exec3, run3) = db
@@ -6989,7 +6989,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &exec3.id,
                 &run3.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 None,
                 None,
@@ -7076,7 +7076,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
             let execution = db.get_execution(execution_id).unwrap();
             assert_eq!(
-                execution.status, "waiting_human",
+                execution.status, ExecutionStatus::WaitingHuman,
                 "execution must stay in waiting_human after a Stale recheck",
             );
             assert!(
@@ -7139,7 +7139,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
             let execution = db.get_execution(execution_id).unwrap();
             assert_eq!(
-                execution.status, "completed",
+                execution.status, ExecutionStatus::Completed,
                 "execution {execution_id} must finalise on the recovery pass",
             );
             assert!(
@@ -7236,7 +7236,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, "waiting_human",
+            execution.status, ExecutionStatus::WaitingHuman,
             "execution must remain `waiting_human` for the human to resolve",
         );
         assert!(
@@ -7443,7 +7443,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.finished_at.is_some());
         assert_eq!(
             cube.release_calls.lock().await.as_slice(),
@@ -7906,7 +7906,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
                     // Intentionally omitting pr_url to test chain-root fallback.
@@ -7927,7 +7927,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned revision worker pane"),
                 None,
@@ -8065,7 +8065,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
                     .build(),
@@ -8085,7 +8085,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned revision worker pane"),
                 None,
@@ -8295,7 +8295,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
-                .status("ready")
+                .status(ExecutionStatus::Ready)
                 .repo_remote_url("git@github.com:spinyfin/mono.git")
                 .build())
             .unwrap();
@@ -8313,7 +8313,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         db.finish_execution_run(
             &execution.id,
             &run.id,
-            "waiting_human",
+            ExecutionStatus::WaitingHuman,
             "completed",
             Some("spawned pane"),
             None,
@@ -8362,7 +8362,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Execution itself stays abandoned — recheck_for_pr_late does not
         // touch the execution row.
         let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(exec.status, "abandoned");
+        assert_eq!(exec.status, ExecutionStatus::Abandoned);
     }
 
     #[tokio::test]
@@ -8473,7 +8473,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
                     .pr_url(parent_pr_url)
@@ -8496,7 +8496,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned revision worker pane"),
                 None,
@@ -8570,7 +8570,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         // Execution must be completed; lease must be released.
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.finished_at.is_some());
         assert_eq!(
             cube.release_calls.lock().await.as_slice(),
@@ -8741,7 +8741,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected revision task, got {other:?}"),
         }
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert!(execution.cube_lease_id.is_none());
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
@@ -8810,7 +8810,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "active"),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
         assert!(
@@ -8864,7 +8864,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
     }
@@ -8914,7 +8914,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, "completed");
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Completed);
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert!(probes.snapshot().is_empty(), "recovery must not nudge");
     }
@@ -8971,7 +8971,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             ),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
         assert!(
             cube.release_calls.lock().await.is_empty(),
             "an unmarked revision's lease must stay held (not reaped)",
@@ -9044,7 +9044,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         // Execution must be completed with pr_url populated (= parent PR URL).
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert_eq!(
             execution.pr_url.as_deref(),
             Some(parent_pr_url),
@@ -9117,7 +9117,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Execution must still be waiting_human — not completed, not parked.
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, "waiting_human",
+            execution.status, ExecutionStatus::WaitingHuman,
             "execution must remain in waiting_human until merge poller finalizes it",
         );
     }
@@ -9216,7 +9216,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
                     .pr_url(parent_pr_url)
@@ -9237,7 +9237,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned conflict-resolution worker pane"),
                 None,
@@ -9337,7 +9337,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         // Execution must be finalised (completed, lease released).
         let execution = db.get_execution(&execution_id).unwrap();
-        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.status, ExecutionStatus::Completed);
         assert_eq!(
             cube.release_calls.lock().await.as_slice(),
             ["lease-1"],
@@ -9538,7 +9538,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
                     .pr_url(parent_pr_url)
@@ -9559,7 +9559,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &execution.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("spawned CI-fix revision worker pane"),
                 None,
@@ -10546,7 +10546,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::PrReview)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .build(),
             )
@@ -10565,7 +10565,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &pr_review_exec.id,
                 &run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("reviewer spawned"),
                 None,
@@ -10993,7 +10993,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &pr_review_exec_1.id,
                 &run1.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("reviewer spawned"),
                 None,
@@ -11039,7 +11039,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 CreateExecutionInput::builder()
                     .work_item_id(revision_task_id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
-                    .status("ready")
+                    .status(ExecutionStatus::Ready)
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .build(),
             )
@@ -11058,7 +11058,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &rev_exec.id,
                 &rev_run.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("revision worker spawned"),
                 None,
@@ -11117,7 +11117,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &pr_review_exec_2.id,
                 &run2.id,
-                "waiting_human",
+                ExecutionStatus::WaitingHuman,
                 "completed",
                 Some("reviewer 2 spawned"),
                 None,

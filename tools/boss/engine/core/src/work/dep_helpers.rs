@@ -334,7 +334,7 @@ pub(crate) fn maybe_engine_unblock_dependent(
     if dependent_id.starts_with("task_") {
         let kind = execution_kind_for_work_item(conn, dependent_id)?;
         let mut reconcile_result = ExecutionReconcileResult::default();
-        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, "ready")?;
+        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
     }
     Ok(true)
 }

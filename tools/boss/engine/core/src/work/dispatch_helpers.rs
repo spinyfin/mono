@@ -270,7 +270,7 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Resul
     // live run — skips the extra lookup.
     let latest_is_live = latest
         .as_ref()
-        .map(|e| execution_status_is_live(&e.status))
+        .map(|e| e.status.is_live())
         .unwrap_or(false);
     let execution = if latest_is_live {
         latest
@@ -377,7 +377,7 @@ pub(crate) fn reconcile_work_item_execution(
     result: &mut ExecutionReconcileResult,
     work_item_id: &str,
     kind: ExecutionKind,
-    desired_status: &str,
+    desired_status: ExecutionStatus,
 ) -> Result<()> {
     // Dispatcher gate (Q8): if the work item has any unmet `blocks`
     // prereq, downgrade its desired execution status to
@@ -385,15 +385,15 @@ pub(crate) fn reconcile_work_item_execution(
     // This keeps gated dependents out of `ready` and therefore out
     // of the dispatcher's pickup pool.
     let gated = !deps::gating_prereqs_for(conn, work_item_id)?.is_empty();
-    let effective_status = if gated && desired_status == "ready" {
-        "waiting_dependency"
+    let effective_status = if gated && desired_status == ExecutionStatus::Ready {
+        ExecutionStatus::WaitingDependency
     } else {
         desired_status
     };
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
             if execution.kind == kind
-                && can_reconcile_execution_status(&execution.status)
+                && execution.status.can_reconcile()
                 && execution.status != effective_status
             {
                 let updated = update_execution_status(conn, &execution.id, effective_status)?;
@@ -643,12 +643,16 @@ pub(crate) fn reconcile_revision_execution(
 
     // Gate passed.  Create or refresh the execution row.
     let gated = !deps::gating_prereqs_for(conn, &task.id)?.is_empty();
-    let effective_status = if gated { "waiting_dependency" } else { "ready" };
+    let effective_status = if gated {
+        ExecutionStatus::WaitingDependency
+    } else {
+        ExecutionStatus::Ready
+    };
 
     match query_latest_execution_for_work_item(conn, &task.id)? {
         Some(existing)
             if existing.kind == ExecutionKind::RevisionImplementation
-                && can_reconcile_execution_status(&existing.status)
+                && existing.status.can_reconcile()
                 && existing.status != effective_status =>
         {
             let updated = update_execution_status(conn, &existing.id, effective_status)?;
@@ -656,7 +660,7 @@ pub(crate) fn reconcile_revision_execution(
         }
         Some(existing)
             if existing.kind == ExecutionKind::RevisionImplementation
-                && can_reconcile_execution_status(&existing.status) =>
+                && existing.status.can_reconcile() =>
         {
             // Already in the right status — nothing to do.
         }
@@ -785,7 +789,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     let governing = live.clone().or_else(|| latest.clone());
 
     if let Some(existing) = governing {
-        if !execution_status_is_terminal(&existing.status) {
+        if !existing.status.is_terminal() {
             // Existing non-terminal row. Two cases:
             //   - is_live=true: a worker is genuinely attached to the
             //     slot. Keep the row, refresh priority / preferred
@@ -821,8 +825,8 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                     "dispatch_decision: work item already has a live execution — \
                      returning it, no new dispatch",
                 );
-                let next_status = if existing.status == "waiting_dependency" {
-                    "ready".to_owned()
+                let next_status = if existing.status == ExecutionStatus::WaitingDependency {
+                    ExecutionStatus::Ready
                 } else {
                     existing.status.clone()
                 };
@@ -836,7 +840,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                          priority = ?3,
                          preferred_workspace_id = ?4
                      WHERE id = ?1",
-                    params![existing.id, next_status, next_priority, next_preferred],
+                    params![existing.id, next_status.as_str(), next_priority, next_preferred],
                 )?;
                 return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else if existing.kind == ExecutionKind::CiRemediation {
@@ -984,7 +988,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         CreateExecutionInput::builder()
             .work_item_id(work_item_id)
             .kind(kind)
-            .status("ready")
+            .status(ExecutionStatus::Ready)
             .maybe_repo_remote_url(resolved_repo)
             .maybe_priority(priority)
             .maybe_preferred_workspace_id(preferred_workspace_id)
