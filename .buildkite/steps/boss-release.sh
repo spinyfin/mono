@@ -16,7 +16,7 @@
 # See tools/boss/docs/buildkite-shake-secrets-setup.md for provisioning.
 set -euo pipefail
 
-source ci-env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "--- $*"; }

@@ -9,7 +9,7 @@
 # root as its working directory — same rationale as checks.sh.
 set -euo pipefail
 
-source ci-env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [integrity-checkleft] starting"
 

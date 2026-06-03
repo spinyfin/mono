@@ -13,7 +13,7 @@
 # and boss-release.sh.
 set -euo pipefail
 
-source ci-env.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [integrity-bazel] starting"
 echo "[integrity-bazel] agent: $(uname -a)"
