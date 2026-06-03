@@ -1063,6 +1063,17 @@ pub(super) enum TranscriptResolution {
     /// `bossctl agents transcript` rejected the same id as `unknown
     /// run`, breaking the coordinator's diagnostic path.
     Buffering,
+    /// The execution exists but was never dispatched — no `work_runs`
+    /// row was ever created for it (the execution was abandoned or
+    /// orphaned before the scheduler could start it). No worker ran
+    /// so no transcript was recorded.
+    ///
+    /// This is the graceful-degradation path for conflict-resolution
+    /// and CI-fix revision executions that are abandoned when the
+    /// spawning attempt retires before dispatch (T1291 pattern). The
+    /// `execution_status` field carries the DB status for the error
+    /// message so the caller can explain _why_ there is no transcript.
+    NeverDispatched { execution_status: String },
     /// The id resolves to a `work_runs` row or `work_executions` row
     /// that has finished (or never recorded a transcript path).
     KnownNoTranscript,
@@ -1121,13 +1132,36 @@ pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &s
     // No path on either row. Decide between "known but no transcript",
     // "live worker still buffering", and "genuinely unknown".
     let run_known = run_lookup.is_some();
-    let execution_known = server_state.work_db.get_execution(run_id).is_ok();
+    let execution = server_state.work_db.get_execution(run_id).ok();
+    let execution_known = execution.is_some();
     let is_live = server_state.live_worker_states.is_run_live(run_id);
 
     if is_live {
         return TranscriptResolution::Buffering;
     }
     if run_known || execution_known {
+        // Distinguish between "execution was abandoned before a worker was
+        // ever started" (no work_runs row) and "worker ran but path wasn't
+        // recorded". The former is the T1291 pattern: a conflict-resolution
+        // or CI-fix revision execution gets abandoned by
+        // `reconcile_revision_execution` when the spawning attempt retires
+        // before the scheduler can pick up the execution. In that case the
+        // work_runs table has no row at all (current_run_id=null on the
+        // task), so pointing the user at transcript tail is misleading —
+        // instead surface a clear "never dispatched" message.
+        if !run_known && execution_known {
+            let has_any_run = server_state
+                .work_db
+                .has_run_row_for_execution(run_id)
+                .unwrap_or(true); // on DB error, default to "yes" → fall through to KnownNoTranscript
+            if !has_any_run {
+                let status = execution
+                    .as_ref()
+                    .map(|e| e.status.as_str().to_owned())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                return TranscriptResolution::NeverDispatched { execution_status: status };
+            }
+        }
         return TranscriptResolution::KnownNoTranscript;
     }
     TranscriptResolution::Unknown
