@@ -3377,21 +3377,37 @@ impl ExecutionCoordinator {
                         // (already surfaced as a `pane_spawn_failed`
                         // attention item) is recoverable rather than a
                         // silent green-flicker strand.
-                        match self
-                            .work_db
-                            .demote_active_work_item_to_todo(&execution.work_item_id)
-                        {
-                            Ok(true) => tracing::info!(
+                        //
+                        // Exception: PrReview spawn failures are engine
+                        // infrastructure bugs (e.g. slot-range mismatch),
+                        // not task regressions. Demoting the work item
+                        // here would silently move a reviewed PR back to
+                        // To-Do, erasing the review context. Leave the
+                        // task in place — the attention item already
+                        // surfaces the failure for the operator.
+                        if execution.kind != ExecutionKind::PrReview {
+                            match self
+                                .work_db
+                                .demote_active_work_item_to_todo(&execution.work_item_id)
+                            {
+                                Ok(true) => tracing::info!(
+                                    execution_id = %execution.id,
+                                    work_item_id = %execution.work_item_id,
+                                    "demoted work item to todo after pane-spawn failure",
+                                ),
+                                Ok(false) => {}
+                                Err(demote_err) => tracing::error!(
+                                    ?demote_err,
+                                    work_item_id = %execution.work_item_id,
+                                    "failed to demote work item out of active after pane-spawn failure",
+                                ),
+                            }
+                        } else {
+                            tracing::info!(
                                 execution_id = %execution.id,
                                 work_item_id = %execution.work_item_id,
-                                "demoted work item to todo after pane-spawn failure",
-                            ),
-                            Ok(false) => {}
-                            Err(demote_err) => tracing::error!(
-                                ?demote_err,
-                                work_item_id = %execution.work_item_id,
-                                "failed to demote work item out of active after pane-spawn failure",
-                            ),
+                                "skipping demote for pr_review spawn failure — engine infrastructure issue, not a task regression",
+                            );
                         }
                         self.publisher
                             .publish(

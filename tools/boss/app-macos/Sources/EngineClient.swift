@@ -197,6 +197,12 @@ enum EngineEvent {
     /// pane warning. Introduced after #699 where a missing API key
     /// silently broke summarization with no UI affordance.
     case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
+    /// Engine's live pool-size configuration, pushed immediately after
+    /// `app_session_registered` so `WorkersWorkspaceModel` can configure
+    /// its slot ranges before any `SpawnWorkerPane` request arrives.
+    /// This is the single source of truth: the engine's runtime config
+    /// drives the app's capacity check so they can never drift out of sync.
+    case enginePoolConfig(workerSlots: Int, automationSlots: Int, reviewSlots: Int)
     /// Response to `get_settings` — snapshot of every per-installation
     /// setting and its current value. Drives the Settings window.
     case settingsList(settings: [EngineSetting])
@@ -1219,6 +1225,11 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message: message))
             case "app_session_registered":
                 emit(.appSessionRegistered)
+            case "engine_pool_config":
+                let workerSlots = (payload["worker_slots"] as? NSNumber)?.intValue ?? 8
+                let automationSlots = (payload["automation_slots"] as? NSNumber)?.intValue ?? 3
+                let reviewSlots = (payload["review_slots"] as? NSNumber)?.intValue ?? 8
+                emit(.enginePoolConfig(workerSlots: workerSlots, automationSlots: automationSlots, reviewSlots: reviewSlots))
             case "boss_session_registered":
                 emit(.bossSessionRegistered)
             case "engine_request":

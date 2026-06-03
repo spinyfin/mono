@@ -10,10 +10,23 @@ final class WorkersWorkspaceModel: ObservableObject {
     static let automationSlotBase = workerSlotCount + 1   // 9
     static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 9...11
     /// Review pool occupies slot IDs immediately above the automation pool.
-    /// Mirrors MAX_REVIEW_POOL_SIZE in coordinator.rs.
-    static let reviewSlotCount = 3
+    /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
+    /// when the engine pushes EnginePoolConfig on RegisterAppSession, so the
+    /// app never independently hardcodes a value that drifts from the engine.
+    /// The initial value of 8 matches DEFAULT_REVIEW_POOL_SIZE in coordinator.rs
+    /// and ensures the slot grid renders correctly before the first pool-config
+    /// push arrives (covering the unlikely race of a SpawnWorkerPane before
+    /// EnginePoolConfig, and preventing an empty grid on first launch).
     static let reviewSlotBase = automationSlotBase + automationSlotCount   // 12
-    static let reviewSlotRange = reviewSlotBase...(reviewSlotBase + reviewSlotCount - 1)  // 12...14
+
+    /// Instance-level review slot count, kept in sync with the engine's live
+    /// pool config. Published so the pool-picker header re-renders whenever
+    /// the engine reports a pool size change on reconnect.
+    @Published private(set) var reviewSlotCount: Int = 8
+
+    var reviewSlotRange: ClosedRange<Int> {
+        WorkersWorkspaceModel.reviewSlotBase...(WorkersWorkspaceModel.reviewSlotBase + reviewSlotCount - 1)
+    }
 
     let runtime: GhosttyRuntime
     @Published private(set) var slots: [WorkerSlot]
@@ -33,7 +46,20 @@ final class WorkersWorkspaceModel: ObservableObject {
         self.automationSlots = (Self.automationSlotBase...(Self.automationSlotBase + Self.automationSlotCount - 1)).map { slot in
             WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
-        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + Self.reviewSlotCount - 1)).map { slot in
+        self.reviewSlots = (Self.reviewSlotBase...(Self.reviewSlotBase + 8 - 1)).map { slot in
+            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        }
+    }
+
+    /// Update pool capacities from the engine's EnginePoolConfig push.
+    /// Called every time the app registers a session, so the slot ranges
+    /// always mirror the live engine rather than independently-maintained
+    /// constants. Rebuilds the reviewer slot array when the count changes.
+    func configureSlots(workerCount: Int, automationCount: Int, reviewCount: Int) {
+        guard reviewSlotCount != reviewCount else { return }
+        reviewSlotCount = reviewCount
+        let base = WorkersWorkspaceModel.reviewSlotBase
+        reviewSlots = (base...(base + reviewCount - 1)).map { slot in
             WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
     }
@@ -55,13 +81,13 @@ final class WorkersWorkspaceModel: ObservableObject {
     func spawnWorkerPane(_ request: EngineSpawnRequest) -> EngineSpawnResult {
         let requestedSlot = request.slotId
         let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
-        let isReview = Self.reviewSlotRange.contains(Int(requestedSlot))
+        let isReview = reviewSlotRange.contains(Int(requestedSlot))
         let targetSlots: [WorkerSlot] = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
         guard requestedSlot >= 1,
               (requestedSlot <= Self.workerSlotCount || isAutomation || isReview),
               let index = targetSlots.firstIndex(where: { $0.slotId == Int(requestedSlot) })
         else {
-            let validRanges = "1...\(Self.workerSlotCount) or \(Self.automationSlotBase)...\(Self.automationSlotBase + Self.automationSlotCount - 1) or \(Self.reviewSlotBase)...\(Self.reviewSlotBase + Self.reviewSlotCount - 1)"
+            let validRanges = "1...\(Self.workerSlotCount) or \(Self.automationSlotBase)...\(Self.automationSlotBase + Self.automationSlotCount - 1) or \(Self.reviewSlotBase)...\(Self.reviewSlotBase + reviewSlotCount - 1)"
             return .failure(.internalFailure(
                 "engine requested slot \(requestedSlot), valid ranges are \(validRanges)"
             ))
@@ -144,7 +170,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// budget).
     func releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32) -> EngineReleaseResult {
         let isAutomation = Self.automationSlotRange.contains(slotId)
-        let isReview = Self.reviewSlotRange.contains(slotId)
+        let isReview = reviewSlotRange.contains(slotId)
         var targetSlots = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
@@ -210,7 +236,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// land the prompt: libghostty's paste path delivers control
     /// characters as input-field content, not as a keystroke.
     func sendToPane(slotId: Int, text: String) -> EngineSendResult {
-        let targetSlots = Self.reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
+        let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
@@ -231,7 +257,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// the window is visible if it was minimised or behind another
     /// app. Used by `bossctl agents focus`.
     func focusWorkerPane(slotId: Int) -> EngineFocusResult {
-        let targetSlots = Self.reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
+        let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
@@ -265,7 +291,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// as an in-flight-turn cancel). Used by `bossctl agents
     /// interrupt`.
     func interruptWorkerPane(slotId: Int) -> EngineInterruptResult {
-        let targetSlots = Self.reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
+        let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }

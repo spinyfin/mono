@@ -1513,6 +1513,18 @@ pub enum FrontendEvent {
     /// Engine confirms the calling session is now the registered app
     /// session, and any prior registration was invalidated.
     AppSessionRegistered,
+    /// Engine's live pool-size configuration, pushed to the macOS app
+    /// immediately after [`FrontendEvent::AppSessionRegistered`] so the
+    /// app's `WorkersWorkspaceModel` knows the exact slot ranges to
+    /// accept for `SpawnWorkerPane` requests. The engine is the source
+    /// of truth; the app must configure itself from this on every
+    /// connection rather than relying on independently-maintained
+    /// hardcoded counts that drift when pool sizes change.
+    EnginePoolConfig {
+        worker_slots: u8,
+        automation_slots: u8,
+        review_slots: u8,
+    },
     /// Engine confirms the Boss session pid was registered.
     BossSessionRegistered,
     /// Engine confirms a probe was queued for the given run. The
@@ -2507,6 +2519,29 @@ mod editorial_controls_tests {
         assert!(json.contains("boss_exec_prefix"), "serialized: {json}");
         let parsed: BranchNaming = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, BranchNaming::BossExecPrefix);
+    }
+
+    #[test]
+    fn engine_pool_config_round_trips_through_serde() {
+        let event = FrontendEvent::EnginePoolConfig {
+            worker_slots: 8,
+            automation_slots: 3,
+            review_slots: 8,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"engine_pool_config\""), "serialized: {json}");
+        assert!(json.contains("\"worker_slots\":8"), "serialized: {json}");
+        assert!(json.contains("\"automation_slots\":3"), "serialized: {json}");
+        assert!(json.contains("\"review_slots\":8"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::EnginePoolConfig { worker_slots, automation_slots, review_slots } => {
+                assert_eq!(worker_slots, 8);
+                assert_eq!(automation_slots, 3);
+                assert_eq!(review_slots, 8);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

@@ -1760,6 +1760,10 @@ final class ChatViewModel: ObservableObject {
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
+    /// Invoked when the engine pushes `engine_pool_config` on session
+    /// registration. Allows `ContentView` to forward the pool sizes to
+    /// `WorkersWorkspaceModel` so its slot ranges mirror the engine.
+    var panePoolConfigHandler: ((Int, Int, Int) -> Void)?
 
     /// Whether the engine has confirmed this client is the registered app session.
     /// Reset on disconnect; set when `appSessionRegistered` is received.
@@ -2031,6 +2035,8 @@ final class ChatViewModel: ObservableObject {
         case .engineHealthResult(let apiKeyPresent, let issues):
             engineAnthropicApiKeyPresent = apiKeyPresent
             engineHealthIssues = issues
+        case .enginePoolConfig(let workerSlots, let automationSlots, let reviewSlots):
+            panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots)
         case .settingsList(let settings):
             engineSettings = settings
         case .settingSet(let key, let enabled):
