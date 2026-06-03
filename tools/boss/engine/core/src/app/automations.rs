@@ -50,15 +50,23 @@ pub(super) async fn handle_list_automations(ctx: Dispatch, req: FrontendRequest)
         unreachable!()
     };
     {
-        match work_db.list_automations(&product_id) {
-            Ok(automations) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationsList {
-                    product_id,
-                    automations,
-                },
-            ),
+        match work_db.list_automations_with_open_task_counts(&product_id) {
+            Ok(rows) => {
+                let open_task_counts = rows
+                    .iter()
+                    .map(|(a, count)| (a.id.clone(), *count))
+                    .collect();
+                let automations = rows.into_iter().map(|(a, _)| a).collect();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::AutomationsList {
+                        product_id,
+                        automations,
+                        open_task_counts,
+                    },
+                );
+            }
             Err(err) => send_response(
                 &sink,
                 &request_id,
