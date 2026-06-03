@@ -65,8 +65,8 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, GhPrStateChecker, PendingMergeCheck, WorkDb,
-    WorkItem, WorkerPrCompletionTarget,
+    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
+    WorkerPrCompletionTarget,
 };
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -981,6 +981,11 @@ pub struct WorkerCompletionHandler {
     /// no file-content changes). Production wires in the value from
     /// `WorkConfig` via [`Self::with_min_review_changed_lines`].
     min_review_changed_lines: u64,
+    /// PR state checker passed to `create_revision` in
+    /// `finalize_pr_review_pass`. Defaults to [`GhPrStateChecker`] (shells
+    /// out to `gh pr view`); tests inject `FakePrStateChecker::always(Open)`
+    /// via [`Self::with_pr_state_checker`] to avoid live network calls.
+    pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
 }
 
 impl WorkerCompletionHandler {
@@ -1015,6 +1020,7 @@ impl WorkerCompletionHandler {
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
+            pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
         }
     }
 
@@ -1047,6 +1053,18 @@ impl WorkerCompletionHandler {
     /// tests that exercise the trivial-diff path set it to a small value.
     pub fn with_min_review_changed_lines(mut self, min: u64) -> Self {
         self.min_review_changed_lines = min;
+        self
+    }
+
+    /// Override the PR state checker used by `finalize_pr_review_pass` when
+    /// creating a revision (P992 task 8). Tests inject
+    /// `FakePrStateChecker::always(Open)` to avoid live `gh` calls.
+    #[cfg(test)]
+    fn with_pr_state_checker(
+        mut self,
+        checker: Arc<dyn crate::work::PrStateChecker>,
+    ) -> Self {
+        self.pr_state_checker = checker;
         self
     }
 
@@ -2294,7 +2312,7 @@ must not be asked to open one",
                     .description(instructions)
                     .created_via(created_via)
                     .build(),
-                &GhPrStateChecker,
+                self.pr_state_checker.as_ref(),
             ) {
                 Ok(revision) => {
                     tracing::info!(
@@ -4440,7 +4458,8 @@ mod tests {
     };
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, WorkDb, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState,
+        WorkDb, WorkItem,
     };
 
     /// Captured arguments from one `detect_pr` call. Tests assert on
@@ -10437,6 +10456,703 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert!(
             matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
             "API error in noop gate must fail open (enqueue reviewer); got {outcome:?}",
+        );
+    }
+
+    // ── P992 task 13: end-to-end / integration tests ──────────────────────────
+    //
+    // These tests exercise the complete produce→review→revise→re-review loop
+    // and the termination conditions (cycle bound, no-op gate interaction).
+    // Individual component unit tests (severity gate, no-op gate, instructions
+    // rendering, etc.) live above; these tests operate at the completion-handler
+    // level to verify the full state-machine transitions.
+
+    /// Build a JSONL transcript line containing `review_result_json` in an
+    /// assistant message, matching the format `read_final_triage_message`
+    /// expects (one JSON object per line, `type=assistant`, `message.content`
+    /// array with a `text` block).
+    ///
+    /// Uses `serde_json` for the outer object so the `text` field is properly
+    /// escaped regardless of what characters appear in the ReviewResult JSON.
+    fn make_review_transcript_jsonl(review_result_json: &str) -> String {
+        let text =
+            format!("Here is my automated PR review.\n\n```json\n{review_result_json}\n```");
+        let obj = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": text}]
+            }
+        });
+        format!("{}\n", obj)
+    }
+
+    /// Build a producing chore with `pr_url` already set (simulating the
+    /// PendingReview state that `finalize_pr_transition` writes) together with
+    /// a `pr_review` execution in `waiting_human` status. Optionally write a
+    /// JSONL transcript file and register its path so
+    /// `finalize_pr_review_pass` can read the `ReviewResult`.
+    ///
+    /// Returns `(db, product_id, chore_id, pr_review_exec_id, pr_url)`.
+    fn pr_review_exec_fixture(
+        workspace_path: &Path,
+        review_result_json: Option<&str>,
+    ) -> (Arc<WorkDb>, String, String, String, String) {
+        const PR_URL: &str = "https://github.com/spinyfin/mono/pull/88";
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        // Producing task — starts active, gets pr_url stamped so the reviewer
+        // can find the PR (mirrors what finalize_pr_transition writes on
+        // PendingReview).
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Implement feature X".into(),
+                description: Some("Feature X adds Y functionality to the pipeline.".into()),
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(PR_URL.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // PrReview execution in waiting_human (reviewer spawned, now stopped).
+        let pr_review_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let (pr_review_exec, run) = db
+            .start_execution_run(
+                &pr_review_exec.id,
+                "review-worker-1",
+                "mono",
+                "lease-review-1",
+                "mono-agent-review-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &pr_review_exec.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("reviewer spawned"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Optionally write a transcript containing the ReviewResult JSON.
+        if let Some(json) = review_result_json {
+            let jsonl = make_review_transcript_jsonl(json);
+            let transcript_path =
+                workspace_path.join(format!("transcript-{}.jsonl", pr_review_exec.id));
+            std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
+            db.set_run_transcript_path_if_unset(
+                &pr_review_exec.id,
+                transcript_path.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
+        (
+            db,
+            product.id,
+            chore.id,
+            pr_review_exec.id,
+            PR_URL.to_owned(),
+        )
+    }
+
+    /// Produce a minimal valid `ReviewResult` JSON with no qualifying findings
+    /// (medium severity only, no regressions) — the engine severity gate must
+    /// NOT fire for this result.
+    fn clean_review_result_json(pr_url: &str) -> String {
+        serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_abc123",
+            "summary": "The PR looks good overall. Minor style note only.",
+            "revision_warranted": false,
+            "findings": [
+                {
+                    "severity": "medium",
+                    "category": "readability",
+                    "file": "src/lib.rs",
+                    "title": "Minor naming nit",
+                    "detail": "Consider renaming `x` to `input` for clarity.",
+                    "confidence": "low"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string()
+    }
+
+    /// Produce a `ReviewResult` JSON with a HIGH severity correctness finding —
+    /// the engine severity gate fires for this result.
+    fn high_finding_review_result_json(pr_url: &str) -> String {
+        serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_abc123",
+            "summary": "Critical correctness issue found in the PR.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "src/pr.rs",
+                    "location": "fn ensure_pr, ~L120",
+                    "title": "Duplicate PR case not handled",
+                    "detail": "The `?` on the gh call swallows the 422 — handle the duplicate-PR case explicitly.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string()
+    }
+
+    /// Produce a `ReviewResult` JSON with a LOW severity REGRESSION finding
+    /// (the T793 check class). Even though the severity is low, the engine's
+    /// gate must fire because `category = "regression"` overrides severity.
+    fn t793_regression_review_result_json(pr_url: &str) -> String {
+        serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_abc123",
+            "summary": "Forward-port silently dropped the autostart feature.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "low",
+                    "category": "regression",
+                    "file": "tools/boss/engine/core/src/lib.rs",
+                    "location": "fn init, ~L10",
+                    "title": "Forward-port dropped the autostart feature",
+                    "detail": "The autostart flag was removed during conflict resolution; restore it.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string()
+    }
+
+    // ── Tests: finalize_pr_review_pass paths ─────────────────────────────────
+
+    /// Build a `FakePrStateChecker` that always reports the PR as open — used
+    /// by all pr_review tests so `create_revision` doesn't shell out to `gh`.
+    fn open_pr_checker() -> Arc<dyn crate::work::PrStateChecker> {
+        Arc::new(FakePrStateChecker::always(PrOpenState::Open))
+    }
+
+    /// A clean reviewer result (no critical/high/regression findings) must
+    /// advance the producing task to `in_review` without creating a revision
+    /// and tick the `review_cycle` counter.
+    #[tokio::test]
+    async fn pr_review_pass_clean_advances_to_in_review_without_revision() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = clean_review_result_json(pr_url);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), Some(&json));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+            "clean result must yield ReviewPassCompleted; got {outcome:?}",
+        );
+
+        // Producing task must be in in_review.
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected task/chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review", "chore must advance to in_review after reviewer approves");
+
+        // review_cycle must be incremented (0 → 1) by the completion handler.
+        let (review_cycle, last_sha) = db.get_task_review_cycle_state(&chore_id).unwrap();
+        assert_eq!(review_cycle, 1, "review_cycle must be incremented after each reviewer pass");
+        assert_eq!(
+            last_sha.as_deref(),
+            Some("sha_reviewed_abc123"),
+            "last_reviewed_sha must be recorded from the ReviewResult head_sha",
+        );
+    }
+
+    /// A `ReviewResult` with a HIGH severity finding must trigger the engine's
+    /// severity gate and create a revision on the producing task with the
+    /// correct `created_via` prefix and rendered instructions.
+    #[tokio::test]
+    async fn pr_review_pass_high_finding_creates_revision_with_correct_metadata() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = high_finding_review_result_json(pr_url);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), Some(&json));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        let revision_task_id = match &outcome {
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => {
+                revision_task_id.clone()
+            }
+            other => panic!("high finding must yield ReviewPassRevisionCreated; got {other:?}"),
+        };
+
+        // Revision must have the pr_review created_via prefix so the
+        // RevisionImplementation completion triggers another reviewer pass.
+        let revision = match db.get_work_item(&revision_task_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("revision is not a task/chore: {other:?}"),
+        };
+        assert!(
+            revision.created_via.starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX),
+            "revision created_via must carry the pr_review prefix so the \
+             RevisionImplementation re-triggers a reviewer pass; got: {:?}",
+            revision.created_via,
+        );
+        // Revision instructions must mention the finding.
+        assert!(
+            revision.description.contains("Duplicate PR case not handled"),
+            "revision instructions must include the finding title; got: {:?}",
+            revision.description,
+        );
+
+        // Producing task advances to in_review even when a revision is created
+        // (the revision is a follow-up child — the PR is still ready for
+        // human review with the outstanding findings noted internally).
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            task.status, "in_review",
+            "producing task must advance to in_review after reviewer pass",
+        );
+    }
+
+    /// A `ReviewResult` with a `regression` category finding must trigger the
+    /// engine's severity gate *regardless of severity level* — this is the
+    /// T793 check (a live feature silently removed during a forward-port must
+    /// be caught even if the reviewer rates it `low` severity).
+    #[tokio::test]
+    async fn pr_review_regression_finding_creates_revision_at_low_severity_t793_check() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = t793_regression_review_result_json(pr_url);
+        let (db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), Some(&json));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
+            "low-severity regression finding must still fire the severity gate \
+             and create a revision (T793 check); got {outcome:?}",
+        );
+    }
+
+    /// When no transcript is recorded (reviewer crashed or hook missed) the
+    /// completion handler must fall back gracefully to advancing the producing
+    /// task to `in_review` without creating a revision.
+    #[tokio::test]
+    async fn pr_review_pass_missing_transcript_advances_gracefully_without_revision() {
+        let workspace = tempdir().unwrap();
+        // No review result JSON → no transcript written.
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+            "missing transcript must fall back to ReviewPassCompleted; got {outcome:?}",
+        );
+
+        // Task still advances — a reviewer crash must not strand the task.
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            task.status, "in_review",
+            "producing task must advance to in_review even when reviewer produced no transcript",
+        );
+    }
+
+    // ── Test: cycle bound ─────────────────────────────────────────────────────
+
+    /// When `review_cycle` has already reached `max_review_cycles`, the next
+    /// producing-worker completion must skip the reviewer entirely, advance the
+    /// task directly to `in_review` (PrDetected), and create a sticky
+    /// `pr_review_cycle_bound` attention item for the human.
+    #[tokio::test]
+    async fn pr_review_cycle_bound_skips_reviewer_and_creates_attention_item() {
+        let workspace = tempdir().unwrap();
+        let (db, chore_id, execution_id, staged, branch) =
+            noop_skip_fixture(workspace.path(), None);
+
+        // Pre-increment the cycle counter to `max_review_cycles` so the bound
+        // is already reached when the producing worker finishes.
+        let max_cycles: usize = 1;
+        for _ in 0..max_cycles {
+            db.increment_task_review_cycle(&chore_id, Some("sha_prev"))
+                .expect("failed to pre-increment review_cycle");
+        }
+
+        let verifier = StubBranchVerifier::ok(&branch);
+        // diff line count doesn't matter here (cycle bound fires before noop gate).
+        verifier.set_diff_line_count(Ok(999)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged)
+        .with_branch_verifier(verifier)
+        .with_max_review_cycles(max_cycles);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        // Cycle bound: no reviewer enqueued → task goes straight to in_review.
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "cycle bound must skip reviewer and yield PrDetected; got {outcome:?}",
+        );
+
+        // Verify the sticky attention item was created for the human.
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review", "task must be in_review after cycle bound");
+
+        // The attention item is created on the task (work_item_id), not on
+        // the execution, so we query it via the task.
+        let attentions = db
+            .list_attention_items_for_work_item(&chore_id)
+            .expect("failed to list attention items");
+        assert!(
+            attentions.iter().any(|a| a.kind == "pr_review_cycle_bound"),
+            "a pr_review_cycle_bound attention item must exist; got: {attentions:?}",
+        );
+    }
+
+    // ── Test: full produce → review → revise → re-review loop ────────────────
+
+    /// End-to-end integration test for the complete automated-reviewer loop
+    /// (P992 design §1, §4, §7, §8, §9, §10, task 13).
+    ///
+    /// Flow:
+    ///   1. ChoreImplementation finishes → reviewer enqueued (PendingReview).
+    ///   2. PrReview (high finding) → revision created; producing task in_review.
+    ///   3. RevisionImplementation finishes → reviewer re-enqueued.
+    ///   4. PrReview (clean) → ReviewPassCompleted; revision task in_review.
+    #[tokio::test]
+    async fn full_produce_review_revise_re_review_loop_converges() {
+        const PR_URL: &str = "https://github.com/spinyfin/mono/pull/99";
+        let workspace = tempdir().unwrap();
+
+        // ── Step 1: ChoreImplementation completes → reviewer enqueued ────────
+        let (db, _product_id, chore_id, chore_exec_id) = fixture(workspace.path());
+
+        let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged.record_if_unset(&chore_exec_id, PR_URL);
+
+        let chore_branch =
+            expected_branch_name(&chore_exec_id, &BranchNaming::BossExecPrefix, None);
+        let verifier = StubBranchVerifier::ok(&chore_branch);
+        // diff line count: non-trivial so no-op gate doesn't fire (first review
+        // is never skipped by the trivial rule, but set it anyway for realism).
+        verifier.set_diff_line_count(Ok(50)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(staged.clone())
+        .with_branch_verifier(verifier.clone())
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&chore_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "step 1: expected ReviewerEnqueued; got {outcome:?}",
+        );
+
+        // ── Step 2: PrReview (high finding) → revision created ───────────────
+        // Find the newly-created PrReview execution (status = ready).
+        let ready = db.list_ready_executions().unwrap();
+        let pr_review_exec_1 = ready
+            .iter()
+            .find(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == chore_id)
+            .cloned()
+            .expect("a PrReview execution must exist in ready status after step 1");
+
+        // Start + finish the PrReview execution (simulate reviewer spawned).
+        let (pr_review_exec_1, run1) = db
+            .start_execution_run(
+                &pr_review_exec_1.id,
+                "review-worker-1",
+                "mono",
+                "lease-review-1",
+                "mono-agent-review-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &pr_review_exec_1.id,
+                &run1.id,
+                "waiting_human",
+                "completed",
+                Some("reviewer spawned"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Write a transcript with a HIGH finding.
+        let high_json = high_finding_review_result_json(PR_URL);
+        let transcript1 = workspace
+            .path()
+            .join(format!("transcript-{}.jsonl", pr_review_exec_1.id));
+        std::fs::write(&transcript1, make_review_transcript_jsonl(&high_json).as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(
+            &pr_review_exec_1.id,
+            transcript1.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let outcome2 = handler.on_stop(&pr_review_exec_1.id).await;
+        let revision_task_id = match &outcome2 {
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => {
+                revision_task_id.clone()
+            }
+            other => panic!("step 2: expected ReviewPassRevisionCreated; got {other:?}"),
+        };
+
+        // Verify the chore is now in_review and review_cycle = 1.
+        let chore_item = db.get_work_item(&chore_id).unwrap();
+        let chore_task = match chore_item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(chore_task.status, "in_review", "step 2: chore must be in_review");
+        let (cycle_after_r1, _) = db.get_task_review_cycle_state(&chore_id).unwrap();
+        assert_eq!(cycle_after_r1, 1, "step 2: review_cycle must be 1 after first reviewer pass");
+
+        // ── Step 3: RevisionImplementation finishes → reviewer re-enqueued ───
+        // Create and run a RevisionImplementation execution for the revision task.
+        let rev_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision_task_id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let (rev_exec, rev_run) = db
+            .start_execution_run(
+                &rev_exec.id,
+                "worker-rev-1",
+                "mono",
+                "lease-rev-1",
+                "mono-agent-rev-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &rev_exec.id,
+                &rev_run.id,
+                "waiting_human",
+                "completed",
+                Some("revision worker spawned"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Stage the same PR URL for the revision execution.
+        let rev_staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        rev_staged.record_if_unset(&rev_exec.id, PR_URL);
+
+        let rev_branch = expected_branch_name(&rev_exec.id, &BranchNaming::BossExecPrefix, None);
+        let rev_verifier = StubBranchVerifier::ok(&rev_branch);
+        rev_verifier.set_diff_line_count(Ok(30)).await;
+
+        let handler3 = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_staged_pr_urls(rev_staged)
+        .with_branch_verifier(rev_verifier)
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome3 = handler3.on_stop(&rev_exec.id).await;
+        assert!(
+            matches!(outcome3, StopOutcome::ReviewerEnqueued { .. }),
+            "step 3: revision completion must re-enqueue reviewer; got {outcome3:?}",
+        );
+
+        // ── Step 4: PrReview (clean) → ReviewPassCompleted ───────────────────
+        // Find the second PrReview execution (for the revision task).
+        let ready2 = db.list_ready_executions().unwrap();
+        let pr_review_exec_2 = ready2
+            .iter()
+            .find(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_task_id)
+            .cloned()
+            .expect("a second PrReview execution must exist after step 3");
+
+        // Start + finish.
+        let (pr_review_exec_2, run2) = db
+            .start_execution_run(
+                &pr_review_exec_2.id,
+                "review-worker-2",
+                "mono",
+                "lease-review-2",
+                "mono-agent-review-002",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &pr_review_exec_2.id,
+                &run2.id,
+                "waiting_human",
+                "completed",
+                Some("reviewer 2 spawned"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Write a clean transcript — no qualifying findings.
+        let clean_json = clean_review_result_json(PR_URL);
+        let transcript2 = workspace
+            .path()
+            .join(format!("transcript-{}.jsonl", pr_review_exec_2.id));
+        std::fs::write(&transcript2, make_review_transcript_jsonl(&clean_json).as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(
+            &pr_review_exec_2.id,
+            transcript2.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let outcome4 = handler.on_stop(&pr_review_exec_2.id).await;
+        assert!(
+            matches!(outcome4, StopOutcome::ReviewPassCompleted { .. }),
+            "step 4: clean review must yield ReviewPassCompleted; got {outcome4:?}",
+        );
+
+        // Revision task must be in_review — the loop converged.
+        let rev_item = db.get_work_item(&revision_task_id).unwrap();
+        let rev_task = match rev_item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected task, got {other:?}"),
+        };
+        assert_eq!(
+            rev_task.status, "in_review",
+            "step 4: revision task must be in_review after clean reviewer pass",
         );
     }
 }
