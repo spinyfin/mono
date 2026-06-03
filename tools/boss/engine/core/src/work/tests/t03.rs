@@ -2387,6 +2387,29 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
          or the Review-lane doc affordance silently disappears (the recurring bug)"
     );
 
+    // Wire-format assertion: verify that the pr_url value actually appears in
+    // the JSON serialization of the work tree — the IPC payload the macOS app
+    // receives. The existing assertion above checks the Rust struct; this
+    // checks the wire path so a serde annotation that silently drops pr_url
+    // (e.g. a mistaken skip_serializing_if) would also fail here. This is the
+    // T1310 gap-hunt addition: if this passes but the live card shows no link,
+    // the gap is in the app's IPC reception (parseTask) or render path.
+    let tasks_json = serde_json::to_value(&tree.tasks)
+        .expect("work tree tasks must be JSON-serializable");
+    let inv_json = tasks_json
+        .as_array()
+        .expect("tasks is an array")
+        .iter()
+        .find(|t| t["id"].as_str() == Some(investigation.id.as_str()))
+        .expect("investigation must appear in the serialized tasks array");
+    assert_eq!(
+        inv_json["pr_url"].as_str(),
+        Some(pr),
+        "pr_url must be present and non-null in the JSON wire payload — \
+         if this passes but the macOS card shows no link, the gap is in \
+         parseTask() or the render path, not in get_work_tree delivery"
+    );
+
     let _ = std::fs::remove_file(path);
 }
 
