@@ -1174,6 +1174,23 @@ impl WorkDb {
         Ok(path.flatten())
     }
 
+    /// `true` when at least one `work_runs` row exists for `execution_id`,
+    /// regardless of its `transcript_path` or `status`.
+    ///
+    /// Used by the `TailRunTranscript` handler to distinguish between
+    /// "execution was abandoned before dispatch (no work_runs row)" and
+    /// "worker ran but transcript_path was not recorded (row exists, column
+    /// is NULL)". The two cases warrant different diagnostic messages.
+    pub fn has_run_row_for_execution(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_runs WHERE execution_id = ?1",
+            params![execution_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Host id of the most-recent `work_runs` row for `execution_id`,
     /// or `None` when the execution has no run yet.
     ///

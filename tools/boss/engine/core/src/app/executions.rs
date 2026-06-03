@@ -726,6 +726,21 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                     },
                 );
             }
+            TranscriptResolution::NeverDispatched { execution_status } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "execution {run_id} was {execution_status} before dispatch — \
+                             no worker ever ran for this execution so no transcript was recorded. \
+                             This typically happens when a conflict-resolution or CI-fix revision \
+                             attempt retires (resolves) before the scheduler dispatches the \
+                             associated execution. Check the parent task's execution transcript instead."
+                        ),
+                    },
+                );
+            }
             TranscriptResolution::KnownNoTranscript => {
                 send_response(
                     &sink,

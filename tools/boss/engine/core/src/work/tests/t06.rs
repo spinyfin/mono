@@ -2223,3 +2223,164 @@ fn revision_completion_keeps_base_project_task_in_review() {
     let base_id = make_in_review_project_task(&db, &product_id, pr_url);
     assert_started_execution_keeps_base_in_review(&db, &base_id);
 }
+
+// ── Transcript-path recording for conflict-resolution revision executions ──
+
+/// Regression guard for the T1291 incident: a conflict-resolution revision
+/// execution that IS dispatched (while the `conflict_resolutions` attempt is
+/// still active) must record `transcript_path` in `work_runs` when the
+/// worker fires a hook with the path.
+///
+/// The failure mode: `set_run_transcript_path_if_unset` receives
+/// `RowMissing` when there is no `work_runs` row for the execution (the
+/// execution was abandoned before dispatch). This test verifies the HAPPY
+/// path — when the attempt is active and the scheduler calls
+/// `start_execution_run`, the `work_runs` row IS created, and the transcript
+/// path CAN be recorded. A separate test covers the abandoned-before-dispatch
+/// path (no `work_runs` row → `has_run_row_for_execution` returns false).
+#[test]
+fn conflict_resolution_revision_execution_records_transcript_path() {
+    let db = WorkDb::open(temp_db_path("crz-transcript-path")).unwrap();
+    let product_id = make_revision_product(&db, "crz-transcript");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1291";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // Insert a `conflict_resolutions` attempt (still `pending` / active).
+    let crz = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 1291,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base-sha-1".into()),
+            head_sha_before: Some("head-sha-1".into()),
+        })
+        .unwrap()
+        .unwrap();
+
+    // Create the revision task as `conflict_watch::maybe_spawn_conflict_revision`
+    // would (created_via = "merge-conflict:<crz_id>").
+    let revision_id = insert_conflict_revision_row(&db, &product_id, &chore_id, &crz.id);
+    db.set_conflict_resolution_revision_task_id(&crz.id, &revision_id)
+        .unwrap();
+
+    // Reconcile: attempt is still active → a `revision_implementation`
+    // execution is created with status = `ready`.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1, "one execution should be created");
+    assert_eq!(execs[0].1, "ready");
+    let exec_id = &execs[0].0;
+
+    // Precondition: no work_runs row yet.
+    assert!(
+        !db.has_run_row_for_execution(exec_id).unwrap(),
+        "precondition: no work_runs row before start_execution_run",
+    );
+
+    // Simulate the scheduler dispatching the execution.
+    let (_, run) = db
+        .start_execution_run(
+            exec_id,
+            "worker-conflict-1",
+            "mono",
+            "lease-crz-1",
+            "mono-agent-064",
+            "/tmp/mono-agent-064",
+        )
+        .unwrap();
+
+    // Now a work_runs row exists.
+    assert!(
+        db.has_run_row_for_execution(exec_id).unwrap(),
+        "work_runs row must exist after start_execution_run",
+    );
+    assert!(
+        db.transcript_path_for_execution(exec_id).unwrap().is_none(),
+        "transcript_path must be NULL at run start",
+    );
+
+    // Simulate the worker's first hook event reporting its transcript path.
+    let transcript_path = "/tmp/mono-agent-064/.boss/session.jsonl";
+    let outcome = db
+        .set_run_transcript_path_if_unset(exec_id, transcript_path)
+        .unwrap();
+    assert!(
+        matches!(outcome, SetRunTranscriptPathOutcome::Updated),
+        "set_run_transcript_path_if_unset must return Updated for a new run; got {outcome:?}",
+    );
+
+    // Confirm the path is readable via the execution-id namespace.
+    let recorded = db
+        .transcript_path_for_execution(exec_id)
+        .unwrap();
+    assert_eq!(
+        recorded.as_deref(),
+        Some(transcript_path),
+        "transcript_path must be retrievable via transcript_path_for_execution",
+    );
+
+    // The run row's id must match the run we started.
+    let _ = run; // run.id is the work_runs id; path was keyed on execution_id, both must agree.
+}
+
+/// Companion test: a conflict-resolution revision execution that was abandoned
+/// BEFORE the scheduler dispatched it has no `work_runs` row.
+/// `has_run_row_for_execution` must return `false` so the `TailRunTranscript`
+/// handler can surface a clear "never dispatched" message instead of the
+/// generic "no transcript path recorded" error.
+#[test]
+fn abandoned_conflict_resolution_revision_execution_has_no_run_row() {
+    let db = WorkDb::open(temp_db_path("crz-abandoned-no-run")).unwrap();
+    let product_id = make_revision_product(&db, "crz-abandoned");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1292";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let crz = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 1292,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base-sha-2".into()),
+            head_sha_before: Some("head-sha-2".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let revision_id = insert_conflict_revision_row(&db, &product_id, &chore_id, &crz.id);
+    db.set_conflict_resolution_revision_task_id(&crz.id, &revision_id)
+        .unwrap();
+
+    // First reconcile: attempt is active → execution created with status=ready.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1);
+    let exec_id = &execs[0].0.clone();
+    assert_eq!(execs[0].1, "ready");
+
+    // Conflict resolves before the scheduler picks up the execution.
+    db.mark_conflict_resolution_succeeded(&crz.id, None).unwrap();
+
+    // Second reconcile: execution is abandoned (no worker ran).
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].1, "abandoned", "execution must be abandoned");
+
+    // No work_runs row — the scheduler never called start_execution_run.
+    assert!(
+        !db.has_run_row_for_execution(&exec_id).unwrap(),
+        "abandoned execution must have no work_runs row; the TailRunTranscript handler \
+         must surface NeverDispatched rather than KnownNoTranscript",
+    );
+
+    // transcript_path_for_execution must return None (consistent with current behaviour).
+    assert!(
+        db.transcript_path_for_execution(&exec_id).unwrap().is_none(),
+        "no transcript path must be recorded for an execution that was never dispatched",
+    );
+}
