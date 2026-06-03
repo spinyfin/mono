@@ -525,7 +525,7 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
         }));
     }
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         // Auto mode for the worker pane. The engine's worker prompt
         // already instructs claude not to ask for human permission,
         // but that instruction is soft and cannot stop claude from
@@ -564,7 +564,16 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
             "Notification":     [hook.clone()],
             "SessionEnd":       [hook],
         },
-    })
+    });
+
+    // Reviewer sessions are latency-sensitive review passes: fast mode
+    // keeps Opus quality while cutting turnaround. Scoped to reviewers
+    // only — implementation/design/investigation workers are unaffected.
+    if input.worker_kind == WorkerKind::Reviewer {
+        value["fastMode"] = serde_json::json!(true);
+    }
+
+    value
 }
 
 /// Build the permission deny list. Returns a JSON array of strings in
@@ -1761,6 +1770,31 @@ mod tests {
                 "reviewer must deny {critical} (got {rev_deny:?})",
             );
         }
+    }
+
+    #[test]
+    fn reviewer_settings_json_has_fast_mode_standard_does_not() {
+        // Reviewer workers are latency-sensitive: fastMode must be true.
+        let mut rev_input = sample_input();
+        rev_input.worker_kind = WorkerKind::Reviewer;
+        let rev_parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+        assert_eq!(
+            rev_parsed["fastMode"],
+            serde_json::json!(true),
+            "reviewer settings.json must have fastMode:true",
+        );
+
+        // Standard workers must NOT have fastMode set at all.
+        let std_input = sample_input();
+        let std_parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+        assert!(
+            std_parsed.get("fastMode").is_none()
+                || std_parsed["fastMode"] == serde_json::json!(null),
+            "standard worker settings.json must not carry fastMode (got {:?})",
+            std_parsed.get("fastMode"),
+        );
     }
 
     #[test]
