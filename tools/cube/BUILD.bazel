@@ -34,7 +34,7 @@ rust_binary(
 rust_test(
     name = "cube_lib_test",
     crate = ":cube_lib",
-    size = "small",
+    size = "medium",
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
