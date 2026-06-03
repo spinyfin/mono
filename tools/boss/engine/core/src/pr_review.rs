@@ -46,6 +46,11 @@ pub struct PrReviewContext {
     pub head_sha: String,
     /// Paths of every file changed by the PR, relative to the repo root.
     pub changed_files: Vec<String>,
+    /// Full output of `gh pr diff` when the diff fits within the configured
+    /// line threshold. `None` when the diff was too large to embed or could
+    /// not be fetched. When `Some`, the reviewer prompt embeds it directly
+    /// so the reviewer skips the `gh pr diff` tool call.
+    pub diff_content: Option<String>,
 }
 
 /// Which review rubric to apply to a PR.
@@ -584,6 +589,31 @@ pub fn render_reviewer_initial_prompt(
         .map(|c| c.head_sha.as_str())
         .unwrap_or("<sha from gh pr view --json headRefOid>");
 
+    // When the diff is small enough, embed it directly so the reviewer
+    // doesn't need a `gh pr diff` tool call.
+    let embedded_diff = ctx.and_then(|c| c.diff_content.as_deref());
+    let diff_step = if embedded_diff.is_some() {
+        "2. The PR diff is pre-embedded in the **Embedded diff** section \
+         below — no need to fetch it separately.\n"
+            .to_owned()
+    } else {
+        format!("2. Get the diff for the annotated view: `gh pr diff {pr_ref}`\n")
+    };
+    let embedded_diff_section = match embedded_diff {
+        Some(diff) => format!(
+            "## Embedded diff\n\
+             \n\
+             Pre-fetched at review time. Read it carefully before forming \
+             findings.\n\
+             \n\
+             ```diff\n\
+             {diff}\n\
+             ```\n\
+             \n"
+        ),
+        None => String::new(),
+    };
+
     format!(
         "# PR review\n\
          \n\
@@ -608,7 +638,7 @@ pub fn render_reviewer_initial_prompt(
          \n\
          1. Your workspace is already checked out to the PR head — read \
             changed files directly with `Read`, `cat`, `grep`, etc.\n\
-         2. Get the diff for the annotated view: `gh pr diff {pr_ref}`\n\
+         {diff_step}\
          3. Get the PR description: `gh pr view {pr_ref}`\n\
          4. Read changed files and surrounding context using `Read`, `cat`, \
             `grep`, `jj show`, etc. — no writes.\n\
@@ -617,6 +647,7 @@ pub fn render_reviewer_initial_prompt(
             No prose, commentary, or text of any kind may follow the closing ` ``` `. \
             Do NOT emit the JSON bare or inline — it must be inside a ` ```json ` fence.\n\
          \n\
+         {embedded_diff_section}\
          {rubric}\n\
          ## Speed/comprehensiveness balance\n\
          \n\
@@ -685,6 +716,8 @@ pub fn render_reviewer_initial_prompt(
         pr_url = pr_url,
         pr_metadata_block = pr_metadata_block,
         pr_ref = pr_ref,
+        diff_step = diff_step,
+        embedded_diff_section = embedded_diff_section,
         schema_head_sha = schema_head_sha,
         rubric = rubric,
     )
@@ -868,6 +901,7 @@ mod tests {
             base_sha: "base000".to_owned(),
             head_sha: "head999".to_owned(),
             changed_files: vec!["src/main.rs".to_owned(), "tests/test.rs".to_owned()],
+            diff_content: None,
         };
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",
@@ -892,6 +926,68 @@ mod tests {
         assert!(
             !prompt.contains("NOT at the PR head"),
             "prompt must not warn that working tree is stale"
+        );
+    }
+
+    #[test]
+    fn reviewer_initial_prompt_with_embedded_diff_omits_gh_pr_diff_step() {
+        let ctx = PrReviewContext {
+            pr_number: 42,
+            base_sha: "base111".to_owned(),
+            head_sha: "head222".to_owned(),
+            changed_files: vec!["src/lib.rs".to_owned()],
+            diff_content: Some(
+                "diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}".to_owned(),
+            ),
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/42",
+            ReviewScope::Code,
+            Some(&ctx),
+        );
+        assert!(
+            !prompt.contains("gh pr diff 42"),
+            "prompt must NOT instruct reviewer to call gh pr diff when diff is embedded"
+        );
+        assert!(
+            prompt.contains("Embedded diff"),
+            "prompt must include the embedded diff section"
+        );
+        assert!(
+            prompt.contains("diff --git a/src/lib.rs"),
+            "prompt must contain the actual diff content"
+        );
+        assert!(
+            prompt.contains("no need to fetch it separately"),
+            "prompt must tell reviewer not to fetch the diff"
+        );
+    }
+
+    #[test]
+    fn reviewer_initial_prompt_without_diff_content_uses_gh_pr_diff_step() {
+        let ctx = PrReviewContext {
+            pr_number: 42,
+            base_sha: "base111".to_owned(),
+            head_sha: "head222".to_owned(),
+            changed_files: vec!["src/lib.rs".to_owned()],
+            diff_content: None,
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/42",
+            ReviewScope::Code,
+            Some(&ctx),
+        );
+        assert!(
+            prompt.contains("gh pr diff 42"),
+            "prompt must instruct reviewer to call gh pr diff when no diff is embedded"
+        );
+        assert!(
+            !prompt.contains("Embedded diff"),
+            "prompt must NOT include the embedded diff section when diff_content is None"
         );
     }
 

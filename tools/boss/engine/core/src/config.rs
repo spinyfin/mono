@@ -16,6 +16,13 @@ pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
 /// lines)"; operators can raise this to also skip small cosmetic-only pushes.
 pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
 
+/// Default line threshold for embedding `gh pr diff` output directly in the
+/// reviewer's initial prompt. PRs whose diff is at or below this many lines
+/// get the diff pre-embedded so the reviewer skips one `gh pr diff` tool
+/// call. Set to 0 to disable embedding entirely. Operators can lower this for
+/// cost-sensitive deployments or raise it to cover larger PRs.
+pub const DEFAULT_MAX_EMBED_DIFF_LINES: u64 = 500;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -63,6 +70,14 @@ pub struct WorkConfig {
     /// [`DEFAULT_MIN_REVIEW_CHANGED_LINES`] (0). P992 design §8.
     #[builder(default = DEFAULT_MIN_REVIEW_CHANGED_LINES)]
     pub min_review_changed_lines: u64,
+    /// Maximum diff size (lines) at which the engine pre-embeds the full
+    /// `gh pr diff` output in the reviewer's initial prompt. PRs at or below
+    /// this threshold skip the reviewer's first `gh pr diff` tool call.
+    /// Set to 0 to disable embedding. Configured via
+    /// `BOSS_MAX_EMBED_DIFF_LINES`; defaults to
+    /// [`DEFAULT_MAX_EMBED_DIFF_LINES`] (500).
+    #[builder(default = DEFAULT_MAX_EMBED_DIFF_LINES)]
+    pub max_review_embed_diff_lines: u64,
 }
 
 impl WorkConfig {
@@ -118,6 +133,14 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
+        let max_review_embed_diff_lines = std::env::var("BOSS_MAX_EMBED_DIFF_LINES")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .with_context(|| format!("could not parse BOSS_MAX_EMBED_DIFF_LINES: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -126,6 +149,7 @@ impl WorkConfig {
             .review_pool_size(review_pool_size)
             .max_review_cycles(max_review_cycles)
             .min_review_changed_lines(min_review_changed_lines)
+            .max_review_embed_diff_lines(max_review_embed_diff_lines)
             .build())
     }
 }
@@ -276,8 +300,9 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
-        MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
+        DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES,
+        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
+        resolve_runtime_cwd,
     };
     use std::path::PathBuf;
 
@@ -492,6 +517,41 @@ mod tests {
             match original_cycles {
                 Some(value) => std::env::set_var("BOSS_MAX_REVIEW_CYCLES", value),
                 None => std::env::remove_var("BOSS_MAX_REVIEW_CYCLES"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn max_embed_diff_lines_defaults_and_reads_from_env() {
+        let original = std::env::var_os("BOSS_MAX_EMBED_DIFF_LINES");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+
+        unsafe {
+            std::env::remove_var("BOSS_MAX_EMBED_DIFF_LINES");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(
+            config.max_review_embed_diff_lines,
+            DEFAULT_MAX_EMBED_DIFF_LINES
+        );
+
+        unsafe {
+            std::env::set_var("BOSS_MAX_EMBED_DIFF_LINES", "200");
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.max_review_embed_diff_lines, 200);
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("BOSS_MAX_EMBED_DIFF_LINES", value),
+                None => std::env::remove_var("BOSS_MAX_EMBED_DIFF_LINES"),
             }
             match original_db {
                 Some(value) => std::env::set_var("BOSS_DB_PATH", value),
