@@ -1073,12 +1073,17 @@ fn reviewer_claude_md_states_read_only_mandate() {
         rendered.contains("Read-only mandate"),
         "reviewer CLAUDE.md must contain read-only mandate section",
     );
-    // Must contain lease id but NOT workspace path (workspace locations are
-    // not stable — cube can place workspaces anywhere).
+    // Must contain both lease id and workspace path — reviewers need both to
+    // navigate the workspace that the engine checked out to the PR head.
     assert!(rendered.contains(&input.lease_id));
     assert!(
-        !rendered.contains(input.workspace_path.to_str().unwrap()),
-        "reviewer CLAUDE.md must not hardcode workspace path",
+        rendered.contains(input.workspace_path.to_str().unwrap()),
+        "reviewer CLAUDE.md must include workspace path (workspace is checked out to PR head)",
+    );
+    // Must mention that the workspace is at the PR head.
+    assert!(
+        rendered.contains("checked out to the PR head"),
+        "reviewer CLAUDE.md must mention that the workspace is at the PR head",
     );
     // Must NOT contain the standard PR-required delivery mandate from
     // the implementation worker CLAUDE.md.

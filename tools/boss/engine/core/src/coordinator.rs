@@ -1168,6 +1168,110 @@ pub struct ExecutionCoordinator {
     dispatch_paused_since_epoch_s: AtomicU64,
 }
 
+/// Check out a leased cube workspace to the head commit of a PR, so a reviewer
+/// worker can read full source at the PR head rather than working from a stale
+/// or arbitrary baseline.
+///
+/// Steps:
+/// 1. Fetch the current head OID from GitHub via `gh pr view`.
+/// 2. `jj git fetch` — pull the remote refs into the local jj store.
+/// 3. `jj edit <sha>` — move the workspace's working copy to the PR head.
+///
+/// Returns the head SHA on success. Any subprocess failure is returned as an
+/// `Err` so the dispatcher can record a start failure and retry.
+///
+/// The caller is responsible for releasing the workspace on error.
+async fn checkout_pr_head_for_review_workspace(
+    workspace_path: &Path,
+    pr_url: &str,
+    repo_slug: &str,
+) -> Result<String> {
+    let pr_number = crate::completion::pr_number_from_url(pr_url)
+        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
+    let pr_str = pr_number.to_string();
+
+    // 1. Fetch the current head SHA from GitHub.
+    let head_sha = {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr_str,
+                "-R",
+                repo_slug,
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| {
+                format!("failed to spawn `gh pr view {pr_number}` to fetch head SHA")
+            })?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if sha.is_empty() {
+            return Err(anyhow!(
+                "empty headRefOid for PR {pr_number} in {repo_slug}"
+            ));
+        }
+        sha
+    };
+
+    // 2. Fetch remote refs so jj knows about the head commit.
+    {
+        let output = Command::new("jj")
+            .args(["git", "fetch"])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .context("failed to spawn `jj git fetch`")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "`jj git fetch` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    // 3. Move the workspace's working copy to the PR head.
+    {
+        let output = Command::new("jj")
+            .args(["edit", &head_sha])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn `jj edit {head_sha}`"))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "`jj edit {head_sha}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    Ok(head_sha)
+}
+
 impl ExecutionCoordinator {
     /// Convenience constructor for tests and simple callers. Wraps the
     /// provided `cube_client` and `execution_runner` in a
@@ -2250,72 +2354,172 @@ impl ExecutionCoordinator {
                 .await;
         }
         let change_title = execution_change_title(execution, &work_item);
-        let workspace_path_str = lease.workspace_path.display().to_string();
-        let change_repr: Option<(String, String)> = adapter.command_repr(&[
-            "--json",
-            "change",
-            "create",
-            "--workspace",
-            &workspace_path_str,
-            "--title",
-            &change_title,
-        ]);
-        let change = match adapter
-            .create_change(&lease.workspace_path, &change_title)
-            .await
-        {
-            Ok(change) => change,
-            Err(err) => {
-                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                    tracing::error!(
-                        ?release_err,
-                        lease_id = %lease.lease_id,
-                        "failed to release workspace after change creation failure"
-                    );
+
+        // For pr_review executions that have a resolvable PR URL, check out the
+        // PR head in the leased workspace rather than creating a fresh jj change.
+        // The reviewer reads real source at the PR head; writes remain blocked by
+        // the tool denylist (design §9). When there is no PR URL (rare edge case),
+        // fall through to the normal create_change path.
+        let pr_review_pr_url: Option<&str> = if execution.kind == ExecutionKind::PrReview {
+            match &work_item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => {
+                    task.pr_url.as_deref().filter(|u| !u.is_empty())
                 }
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(
-                            Stage::CubeChangeCreated,
-                            DispatchOutcome::Error,
-                            &execution.id,
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let change: Option<CubeChangeHandle> = if let Some(pr_url) = pr_review_pr_url {
+            let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+                .unwrap_or_default();
+            match checkout_pr_head_for_review_workspace(
+                &lease.workspace_path,
+                pr_url,
+                &repo_slug,
+            )
+            .await
+            {
+                Ok(head_sha) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        %head_sha,
+                        workspace_path = %lease.workspace_path.display(),
+                        "reviewer workspace checked out to PR head",
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Ok,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "reviewer_pr_checkout": true,
+                                "head_sha": head_sha,
+                            })),
                         )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_cube_lease(&lease.lease_id)
-                        .with_cube_workspace(&lease.workspace_id)
-                        .with_error(&err)
-                        .with_cube_invocation(change_repr.clone()),
-                    )
-                    .await;
-                self.record_start_failure(
-                    Arc::clone(self),
-                    execution,
-                    worker_id,
-                    Some(repo.repo_id.as_str()),
-                    "cube_change_create_failed",
-                    "Cube `change create` failed",
-                    &err,
-                )?;
-                return Err(err);
+                        .await;
+                    None
+                }
+                Err(err) => {
+                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                        tracing::error!(
+                            ?release_err,
+                            lease_id = %lease.lease_id,
+                            "failed to release workspace after reviewer PR checkout failure",
+                        );
+                    }
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Error,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err),
+                        )
+                        .await;
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        "reviewer_pr_checkout_failed",
+                        "Reviewer workspace checkout to PR head failed",
+                        &err,
+                    )?;
+                    return Err(err);
+                }
+            }
+        } else {
+            // Normal path (and pr_review fallback when pr_url is absent): create
+            // a fresh jj change via `cube change create`.
+            let workspace_path_str = lease.workspace_path.display().to_string();
+            let change_repr: Option<(String, String)> = adapter.command_repr(&[
+                "--json",
+                "change",
+                "create",
+                "--workspace",
+                &workspace_path_str,
+                "--title",
+                &change_title,
+            ]);
+            match adapter
+                .create_change(&lease.workspace_path, &change_title)
+                .await
+            {
+                Ok(change) => {
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Ok,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_cube_invocation(change_repr)
+                            .with_details(serde_json::json!({
+                                "change_id": change.change_id,
+                                "change_title": change_title,
+                            })),
+                        )
+                        .await;
+                    Some(change)
+                }
+                Err(err) => {
+                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                        tracing::error!(
+                            ?release_err,
+                            lease_id = %lease.lease_id,
+                            "failed to release workspace after change creation failure"
+                        );
+                    }
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Error,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_cube_invocation(change_repr.clone()),
+                        )
+                        .await;
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        "cube_change_create_failed",
+                        "Cube `change create` failed",
+                        &err,
+                    )?;
+                    return Err(err);
+                }
             }
         };
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(worker_id)
-                    .with_cube_repo(&repo.repo_id)
-                    .with_cube_lease(&lease.lease_id)
-                    .with_cube_workspace(&lease.workspace_id)
-                    .with_cube_invocation(change_repr)
-                    .with_details(serde_json::json!({
-                        "change_id": change.change_id,
-                        "change_title": change_title,
-                    })),
-            )
-            .await;
 
         match self.work_db.start_execution_run_on_host(
             &execution.id,
@@ -2335,7 +2539,7 @@ impl ExecutionCoordinator {
                     cube_repo_id = %repo.repo_id,
                     cube_lease_id = %lease.lease_id,
                     cube_workspace_id = %lease.workspace_id,
-                    cube_change_id = %change.change_id,
+                    cube_change_id = ?change.as_ref().map(|c| &c.change_id),
                     workspace_path = %lease.workspace_path.display(),
                     "started execution run"
                 );
@@ -3072,6 +3276,8 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
+    // `change` is `None` for `pr_review` executions that checked out the PR
+    // head directly; `Some` for all other executions that created a jj change.
     #[allow(clippy::too_many_arguments)]
     async fn run_execution(
         self: Arc<Self>,
@@ -3080,7 +3286,7 @@ impl ExecutionCoordinator {
         work_item: WorkItem,
         worker_id: String,
         lease: CubeWorkspaceLease,
-        change: CubeChangeHandle,
+        change: Option<CubeChangeHandle>,
         adapter: Arc<dyn HostAdapter>,
     ) {
         // Keep the cube lease alive for the lifetime of the run. Without
@@ -3117,7 +3323,7 @@ impl ExecutionCoordinator {
                 &execution,
                 &work_item,
                 lease.workspace_path.as_path(),
-                Some(change.change_id.as_str()),
+                change.as_ref().map(|c| c.change_id.as_str()),
             )
             .await;
         drop(heartbeat);

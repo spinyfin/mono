@@ -41,8 +41,9 @@ turnaround.
   pool, always running at **Opus** level regardless of the reviewed task's
   effort, with its own execution kind and dispatch routing.
 - **Read-only enforcement.** The reviewer cannot mutate the PR/branch — by
-  prompt mandate, by tool denylist, and by not depending on workspace
-  writes.
+  prompt mandate and by tool denylist. The reviewer has a real workspace
+  checked out to the PR head so it can read full source in context; writes
+  remain denied via the tool denylist.
 - **Bounded cost and latency.** Explicit, tunable cap on review→revision
   cycles; skip re-review of no-ops; prefer fast high-signal feedback over
   exhaustive analysis.
@@ -225,8 +226,10 @@ This mandate is reinforced at the tooling level (see *Read-only
 enforcement*).
 
 **What to review (inputs):** the PR diff against the merge base / `main`,
-the producing task's stated purpose, and the changed files in context
-(read access to the workspace checkout is allowed; writes are denied).
+the producing task's stated purpose, and the changed files in context.
+The reviewer workspace is checked out to the PR head SHA so the reviewer
+can read files directly (read access is allowed; writes are denied via
+the tool denylist).
 
 **High-bar, actionable rubric.** Push back, with a HIGH bar and VERY
 actionable feedback, on:
@@ -417,22 +420,24 @@ never skipped by the trivial-size rule (we always do at least one pass).
 
 ### 9. Read-only enforcement
 
-Three layers:
+Two layers:
 
 1. **Prompt mandate** (section 2): explicit, repeated read-only / no-GitHub
-   instruction.
-2. **Tool denylist** (primary enforcement): the reviewer worker kind is
-   spawned with write/push tools denied — no `Edit`/`Write`, no `jj`/`git`
-   push, no `gh` write subcommands, no `cube pr ensure`. Read/search tools
-   and read-only `gh`/`jj` (diff, view, log) are allowed. This requires a
-   per-worker-kind tool allow/deny capability in the worker spawn path; if
-   one does not already exist it is a prerequisite implementation task
-   (see breakdown). This is the *enforceable* guarantee, not just a polite
-   request.
-3. **No-write workspace posture:** the reviewer reads the PR via
-   `gh pr diff` / a read-only checkout and does not need workspace mutation
-   at all. If feasible, run the reviewer against a read-only view so even an
-   attempted write fails. (Defense in depth; the denylist is the contract.)
+   instruction. The reviewer CLAUDE.md and the initial prompt both state
+   the mandate prominently.
+2. **Tool denylist** (primary enforcement, the contract): the reviewer worker
+   kind is spawned with write/push tools denied — no `Edit`/`Write`, no
+   `jj`/`git` push, no `gh` write subcommands, no `cube pr ensure`.
+   Read/search tools and read-only `gh`/`jj` (diff, view, log) are allowed.
+   This is the *enforceable* guarantee, not just a polite request.
+
+The reviewer is dispatched with a real cube workspace checked out to the PR
+head SHA (`jj git fetch` + `jj edit <sha>` before worker spawn). This lets
+the reviewer read any file in the PR directly — it is no longer constrained
+to `gh pr diff` plus `git show <sha>:<path>` for every lookup. The tool
+denylist remains the enforcement mechanism for read-only; the real workspace
+improves review quality by enabling full source navigation without weakening
+any guarantee.
 
 ### 10. Cost & latency analysis
 
@@ -518,10 +523,11 @@ lengthening turnaround."
    findings, the PR proceeds to human Review with findings attached
    internally. Where do those surface for the human — the task detail, the
    Reviewers page, or both?
-7. **Reviewer reading the diff.** Read the diff via `gh pr diff` (needs
-   read-only gh auth) vs. a local read-only checkout (needs the branch
-   present in a workspace). Which is the canonical input? Affects the
-   read-only workspace posture (section 9.3).
+7. **Reviewer reading the diff.** *(Resolved.)* The engine checks out the
+   reviewer's workspace to the PR head SHA (`jj git fetch` + `jj edit <sha>`)
+   before spawning the worker. The reviewer uses `gh pr diff` for the diff
+   view but reads surrounding files directly from the workspace checkout.
+   The tool denylist enforces read-only (section 9).
 8. **Interaction with stacked PRs.** For stacked PRs (auto-rebase design),
    does each PR in the stack get its own review, and how is the merge base
    computed per-stack-entry? Likely "review each PR against its stack

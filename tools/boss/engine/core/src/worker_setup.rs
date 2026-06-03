@@ -149,7 +149,10 @@ pub struct WorkerSetupInput {
 /// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     if input.worker_kind == WorkerKind::Reviewer {
-        return crate::pr_review::render_reviewer_claude_md(&input.lease_id);
+        return crate::pr_review::render_reviewer_claude_md(
+            &input.lease_id,
+            &input.workspace_path.display().to_string(),
+        );
     }
     if input.worker_kind == WorkerKind::Triage {
         return crate::automation_triage::render_triage_claude_md(&input.lease_id);
