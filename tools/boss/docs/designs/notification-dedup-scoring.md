@@ -23,7 +23,7 @@ What it does **not** catch is the case this project targets: two agents flag *th
 | Anthropic API substrate (`pane_summary::claude_short_summary`, `live_status::SummarizerOutcome`) | A structured-output **dedup decision** call reusing that substrate |
 | `merge_poller` background-sweep pattern (`run_one_pass`) | A bounded, idempotent **startup sweep** over existing `Attention` items |
 | `AttentionsView` Notifications window | A score/priority affordance + score-aware ordering |
-| Env-var config (`WorkConfig::load_from_env`) | A `notification_dedup_enabled` flag (`BOSS_NOTIFICATION_DEDUP`), off-safe default |
+| `boss-feature-flags` framework (`FeatureFlagsStore`, debug-pane toggle) | A `notification_dedup` flag registered in the `REGISTRY` with `default_enabled: false`, togglable live from Debug → Feature Flags |
 
 ## Naming
 
@@ -279,13 +279,25 @@ The LLM **may** fold new information from the duplicate into the canonical, but 
 
 ### 6. Feature flag
 
-Boss has no general feature-flag framework — config is environment-driven (`WorkConfig::load_from_env`, `engine/core/src/config.rs`). The flag follows that exact pattern:
+Boss has a feature-flag framework (`boss-feature-flags` crate, `tools/boss/engine/feature-flags/src/lib.rs`) that surfaces flags in the macOS app under **Debug → Feature Flags** and lets an operator toggle them live without rebuilding the engine. Adding a flag is two edits: append a `FeatureFlagSpec` to `REGISTRY`, then call `feature_flags.is_enabled("name")` at the consumer site. The `FeatureFlagsStore` is already threaded through `ServerState` and `Runner` as `Arc<FeatureFlagsStore>`, so new consumers can reach it without new plumbing.
 
-- **Field:** `WorkConfig.notification_dedup_enabled: bool`.
-- **Env var:** `BOSS_NOTIFICATION_DEDUP` (parsed like the existing `BOSS_*` vars).
+This flag fits the framework's "manual opt-in" pattern (the README's `default_enabled: false` case) — it gates a new risk-bearing LLM path that operators should be able to enable deliberately and kill instantly if it misbehaves.
+
+- **Registry entry** (`tools/boss/engine/feature-flags/src/lib.rs`):
+  ```rust
+  FeatureFlagSpec {
+      name: "notification_dedup",
+      description: "Run LLM near-duplicate detection when persisting an Attention item \
+                    (creation path) and on startup (sweep). Off by default — enable to \
+                    opt in; set to false to kill immediately if it misbehaves.",
+      category: "notifications",
+      default_enabled: false,
+  }
+  ```
 - **Default: `false` (off-safe).** With the flag off: the creation-time LLM check is never reached (exact dedup runs exactly as today), and the startup sweep is not scheduled. The score column still exists on `attentions` and defaults to `1`, so the data model is forward-compatible whether or not the flag is ever turned on.
-- **What each path checks:** the creation path consults the flag at the point it would otherwise persist a new `Attention` item (after exact dedup, before the prefilter); the sweep consults it at boot before scheduling. One field, two read sites — no scattered conditionals.
+- **Consumer pattern:** `feature_flags.is_enabled("notification_dedup")`. Two read sites — the creation path (after exact dedup, before the prefilter) and the boot-time sweep scheduler. No scattered conditionals. The `FeatureFlagsStore` is available at both sites via the existing `Arc<FeatureFlagsStore>` threading (`ServerState::feature_flags`, `Runner::feature_flags`).
 - **Degradation independent of the flag:** even with the flag *on*, a `NoApiKey` / `ApiError` / timeout outcome fails safe to "create normally" (creation) or "skip this bucket" (sweep) — the absence of an API key never blocks notification creation. (Mirrors how `live_status` degrades on `NoApiKey`.)
+- **Live toggle from the debug pane:** because the flag is in the registry, an operator can flip it via Debug → Feature Flags with immediate effect. No rebuild, no restart required. This is the primary kill switch if the dedup logic misbehaves in production.
 
 ### 7. Startup sweep — trigger & idempotency
 
@@ -356,7 +368,7 @@ PR-sized tasks in dependency order. Effort hints: `trivial | small | medium | la
 
 1. **Schema + score field + provenance ledger** (`boss-engine`). Idempotent migration adding `score INTEGER NOT NULL DEFAULT 1` and `merged_into_attention_id TEXT` to `attentions`; adding `answer_state = 'merged'` as a recognized terminal value; creating the `attention_merges` table + its indexes (item-level ids, including the pair-unique sweep-idempotency index). Add `score` (and the atomic `UPDATE ... SET score = score + ?` increment helper) and `merged_into_attention_id` to `map_attention` / list queries; add `score: i64` to `boss_protocol::Attention` with `#[builder(default = 1)]`; `WorkDb` accessors for `attention_merges` (insert/list); empty-card-cleanup helper (count open members after fold). **Effort:** `medium`. **Depends on:** none.
 
-2. **Feature-flag plumbing** (`boss-engine`). Add `notification_dedup_enabled: bool` to `WorkConfig` + `WorkConfigBuilder`, parse `BOSS_NOTIFICATION_DEDUP` in `load_from_env` (default `false`), and thread it to the two read sites (creation path, boot). No behavior change yet — just the gate, defaulting off. **Effort:** `small`. **Depends on:** none.
+2. **Feature-flag plumbing** (`boss-feature-flags`, `boss-engine`). Append the `notification_dedup` `FeatureFlagSpec` (with `default_enabled: false`, `category: "notifications"`) to `REGISTRY` in `tools/boss/engine/feature-flags/src/lib.rs`. Add `is_enabled("notification_dedup")` checks at the two consumer sites (creation path in `attentions.rs`, boot-time sweep scheduler in `app.rs`), reading from the `Arc<FeatureFlagsStore>` already available at both sites. No behavior change yet — just the gate, defaulting off, with a live debug-pane toggle. **Effort:** `trivial`. **Depends on:** none.
 
 3. **Structured-output dedup-decision substrate + contract** (`boss-protocol`, `boss-engine`). Define `DedupInput` / `DedupDecision` / `AttentionBrief` / `CanonicalEdit` / `Confidence` in `boss-protocol`; add a reusable `structured_call` helper alongside `pane_summary::claude_short_summary` (forced tool call / JSON-schema-constrained output, typed outcomes modeled on `SummarizerOutcome`); implement `decide_dedup(DedupInput) -> Result<DedupDecision>` with the system prompt, model-tier constant (default Haiku), `max_tokens` bound, and engine-side validation (canonical attention id ∈ input set; else not-a-dup). No callers yet. **Effort:** `large`. **Depends on:** none (but the prefilter/rendering helpers in task 4 consume its types).
 
