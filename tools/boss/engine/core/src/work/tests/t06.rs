@@ -1144,17 +1144,12 @@ fn create_revision_uses_explicit_name_over_description_fallback() {
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let explicit_name = "Fix missing version number in release builds";
     let task = db.create_revision(
-            CreateRevisionInput {
-                parent_task_id: parent_id,
-                description: "I also don't see the version number in /release/ builds created by the buildkite release pipeline.".to_owned(),
-                name: Some(explicit_name.to_owned()),
-                priority: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-                created_via: None,
-                autostart: true,
-            },
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id)
+                .description("I also don't see the version number in /release/ builds created by the buildkite release pipeline.")
+                .name(explicit_name)
+                .autostart(true)
+                .build(),
             &checker,
         ).unwrap();
 
@@ -1174,17 +1169,11 @@ fn create_revision_with_autostart_false_stores_zero() {
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let revision = db
         .create_revision(
-            CreateRevisionInput {
-                parent_task_id: parent_id,
-                description: "fix something but don't auto-start".to_owned(),
-                name: None,
-                priority: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-                created_via: None,
-                autostart: false,
-            },
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id)
+                .description("fix something but don't auto-start")
+                .autostart(false)
+                .build(),
             &checker,
         )
         .unwrap();
