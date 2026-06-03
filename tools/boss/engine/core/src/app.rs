@@ -930,7 +930,8 @@ impl ServerState {
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion)
-            .with_max_review_cycles(cfg.work.max_review_cycles),
+            .with_max_review_cycles(cfg.work.max_review_cycles)
+            .with_min_review_changed_lines(cfg.work.min_review_changed_lines),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
