@@ -4265,12 +4265,14 @@ private struct PrMergingIndicator: View {
                 .font(.caption2.weight(.semibold))
             Text("merging")
                 .font(.caption.weight(.semibold))
+                .lineLimit(1)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(backgroundColor)
         .clipShape(Capsule())
+        .fixedSize()
         .help("PR is in the merge queue and actively being shipped.")
         .accessibilityLabel("In merge queue — merging")
     }
@@ -4297,12 +4299,14 @@ private struct PrInRevisionIndicator: View {
                 .font(.caption2.weight(.semibold))
             Text("in revision")
                 .font(.caption.weight(.semibold))
+                .lineLimit(1)
         }
         .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.orange)
         .clipShape(Capsule())
+        .fixedSize()
         .help("A revision is in progress — do not merge this PR yet")
         .accessibilityLabel("In revision — do not merge")
     }
