@@ -6,12 +6,7 @@ exports_files(["Cargo.toml"])
 rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
-    # `boss shake`'s github_app module loads embedded RSA test fixtures
-    # via `include_str!("../tests/fixtures/…")` inside #[cfg(test)]
-    # blocks. The fixtures aren't reachable from a non-test build, but
-    # `include_str!` is parsed unconditionally — Bazel needs them
-    # staged in the sandbox or the binary fails to compile.
-    compile_data = glob(["tests/fixtures/**"]) + [
+    compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         # rules_rust expands $(execpath ...) to an absolute path at compile time.
@@ -23,9 +18,6 @@ rust_binary(
     # actually sees the vars via option_env!(). Default values are empty
     # strings (see .bazelrc); the release pipeline overrides via --define.
     rustc_env = {
-        "BOSS_SHAKE_APP_ID": "$(BOSS_SHAKE_APP_ID)",
-        "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
-        "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
         # Absolute path to the generated build-info constants file.
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
@@ -37,6 +29,7 @@ rust_binary(
     ],
     deps = [
         "//tools/boss/client",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -48,6 +41,7 @@ rust_test(
     size = "small",
     deps = [
         "//tools/boss/client",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

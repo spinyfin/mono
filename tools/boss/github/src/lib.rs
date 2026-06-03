@@ -1,12 +1,8 @@
-//! GitHub App authentication for `boss shake`.
+//! GitHub App authentication helpers for Boss tooling.
 //!
-//! The verb files an issue against `spinyfin/mono` (the upstream Boss
-//! repo). Authentication has to work in the user's corporate
-//! environment, where `gh` requires a wrapper alias to function, so we
-//! cannot shell out to `gh`. Instead we authenticate as a registered
-//! GitHub App: sign a JWT with the App's RSA private key, exchange it
-//! for a short-lived installation access token, and use that token on
-//! the issue-create call.
+//! Authentication works without `gh`: we sign a JWT with the App's RSA
+//! private key, exchange it for a short-lived installation access token,
+//! and use that token for REST and GraphQL API calls.
 //!
 //! Credentials are embedded at build time from three env vars:
 //! `BOSS_SHAKE_APP_ID`, `BOSS_SHAKE_INSTALLATION_ID`, and

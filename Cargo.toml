@@ -4,6 +4,7 @@ members = [
   "tools/boss/bossctl",
   "tools/boss/cli",
   "tools/boss/client",
+  "tools/boss/github",
   "tools/boss/engine/conflict-diagnosis",
   "tools/boss/engine/core",
   "tools/boss/engine/editorial",
