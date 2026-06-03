@@ -370,6 +370,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             workspace_path,
             cube_change_id,
             editorial_enabled,
+            self.cfg.work.max_review_embed_diff_lines,
         )
         .await;
 
@@ -624,7 +625,48 @@ async fn fetch_pr_review_context(
         base_sha: response.base_ref_oid,
         head_sha: response.head_ref_oid,
         changed_files: response.files.into_iter().map(|f| f.path).collect(),
+        diff_content: None,
     })
+}
+
+/// Fetch the raw diff for a PR via `gh pr diff <pr_url>`.
+///
+/// Returns the full diff text on success. Returns `None` on any error —
+/// callers fall back gracefully (reviewer fetches the diff itself). The
+/// caller is responsible for deciding whether the diff is small enough to
+/// embed.
+async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
+    use std::process::Stdio;
+
+    let output = tokio::process::Command::new("gh")
+        .args(["pr", "diff", pr_url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            pr_url,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "fetch_pr_diff: gh pr diff failed; reviewer will fetch diff itself",
+        );
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| {
+            tracing::warn!(
+                pr_url,
+                error = %e,
+                "fetch_pr_diff: diff output is not valid UTF-8",
+            );
+            e
+        })
+        .ok()
 }
 
 /// Per-execution prompt + spawn-config composition shared by every
@@ -651,6 +693,7 @@ pub(crate) async fn compose_worker_spawn(
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     editorial_enabled: bool,
+    max_embed_diff_lines: u64,
 ) -> ComposedWorkerSpawn {
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -852,7 +895,7 @@ pub(crate) async fn compose_worker_spawn(
             // context (base/head SHAs, changed files) rather than discovering
             // it turn-by-turn. Fail open on error — the URL-only prompt is
             // still functional.
-            let pr_review_context = fetch_pr_review_context(pr_url).await;
+            let mut pr_review_context = fetch_pr_review_context(pr_url).await;
             if let Some(ref ctx) = pr_review_context {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -868,6 +911,36 @@ pub(crate) async fn compose_worker_spawn(
                     pr_url,
                     "pr_review execution: PR metadata fetch failed; reviewer will use URL-only prompt",
                 );
+            }
+            // When the diff is small enough, pre-fetch it and embed it
+            // directly in the reviewer's initial prompt so the reviewer
+            // skips one `gh pr diff` tool call. Disabled when
+            // max_embed_diff_lines is 0.
+            if max_embed_diff_lines > 0 {
+                if let Some(ref mut ctx) = pr_review_context {
+                    if let Some(diff) = fetch_pr_diff(pr_url).await {
+                        let line_count = diff.lines().count() as u64;
+                        if line_count <= max_embed_diff_lines {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                line_count,
+                                max_embed_diff_lines,
+                                "pr_review execution: embedding diff in reviewer prompt",
+                            );
+                            ctx.diff_content = Some(diff);
+                        } else {
+                            tracing::debug!(
+                                execution_id = %execution.id,
+                                pr_url,
+                                line_count,
+                                max_embed_diff_lines,
+                                "pr_review execution: diff too large to embed; \
+                                 reviewer will fetch it",
+                            );
+                        }
+                    }
+                }
             }
             // Use the changed-file list (when available) to classify the review
             // scope accurately, instead of always defaulting to Code.
