@@ -13,5 +13,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+rand = { workspace = true }
+rsa = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 wiremock = { workspace = true }

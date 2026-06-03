@@ -26,7 +26,6 @@ rust_library(
 rust_test(
     name = "github_test",
     size = "small",
-    compile_data = glob(["tests/fixtures/**"]),
     crate = ":github",
     edition = "2024",
     proc_macro_deps = all_crate_deps(

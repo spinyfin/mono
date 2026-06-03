@@ -381,24 +381,39 @@ pub async fn add_issue_to_project_with_embedded_token(
 mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding as Pkcs1LineEnding};
+    use rsa::pkcs8::EncodePublicKey;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A throwaway RSA-2048 keypair generated offline (`openssl genrsa
-    /// 2048` + `openssl rsa -pubout`). Loaded via `include_str!` from
-    /// `tests/fixtures/` so the actual armoring matches what GitHub's
-    /// App download UI emits.
-    const TEST_RSA_PEM: &str = include_str!("../tests/fixtures/github-app-private-key.pem");
-    const TEST_RSA_PUBLIC_PEM: &str = include_str!("../tests/fixtures/github-app-public-key.pem");
+    /// Generate a fresh RSA-2048 keypair for tests. Returns `(private_pem,
+    /// public_pem)` in PKCS#1 and SPKI PEM formats respectively — the same
+    /// formats `jsonwebtoken` expects for `EncodingKey::from_rsa_pem` and
+    /// `DecodingKey::from_rsa_pem`.
+    fn generate_test_keypair() -> (String, String) {
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen failed");
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let private_pem = private_key
+            .to_pkcs1_pem(Pkcs1LineEnding::LF)
+            .expect("private key to PKCS#1 PEM")
+            .to_string();
+        let public_pem = public_key
+            .to_public_key_pem(rsa::pkcs8::spki::der::pem::LineEnding::LF)
+            .expect("public key to SPKI PEM");
+        (private_pem, public_pem)
+    }
 
     #[test]
     fn build_jwt_produces_decodable_rs256_token() {
-        let token = build_jwt_at("42", TEST_RSA_PEM.as_bytes(), 1_700_000_000).unwrap();
+        let (private_pem, public_pem) = generate_test_keypair();
+        let token = build_jwt_at("42", private_pem.as_bytes(), 1_700_000_000).unwrap();
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&["42"]);
         validation.validate_exp = false;
-        let key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_PEM.as_bytes()).unwrap();
+        let key = DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap();
 
         #[derive(Deserialize)]
         struct Claims {
@@ -439,10 +454,11 @@ mod tests {
     }
 
     fn make_test_config() -> AppConfig {
+        let (private_pem, _) = generate_test_keypair();
         AppConfig {
             app_id: "42".into(),
             installation_id: "67890".into(),
-            private_key_pem: TEST_RSA_PEM.to_owned(),
+            private_key_pem: private_pem,
         }
     }
 
