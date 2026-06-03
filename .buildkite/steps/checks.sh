@@ -10,7 +10,7 @@
 # execs the binary directly, preserving the caller's cwd.
 set -euo pipefail
 
-source ci_env.sh
+source ci-env.sh
 
 echo "--- [checks] starting"
 

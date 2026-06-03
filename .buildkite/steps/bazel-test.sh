@@ -5,7 +5,7 @@
 # are excluded here; they run on the mac-app-build step on a macos-arm64 agent.
 set -euo pipefail
 
-source ci_env.sh
+source ci-env.sh
 
 echo "--- [bazel-test] starting"
 echo "[bazel-test] bazelisk: $(bazelisk version 2>&1 | head -1)"
