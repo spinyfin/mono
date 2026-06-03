@@ -22,35 +22,35 @@ pub struct CubeConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 #[non_exhaustive]
 pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
+    /// Defaults to 1 so test call sites don't need updating when new pool
+    /// fields are added.
+    #[builder(default = 1)]
     pub worker_pool_size: usize,
     /// Size of the dedicated automation worker pool. Configured via
     /// `BOSS_AUTOMATION_POOL_SIZE`; defaults to [`MAX_AUTOMATION_POOL_SIZE`].
+    #[builder(default = 1)]
     pub automation_pool_size: usize,
     /// Size of the dedicated review worker pool. Configured via
     /// `BOSS_REVIEW_POOL_SIZE`; defaults to [`DEFAULT_REVIEW_POOL_SIZE`]
     /// (deliberately small to bound always-Opus review spend).
+    #[builder(default = 1)]
     pub review_pool_size: usize,
     /// Maximum number of automated reviewer passes to run per PR.
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances the task to human Review
     /// directly. Configured via `BOSS_MAX_REVIEW_CYCLES`; defaults to
     /// [`DEFAULT_MAX_REVIEW_CYCLES`] (3). P992 design §7.
+    #[builder(default = DEFAULT_MAX_REVIEW_CYCLES)]
     pub max_review_cycles: usize,
 }
 
 impl WorkConfig {
-    /// Start building a [`WorkConfig`]. `cwd` and `db_path` are required; all
-    /// pool sizes default to 1 so call sites (especially tests) don't have to
-    /// be updated every time a new pool field is added.
-    pub fn builder() -> WorkConfigBuilder {
-        WorkConfigBuilder::new()
-    }
-
     pub fn load_from_env() -> Result<Self> {
         let cwd = resolve_runtime_cwd()?;
         let db_path = match std::env::var_os("BOSS_DB_PATH") {
@@ -102,66 +102,6 @@ impl WorkConfig {
             .review_pool_size(review_pool_size)
             .max_review_cycles(max_review_cycles)
             .build())
-    }
-}
-
-/// Builder for [`WorkConfig`]. Pool sizes default to 1; `cwd` and `db_path`
-/// must be set before [`build`](WorkConfigBuilder::build).
-#[derive(Debug, Clone, Default)]
-pub struct WorkConfigBuilder {
-    cwd: Option<PathBuf>,
-    db_path: Option<PathBuf>,
-    worker_pool_size: Option<usize>,
-    automation_pool_size: Option<usize>,
-    review_pool_size: Option<usize>,
-    max_review_cycles: Option<usize>,
-}
-
-impl WorkConfigBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    pub fn db_path(mut self, db_path: impl Into<PathBuf>) -> Self {
-        self.db_path = Some(db_path.into());
-        self
-    }
-
-    pub fn worker_pool_size(mut self, size: usize) -> Self {
-        self.worker_pool_size = Some(size);
-        self
-    }
-
-    pub fn automation_pool_size(mut self, size: usize) -> Self {
-        self.automation_pool_size = Some(size);
-        self
-    }
-
-    pub fn review_pool_size(mut self, size: usize) -> Self {
-        self.review_pool_size = Some(size);
-        self
-    }
-
-    pub fn max_review_cycles(mut self, n: usize) -> Self {
-        self.max_review_cycles = Some(n);
-        self
-    }
-
-    /// Build the [`WorkConfig`]. Panics if `cwd` or `db_path` were not set.
-    pub fn build(self) -> WorkConfig {
-        WorkConfig {
-            cwd: self.cwd.expect("WorkConfig::builder requires cwd"),
-            db_path: self.db_path.expect("WorkConfig::builder requires db_path"),
-            worker_pool_size: self.worker_pool_size.unwrap_or(1),
-            automation_pool_size: self.automation_pool_size.unwrap_or(1),
-            review_pool_size: self.review_pool_size.unwrap_or(1),
-            max_review_cycles: self.max_review_cycles.unwrap_or(DEFAULT_MAX_REVIEW_CYCLES),
-        }
     }
 }
 
