@@ -5,28 +5,28 @@ exports_files(["Cargo.toml"])
 
 rust_library(
     name = "conflict-diagnosis",
-    crate_name = "boss_conflict_diagnosis",
     srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_conflict_diagnosis",
     crate_root = "src/lib.rs",
     edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "conflict-diagnosis_test",
+    size = "small",
     crate = ":conflict-diagnosis",
     edition = "2024",
-    size = "small",
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )

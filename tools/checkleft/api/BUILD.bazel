@@ -13,8 +13,8 @@ js_library(
 npm_package(
     name = "checkleft_exec_pkg",
     srcs = [
-        ":checkleft_exec_js",
         "package.json",
+        ":checkleft_exec_js",
     ],
     package = "@checkleft/exec",
     version = "0.0.0",
@@ -23,13 +23,13 @@ npm_package(
 
 js_test(
     name = "checkleft_exec_js_test",
-    entry_point = "javascript/checkleft_exec_test.mjs",
     size = "small",
     data = [
-        ":checkleft_exec_js",
         "javascript/checkleft_exec_child.mjs",
         "javascript/checkleft_exec_test.mjs",
+        ":checkleft_exec_js",
     ],
+    entry_point = "javascript/checkleft_exec_test.mjs",
 )
 
 exports_files(

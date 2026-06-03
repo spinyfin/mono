@@ -12,11 +12,11 @@ npm_link_package(
 
 js_binary(
     name = "no_debug_logging_bin",
-    entry_point = "check.mjs",
     data = [
         "check.mjs",
         ":node_modules/@checkleft/exec",
     ],
+    entry_point = "check.mjs",
 )
 
 local_check(
@@ -26,13 +26,13 @@ local_check(
 
 js_test(
     name = "check_test",
-    entry_point = "check_test.mjs",
     size = "small",
     data = [
         "check.mjs",
         "fixture.ts",
         ":node_modules/@checkleft/exec",
     ],
+    entry_point = "check_test.mjs",
 )
 
 checkleft(

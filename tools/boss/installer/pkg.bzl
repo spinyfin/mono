@@ -157,6 +157,7 @@ notarize, and staple the final artifact.
 def _build_info_rs_impl(ctx):
     """Emits a Rust source file with stamped build constants."""
     output = ctx.actions.declare_file(ctx.attr.out)
+
     # ctx.info_file is the non-volatile status file (stable-status.txt)
     info_file = ctx.info_file
 

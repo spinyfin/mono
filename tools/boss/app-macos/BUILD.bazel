@@ -12,7 +12,6 @@ exports_files([
 
 swift_library(
     name = "boss_mac_app_lib",
-    module_name = "Boss",
     srcs = glob(["Sources/**/*.swift"]),
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
@@ -28,8 +27,9 @@ swift_library(
         "6",
         "-strict-concurrency=complete",
     ],
+    module_name = "Boss",
     deps = [
-        "//tools/boss/app-macos/Sources/UpdateCore:UpdateCore",
+        "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],
@@ -37,18 +37,18 @@ swift_library(
 
 macos_unit_test(
     name = "BossTests",
-    minimum_os_version = "15.0",
     size = "small",
+    minimum_os_version = "15.0",
     deps = [":boss_mac_app_tests_lib"],
 )
 
 swift_library(
     name = "boss_mac_app_tests_lib",
-    module_name = "BossTests",
+    testonly = True,
     srcs = glob(["Tests/BossTests/**/*.swift"]),
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTests",
     deps = [":boss_mac_app_lib"],
-    testonly = True,
 )
 
 # Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and
@@ -64,10 +64,6 @@ boss_short_version_plist(
 
 macos_application(
     name = "Boss",
-    bundle_id = "dev.spinyfin.bossmacapp",
-    infoplists = ["Info.plist", ":boss_version_plist"],
-    minimum_os_version = "15.0",
-    deps = [":boss_mac_app_lib"],
     # Bundle the engine and the Boss CLIs into Contents/Resources/bin/ so that
     # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
     # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
@@ -88,5 +84,12 @@ macos_application(
         # Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh").
         "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper": "Resources",
     },
+    bundle_id = "dev.spinyfin.bossmacapp",
+    infoplists = [
+        "Info.plist",
+        ":boss_version_plist",
+    ],
+    minimum_os_version = "15.0",
     visibility = ["//tools/boss/installer:__pkg__"],
+    deps = [":boss_mac_app_lib"],
 )

@@ -1,3 +1,5 @@
+"""Bazel rules and providers for local checkleft checks."""
+
 CheckInfo = provider(
     doc = "Metadata for one repo-local checkleft exec-v1 package.",
     fields = {
@@ -17,7 +19,6 @@ CheckIndexInfo = provider(
     },
 )
 
-
 def _sanitize_fragment(value):
     sanitized = value
     for needle in [" ", "/", "\\", ":", "@", "[", "]", "(", ")", "{", "}", ",", ";", "=", "\"", "'"]:
@@ -26,12 +27,10 @@ def _sanitize_fragment(value):
         return sanitized
     return "check"
 
-
 def _toml_string(value):
     return "\"{}\"".format(
         value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"),
     )
-
 
 def _render_exec_manifest(check_id, executable_path, args, provenance_target):
     lines = [
@@ -54,12 +53,10 @@ def _render_exec_manifest(check_id, executable_path, args, provenance_target):
     ])
     return "\n".join(lines)
 
-
 def _workspace_bin_path(file):
     if file.short_path.startswith("../"):
         return "bazel-bin/external/{}".format(file.short_path[len("../"):])
     return "bazel-bin/{}".format(file.short_path)
-
 
 def _render_bash_runfiles_setup(require_runfiles):
     lines = [
@@ -109,7 +106,6 @@ def _render_bash_runfiles_setup(require_runfiles):
         "fi",
     ])
     return "\n".join(lines)
-
 
 def _local_check_impl(ctx):
     check_id = ctx.attr.id.strip() or ctx.label.name
@@ -171,7 +167,6 @@ exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
         ),
     ]
 
-
 _local_check_rule = rule(
     implementation = _local_check_impl,
     executable = True,
@@ -187,7 +182,6 @@ _local_check_rule = rule(
     },
 )
 
-
 def _local_check_macro_impl(name, visibility, id, binary, args, implementation_name):
     _local_check_rule(
         name = name,
@@ -197,7 +191,6 @@ def _local_check_macro_impl(name, visibility, id, binary, args, implementation_n
         exec_args = args,
         implementation_name = implementation_name,
     )
-
 
 local_check = macro(
     attrs = {
@@ -213,7 +206,6 @@ local_check = macro(
     },
     implementation = _local_check_macro_impl,
 )
-
 
 def _check_index_impl(ctx):
     if not ctx.attr.checks:
@@ -279,7 +271,6 @@ def _check_index_impl(ctx):
         CheckIndexInfo(index = index_file),
     ]
 
-
 check_index = rule(
     implementation = _check_index_impl,
     attrs = {
@@ -290,14 +281,12 @@ check_index = rule(
     },
 )
 
-
 def _declare_check_index(name, visibility, checks):
     check_index(
         name = name,
         visibility = visibility,
         checks = checks,
     )
-
 
 def _checkleft_launcher_impl(ctx):
     index_file = ctx.attr.check_index[CheckIndexInfo].index
@@ -346,7 +335,6 @@ exec "$workspace_dir/{checkleft_path}" run{external_checks_file_arg} "$@"
         runfiles = runfiles,
     )
 
-
 _checkleft_launcher = rule(
     implementation = _checkleft_launcher_impl,
     executable = True,
@@ -365,7 +353,6 @@ _checkleft_launcher = rule(
         ),
     },
 )
-
 
 def _checkleft_impl(name, visibility, check_index, checks, external_checks_file):
     has_check_index = check_index != None
@@ -389,7 +376,6 @@ def _checkleft_impl(name, visibility, check_index, checks, external_checks_file)
         check_index = resolved_check_index,
         external_checks_file = external_checks_file,
     )
-
 
 checkleft = macro(
     attrs = {
