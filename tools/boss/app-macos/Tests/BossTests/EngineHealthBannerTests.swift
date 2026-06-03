@@ -47,6 +47,54 @@ final class EngineHealthBannerTests: XCTestCase {
         XCTAssertEqual(model.engineHealthIssues, [issue])
     }
 
+    /// Engine reports dispatch is paused — the `dispatch_paused` warning
+    /// issue must surface in `engineHealthIssues` so the amber banner
+    /// renders. The issue body contains the `bossctl dispatch resume`
+    /// remediation so operators know how to unblock dispatch.
+    func testDispatchPausedSurfacesWarningIssue() {
+        let model = makeModel()
+        let issue = EngineHealthIssue(
+            kind: "dispatch_paused",
+            severity: "warning",
+            title: "Dispatch is globally paused",
+            body: "Run `bossctl dispatch resume` to restore normal dispatch."
+        )
+
+        model.applyEventForTest(.engineHealthResult(
+            apiKeyPresent: true,
+            issues: [issue]
+        ))
+
+        XCTAssertTrue(model.engineAnthropicApiKeyPresent)
+        XCTAssertEqual(model.engineHealthIssues, [issue])
+    }
+
+    /// A resume (healthy report with no dispatch_paused issue) must
+    /// clear the banner. Without this, the amber strip persists after
+    /// `bossctl dispatch resume` runs — defeating the reactivity the
+    /// polling mechanism provides.
+    func testDispatchResumedClearsPausedIssue() {
+        let model = makeModel()
+        let issue = EngineHealthIssue(
+            kind: "dispatch_paused",
+            severity: "warning",
+            title: "Dispatch is globally paused",
+            body: "Run `bossctl dispatch resume` to restore normal dispatch."
+        )
+        model.applyEventForTest(.engineHealthResult(
+            apiKeyPresent: true,
+            issues: [issue]
+        ))
+        XCTAssertFalse(model.engineHealthIssues.isEmpty)
+
+        model.applyEventForTest(.engineHealthResult(
+            apiKeyPresent: true,
+            issues: []
+        ))
+
+        XCTAssertTrue(model.engineHealthIssues.isEmpty)
+    }
+
     /// A subsequent healthy report must clear a previously-surfaced
     /// issue. Otherwise the banner would stick around after the user
     /// restarted Boss with the env var set — exactly the affordance

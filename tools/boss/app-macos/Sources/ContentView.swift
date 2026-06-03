@@ -82,10 +82,10 @@ struct ContentView: View {
                     )
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                // Connection is up but the engine reports degraded
-                // config (currently: missing ANTHROPIC_API_KEY).
-                // Per #699: surface as a first-class affordance so
-                // summarization can't silently disappear.
+                // Connection is up but the engine reports a degraded
+                // condition (missing ANTHROPIC_API_KEY, dispatch paused,
+                // syspolicyd wedged, etc.). Surface as a first-class
+                // affordance so operators can't miss it (#699).
                 if model.isConnected, !model.engineHealthIssues.isEmpty {
                     EngineHealthBanner(issues: model.engineHealthIssues)
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -4798,11 +4798,11 @@ private struct EngineUnreachableBanner: View {
     }
 }
 
-/// Chrome-level banner surfacing engine-health issues — currently a
-/// missing `ANTHROPIC_API_KEY`. Introduced after #699 where the
-/// summarizer failed silently and the user only noticed because live
-/// status sentences never appeared. The first issue's title renders
-/// inline; expansion (chevron) reveals each issue's remediation body.
+/// Chrome-level banner surfacing engine-health issues: missing
+/// `ANTHROPIC_API_KEY`, dispatch paused, `syspolicyd` wedged, and any
+/// future issue the engine emits. Introduced after #699. The first
+/// issue's title renders inline; the chevron expands all issues with
+/// their remediation bodies.
 private struct EngineHealthBanner: View {
     let issues: [EngineHealthIssue]
     @State private var isExpanded: Bool = false
