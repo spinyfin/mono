@@ -1,0 +1,38 @@
+# checkleft-release build fragment — uploaded dynamically by the prepare step
+# when a release is actually being cut. Never used as a standalone pipeline.
+#
+# Uploaded via `buildkite-agent pipeline upload` inside phase_prepare() in
+# .buildkite/steps/checkleft-release.sh after the tag and GitHub Release are
+# created. On a no-release run (scheduled build, nothing changed) prepare exits
+# without uploading this fragment, so these steps never appear in the build.
+#
+# No `depends_on` is needed here: these steps are injected by prepare itself
+# and will only be scheduled after prepare exits successfully.
+
+steps:
+  - label: ":rust: checkleft-release (linux)"
+    key: "checkleft-release-linux"
+    command: ".buildkite/steps/checkleft-release.sh linux"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":linux: checkleft-release (musl)"
+    key: "checkleft-release-musl"
+    command: ".buildkite/steps/checkleft-release.sh musl"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":apple: checkleft-release (darwin)"
+    key: "checkleft-release-darwin"
+    command: ".buildkite/steps/checkleft-release.sh darwin"
+    agents:
+      queue: bazel-any
+      os: darwin
+    retry:
+      automatic: false

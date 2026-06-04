@@ -60,7 +60,7 @@ NOTES_FILE=""
 # checkleft-affecting paths for change-detection. Mirrors boss-release.sh's
 # scoping: the binary's source, the release script, and the pipeline wiring.
 # `tools/checkleft/` (trailing slash) deliberately excludes tools/checkleft_package/.
-CHANGE_PATHS_RE='^(tools/checkleft/|\.buildkite/steps/checkleft-release\.sh|\.buildkite/pipeline-checkleft-release\.yml)'
+CHANGE_PATHS_RE='^(tools/checkleft/|\.buildkite/steps/checkleft-release\.sh|\.buildkite/pipeline-checkleft-release\.yml|\.buildkite/pipeline-checkleft-release-builds\.yml)'
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
@@ -364,6 +364,15 @@ phase_prepare() {
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"
   TAG_PUSHED=0  # release created; stop guarding the tag
+
+  # Fan out the build phases. The linux/musl/darwin steps live in a separate
+  # fragment file and are only injected into the running build now that we know
+  # a release is being cut. On a no-release run this block is never reached, so
+  # those steps never appear in the build and no bazel builds are wasted.
+  if command -v buildkite-agent &>/dev/null; then
+    log "[checkleft-release] uploading build phases for ${NEW_TAG}"
+    buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release-builds.yml
+  fi
   log "[checkleft-release] prepare done — ${NEW_TAG} created; build phases will attach assets"
 }
 
