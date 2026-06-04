@@ -333,18 +333,28 @@ phase_prepare() {
     || die "tag push rejected for ${NEW_TAG}; the agent's git credentials may not be able to push to ${REPO}."
   TAG_PUSHED=1
 
-  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
-  # Explicitly anchor the changelog range to the previous checkleft-v* tag so
-  # that --generate-notes doesn't fall back to whatever tag is globally newest
-  # (which may belong to a different product like boss-v*).  When LAST_TAG is
-  # empty (first-ever checkleft release) we omit the flag and let GitHub default.
-  local notes_start_arg=()
+  log "[checkleft-release] generating release notes for ${NEW_TAG}"
+  local notes_file
+  notes_file="$(mktemp /tmp/checkleft-release-notes-XXXXXX.md)"
   if [[ -n "${LAST_TAG}" ]]; then
-    notes_start_arg=(--notes-start-tag "${LAST_TAG}")
+    bazel build //tools/repobin:repobin
+    ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
+    bin/changelog \
+      --project tools/checkleft/PROJECT.yaml \
+      --from "${LAST_TAG}" \
+      --to "${NEW_TAG}" \
+      --repo "${REPO}" \
+      --enrich \
+      > "${notes_file}"
+  else
+    printf 'Initial checkleft release.\n' > "${notes_file}"
   fi
+
+  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
   gh release create "${NEW_TAG}" --repo "${REPO}" \
-    --title "checkleft ${NEW_VERSION}" --generate-notes \
-    "${notes_start_arg[@]}"
+    --title "checkleft ${NEW_VERSION}" \
+    --notes-file "${notes_file}"
+  rm -f "${notes_file}"
 
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"
