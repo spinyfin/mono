@@ -516,8 +516,7 @@ impl std::str::FromStr for ExecutionStatus {
 /// that every callsite handles new variants explicitly — adding a new status
 /// here produces a compile error at every status-keyed branch that must
 /// reason about it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaskStatus {
     Todo,
     Active,
@@ -526,6 +525,19 @@ pub enum TaskStatus {
     Done,
     Archived,
     Cancelled,
+}
+
+impl serde::Serialize for TaskStatus {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.display_label())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TaskStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        raw.parse::<TaskStatus>().map_err(serde::de::Error::custom)
+    }
 }
 
 impl TaskStatus {
@@ -587,16 +599,17 @@ impl std::str::FromStr for TaskStatus {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "todo" => Ok(Self::Todo),
-            "active" => Ok(Self::Active),
+            // stored names (DB / wire send path)
+            "todo" | "backlog" => Ok(Self::Todo),
+            "active" | "doing" => Ok(Self::Active),
             "blocked" => Ok(Self::Blocked),
-            "in_review" => Ok(Self::InReview),
+            "in_review" | "review" => Ok(Self::InReview),
             "done" => Ok(Self::Done),
             "archived" => Ok(Self::Archived),
             "cancelled" => Ok(Self::Cancelled),
             other => Err(format!(
                 "unknown task status: `{other}`; expected one of: \
-                 todo, active, blocked, in_review, done, archived, cancelled"
+                 backlog, doing, review, blocked, done, archived, cancelled"
             )),
         }
     }
@@ -4601,6 +4614,40 @@ mod tests {
         assert_eq!(chore, TaskKind::Chore);
         let project_task: TaskKind = serde_json::from_str(r#""project_task""#).unwrap();
         assert_eq!(project_task, TaskKind::ProjectTask);
+    }
+
+    #[test]
+    fn task_status_serializes_as_display_labels() {
+        assert_eq!(serde_json::to_string(&TaskStatus::Todo).unwrap(), r#""backlog""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Active).unwrap(), r#""doing""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::InReview).unwrap(), r#""review""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Blocked).unwrap(), r#""blocked""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Done).unwrap(), r#""done""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Archived).unwrap(), r#""archived""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Cancelled).unwrap(), r#""cancelled""#);
+    }
+
+    #[test]
+    fn task_status_deserializes_from_both_stored_and_display_names() {
+        // display names (what the engine serializes after this change)
+        let s: TaskStatus = serde_json::from_str(r#""backlog""#).unwrap();
+        assert_eq!(s, TaskStatus::Todo);
+        let s: TaskStatus = serde_json::from_str(r#""doing""#).unwrap();
+        assert_eq!(s, TaskStatus::Active);
+        let s: TaskStatus = serde_json::from_str(r#""review""#).unwrap();
+        assert_eq!(s, TaskStatus::InReview);
+        // stored names (accepted for backward compat / DB reads)
+        let s: TaskStatus = serde_json::from_str(r#""todo""#).unwrap();
+        assert_eq!(s, TaskStatus::Todo);
+        let s: TaskStatus = serde_json::from_str(r#""active""#).unwrap();
+        assert_eq!(s, TaskStatus::Active);
+        let s: TaskStatus = serde_json::from_str(r#""in_review""#).unwrap();
+        assert_eq!(s, TaskStatus::InReview);
+        // identical in both vocabularies
+        let s: TaskStatus = serde_json::from_str(r#""blocked""#).unwrap();
+        assert_eq!(s, TaskStatus::Blocked);
+        let s: TaskStatus = serde_json::from_str(r#""done""#).unwrap();
+        assert_eq!(s, TaskStatus::Done);
     }
 
     #[test]
