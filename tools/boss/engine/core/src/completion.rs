@@ -489,7 +489,7 @@ impl BranchVerifier for CommandBranchVerifier {
     }
 
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
-        fetch_pr_head_oid_cmd(repo_slug, pr_number).await
+        boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await
     }
 
     async fn fetch_diff_line_count(
@@ -555,30 +555,6 @@ async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String
     Ok(head_ref)
 }
 
-/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json headRefOid`
-/// and return the head SHA, or an error on failure / empty response.
-async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
-    let pr_str = pr_number.to_string();
-    let head_oid = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_str,
-            "-R",
-            repo_slug,
-            "--json",
-            "headRefOid",
-            "--jq",
-            ".headRefOid",
-        ],
-        &format!("gh pr view {pr_number} -R {repo_slug} --json headRefOid"),
-    )
-    .await?;
-    if head_oid.is_empty() {
-        return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
-    }
-    Ok(head_oid)
-}
 
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return
 /// the total number of changed lines (additions + deletions) across all files
