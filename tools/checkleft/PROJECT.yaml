@@ -1,0 +1,4 @@
+name: checkleft
+paths:
+  - tools/checkleft_package/
+  - tools/checks_js_componentizer/
