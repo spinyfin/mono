@@ -2588,6 +2588,7 @@ fn ci_flaky_retrigger_signal_clears_on_resolve_and_supersede() {
 
 /// Helper: collect the `reason` of every active blocked signal for a
 /// work item (cleared signals are excluded by `active_blocked_signals`).
+#[cfg(test)]
 fn active_signal_reasons(db: &WorkDb, work_item_id: &str) -> Vec<String> {
     db.active_blocked_signals(work_item_id)
         .unwrap()
@@ -2597,6 +2598,7 @@ fn active_signal_reasons(db: &WorkDb, work_item_id: &str) -> Vec<String> {
 }
 
 /// Helper: read a chore/task work item and unwrap to its `Task`.
+#[cfg(test)]
 fn task_of(db: &WorkDb, work_item_id: &str) -> Task {
     match db.get_work_item(work_item_id).unwrap() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
