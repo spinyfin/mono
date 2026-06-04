@@ -1302,11 +1302,6 @@ pub enum FrontendRequest {
         patch: AutomationPatch,
     },
 
-    UpdateWorkItem {
-        id: String,
-        patch: WorkItemPatch,
-    },
-
     /// App reports the real shell pid for a worker pane after the
     /// libghostty surface initializes. The engine stores this in
     /// `WorkerRegistry` and `LiveWorkerStateRegistry` so process
@@ -1316,6 +1311,11 @@ pub enum FrontendRequest {
     UpdateWorkerShellPid {
         run_id: String,
         shell_pid: i32,
+    },
+
+    UpdateWorkItem {
+        id: String,
+        patch: WorkItemPatch,
     },
 
     /// Snapshot the cube workspace pool. Proxies to
