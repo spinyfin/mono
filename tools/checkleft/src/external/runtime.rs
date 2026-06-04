@@ -2,7 +2,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -17,8 +16,7 @@ use crate::output::{CheckResult, Finding};
 use super::{
     EXTERNAL_CHECK_EXEC_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage,
     ExternalCheckExecPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCommandCapabilities, ExternalSourcePackageBuilder,
-    JavaScriptComponentSourcePackageBuilder, exec_protocol,
+    ExternalCommandCapabilities, exec_protocol,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -80,7 +78,6 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
 pub struct DefaultExternalCheckExecutor {
     root: PathBuf,
     engine: Engine,
-    source_package_builder: Arc<dyn ExternalSourcePackageBuilder>,
 }
 
 impl DefaultExternalCheckExecutor {
@@ -98,38 +95,7 @@ impl DefaultExternalCheckExecutor {
 
         let engine = build_wasmtime_engine()?;
 
-        let source_package_builder =
-            Arc::new(JavaScriptComponentSourcePackageBuilder::new(root.clone()));
-        Ok(Self {
-            root,
-            engine,
-            source_package_builder,
-        })
-    }
-
-    #[cfg(test)]
-    fn with_source_package_builder(
-        root: impl Into<PathBuf>,
-        source_package_builder: Arc<dyn ExternalSourcePackageBuilder>,
-    ) -> Result<Self> {
-        let root = root.into();
-        let root = root.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize check runtime root {}",
-                root.display()
-            )
-        })?;
-        if !root.is_dir() {
-            bail!("check runtime root is not a directory: {}", root.display());
-        }
-
-        let engine = build_wasmtime_engine()?;
-
-        Ok(Self {
-            root,
-            engine,
-            source_package_builder,
-        })
+        Ok(Self { root, engine })
     }
 
     fn execute_artifact(
@@ -436,33 +402,6 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                             )
                         })?;
                 self.execute_artifact(package, artifact, &command_capabilities, changeset, config)
-            }
-            ExternalCheckPackageImplementation::Source(source) => {
-                if package.runtime != EXTERNAL_CHECK_RUNTIME_V1 {
-                    bail!(
-                        "unsupported external runtime `{}` for source package `{}`",
-                        package.runtime,
-                        package.id
-                    );
-                }
-                let command_capabilities =
-                    ExternalCommandCapabilities::from_manifest(&package.capabilities)
-                        .with_context(|| {
-                            format!(
-                                "invalid command capability declaration for package `{}`",
-                                package.id
-                            )
-                        })?;
-                let built_artifact = self
-                    .source_package_builder
-                    .build_source_package(package, source)?;
-                self.execute_artifact(
-                    package,
-                    &built_artifact,
-                    &command_capabilities,
-                    changeset,
-                    config,
-                )
             }
         }
     }

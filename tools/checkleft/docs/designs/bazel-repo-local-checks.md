@@ -216,10 +216,6 @@ Not allowed in repo-local exec mode:
 - `[capabilities]`
 - `artifact_path`
 - `artifact_sha256`
-- `language`
-- `entry`
-- `build_adapter`
-- `sources`
 
 This keeps the mode honest: it is an executable contract, not a sandboxed
 artifact contract.

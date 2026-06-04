@@ -142,12 +142,3 @@ stale_exclusion_severity = "warning"
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.
 - Some built-in checks are specific to Bazel- or monorepo-style workflows.
-- JS/TS external checks in `source` mode cache built wasm artifacts under a
-  repo-scoped path in `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/`, and share
-  the JS toolchain install across repos when the pinned toolchain inputs match.
-  Those entries are derived-only and can be deleted to force a rebuild.
-
-## Examples
-
-- Repo-local `exec-v1` example with typed JavaScript API usage:
-  [`examples/typed_js_local_check/README.md`](examples/typed_js_local_check/README.md)

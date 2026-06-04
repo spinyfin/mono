@@ -67,12 +67,13 @@ allow_bypass = true
             runtime: "sandbox-v1".to_owned(),
             api_version: "v1".to_owned(),
             capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Source(
-                ExternalCheckSourcePackage {
-                    language: "javascript".to_owned(),
-                    entry: "./check.ts".to_owned(),
-                    build_adapter: "javascript-component".to_owned(),
-                    sources: Vec::new(),
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "check.wasm".to_owned(),
+                    artifact_sha256:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_owned(),
+                    provenance: None,
                 },
             ),
         }),
@@ -124,12 +125,13 @@ allow_bypass = true
             runtime: "sandbox-v1".to_owned(),
             api_version: "v1".to_owned(),
             capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Source(
-                ExternalCheckSourcePackage {
-                    language: "javascript".to_owned(),
-                    entry: "./check.ts".to_owned(),
-                    build_adapter: "javascript-component".to_owned(),
-                    sources: Vec::new(),
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "check.wasm".to_owned(),
+                    artifact_sha256:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_owned(),
+                    provenance: None,
                 },
             ),
         }),
@@ -274,12 +276,13 @@ severity = "error"
             runtime: "sandbox-v1".to_owned(),
             api_version: "v1".to_owned(),
             capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Source(
-                ExternalCheckSourcePackage {
-                    language: "javascript".to_owned(),
-                    entry: "./check.ts".to_owned(),
-                    build_adapter: "javascript-component".to_owned(),
-                    sources: Vec::new(),
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "check.wasm".to_owned(),
+                    artifact_sha256:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_owned(),
+                    provenance: None,
                 },
             ),
         }),
@@ -345,12 +348,13 @@ allow_bypass = true
             runtime: "sandbox-v1".to_owned(),
             api_version: "v1".to_owned(),
             capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Source(
-                ExternalCheckSourcePackage {
-                    language: "javascript".to_owned(),
-                    entry: "./check.ts".to_owned(),
-                    build_adapter: "javascript-component".to_owned(),
-                    sources: Vec::new(),
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "check.wasm".to_owned(),
+                    artifact_sha256:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_owned(),
+                    provenance: None,
                 },
             ),
         }),
@@ -420,12 +424,13 @@ implementation = "generated:domain-typo-check"
             runtime: "sandbox-v1".to_owned(),
             api_version: "v1".to_owned(),
             capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Source(
-                ExternalCheckSourcePackage {
-                    language: "javascript".to_owned(),
-                    entry: "./check.ts".to_owned(),
-                    build_adapter: "javascript-component".to_owned(),
-                    sources: Vec::new(),
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "check.wasm".to_owned(),
+                    artifact_sha256:
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_owned(),
+                    provenance: None,
                 },
             ),
         }),

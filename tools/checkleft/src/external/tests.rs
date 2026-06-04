@@ -6,10 +6,10 @@ use tempfile::tempdir;
 
 use super::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_EXEC_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1,
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider, parse_external_check_package_manifest,
+    EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
+    parse_external_check_package_manifest,
 };
 
 struct StaticProvider {
@@ -23,34 +23,6 @@ impl ExternalCheckPackageProvider for StaticProvider {
     ) -> anyhow::Result<Option<ExternalCheckPackage>> {
         Ok(self.package.clone())
     }
-}
-
-#[test]
-fn parses_source_mode_manifest() {
-    let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-sources = ["./check.ts", "./package.json", "./pnpm-lock.yaml"]
-
-[capabilities]
-commands = ["grep", "sed"]
-"#;
-
-    let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
-
-    assert_eq!(package.id, "workflow-shell-strict-v2");
-    assert_eq!(package.runtime, EXTERNAL_CHECK_RUNTIME_V1);
-    assert_eq!(package.api_version, EXTERNAL_CHECK_API_V1);
-    assert_eq!(package.capabilities.commands, vec!["grep", "sed"]);
-    assert!(matches!(
-        package.implementation,
-        ExternalCheckPackageImplementation::Source(_)
-    ));
 }
 
 #[test]
@@ -105,24 +77,6 @@ target = "//checks/frontend_no_legacy_api:frontend_no_legacy_api_bin"
 }
 
 #[test]
-fn source_mode_rejects_artifact_fields() {
-    let manifest = r#"
-id = "workflow-shell-strict-v2"
-mode = "source"
-runtime = "sandbox-v1"
-api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
-artifact_path = "x.wasm"
-artifact_sha256 = "abc"
-"#;
-
-    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-    assert!(error.to_string().contains("artifact_path"));
-}
-
-#[test]
 fn artifact_mode_requires_required_fields() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
@@ -152,12 +106,11 @@ api_version = "v1"
 fn rejects_invalid_runtime() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "source"
+mode = "artifact"
 runtime = "sandbox-v2"
 api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
+artifact_path = "check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
 
     let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
@@ -168,12 +121,11 @@ build_adapter = "javascript-component"
 fn rejects_duplicate_commands() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "source"
+mode = "artifact"
 runtime = "sandbox-v1"
 api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
+artifact_path = "check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [capabilities]
 commands = ["grep", "grep"]
@@ -218,13 +170,12 @@ executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_ap
 fn rejects_unknown_manifest_fields() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "source"
+mode = "artifact"
 runtime = "sandbox-v1"
 api_version = "v1"
 api_vesion = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
+artifact_path = "check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
 
     let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
@@ -291,12 +242,11 @@ fn file_provider_resolves_manifest_path() {
         temp.path().join("checks/workflow/check.toml"),
         r#"
 id = "workflow-shell-strict-v2"
-mode = "source"
+mode = "artifact"
 runtime = "sandbox-v1"
 api_version = "v1"
-language = "javascript"
-entry = "./check.ts"
-build_adapter = "javascript-component"
+artifact_path = "checks/workflow/check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("write manifest");
@@ -388,12 +338,12 @@ fn composite_provider_reports_conflicts() {
         runtime: "sandbox-v1".to_owned(),
         api_version: "v1".to_owned(),
         capabilities: Default::default(),
-        implementation: ExternalCheckPackageImplementation::Source(
-            super::ExternalCheckSourcePackage {
-                language: "javascript".to_owned(),
-                entry: "./check.ts".to_owned(),
-                build_adapter: "javascript-component".to_owned(),
-                sources: Vec::new(),
+        implementation: ExternalCheckPackageImplementation::Artifact(
+            super::ExternalCheckArtifactPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
+                provenance: None,
             },
         ),
     };
