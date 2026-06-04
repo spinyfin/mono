@@ -345,8 +345,6 @@ phase_prepare() {
       echo "[checkleft-release] unshallowing repo for changelog"
       git fetch --unshallow origin 2>/dev/null || true
     fi
-    bazel build //tools/repobin:repobin
-    ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
     bin/changelog \
       --project tools/checkleft/PROJECT.yaml \
       --from "${LAST_TAG}" \
