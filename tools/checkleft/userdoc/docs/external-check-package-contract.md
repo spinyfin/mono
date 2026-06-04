@@ -1,10 +1,10 @@
 # External Check Package Contract (Phase 0 Freeze)
 
-This page freezes the initial external-check contracts for the sandboxed polyglot work.
+This page freezes the initial external-check contracts for the sandboxed work.
 
 Scope for this phase:
 
-1. Manifest schema (`source`, `artifact`, and `exec` modes).
+1. Manifest schema (`artifact` and `exec` modes).
 2. Implementation reference syntax (`generated:` and file path refs).
 3. Capability policy contract shape.
 4. Host API operation names and semantics.
@@ -67,26 +67,8 @@ Required common fields:
 1. `id`
 2. `runtime`
 3. `api_version` (currently must be `v1`)
-4. `mode` (`source`, `artifact`, or `exec`)
+4. `mode` (`artifact` or `exec`)
 5. Optional `[capabilities]` table for sandboxed modes only
-
-### `source` mode fields
-
-Required:
-
-1. `language`
-2. `entry` (safe relative path)
-3. `build_adapter`
-
-Optional:
-
-1. `sources` (array of safe relative paths)
-
-Not allowed in `source` mode:
-
-1. `artifact_path`
-2. `artifact_sha256`
-3. `provenance`
 
 ### `artifact` mode fields
 
@@ -131,22 +113,6 @@ Not allowed in `exec` mode:
 5. `sources`
 6. `artifact_path`
 7. `artifact_sha256`
-
-## Source Build Cache
-
-For JavaScript and TypeScript `source` mode packages using the
-`javascript-component` adapter, `checkleft` keeps derived state in a per-user,
-cache root:
-
-1. `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/repos/<repo>-<repo-hash>/source-mode/artifacts/<build-hash>/check.wasm`
-2. `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/toolchains/js-componentizer/toolchains/<toolchain-hash>/`
-
-Built artifacts remain repo-scoped so unrelated repos do not share those
-entries. The JS toolchain install is shared across repos when the checked-in
-toolchain inputs match. The cache contents are disposable and may be removed to
-force a fresh toolchain install and rebuild. Manifest-declared `artifact_path`
-values remain repository-relative; the per-user cache is only used for
-internally generated source-mode artifacts.
 
 ## Capability Contract
 
