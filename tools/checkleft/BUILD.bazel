@@ -25,6 +25,11 @@ rust_binary(
     crate_root = "src/main.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    # CHECKLEFT_VERSION is set via --define by the release pipeline; .bazelrc
+    # defaults it to "0.0.0-dev" for local and CI non-release builds.
+    rustc_env = {
+        "CHECKLEFT_BUILD_VERSION": "$(CHECKLEFT_VERSION)",
+    },
     visibility = ["//tools/checkleft/bazel:__pkg__"],
     deps = [
         ":checkleft_lib",
