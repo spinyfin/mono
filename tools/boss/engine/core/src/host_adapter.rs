@@ -287,46 +287,9 @@ async fn checkout_pr_head_local(
 ) -> Result<String> {
     let pr_number = crate::completion::pr_number_from_url(pr_url)
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-    let pr_str = pr_number.to_string();
 
-    // 1. Fetch the current head SHA from GitHub.
-    let head_sha = {
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr_str,
-                "-R",
-                repo_slug,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| {
-                format!("failed to spawn `gh pr view {pr_number}` to fetch head SHA")
-            })?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if sha.is_empty() {
-            return Err(anyhow!(
-                "empty headRefOid for PR {pr_number} in {repo_slug}"
-            ));
-        }
-        sha
-    };
+    // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
+    let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
 
     // 2. Fetch remote refs so jj knows about the head commit.
     {
@@ -709,40 +672,13 @@ impl HostAdapter for SshHostAdapter {
     ) -> Result<String> {
         let pr_number = crate::completion::pr_number_from_url(pr_url)
             .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-        let pr_str = pr_number.to_string();
         let host = &self.transport.host_id;
 
-        // 1. Fetch the head SHA via gh on the remote host.
-        let output = self
-            .transport
-            .run(&[
-                "gh",
-                "pr",
-                "view",
-                &pr_str,
-                "-R",
-                repo_slug,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ])
-            .await
-            .with_context(|| {
-                format!("failed to run `gh pr view {pr_number}` on remote host {host}")
-            })?;
-        if !output.success() {
-            return Err(anyhow!(
-                "`gh pr view {pr_number} -R {repo_slug}` failed on {host}: {}",
-                output.stderr.trim()
-            ));
-        }
-        let head_sha = output.stdout.trim().to_owned();
-        if head_sha.is_empty() {
-            return Err(anyhow!(
-                "empty headRefOid for PR {pr_number} in {repo_slug} on {host}"
-            ));
-        }
+        // 1. Fetch the head SHA from GitHub via the shared gh-cli helper.
+        //    gh queries the GitHub API; the result is identical whether run
+        //    locally or on the remote host, so we run it locally to avoid the
+        //    SSH round-trip.
+        let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
 
         // 2. Fetch remote refs on the remote host.
         let workspace = workspace_path.display().to_string();
