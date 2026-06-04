@@ -152,6 +152,10 @@ pub struct PaneSpawnRunner {
     /// Stored as `Weak` to avoid the runner ↔ ServerState reference
     /// cycle. Resolved each call.
     server_state: std::sync::OnceLock<Weak<dyn crate::spawn_flow::WorkerSpawner>>,
+    /// Test-injection override for the boss-event binary path. When set,
+    /// `boss_event_binary()` returns this directly without consulting the
+    /// environment — so tests don't depend on host PATH/filesystem layout.
+    boss_event_path_override: std::sync::OnceLock<PathBuf>,
 }
 
 impl PaneSpawnRunner {
@@ -165,6 +169,7 @@ impl PaneSpawnRunner {
             work_db,
             feature_flags,
             server_state: std::sync::OnceLock::new(),
+            boss_event_path_override: std::sync::OnceLock::new(),
         }
     }
 
@@ -172,11 +177,21 @@ impl PaneSpawnRunner {
         let _ = self.server_state.set(server_state);
     }
 
+    /// Inject a known absolute boss-event path for tests so they don't
+    /// depend on the host filesystem or `BOSS_EVENT_BIN` env var.
+    #[cfg(test)]
+    pub(crate) fn set_boss_event_path(&self, path: PathBuf) {
+        let _ = self.boss_event_path_override.set(path);
+    }
+
     fn events_socket_path(&self) -> PathBuf {
         engine_events_socket_path()
     }
 
     fn boss_event_binary(&self) -> PathBuf {
+        if let Some(injected) = self.boss_event_path_override.get() {
+            return injected.clone();
+        }
         let engine_path = std::env::current_exe().unwrap_or_default();
         let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
@@ -191,6 +206,15 @@ impl PaneSpawnRunner {
             boss_bin_dir.as_deref(),
             stable_bin_dir.as_deref(),
         )
+        .unwrap_or_else(|| {
+            panic!(
+                "boss-event binary not found: none of BOSS_EVENT_BIN, BOSS_BIN_DIR, \
+                 the stable bin dir, runfiles, bazel-bin, or the engine-sibling resolved \
+                 to an existing file. A bare 'boss-event' in hook commands causes silent \
+                 event-emission failures when the worker's sanitized PATH does not include it. \
+                 Set BOSS_EVENT_BIN to the absolute boss-event path to fix this."
+            )
+        })
     }
 }
 
@@ -198,6 +222,12 @@ impl PaneSpawnRunner {
 /// that the worker pane invokes from `settings.json`. Pulled out
 /// as a free function so tests can pass synthetic `engine_path` /
 /// `workspace_dir` / env values without monkey-patching globals.
+///
+/// Returns `Some(path)` when a candidate exists on disk, `None` when no
+/// candidate resolves. The caller is responsible for treating `None` as a
+/// hard error — a bare `boss-event` in hook commands causes silent
+/// event-emission failures because the worker's sanitized PATH does not
+/// include bazel-out or other non-standard directories.
 ///
 /// Resolution order:
 ///   1. `BOSS_EVENT_BIN` env override (caller-controlled).
@@ -221,24 +251,22 @@ impl PaneSpawnRunner {
 ///      when `BUILD_WORKSPACE_DIRECTORY` is set (i.e., the engine
 ///      was launched via `bazel run` from a checkout).
 ///   6. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
-///   7. Bare name `boss-event` — only useful if the worker's PATH
-///      happens to include it (today it doesn't, on purpose).
 pub(crate) fn resolve_boss_event_binary(
     engine_path: &Path,
     workspace_dir: Option<&Path>,
     env_override: Option<&Path>,
     boss_bin_dir: Option<&Path>,
     stable_bin_dir: Option<&Path>,
-) -> PathBuf {
+) -> Option<PathBuf> {
     if let Some(override_path) = env_override {
-        return override_path.to_path_buf();
+        return Some(override_path.to_path_buf());
     }
 
     // Installed mode: BOSS_BIN_DIR is Boss.app/Contents/Resources/bin/.
     if let Some(bin_dir) = boss_bin_dir {
         let candidate = bin_dir.join("boss-event");
         if candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
 
@@ -248,7 +276,7 @@ pub(crate) fn resolve_boss_event_binary(
     if let Some(bin_dir) = stable_bin_dir {
         let candidate = bin_dir.join("boss-event");
         if candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
 
@@ -259,24 +287,24 @@ pub(crate) fn resolve_boss_event_binary(
         .join("_main")
         .join("tools/boss/event-shim/boss-event");
     if runfiles_candidate.exists() {
-        return runfiles_candidate;
+        return Some(runfiles_candidate);
     }
 
     if let Some(workspace) = workspace_dir {
         let candidate = workspace.join("bazel-bin/tools/boss/event-shim/boss-event");
         if candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
 
     if let Some(engine_dir) = engine_path.parent() {
         let sibling = engine_dir.join("boss-event");
         if sibling.exists() {
-            return sibling;
+            return Some(sibling);
         }
     }
 
-    PathBuf::from("boss-event")
+    None
 }
 
 /// Copy the boss-event shim binary to a stable location in the Boss
@@ -4023,7 +4051,15 @@ mod pane_spawn_tests {
     /// Build a runner already bound to a `CapturingSpawner` and drive a
     /// run_execution against `workspace`. Returns the spawner so tests
     /// can inspect the captured request.
-    async fn run_once(workspace: &TempDir) -> Result<Arc<CapturingSpawner>> {
+    ///
+    /// `boss_event_path`: when `Some`, injects a known absolute path for
+    /// the boss-event binary so the test is independent of host
+    /// filesystem layout / env vars. Pass `None` for tests that don't
+    /// inspect the hook command.
+    async fn run_once(
+        workspace: &TempDir,
+        boss_event_path: Option<&Path>,
+    ) -> Result<Arc<CapturingSpawner>> {
         // We need a Weak<dyn WorkerSpawner> the runner can upgrade.
         // Box-leak the Arc so it lives for the test's duration; the
         // tempdir guards the workspace lifetime.
@@ -4041,6 +4077,9 @@ mod pane_spawn_tests {
         ));
         let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
+        if let Some(path) = boss_event_path {
+            runner.set_boss_event_path(path.to_path_buf());
+        }
 
         runner
             .run_execution(
@@ -4058,7 +4097,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn writes_initial_prompt_to_workspace_dot_claude() {
         let workspace = TempDir::new().unwrap();
-        let _spawner = run_once(&workspace).await.unwrap();
+        let _spawner = run_once(&workspace, None).await.unwrap();
 
         let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
         assert!(
@@ -4084,7 +4123,7 @@ mod pane_spawn_tests {
         // dispatch prompt must telegraph that up front so the worker
         // doesn't waste a round-trip discovering it from the probe.
         let workspace = TempDir::new().unwrap();
-        let _spawner = run_once(&workspace).await.unwrap();
+        let _spawner = run_once(&workspace, None).await.unwrap();
         let prompt = std::fs::read_to_string(
             workspace.path().join(".claude").join("initial-prompt.txt"),
         )
@@ -4118,7 +4157,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn implementation_prompt_dictates_engine_supplied_branch_name() {
         let workspace = TempDir::new().unwrap();
-        let _spawner = run_once(&workspace).await.unwrap();
+        let _spawner = run_once(&workspace, None).await.unwrap();
         let prompt = std::fs::read_to_string(
             workspace.path().join(".claude").join("initial-prompt.txt"),
         )
@@ -4141,7 +4180,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn initial_input_reads_prompt_from_disk() {
         let workspace = TempDir::new().unwrap();
-        let spawner = run_once(&workspace).await.unwrap();
+        let spawner = run_once(&workspace, None).await.unwrap();
         let input = spawner.spawn_input();
 
         // The pane needs to type a `claude` invocation that picks up
@@ -4627,7 +4666,7 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn spawn_env_carries_sanitized_path_and_engine_keys() {
         let workspace = TempDir::new().unwrap();
-        let spawner = run_once(&workspace).await.unwrap();
+        let spawner = run_once(&workspace, None).await.unwrap();
         let input = spawner.spawn_input();
 
         let path_var = input
@@ -4716,7 +4755,7 @@ mod pane_spawn_tests {
         // worker on chore X" forces the user to disambiguate slot
         // numbers manually.
         let workspace = TempDir::new().unwrap();
-        let spawner = run_once(&workspace).await.unwrap();
+        let spawner = run_once(&workspace, None).await.unwrap();
 
         let state = spawner
             .live_states
@@ -5182,11 +5221,16 @@ mod pane_spawn_tests {
 
     #[tokio::test]
     async fn settings_json_uses_absolute_boss_event_path() {
-        // BOSS_EVENT_BIN is set to "/opt/boss/bin/boss-event" by the Bazel
-        // BUILD env for engine_lib_test_b, so boss_event_binary() returns
-        // that stable absolute path without racing against parallel tests.
+        // Inject a fake boss-event at a known absolute temp path so this
+        // test is deterministic on every agent — no host PATH lookup, no
+        // BOSS_EVENT_BIN env var, no runfiles, no bazel-bin dependency.
+        let fake_bin_dir = TempDir::new().unwrap();
+        let fake_boss_event = fake_bin_dir.path().join("boss-event");
+        std::fs::write(&fake_boss_event, b"").unwrap();
+
         let workspace = TempDir::new().unwrap();
-        let _spawner = run_once(&workspace).await.unwrap();
+        let _spawner = run_once(&workspace, Some(&fake_boss_event)).await.unwrap();
+
         // The settings file lives outside the workspace tree, keyed by
         // workspace name (see worker_setup); it must NOT be written into
         // the workspace `.claude/`.
@@ -5201,14 +5245,17 @@ mod pane_spawn_tests {
         // `boss-event` is what produced the production
         // `command not found` failures because the worker's sanitized
         // PATH doesn't include the bazel-out directory.
+        let expected_path = fake_boss_event.to_str().unwrap();
         assert!(
-            settings.contains("/opt/boss/bin/boss-event"),
-            "expected absolute boss-event path in settings file, got: {}",
+            settings.contains(expected_path),
+            "expected absolute boss-event path {} in settings file, got: {}",
+            expected_path,
             settings,
         );
         assert!(
-            !settings.contains("\"boss-event\"") || settings.contains("/opt/boss/bin/boss-event"),
-            "settings file must not invoke `boss-event` as a bare name",
+            !settings.contains("'boss-event'") && !settings.contains("\"boss-event\""),
+            "settings file must not invoke `boss-event` as a bare name, got: {}",
+            settings,
         );
     }
 
@@ -5220,7 +5267,7 @@ mod pane_spawn_tests {
         std::fs::write(&engine, b"").unwrap();
         let override_path = PathBuf::from("/opt/whatever/boss-event");
         let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None, None);
-        assert_eq!(resolved, override_path);
+        assert_eq!(resolved, Some(override_path));
     }
 
     /// `BOSS_BIN_DIR` is the installed-mode path; it wins over the
@@ -5244,7 +5291,7 @@ mod pane_spawn_tests {
         std::fs::write(runfiles.join("boss-event"), b"").unwrap();
 
         let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin), None);
-        assert_eq!(resolved, bundle_shim);
+        assert_eq!(resolved, Some(bundle_shim));
     }
 
     /// When the engine binary has runfiles at the bazel-conventional
@@ -5267,7 +5314,7 @@ mod pane_spawn_tests {
         std::fs::write(&shim, b"").unwrap();
 
         let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
-        assert_eq!(resolved, shim);
+        assert_eq!(resolved, Some(shim));
     }
 
     /// Workspace `bazel-bin` symlink path is the secondary candidate
@@ -5287,20 +5334,20 @@ mod pane_spawn_tests {
         std::fs::write(&shim, b"").unwrap();
 
         let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None, None);
-        assert_eq!(resolved, shim);
+        assert_eq!(resolved, Some(shim));
     }
 
-    /// When nothing resolves we still return *something* so the
-    /// system fails loud (worker logs `command not found`) rather
-    /// than the engine crashing on path-construction. The bare
-    /// fallback is intentional — see the resolver's doc comment.
+    /// When nothing resolves the function returns `None` — the caller
+    /// (`boss_event_binary`) turns this into a hard panic rather than
+    /// silently baking a bare `boss-event` into hook commands (which
+    /// causes `command not found` in the worker's sanitized PATH).
     #[test]
-    fn resolve_boss_event_falls_back_to_bare_name_when_nothing_resolves() {
+    fn resolve_boss_event_returns_none_when_nothing_resolves() {
         let dir = TempDir::new().unwrap();
         let engine = dir.path().join("engine");
         std::fs::write(&engine, b"").unwrap();
         let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
-        assert_eq!(resolved, PathBuf::from("boss-event"));
+        assert_eq!(resolved, None);
     }
 
     /// The stable bin dir (installed by the engine at startup) is
@@ -5324,7 +5371,7 @@ mod pane_spawn_tests {
         std::fs::write(runfiles.join("boss-event"), b"runfiles").unwrap();
 
         let resolved = resolve_boss_event_binary(&engine, None, None, None, Some(&stable_bin));
-        assert_eq!(resolved, stable_shim);
+        assert_eq!(resolved, Some(stable_shim));
     }
 
     /// `install_boss_event_to_stable_bin` copies the shim and marks it

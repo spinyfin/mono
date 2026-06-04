@@ -360,41 +360,61 @@ pub async fn serve(
     // Resolution at install time intentionally skips the stable-bin-dir
     // candidate (pass None) so we always copy the real binary from its
     // original source rather than potentially re-copying a previous install.
-    let stable_boss_event_path = {
+    //
+    // If boss-event cannot be located (None), log a warning and skip the
+    // install+heal step — the first worker spawn will hard-fail with a
+    // clear error message rather than silently baking a bare name.
+    let stable_boss_event_path_opt: Option<PathBuf> = {
         let engine_path = std::env::current_exe().unwrap_or_default();
         let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
         let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
-        let current_shim = crate::runner::resolve_boss_event_binary(
+        match crate::runner::resolve_boss_event_binary(
             &engine_path,
             workspace_dir.as_deref(),
             env_override.as_deref(),
             boss_bin_dir.as_deref(),
             None,
-        );
-        if let Some(home) = std::env::var_os("HOME") {
-            let stable_bin_dir = PathBuf::from(home).join("Library/Application Support/Boss/bin");
-            match crate::runner::install_boss_event_to_stable_bin(&current_shim, &stable_bin_dir) {
-                Ok(stable) => {
-                    tracing::info!(
-                        stable_path = %stable.display(),
-                        source_path = %current_shim.display(),
-                        "boss-event installed to stable bin dir",
-                    );
-                    stable
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        source_path = %current_shim.display(),
-                        "failed to install boss-event to stable bin dir; \
-                         new workers will use the resolved path",
-                    );
-                    current_shim
+        ) {
+            Some(current_shim) => {
+                if let Some(home) = std::env::var_os("HOME") {
+                    let stable_bin_dir =
+                        PathBuf::from(home).join("Library/Application Support/Boss/bin");
+                    match crate::runner::install_boss_event_to_stable_bin(
+                        &current_shim,
+                        &stable_bin_dir,
+                    ) {
+                        Ok(stable) => {
+                            tracing::info!(
+                                stable_path = %stable.display(),
+                                source_path = %current_shim.display(),
+                                "boss-event installed to stable bin dir",
+                            );
+                            Some(stable)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                source_path = %current_shim.display(),
+                                "failed to install boss-event to stable bin dir; \
+                                 new workers will use the resolved path",
+                            );
+                            Some(current_shim)
+                        }
+                    }
+                } else {
+                    Some(current_shim)
                 }
             }
-        } else {
-            current_shim
+            None => {
+                tracing::warn!(
+                    "boss-event binary not found at engine startup (checked BOSS_EVENT_BIN, \
+                     BOSS_BIN_DIR, runfiles, bazel-bin, and engine-sibling); \
+                     skipping stable-install and settings heal. \
+                     Worker spawns will hard-fail until boss-event is resolvable."
+                );
+                None
+            }
         }
     };
 
@@ -403,13 +423,18 @@ pub async fn serve(
     // boss-event path on the next engine restart. The settings files
     // live under the system temp dir, outside every workspace — see
     // `worker_setup` module docs.
-    let worker_settings_dir = crate::worker_setup::worker_settings_dir();
-    tracing::info!(
-        dir = %worker_settings_dir.display(),
-        new_path = %stable_boss_event_path.display(),
-        "healing boss-event path in worker settings files",
-    );
-    crate::worker_setup::heal_worker_settings_json(&worker_settings_dir, &stable_boss_event_path);
+    if let Some(stable_boss_event_path) = stable_boss_event_path_opt {
+        let worker_settings_dir = crate::worker_setup::worker_settings_dir();
+        tracing::info!(
+            dir = %worker_settings_dir.display(),
+            new_path = %stable_boss_event_path.display(),
+            "healing boss-event path in worker settings files",
+        );
+        crate::worker_setup::heal_worker_settings_json(
+            &worker_settings_dir,
+            &stable_boss_event_path,
+        );
+    }
 
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
