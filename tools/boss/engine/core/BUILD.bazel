@@ -293,9 +293,13 @@ rust_test(
     edition = "2024",
     env = {
         "HOME": "/tmp",
-        # BOSS_EVENT_BIN is set at BUILD time so runner::pane_spawn_tests::
-        # settings_json_uses_absolute_boss_event_path can assert the absolute
-        # path without racing against other tests via std::env::set_var.
+        # Provide a non-empty boss-event path so runner tests that call
+        # boss_event_binary() without an injected override don't panic in
+        # the Bazel sandbox (no runfiles, no stable bin dir, no sibling).
+        # The env-override branch returns this without an existence check,
+        # so it works even though /opt/boss/bin/boss-event doesn't exist on
+        # CI agents. Tests that assert on the actual baked path inject a
+        # real temp file via PaneSpawnRunner::set_boss_event_path() instead.
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
     },
     proc_macro_deps = all_crate_deps(
