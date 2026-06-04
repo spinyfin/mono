@@ -12,6 +12,9 @@ target = "//tools/boss/event-shim:boss-event"
 [tools.bossctl]
 target = "//tools/boss/bossctl:bossctl"
 
+[tools.changelog]
+target = "//tools/changelog:changelog"
+
 [tools.checkleft]
 target = "//tools/checkleft:checkleft"
 
