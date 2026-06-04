@@ -1,6 +1,6 @@
 """Starlark platform transition for building checkleft for musl targets."""
 
-def _musl_x86_64_transition_impl(settings, attr):
+def _musl_x86_64_transition_impl(_settings, _attr):
     return {"//command_line_option:platforms": str(Label("//platforms:linux_x86_64_musl"))}
 
 musl_x86_64_transition = transition(

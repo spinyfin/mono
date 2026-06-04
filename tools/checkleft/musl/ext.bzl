@@ -50,7 +50,7 @@ _MUSL_TARGETS = [
 def _safe(s):
     return s.replace("-", "_")
 
-def _musl_rust_toolchain_impl(module_ctx):
+def _musl_rust_toolchain_impl(_module_ctx):
     for exec_triple in _EXEC_TRIPLES:
         exec_constraints = triple_to_constraint_set(exec_triple)
         for musl_triple, libc_constraint in _MUSL_TARGETS:

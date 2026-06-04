@@ -12,6 +12,7 @@ bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_ap
 bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")
 bazel_dep(name = "rules_apple", version = "4.5.1", repo_name = "build_bazel_rules_apple")
 bazel_dep(name = "rules_swift_package_manager", version = "1.13.0")
+
 # Zig-based hermetic CC toolchain used for musl cross-compilation.
 # Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
 # which cross-compile C/C++ code from any host to a fully-static musl binary.
@@ -79,15 +80,16 @@ use_repo(rust, "rust_toolchains")
 musl_rust = use_extension("//tools/checkleft/musl:ext.bzl", "musl_rust_toolchain")
 use_repo(
     musl_rust,
-    "rust_musl_aarch64_apple_darwin_x86_64_unknown_linux_musl",
     "rust_musl_aarch64_apple_darwin_aarch64_unknown_linux_musl",
-    "rust_musl_x86_64_apple_darwin_x86_64_unknown_linux_musl",
-    "rust_musl_x86_64_apple_darwin_aarch64_unknown_linux_musl",
-    "rust_musl_aarch64_unknown_linux_gnu_x86_64_unknown_linux_musl",
+    "rust_musl_aarch64_apple_darwin_x86_64_unknown_linux_musl",
     "rust_musl_aarch64_unknown_linux_gnu_aarch64_unknown_linux_musl",
-    "rust_musl_x86_64_unknown_linux_gnu_x86_64_unknown_linux_musl",
+    "rust_musl_aarch64_unknown_linux_gnu_x86_64_unknown_linux_musl",
+    "rust_musl_x86_64_apple_darwin_aarch64_unknown_linux_musl",
+    "rust_musl_x86_64_apple_darwin_x86_64_unknown_linux_musl",
     "rust_musl_x86_64_unknown_linux_gnu_aarch64_unknown_linux_musl",
+    "rust_musl_x86_64_unknown_linux_gnu_x86_64_unknown_linux_musl",
 )
+
 register_toolchains(
     "@rust_musl_aarch64_apple_darwin_x86_64_unknown_linux_musl//:toolchain",
     "@rust_musl_aarch64_apple_darwin_aarch64_unknown_linux_musl//:toolchain",

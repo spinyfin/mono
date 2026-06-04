@@ -283,7 +283,7 @@
   "moduleExtensions": {
     "//tools/checkleft/musl:ext.bzl%musl_rust_toolchain": {
       "general": {
-        "bzlTransitiveDigest": "q9YRz4aEQxvm5YjqO8mdTl37BPC0cA23ILEqOCJPxZU=",
+        "bzlTransitiveDigest": "gw+1Oj2V9PvtczW+kpQyDyaUUTq7dTcq/E6vaqfqSzU=",
         "usagesDigest": "N3rcLiecjqeLHp+Wzf/rS9xSSnwbhd3n8qoMmTFz3LY=",
         "recordedInputs": [
           "REPO_MAPPING:,rules_rust rules_rust+",

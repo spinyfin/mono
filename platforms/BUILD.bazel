@@ -9,8 +9,6 @@ regular Linux platforms do NOT have the musl constraint, so libc_aware musl
 toolchains are never accidentally selected for standard glibc targets.
 """
 
-package(default_visibility = ["//visibility:public"])
-
 # x86_64 Linux with musl libc — produces a fully-static binary.
 platform(
     name = "linux_x86_64_musl",
@@ -19,6 +17,7 @@ platform(
         "@platforms//cpu:x86_64",
         "@zig_sdk//libc:musl",
     ],
+    visibility = ["//tools/checkleft:__subpackages__"],
 )
 
 # aarch64 Linux with musl libc (for completeness; primary focus is x86_64).
@@ -29,4 +28,5 @@ platform(
         "@platforms//cpu:aarch64",
         "@zig_sdk//libc:musl",
     ],
+    visibility = ["//tools/checkleft:__subpackages__"],
 )
