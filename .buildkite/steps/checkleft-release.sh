@@ -406,11 +406,23 @@ phase_musl() {
   STAGE="$(mktemp -d)"
 
   local musl_target="//tools/checkleft:checkleft_musl"
-  log "[checkleft-release] bazel build -c opt --define=CHECKLEFT_VERSION=${NEW_VERSION} ${musl_target}"
-  bazel build -c opt "--define=CHECKLEFT_VERSION=${NEW_VERSION}" "${musl_target}"
+  # The --define must be forwarded to both the build and the cquery so their
+  # configuration hashes match; without it the Make-variable $(CHECKLEFT_VERSION)
+  # falls back to the .bazelrc default of "0.0.0-dev" (T1329/T1328 seam).
+  local version_define="--define=CHECKLEFT_VERSION=${NEW_VERSION}"
+  log "[checkleft-release] bazel build -c opt ${version_define} ${musl_target}"
+  bazel build -c opt "${version_define}" "${musl_target}"
   local musl_path
-  musl_path="$(bazel cquery -c opt "--define=CHECKLEFT_VERSION=${NEW_VERSION}" --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
+  musl_path="$(bazel cquery -c opt "${version_define}" --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
   [[ -n "${musl_path}" && -f "${musl_path}" ]] || die "musl build succeeded but binary not found; check bazel cquery output for ${musl_target}"
+
+  # Version guard: the musl binary must embed NEW_VERSION, not the dev placeholder.
+  # Fail hard here so an unstamped binary can never reach the release assets.
+  local musl_ver
+  musl_ver="$("${musl_path}" --version 2>&1 | awk '{print $2}')" \
+    || die "musl version check failed: could not execute the binary (check agent architecture)"
+  [[ "${musl_ver}" == "${NEW_VERSION}" ]] \
+    || die "musl version guard FAILED: binary reports '${musl_ver}', expected '${NEW_VERSION}' — CHECKLEFT_VERSION injection did not reach the musl build"
 
   stage_asset "${musl_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
   upload_release_assets
