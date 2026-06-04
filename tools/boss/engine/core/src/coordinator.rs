@@ -2280,6 +2280,18 @@ impl ExecutionCoordinator {
             None
         };
 
+        // For revision_implementation executions that have a resolvable PR URL,
+        // pre-position the workspace on a fresh editable child change above the
+        // PR head.  execution.pr_url holds the parent task's PR URL (set at
+        // dispatch time by reconcile_revision_execution).  When absent, fall
+        // through to the normal create_change path.
+        let revision_pr_url: Option<&str> =
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                execution.pr_url.as_deref().filter(|u| !u.is_empty())
+            } else {
+                None
+            };
+
         let change: Option<CubeChangeHandle> = if let Some(pr_url) = pr_review_pr_url {
             let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_default();
@@ -2350,9 +2362,83 @@ impl ExecutionCoordinator {
                     return Err(err);
                 }
             }
+        } else if let Some(pr_url) = revision_pr_url {
+            // Revision pre-positioning: place the workspace on a fresh editable
+            // child change above the PR head via `jj new <head_sha>`.  The worker
+            // starts already on that change — no branch discovery needed.
+            let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+                .unwrap_or_default();
+            match adapter
+                .position_revision_workspace(&lease.workspace_path, pr_url, &repo_slug)
+                .await
+            {
+                Ok(head_sha) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        %head_sha,
+                        workspace_path = %lease.workspace_path.display(),
+                        "revision workspace positioned on editable child of PR head",
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Ok,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "revision_pr_positioning": true,
+                                "head_sha": head_sha,
+                            })),
+                        )
+                        .await;
+                    None
+                }
+                Err(err) => {
+                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                        tracing::error!(
+                            ?release_err,
+                            lease_id = %lease.lease_id,
+                            "failed to release workspace after revision positioning failure",
+                        );
+                    }
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeChangeCreated,
+                                DispatchOutcome::Error,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err),
+                        )
+                        .await;
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        "revision_pr_positioning_failed",
+                        "Revision workspace positioning to PR head failed",
+                        &err,
+                    )?;
+                    return Err(err);
+                }
+            }
         } else {
-            // Normal path (and pr_review fallback when pr_url is absent): create
-            // a fresh jj change via `cube change create`.
+            // Normal path (pr_review/revision fallback when pr_url is absent,
+            // and all non-review/non-revision executions): create a fresh jj
+            // change via `cube change create`.
             let workspace_path_str = lease.workspace_path.display().to_string();
             let change_repr: Option<(String, String)> = adapter.command_repr(&[
                 "--json",
@@ -9171,14 +9257,18 @@ mod tests {
 
     /// A host adapter that delegates all workspace-lifecycle and spawn methods
     /// to an inner `LocalHostAdapter` but intercepts
-    /// `checkout_pr_head_for_review` so tests can control its outcome and
-    /// verify it was called.
+    /// `checkout_pr_head_for_review` and `position_revision_workspace` so tests
+    /// can control their outcomes and verify they were called.
     struct CheckoutControllingHostAdapter {
         inner: Arc<dyn HostAdapter>,
-        /// `Some(sha)` → checkout succeeds and returns that SHA.
-        /// `None` → checkout fails with a canned error.
+        /// `Some(sha)` → reviewer checkout succeeds and returns that SHA.
+        /// `None` → reviewer checkout fails with a canned error.
         checkout_sha: Option<String>,
         checkout_calls: Mutex<Vec<(PathBuf, String, String)>>,
+        /// `Some(sha)` → revision positioning succeeds and returns that SHA.
+        /// `None` → revision positioning fails with a canned error.
+        revision_sha: Option<String>,
+        revision_positioning_calls: Mutex<Vec<(PathBuf, String, String)>>,
     }
 
     #[async_trait]
@@ -9245,6 +9335,23 @@ mod tests {
             match &self.checkout_sha {
                 Some(sha) => Ok(sha.clone()),
                 None => Err(anyhow!("simulated reviewer checkout failure")),
+            }
+        }
+
+        async fn position_revision_workspace(
+            &self,
+            workspace_path: &std::path::Path,
+            pr_url: &str,
+            repo_slug: &str,
+        ) -> Result<String> {
+            self.revision_positioning_calls.lock().await.push((
+                workspace_path.to_path_buf(),
+                pr_url.to_owned(),
+                repo_slug.to_owned(),
+            ));
+            match &self.revision_sha {
+                Some(sha) => Ok(sha.clone()),
+                None => Err(anyhow!("simulated revision positioning failure")),
             }
         }
 
@@ -9373,6 +9480,8 @@ mod tests {
             )),
             checkout_sha: Some("abc123deadbeef".to_owned()),
             checkout_calls: Mutex::new(Vec::new()),
+            revision_sha: None,
+            revision_positioning_calls: Mutex::new(Vec::new()),
         });
 
         let mut coord = ExecutionCoordinator::new(
@@ -9444,6 +9553,8 @@ mod tests {
             )),
             checkout_sha: None, // fail
             checkout_calls: Mutex::new(Vec::new()),
+            revision_sha: None,
+            revision_positioning_calls: Mutex::new(Vec::new()),
         });
 
         let mut coord = ExecutionCoordinator::new(
@@ -9522,6 +9633,8 @@ mod tests {
             )),
             checkout_sha: Some("would-not-be-called".to_owned()),
             checkout_calls: Mutex::new(Vec::new()),
+            revision_sha: None,
+            revision_positioning_calls: Mutex::new(Vec::new()),
         });
 
         let mut coord = ExecutionCoordinator::new(
@@ -9561,6 +9674,165 @@ mod tests {
             cube.create_calls.lock().await.len(),
             1,
             "create_change must be called when pr_url is absent"
+        );
+    }
+
+    /// When a `revision_implementation` execution has a non-empty `pr_url`,
+    /// `schedule_execution` must call `position_revision_workspace` and must
+    /// NOT call `create_change`.
+    #[tokio::test]
+    async fn revision_with_pr_url_calls_position_not_create_change() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/99";
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let positioning_adapter = Arc::new(CheckoutControllingHostAdapter {
+            inner: Arc::new(LocalHostAdapter::new(
+                Arc::clone(&cube) as Arc<dyn CubeClient>,
+                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
+            )),
+            checkout_sha: None,
+            checkout_calls: Mutex::new(Vec::new()),
+            revision_sha: Some("deadbeef123456".to_owned()),
+            revision_positioning_calls: Mutex::new(Vec::new()),
+        });
+
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
+            adapter: Arc::clone(&positioning_adapter) as Arc<dyn HostAdapter>,
+        }));
+        let coordinator = Arc::new(coord);
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator
+            .schedule_execution(&execution, &worker_id)
+            .await;
+        assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
+
+        // position_revision_workspace was called with the correct pr_url.
+        let calls = positioning_adapter.revision_positioning_calls.lock().await;
+        assert_eq!(calls.len(), 1, "position_revision_workspace must be called exactly once");
+        assert_eq!(
+            calls[0].1, pr_url,
+            "position_revision_workspace must receive the execution's pr_url"
+        );
+
+        // checkout_pr_head_for_review must NOT have been called.
+        assert!(
+            positioning_adapter.checkout_calls.lock().await.is_empty(),
+            "checkout_pr_head_for_review must not be called for revision executions"
+        );
+
+        // create_change must NOT have been called.
+        assert!(
+            cube.create_calls.lock().await.is_empty(),
+            "create_change must not be called for the revision positioning path"
+        );
+    }
+
+    /// When `position_revision_workspace` fails, `schedule_execution` must
+    /// record a `revision_pr_positioning_failed` start failure and release
+    /// the workspace.
+    #[tokio::test]
+    async fn revision_positioning_failure_records_start_failure_and_releases_workspace() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/100";
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+
+        let positioning_adapter = Arc::new(CheckoutControllingHostAdapter {
+            inner: Arc::new(LocalHostAdapter::new(
+                Arc::clone(&cube) as Arc<dyn CubeClient>,
+                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
+            )),
+            checkout_sha: None,
+            checkout_calls: Mutex::new(Vec::new()),
+            revision_sha: None, // fail
+            revision_positioning_calls: Mutex::new(Vec::new()),
+        });
+
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
+            adapter: Arc::clone(&positioning_adapter) as Arc<dyn HostAdapter>,
+        }));
+        let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator
+            .schedule_execution(&execution, &worker_id)
+            .await;
+        assert!(
+            result.is_err(),
+            "schedule_execution must fail when positioning fails"
+        );
+
+        // The workspace lease must have been released.
+        assert_eq!(
+            cube.release_calls.lock().await.len(),
+            1,
+            "workspace must be released after positioning failure"
+        );
+
+        // A revision_pr_positioning_failed attention item must exist.
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == "revision_pr_positioning_failed"),
+            "expected a revision_pr_positioning_failed attention item, got {:?}",
+            items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
         );
     }
 }
