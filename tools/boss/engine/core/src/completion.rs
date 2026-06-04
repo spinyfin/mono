@@ -2210,16 +2210,23 @@ must not be asked to open one",
         // P992 task 8: parse ReviewResult from the reviewer's transcript and
         // apply the severity gate. Falls back gracefully (no revision) when the
         // reviewer produced no parseable JSON block.
+        //
+        // The extractor tries three strategies: ```json fence, plain ``` fence,
+        // and bare JSON scan. Failure here means the transcript was truly
+        // unparseable (malformed JSON, wrong schema, or reviewer crash) — log at
+        // ERROR so it surfaces in monitoring rather than passing silently.
         let review_result = self.read_final_triage_message(&execution.id).await
             .into_message()
             .and_then(|text| {
                 let result = crate::pr_review::extract_review_result(&text);
                 if result.is_none() {
-                    tracing::warn!(
+                    tracing::error!(
                         execution_id = %execution.id,
                         producing_task_id,
-                        "pr_review finalize: no parseable ReviewResult JSON block in \
-                         reviewer transcript; advancing to in_review without revision",
+                        "pr_review finalize: reviewer transcript contained no parseable \
+                         ReviewResult (tried fenced-json, plain-fence, and bare-JSON scan); \
+                         advancing to in_review without revision — check reviewer output for \
+                         malformed JSON or schema mismatch",
                     );
                 }
                 result
@@ -10651,16 +10658,51 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         format!("{}\n", obj)
     }
 
+    /// Build a JSONL transcript line containing `review_result_json` as **bare
+    /// JSON** (no ` ```json ` fence). Simulates the T1359 failure mode where the
+    /// model emits the ReviewResult inline after prose without any code fence.
+    fn make_bare_review_transcript_jsonl(review_result_json: &str) -> String {
+        let text = format!(
+            "I have reviewed the PR carefully.\n\n\
+             Key findings are summarised below.\n\n\
+             {review_result_json}"
+        );
+        let obj = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": text}]
+            }
+        });
+        format!("{}\n", obj)
+    }
+
     /// Build a producing chore with `pr_url` already set (simulating the
     /// PendingReview state that `finalize_pr_transition` writes) together with
     /// a `pr_review` execution in `waiting_human` status. Optionally write a
     /// JSONL transcript file and register its path so
     /// `finalize_pr_review_pass` can read the `ReviewResult`.
     ///
+    /// The `review_result_json` is the raw ReviewResult JSON; it is wrapped in
+    /// a ` ```json ` fence by `make_review_transcript_jsonl`. Use
+    /// `pr_review_exec_fixture_with_jsonl` to supply a pre-built transcript
+    /// JSONL directly (e.g., for bare-JSON regression tests).
+    ///
     /// Returns `(db, product_id, chore_id, pr_review_exec_id, pr_url)`.
     fn pr_review_exec_fixture(
         workspace_path: &Path,
         review_result_json: Option<&str>,
+    ) -> (Arc<WorkDb>, String, String, String, String) {
+        let transcript_jsonl = review_result_json.map(|j| make_review_transcript_jsonl(j));
+        pr_review_exec_fixture_with_jsonl(workspace_path, transcript_jsonl.as_deref())
+    }
+
+    /// Like `pr_review_exec_fixture`, but accepts a pre-built JSONL transcript
+    /// string. Use this when the transcript format matters (e.g., bare JSON,
+    /// multi-turn) and `make_review_transcript_jsonl` does not produce the
+    /// desired shape.
+    fn pr_review_exec_fixture_with_jsonl(
+        workspace_path: &Path,
+        transcript_jsonl: Option<&str>,
     ) -> (Arc<WorkDb>, String, String, String, String) {
         const PR_URL: &str = "https://github.com/spinyfin/mono/pull/88";
         let dir = tempdir().unwrap();
@@ -10739,9 +10781,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
 
-        // Optionally write a transcript containing the ReviewResult JSON.
-        if let Some(json) = review_result_json {
-            let jsonl = make_review_transcript_jsonl(json);
+        // Optionally write a pre-built JSONL transcript and register its path.
+        if let Some(jsonl) = transcript_jsonl {
             let transcript_path =
                 workspace_path.join(format!("transcript-{}.jsonl", pr_review_exec.id));
             std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
@@ -11023,6 +11064,67 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(
             task.status, TaskStatus::InReview,
             "producing task must advance to in_review even when reviewer produced no transcript",
+        );
+    }
+
+    /// Regression test for T1359: a reviewer that emits the ReviewResult as
+    /// **bare JSON** (no ` ```json ` fence) must still produce a revision when
+    /// the severity gate fires. The extractor's bare-JSON scan (Strategy 3) must
+    /// find and validate the object; the finalizer must NOT silently advance to
+    /// `in_review` without revision.
+    #[tokio::test]
+    async fn pr_review_pass_bare_json_revision_warranted_true_creates_revision() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = high_finding_review_result_json(pr_url);
+
+        // Transcript contains bare JSON (no fence) — the T1359 shape.
+        let jsonl = make_bare_review_transcript_jsonl(&json);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture_with_jsonl(workspace.path(), Some(&jsonl));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
+            "bare-JSON reviewer output with a high finding must create a revision \
+             (T1359 regression); got {outcome:?}",
+        );
+
+        // Verify the revision was actually created and has the finding.
+        let revision_task_id = match outcome {
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => revision_task_id,
+            _ => unreachable!(),
+        };
+        let revision = match db.get_work_item(&revision_task_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("revision is not a task/chore: {other:?}"),
+        };
+        assert!(
+            revision.description.contains("Duplicate PR case not handled"),
+            "revision instructions must include the finding from the bare-JSON result; \
+             got: {:?}",
+            revision.description,
+        );
+
+        // Producing task must still advance to in_review.
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            task.status, TaskStatus::InReview,
+            "producing task must advance to in_review after bare-JSON review pass",
         );
     }
 
