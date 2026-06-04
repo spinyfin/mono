@@ -229,6 +229,14 @@ mod tests {
         ) -> Result<String> {
             unimplemented!()
         }
+        async fn position_revision_workspace(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Result<String> {
+            unimplemented!()
+        }
         async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
             unimplemented!()
         }

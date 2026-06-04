@@ -1701,6 +1701,8 @@ fn compose_revision_directive(
     let pr_number = crate::completion::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".into());
+    let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+        .unwrap_or_else(|_| "<owner/repo>".to_owned());
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
@@ -1718,33 +1720,48 @@ fn compose_revision_directive(
         out.push_str(&gate);
     }
     out.push('\n');
+    out.push_str("## Workspace state\n");
+    out.push_str("The engine pre-positioned this workspace: it ran `jj git fetch` and `jj new <PR-head-sha>`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+    out.push('\n');
+    out.push_str("**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head — e.g. the pre-positioning step failed):\n");
+    out.push_str("```\n");
+    out.push_str("jj git fetch\n");
+    out.push_str("# Find the PR branch bookmark (look for boss/exec_... ending in @origin):\n");
+    out.push_str("jj bookmark list --all\n");
+    out.push_str("# Create an editable child change on top of it:\n");
+    out.push_str("jj new '<bookmark>@origin'\n");
+    out.push_str("```\n");
+    out.push_str("IMPORTANT: NEVER run `jj edit`, `gh pr checkout`, or `git checkout` in this workspace — fetched remote commits are immutable and those tools do not work correctly in a jj workspace.\n");
+    out.push('\n');
     out.push_str("Steps:\n");
-    out.push_str("1. `jj git fetch`   # the parent branch lives on GitHub; sync before editing.\n");
+    out.push_str("1. Make the requested change.\n");
+    out.push_str("2. `jj describe -m \"<short message describing THIS revision's change>\"`\n");
+    out.push_str("3. Find the parent bookmark name and advance it to the new commit:\n");
+    out.push_str("   ```\n");
+    out.push_str("   # Find the parent bookmark (strip the @origin suffix for the branch name):\n");
+    out.push_str("   jj log -r 'parents(@)' --no-graph -T 'remote_bookmarks'\n");
+    out.push_str("   # Advance the local bookmark:\n");
+    out.push_str("   jj bookmark set <parent-branch-name> -r @\n");
+    out.push_str("   ```\n");
+    out.push_str("4. `jj git push -b <parent-branch-name>`   # NO --allow-new; NO GIT_DIR prefix; the branch already exists.\n");
+    out.push_str("5. **Update the PR description** — this is a required step, not optional:\n");
     out.push_str(&format!(
-        "2. `GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}`   # checks out the parent PR branch tip.\n"
-    ));
-    out.push_str("3. `jj new @`   # START A NEW COMMIT on top of the PR head — do NOT edit/amend/squash the existing commit.\n");
-    out.push_str("4. Make the requested change in this new commit.\n");
-    out.push_str("5. `jj describe -m \"<short message describing THIS revision's change>\"`\n");
-    out.push_str("   Then identify the parent branch name from `jj log` and advance it to the new commit:\n");
-    out.push_str("   `jj bookmark set <parent-branch-name> -r @`\n");
-    out.push_str("6. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n");
-    out.push_str("7. **Update the PR description** — this is a required step, not optional:\n");
-    out.push_str(&format!(
-        "   a. Read the current description: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number} --json body -q .body`\n"
+        "   a. Read the current description: `gh pr view {pr_number} -R {repo_slug} --json body -q .body`\n"
     ));
     out.push_str("   b. Compare it carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
     out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
-    out.push_str("      `body=$(mktemp) && <write corrected body to $body> && GIT_DIR=.jj/repo/store/git gh pr edit --body-file \"$body\" -R <owner/repo>`\n");
+    out.push_str(&format!(
+        "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
+    ));
     out.push_str("      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n");
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review.\n");
     out.push('\n');
     out.push_str(&format!(
-        "8. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
+        "6. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
     ));
     out.push_str(&format!(
-        "9. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
+        "7. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
@@ -1760,9 +1777,9 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
-         - Push your changes to the parent branch (see step 6 above). Do NOT open a new PR.\n\
-         - Update the PR description per step 7 above — a stale or contradictory description is a defect.\n\
-         - Confirm the parent PR shows your new commit with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
+         - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
+         - Update the PR description per step 5 above — a stale or contradictory description is a defect.\n\
+         - Confirm the parent PR shows your new commit with `gh pr view {pr_number} -R {repo_slug}`.\n\
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
          - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
     ));
