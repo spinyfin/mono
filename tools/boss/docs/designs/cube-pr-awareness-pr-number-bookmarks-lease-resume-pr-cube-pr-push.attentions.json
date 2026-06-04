@@ -1,0 +1,30 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should `cube pr push` determine which PR/branch to advance in v1?",
+    "choices": [
+      "Infer from @'s ancestry (nearest pr/<n> bookmark), with --pr/--branch as explicit override",
+      "Require an explicit --pr <n> in v1; no inference"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Defer any force-push capability (e.g. a guarded --force-with-lease on `cube pr push`) entirely to a later version, keeping v1 strictly fast-forward-only?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What should `cube workspace lease --resume_pr <n>` do when PR N is already MERGED or CLOSED?",
+    "choices": [
+      "Warn and proceed (positioning is still useful for inspection)",
+      "Hard error (refuse to resume a non-open PR)"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Include T5 (GC of pr/* bookmarks for closed PRs) in the cube v1 scope, rather than deferring it as optional hygiene?",
+    "anchor": "proposed-implementation-task-breakdown"
+  }
+]
