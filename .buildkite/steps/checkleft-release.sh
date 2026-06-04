@@ -55,6 +55,7 @@ STAGE=""
 TAG_PUSHED=0
 LOCAL_TAG_CREATED=0
 NEW_TAG=""
+NOTES_FILE=""
 
 # checkleft-affecting paths for change-detection. Mirrors boss-release.sh's
 # scoping: the binary's source, the release script, and the pipeline wiring.
@@ -278,6 +279,7 @@ cleanup() {
     echo "[checkleft-release] cleaning up local tag ${NEW_TAG} after push failure" >&2
     git tag -d "${NEW_TAG}" 2>/dev/null || true
   fi
+  [[ -n "${NOTES_FILE}" ]] && rm -f "${NOTES_FILE}"
   [[ -n "${STAGE}" ]] && rm -rf "${STAGE}"
   return 0
 }
@@ -334,9 +336,15 @@ phase_prepare() {
   TAG_PUSHED=1
 
   log "[checkleft-release] generating release notes for ${NEW_TAG}"
-  local notes_file
-  notes_file="$(mktemp /tmp/checkleft-release-notes-XXXXXX.md)"
+  NOTES_FILE="$(mktemp /tmp/checkleft-release-notes-XXXXXX.md)"
   if [[ -n "${LAST_TAG}" ]]; then
+    # Ensure full history for git log — a shallow clone silently truncates the
+    # commit range returned by changelog, including on manual (ui/api) triggers
+    # where the change-detection unshallow inside should_skip() is skipped.
+    if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+      echo "[checkleft-release] unshallowing repo for changelog"
+      git fetch --unshallow origin 2>/dev/null || true
+    fi
     bazel build //tools/repobin:repobin
     ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
     bin/changelog \
@@ -345,16 +353,15 @@ phase_prepare() {
       --to "${NEW_TAG}" \
       --repo "${REPO}" \
       --enrich \
-      > "${notes_file}"
+      > "${NOTES_FILE}"
   else
-    printf 'Initial checkleft release.\n' > "${notes_file}"
+    printf 'Initial checkleft release.\n' > "${NOTES_FILE}"
   fi
 
   log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
   gh release create "${NEW_TAG}" --repo "${REPO}" \
     --title "checkleft ${NEW_VERSION}" \
-    --notes-file "${notes_file}"
-  rm -f "${notes_file}"
+    --notes-file "${NOTES_FILE}"
 
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"
