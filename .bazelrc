@@ -17,6 +17,11 @@ build --stamp
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
+# checkleft version: injected at release time via --define=CHECKLEFT_VERSION=<ver>.
+# Dev builds default to "0.0.0-dev" via the rustc_env Make-variable on the
+# rust_binary target; the release pipeline overrides this with the tag version.
+build --define=CHECKLEFT_VERSION=0.0.0-dev
+
 # boss shake credentials: propagate the three env vars that embed the
 # GitHub App into the binary at compile time. Values must be set in your
 # shell (or via direnv) before running bazel build //tools/boss/cli:boss.

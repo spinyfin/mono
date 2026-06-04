@@ -19,16 +19,15 @@
 # in PARALLEL on separate agents; wall-clock is prepare + max(linux, darwin)
 # rather than the sum.
 #
-# The version bump is NEVER committed to main. It is patched into the build
-# checkout only (so the release builds from a tree carrying the new version) and
-# recorded in the git tag + GitHub Release. The tag points at the release commit
+# The version bump is NEVER committed to main. It is patched into each build
+# phase's checkout (so the release builds embed the new version) and recorded in
+# the git tag + GitHub Release. The tag points at the release commit
 # (BUILDKITE_COMMIT) itself, so pushing it needs only `contents: write` — no
 # branch-protection bypass, unlike pushing a commit to main. Developer builds
-# off main therefore carry whatever (possibly stale) version Cargo.toml holds;
-# that is intentional and harmless: checkleft's CLI does not embed
-# CARGO_PKG_VERSION (no `#[command(version)]`), so the compiled binary is
-# byte-identical regardless of the version string. All phases build from the
-# SAME commit (BUILDKITE_COMMIT) and need not share a checkout.
+# off main report "0.0.0-dev" (Bazel, via --define default in .bazelrc) or the
+# placeholder in Cargo.toml (Cargo). Each build phase patches the version
+# independently — all phases build from the SAME commit (BUILDKITE_COMMIT) and
+# do not need to share a checkout.
 #
 # Trigger model (see tools/checkleft/docs/buildkite-release-setup.md):
 #   - scheduled (cron) builds  → skip if nothing under checkleft changed since
@@ -140,13 +139,16 @@ apply_version_edits() {
 
 # ── build helpers ─────────────────────────────────────────────────────────────
 
-# build_native_bazel — optimized native binary via bazel, echoes its path.
+# build_native_bazel [extra_bazel_flags...] — optimized native binary via bazel,
+# echoes its path. Extra flags (e.g. --define=CHECKLEFT_VERSION=X) are forwarded
+# to both the build and cquery invocations so their configuration hash matches.
 build_native_bazel() {
+  local extra_bazel_flags=("$@")
   log "[checkleft-release] bazel build -c opt ${BIN_TARGET}" >&2
-  bazel build -c opt "${BIN_TARGET}" >&2
+  bazel build -c opt "${extra_bazel_flags[@]}" "${BIN_TARGET}" >&2
   local path
   # `|| true`: head can SIGPIPE cquery under pipefail; the guard below reports.
-  path="$(bazel cquery -c opt --output=files "${BIN_TARGET}" 2>/dev/null | head -1 || true)"
+  path="$(bazel cquery -c opt "${extra_bazel_flags[@]}" --output=files "${BIN_TARGET}" 2>/dev/null | head -1 || true)"
   [[ -n "${path}" && -f "${path}" ]] || { echo "could not locate bazel binary output" >&2; return 1; }
   echo "${path}"
 }
@@ -331,16 +333,21 @@ phase_linux() {
   echo "[checkleft-release] agent: $(uname -a)"
   resolve_release_tag
 
-  # Patch the release version into the build checkout (NEVER committed; the
-  # binary is version-independent, so this is for tree self-consistency).
+  # Patch the release version into the build checkout (NEVER committed).
+  # Required so that cargo builds embed the correct CARGO_PKG_VERSION; also
+  # ensures Cargo.lock stays consistent with Cargo.toml for --locked builds.
   CUR_VERSION="$(grep -E '^version = "' "${CARGO_TOML}" | head -1 | sed -E 's/^version = "(.*)"/\1/')"
   apply_version_edits
+
+  # Expose the version to build.rs (Cargo cross-builds) and to the bazel
+  # rustc_env Make-variable (native Bazel build).
+  export CHECKLEFT_VERSION="${NEW_VERSION}"
 
   log "[checkleft-release] building Linux assets for ${NEW_TAG}"
   STAGE="$(mktemp -d)"
 
   local gnu_path
-  gnu_path="$(build_native_bazel)"
+  gnu_path="$(build_native_bazel "--define=CHECKLEFT_VERSION=${NEW_VERSION}")"
   stage_asset "${gnu_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-gnu"
 
   # musl is best-effort: a static build is nice-to-have, not release-blocking.
@@ -360,13 +367,24 @@ phase_darwin() {
 
   echo "[checkleft-release] agent: $(uname -a)"
   resolve_release_tag
+
+  # Patch the release version into the build checkout (NEVER committed).
+  # Required so that cargo builds embed the correct CARGO_PKG_VERSION; also
+  # ensures Cargo.lock stays consistent with Cargo.toml for --locked builds.
+  CUR_VERSION="$(grep -E '^version = "' "${CARGO_TOML}" | head -1 | sed -E 's/^version = "(.*)"/\1/')"
+  apply_version_edits
+
+  # Expose the version to build.rs (Cargo cross-builds) and to the bazel
+  # rustc_env Make-variable (native Bazel build).
+  export CHECKLEFT_VERSION="${NEW_VERSION}"
+
   log "[checkleft-release] building macOS assets for ${NEW_TAG}"
 
   STAGE="$(mktemp -d)"
 
   # Native arm64 via bazel (matches how mono builds checkleft).
   local arm_path
-  arm_path="$(build_native_bazel)"
+  arm_path="$(build_native_bazel "--define=CHECKLEFT_VERSION=${NEW_VERSION}")"
   stage_asset "${arm_path}" "${ASSET_PREFIX}-aarch64-apple-darwin"
 
   # x86_64 via cargo cross — Apple's toolchain builds both arches natively.

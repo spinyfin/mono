@@ -43,6 +43,7 @@ struct RunArgs {
 
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
+#[command(version = option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Run repository convention checks")]
 struct Cli {
     #[arg(long, global = true)]
