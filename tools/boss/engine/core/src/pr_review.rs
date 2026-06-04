@@ -200,7 +200,11 @@ pub struct ReviewFinding {
 /// `performed` must be `true`; the reviewer cannot skip the deletion check.
 /// If it finds no regressions, it returns `suspected_deletions: []` with
 /// `performed: true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` (performed=false, suspected_deletions=[]) exists solely for
+/// `#[serde(default)]` on `ReviewResult::regression_check`; it is not a
+/// meaningful state for normal use.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegressionCheck {
     /// Always `true`. The reviewer must always perform the deletion check.
     pub performed: bool,
@@ -232,7 +236,12 @@ pub struct ReviewResult {
     pub revision_warranted: bool,
     /// All findings, ordered by severity (critical first, low last).
     pub findings: Vec<ReviewFinding>,
-    /// First-class regression/deletion check — always present.
+    /// First-class regression/deletion check — always present in well-formed
+    /// reviewer output. Defaults to `{performed:false, suspected_deletions:[]}`
+    /// if the field is absent or uses a different key (e.g. an older model
+    /// using `deletion_check`) so the overall `ReviewResult` can still be
+    /// extracted and the `findings`/`revision_warranted` fields honoured.
+    #[serde(default)]
     pub regression_check: RegressionCheck,
 }
 
@@ -645,7 +654,8 @@ pub fn render_reviewer_initial_prompt(
          5. Produce the `ReviewResult` JSON (schema below) in a fenced \
             ` ```json ` block as the **very last thing in your final message**. \
             No prose, commentary, or text of any kind may follow the closing ` ``` `. \
-            Do NOT emit the JSON bare or inline — it must be inside a ` ```json ` fence.\n\
+            Prefer the ` ```json ` fence — the engine also accepts plain ` ``` ` fences \
+            and bare inline JSON, but the fenced form is the canonical shape.\n\
          \n\
          {embedded_diff_section}\
          {rubric}\n\
@@ -1136,6 +1146,37 @@ mod tests {
         }
     }
 
+    /// A `ReviewResult` that omits `regression_check` entirely (e.g., a model
+    /// that used the old `deletion_check` key) must still parse successfully.
+    /// The `findings`/`revision_warranted` fields carry all the information the
+    /// engine needs; silently discarding the whole review for a missing optional
+    /// field is the T1359 failure mode.
+    #[test]
+    fn review_result_parses_without_regression_check_field() {
+        let json = serde_json::json!({
+            "pr_url": "https://github.com/org/repo/pull/1",
+            "head_sha": "abc",
+            "summary": "Found a bug.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "src/lib.rs",
+                    "title": "Orphan tag leak",
+                    "detail": "The tag is created before the push check.",
+                    "confidence": "high"
+                }
+            ]
+            // regression_check intentionally omitted — T1359 failure mode
+        });
+        let result = ReviewResult::from_json(&json.to_string())
+            .expect("ReviewResult must parse even without regression_check (T1359 robustness)");
+        assert!(result.revision_warranted, "revision_warranted must be preserved");
+        assert_eq!(result.findings.len(), 1, "findings must be preserved");
+        assert!(!result.regression_check.performed, "missing regression_check defaults to performed=false");
+    }
+
     #[test]
     fn regression_check_performed_must_be_true_in_valid_result() {
         let json = serde_json::json!({
@@ -1251,6 +1292,178 @@ mod tests {
     fn extract_review_result_ignores_non_review_result_json_objects() {
         let text = r#"Some context {"key": "value", "unrelated": true} then prose."#;
         assert!(extract_review_result(text).is_none());
+    }
+
+    /// Regression test for T1359 — the EXACT quark ReviewResult JSON that was
+    /// silently dropped by `extract_review_result` in boss-v1.0.88 (exec
+    /// `exec_18b5da2a31922490_161`). The JSON is fed BARE (no ` ```json ` fence)
+    /// exactly as the reviewer emitted it. If this test fails the T1359 failure
+    /// mode is still live; if it passes the parser handles this specific input.
+    ///
+    /// Key diagnostic targets:
+    /// (a) `extract_balanced_object` mis-bounding on `\"${NOTES_FILE}\"` in
+    ///     finding[2].detail (escaped quotes + `${...}` inside a string literal).
+    /// (b) `ReviewResult` serde rejecting a present field such as `regression_check`.
+    #[test]
+    fn extract_review_result_t1359_exact_quark_json_bare_unfenced() {
+        // This is quark's verbatim ReviewResult from exec exec_18b5da2a31922490_161.
+        // The text is the DECODED reviewer message (what read_final_triage_message
+        // returns after parsing the JSONL transcript). The JSON is bare — no fence.
+        let bare_json = r#"{
+"pr_url": "https://github.com/spinyfin/mono/pull/1361",
+"head_sha": "0caebb932d3cd7af212cb7bf31592e8801bcf365",
+"summary": "The PR correctly swaps GitHub's --generate-notes for bin/changelog in both the boss and checkleft release steps, reusing the existing per-product LAST_TAG/NEW_TAG (no global-latest-tag regression), routing through repobin dispatch (changelog is registered in REPOBIN.toml; --no-defaults only skips writing repobin.yaml, symlinks for configured tools including changelog are still created), and the --project/--from/--to/--repo/--enrich flags all match tools/changelog's CLI. Two substantive issues remain. (1) The changelog extracts commits with a LOCAL `git log <from>..<to>` (tools/changelog/src/extract.rs get_commits), which succeeds-but-truncates on a shallow Buildkite checkout; the repo is only unshallowed on the non-manual change-detection path, so manual (ui/api) releases — and the LAST_SHA-unresolved cron edge — can silently produce an incomplete/empty release body. (2) In boss-release.sh the new `bazel build`/changelog block is placed AFTER `trap - ERR` is removed and is not covered by the EXIT trap (which only removes WORK_DIR), so a failure there leaks the already-pushed boss-v* tag with no release and no cleanup, wedging subsequent releases on a duplicate-tag push; checkleft handles the equivalent window correctly via its cleanup() EXIT trap (TAG_PUSHED guard). No unrelated features were dropped.",
+"revision_warranted": true,
+"findings": [
+{
+"severity": "high",
+"category": "correctness",
+"file": ".buildkite/steps/checkleft-release.sh",
+"location": "phase_prepare, ~L336-351 (and boss-release.sh ~L297-311)",
+"title": "changelog reads local git history that isn't unshallowed on manual releases → silently truncated notes",
+"detail": "The changelog tool builds the body from a local `git log <LAST_TAG>..<NEW_TAG>` (tools/changelog/src/extract.rs get_commits, line ~147). The old `gh release create --generate-notes` computed notes server-side from GitHub, so a shallow Buildkite checkout was fine; the new approach needs the full local commit range. The repo is only unshallowed inside the change-detection path (checkleft should_skip L246-248, boss L96-98), which is SKIPPED for manual (ui/api) triggers (checkleft is_manual returns early at L232-235; boss skips at L85-86) and is also skipped on the cron edge where LAST_SHA fails to resolve (boss L92-93 'proceeds'). git log on a shallow clone returns success with a truncated/empty set rather than failing, so the release body is silently wrong — directly violating the acceptance criterion that the body contain ALL product-owned commits in the range. Fix: before invoking changelog (when LAST_TAG is non-empty), ensure full history, e.g. `if git rev-parse --is-shallow-repository | grep -q true; then git fetch --unshallow origin || true; fi`, in BOTH scripts, so every trigger path (manual included) renders the complete range.",
+"confidence": "medium"
+},
+{
+"severity": "medium",
+"category": "correctness",
+"file": ".buildkite/steps/boss-release.sh",
+"location": "~L280-318 (after `trap - ERR`)",
+"title": "boss: fallible `bazel build`/changelog runs after tag-cleanup trap is disarmed → leaked tag wedges future releases",
+"detail": "The new notes-generation block (L297-311), which includes `bazel build //tools/repobin:repobin` and the changelog dispatch (itself another bazel build), runs AFTER `trap - ERR` is cleared at L280. The only remaining trap is the EXIT handler set at L288, which removes WORK_DIR but does NOT delete the pushed tag. So if repobin/changelog build or `bin/changelog` fails under `set -e`, the script aborts with boss-v1.0.N already pushed (L199) and no release created or cleaned up. Because the next run computes the version from `gh release list` (L167, releases not tags), it recomputes the same N and `git push origin refs/tags/boss-v1.0.N` (L199) then fails on the pre-existing remote tag — permanently blocking boss releases until someone manually deletes the orphan tag. checkleft avoids this: its cleanup() EXIT trap deletes the leaked tag while TAG_PUSHED=1 (reset to 0 only after the release is created, L361). Fix: in boss, either generate the notes before pushing the tag / before `trap - ERR` (the changelog only needs the LOCAL tag created at L198, so it can run earlier under ERR-trap protection), or extend the EXIT trap to delete the pushed tag if the release was never created.",
+"confidence": "medium"
+},
+{
+"severity": "low",
+"category": "edgecase",
+"file": ".buildkite/steps/boss-release.sh",
+"location": "~L298-318 (and checkleft ~L338-357)",
+"title": "Notes temp file leaks when `gh release create` fails",
+"detail": "`rm -f \"${NOTES_FILE}\"` (boss L318) / `rm -f \"${notes_file}\"` (checkleft L357) runs only after a successful `gh release create`; under `set -e` a failed release create skips the rm, leaving /tmp/*-release-notes-*.md behind. Minor, but easily made robust by registering the temp file in the existing EXIT trap (boss already has one for WORK_DIR; checkleft's cleanup() could `rm -f` it) instead of an inline rm.",
+"confidence": "high"
+}
+],
+"regression_check": {
+"performed": true,
+"suspected_deletions": []
+}
+}"#;
+
+        let result = extract_review_result(bare_json)
+            .expect("T1359 exact quark JSON (bare, unfenced) must parse successfully");
+        assert!(result.revision_warranted, "revision_warranted must be true");
+        assert!(
+            result.findings.iter().any(|f| matches!(f.severity, ReviewFindingSeverity::High)),
+            "high-severity finding must be present",
+        );
+        assert!(
+            result.findings.iter().any(|f| matches!(f.category, ReviewFindingCategory::Correctness)),
+            "correctness finding must be present",
+        );
+    }
+
+    /// Regression test for T1359: bare JSON with RICH text in summary/detail
+    /// fields — bash code, escaped quotes, `${VAR}` syntax, and backtick fences
+    /// embedded in the finding's `detail`. This mimics the quark reviewer output
+    /// that defeated the original bare-JSON scanner.
+    ///
+    /// The scanner must correctly skip braces inside JSON string literals
+    /// even when the strings contain `${...}`, `\"`, and backtick code blocks.
+    #[test]
+    fn extract_review_result_bare_json_rich_text_with_embedded_code_and_braces() {
+        // Construct a JSON that closely resembles what quark emitted for T1359.
+        // The `detail` field contains bash code with `${TAG}` syntax (braces inside
+        // a JSON string literal) and escaped quotes — the suspected failure vector.
+        let json = serde_json::json!({
+            "pr_url": "https://github.com/brianduff/mono/pull/1361",
+            "head_sha": "deadbeef",
+            "summary": "Found a correctness bug in tools/boss/release/boss-release.sh. The script creates a git tag before pushing it (~L42), but if `git push --tags` fails the orphan tag persists locally. On the next release attempt the script would fail with \"tag already exists\".",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "tools/boss/release/boss-release.sh",
+                    "location": "~L42-52",
+                    "title": "Orphan tag leak when git push fails",
+                    "detail": "The script creates the tag before verifying the push:\n\n```bash\ngit tag -a \"${TAG}\" -m \"Release ${TAG}\"\ngit push --tags\n```\n\nIf `git push --tags` fails (auth error, network timeout) the local tag persists. The next run hits \"fatal: tag '${TAG}' already exists\". Fix: tag AFTER push, or clean up on failure with `git push --tags || git tag -d \"${TAG}\"`.",
+                    "confidence": "high"
+                },
+                {
+                    "severity": "medium",
+                    "category": "correctness",
+                    "file": "tools/boss/release/boss-release.sh",
+                    "title": "Missing set -euo pipefail",
+                    "detail": "No `set -euo pipefail` at the top; a failed intermediate command silently continues. Add it as the first non-comment line.",
+                    "confidence": "medium"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string();
+
+        // Emit the JSON BARE — no code fence anywhere in the message (T1359 shape).
+        let text = format!(
+            "I reviewed PR #1361. Key findings:\n\n\
+             The main issue is an orphan-tag leak in the release script. \
+             Full structured result:\n\n{json}"
+        );
+        let result = extract_review_result(&text)
+            .expect("rich bare-JSON ReviewResult must be extracted (T1359 regression)");
+        assert!(result.revision_warranted, "revision_warranted must be true");
+        assert_eq!(result.findings.len(), 2, "must recover both findings");
+        assert_eq!(
+            result.findings[0].severity,
+            ReviewFindingSeverity::High,
+            "first finding must be high severity",
+        );
+        assert_eq!(
+            result.findings[0].category,
+            ReviewFindingCategory::Correctness,
+        );
+    }
+
+    /// Regression fixture for T1359: when the bare JSON is preceded by prose
+    /// that contains `${VARIABLE}` syntax (which contains `{` and `}` characters),
+    /// the scanner must NOT be confused by those brace pairs and must still find
+    /// the actual ReviewResult that follows.
+    #[test]
+    fn extract_review_result_bare_json_with_braces_in_preceding_prose() {
+        let json = serde_json::json!({
+            "pr_url": "https://github.com/org/repo/pull/99",
+            "head_sha": "deadbeef",
+            "summary": "Found issue with variable substitution.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "script.sh",
+                    "title": "Orphan tag leak",
+                    "detail": "The call `git tag -a \"${TAG}\"` runs before the push check.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string();
+
+        // Prose BEFORE the JSON contains ${TAG} and ${RELEASE} — braces that
+        // must not confuse the balanced-brace scanner.
+        let text = format!(
+            "The release script sets TAG=${{TAG}} and runs `git push ${{RELEASE}}`.\n\n\
+             If the push fails, the local tag at ${{TAG}} persists.\n\n{json}"
+        );
+        let result = extract_review_result(&text)
+            .expect("ReviewResult must be found even when preceding prose has bare braces");
+        assert!(result.revision_warranted);
+        assert_eq!(result.findings.len(), 1);
     }
 
     // --- passes_severity_gate ---
