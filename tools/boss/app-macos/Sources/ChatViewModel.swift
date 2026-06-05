@@ -100,6 +100,13 @@ final class ChatViewModel: ObservableObject {
     @Published var automationRunsByID: [String: [AppAutomationRun]] = [:]
     /// The automation currently selected in the Automations tab detail pane.
     @Published var selectedAutomationID: String?
+    /// Editorial-action audit rows keyed by product id. Populated on demand
+    /// when the Editorial Controls sheet is opened for a product.
+    @Published var editorialActionsByProductID: [String: [EditorialAction]] = [:]
+    /// Fetch state for the editorial-actions list keyed by product id.
+    @Published var editorialActionsFetchStateByProductID: [String: AutomationsFetchState] = [:]
+    /// When non-nil, the Editorial Controls sheet is presented for this product id.
+    @Published var editorialControlsProductID: String?
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -2269,6 +2276,10 @@ final class ChatViewModel: ObservableObject {
             openTaskCountByAutomationID[automationID] = count
         case .automationRunsList(let automationID, let runs):
             automationRunsByID[automationID] = runs
+        // MARK: Editorial controls events
+        case .editorialActionsList(let productID, let actions):
+            editorialActionsByProductID[productID] = actions
+            editorialActionsFetchStateByProductID[productID] = .loaded
         }
     }
 
