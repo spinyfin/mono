@@ -1,151 +1,124 @@
-//! A deliberately tiny jq-subset selector — just enough to express buildifier's
-//! two transforms:
+//! A jaq-backed JSON selector: evaluates any jq/jaq filter against a JSON
+//! value, returning the matching items as the set of "rows" each finding is
+//! projected from.
+//!
+//! The filter string is validated at parse time (syntax errors are caught
+//! early) and compiled at evaluation time. Both of buildifier's filters work
+//! without modification:
 //!
 //! - `.files[] | select(.formatted == false)` (format pass)
 //! - `.files[].warnings[]` (lint pass)
 //!
-//! Grammar (informal):
+//! Richer jq expressions — variable binding, arithmetic, `|=`, arbitrary
+//! function calls — are supported by jaq and do not need a separate wasm tier
+//! unless they require side-effectful computation. That seam now lives at the
+//! boundary of jaq's own feature set rather than at hand-rolled parsing limits.
 //!
-//! ```text
-//! selector := segment ( "|" segment )*
-//! segment  := path | "select(" path op literal ")"
-//! path     := ( "." field "[]"? )+
-//! op       := "=="
-//! literal  := "true" | "false" | number | "\"" string "\""
-//! ```
+//! ## jaq prelude
 //!
-//! Evaluation threads a working set of JSON values: `Field` projects into an
-//! object key, `Iterate` flattens an array, `Select` filters by a comparison.
-//! Anything richer (variable binding like `.files[] as $f | $f.warnings[]`,
-//! arithmetic, `|=`, function calls) is intentionally unsupported — that
-//! complexity is the seam where the wasm pure-function transform tier takes over.
+//! jaq 1.x parses `false`, `true`, and `null` as zero-arity filter calls
+//! rather than literals (the token grammar does not have dedicated keyword
+//! variants for them). `jaq_core::core()` does not define these filters
+//! either. The prelude below registers the minimum set needed to support the
+//! kinds of filters declarative checks are expected to use.
 
 use anyhow::{Result, bail};
+use jaq_interpret::{Ctx, FilterT as _, Native, ParseCtx, RcIter, Val, ValR, ValRs};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selector {
-    steps: Vec<Step>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Step {
-    /// Project into an object key.
-    Field(String),
-    /// Flatten an array into its elements.
-    Iterate,
-    /// Keep values where `path == value`.
-    Select { path: Vec<String>, value: Value },
+    filter: String,
 }
 
 impl Selector {
+    /// Parse and syntax-validate a jaq filter string. Returns an error on
+    /// any jq syntax problem so bad manifests are rejected at load time, not
+    /// at the moment a tool runs and produces output.
     pub fn parse(raw: &str) -> Result<Self> {
-        let mut steps = Vec::new();
-        for segment in raw.split('|') {
-            let segment = segment.trim();
-            if segment.is_empty() {
-                bail!("empty selector segment in `{raw}`");
-            }
-            if let Some(inner) = segment.strip_prefix("select(") {
-                let inner = inner
-                    .strip_suffix(')')
-                    .ok_or_else(|| anyhow::anyhow!("unterminated `select(` in `{segment}`"))?;
-                steps.push(parse_select(inner.trim())?);
-            } else {
-                parse_path_into(segment, &mut steps)?;
-            }
+        let raw = raw.trim().to_owned();
+        if raw.is_empty() {
+            bail!("selector filter must not be empty");
         }
-        if steps.is_empty() {
-            bail!("selector `{raw}` produced no steps");
+        // Syntax-check at construction time so manifest load fails fast.
+        let (_f, errs) = jaq_parse::parse(&raw, jaq_parse::main());
+        if !errs.is_empty() {
+            bail!("selector `{raw}` has jaq parse errors: {errs:?}");
         }
-        Ok(Self { steps })
+        Ok(Self { filter: raw })
     }
 
-    /// Evaluate against `root`, returning the selected items (the "rows" each
-    /// finding is projected from).
-    pub fn select<'a>(&self, root: &'a Value) -> Vec<&'a Value> {
-        let mut working: Vec<&Value> = vec![root];
-        for step in &self.steps {
-            working = match step {
-                Step::Field(name) => working.iter().filter_map(|v| v.get(name)).collect(),
-                Step::Iterate => working
-                    .iter()
-                    .filter_map(|v| v.as_array())
-                    .flatten()
-                    .collect(),
-                Step::Select { path, value } => working
-                    .into_iter()
-                    .filter(|v| navigate(v, path) == Some(value))
-                    .collect(),
-            };
+    /// Evaluate the filter against `root`, returning each output value as a
+    /// separate row. Evaluation errors (e.g. type mismatches inside the
+    /// filter) are surfaced as `Err`.
+    pub fn select(&self, root: &Value) -> Result<Vec<Value>> {
+        // jaq 1.x parses `false`, `true`, `null` as Call("false"/"true"/"null",
+        // []) — not as literals. They are not provided by jaq_core::core().
+        // Register them as natives, plus `empty` (also not in core) so that
+        // `select(f)` from the stdlib can be defined.
+        //
+        // Order matters: natives must be registered before insert_defs so that
+        // the stdlib def that uses `empty` compiles correctly.
+        let (stdlib_defs, errs) = jaq_parse::parse(
+            "def select(f): if f then . else empty end; \
+             def not: if . then false else true end;",
+            jaq_parse::defs(),
+        );
+        if !errs.is_empty() {
+            bail!("jaq prelude parse errors: {errs:?}");
         }
-        working
-    }
-}
 
-/// Parse a `.a.b[].c` path into a sequence of `Field`/`Iterate` steps.
-fn parse_path_into(segment: &str, steps: &mut Vec<Step>) -> Result<()> {
-    let rest = segment
-        .strip_prefix('.')
-        .ok_or_else(|| anyhow::anyhow!("path segment `{segment}` must start with `.`"))?;
-    // Split on `.` but keep trailing `[]` attached to each field.
-    for raw_field in rest.split('.') {
-        if raw_field.is_empty() {
-            bail!("empty field in path segment `{segment}`");
+        let (f, errs) = jaq_parse::parse(&self.filter, jaq_parse::main());
+        if !errs.is_empty() {
+            bail!("selector `{}` jaq parse errors: {errs:?}", self.filter);
         }
-        let (name, iterate) = match raw_field.strip_suffix("[]") {
-            Some(name) => (name, true),
-            None => (raw_field, false),
+        let Some(f) = f else {
+            bail!("selector `{}` produced no filter", self.filter);
         };
-        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-            bail!("invalid field name `{name}` in path segment `{segment}`");
-        }
-        steps.push(Step::Field(name.to_owned()));
-        if iterate {
-            steps.push(Step::Iterate);
-        }
-    }
-    Ok(())
-}
 
-/// Parse `.a.b == literal` inside a `select(...)`.
-fn parse_select(inner: &str) -> Result<Step> {
-    let (lhs, rhs) = inner
-        .split_once("==")
-        .ok_or_else(|| anyhow::anyhow!("select expression `{inner}` must use `==`"))?;
-    let lhs = lhs.trim();
-    let path = lhs
-        .strip_prefix('.')
-        .ok_or_else(|| anyhow::anyhow!("select path `{lhs}` must start with `.`"))?;
-    let path: Vec<String> = path.split('.').map(str::to_owned).collect();
-    if path.iter().any(String::is_empty) {
-        bail!("malformed select path `{lhs}`");
-    }
-    let value = parse_literal(rhs.trim())?;
-    Ok(Step::Select { path, value })
-}
+        let mut ctx = ParseCtx::new(Vec::new());
+        ctx.insert_natives(jaq_core::core());
+        ctx.insert_native("empty".to_string(), 0, Native::new(jaq_empty));
+        ctx.insert_native("false".to_string(), 0, Native::new(jaq_false));
+        ctx.insert_native("true".to_string(), 0, Native::new(jaq_true));
+        ctx.insert_native("null".to_string(), 0, Native::new(jaq_null));
+        ctx.insert_defs(stdlib_defs.unwrap_or_default());
+        let filter = ctx.compile(f);
+        if !ctx.errs.is_empty() {
+            bail!(
+                "selector `{}` jaq compile errors: {} error(s)",
+                self.filter,
+                ctx.errs.len()
+            );
+        }
 
-fn parse_literal(raw: &str) -> Result<Value> {
-    match raw {
-        "true" => Ok(Value::Bool(true)),
-        "false" => Ok(Value::Bool(false)),
-        "null" => Ok(Value::Null),
-        _ => {
-            if let Some(quoted) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                return Ok(Value::String(quoted.to_owned()));
+        let inputs = RcIter::new(core::iter::empty());
+        let ctx = Ctx::new([], &inputs);
+        let input = Val::from(root.clone());
+
+        let mut rows = Vec::new();
+        for result in filter.run((ctx, input)) {
+            match result {
+                Ok(val) => rows.push(Value::from(val)),
+                Err(e) => bail!("selector `{}` evaluation error: {e}", self.filter),
             }
-            if let Ok(number) = raw.parse::<i64>() {
-                return Ok(Value::Number(number.into()));
-            }
-            bail!("unsupported select literal `{raw}` (expected bool, null, integer, or \"string\")")
         }
+        Ok(rows)
     }
 }
 
-fn navigate<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
-    let mut current = value;
-    for key in path {
-        current = current.get(key)?;
-    }
-    Some(current)
+fn jaq_empty<'a>(_: jaq_interpret::Args<'a>, _: (Ctx<'a>, Val)) -> ValRs<'a> {
+    Box::new(core::iter::empty::<ValR>())
+}
+
+fn jaq_false<'a>(_: jaq_interpret::Args<'a>, _: (Ctx<'a>, Val)) -> ValRs<'a> {
+    Box::new(core::iter::once(Ok(Val::Bool(false))))
+}
+
+fn jaq_true<'a>(_: jaq_interpret::Args<'a>, _: (Ctx<'a>, Val)) -> ValRs<'a> {
+    Box::new(core::iter::once(Ok(Val::Bool(true))))
+}
+
+fn jaq_null<'a>(_: jaq_interpret::Args<'a>, _: (Ctx<'a>, Val)) -> ValRs<'a> {
+    Box::new(core::iter::once(Ok(Val::Null)))
 }
