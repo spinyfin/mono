@@ -1181,7 +1181,10 @@ pub struct ExecutionCoordinator {
 /// Steps:
 /// 1. Fetch the current head OID from GitHub via `gh pr view`.
 /// 2. `jj git fetch` — pull the remote refs into the local jj store.
-/// 3. `jj edit <sha>` — move the workspace's working copy to the PR head.
+/// 3. `jj new <sha>` — position the working copy on a fresh empty child of the
+///    PR head. (`jj new`, not `jj edit`: a pushed PR head is immutable, so
+///    `jj edit` fails deterministically; the empty child's tree equals the
+///    head's, so the read-only reviewer still sees the PR-head files.)
 ///
 /// Returns the head SHA on success. Any subprocess failure is returned as an
 /// `Err` so the dispatcher can record a start failure and retry.

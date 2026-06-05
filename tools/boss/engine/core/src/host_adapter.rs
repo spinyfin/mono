@@ -278,10 +278,18 @@ impl HostAdapter for LocalHostAdapter {
     }
 }
 
-/// Run `gh pr view` + `jj git fetch` + `jj edit` locally in `workspace_path`
-/// to position the working copy at the PR head. Called by
-/// [`LocalHostAdapter::checkout_pr_head_for_review`]; extracted as a free
+/// Run `gh pr view` + `jj git fetch` + `jj new` locally in `workspace_path`
+/// to position the working copy on a fresh empty child of the PR head. Called
+/// by [`LocalHostAdapter::checkout_pr_head_for_review`]; extracted as a free
 /// function so the logic is readable without the `self` boilerplate.
+///
+/// `jj new` (not `jj edit`) is load-bearing: a PR head is a pushed,
+/// remote-tracked commit and is therefore immutable, so `jj edit <head>`
+/// fails with "Commit … is immutable" — the deterministic failure that left
+/// every `pr_review` dispatch stuck at `run_id = null`. The reviewer is
+/// read-only and only needs to read files at the PR-head state, which an
+/// empty child commit's tree preserves exactly. Mirrors cube's `--resume_pr`
+/// positioning (`jj new pr/<n>`).
 async fn checkout_pr_head_local(
     workspace_path: &Path,
     pr_url: &str,
@@ -313,10 +321,13 @@ async fn checkout_pr_head_local(
         }
     }
 
-    // 3. Move the workspace's working copy to the PR head.
+    // 3. Position the working copy on a fresh empty child of the PR head.
+    //    `jj new` (not `jj edit`): the PR head is a pushed, immutable commit,
+    //    so `jj edit` would fail with "Commit … is immutable". The empty
+    //    child's tree equals the head's, so the reviewer reads identical files.
     {
         let output = Command::new("jj")
-            .args(["edit", &head_sha])
+            .args(["new", &head_sha])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -324,10 +335,10 @@ async fn checkout_pr_head_local(
             .kill_on_drop(true)
             .output()
             .await
-            .with_context(|| format!("failed to spawn `jj edit {head_sha}`"))?;
+            .with_context(|| format!("failed to spawn `jj new {head_sha}`"))?;
         if !output.status.success() {
             return Err(anyhow!(
-                "`jj edit {head_sha}` failed: {}",
+                "`jj new {head_sha}` failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -702,18 +713,22 @@ impl HostAdapter for SshHostAdapter {
             ));
         }
 
-        // 3. Move the working copy to the PR head on the remote host.
-        let edit_cmd = format!("cd '{}' && jj edit '{head_sha}'", workspace);
+        // 3. Position the working copy on a fresh empty child of the PR head on
+        //    the remote host. `jj new` (not `jj edit`): the PR head is a pushed,
+        //    immutable commit, so `jj edit` fails with "Commit … is immutable".
+        //    The empty child's tree equals the head's, so the reviewer reads
+        //    identical files.
+        let new_cmd = format!("cd '{}' && jj new '{head_sha}'", workspace);
         let output = self
             .transport
-            .run(&["sh", "-c", &edit_cmd])
+            .run(&["sh", "-c", &new_cmd])
             .await
             .with_context(|| {
-                format!("failed to run `jj edit {head_sha}` on remote host {host}")
+                format!("failed to run `jj new {head_sha}` on remote host {host}")
             })?;
         if !output.success() {
             return Err(anyhow!(
-                "`jj edit {head_sha}` failed on {host}: {}",
+                "`jj new {head_sha}` failed on {host}: {}",
                 output.stderr.trim()
             ));
         }
