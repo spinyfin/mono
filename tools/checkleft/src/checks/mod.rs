@@ -1,8 +1,5 @@
 mod api_breaking_surface;
 mod bazel;
-// `pub(crate)` so the declarative external-check tier can reuse the bazel binary
-// resolver, and so spike parity tests can call the built-in JSON parsers directly.
-pub(crate) mod buildifier;
 mod code_patterns;
 mod docs_link_integrity;
 mod file_size;
@@ -27,7 +24,6 @@ use crate::check::CheckRegistry;
 
 pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(api_breaking_surface::ApiBreakingSurfaceCheck)?;
-    registry.register(buildifier::BuildifierCheck)?;
     registry.register(bazel::BazelPoliciesCheck)?;
     registry.register(bazel::BazelrcPoliciesCheck)?;
     registry.register(bazel::BazelversionPoliciesCheck)?;
