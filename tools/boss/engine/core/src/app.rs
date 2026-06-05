@@ -2678,6 +2678,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProductEditorialRules { .. } => {
                 products::handle_set_product_editorial_rules(ctx, r).await
             }
+            r @ FrontendRequest::EvaluateEditorialRules { .. } => {
+                products::handle_evaluate_editorial_rules(ctx, r).await
+            }
             r @ FrontendRequest::SetProductExternalTracker { .. } => {
                 external_tracker::handle_set_product_external_tracker(ctx, r).await
             }

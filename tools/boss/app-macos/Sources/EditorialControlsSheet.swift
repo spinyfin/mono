@@ -4,7 +4,8 @@ import SwiftUI
 
 /// Sheet presented when the operator clicks the editorial-controls button in
 /// the Work sidebar. Shows the current `EditorialRules` for the selected
-/// product (editable) and a recent audit trail of enforcement actions.
+/// product (editable), a recent audit trail of enforcement actions, and a
+/// test panel to preview how rules would handle a draft PR body.
 struct EditorialControlsSheet: View {
     @ObservedObject var model: ChatViewModel
     let productID: String
@@ -62,6 +63,8 @@ struct EditorialControlsSheet: View {
                     }
                 case .actions:
                     EditorialActionsPane(model: model, productID: productID)
+                case .test:
+                    EditorialTestPane(model: model, productID: productID)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -71,12 +74,13 @@ struct EditorialControlsSheet: View {
 }
 
 private enum EditorialTab: String, CaseIterable, Identifiable {
-    case rules, actions
+    case rules, actions, test
     var id: String { rawValue }
     var label: String {
         switch self {
         case .rules: return "Rules"
         case .actions: return "Recent Actions"
+        case .test: return "Test"
         }
     }
 }
@@ -555,6 +559,193 @@ private struct EditorialActionsPane: View {
         case "rewrite": return .orange
         case "advise": return .blue
         default: return .primary
+        }
+    }
+}
+
+// MARK: - Test pane
+
+/// Inline tab pane that lets the operator paste a draft PR body and title,
+/// then sends an `EvaluateEditorialRules` RPC to preview the hook decision
+/// without touching GitHub.
+private struct EditorialTestPane: View {
+    @ObservedObject var model: ChatViewModel
+    let productID: String
+
+    @State private var prBody: String = ""
+    @State private var prTitle: String = ""
+
+    private var isIdle: Bool {
+        if case .idle = model.editorialEvaluationState { return true }
+        return false
+    }
+
+    private var isLoading: Bool {
+        if case .loading = model.editorialEvaluationState { return true }
+        return false
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    inputSection
+                    if !isIdle { resultSection }
+                }
+                .padding(20)
+            }
+
+            Divider()
+
+            HStack {
+                Button("Test") {
+                    model.evaluateEditorialRules(
+                        productId: productID,
+                        body: prBody,
+                        title: prTitle.isEmpty ? nil : prTitle
+                    )
+                }
+                .disabled(prBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isLoading)
+                .keyboardShortcut(.return, modifiers: .command)
+
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .onAppear {
+            model.editorialEvaluationState = .idle
+        }
+    }
+
+    @ViewBuilder
+    private var inputSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Paste a draft PR body to see what the editorial hook would do — allow, rewrite, or deny — without touching GitHub.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("PR Title (optional)")
+                    .font(.callout.weight(.medium))
+                TextField("", text: $prTitle, prompt: Text("Leave blank to skip title check"))
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("PR Body")
+                    .font(.callout.weight(.medium))
+                TextEditor(text: $prBody)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 160)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resultSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Divider()
+
+            switch model.editorialEvaluationState {
+            case .idle:
+                EmptyView()
+
+            case .loading:
+                HStack {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Evaluating…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+            case .result(let decision, let findings, let rewrittenBody):
+                decisionBadge(decision)
+
+                if !findings.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Findings")
+                            .font(.callout.weight(.medium))
+                        ForEach(Array(findings.enumerated()), id: \.offset) { _, finding in
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("•")
+                                    .foregroundStyle(.secondary)
+                                Text(finding)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+
+                if let rewrittenBody {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Rewritten Body")
+                            .font(.callout.weight(.medium))
+                        ScrollView {
+                            Text(rewrittenBody)
+                                .font(.system(.callout, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(maxHeight: 180)
+                        .background(Color(nsColor: .textBackgroundColor))
+                        .cornerRadius(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                        )
+                    }
+                }
+
+            case .failed(let message):
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                    Text(message)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func decisionBadge(_ decision: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: decisionIcon(decision))
+                .foregroundStyle(decisionColor(decision))
+            Text("Decision: \(decision.uppercased())")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(decisionColor(decision))
+        }
+    }
+
+    private func decisionIcon(_ decision: String) -> String {
+        switch decision {
+        case "allow": return "checkmark.circle.fill"
+        case "rewrite": return "pencil.circle.fill"
+        case "deny": return "xmark.circle.fill"
+        default: return "questionmark.circle.fill"
+        }
+    }
+
+    private func decisionColor(_ decision: String) -> Color {
+        switch decision {
+        case "allow": return .green
+        case "rewrite": return .orange
+        case "deny": return .red
+        default: return .secondary
         }
     }
 }

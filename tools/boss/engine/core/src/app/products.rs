@@ -175,3 +175,89 @@ pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: Front
         }
     }
 }
+
+pub(super) async fn handle_evaluate_editorial_rules(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::EvaluateEditorialRules {
+        product_id,
+        body,
+        title,
+    } = req
+    else {
+        unreachable!()
+    };
+
+    let product = match work_db.get_product(&product_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("product {product_id} not found"),
+                },
+            );
+            return;
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    let rules = product.editorial_rules.clone().unwrap_or_default();
+    let compiled = match boss_editorial::CompiledRules::compile(rules) {
+        Ok(c) => c,
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("invalid redaction regex in editorial_rules: {err}"),
+                },
+            );
+            return;
+        }
+    };
+
+    let decision = boss_editorial::evaluate(&body, title.as_deref().unwrap_or(""), &compiled, None);
+    let (decision_str, findings, rewritten_body) = match decision {
+        boss_editorial::EditorialDecision::Allow => ("allow", vec![], None),
+        boss_editorial::EditorialDecision::Rewrite {
+            body: new_body,
+            findings,
+            ..
+        } => (
+            "rewrite",
+            findings.iter().map(|f| f.description.clone()).collect(),
+            Some(new_body),
+        ),
+        boss_editorial::EditorialDecision::Block { findings } => (
+            "deny",
+            findings.iter().map(|f| f.description.clone()).collect(),
+            None,
+        ),
+    };
+
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::EditorialRulesEvaluated {
+            product_id,
+            decision: decision_str.to_owned(),
+            findings,
+            rewritten_body,
+        },
+    );
+}

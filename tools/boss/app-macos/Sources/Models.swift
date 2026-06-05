@@ -1697,6 +1697,15 @@ enum AutomationsFetchState {
     case failed(String)
 }
 
+/// State for an in-flight or completed `evaluate_editorial_rules` RPC,
+/// held on `ChatViewModel.editorialEvaluationState`.
+enum EditorialEvaluationState {
+    case idle
+    case loading
+    case result(decision: String, findings: [String], rewrittenBody: String?)
+    case failed(String)
+}
+
 /// Load state for one execution's transcript, keyed by execution id in
 /// [[ChatViewModel.transcriptsByExecutionID]]. `nil` (absent) means the
 /// transcript has not been requested yet.

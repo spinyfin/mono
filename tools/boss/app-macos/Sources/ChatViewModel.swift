@@ -160,6 +160,8 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
     @Published var pendingWorkEditRequest: WorkEditRequest?
     @Published var workErrorMessage: String?
+    /// Current state of an in-flight `evaluate_editorial_rules` RPC.
+    @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {
         didSet { invalidateWorkCache() }
     }
@@ -1137,6 +1139,11 @@ final class ChatViewModel: ObservableObject {
         pendingWorkEditRequest = nil
     }
 
+    func evaluateEditorialRules(productId: String, body: String, title: String?) {
+        editorialEvaluationState = .loading
+        engine.sendEvaluateEditorialRules(productId: productId, body: body, title: title?.isEmpty == true ? nil : title)
+    }
+
     func submitWorkCreateRequest(
         _ request: WorkCreateRequest,
         name: String,
@@ -1982,6 +1989,9 @@ final class ChatViewModel: ObservableObject {
         case .workError(let message):
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
+            if case .loading = editorialEvaluationState {
+                editorialEvaluationState = .failed(message)
+            }
             openingReviewTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
@@ -2246,6 +2256,13 @@ final class ChatViewModel: ObservableObject {
         case .editorialActionsList(let productID, let actions):
             editorialActionsByProductID[productID] = actions
             editorialActionsFetchStateByProductID[productID] = .loaded
+        case .editorialRulesEvaluated(let productID, let decision, let findings, let rewrittenBody):
+            guard productID == editorialControlsProductID else { break }
+            editorialEvaluationState = .result(
+                decision: decision,
+                findings: findings,
+                rewrittenBody: rewrittenBody
+            )
         }
     }
 
