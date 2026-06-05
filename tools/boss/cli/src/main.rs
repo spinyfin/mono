@@ -8968,6 +8968,9 @@ mod tests {
         let shown = with_display_status(task);
         assert_eq!(shown.status.display_label(), "review");
         assert_eq!(shown.status, TaskStatus::InReview);
+        // JSON output must use the display label so --json is consistent with table.
+        let json = serde_json::to_string(&shown.status).unwrap();
+        assert_eq!(json, r#""review""#);
     }
 
     #[test]
