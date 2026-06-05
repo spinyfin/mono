@@ -1084,6 +1084,17 @@ pub enum FrontendRequest {
         shell_pid: i32,
     },
 
+    /// App reports the capability IDs compiled into this build. The
+    /// engine updates its in-memory capability registry so the flag
+    /// system can detect when a flag is enabled but its backing
+    /// capability is absent. Sent once per session immediately after
+    /// [`Self::RegisterAppSession`] is acknowledged. Replies with
+    /// [`FrontendEvent::FeatureFlagsList`] so the flag pane
+    /// immediately reflects accurate `capability_present` state.
+    RegisterCapabilities {
+        capability_ids: Vec<String>,
+    },
+
     /// App notifies the engine that a review terminal window has closed
     /// and the associated workspace lease should be released. This is
     /// fire-and-forget: the engine logs failures but does not reply.
@@ -2399,6 +2410,13 @@ pub struct FeatureFlagSnapshot {
     /// Current effective value — what `is_enabled(name)` returns
     /// right now. Equals `default_enabled` when no override exists.
     pub enabled: bool,
+    /// Whether the capability backing this flag is present in the
+    /// current running build. `None` when the flag has no backing
+    /// capability (kill-switch pattern). `Some(false)` when the flag
+    /// is enabled but its implementation is absent from this build —
+    /// the debug pane shows a warning badge in this state.
+    #[serde(default)]
+    pub capability_present: Option<bool>,
 }
 
 /// Snapshot of one per-installation setting's static metadata + current
@@ -2751,6 +2769,7 @@ mod feature_flags_wire_tests {
             category: "completion".into(),
             default_enabled: true,
             enabled: false,
+            capability_present: None,
         };
         let original = FrontendEvent::FeatureFlagsList {
             flags: vec![snap.clone()],
@@ -2761,6 +2780,48 @@ mod feature_flags_wire_tests {
         match parsed {
             FrontendEvent::FeatureFlagsList { flags } => {
                 assert_eq!(flags, vec![snap]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_flags_list_event_round_trips_with_capability_present() {
+        let snap = FeatureFlagSnapshot {
+            name: "toolbar_search_standard".into(),
+            description: "Standard SwiftUI search in toolbar".into(),
+            category: "search".into(),
+            default_enabled: false,
+            enabled: true,
+            capability_present: Some(false),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("capability_present"));
+        let parsed: FeatureFlagSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.capability_present, Some(false));
+    }
+
+    #[test]
+    fn feature_flag_snapshot_capability_present_defaults_to_none_on_old_payload() {
+        // Payloads from older engine builds omit capability_present.
+        // The #[serde(default)] annotation must round-trip them as None.
+        let json = r#"{"name":"detect_pr_cold_fallback","description":"d","category":"completion","default_enabled":true,"enabled":true}"#;
+        let parsed: FeatureFlagSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.capability_present, None);
+    }
+
+    #[test]
+    fn register_capabilities_request_round_trips() {
+        let original = FrontendRequest::RegisterCapabilities {
+            capability_ids: vec!["toolbar_search_standard".into(), "other_cap".into()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("register_capabilities"));
+        assert!(json.contains("toolbar_search_standard"));
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::RegisterCapabilities { capability_ids } => {
+                assert_eq!(capability_ids, &["toolbar_search_standard", "other_cap"]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
