@@ -13,10 +13,11 @@ use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
 use checkleft::external::{
-    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    DefaultExternalCheckExecutor, ExternalCheckExecutor, ExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
-    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
+    BundledExternalCheckPackageProvider, CompositeExternalCheckPackageProvider,
+    ConfiguredExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckExecutor,
+    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
+    GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
+    NoopExternalCheckPackageProvider,
 };
 use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
@@ -302,6 +303,13 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
         providers.push(ConfiguredExternalCheckPackageProvider::new(
             "file",
             Arc::new(FileExternalCheckPackageProvider::new(root)?),
+        ));
+        // First-party defs embedded in the binary: zero install for target
+        // repos. Grouped with the file provider (both are the non-generated
+        // path), so `generated-only` mode excludes it too.
+        providers.push(ConfiguredExternalCheckPackageProvider::new(
+            "bundled",
+            Arc::new(BundledExternalCheckPackageProvider),
         ));
     }
 

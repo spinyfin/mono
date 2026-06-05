@@ -257,7 +257,124 @@ checks:
     assert!(
         error
             .to_string()
-            .contains("external checks files may only use `generated:` implementations")
+            .contains("external checks files may only use `generated:` or `bundled:` implementations")
+    );
+}
+
+#[tokio::test]
+async fn allows_bundled_implementation_from_external_checks_file() {
+    // Bundled defs are embedded in the binary, so a remotely-distributed external
+    // checks file may reference them (unlike local `File` refs) — this is the
+    // zero-install distribution path.
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: buildifier
+    implementation: bundled:buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolution must succeed");
+
+    let check = checks.get("buildifier").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(crate::external::ExternalCheckImplementationRef::Bundled(
+            "buildifier".to_owned()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn bare_id_in_external_config_resolves_to_bundled() {
+    // A bare `id: buildifier` in an external config resolves to the bundled def
+    // automatically — no `implementation:` line needed.
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolution must succeed");
+
+    let check = checks.get("buildifier").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(crate::external::ExternalCheckImplementationRef::Bundled(
+            "buildifier".to_owned()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn rejects_exec_paths_in_external_checks_file() {
+    // exec_paths would reach into the consuming repo's local filesystem — forbidden
+    // in external configs (same trust rule as local File implementation refs).
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks
+checks:
+  - id: buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let error = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect_err("resolution must fail");
+
+    assert!(
+        format!("{error:#}")
+            .contains("exec_paths` is not allowed in an external checks config"),
+        "unexpected error: {error:#}"
     );
 }
 

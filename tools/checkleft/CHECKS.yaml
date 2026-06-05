@@ -5,14 +5,19 @@ checks:
 # ── declarative buildifier spike (not enabled — enabling would duplicate the
 #    built-in `buildifier` check and break dogfooding CI) ──────────────────────
 #
-# To enable the declarative check in a repo that has adopted it:
+# To enable the declarative check in a repo that has adopted it, use the simple
+# zero-install form (no implementation: line required):
 #
 #   checks:
 #     - id: buildifier
-#       check: buildifier-declarative
-#       implementation: tools/checkleft/checks/buildifier/check.yaml
-#       # Optional: override the default Bazel resolver with a direct path.
-#       # config:
-#       #   needs:
-#       #     buildifier:
-#       #       path: /usr/local/bin/buildifier
+#
+# To use the checked-in (always-head) definition from disk instead of the
+# bundled snapshot, add a check_definitions section:
+#
+#   check_definitions:
+#     exec_paths:
+#       - tools/checkleft/checks
+#     allow_override_bundled: true
+#
+#   checks:
+#     - id: buildifier

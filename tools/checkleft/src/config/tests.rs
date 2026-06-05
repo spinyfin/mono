@@ -312,7 +312,7 @@ check = "typo"
 }
 
 #[test]
-fn parses_external_check_implementation_reference() {
+fn parses_explicit_generated_implementation_reference() {
     let temp = tempdir().expect("create temp dir");
 
     fs::write(
@@ -341,6 +341,309 @@ implementation = "generated:domain-typo-check"
     assert_eq!(check.policy.severity, None);
     assert_eq!(check.policy.allow_bypass, None);
     assert_eq!(check.policy.bypass_name, None);
+}
+
+// ── bundled resolution (new shape: id/check name only, no implementation: needed) ──
+
+#[test]
+fn bare_id_matching_bundled_name_resolves_to_bundled() {
+    // The simplest consumer shape: just an id. No implementation:, no check_definitions.
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "buildifier"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+
+    let check = checks.get("buildifier").expect("check exists");
+    assert_eq!(check.check, "buildifier");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+    );
+}
+
+#[test]
+fn custom_id_with_bundled_check_name_resolves_to_bundled() {
+    // Custom instance id + check: pointing at a bundled name.
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "my-buildifier"
+check = "buildifier"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-buildifier").expect("check exists");
+    assert_eq!(check.check, "buildifier");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+    );
+}
+
+#[test]
+fn unknown_name_without_exec_paths_leaves_implementation_none() {
+    // A name that is neither bundled nor in exec_paths stays as None (routes to built-in).
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("file-size").expect("check exists");
+    assert_eq!(check.implementation, None);
+}
+
+#[test]
+fn exec_paths_resolves_check_from_on_disk_dir() {
+    let temp = tempdir().expect("create temp dir");
+    // Lay down a fake check def at checks/my-check/check.yaml.
+    let defs_dir = temp.path().join("checks/my-check");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    // The file just needs to exist; content irrelevant for config resolution.
+    fs::write(defs_dir.join("check.yaml"), "id: my-check\n").expect("write def");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["checks"]
+
+[[checks]]
+id = "my-check"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-check").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::File(
+            Path::new("checks/my-check/check.yaml").to_path_buf()
+        ))
+    );
+}
+
+#[test]
+fn allow_override_bundled_makes_exec_path_win_over_bundled() {
+    let temp = tempdir().expect("create temp dir");
+    // Lay down a local copy of the bundled buildifier def.
+    let defs_dir = temp.path().join("tools/checkleft/checks/buildifier");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    fs::write(defs_dir.join("check.yaml"), "id: buildifier\n").expect("write def");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["tools/checkleft/checks"]
+allow_override_bundled = true
+
+[[checks]]
+id = "buildifier"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+
+    let check = checks.get("buildifier").expect("check exists");
+    // The exec-path copy wins over the bundled def.
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::File(
+            Path::new("tools/checkleft/checks/buildifier/check.yaml").to_path_buf()
+        ))
+    );
+}
+
+#[test]
+fn bundled_wins_over_exec_path_by_default() {
+    let temp = tempdir().expect("create temp dir");
+    // Lay down a local copy of the bundled buildifier def.
+    let defs_dir = temp.path().join("checks/buildifier");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    fs::write(defs_dir.join("check.yaml"), "id: buildifier\n").expect("write def");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["checks"]
+
+[[checks]]
+id = "buildifier"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+
+    let check = checks.get("buildifier").expect("check exists");
+    // Bundled wins (allow_override_bundled defaults to false).
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+    );
+}
+
+#[test]
+fn check_definitions_is_inherited_by_child_configs() {
+    let temp = tempdir().expect("create temp dir");
+    let defs_dir = temp.path().join("checks/my-check");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    fs::write(defs_dir.join("check.yaml"), "id: my-check\n").expect("write def");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["checks"]
+"#,
+    )
+    .expect("write root config");
+
+    fs::create_dir_all(temp.path().join("sub")).expect("create child dir");
+    fs::write(
+        temp.path().join("sub/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "my-check"
+"#,
+    )
+    .expect("write child config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("sub/file.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-check").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::File(
+            Path::new("checks/my-check/check.yaml").to_path_buf()
+        ))
+    );
+}
+
+#[test]
+fn explicit_bundled_ref_still_works() {
+    // Explicit `implementation: bundled:<name>` still resolves correctly.
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "my-buildifier"
+check = "buildifier"
+implementation = "bundled:buildifier"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-buildifier").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+    );
+}
+
+#[test]
+fn explicit_generated_ref_still_works() {
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "my-custom"
+implementation = "generated:my-custom"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-custom").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Generated("my-custom".to_owned()))
+    );
+}
+
+#[test]
+fn rejects_invalid_exec_path() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["../escape"]
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("invalid `check_definitions.exec_paths`")
+    );
 }
 
 #[test]

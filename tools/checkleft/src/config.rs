@@ -27,6 +27,27 @@ const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
 const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
+/// Canonical manifest filename within a definition directory.
+/// Used for both the embedded bundle (`checks/<name>/check.yaml`) and
+/// exec-path source directories (`<dir>/<name>/check.yaml`).
+const CHECK_DEF_FILE_NAME: &str = "check.yaml";
+
+/// Resolved `check_definitions` section from a CHECKS file. Controls where
+/// name-based definition resolution looks beyond the bundled set.
+///
+/// The default (zero config) is bundled-only resolution: a check whose `id`/`check`
+/// names a bundled definition gets that def without any `implementation:` line.
+/// `exec_paths` adds on-disk directories as an additional source; `allow_override_bundled`
+/// controls precedence when both a bundled def and an exec-path def share a name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedCheckDefinitions {
+    /// Repo-root-relative directories to search for declarative check-definition
+    /// yaml files (`<dir>/<name>/check.yaml`). Empty by default.
+    pub exec_paths: Vec<PathBuf>,
+    /// When `true`, an exec-path def with the same name as a bundled def wins.
+    /// Default `false` (bundled wins).
+    pub allow_override_bundled: bool,
+}
 
 fn ensure_rustls_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
@@ -110,6 +131,9 @@ pub struct ResolvedChecks {
     diagnostics: Vec<ConfigDiagnostic>,
     include_config_files: bool,
     stale_exclusion_mode: StaleExclusionMode,
+    /// Accumulated check-definitions config (exec_paths + allow_override_bundled).
+    /// Inherited down the config hierarchy and applied to each check's name-based resolution.
+    check_definitions: ResolvedCheckDefinitions,
 }
 
 impl ResolvedChecks {
@@ -316,11 +340,24 @@ impl ConfigResolver {
             config_abs_dir == self.root,
             &config_relative_path,
         );
+        // Apply check_definitions if present (updates inherited state before the per-check loop).
+        if let Some(raw_defs) = &checks_file.check_definitions {
+            match parse_check_definitions(raw_defs, &config_relative_path) {
+                Ok(defs) => resolved.check_definitions = defs,
+                Err(diagnostic) => resolved.push_diagnostic(diagnostic),
+            }
+        }
+
         for check in checks_file.checks {
             let configured_id = check.id;
+            // check_name is the definition name (check: field, defaulting to id).
+            let check_name = check.check.as_deref().unwrap_or(&configured_id).to_owned();
             let implementation = if check.enabled {
-                match parse_check_implementation(
+                match resolve_check_implementation(
                     check.implementation.as_deref(),
+                    &check_name,
+                    &resolved.check_definitions,
+                    Some(&self.root),
                     &configured_id,
                     None,
                 ) {
@@ -350,7 +387,7 @@ impl ConfigResolver {
                     }
                 };
             resolved.upsert(CheckConfig {
-                check: check.check.unwrap_or_else(|| configured_id.clone()),
+                check: check_name,
                 id: configured_id,
                 source_path: config_relative_path.clone(),
                 config_dir: check_config_dir.clone(),
@@ -368,6 +405,10 @@ impl ConfigResolver {
 struct ParsedChecksFile {
     #[serde(default)]
     settings: ParsedSettings,
+    /// Top-level `check_definitions` section: controls where definition names
+    /// are resolved (bundled vs. on-disk exec_paths).
+    #[serde(default)]
+    check_definitions: Option<ParsedCheckDefinitions>,
     #[serde(default)]
     checks: Vec<ParsedCheckConfig>,
 }
@@ -382,11 +423,25 @@ struct ParsedSettings {
     stale_exclusion_severity: Option<String>,
 }
 
+/// Parsed form of the top-level `check_definitions:` section.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ParsedCheckDefinitions {
+    /// Relative directories containing check-definition yaml files.
+    #[serde(default)]
+    exec_paths: Vec<String>,
+    /// When true, an exec-path def with the same name as a bundled def wins.
+    #[serde(default)]
+    allow_override_bundled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ParsedCheckConfig {
     id: String,
     #[serde(default)]
     check: Option<String>,
+    /// Explicit implementation reference (`generated:<id>`, `bundled:<name>`,
+    /// or a repo-relative manifest path). When absent, the check name is resolved
+    /// automatically against the bundled set and configured exec_paths.
     #[serde(default)]
     implementation: Option<String>,
     #[serde(default = "enabled_default")]
@@ -484,15 +539,145 @@ fn parse_check_implementation(
     let Some(implementation) = implementation else {
         return Ok(None);
     };
-    let implementation = ExternalCheckImplementationRef::parse(implementation).with_context(
-        || match config_source {
-            Some(config_source) => {
-                format!("invalid `implementation` for check `{check_id}` in {config_source}")
-            }
-            None => format!("invalid `implementation` for check `{check_id}`"),
-        },
-    )?;
+    let implementation = ExternalCheckImplementationRef::parse(implementation)
+        .with_context(|| invalid_field_context("implementation", check_id, config_source))?;
     Ok(Some(implementation))
+}
+
+fn invalid_field_context(field: &str, check_id: &str, config_source: Option<&str>) -> String {
+    match config_source {
+        Some(config_source) => format!("invalid `{field}` for check `{check_id}` in {config_source}"),
+        None => format!("invalid `{field}` for check `{check_id}`"),
+    }
+}
+
+/// Validate and convert a [`ParsedCheckDefinitions`] to [`ResolvedCheckDefinitions`],
+/// producing a config diagnostic on failure.
+fn parse_check_definitions(
+    raw: &ParsedCheckDefinitions,
+    source_path: &Path,
+) -> std::result::Result<ResolvedCheckDefinitions, ConfigDiagnostic> {
+    let mut exec_paths = Vec::with_capacity(raw.exec_paths.len());
+    for raw_path in &raw.exec_paths {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return Err(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                "check_definitions.exec_paths entries must not be empty".to_owned(),
+                None,
+                None,
+                Some("Provide a non-empty relative directory path.".to_owned()),
+            ));
+        }
+        let path = PathBuf::from(trimmed);
+        if let Err(err) = validate_relative_path(&path) {
+            return Err(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                format!("invalid `check_definitions.exec_paths` entry `{trimmed}`: {err}"),
+                None,
+                None,
+                Some(
+                    "Each exec_paths entry must be a safe relative directory path.".to_owned(),
+                ),
+            ));
+        }
+        exec_paths.push(path);
+    }
+    Ok(ResolvedCheckDefinitions {
+        exec_paths,
+        allow_override_bundled: raw.allow_override_bundled,
+    })
+}
+
+/// Resolve a check's external implementation reference.
+///
+/// - An explicit `implementation:` field (`generated:`, `bundled:`, or a path) is used verbatim.
+/// - When `implementation:` is absent, `check_name` is resolved against the configured
+///   definition sources in priority order:
+///   1. `exec_paths` (if `allow_override_bundled: true`)
+///   2. Bundled definitions embedded in the binary
+///   3. `exec_paths` (if `allow_override_bundled: false`)
+///   4. `None` — falls through to the Rust built-in registry at run time.
+///
+/// `repo_root` is `None` for remotely-fetched external configs, which may not reach into
+/// the consuming repo's local filesystem; exec_paths are skipped in that case.
+fn resolve_check_implementation(
+    explicit_implementation: Option<&str>,
+    check_name: &str,
+    definitions: &ResolvedCheckDefinitions,
+    repo_root: Option<&Path>,
+    check_id: &str,
+    config_source: Option<&str>,
+) -> Result<Option<ExternalCheckImplementationRef>> {
+    // Explicit `implementation:` field is used verbatim (for generated:, bundled:, or path).
+    if let Some(raw_impl) = explicit_implementation {
+        let raw_impl = raw_impl.trim();
+        if raw_impl.is_empty() {
+            bail!("`implementation` for check `{check_id}` must not be empty");
+        }
+        return parse_check_implementation(Some(raw_impl), check_id, config_source);
+    }
+
+    // No explicit implementation: resolve check_name against exec_paths and bundled defs.
+    let in_bundled = is_bundled_check_name(check_name);
+
+    // When allow_override_bundled, exec_paths take priority over bundled.
+    if definitions.allow_override_bundled {
+        if let Some(root) = repo_root {
+            if let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)? {
+                return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
+            }
+        }
+    }
+
+    // Bundled defs (embedded in binary, zero install).
+    if in_bundled {
+        return Ok(Some(ExternalCheckImplementationRef::Bundled(
+            check_name.to_owned(),
+        )));
+    }
+
+    // exec_paths at lower priority (when bundled does not win).
+    if !definitions.allow_override_bundled {
+        if let Some(root) = repo_root {
+            if let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)? {
+                return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
+            }
+        }
+    }
+
+    // Not found in bundled or exec_paths → None (falls through to Rust built-in registry).
+    Ok(None)
+}
+
+/// Search `exec_paths` for a `<dir>/<name>/check.yaml` manifest, returning the
+/// repo-root-relative path if found. Returns `None` if no match exists.
+fn find_in_exec_paths(
+    exec_paths: &[PathBuf],
+    check_name: &str,
+    repo_root: &Path,
+) -> Result<Option<PathBuf>> {
+    for exec_path in exec_paths {
+        let manifest_rel = exec_path.join(check_name).join(CHECK_DEF_FILE_NAME);
+        let manifest_abs = repo_root.join(&manifest_rel);
+        if manifest_abs.exists() {
+            validate_relative_path(&manifest_rel).with_context(|| {
+                format!(
+                    "resolved manifest path `{}` is not a safe relative path",
+                    manifest_rel.display()
+                )
+            })?;
+            return Ok(Some(manifest_rel));
+        }
+    }
+    Ok(None)
+}
+
+/// Returns `true` when `name` matches a first-party definition embedded in the binary.
+fn is_bundled_check_name(name: &str) -> bool {
+    crate::external::bundled_check_names().any(|n| n == name)
 }
 
 fn parse_policy_config(
@@ -734,11 +919,30 @@ fn apply_external_checks_file(
         })?;
     }
 
+    // Reject exec_paths in external configs — they would reach into the consuming
+    // repo's local filesystem, which is the same trust boundary as a File implementation ref.
+    if let Some(raw_defs) = &external_checks_file.parsed.check_definitions {
+        if !raw_defs.exec_paths.is_empty() {
+            bail!(
+                "`check_definitions.exec_paths` is not allowed in an external checks config ({}); \
+                 a directory path source would reach into the consuming repo's local filesystem",
+                external_checks_file.source_label
+            );
+        }
+        // allow_override_bundled without exec_paths is a no-op for remote configs, ignore.
+    }
+
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();
+        let check_name = check.check.clone().unwrap_or_else(|| configured_id.clone());
         let implementation = if check.enabled {
-            let implementation = parse_check_implementation(
+            // External configs may not use exec_paths (no repo_root passed).
+            // Bundled resolution still applies (zero-install path).
+            let implementation = resolve_check_implementation(
                 check.implementation.as_deref(),
+                &check_name,
+                &resolved.check_definitions,
+                None,
                 &configured_id,
                 Some(&external_checks_file.source_label),
             )?;
@@ -759,7 +963,7 @@ fn apply_external_checks_file(
             Some(&external_checks_file.source_label),
         )?;
         resolved.upsert(CheckConfig {
-            check: check.check.clone().unwrap_or_else(|| configured_id.clone()),
+            check: check_name,
             id: configured_id,
             source_path: external_checks_file.source_path.clone(),
             config_dir: PathBuf::new(),
@@ -936,7 +1140,7 @@ fn validate_external_root_check_implementation(
         && matches!(implementation, ExternalCheckImplementationRef::File(_))
     {
         bail!(
-            "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` implementations"
+            "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` or `bundled:` implementations"
         );
     }
 

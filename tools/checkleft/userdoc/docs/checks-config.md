@@ -61,13 +61,33 @@ When `external_checks_url` is set in the repository root config, `checkleft`
 fetches that remote `CHECKS.yaml` or `CHECKS.toml`, applies it first, and then
 merges the local root config and any child configs on top.
 
+## `check_definitions`
+
+Optional top-level section controlling where first-party check definitions are loaded from.
+
+```yaml
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks   # relative dir(s) containing check definition yaml files
+  allow_override_bundled: true
+```
+
+Supported keys:
+
+- `exec_paths` (list of strings): relative directories to search for check-definition yaml files. Each definition lives at `<dir>/<name>/check.yaml`. Inherited by child configs.
+- `allow_override_bundled` (boolean, default `false`): when `true`, a definition found in `exec_paths` with the same name as a bundled definition takes precedence over the bundled copy. When `false` (the default), bundled definitions win.
+
+`exec_paths` is not allowed in remotely-fetched external configs — a path source would reach into the consuming repo's local filesystem.
+
+**Default behavior (no `check_definitions` section):** a check whose `id` (or `check`) matches the name of a first-party bundled definition resolves to that bundled def automatically — no `implementation:` line needed, no install required.
+
 ## `checks` entry
 
 Supported keys:
 
 - `id` (required): check instance ID used in output.
-- `check` (optional): implementation ID; defaults to `id`.
-- `implementation` (optional): external package reference, either a checked-in manifest path or `generated:<id>`.
+- `check` (optional): check definition name; defaults to `id`.
+- `implementation` (optional): explicit external package reference — `generated:<id>` or a checked-in manifest path. For first-party (bundled) and exec-path checks, omit this field; resolution is automatic from the `id`/`check` name.
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
 - `policy` (optional table): framework-managed severity/bypass controls.
@@ -77,6 +97,37 @@ Supported keys:
 - `severity` (optional `error|warning|info`): overrides finding severity for the check instance.
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
+
+## Pattern: First-party (bundled) check — zero install
+
+First-party checks whose definitions ship inside the `checkleft` binary resolve automatically from `id` (or `check`). No `implementation:` line needed:
+
+```yaml
+checks:
+  - id: buildifier
+```
+
+With a custom instance ID:
+
+```yaml
+checks:
+  - id: my-buildifier
+    check: buildifier
+```
+
+## Pattern: Always-head definitions from disk (e.g. mono)
+
+A repo that maintains its own check definitions on disk can point `exec_paths` at them. With `allow_override_bundled: true`, the on-disk copy takes precedence over the bundled snapshot — so the repo always runs its checked-in (head) version:
+
+```yaml
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks
+  allow_override_bundled: true
+
+checks:
+  - id: buildifier   # resolves to tools/checkleft/checks/buildifier/check.yaml
+```
 
 ## Pattern: Multiple instances of one implementation
 

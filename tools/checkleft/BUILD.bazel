@@ -10,6 +10,10 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
+    # First-party check definitions embedded in the binary via include_str!
+    # (see src/external/bundled.rs). Must be compile_data so the bundle is
+    # readable at compile time under bazel's sandbox.
+    compile_data = ["checks/buildifier/check.yaml"],
     crate_name = "checkleft",
     crate_root = "src/lib.rs",
     edition = "2024",
