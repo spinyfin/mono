@@ -56,6 +56,7 @@ rust_test(
     name = "checkleft_lib_test",
     size = "small",
     crate = ":checkleft_lib",
+    compile_data = ["checks/buildifier/check.yaml"],
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

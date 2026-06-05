@@ -122,14 +122,87 @@ pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExter
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read external check manifest {}", path.display()))?;
-    parse_external_check_package_manifest(&contents)
-        .with_context(|| format!("invalid external check manifest {}", path.display()))
+    let is_yaml = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml" | "yml")
+    );
+    if is_yaml {
+        parse_declarative_check_manifest(&contents)
+            .with_context(|| format!("invalid declarative external check manifest {}", path.display()))
+    } else {
+        parse_external_check_package_manifest(&contents)
+            .with_context(|| format!("invalid external check manifest {}", path.display()))
+    }
 }
 
 pub fn parse_external_check_package_manifest(contents: &str) -> Result<ExternalCheckPackage> {
     let raw: RawExternalCheckPackage =
         toml::from_str(contents).context("failed to parse external check manifest TOML")?;
     raw.validate()
+}
+
+/// Parse a declarative check package manifest from YAML. Declarative manifests
+/// are YAML (as opposed to the TOML used by `artifact`/`exec` packages) — they
+/// have a richer schema (invocations/transforms) that reads naturally as YAML.
+pub fn parse_declarative_check_manifest(contents: &str) -> Result<ExternalCheckPackage> {
+    let raw: RawDeclarativeCheckManifest =
+        serde_yaml::from_str(contents).context("failed to parse declarative check manifest YAML")?;
+    raw.validate()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeclarativeCheckManifest {
+    id: String,
+    mode: String,
+    runtime: String,
+    api_version: String,
+    applies_to: Vec<String>,
+    #[serde(default)]
+    needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
+    #[serde(default)]
+    invocations: Vec<declarative::RawInvocation>,
+}
+
+impl RawDeclarativeCheckManifest {
+    fn validate(self) -> Result<ExternalCheckPackage> {
+        let id = required_non_empty("id", self.id)?;
+        let runtime = required_non_empty("runtime", self.runtime)?;
+        let api_version = required_non_empty("api_version", self.api_version)?;
+
+        if self.mode != "declarative" {
+            bail!(
+                "declarative manifest `mode` must be `declarative`, got `{}`",
+                self.mode
+            );
+        }
+        if runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
+            bail!(
+                "unsupported runtime `{runtime}` (expected `{EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1}`)"
+            );
+        }
+        if api_version != EXTERNAL_CHECK_API_V1 {
+            bail!(
+                "unsupported api_version `{api_version}` (expected `{EXTERNAL_CHECK_API_V1}`)"
+            );
+        }
+
+        let declarative_fields = declarative::RawDeclarativeFields {
+            applies_to: self.applies_to,
+            needs: self.needs,
+            invocations: self.invocations,
+        };
+
+        Ok(ExternalCheckPackage {
+            id,
+            runtime,
+            api_version,
+            capabilities: ExternalCheckCapabilities::default(),
+            implementation: ExternalCheckPackageImplementation::Declarative(
+                declarative::validate_declarative_implementation(declarative_fields)?,
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

@@ -15,7 +15,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::checks::buildifier::{parse_format_output, parse_lint_output};
-use crate::external::{ExternalCheckPackageImplementation, parse_external_check_package_manifest};
+use crate::external::{
+    ExternalCheckPackageImplementation, parse_declarative_check_manifest,
+    parse_external_check_package_manifest,
+};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::{Finding, Severity};
 
@@ -23,61 +26,11 @@ use super::selector::Selector;
 use super::template::{RenderContext, Template};
 use super::{ExternalCheckDeclarativePackage, ExitOutcome, ExitSemantics, InvocationMode};
 
-// The spike manifest — the *entire* check definition. Zero check-authored code.
-const BUILDIFIER_MANIFEST: &str = r##"
-id = "buildifier-declarative"
-mode = "declarative"
-runtime = "declarative-v1"
-api_version = "v1"
-applies_to = [
-    "**/BUILD",
-    "**/BUILD.bazel",
-    "**/*.bzl",
-    "**/*.star",
-    "**/WORKSPACE",
-    "**/WORKSPACE.bazel",
-    "**/MODULE.bazel",
-]
-
-[needs.buildifier]
-default = { bazel = "@buildifier_prebuilt//:buildifier" }
-
-[[invocations]]
-id = "format"
-run = "buildifier"
-mode = "batch"
-args = ["--mode=check", "--format=json", "{{files}}"]
-exit = { "0" = "findings", default = "error" }
-
-[invocations.transform]
-kind = "json"
-select = ".files[] | select(.formatted == false)"
-
-[invocations.transform.finding]
-path = "{{item.filename}}"
-message = "file needs buildifier formatting"
-severity = "warning"
-remediations = ["Run `buildifier {{item.filename}}` to auto-format."]
-
-[[invocations]]
-id = "lint"
-run = "buildifier"
-mode = "per_file"
-args = ["--mode=check", "--lint=warn", "--format=json", "{{file}}"]
-exit = { "0" = "findings", default = "error" }
-
-[invocations.transform]
-kind = "json"
-select = ".files[].warnings[]"
-
-[invocations.transform.finding]
-path = "{{input.file}}"
-line = "{{item.start.line}}"
-column = "{{item.start.column}}"
-message = "{{item.category}}: {{item.message}}"
-severity = "warning"
-remediations = ["Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."]
-"##;
+// The committed manifest — the single source of truth for the buildifier
+// declarative check definition. Tests source from this file so the test and the
+// shipped definition cannot drift.
+const BUILDIFIER_MANIFEST: &str =
+    include_str!("../../../checks/buildifier/check.yaml");
 
 // Real buildifier 7.3.1 `--mode=check --format=json` output for an unformatted file.
 const REAL_FORMAT_UNFORMATTED: &[u8] =
@@ -96,7 +49,7 @@ const REAL_LINT_CLEAN: &[u8] =
     br#"{"success":true,"files":[{"filename":"a/b/clean.bzl","formatted":true,"valid":true,"warnings":[]}]}"#;
 
 fn parse_package() -> ExternalCheckDeclarativePackage {
-    let package = parse_external_check_package_manifest(BUILDIFIER_MANIFEST)
+    let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST)
         .expect("spike manifest must parse");
     assert_eq!(package.id, "buildifier-declarative");
     assert_eq!(package.runtime, "declarative-v1");
@@ -134,8 +87,8 @@ fn manifest_parses_into_two_invocations() {
 
 #[test]
 fn manifest_rejects_unknown_transform_kind() {
-    let manifest = BUILDIFIER_MANIFEST.replace("kind = \"json\"", "kind = \"regex\"");
-    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    let manifest = BUILDIFIER_MANIFEST.replace("kind: json", "kind: regex");
+    let err = parse_declarative_check_manifest(&manifest).unwrap_err();
     assert!(
         format!("{err:#}").contains("reserved for a future spike"),
         "unexpected: {err:#}"
@@ -144,8 +97,8 @@ fn manifest_rejects_unknown_transform_kind() {
 
 #[test]
 fn manifest_rejects_invocation_with_unknown_binary() {
-    let manifest = BUILDIFIER_MANIFEST.replace("run = \"buildifier\"", "run = \"nonexistent\"");
-    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    let manifest = BUILDIFIER_MANIFEST.replace("run: buildifier", "run: nonexistent");
+    let err = parse_declarative_check_manifest(&manifest).unwrap_err();
     assert!(
         format!("{err:#}").contains("unknown binary"),
         "unexpected: {err:#}"
@@ -154,9 +107,9 @@ fn manifest_rejects_invocation_with_unknown_binary() {
 
 #[test]
 fn manifest_requires_default_exit_outcome() {
-    let manifest = BUILDIFIER_MANIFEST
-        .replace("exit = { \"0\" = \"findings\", default = \"error\" }", "exit = { \"0\" = \"findings\" }");
-    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    // Remove the `default: error` line from the first invocation's exit block.
+    let manifest = BUILDIFIER_MANIFEST.replacen("      default: error\n", "", 1);
+    let err = parse_declarative_check_manifest(&manifest).unwrap_err();
     assert!(
         format!("{err:#}").contains("default"),
         "exit semantics must require a default so crashes surface as errors: {err:#}"

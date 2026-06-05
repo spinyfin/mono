@@ -18,65 +18,79 @@ A declarative check decomposes into: **select files → resolve declared binarie
 
 ## The manifest schema I settled on
 
-The definition lives in a **package manifest, not in CHECKS.yaml**. It reuses the existing `load_external_check_package_manifest` infrastructure: a new `mode = "declarative"` alongside `artifact`/`exec`, validated into `ExternalCheckPackageImplementation::Declarative(...)`. Manifests are TOML (the existing manifest format); the design discussion's YAML sketch maps field-for-field.
+The definition lives in a **package manifest, not in CHECKS.yaml**. It reuses the existing `load_external_check_package_manifest` infrastructure: a new `mode = "declarative"` alongside `artifact`/`exec`, validated into `ExternalCheckPackageImplementation::Declarative(...)`. Declarative manifests are **YAML** (distinct from the TOML used by `artifact`/`exec` manifests) — the schema is richer (invocations/transforms) and reads more naturally as YAML, which also matches the design discussion's field-for-field sketch and `CHECKS.yaml` itself. The committed definition lives at **`tools/checkleft/checks/buildifier/check.yaml`**; the parity tests source from it directly via `include_str!` so the test and the shipped file cannot drift.
 
-```toml
-id = "buildifier-declarative"
-mode = "declarative"
-runtime = "declarative-v1"
-api_version = "v1"
-applies_to = ["**/BUILD", "**/BUILD.bazel", "**/*.bzl", "**/*.star", "**/WORKSPACE", "**/WORKSPACE.bazel", "**/MODULE.bazel"]
+```yaml
+id: buildifier-declarative
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/BUILD"
+  - "**/BUILD.bazel"
+  - "**/*.bzl"
+  - "**/*.star"
+  - "**/WORKSPACE"
+  - "**/WORKSPACE.bazel"
+  - "**/MODULE.bazel"
 
-[needs.buildifier]
-default = { bazel = "@buildifier_prebuilt//:buildifier" }
+needs:
+  buildifier:
+    default:
+      bazel: "@buildifier_prebuilt//:buildifier"
 
-[[invocations]]
-id = "format"
-run = "buildifier"
-mode = "batch"
-args = ["--mode=check", "--format=json", "{{files}}"]
-exit = { "0" = "findings", default = "error" }
-[invocations.transform]
-kind = "json"
-select = ".files[] | select(.formatted == false)"
-[invocations.transform.finding]
-path = "{{item.filename}}"
-message = "file needs buildifier formatting"
-severity = "warning"
-remediations = ["Run `buildifier {{item.filename}}` to auto-format."]
+invocations:
+  - id: format
+    run: buildifier
+    mode: batch
+    args: ["--mode=check", "--format=json", "{{files}}"]
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: json
+      select: ".files[] | select(.formatted == false)"
+      finding:
+        path: "{{item.filename}}"
+        message: "file needs buildifier formatting"
+        severity: warning
+        remediations:
+          - "Run `buildifier {{item.filename}}` to auto-format."
 
-[[invocations]]
-id = "lint"
-run = "buildifier"
-mode = "per_file"
-args = ["--mode=check", "--lint=warn", "--format=json", "{{file}}"]
-exit = { "0" = "findings", default = "error" }
-[invocations.transform]
-kind = "json"
-select = ".files[].warnings[]"
-[invocations.transform.finding]
-path = "{{input.file}}"
-line = "{{item.start.line}}"
-column = "{{item.start.column}}"
-message = "{{item.category}}: {{item.message}}"
-severity = "warning"
-remediations = ["Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."]
+  - id: lint
+    run: buildifier
+    mode: per_file
+    args: ["--mode=check", "--lint=warn", "--format=json", "{{file}}"]
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: json
+      select: ".files[].warnings[]"
+      finding:
+        path: "{{input.file}}"
+        line: "{{item.start.line}}"
+        column: "{{item.start.column}}"
+        message: "{{item.category}}: {{item.message}}"
+        severity: warning
+        remediations:
+          - "Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."
 ```
 
-CHECKS.yaml stays thin — enable by id + repo-specific overrides only (this spike does **not** enable it in the repo's real CHECKS.yaml; doing so would break dogfooding CI):
+CHECKS.yaml stays thin — enable by id + repo-specific overrides only (this spike does **not** enable it in the repo's real CHECKS.yaml; doing so would break dogfooding CI). A commented example sits in `tools/checkleft/CHECKS.yaml`:
 
 ```yaml
 checks:
   - id: buildifier
     check: buildifier-declarative
-    implementation: <manifest path>     # File implementation, resolved by the file provider
+    implementation: tools/checkleft/checks/buildifier/check.yaml
     config:                             # optional repo-specific override
       needs:
         buildifier:
           path: /usr/local/bin/buildifier   # force the portable resolver
 ```
 
-Code: `src/external/declarative/` (`mod.rs` schema + validation, `selector.rs`, `template.rs`, `transform.rs`, `resolve.rs`, `executor.rs`), plus the `mode`/runtime/implementation wiring in `src/external/mod.rs`, the executor arm in `src/external/runtime.rs`, and the URL-origin guard in `src/runner.rs`.
+Code: `src/external/declarative/` (`mod.rs` schema + validation, `selector.rs`, `template.rs`, `transform.rs`, `resolve.rs`, `executor.rs`), plus the `mode`/runtime/implementation wiring in `src/external/mod.rs` (including `parse_declarative_check_manifest` — a YAML-based parser separate from the existing TOML parser), the executor arm in `src/external/runtime.rs`, and the URL-origin guard in `src/runner.rs`.
 
 ## How invocation + exit-semantics + the projection DSL are modeled
 
@@ -134,7 +148,7 @@ Sandboxing the invocation is **out of scope** (deferred by design). The framewor
 
 **Yes — buildifier ran end-to-end through the declarative pipeline**, and parity with the built-in holds at two levels.
 
-1. **Transform-level parity (deterministic, runs in `bazel test`).** Real captured buildifier 7.3.1 `--format=json` output (a format-unformatted file, a clean file, and the spike fixture's 3 lint warnings) is fed through *both* the built-in parsers (`parse_format_output` / `parse_lint_output`) and the declarative `json` transform using the manifest's `select` + `finding` map. The resulting `Vec<Finding>` are asserted **equal** — same severity, message, location (path/line/column), and remediations. See `format_transform_matches_builtin_*` and `lint_transform_matches_builtin_*` in `src/external/declarative/tests.rs`.
+1. **Transform-level parity (deterministic, runs in `bazel test`).** Real captured buildifier 7.3.1 `--format=json` output (a format-unformatted file, a clean file, and the spike fixture's 3 lint warnings) is fed through *both* the built-in parsers (`parse_format_output` / `parse_lint_output`) and the declarative `json` transform using the manifest's `select` + `finding` map. The resulting `Vec<Finding>` are asserted **equal** — same severity, message, location (path/line/column), and remediations. See `format_transform_matches_builtin_*` and `lint_transform_matches_builtin_*` in `src/external/declarative/tests.rs`. The tests source the manifest directly from `tools/checkleft/checks/buildifier/check.yaml` via `include_str!` so the test and the shipped definition cannot drift.
 
 2. **Real end-to-end run (gated, run manually this session).** Two tests behind `CHECKLEFT_SPIKE_E2E=1`:
    - `e2e_bazel_resolver_resolves_buildifier` — the framework's bazel resolver resolves `@buildifier_prebuilt//:buildifier` to an existing executable.
