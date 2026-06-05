@@ -1,9 +1,9 @@
-/// Reserved `pr/<n>` namespace — local-only bookmarks that cube manages as
-/// convenience pointers from a PR number to its head commit within a workspace.
-///
-/// These bookmarks are NEVER pushed to any remote. Every push path in cube
-/// calls `assert_not_pr_bookmark` before executing `jj git push` to enforce
-/// this invariant.
+//! Reserved `pr/<n>` namespace — local-only bookmarks that cube manages as
+//! convenience pointers from a PR number to its head commit within a workspace.
+//!
+//! These bookmarks are NEVER pushed to any remote. Every push path in cube
+//! calls [`assert_not_pr_bookmark`] before executing `jj git push` to enforce
+//! this invariant.
 
 /// Returns `true` if `name` matches the reserved `pr/<digits>` pattern.
 pub fn is_pr_bookmark(name: &str) -> bool {

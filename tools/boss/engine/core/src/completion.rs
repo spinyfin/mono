@@ -487,11 +487,11 @@ impl CommandBranchVerifier {
 #[async_trait]
 impl BranchVerifier for CommandBranchVerifier {
     async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
-        fetch_pr_head_ref_cmd(repo_slug, pr_number).await
+        git_utils::gh_cli::fetch_pr_head_ref(repo_slug, pr_number).await
     }
 
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
-        boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await
+        git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await
     }
 
     async fn fetch_diff_line_count(
@@ -530,31 +530,6 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json headRefName`
-/// and return the branch name, or an error on failure / empty response.
-async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
-    let pr_str = pr_number.to_string();
-    let head_ref = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_str,
-            "-R",
-            repo_slug,
-            "--json",
-            "headRefName",
-            "--jq",
-            ".headRefName",
-        ],
-        &format!("gh pr view {pr_number} -R {repo_slug}"),
-    )
-    .await?;
-    if head_ref.is_empty() {
-        return Err(anyhow!("empty headRefName for PR {pr_number} in {repo_slug}"));
-    }
-    Ok(head_ref)
 }
 
 
@@ -851,7 +826,7 @@ async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> 
 /// (`git@github.com:owner/repo.git`) and HTTPS
 /// (`https://github.com/owner/repo[.git]`) shapes.
 pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
-    let (owner, repo) = boss_github::repo_slug::parse_github_owner_repo(remote_url)?;
+    let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(remote_url)?;
     Ok(format!("{owner}/{repo}"))
 }
 

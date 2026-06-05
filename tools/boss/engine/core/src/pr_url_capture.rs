@@ -72,7 +72,7 @@ static PLACEHOLDER_SLUGS: &[&str] = &[
 /// HTTPS `https://github.com/owner/repo`) into a lowercase `owner/repo` slug.
 /// Returns `None` if the URL is not a recognisable github.com remote.
 pub fn parse_product_slug(repo_remote_url: &str) -> Option<String> {
-    let (owner, repo) = boss_github::repo_slug::parse_github_owner_repo(repo_remote_url).ok()?;
+    let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(repo_remote_url).ok()?;
     Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
 }
 

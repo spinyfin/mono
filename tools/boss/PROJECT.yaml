@@ -1,3 +1,4 @@
 name: boss
 paths:
+  - lib/rust/git_utils/
   - tools/cube/

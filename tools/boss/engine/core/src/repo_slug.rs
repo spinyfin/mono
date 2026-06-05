@@ -26,20 +26,9 @@
 
 use std::sync::Arc;
 
-use crate::coordinator::{CubeClient, CubeRepoSummary};
+use git_utils::repo_slug::is_bare_repo_slug;
 
-/// True when `value` is a bare cube repo slug rather than a git remote
-/// URL, scp-style remote, or filesystem path. URLs and remotes always
-/// carry at least one of `:` (scheme / scp host separator), `/` (path),
-/// or `@` (user); a slug like `bduff` carries none of those and no
-/// whitespace.
-pub fn is_bare_repo_slug(value: &str) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| !matches!(c, ':' | '/' | '@') && !c.is_whitespace())
-}
+use crate::coordinator::{CubeClient, CubeRepoSummary};
 
 /// Build the argv tail for `cube repo ensure` from a repo reference that
 /// may be either a canonical origin URL or a bare cube slug.
@@ -125,22 +114,6 @@ mod tests {
             workspace_prefix: format!("{repo_id}-"),
             source: None,
         }
-    }
-
-    #[test]
-    fn bare_slug_recognises_plain_names_and_rejects_urls() {
-        assert!(is_bare_repo_slug("bduff"));
-        assert!(is_bare_repo_slug("my-repo"));
-        assert!(is_bare_repo_slug("repo.with.dots"));
-        assert!(is_bare_repo_slug("  bduff  ")); // trimmed
-
-        assert!(!is_bare_repo_slug(""));
-        assert!(!is_bare_repo_slug("   "));
-        assert!(!is_bare_repo_slug("git@github.com:linkedin-sandbox/bduff.git"));
-        assert!(!is_bare_repo_slug("https://github.com/foo/bar.git"));
-        assert!(!is_bare_repo_slug("foo/bar"));
-        assert!(!is_bare_repo_slug("org-132020694@github.com:ls/bduff.git"));
-        assert!(!is_bare_repo_slug("two words"));
     }
 
     #[test]

@@ -9,9 +9,6 @@
 //! `BOSS_SHAKE_PRIVATE_KEY_PEM`. See `tools/boss/cli/README.md` for
 //! the one-time developer setup instructions.
 
-pub mod gh_cli;
-pub mod repo_slug;
-
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

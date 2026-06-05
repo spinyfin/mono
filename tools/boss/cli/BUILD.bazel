@@ -29,6 +29,7 @@ rust_binary(
         "//tools/boss/installer:__pkg__",
     ],
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/client",
         "//tools/boss/github",
         "//tools/boss/protocol",
@@ -44,6 +45,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//lib/rust/git_utils",
         "//tools/boss/client",
         "//tools/boss/github",
         "//tools/boss/protocol",

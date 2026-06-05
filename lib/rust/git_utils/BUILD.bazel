@@ -1,0 +1,38 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "git_utils",
+    srcs = [
+        "src/gh_cli.rs",
+        "src/lib.rs",
+        "src/pr_bookmark.rs",
+        "src/repo_slug.rs",
+    ],
+    crate_name = "git_utils",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/cli:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/cube:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "git_utils_test",
+    size = "small",
+    crate = ":git_utils",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
