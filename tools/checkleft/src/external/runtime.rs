@@ -1,13 +1,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Instance, Memory, Module, ResourceLimiter, Store};
+use wasmtime::{
+    AsContextMut, Caller, Config, Engine, Extern, Instance, Linker as CoreLinker, Memory, Module,
+    ResourceLimiter, Store,
+};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
@@ -166,6 +173,53 @@ impl Drop for EpochTicker {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sandbox-v1 wasm GUEST ABI — as reverse-engineered for this spike.
+//
+// CORE-MODULE contract (what a Rust `cdylib` compiled to wasm32-unknown-unknown
+// produces, and what the buildifier-wasm guest implements):
+//
+//   exports:
+//     (memory "memory")
+//     (func "checkleft_run"  (param i32 i32) (result i64))
+//         params  = (input_ptr, input_len) of a UTF-8 JSON `ExternalCheckRuntimeInput`
+//                   { changeset, config, capabilities } written by the host at offset 0.
+//         result  = i64 packing (output_ptr << 32 | output_len) of a UTF-8 JSON
+//                   `{ "findings": [Finding, ...] }` the guest wrote into its memory.
+//     (func "checkleft_alloc" (param i32) (result i32))   // NEW for this spike
+//         Returns a pointer to `len` writable bytes in guest memory. The host calls
+//         this to obtain a destination for command-response payloads (below).
+//
+//   imports (host-mediated command execution — the genuinely NEW piece):
+//     (func (import "checkleft" "run_command") (param i32 i32) (result i64))
+//         params  = (request_ptr, request_len) of a UTF-8 JSON `HostCommandRequest`
+//                   { "program": "...", "args": ["..."] } the guest wrote into memory.
+//         result  = i64 packing (response_ptr << 32 | response_len) of a UTF-8 JSON
+//                   `HostCommandResponse` { exit_code, stdout, stderr, timed_out, error }
+//                   that the host allocated (via "checkleft_alloc") and wrote back.
+//         The host validates `program`/`args` against `ExternalCommandCapabilities`
+//         and enforces the timeout + stdout/stderr caps BEFORE running anything.
+//
+// NOTE (discovered during the spike): before this change the runtime instantiated
+// core modules with NO imports (`Instance::new(.., &[])`) and components with an
+// EMPTY `Linker`, so although `command_policy.rs` and the serialized `capabilities`
+// existed, there was no host function for a guest to actually run a command. The
+// "checkleft"/"run_command" import below is that missing primitive. It is wired
+// into the CORE path only; the component path is left unchanged (see notes).
+// ─────────────────────────────────────────────────────────────────────────────
+const GUEST_ALLOC_EXPORT: &str = "checkleft_alloc";
+const HOST_COMMAND_IMPORT_MODULE: &str = "checkleft";
+const HOST_COMMAND_IMPORT_NAME: &str = "run_command";
+
+/// PROTOTYPE-ONLY env flag. When `=1`, the runtime selects the relaxed command
+/// policy (`ExternalCommandCapabilities::from_manifest_prototype`) and a higher
+/// fuel ceiling so the buildifier-wasm spike can run. Unset/anything-else keeps
+/// the production policy and fuel. See PROTOTYPE-NOTES.md.
+const PROTOTYPE_SANDBOX_COMMANDS_ENV: &str = "CHECKLEFT_PROTOTYPE_SANDBOX_COMMANDS";
+
+/// PROTOTYPE-ONLY. A Rust guest doing serde_json work needs far more than the
+/// production 10M fuel budget; raise it only when the prototype flag is set.
+const PROTOTYPE_EXECUTION_FUEL_LIMIT: u64 = 5_000_000_000;
 #[derive(Debug)]
 enum CoreArtifactExecutionError {
     ArtifactMismatch(anyhow::Error),
@@ -244,6 +298,7 @@ impl DefaultExternalCheckExecutor {
         package: &ExternalCheckPackage,
         artifact: &ExternalCheckArtifactPackage,
         command_capabilities: &ExternalCommandCapabilities,
+        prototype: bool,
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> Result<CheckResult> {
@@ -256,6 +311,7 @@ impl DefaultExternalCheckExecutor {
             package,
             &module_bytes,
             command_capabilities,
+            prototype,
             changeset,
             config,
         ) {
@@ -283,19 +339,35 @@ impl DefaultExternalCheckExecutor {
         package: &ExternalCheckPackage,
         module_bytes: &[u8],
         command_capabilities: &ExternalCommandCapabilities,
+        prototype: bool,
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> std::result::Result<CheckResult, CoreArtifactExecutionError> {
         let module = compile_core_module(&self.engine, package.id.as_str(), module_bytes)
             .map_err(CoreArtifactExecutionError::mismatch)?;
-        let mut store = Store::new(&self.engine, ());
-        configure_store_fuel(&mut store).map_err(CoreArtifactExecutionError::execution)?;
+        let state = HostCommandState {
+            root: self.root.clone(),
+            capabilities: command_capabilities.clone(),
+        };
+        let mut store = Store::new(&self.engine, state);
+        let fuel = if prototype {
+            PROTOTYPE_EXECUTION_FUEL_LIMIT
+        } else {
+            EXECUTION_FUEL_LIMIT
+        };
+        configure_store_fuel(&mut store, fuel).map_err(CoreArtifactExecutionError::execution)?;
         // The core (sandbox-v1) path uses fuel for throttling, not epoch. Set
         // the epoch deadline to u64::MAX so the always-enabled epoch mechanism
         // does not interrupt this store — wasmtime defaults to 0 (immediate trap).
         store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
 
-        let instance = instantiate_core_module(&mut store, &module, package.id.as_str())
+        // Register the host-mediated command import. Modules that don't import it
+        // (e.g. the simple WAT test fixtures) still instantiate fine — an unused
+        // linker definition is harmless.
+        let mut linker = CoreLinker::<HostCommandState>::new(&self.engine);
+        register_host_command(&mut linker).map_err(CoreArtifactExecutionError::execution)?;
+
+        let instance = instantiate_core_module(&linker, &mut store, &module, package.id.as_str())
             .map_err(CoreArtifactExecutionError::mismatch)?;
 
         let memory = instance
@@ -350,10 +422,14 @@ impl DefaultExternalCheckExecutor {
         changeset: &ChangeSet,
         config: &toml::Value,
     ) -> Result<CheckResult> {
+        // NOTE: the component path does NOT wire the host command import. The
+        // buildifier-wasm spike targets the core-module path only (a Rust cdylib
+        // compiled to wasm32-unknown-unknown is a core module). Component-model
+        // host functions are a larger lift left for the production design.
         let component = compile_component(&self.engine, package.id.as_str(), component_bytes)?;
         let linker = Linker::<()>::new(&self.engine);
         let mut store = Store::new(&self.engine, ());
-        configure_store_fuel(&mut store)?;
+        configure_store_fuel(&mut store, EXECUTION_FUEL_LIMIT)?;
         // Legacy path uses fuel; disable epoch the same way as execute_core_artifact.
         store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
         let instance = instantiate_component(&linker, &mut store, &component, package.id.as_str())?;
@@ -482,18 +558,28 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                         package, artifact, None, changeset, source_tree, config,
                     ),
                     EXTERNAL_CHECK_RUNTIME_V1 => {
-                        let command_capabilities =
+                        // PROTOTYPE-ONLY: when the spike flag is set, select the relaxed
+                        // command policy + fuel so the buildifier-wasm guest can run. The
+                        // production path (flag unset) is unchanged.
+                        let prototype = prototype_commands_enabled();
+                        let command_capabilities = if prototype {
+                            ExternalCommandCapabilities::from_manifest_prototype(
+                                &package.capabilities,
+                            )
+                        } else {
                             ExternalCommandCapabilities::from_manifest(&package.capabilities)
-                                .with_context(|| {
-                                    format!(
-                                        "invalid command capability declaration for package `{}`",
-                                        package.id
-                                    )
-                                })?;
+                        }
+                        .with_context(|| {
+                            format!(
+                                "invalid command capability declaration for package `{}`",
+                                package.id
+                            )
+                        })?;
                         self.execute_artifact(
                             package,
                             artifact,
                             &command_capabilities,
+                            prototype,
                             changeset,
                             config,
                         )
@@ -573,17 +659,18 @@ fn compile_core_module(engine: &Engine, package_id: &str, module_bytes: &[u8]) -
 }
 
 fn instantiate_core_module(
-    store: &mut Store<()>,
+    linker: &CoreLinker<HostCommandState>,
+    store: &mut Store<HostCommandState>,
     module: &Module,
     package_id: &str,
 ) -> Result<Instance> {
-    wasmtime(Instance::new(store, module, &[]))
+    wasmtime(linker.instantiate(store, module))
         .with_context(|| format!("failed to instantiate wasm module for `{package_id}`"))
 }
 
 fn get_core_run_function(
     instance: &Instance,
-    store: &mut Store<()>,
+    store: &mut Store<HostCommandState>,
 ) -> Result<wasmtime::TypedFunc<(i32, i32), i64>> {
     wasmtime(instance.get_typed_func::<(i32, i32), i64>(store, CORE_ENTRYPOINT_EXPORT))
         .with_context(|| {
@@ -595,7 +682,7 @@ fn get_core_run_function(
 
 fn call_core_run(
     run: &wasmtime::TypedFunc<(i32, i32), i64>,
-    store: &mut Store<()>,
+    store: &mut Store<HostCommandState>,
     input_offset: i32,
     input_len: i32,
 ) -> Result<i64> {
@@ -642,8 +729,8 @@ fn call_component_run(
     wasmtime(run.call(store, (input_json,))).context("external component check execution failed")
 }
 
-fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
-    wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
+fn configure_store_fuel<T>(store: &mut Store<T>, fuel: u64) -> Result<()> {
+    wasmtime(store.set_fuel(fuel)).context("failed to configure runtime fuel limit")
 }
 
 /// Instantiate a component from raw bytes and execute the named check via the
@@ -668,7 +755,7 @@ fn run_component_check(
     // descriptor is purely static metadata; no filesystem access is needed.
     let descriptors = {
         let mut store = Store::new(engine, HostState::with_empty_wasi());
-        configure_store_fuel(&mut store)?;
+        configure_store_fuel(&mut store, EXECUTION_FUEL_LIMIT)?;
         let instance = wasmtime(linker.instantiate(&mut store, &component))
             .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
         let bindings = wasmtime(WitCheck::new(&mut store, &instance))
@@ -705,7 +792,7 @@ fn run_component_check(
         format!("failed to configure WASI context for check `{}`", package.id)
     })?;
     let mut store = Store::new(engine, host_state);
-    configure_store_fuel(&mut store)?;
+    configure_store_fuel(&mut store, EXECUTION_FUEL_LIMIT)?;
     let instance = wasmtime(linker.instantiate(&mut store, &component))
         .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
@@ -744,14 +831,19 @@ fn run_component_check(
     })
 }
 
-fn write_memory(memory: &Memory, store: &mut Store<()>, offset: usize, bytes: &[u8]) -> Result<()> {
+fn write_memory(
+    memory: &Memory,
+    store: impl AsContextMut,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<()> {
     any_result(memory.write(store, offset, bytes))
         .context("failed to write runtime input into wasm memory")
 }
 
 fn read_memory(
     memory: &Memory,
-    store: &mut Store<()>,
+    store: impl AsContextMut,
     offset: usize,
     bytes: &mut [u8],
 ) -> Result<()> {
@@ -934,14 +1026,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn ensure_memory_capacity(
     memory: &Memory,
-    store: &mut Store<()>,
+    mut store: impl AsContextMut,
     offset: usize,
     len: usize,
 ) -> Result<()> {
     let required_size = offset
         .checked_add(len)
         .context("requested wasm memory range overflows usize")?;
-    let current_size = memory.data_size(&mut *store);
+    let current_size = memory.data_size(&mut store);
     if required_size <= current_size {
         return Ok(());
     }
@@ -949,7 +1041,7 @@ fn ensure_memory_capacity(
     let needed_bytes = required_size - current_size;
     let additional_pages = needed_bytes.div_ceil(WASM_PAGE_SIZE_BYTES);
     wasmtime(memory.grow(
-        &mut *store,
+        &mut store,
         u64::try_from(additional_pages).context("page count does not fit in u64")?,
     ))
     .context("failed to grow wasm memory")?;
@@ -961,6 +1053,236 @@ fn decode_output_range(encoded: i64) -> Result<(usize, usize)> {
     let offset = usize::try_from((encoded >> 32) as u32).context("output offset does not fit")?;
     let len = usize::try_from((encoded & 0xffff_ffff) as u32).context("output len does not fit")?;
     Ok((offset, len))
+}
+
+/// Packs `(offset << 32 | len)` into an i64 for the guest ABI return convention.
+fn encode_output_range(offset: usize, len: usize) -> Result<i64> {
+    let offset = u32::try_from(offset).context("response offset does not fit in u32")?;
+    let len = u32::try_from(len).context("response length does not fit in u32")?;
+    let encoded = (u64::from(offset) << 32) | u64::from(len);
+    i64::try_from(encoded).context("encoded response range does not fit in i64")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host-mediated command execution (the NEW sandbox-v1 primitive for this spike).
+//
+// `register_host_command` links `("checkleft","run_command")` into the core
+// linker. The guest writes a `HostCommandRequest` JSON into its memory and calls
+// the import; the host validates against `ExternalCommandCapabilities`, runs the
+// process (enforcing timeout + stdout/stderr caps), allocates a destination via
+// the guest's `checkleft_alloc`, writes a `HostCommandResponse` JSON back, and
+// returns the packed (ptr<<32|len) range.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-instance host state for the core-module path: the repo root (the cwd for
+/// host commands) and the resolved command capabilities (the allow-list + limits).
+struct HostCommandState {
+    root: PathBuf,
+    capabilities: ExternalCommandCapabilities,
+}
+
+/// PROTOTYPE-ONLY toggle. See `PROTOTYPE_SANDBOX_COMMANDS_ENV`.
+fn prototype_commands_enabled() -> bool {
+    std::env::var(PROTOTYPE_SANDBOX_COMMANDS_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+struct HostCommandRequest {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct HostCommandResponse {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    error: Option<String>,
+}
+
+impl HostCommandResponse {
+    fn error(message: String) -> Self {
+        Self {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            error: Some(message),
+        }
+    }
+}
+
+fn register_host_command(linker: &mut CoreLinker<HostCommandState>) -> Result<()> {
+    wasmtime(linker.func_wrap(
+        HOST_COMMAND_IMPORT_MODULE,
+        HOST_COMMAND_IMPORT_NAME,
+        host_run_command,
+    ))
+    .context("failed to register host command import")?;
+    Ok(())
+}
+
+/// The host side of the `("checkleft","run_command")` import. `func_wrap` requires
+/// a `wasmtime::Error` result, so this thin wrapper maps the inner anyhow error.
+fn host_run_command(
+    caller: Caller<'_, HostCommandState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> std::result::Result<i64, wasmtime::Error> {
+    host_run_command_inner(caller, req_ptr, req_len)
+        .map_err(|err| wasmtime::Error::msg(format!("{err:#}")))
+}
+
+/// Reads a JSON request from guest memory, runs the command under policy, writes a
+/// JSON response back into guest-allocated memory, and returns the packed
+/// (ptr<<32|len) range.
+fn host_run_command_inner(
+    mut caller: Caller<'_, HostCommandState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> Result<i64> {
+    let memory = caller
+        .get_export(MEMORY_EXPORT)
+        .and_then(Extern::into_memory)
+        .context("guest must export `memory` to use host commands")?;
+
+    let req_offset = usize::try_from(req_ptr).context("host command request pointer is negative")?;
+    let req_length = usize::try_from(req_len).context("host command request length is negative")?;
+    let mut request_bytes = vec![0_u8; req_length];
+    read_memory(&memory, &mut caller, req_offset, &mut request_bytes)
+        .context("failed to read host command request from guest memory")?;
+    let request: HostCommandRequest =
+        serde_json::from_slice(&request_bytes).context("host command request was not valid JSON")?;
+
+    let (root, capabilities) = {
+        let state = caller.data();
+        (state.root.clone(), state.capabilities.clone())
+    };
+    let response = execute_host_command(&root, &capabilities, &request.program, &request.args);
+    let response_bytes =
+        serde_json::to_vec(&response).context("failed to encode host command response")?;
+
+    // Ask the guest to allocate a landing buffer for the response, then write it.
+    let alloc = caller
+        .get_export(GUEST_ALLOC_EXPORT)
+        .and_then(Extern::into_func)
+        .context("guest must export `checkleft_alloc` to receive host command responses")?;
+    let alloc = wasmtime(alloc.typed::<i32, i32>(&caller))
+        .context("`checkleft_alloc` must have signature (i32) -> i32")?;
+    let response_len = i32::try_from(response_bytes.len())
+        .context("host command response exceeds i32 addressable length")?;
+    let dest =
+        wasmtime(alloc.call(&mut caller, response_len)).context("guest `checkleft_alloc` failed")?;
+    let dest_offset = usize::try_from(dest).context("guest alloc returned a negative pointer")?;
+
+    ensure_memory_capacity(&memory, &mut caller, dest_offset, response_bytes.len())
+        .context("failed to grow guest memory for host command response")?;
+    write_memory(&memory, &mut caller, dest_offset, &response_bytes)
+        .context("failed to write host command response into guest memory")?;
+
+    encode_output_range(dest_offset, response_bytes.len())
+}
+
+/// Runs `program args` from `root`, enforcing the capability allow-list, the
+/// timeout, and the stdout/stderr caps. Never panics or returns `Err` for an
+/// untrusted/failed command — the failure is reported in the response so the
+/// guest can turn it into a finding (mirroring the built-in check's error path).
+fn execute_host_command(
+    root: &Path,
+    capabilities: &ExternalCommandCapabilities,
+    program: &str,
+    args: &[String],
+) -> HostCommandResponse {
+    if let Err(err) = capabilities.validate_invocation(program, args) {
+        return HostCommandResponse::error(format!("{err:#}"));
+    }
+
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => return HostCommandResponse::error(format!("failed to spawn `{program}`: {err}")),
+    };
+
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stream| spawn_capping_reader(stream, capabilities.max_stdout_bytes()));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stream| spawn_capping_reader(stream, capabilities.max_stderr_bytes()));
+
+    let deadline = Instant::now() + capabilities.timeout();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let stdout = stdout_handle.map(join_capping_reader).unwrap_or_default();
+    let stderr = stderr_handle.map(join_capping_reader).unwrap_or_default();
+
+    HostCommandResponse {
+        exit_code: status.as_ref().and_then(ExitStatus::code),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+        error: if timed_out {
+            Some("command exceeded the sandbox command timeout".to_owned())
+        } else {
+            None
+        },
+    }
+}
+
+/// Reads a stream, keeping at most `cap` bytes but always draining to EOF so the
+/// child never blocks writing into a full pipe.
+fn spawn_capping_reader<R>(mut reader: R, cap: usize) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if output.len() < cap {
+                        let take = (cap - output.len()).min(read);
+                        output.extend_from_slice(&chunk[..take]);
+                    }
+                }
+            }
+        }
+        output
+    })
+}
+
+fn join_capping_reader(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
 }
 
 fn wasmtime<T>(result: std::result::Result<T, wasmtime::Error>) -> Result<T> {

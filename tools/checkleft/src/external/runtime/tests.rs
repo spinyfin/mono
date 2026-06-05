@@ -6,7 +6,7 @@ use tempfile::tempdir;
 use crate::external::{
     EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckArtifactPackage,
     ExternalCheckCapabilities, ExternalCheckComponentLimits, ExternalCheckPackage,
-    ExternalCheckPackageImplementation,
+    ExternalCheckPackageImplementation, ExternalCommandCapabilities,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
 use crate::output::Severity;
@@ -14,8 +14,8 @@ use crate::source_tree::LocalSourceTree;
 
 use super::{
     DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState,
-    MemoryLimiter, WASM_PAGE_SIZE_BYTES, build_wasmtime_engine, is_interrupt_error,
-    resolve_component_limits, sha256_hex,
+    MemoryLimiter, WASM_PAGE_SIZE_BYTES, build_wasmtime_engine, execute_host_command,
+    is_interrupt_error, resolve_component_limits, sha256_hex,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -830,4 +830,160 @@ fn memory_cap_trip_via_resource_limiter() {
         result, -1,
         "memory.grow must return -1 when the cap is exceeded"
     );
+}
+
+
+// ── host-mediated command primitive (sandbox-v1 spike) ──────────────────────
+//
+// These cover the NEW `("checkleft","run_command")` primitive: the host-side
+// executor (validate + run + cap) at the unit level, and the wasm wiring (a WAT
+// guest invoking the import) at the integration level. None require buildifier or
+// a wasm toolchain, so they run hermetically under `bazel test`.
+
+fn cat_capabilities() -> ExternalCommandCapabilities {
+    // `cat` is in the production global ceiling, so no prototype flag is needed.
+    ExternalCommandCapabilities::from_manifest(&ExternalCheckCapabilities {
+        commands: vec!["cat".to_owned()],
+    })
+    .expect("resolve cat capabilities")
+}
+
+#[test]
+#[cfg(unix)]
+fn host_command_runs_allowed_command_and_captures_stdout() {
+    let temp = tempdir().expect("temp dir");
+    fs::write(temp.path().join("probe.txt"), "host-command-ok\n").expect("write probe");
+
+    let response = execute_host_command(
+        temp.path(),
+        &cat_capabilities(),
+        "cat",
+        &["probe.txt".to_owned()],
+    );
+
+    assert_eq!(response.exit_code, Some(0));
+    assert!(!response.timed_out);
+    assert!(
+        response.error.is_none(),
+        "unexpected error: {:?}",
+        response.error
+    );
+    assert_eq!(response.stdout, "host-command-ok\n");
+}
+
+#[test]
+fn host_command_rejects_command_outside_allow_list() {
+    let temp = tempdir().expect("temp dir");
+
+    // `rm` is not in the allow-list (only `cat` is) — must be refused before spawn.
+    let response =
+        execute_host_command(temp.path(), &cat_capabilities(), "rm", &["-rf".to_owned()]);
+
+    assert_eq!(response.exit_code, None);
+    assert!(response.stdout.is_empty());
+    let error = response.error.expect("expected a policy rejection");
+    assert!(
+        error.contains("not allowed"),
+        "expected an allow-list rejection, got: {error}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn host_command_truncates_stdout_at_capability_cap() {
+    let temp = tempdir().expect("temp dir");
+    // The production cap is 64KiB; cat a file larger than that and assert the
+    // captured stdout is truncated to exactly the cap (the rest is drained).
+    let cap = cat_capabilities().max_stdout_bytes();
+    let big = "a".repeat(cap + 50_000);
+    fs::write(temp.path().join("big.txt"), &big).expect("write big");
+
+    let response = execute_host_command(
+        temp.path(),
+        &cat_capabilities(),
+        "cat",
+        &["big.txt".to_owned()],
+    );
+
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(
+        response.stdout.len(),
+        cap,
+        "stdout must be truncated to the capability cap"
+    );
+}
+
+/// End-to-end wasm wiring: a WAT guest writes a `run_command` request into its
+/// memory, calls the host import (which runs `cat probe.txt` under policy), and
+/// returns a fixed findings payload. Proves the import is linked and callable
+/// through wasmtime, the guest's `checkleft_alloc` is invoked, and no trap occurs.
+#[test]
+#[cfg(unix)]
+fn wasm_guest_invokes_host_command_import() {
+    let temp = tempdir().expect("temp dir");
+    fs::write(temp.path().join("probe.txt"), "wasm-host-bridge\n").expect("write probe");
+
+    let request = r#"{"program":"cat","args":["probe.txt"]}"#;
+    let findings = r#"{"findings":[{"severity":"info","message":"ran","location":null,"suggested_fix":null}]}"#;
+    let request_offset: u64 = 2048;
+    let findings_offset: u64 = 4096;
+    let encoded_findings = (findings_offset << 32) | findings.len() as u64;
+
+    // `{request:?}` / `{findings:?}` reuse the existing tests' trick: Rust's Debug
+    // quoting produces a WAT-safe escaped string literal for plain-ASCII JSON.
+    let wat = format!(
+        r#"(module
+  (import "checkleft" "run_command" (func $run_command (param i32 i32) (result i64)))
+  (memory (export "memory") 2)
+  (data (i32.const {request_offset}) {request:?})
+  (data (i32.const {findings_offset}) {findings:?})
+  (func (export "checkleft_alloc") (param i32) (result i32)
+    i32.const 16384)
+  (func (export "checkleft_run") (param i32 i32) (result i64)
+    i32.const {request_ptr}
+    i32.const {request_len}
+    call $run_command
+    drop
+    i64.const {encoded_findings}))
+"#,
+        request_offset = request_offset,
+        findings_offset = findings_offset,
+        request = request,
+        findings = findings,
+        request_ptr = request_offset as i32,
+        request_len = request.len() as i32,
+        encoded_findings = encoded_findings,
+    );
+
+    let wasm_bytes = wat::parse_str(&wat).expect("parse wat");
+    fs::write(temp.path().join("check.wasm"), &wasm_bytes).expect("write wasm");
+    let artifact_sha256 = sha256_hex(&wasm_bytes);
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "host-command-probe".to_owned(),
+        runtime: "sandbox-v1".to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities {
+            commands: vec!["cat".to_owned()],
+        },
+        implementation: ExternalCheckPackageImplementation::Artifact(ExternalCheckArtifactPackage {
+            artifact_path: "check.wasm".to_owned(),
+            artifact_sha256,
+            provenance: None,
+        }),
+    };
+
+    let result = executor
+        .execute(
+            &package,
+            &ChangeSet::default(),
+            &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Info);
+    assert_eq!(result.findings[0].message, "ran");
 }

@@ -1,0 +1,38 @@
+# PROTOTYPE sandbox-v1 external check manifest for the buildifier-wasm guest.
+#
+# To use:
+#   1. Build the artifact:   ./build.sh        (prints the artifact sha256)
+#   2. Set `artifact_sha256` below to the printed value.
+#   3. Reference it from a CHECKS config with an external check entry, e.g.:
+#
+#        [[checks]]
+#        id = "buildifier-wasm"
+#        check = "buildifier-wasm"          # must equal `id` below
+#        implementation = "tools/checkleft/external-checks/buildifier-wasm/buildifier-wasm.toml"
+#
+#   4. Run checkleft with the prototype command policy enabled:
+#        CHECKLEFT_PROTOTYPE_SANDBOX_COMMANDS=1 checkleft ...
+#
+# The artifact path is relative to the checkleft runtime root (the repo root).
+# Adjust it to wherever you place the built .wasm.
+
+id = "buildifier-wasm"
+mode = "artifact"
+runtime = "sandbox-v1"
+api_version = "v1"
+
+artifact_path = "tools/checkleft/external-checks/buildifier-wasm/buildifier_wasm.wasm"
+# Placeholder — replace with the sha256 printed by ./build.sh. Must be 64 lowercase
+# hex characters or the manifest will not parse.
+artifact_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[capabilities]
+# Host-mediated commands this check may run. Intersected with the prototype
+# ceiling (buildifier, bazel + the global cat/grep/sed/wc) by command_policy.rs.
+# `bazel` is declared so the bazel-target-resolution route is *available*, though
+# the prototype guest defaults to a direct `buildifier` path.
+commands = ["buildifier", "bazel"]
+
+[provenance]
+generator = "cargo"
+target = "tools/checkleft/external-checks/buildifier-wasm:lib (wasm32-unknown-unknown)"

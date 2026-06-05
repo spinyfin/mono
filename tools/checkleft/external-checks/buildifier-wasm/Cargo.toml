@@ -1,0 +1,26 @@
+# PROTOTYPE-ONLY crate (spike: buildifier check as a sandbox-v1 wasm external check).
+#
+# Deliberately DETACHED from the monorepo Cargo workspace (note the empty
+# `[workspace]` table below). It targets wasm32-unknown-unknown with a wasm-only
+# dependency set and must NOT perturb the repo's Cargo.lock / crate_universe /
+# bazel build. It is built out-of-band via `build.sh` (cargo), not by bazel —
+# there is no wasm32 rust toolchain registered in MODULE.bazel.
+[package]
+name = "checkleft-buildifier-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
