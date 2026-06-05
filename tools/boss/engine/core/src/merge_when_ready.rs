@@ -15,7 +15,7 @@ use std::process::Stdio;
 use anyhow::{Result, anyhow};
 use tokio::process::Command;
 
-use crate::pr_url::parse_pr_url_parts;
+use boss_github::pr_url::parse_pr_url_parts;
 
 /// Outcome of a successful [`gh_merge_when_ready`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -64,7 +64,7 @@ use crate::merge_poller::{
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
-use crate::pr_url::pr_number_from_url;
+use boss_github::pr_url::pr_number_from_url;
 use crate::work::{
     CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
     WorkerPrCompletionTarget,

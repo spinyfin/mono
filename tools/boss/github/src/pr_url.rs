@@ -1,4 +1,4 @@
-//! Shared parsing for canonical GitHub PR URLs.
+//! Parsing for canonical GitHub PR URLs.
 //!
 //! Every PR URL the engine handles has the canonical shape
 //! `https://github.com/<owner>/<repo>/pull/<N>`. Several modules used to
@@ -13,7 +13,7 @@
 /// Returns `None` for any URL that doesn't match the canonical shape: a
 /// missing/wrong host prefix, an empty owner or repo, a third segment that
 /// isn't `pull`, or a trailing segment that isn't a number.
-pub(crate) fn parse_pr_url_parts(pr_url: &str) -> Option<(&str, &str, u64)> {
+pub fn parse_pr_url_parts(pr_url: &str) -> Option<(&str, &str, u64)> {
     let path = pr_url.strip_prefix("https://github.com/")?;
     let mut parts = path.splitn(4, '/');
     let owner = parts.next().filter(|s| !s.is_empty())?;
@@ -27,7 +27,7 @@ pub(crate) fn parse_pr_url_parts(pr_url: &str) -> Option<(&str, &str, u64)> {
 
 /// Extract `"owner/repo"` from a canonical GitHub PR URL of the form
 /// `https://github.com/<owner>/<repo>/pull/<N>`.
-pub(crate) fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
+pub fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
     let (owner, repo, _) = parse_pr_url_parts(pr_url)?;
     let path = pr_url.strip_prefix("https://github.com/")?;
     let end = owner.len() + 1 + repo.len();
@@ -36,7 +36,7 @@ pub(crate) fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
 
 /// Extract the PR number from a canonical GitHub PR URL of the form
 /// `https://github.com/<owner>/<repo>/pull/<N>`.
-pub(crate) fn pr_number_from_url(pr_url: &str) -> Option<u64> {
+pub fn pr_number_from_url(pr_url: &str) -> Option<u64> {
     parse_pr_url_parts(pr_url).map(|(_, _, number)| number)
 }
 

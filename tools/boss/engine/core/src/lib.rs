@@ -50,7 +50,6 @@ pub mod pane_summary;
 pub mod pool_claim_sweep;
 pub use boss_pr_template as pr_template;
 pub mod pr_review;
-pub mod pr_url;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod recovery_backup;

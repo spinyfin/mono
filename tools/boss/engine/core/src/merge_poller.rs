@@ -53,7 +53,7 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
-use crate::pr_url::{pr_number_from_url, repo_from_pr_url};
+use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
 use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
 #[cfg(test)]
 use crate::work::TaskStatus;
