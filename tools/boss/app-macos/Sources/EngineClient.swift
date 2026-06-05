@@ -287,6 +287,18 @@ enum EngineEvent {
     /// Pushed after `action_attention_group` succeeds: the now-`actioned`
     /// group, its terminal members, and the produced-artifact ref.
     case attentionGroupActioned(group: AttentionGroup, members: [Attention])
+    // MARK: Editorial controls events
+    /// Response to `evaluate_editorial_rules` — the outcome of running the
+    /// product's rules against the supplied body + optional title.
+    /// `decision` is `"allow"`, `"rewrite"`, or `"deny"`.
+    /// `findings` lists human-readable descriptions of every triggered rule.
+    /// `rewrittenBody` is present when `decision == "rewrite"`.
+    case editorialRulesEvaluated(
+        productID: String,
+        decision: String,
+        findings: [String],
+        rewrittenBody: String?
+    )
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -873,6 +885,23 @@ final class EngineClient: @unchecked Sendable {
         if let limit { msg["limit"] = limit }
         sendLine(msg)
     }
+
+    /// Evaluate a product's editorial rules against a candidate PR body +
+    /// optional title without touching GitHub. The engine replies with
+    /// `editorial_rules_evaluated` carrying the decision, findings list, and
+    /// (when decision == "rewrite") the sanitised body.
+    func sendEvaluateEditorialRules(productId: String, body: String, title: String? = nil) {
+        var payload: [String: Any] = [
+            "type": "evaluate_editorial_rules",
+            "product_id": productId,
+            "body": body,
+        ]
+        if let title {
+            payload["title"] = title
+        }
+        sendLine(payload)
+    }
+
 
     /// Resolve a project's design-doc pointer. Engine replies with
     /// `project_design_doc_resolved` carrying a
@@ -1667,6 +1696,19 @@ final class EngineClient: @unchecked Sendable {
                 let actions = rawActions.compactMap(parseEditorialAction)
                 if !productID.isEmpty {
                     emit(.editorialActionsList(productID: productID, actions: actions))
+                }
+            case "editorial_rules_evaluated":
+                let evalProductID = payload["product_id"] as? String ?? ""
+                let decision = payload["decision"] as? String ?? "allow"
+                let findings = payload["findings"] as? [String] ?? []
+                let rewrittenBody = payload["rewritten_body"] as? String
+                if !evalProductID.isEmpty {
+                    emit(.editorialRulesEvaluated(
+                        productID: evalProductID,
+                        decision: decision,
+                        findings: findings,
+                        rewrittenBody: rewrittenBody
+                    ))
                 }
             default:
                 break

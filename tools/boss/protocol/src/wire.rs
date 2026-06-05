@@ -461,6 +461,19 @@ pub enum FrontendRequest {
         response: EngineToAppResponse,
     },
 
+    /// Evaluate a product's editorial rules against a candidate PR body
+    /// (and optional title) without touching GitHub. Returns
+    /// [`FrontendEvent::EditorialRulesEvaluated`] with the decision,
+    /// per-finding descriptions, and the rewritten body when applicable.
+    /// Mirrors `boss editorial test --body-file` but over the IPC socket
+    /// so the macOS app can present the result inline.
+    EvaluateEditorialRules {
+        product_id: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+
     /// Resolve and render the full transcript for a completed or
     /// in-progress execution, keyed on the durable execution id.
     ///
@@ -2212,6 +2225,19 @@ pub enum FrontendEvent {
         product_id: String,
         actions: Vec<EditorialAction>,
     },
+    /// Response to [`FrontendRequest::EvaluateEditorialRules`]: the
+    /// outcome of running the product's rules against the supplied body.
+    /// `decision` is `"allow"`, `"rewrite"`, or `"deny"`. `findings`
+    /// lists human-readable descriptions of every triggered rule.
+    /// `rewritten_body` is present (and differs from the input) when
+    /// `decision == "rewrite"`.
+    EditorialRulesEvaluated {
+        product_id: String,
+        decision: String,
+        findings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewritten_body: Option<String>,
+    },
     /// Response to [`FrontendRequest::ListAutomationRuns`].
     AutomationRunsList {
         automation_id: String,
@@ -2512,6 +2538,57 @@ mod editorial_controls_tests {
                 assert_eq!(product_id, "prod_789");
                 assert_eq!(actions.len(), 1);
                 assert_eq!(actions[0], action);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_editorial_rules_request_round_trips() {
+        let req = FrontendRequest::EvaluateEditorialRules {
+            product_id: "prod_abc".into(),
+            body: "## Summary\nFixes the thing with exec_18b07a_1b inside.".into(),
+            title: Some("Fix the widget".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("evaluate_editorial_rules"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::EvaluateEditorialRules {
+                product_id,
+                body,
+                title,
+            } => {
+                assert_eq!(product_id, "prod_abc");
+                assert!(body.contains("exec_18b07a_1b"));
+                assert_eq!(title.as_deref(), Some("Fix the widget"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_editorial_rules_result_event_round_trips() {
+        let event = FrontendEvent::EditorialRulesEvaluated {
+            product_id: "prod_abc".into(),
+            decision: "rewrite".into(),
+            findings: vec!["exec_ identifier stripped".into()],
+            rewritten_body: Some("## Summary\nFixes the thing inside.".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("editorial_rules_evaluated"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::EditorialRulesEvaluated {
+                product_id,
+                decision,
+                findings,
+                rewritten_body,
+            } => {
+                assert_eq!(product_id, "prod_abc");
+                assert_eq!(decision, "rewrite");
+                assert_eq!(findings.len(), 1);
+                assert!(rewritten_body.is_some());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
