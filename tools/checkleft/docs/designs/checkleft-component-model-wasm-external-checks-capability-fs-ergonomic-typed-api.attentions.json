@@ -11,15 +11,6 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Q2: How should WASI imports that std Rust guests pull in (clocks/stdio) be handled?",
-    "choices": [
-      "Host links a minimal wasmtime-wasi context with no preopens / no real FS, purely to satisfy imports (recommended; ergonomic std guests)",
-      "Require guests to be built to import no WASI at all (smaller host, more constrained authoring)"
-    ],
-    "anchor": "file-capability-model-allowlist-policy"
-  },
-  {
-    "question_type": "multiple_choice",
     "prompt": "Q3: What should the default timeout mechanism be?",
     "choices": [
       "Epoch-based wall-clock deadline by default; fuel available as an opt-in determinism knob (recommended)",
@@ -30,10 +21,11 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Q4: What file-access mechanism should v1 ship?",
+    "prompt": "Q4: Which mechanism should provide per-file capability scoping in v1? File access is always via std::fs — this question is only about how the host enforces which files are reachable.",
     "choices": [
-      "Host-imported host-fs with a host-enforced allowlist only (recommended; integrates with SourceTree, supports virtual/base trees)",
-      "host-fs import PLUS WASI preopened read-only dirs (coarse + fine; more host surface and wasmtime-wasi FS dependency)"
+      "WASI-p2 sandbox dir: host builds a per-invocation temp dir, hardlinks/symlinks allowlisted files at their repo-relative paths, and preopens it as WASI root (recommended; std::fs just works; capability enforcement is structural)",
+      "Custom/virtual host FS: wasmtime_wasi::Dir backed by SourceTree, no disk materialization (more flexible for in-memory/base-revision trees; more complex to implement; treat as a v1-optional optimization)",
+      "Host-imported read-file(path) ABI (last resort only — breaks std::fs ergonomic; must be justified by documented failure of both above approaches)"
     ],
     "anchor": "file-capability-model-allowlist-policy"
   },
