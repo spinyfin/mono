@@ -16,6 +16,10 @@ pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
 pub const EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1: &str = "declarative-v1";
 pub const EXTERNAL_CHECK_API_V1: &str = "v1";
 pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
+/// Prefix selecting a first-party check definition embedded in the checkleft
+/// binary (resolved by [`BundledExternalCheckPackageProvider`]). `bundled:<name>`
+/// names a def under `tools/checkleft/checks/<name>/`.
+pub const BUNDLED_IMPLEMENTATION_PREFIX: &str = "bundled:";
 
 pub mod declarative;
 
@@ -25,6 +29,11 @@ pub use declarative::{ExternalCheckDeclarativePackage, run_declarative_check};
 pub enum ExternalCheckImplementationRef {
     File(PathBuf),
     Generated(String),
+    /// A first-party definition embedded in the checkleft binary, named by its
+    /// bundle key (the directory name under `tools/checkleft/checks/`). Zero
+    /// install for the target repo. Resolved by
+    /// [`BundledExternalCheckPackageProvider`].
+    Bundled(String),
 }
 
 impl ExternalCheckImplementationRef {
@@ -45,10 +54,35 @@ impl ExternalCheckImplementationRef {
             return Ok(Self::Generated(generated_id.to_owned()));
         }
 
+        if let Some(bundled_name) = trimmed.strip_prefix(BUNDLED_IMPLEMENTATION_PREFIX) {
+            let bundled_name = bundled_name.trim();
+            if bundled_name.is_empty() {
+                bail!(
+                    "bundled implementation reference must include a name after `{}`",
+                    BUNDLED_IMPLEMENTATION_PREFIX
+                );
+            }
+            validate_bundled_name(bundled_name)?;
+            return Ok(Self::Bundled(bundled_name.to_owned()));
+        }
+
         let path = PathBuf::from(trimmed);
         validate_relative_path(&path)?;
         Ok(Self::File(path))
     }
+}
+
+/// A bundled definition is named by a single path segment (the directory under
+/// `tools/checkleft/checks/`). Reject separators / traversal so a `bundled:` ref
+/// can never escape the embedded tree.
+pub(crate) fn validate_bundled_name(name: &str) -> Result<()> {
+    if name.contains('/') || name.contains('\\') {
+        bail!("bundled implementation name `{name}` must be a single segment, not a path");
+    }
+    if name == "." || name == ".." {
+        bail!("bundled implementation name `{name}` is not a valid definition name");
+    }
+    Ok(())
 }
 
 impl fmt::Display for ExternalCheckImplementationRef {
@@ -56,6 +90,7 @@ impl fmt::Display for ExternalCheckImplementationRef {
         match self {
             Self::File(path) => write!(f, "{}", path.display()),
             Self::Generated(id) => write!(f, "{GENERATED_IMPLEMENTATION_PREFIX}{id}"),
+            Self::Bundled(name) => write!(f, "{BUNDLED_IMPLEMENTATION_PREFIX}{name}"),
         }
     }
 }
@@ -105,6 +140,8 @@ pub trait ExternalCheckPackageProvider: Send + Sync {
     ) -> Result<Option<ExternalCheckPackage>>;
 }
 
+mod bundled;
+pub use bundled::{BundledExternalCheckPackageProvider, bundled_check_names};
 mod provider;
 pub use provider::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
@@ -119,16 +156,20 @@ pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExter
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read external check manifest {}", path.display()))?;
-    let is_yaml = matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("yaml" | "yml")
-    );
-    if is_yaml {
-        parse_declarative_check_manifest(&contents)
-            .with_context(|| format!("invalid declarative external check manifest {}", path.display()))
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    parse_external_check_manifest(&contents, extension)
+        .with_context(|| format!("invalid external check manifest {}", path.display()))
+}
+
+/// Parse a manifest given its contents and file extension. YAML manifests use
+/// the declarative schema; everything else (TOML) goes through the
+/// artifact/declarative TOML schema. Shared by the on-disk file loader and the
+/// in-binary bundled provider so both honor identical format rules.
+pub fn parse_external_check_manifest(contents: &str, extension: &str) -> Result<ExternalCheckPackage> {
+    if matches!(extension, "yaml" | "yml") {
+        parse_declarative_check_manifest(contents)
     } else {
-        parse_external_check_package_manifest(&contents)
-            .with_context(|| format!("invalid external check manifest {}", path.display()))
+        parse_external_check_package_manifest(contents)
     }
 }
 

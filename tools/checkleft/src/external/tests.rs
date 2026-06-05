@@ -205,6 +205,31 @@ fn rejects_empty_generated_id() {
 }
 
 #[test]
+fn parses_bundled_implementation_ref() {
+    let implementation_ref =
+        ExternalCheckImplementationRef::parse("bundled:buildifier").expect("valid bundled ref");
+    assert!(matches!(
+        implementation_ref,
+        ExternalCheckImplementationRef::Bundled(ref name) if name == "buildifier"
+    ));
+    // Display round-trips back to the canonical `bundled:` form.
+    assert_eq!(implementation_ref.to_string(), "bundled:buildifier");
+}
+
+#[test]
+fn rejects_empty_bundled_name() {
+    let error = ExternalCheckImplementationRef::parse("bundled:").expect_err("must fail");
+    assert!(error.to_string().contains("include a name"));
+}
+
+#[test]
+fn rejects_bundled_name_with_path_separator() {
+    let error =
+        ExternalCheckImplementationRef::parse("bundled:foo/bar").expect_err("must fail");
+    assert!(error.to_string().contains("single segment"));
+}
+
+#[test]
 fn rejects_absolute_file_implementation_ref() {
     let error = ExternalCheckImplementationRef::parse("/tmp/check.toml").expect_err("must fail");
     assert!(error.to_string().contains("absolute paths are not allowed"));

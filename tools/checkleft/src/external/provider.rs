@@ -235,10 +235,12 @@ impl RawGeneratedExternalCheckPackageEntry {
         let implementation_ref = ExternalCheckImplementationRef::parse(&self.implementation)?;
         match implementation_ref {
             ExternalCheckImplementationRef::Generated(id) => Ok(id),
-            ExternalCheckImplementationRef::File(_) => bail!(
-                "generated index `packages[].implementation` must use the `{}` prefix",
-                GENERATED_IMPLEMENTATION_PREFIX
-            ),
+            ExternalCheckImplementationRef::File(_) | ExternalCheckImplementationRef::Bundled(_) => {
+                bail!(
+                    "generated index `packages[].implementation` must use the `{}` prefix",
+                    GENERATED_IMPLEMENTATION_PREFIX
+                )
+            }
         }
     }
 

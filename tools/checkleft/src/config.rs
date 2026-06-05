@@ -5,7 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
-use crate::external::ExternalCheckImplementationRef;
+use crate::external::{
+    BUNDLED_IMPLEMENTATION_PREFIX, ExternalCheckImplementationRef, GENERATED_IMPLEMENTATION_PREFIX,
+};
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
 use anyhow::{Context, Result, bail};
@@ -27,6 +29,61 @@ const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
 const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
+/// The reserved `check_def_source` / `source` value selecting the in-binary
+/// bundle. Any other value is interpreted as an on-disk directory of defs.
+const BUNDLED_SOURCE_KEYWORD: &str = "bundled";
+/// Canonical manifest filename within a definition directory, for both the
+/// embedded bundle (`checks/<name>/check.yaml`) and a path-source directory
+/// (`<dir>/<name>/check.yaml`).
+const CHECK_DEF_FILE_NAME: &str = "check.yaml";
+
+/// Where a check's *definition* is sourced from when its `implementation` is a
+/// bare definition name (rather than an explicit `generated:`/`bundled:`/path
+/// reference). Chosen by the `check_def_source` setting (per config, inherited)
+/// or a per-check `source` override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckDefSource {
+    /// First-party definitions embedded in the checkleft binary (zero install).
+    Bundled,
+    /// An on-disk directory of definitions, relative to the repo root; each def
+    /// lives at `<dir>/<name>/check.yaml`. Used by `mono` to point checkleft at
+    /// the checked-in (always-head) `tools/checkleft/checks/` defs.
+    Path(PathBuf),
+}
+
+/// Parse a `check_def_source` / `source` string into a [`CheckDefSource`].
+/// `bundled` is reserved; anything else is a relative directory path. Path
+/// sources are rejected when `allow_path` is false (e.g. in remotely-fetched
+/// external configs, which must not reference local on-disk files — same trust
+/// rule as `File` implementation refs).
+fn parse_check_def_source(raw: &str, allow_path: bool) -> Result<CheckDefSource> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("check definition source must not be empty");
+    }
+    if trimmed == BUNDLED_SOURCE_KEYWORD {
+        return Ok(CheckDefSource::Bundled);
+    }
+    if !allow_path {
+        bail!(
+            "check definition source must be `{BUNDLED_SOURCE_KEYWORD}` here; a directory path source is not allowed in an external checks config"
+        );
+    }
+    let path = PathBuf::from(trimmed);
+    validate_relative_path(&path)
+        .context("check definition source path must be a safe relative path")?;
+    Ok(CheckDefSource::Path(path))
+}
+
+/// True when `implementation` is an explicit reference (a `generated:`/`bundled:`
+/// prefix, or a path containing a separator) rather than a bare definition name.
+/// Explicit refs are used verbatim and ignore any `source` directive.
+fn is_explicit_implementation_ref(implementation: &str) -> bool {
+    implementation.starts_with(GENERATED_IMPLEMENTATION_PREFIX)
+        || implementation.starts_with(BUNDLED_IMPLEMENTATION_PREFIX)
+        || implementation.contains('/')
+        || implementation.contains('\\')
+}
 
 fn ensure_rustls_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
@@ -110,6 +167,10 @@ pub struct ResolvedChecks {
     diagnostics: Vec<ConfigDiagnostic>,
     include_config_files: bool,
     stale_exclusion_mode: StaleExclusionMode,
+    /// The inherited default definition source for bare `implementation` names.
+    /// `None` preserves the legacy behavior (bare name == repo-relative file
+    /// path). Set by `settings.check_def_source`, inherited down the tree.
+    check_def_source: Option<CheckDefSource>,
 }
 
 impl ResolvedChecks {
@@ -137,6 +198,12 @@ impl ResolvedChecks {
     /// the config hierarchy. Per-check `policy.stale_exclusion_severity` overrides it.
     pub fn stale_exclusion_mode(&self) -> StaleExclusionMode {
         self.stale_exclusion_mode
+    }
+
+    /// The inherited default definition source at this point in the config
+    /// hierarchy. Per-check `source` overrides it.
+    pub fn check_def_source(&self) -> Option<&CheckDefSource> {
+        self.check_def_source.as_ref()
     }
 
     fn upsert(&mut self, check: CheckConfig) {
@@ -316,11 +383,18 @@ impl ConfigResolver {
             config_abs_dir == self.root,
             &config_relative_path,
         );
+        // Snapshot the inherited definition source (set by this dir's own
+        // settings above, or inherited from an ancestor) before the per-check
+        // loop, which mutably borrows `resolved`.
+        let inherited_source = resolved.check_def_source.clone();
         for check in checks_file.checks {
             let configured_id = check.id;
             let implementation = if check.enabled {
-                match parse_check_implementation(
+                match resolve_check_implementation(
                     check.implementation.as_deref(),
+                    check.source.as_deref(),
+                    inherited_source.as_ref(),
+                    true,
                     &configured_id,
                     None,
                 ) {
@@ -380,6 +454,10 @@ struct ParsedSettings {
     external_checks_url: Option<String>,
     #[serde(default)]
     stale_exclusion_severity: Option<String>,
+    /// Default definition source for bare `implementation` names in this config
+    /// (and, by inheritance, its children). `bundled` or a directory path.
+    #[serde(default)]
+    check_def_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,6 +467,10 @@ struct ParsedCheckConfig {
     check: Option<String>,
     #[serde(default)]
     implementation: Option<String>,
+    /// Per-check override of the definition source for a bare `implementation`
+    /// name. `bundled` or a directory path. Overrides `settings.check_def_source`.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default = "enabled_default")]
     enabled: bool,
     #[serde(default)]
@@ -484,15 +566,89 @@ fn parse_check_implementation(
     let Some(implementation) = implementation else {
         return Ok(None);
     };
-    let implementation = ExternalCheckImplementationRef::parse(implementation).with_context(
-        || match config_source {
-            Some(config_source) => {
-                format!("invalid `implementation` for check `{check_id}` in {config_source}")
-            }
-            None => format!("invalid `implementation` for check `{check_id}`"),
-        },
-    )?;
+    let implementation = ExternalCheckImplementationRef::parse(implementation)
+        .with_context(|| invalid_field_context("implementation", check_id, config_source))?;
     Ok(Some(implementation))
+}
+
+fn invalid_field_context(field: &str, check_id: &str, config_source: Option<&str>) -> String {
+    match config_source {
+        Some(config_source) => format!("invalid `{field}` for check `{check_id}` in {config_source}"),
+        None => format!("invalid `{field}` for check `{check_id}`"),
+    }
+}
+
+/// Resolve a check's external implementation reference, honoring the
+/// `check_def_source` / `source` directive.
+///
+/// - An explicit reference (`generated:`/`bundled:`/path) is used verbatim and
+///   ignores any source directive.
+/// - A *bare* definition name is resolved against the effective source: a
+///   per-check `source` (if set) else the `inherited_source`. `bundled` →
+///   [`ExternalCheckImplementationRef::Bundled`]; a path directory →
+///   `File(<dir>/<name>/check.yaml)`.
+/// - With no source at all, a bare name keeps the legacy meaning: a
+///   repo-relative manifest file path.
+///
+/// `allow_path_source` gates directory-path sources (rejected for remotely
+/// fetched external configs, which must not reach into the local filesystem).
+fn resolve_check_implementation(
+    implementation: Option<&str>,
+    check_source_raw: Option<&str>,
+    inherited_source: Option<&CheckDefSource>,
+    allow_path_source: bool,
+    check_id: &str,
+    config_source: Option<&str>,
+) -> Result<Option<ExternalCheckImplementationRef>> {
+    let check_source = match check_source_raw {
+        Some(raw) => Some(
+            parse_check_def_source(raw, allow_path_source)
+                .with_context(|| invalid_field_context("source", check_id, config_source))?,
+        ),
+        None => None,
+    };
+
+    let Some(raw_impl) = implementation else {
+        if check_source.is_some() {
+            bail!(
+                "check `{check_id}` sets `source` but has no `implementation` definition name to resolve"
+            );
+        }
+        return Ok(None);
+    };
+    let raw_impl = raw_impl.trim();
+    if raw_impl.is_empty() {
+        bail!("`implementation` for check `{check_id}` must not be empty");
+    }
+
+    if is_explicit_implementation_ref(raw_impl) {
+        if check_source.is_some() {
+            bail!(
+                "check `{check_id}` sets `source` together with an explicit `implementation` reference `{raw_impl}`; use a bare definition name with `source`, or drop `source`"
+            );
+        }
+        return parse_check_implementation(Some(raw_impl), check_id, config_source);
+    }
+
+    match check_source.as_ref().or(inherited_source) {
+        Some(CheckDefSource::Bundled) => {
+            crate::external::validate_bundled_name(raw_impl)
+                .with_context(|| invalid_field_context("implementation", check_id, config_source))?;
+            Ok(Some(ExternalCheckImplementationRef::Bundled(
+                raw_impl.to_owned(),
+            )))
+        }
+        Some(CheckDefSource::Path(dir)) => {
+            let manifest = dir.join(raw_impl).join(CHECK_DEF_FILE_NAME);
+            validate_relative_path(&manifest).with_context(|| {
+                format!(
+                    "definition name `{raw_impl}` for check `{check_id}` must resolve inside the source directory"
+                )
+            })?;
+            Ok(Some(ExternalCheckImplementationRef::File(manifest)))
+        }
+        None => parse_check_implementation(Some(raw_impl), check_id, config_source),
+    }
 }
 
 fn parse_policy_config(
@@ -684,6 +840,25 @@ fn apply_local_settings(
         }
     }
 
+    if let Some(raw) = settings.check_def_source.as_deref() {
+        // Local configs may point at on-disk directories (e.g. mono's checked-in
+        // `tools/checkleft/checks/`), so path sources are allowed here.
+        match parse_check_def_source(raw, true) {
+            Ok(source) => resolved.check_def_source = Some(source),
+            Err(error) => resolved.push_diagnostic(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                format!("invalid `settings.check_def_source`: {error}"),
+                None,
+                None,
+                Some(
+                    "Set `settings.check_def_source` to `bundled` or a relative directory path."
+                        .to_owned(),
+                ),
+            )),
+        }
+    }
+
     let Some(external_checks_url) = settings.external_checks_url.as_deref() else {
         return;
     };
@@ -734,11 +909,27 @@ fn apply_external_checks_file(
         })?;
     }
 
+    if let Some(raw) = external_checks_file.parsed.settings.check_def_source.as_deref() {
+        // External configs are checked in elsewhere (file) or fetched (URL); a
+        // directory-path source would reach into the consuming repo's local
+        // filesystem, so only `bundled` is permitted here.
+        resolved.check_def_source = Some(parse_check_def_source(raw, false).with_context(|| {
+            format!(
+                "invalid `settings.check_def_source` in {}",
+                external_checks_file.source_label
+            )
+        })?);
+    }
+
+    let inherited_source = resolved.check_def_source.clone();
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();
         let implementation = if check.enabled {
-            let implementation = parse_check_implementation(
+            let implementation = resolve_check_implementation(
                 check.implementation.as_deref(),
+                check.source.as_deref(),
+                inherited_source.as_ref(),
+                false,
                 &configured_id,
                 Some(&external_checks_file.source_label),
             )?;
@@ -936,7 +1127,7 @@ fn validate_external_root_check_implementation(
         && matches!(implementation, ExternalCheckImplementationRef::File(_))
     {
         bail!(
-            "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` implementations"
+            "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` or `bundled:` implementations"
         );
     }
 

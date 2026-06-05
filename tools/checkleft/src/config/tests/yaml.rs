@@ -257,7 +257,125 @@ checks:
     assert!(
         error
             .to_string()
-            .contains("external checks files may only use `generated:` implementations")
+            .contains("external checks files may only use `generated:` or `bundled:` implementations")
+    );
+}
+
+#[tokio::test]
+async fn allows_bundled_implementation_from_external_checks_file() {
+    // Bundled defs are embedded in the binary, so a remotely-distributed external
+    // checks file may reference them (unlike local `File` refs) — this is the
+    // zero-install distribution path.
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: buildifier-declarative
+    implementation: bundled:buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolution must succeed");
+
+    let check = checks.get("buildifier-declarative").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(crate::external::ExternalCheckImplementationRef::Bundled(
+            "buildifier".to_owned()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn bundled_source_directive_in_external_checks_file_resolves_bare_name() {
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+settings:
+  check_def_source: bundled
+checks:
+  - id: buildifier-declarative
+    implementation: buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect("resolution must succeed");
+
+    let check = checks.get("buildifier-declarative").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(crate::external::ExternalCheckImplementationRef::Bundled(
+            "buildifier".to_owned()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn rejects_path_check_def_source_from_external_checks_file() {
+    // A directory-path source from an external file would reach into the
+    // consuming repo's local filesystem — only `bundled` is permitted here.
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+settings:
+  check_def_source: tools/checkleft/checks
+checks:
+  - id: buildifier-declarative
+    implementation: buildifier
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let error = resolver
+        .resolve_for_file(Path::new("BUILD.bazel"))
+        .expect_err("resolution must fail");
+
+    assert!(
+        format!("{error:#}")
+            .contains("directory path source is not allowed in an external checks config"),
+        "unexpected error: {error:#}"
     );
 }
 
