@@ -206,6 +206,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
+            _: Option<u64>,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
@@ -222,14 +223,6 @@ mod tests {
             unimplemented!()
         }
         async fn checkout_pr_head_for_review(
-            &self,
-            _: &Path,
-            _: &str,
-            _: &str,
-        ) -> Result<String> {
-            unimplemented!()
-        }
-        async fn position_revision_workspace(
             &self,
             _: &Path,
             _: &str,

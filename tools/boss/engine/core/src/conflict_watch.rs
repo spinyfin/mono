@@ -1379,6 +1379,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
+            _: Option<u64>,
         ) -> anyhow::Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in conflict_watch tests")
         }
