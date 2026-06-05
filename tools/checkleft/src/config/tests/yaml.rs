@@ -273,7 +273,7 @@ async fn allows_bundled_implementation_from_external_checks_file() {
         &external_path,
         r#"
 checks:
-  - id: buildifier-declarative
+  - id: buildifier
     implementation: bundled:buildifier
 "#,
     )
@@ -292,7 +292,7 @@ checks:
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolution must succeed");
 
-    let check = checks.get("buildifier-declarative").expect("check exists");
+    let check = checks.get("buildifier").expect("check exists");
     assert_eq!(
         check.implementation,
         Some(crate::external::ExternalCheckImplementationRef::Bundled(
@@ -302,18 +302,17 @@ checks:
 }
 
 #[tokio::test]
-async fn bundled_source_directive_in_external_checks_file_resolves_bare_name() {
+async fn bare_id_in_external_config_resolves_to_bundled() {
+    // A bare `id: buildifier` in an external config resolves to the bundled def
+    // automatically — no `implementation:` line needed.
     let temp = tempdir().expect("create temp dir");
     let external_path = temp.path().join("shared/CHECKS.yaml");
     fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
     fs::write(
         &external_path,
         r#"
-settings:
-  check_def_source: bundled
 checks:
-  - id: buildifier-declarative
-    implementation: buildifier
+  - id: buildifier
 "#,
     )
     .expect("write external config");
@@ -331,7 +330,7 @@ checks:
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolution must succeed");
 
-    let check = checks.get("buildifier-declarative").expect("check exists");
+    let check = checks.get("buildifier").expect("check exists");
     assert_eq!(
         check.implementation,
         Some(crate::external::ExternalCheckImplementationRef::Bundled(
@@ -341,20 +340,20 @@ checks:
 }
 
 #[tokio::test]
-async fn rejects_path_check_def_source_from_external_checks_file() {
-    // A directory-path source from an external file would reach into the
-    // consuming repo's local filesystem — only `bundled` is permitted here.
+async fn rejects_exec_paths_in_external_checks_file() {
+    // exec_paths would reach into the consuming repo's local filesystem — forbidden
+    // in external configs (same trust rule as local File implementation refs).
     let temp = tempdir().expect("create temp dir");
     let external_path = temp.path().join("shared/CHECKS.yaml");
     fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
     fs::write(
         &external_path,
         r#"
-settings:
-  check_def_source: tools/checkleft/checks
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks
 checks:
-  - id: buildifier-declarative
-    implementation: buildifier
+  - id: buildifier
 "#,
     )
     .expect("write external config");
@@ -374,7 +373,7 @@ checks:
 
     assert!(
         format!("{error:#}")
-            .contains("directory path source is not allowed in an external checks config"),
+            .contains("exec_paths` is not allowed in an external checks config"),
         "unexpected error: {error:#}"
     );
 }

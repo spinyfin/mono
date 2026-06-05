@@ -54,7 +54,6 @@ Supported keys:
 
 - `include_config_files` (boolean, default `false`)
 - `external_checks_url` (string, root config only)
-- `check_def_source` (string): default definition source for bare `implementation` names. Either `bundled` (use the copy embedded in the `checkleft` binary) or a relative directory path (resolve `<dir>/<name>/check.yaml`). Inherited by child configs.
 
 When `false`, changed `CHECKS.yaml` / `CHECKS.toml` files are excluded from check scheduling.
 
@@ -62,22 +61,33 @@ When `external_checks_url` is set in the repository root config, `checkleft`
 fetches that remote `CHECKS.yaml` or `CHECKS.toml`, applies it first, and then
 merges the local root config and any child configs on top.
 
-`check_def_source` lets a config choose where check *definitions* come from
-without rewriting every check entry. Set it to `bundled` and a target repo gets
-the first-party checks with zero install (the manifests ship inside the
-`checkleft` binary). Set it to a path such as `tools/checkleft/checks` to use the
-checked-in, always-head definitions on disk. A per-check `source` (below)
-overrides it. In a remotely-fetched external config only `bundled` is permitted —
-a path source would reach into the consuming repo's local filesystem.
+## `check_definitions`
+
+Optional top-level section controlling where first-party check definitions are loaded from.
+
+```yaml
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks   # relative dir(s) containing check definition yaml files
+  allow_override_bundled: true
+```
+
+Supported keys:
+
+- `exec_paths` (list of strings): relative directories to search for check-definition yaml files. Each definition lives at `<dir>/<name>/check.yaml`. Inherited by child configs.
+- `allow_override_bundled` (boolean, default `false`): when `true`, a definition found in `exec_paths` with the same name as a bundled definition takes precedence over the bundled copy. When `false` (the default), bundled definitions win.
+
+`exec_paths` is not allowed in remotely-fetched external configs — a path source would reach into the consuming repo's local filesystem.
+
+**Default behavior (no `check_definitions` section):** a check whose `id` (or `check`) matches the name of a first-party bundled definition resolves to that bundled def automatically — no `implementation:` line needed, no install required.
 
 ## `checks` entry
 
 Supported keys:
 
 - `id` (required): check instance ID used in output.
-- `check` (optional): implementation ID; defaults to `id`.
-- `implementation` (optional): external package reference. Either an explicit reference — a checked-in manifest path, `generated:<id>`, or `bundled:<name>` — or, when a `source` / `check_def_source` directive is in effect, a bare definition name resolved against that source.
-- `source` (optional): per-check override of `settings.check_def_source` for a bare `implementation` name (`bundled` or a relative directory path). Cannot be combined with an explicit `implementation` reference.
+- `check` (optional): check definition name; defaults to `id`.
+- `implementation` (optional): explicit external package reference — `generated:<id>` or a checked-in manifest path. For first-party (bundled) and exec-path checks, omit this field; resolution is automatic from the `id`/`check` name.
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
 - `policy` (optional table): framework-managed severity/bypass controls.
@@ -87,6 +97,37 @@ Supported keys:
 - `severity` (optional `error|warning|info`): overrides finding severity for the check instance.
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
+
+## Pattern: First-party (bundled) check — zero install
+
+First-party checks whose definitions ship inside the `checkleft` binary resolve automatically from `id` (or `check`). No `implementation:` line needed:
+
+```yaml
+checks:
+  - id: buildifier
+```
+
+With a custom instance ID:
+
+```yaml
+checks:
+  - id: my-buildifier
+    check: buildifier
+```
+
+## Pattern: Always-head definitions from disk (e.g. mono)
+
+A repo that maintains its own check definitions on disk can point `exec_paths` at them. With `allow_override_bundled: true`, the on-disk copy takes precedence over the bundled snapshot — so the repo always runs its checked-in (head) version:
+
+```yaml
+check_definitions:
+  exec_paths:
+    - tools/checkleft/checks
+  allow_override_bundled: true
+
+checks:
+  - id: buildifier   # resolves to tools/checkleft/checks/buildifier/check.yaml
+```
 
 ## Pattern: Multiple instances of one implementation
 
@@ -122,43 +163,6 @@ checks:
 
 Generated implementations are resolved through the configured generated index,
 for example from a Bazel-produced `check_index` target.
-
-## Pattern: Bundled (zero-install) first-party check
-
-A target repo with no checkleft definition files on disk can still run a
-first-party check whose definition ships inside the `checkleft` binary:
-
-```yaml
-checks:
-  - id: buildifier-declarative
-    implementation: bundled:buildifier
-```
-
-To switch many checks between the embedded copies and an on-disk, always-head
-checkout at once, set the source once and reference bare definition names:
-
-```toml
-# bundled everywhere (zero install)
-[settings]
-check_def_source = "bundled"
-
-[[checks]]
-id = "buildifier-declarative"
-implementation = "buildifier"
-```
-
-```toml
-# mono: use the checked-in (head) definitions on disk instead
-[settings]
-check_def_source = "tools/checkleft/checks"
-
-[[checks]]
-id = "buildifier-declarative"
-implementation = "buildifier"
-```
-
-Both forms resolve definition `buildifier` (i.e. `<source>/buildifier/check.yaml`,
-or the embedded equivalent). Only the `check_def_source` line changes.
 
 ## Pattern: Disable a parent check in a child directory
 

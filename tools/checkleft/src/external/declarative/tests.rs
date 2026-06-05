@@ -51,7 +51,7 @@ const REAL_LINT_CLEAN: &[u8] =
 fn parse_package() -> ExternalCheckDeclarativePackage {
     let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST)
         .expect("spike manifest must parse");
-    assert_eq!(package.id, "buildifier-declarative");
+    assert_eq!(package.id, "buildifier");
     assert_eq!(package.runtime, "declarative-v1");
     match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
@@ -494,7 +494,7 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
 
     let result = super::run_declarative_check(
         temp.path(),
-        "buildifier-declarative",
+        "buildifier",
         &package,
         &changeset,
         &config,

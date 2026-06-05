@@ -2,8 +2,8 @@
 //!
 //! A target repo that has *no* checkleft definition files on disk can still run
 //! these checks: the manifests are compiled into the binary via `include_str!`,
-//! so there is zero install. A check opts in with a `bundled:<name>` reference,
-//! or via the `check_def_source = "bundled"` directive (see [`crate::config`]).
+//! so there is zero install. A check whose `id` (or `check`) names a bundled
+//! definition resolves to it automatically — no `implementation:` line required.
 //!
 //! ## Adding a bundled definition
 //!
@@ -84,7 +84,7 @@ mod tests {
             .resolve(&ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
             .expect("resolve")
             .expect("package");
-        assert_eq!(package.id, "buildifier-declarative");
+        assert_eq!(package.id, "buildifier");
     }
 
     #[test]

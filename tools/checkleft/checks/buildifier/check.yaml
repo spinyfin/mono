@@ -1,4 +1,4 @@
-id: buildifier-declarative
+id: buildifier
 mode: declarative
 runtime: declarative-v1
 api_version: v1
