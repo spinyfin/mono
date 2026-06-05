@@ -44,7 +44,7 @@ struct ReleaseNotesContent: View {
                 if let date = note.publishedAt {
                     Text("·")
                         .foregroundStyle(.secondary)
-                    Text(date, format: .dateTime.month(.abbreviated).day().year())
+                    Text(date, format: .dateTime.month(.abbreviated).day().year().hour().minute())
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
