@@ -1,0 +1,45 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q1: How should per-check config (today an arbitrary toml::Value) cross the WIT boundary in v1?",
+    "choices": [
+      "Pass as a JSON string (config-json); guest SDK deserializes with serde into the author's own config struct (recommended, pragmatic)",
+      "Model config as WIT records / a recursive variant (typed at the boundary, but forces a schema or dynamic-value modeling)",
+      "Generic typed-per-check config baked into the SDK macro (most ergonomic, most SDK complexity)"
+    ],
+    "anchor": "wit-contract"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q2: How should WASI imports that std Rust guests pull in (clocks/stdio) be handled?",
+    "choices": [
+      "Host links a minimal wasmtime-wasi context with no preopens / no real FS, purely to satisfy imports (recommended; ergonomic std guests)",
+      "Require guests to be built to import no WASI at all (smaller host, more constrained authoring)"
+    ],
+    "anchor": "file-capability-model-allowlist-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q3: What should the default timeout mechanism be?",
+    "choices": [
+      "Epoch-based wall-clock deadline by default; fuel available as an opt-in determinism knob (recommended)",
+      "Fuel by default (deterministic but tuning-sensitive, like the current prototype)",
+      "Both always on (epoch + fuel)"
+    ],
+    "anchor": "limit-timeout-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q4: What file-access mechanism should v1 ship?",
+    "choices": [
+      "Host-imported host-fs with a host-enforced allowlist only (recommended; integrates with SourceTree, supports virtual/base trees)",
+      "host-fs import PLUS WASI preopened read-only dirs (coarse + fine; more host surface and wasmtime-wasi FS dependency)"
+    ],
+    "anchor": "file-capability-model-allowlist-policy"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Q5: Remove the sandbox-v1 runtime immediately once the component path lands (T11), rather than keeping both tiers running in parallel during migration?",
+    "anchor": "disposition-of-prior-work"
+  }
+]
