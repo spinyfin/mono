@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use boss_client::BossClient;
-use boss_github::repo_slug::short_name_for;
 use boss_protocol::{FrontendEvent, FrontendRequest, Product, Task};
+use git_utils::repo_slug::short_name_for;
 
 use crate::CliError;
 

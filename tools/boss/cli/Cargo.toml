@@ -10,6 +10,7 @@ boss-github = { path = "../github" }
 boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
+git-utils = { path = "../../../lib/rust/git_utils" }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

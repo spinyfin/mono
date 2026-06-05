@@ -1,24 +1,48 @@
-//! Helpers that invoke the `gh` CLI to fetch GitHub PR metadata.
+//! Helpers that invoke the `gh` CLI to fetch GitHub PR head metadata.
 //!
 //! These functions shell out to the `gh` binary rather than using the
 //! GitHub REST API directly. They are suitable for contexts where a
 //! short-lived `gh`-authenticated call is simpler than a full App-JWT
-//! flow — in particular, fetching PR head SHAs from the engine without
-//! requiring embedded App credentials.
+//! flow — in particular, fetching PR head SHAs / branch names from the
+//! engine without requiring embedded App credentials.
 
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
 use tokio::process::Command;
 
-/// Fetch the head commit SHA for a PR by shelling out to
+/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop
+/// settings, returning the trimmed stdout on success. `display` is a
+/// human-readable rendering of the command, reused in both the
+/// spawn-failure context and the non-zero-exit error message (which also
+/// carries the captured stderr).
+async fn run_gh(args: &[&str], display: &str) -> Result<String> {
+    let output = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `{display}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{display}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Fetch the head commit SHA (`headRefOid`) for a PR by shelling out to
 /// `gh pr view <pr_number> -R <repo_slug> --json headRefOid --jq .headRefOid`.
 ///
 /// Returns an error if the command fails or if the returned SHA is empty.
-pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Result<String> {
+pub async fn fetch_pr_head_oid(repo_slug: &str, pr_number: u64) -> Result<String> {
     let pr_str = pr_number.to_string();
-    let output = Command::new("gh")
-        .args([
+    let sha = run_gh(
+        &[
             "pr",
             "view",
             &pr_str,
@@ -28,22 +52,38 @@ pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Result<String
             "headRefOid",
             "--jq",
             ".headRefOid",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `gh pr view {pr_number}` to fetch head SHA"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug} --json headRefOid"),
+    )
+    .await?;
     parse_head_sha_output(sha, pr_number, repo_slug)
+}
+
+/// Fetch the head branch name (`headRefName`) for a PR by shelling out to
+/// `gh pr view <pr_number> -R <repo_slug> --json headRefName --jq .headRefName`.
+///
+/// Returns an error if the command fails or if the returned ref is empty.
+pub async fn fetch_pr_head_ref(repo_slug: &str, pr_number: u64) -> Result<String> {
+    let pr_str = pr_number.to_string();
+    let head_ref = run_gh(
+        &[
+            "pr",
+            "view",
+            &pr_str,
+            "-R",
+            repo_slug,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName",
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug}"),
+    )
+    .await?;
+    if head_ref.is_empty() {
+        return Err(anyhow!("empty headRefName for PR {pr_number} in {repo_slug}"));
+    }
+    Ok(head_ref)
 }
 
 /// Validate and return the SHA string from `gh pr view ... --jq .headRefOid`

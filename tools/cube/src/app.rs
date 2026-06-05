@@ -5,6 +5,11 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use console::{Style, style};
+use git_utils::pr_bookmark;
+use git_utils::repo_slug::{
+    is_owner_name_slug, origin_path_matches_slug, origin_urls_equivalent, parse_github_remote,
+    parse_org_name_shape,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -20,7 +25,6 @@ use crate::config;
 use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths;
-use crate::pr_bookmark;
 use crate::setup::{self, SetupReport, StepStatus, run_setup_engine};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 
@@ -465,7 +469,7 @@ fn ensure_repo_core(
         //      `org-127256988@github.com:...`), compare the slug against the
         //      *registered* origin's path and treat a match as a no-op success.
         let matches = origin_urls_equivalent(&existing.origin, origin)
-            || (is_bare_repo_slug(origin) && origin_path_matches_slug(&existing.origin, origin));
+            || (is_owner_name_slug(origin) && origin_path_matches_slug(&existing.origin, origin));
         if !matches {
             return Err(CubeError::InvalidArgument(format!(
                 "repo `{}` is already configured for origin `{}`; cannot ensure `{origin}`",
@@ -498,24 +502,6 @@ fn ensure_repo_core(
     store.upsert_repo(&record)
 }
 
-/// Split a bare `<org>/<name>` slug into its two halves. Returns `None` unless
-/// the input is exactly two non-empty `/`-separated segments free of URL
-/// punctuation (no scheme, no `:` host separator, no `user@` prefix) — i.e. a
-/// bare GitHub `owner/repo` slug rather than a clone URL or single name.
-fn parse_org_name_shape(name: &str) -> Option<(String, String)> {
-    let s = name.trim().trim_end_matches('/');
-    if s.contains(':') || s.contains('@') {
-        return None;
-    }
-    let mut parts = s.split('/');
-    let org = parts.next().filter(|p| !p.is_empty())?;
-    let repo = parts.next().filter(|p| !p.is_empty())?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((org.to_string(), repo.to_string()))
-}
-
 /// Wrap a GitHub-fallback clone failure that looks like a missing remote with
 /// guidance pointing at the resolver path. Other errors pass through unchanged.
 fn github_fallback_error(err: CubeError, org: &str, repo: &str) -> CubeError {
@@ -537,127 +523,6 @@ fn github_fallback_error(err: CubeError, org: &str, repo: &str) -> CubeError {
     } else {
         err
     }
-}
-
-/// Parsed representation of a git remote URL, normalised for equivalence checks.
-#[derive(Debug, PartialEq)]
-struct ParsedOrigin {
-    /// Lower-cased host (e.g. `github.com`).
-    host: String,
-    /// Repo path without leading slash and without trailing `.git`
-    /// (e.g. `linkedin-sandbox/bduff`). Case-sensitive.
-    path: String,
-}
-
-/// Parse an SSH-style (`[user@]host:path`), `ssh://` URL, or HTTPS-style
-/// (`https://[user@]host/path`) URL into a `ParsedOrigin`. Returns `None` if
-/// the URL is not in a recognised format.
-fn parse_origin(url: &str) -> Option<ParsedOrigin> {
-    let url = url.trim();
-
-    // HTTPS: https://[user@]host/path
-    if let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
-        // Drop optional `user@`
-        let rest = if let Some(at) = rest.find('@') {
-            &rest[at + 1..]
-        } else {
-            rest
-        };
-        let (host, path) = rest.split_once('/')?;
-        let path = path.trim_end_matches('/').trim_end_matches(".git");
-        return Some(ParsedOrigin {
-            host: host.to_ascii_lowercase(),
-            path: path.to_string(),
-        });
-    }
-
-    // RFC-3986 SSH URL: ssh://[user@]host[:port]/path
-    if let Some(rest) = url.strip_prefix("ssh://") {
-        // Drop optional `user@`
-        let rest = if let Some(at) = rest.find('@') {
-            &rest[at + 1..]
-        } else {
-            rest
-        };
-        // Drop optional `:port` from the host portion before the path `/`
-        let (host_maybe_port, path) = rest.split_once('/')?;
-        let host = if let Some((h, _port)) = host_maybe_port.split_once(':') {
-            h
-        } else {
-            host_maybe_port
-        };
-        let path = path.trim_end_matches('/').trim_end_matches(".git");
-        return Some(ParsedOrigin {
-            host: host.to_ascii_lowercase(),
-            path: path.to_string(),
-        });
-    }
-
-    // SSH SCP-like: [user@]host:path
-    // Must contain `:` but must NOT look like a Windows absolute path (`C:\`).
-    if let Some(colon_pos) = url.find(':') {
-        let before_colon = &url[..colon_pos];
-        let after_colon = &url[colon_pos + 1..];
-        // Reject Windows paths (single letter before colon) and paths starting with `//` (git+ssh://)
-        if before_colon.len() > 1 && !after_colon.starts_with('/') {
-            // Strip optional `user@` from the host part
-            let host = if let Some(at) = before_colon.rfind('@') {
-                &before_colon[at + 1..]
-            } else {
-                before_colon
-            };
-            let path = after_colon
-                .trim_end_matches('/')
-                .trim_end_matches(".git");
-            return Some(ParsedOrigin {
-                host: host.to_ascii_lowercase(),
-                path: path.to_string(),
-            });
-        }
-    }
-
-    None
-}
-
-/// Returns `true` when two origin URL strings refer to the same repository,
-/// ignoring auth-identity prefixes (e.g. `org-X@` vs `git@`) and trailing
-/// `.git` suffixes. Host comparison is case-insensitive; path is case-sensitive.
-fn origin_urls_equivalent(a: &str, b: &str) -> bool {
-    match (parse_origin(a), parse_origin(b)) {
-        (Some(pa), Some(pb)) => pa == pb,
-        // If either URL is unparseable fall back to exact-string equality so
-        // we never accidentally allow a mismatch.
-        _ => a == b,
-    }
-}
-
-/// Returns `true` when `origin` is a bare `owner/name` slug (e.g.
-/// `linkedin-multiproduct/dev-infra`) rather than a full clone URL. Such a
-/// slug has a `/` path separator but no scheme, host, or SSH `user@host:`
-/// prefix, so [`parse_origin`] cannot turn it into a real origin. Boss
-/// callers sometimes only carry the product's `owner/name` slug.
-fn is_bare_repo_slug(origin: &str) -> bool {
-    let s = origin.trim().trim_end_matches('/');
-    !s.is_empty()
-        && !s.contains(':')
-        && !s.contains('@')
-        && !s.starts_with('/')
-        && s.split('/').filter(|seg| !seg.is_empty()).count() >= 2
-        && parse_origin(s).is_none()
-}
-
-/// Returns `true` when a bare `owner/name` `slug` names the same repo as the
-/// registered `origin` URL — i.e. the slug equals the origin's parsed path
-/// (ignoring a trailing `.git`). This compares against the *registered*
-/// origin rather than synthesising one to assert with, so an "ensure" call
-/// that arrives with only a slug succeeds when (and only when) it actually
-/// refers to the configured repo.
-fn origin_path_matches_slug(origin: &str, slug: &str) -> bool {
-    let Some(parsed) = parse_origin(origin) else {
-        return false;
-    };
-    let slug = slug.trim().trim_end_matches('/').trim_end_matches(".git");
-    parsed.path == slug
 }
 
 fn normalize_origin(origin: &str) -> Result<String> {
@@ -2236,29 +2101,6 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     )
 }
 
-/// Parse the first github.com remote from `jj git remote list` output,
-/// returning `(remote_name, owner/repo)`.
-///
-/// The output format is one remote per line: `<name>\t<url>` (or
-/// space-separated). Accepts both SSH (`git@github.com:owner/repo.git`)
-/// and HTTPS (`https://github.com/owner/repo`) remotes. Remotes whose URL
-/// is not a github.com URL — notably the local on-disk mirror that cube
-/// workspaces carry — are skipped, so the returned name is always a real
-/// GitHub upstream regardless of whether it is called `origin`, `github`,
-/// or anything else.
-fn parse_github_remote(remote_list_output: &str) -> Option<(String, String)> {
-    for line in remote_list_output.lines() {
-        // Split on the first run of whitespace to get (name, url).
-        let mut iter = line.splitn(2, |c: char| c.is_whitespace());
-        let name = iter.next().map(str::trim).filter(|s| !s.is_empty())?;
-        if let Some(url) = iter.next().map(str::trim)
-            && let Some(slug) = parse_github_slug(url) {
-                return Some((name.to_string(), slug));
-            }
-    }
-    None
-}
-
 /// Verify that a just-pushed branch actually reached GitHub.
 ///
 /// Reads the branch head sha from GitHub's API (the authoritative source)
@@ -2311,18 +2153,6 @@ fn verify_push_reached_github(
         )));
     }
     Ok(())
-}
-
-/// Parse `owner/repo` from a GitHub remote URL (SSH or HTTPS).
-fn parse_github_slug(remote_url: &str) -> Option<String> {
-    let trimmed = remote_url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let (_, after_host) = trimmed.split_once("github.com")?;
-    let after_host = after_host.trim_start_matches([':', '/']);
-    let mut parts = after_host.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    Some(format!("{owner}/{repo}"))
 }
 
 /// Extract the PR number from a GitHub pull request URL.
@@ -4128,11 +3958,8 @@ mod tests {
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY,
         RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
-        gc_aged_unhealthy_workspaces, is_bare_repo_slug, is_stdin_path,
-        origin_path_matches_slug, origin_urls_equivalent,
-        parse_github_remote, parse_github_slug, parse_origin,
-        render_boss_infra_exclude_block, resolve_body_file, run_with_context,
-        run_with_dependencies, upsert_managed_exclude,
+        gc_aged_unhealthy_workspaces, is_stdin_path, render_boss_infra_exclude_block,
+        resolve_body_file, run_with_context, run_with_dependencies, upsert_managed_exclude,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -4845,232 +4672,6 @@ mod tests {
             msg.contains("resolver"),
             "error should reference the resolver config: {msg}"
         );
-    }
-
-    #[test]
-    fn parse_org_name_shape_accepts_two_segments() {
-        assert_eq!(
-            super::parse_org_name_shape("spinyfin/mono"),
-            Some(("spinyfin".to_string(), "mono".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_org_name_shape_rejects_non_slug_shapes() {
-        assert_eq!(super::parse_org_name_shape("bduff"), None);
-        assert_eq!(super::parse_org_name_shape("a/b/c"), None);
-        assert_eq!(super::parse_org_name_shape("git@github.com:o/r.git"), None);
-        assert_eq!(super::parse_org_name_shape("https://github.com/o/r"), None);
-        assert_eq!(super::parse_org_name_shape("/mono"), None);
-    }
-
-    // --- parse_origin / origin_urls_equivalent unit tests ---
-
-    #[test]
-    fn parse_origin_plain_ssh() {
-        let p = parse_origin("git@github.com:foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn parse_origin_auth_prefixed_ssh() {
-        let p = parse_origin("org-132020694@github.com:linkedin-sandbox/bduff.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "linkedin-sandbox/bduff");
-    }
-
-    #[test]
-    fn parse_origin_ssh_no_dot_git() {
-        let p = parse_origin("git@github.com:foo/bar").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn parse_origin_https() {
-        let p = parse_origin("https://github.com/foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn parse_origin_https_with_user() {
-        let p = parse_origin("https://myuser@github.com/foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn origin_urls_equivalent_plain_vs_auth_prefixed() {
-        assert!(origin_urls_equivalent(
-            "git@github.com:linkedin-sandbox/bduff.git",
-            "org-132020694@github.com:linkedin-sandbox/bduff.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_auth_prefixed_vs_plain() {
-        assert!(origin_urls_equivalent(
-            "org-132020694@github.com:linkedin-sandbox/bduff.git",
-            "git@github.com:linkedin-sandbox/bduff.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_dot_git_vs_no_dot_git() {
-        assert!(origin_urls_equivalent(
-            "git@github.com:foo/bar.git",
-            "git@github.com:foo/bar"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_not_equivalent_different_path() {
-        assert!(!origin_urls_equivalent(
-            "git@github.com:linkedin-sandbox/bduff.git",
-            "git@github.com:linkedin-eng/bduff.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_not_equivalent_different_host() {
-        assert!(!origin_urls_equivalent(
-            "git@github.com:foo/bar.git",
-            "git@gitlab.com:foo/bar.git"
-        ));
-    }
-
-    // --- ssh:// URL form tests ---
-
-    #[test]
-    fn parse_origin_ssh_url_form() {
-        let p = parse_origin("ssh://git@github.com/foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn parse_origin_ssh_url_auth_prefixed() {
-        let p = parse_origin("ssh://org-132020694@github.com/linkedin-eng/ci-infra.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "linkedin-eng/ci-infra");
-    }
-
-    #[test]
-    fn parse_origin_ssh_url_no_user() {
-        let p = parse_origin("ssh://github.com/foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn parse_origin_ssh_url_with_port() {
-        let p = parse_origin("ssh://git@github.com:22/foo/bar.git").unwrap();
-        assert_eq!(p.host, "github.com");
-        assert_eq!(p.path, "foo/bar");
-    }
-
-    #[test]
-    fn origin_urls_equivalent_ssh_url_vs_scp() {
-        // ssh://git@github.com/foo/bar.git == git@github.com:foo/bar.git
-        assert!(origin_urls_equivalent(
-            "ssh://git@github.com/foo/bar.git",
-            "git@github.com:foo/bar.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_scp_vs_ssh_url() {
-        assert!(origin_urls_equivalent(
-            "git@github.com:foo/bar.git",
-            "ssh://git@github.com/foo/bar.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_ssh_url_auth_vs_scp_plain() {
-        // ssh://org-X@github.com/foo/bar.git == git@github.com:foo/bar.git
-        assert!(origin_urls_equivalent(
-            "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git",
-            "git@github.com:linkedin-eng/ci-infra.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_scp_auth_vs_ssh_url_plain() {
-        assert!(origin_urls_equivalent(
-            "org-132020694@github.com:linkedin-eng/ci-infra.git",
-            "ssh://git@github.com/linkedin-eng/ci-infra.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_equivalent_all_four_cross_products() {
-        let variants = [
-            "ssh://git@github.com/foo/bar.git",
-            "ssh://org-132020694@github.com/foo/bar.git",
-            "git@github.com:foo/bar.git",
-            "org-132020694@github.com:foo/bar.git",
-        ];
-        for a in &variants {
-            for b in &variants {
-                assert!(
-                    origin_urls_equivalent(a, b),
-                    "{a} and {b} should be equivalent"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn origin_urls_not_equivalent_ssh_url_different_path() {
-        assert!(!origin_urls_equivalent(
-            "ssh://git@github.com/foo/bar.git",
-            "git@github.com:foo/baz.git"
-        ));
-    }
-
-    #[test]
-    fn origin_urls_not_equivalent_ssh_url_different_host() {
-        assert!(!origin_urls_equivalent(
-            "ssh://git@github.com/foo/bar.git",
-            "git@gitlab.com:foo/bar.git"
-        ));
-    }
-
-    // --- is_bare_repo_slug / origin_path_matches_slug unit tests ---
-
-    #[test]
-    fn is_bare_repo_slug_accepts_owner_name() {
-        assert!(is_bare_repo_slug("linkedin-multiproduct/dev-infra"));
-        assert!(is_bare_repo_slug("foo/bar"));
-        // Trailing slash and `.git` are tolerated.
-        assert!(is_bare_repo_slug("foo/bar/"));
-    }
-
-    #[test]
-    fn is_bare_repo_slug_rejects_real_urls_and_single_segment() {
-        // Real clone URLs are not slugs.
-        assert!(!is_bare_repo_slug("git@github.com:foo/bar.git"));
-        assert!(!is_bare_repo_slug("https://github.com/foo/bar.git"));
-        assert!(!is_bare_repo_slug("ssh://org-1@github.com/foo/bar.git"));
-        // A single bare name has no `owner/` and is not a slug.
-        assert!(!is_bare_repo_slug("dev-infra"));
-        assert!(!is_bare_repo_slug(""));
-        // An absolute path is not a slug.
-        assert!(!is_bare_repo_slug("/foo/bar"));
-    }
-
-    #[test]
-    fn origin_path_matches_slug_compares_against_registered_origin() {
-        let origin = "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git";
-        assert!(origin_path_matches_slug(origin, "linkedin-multiproduct/dev-infra"));
-        assert!(origin_path_matches_slug(origin, "linkedin-multiproduct/dev-infra.git"));
-        // Different owner does not match.
-        assert!(!origin_path_matches_slug(origin, "some-other-org/dev-infra"));
-        // Same name, different owner is still a mismatch.
-        assert!(!origin_path_matches_slug(origin, "dev-infra"));
     }
 
     #[test]
@@ -11089,67 +10690,6 @@ steps:
             matches!(err, CubeError::WorkspaceDirCreate { ref path, .. } if path == &workspace_root),
             "expected WorkspaceDirCreate, got: {err:?}"
         );
-    }
-
-    // --- parse_github_slug tests ---
-
-    #[test]
-    fn parse_github_slug_handles_ssh_url() {
-        assert_eq!(
-            parse_github_slug("git@github.com:spinyfin/mono.git"),
-            Some("spinyfin/mono".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_github_slug_handles_https_url() {
-        assert_eq!(
-            parse_github_slug("https://github.com/spinyfin/mono"),
-            Some("spinyfin/mono".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_github_slug_handles_https_url_with_git_suffix() {
-        assert_eq!(
-            parse_github_slug("https://github.com/spinyfin/mono.git"),
-            Some("spinyfin/mono".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_github_slug_returns_none_for_non_github_url() {
-        assert_eq!(parse_github_slug("git@bitbucket.org:user/repo.git"), None);
-    }
-
-    #[test]
-    fn parse_github_remote_returns_name_and_slug() {
-        let output = "github\tgit@github.com:spinyfin/mono.git\n";
-        assert_eq!(
-            parse_github_remote(output),
-            Some(("github".to_string(), "spinyfin/mono".to_string())),
-        );
-    }
-
-    #[test]
-    fn parse_github_remote_skips_local_mirror_named_origin() {
-        // The cube-workspace trap: `origin` is a local on-disk mirror and the
-        // real GitHub upstream is named `github`. We must select `github`,
-        // never the local mirror, so pushes land on GitHub.
-        let output = "\
-origin\t/Users/bduff/dev/agents/repos/mono
-github\tssh://org-1@github.com/spinyfin/mono.git
-";
-        assert_eq!(
-            parse_github_remote(output),
-            Some(("github".to_string(), "spinyfin/mono".to_string())),
-        );
-    }
-
-    #[test]
-    fn parse_github_remote_returns_none_when_only_local_mirror() {
-        let output = "origin\t/Users/bduff/dev/agents/repos/mono\n";
-        assert_eq!(parse_github_remote(output), None);
     }
 
     // --- resolve_body_file / stdin materialization tests ---

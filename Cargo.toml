@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "lib/rust/broker-robinhood",
+  "lib/rust/git_utils",
   "tools/boss/bossctl",
   "tools/boss/cli",
   "tools/boss/client",

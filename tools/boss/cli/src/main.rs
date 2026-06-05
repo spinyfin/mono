@@ -28,7 +28,7 @@ use serde::Serialize;
 mod buildkite_release;
 mod repo_resolution;
 use boss_github as github_app;
-use boss_github::repo_slug::short_name_for;
+use git_utils::repo_slug::short_name_for;
 
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]

@@ -311,7 +311,7 @@ async fn checkout_pr_head_local(
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
 
     // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
-    let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
+    let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
 
     // 2. Fetch remote refs so jj knows about the head commit.
     {
@@ -371,7 +371,7 @@ async fn position_revision_workspace_local(
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
 
     // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
-    let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
+    let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
 
     // 2. Fetch remote refs so jj knows about the head commit.
     {
@@ -762,7 +762,7 @@ impl HostAdapter for SshHostAdapter {
         //    gh queries the GitHub API; the result is identical whether run
         //    locally or on the remote host, so we run it locally to avoid the
         //    SSH round-trip.
-        let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
+        let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
 
         // 2. Fetch remote refs on the remote host.
         let workspace = workspace_path.display().to_string();
@@ -808,7 +808,7 @@ impl HostAdapter for SshHostAdapter {
             .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
         let host = &self.transport.host_id;
 
-        let head_sha = boss_github::gh_cli::fetch_pr_head_sha(repo_slug, pr_number).await?;
+        let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
 
         let workspace = workspace_path.display().to_string();
         let fetch_cmd = format!("cd '{}' && jj git fetch", workspace);
