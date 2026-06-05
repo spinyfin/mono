@@ -2,22 +2,18 @@ checks:
   - id: no-usfa-typo
     enabled: false
 
-# ── declarative buildifier spike (not enabled — enabling would duplicate the
-#    built-in `buildifier` check and break dogfooding CI) ──────────────────────
+# ── declarative buildifier check notes ───────────────────────────────────────
 #
-# To enable the declarative check in a repo that has adopted it, use the simple
-# zero-install form (no implementation: line required):
+# The buildifier check is now purely declarative (no built-in Rust code).
+# In this repo (mono), the root CHECKS.yaml points at the on-disk definition
+# via check_definitions.exec_paths so changes to checks/buildifier/check.yaml
+# take effect immediately without recompiling the binary.
 #
-#   checks:
-#     - id: buildifier
-#
-# To use the checked-in (always-head) definition from disk instead of the
-# bundled snapshot, add a check_definitions section:
+# In external repos, `- id: buildifier` with no check_definitions section uses
+# the bundled snapshot compiled into the checkleft binary (zero install).
+# To use the always-head definition instead, add:
 #
 #   check_definitions:
 #     exec_paths:
-#       - tools/checkleft/checks
+#       - tools/checkleft/checks   # or wherever the defs live
 #     allow_override_bundled: true
-#
-#   checks:
-#     - id: buildifier

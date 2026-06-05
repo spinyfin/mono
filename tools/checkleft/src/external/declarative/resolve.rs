@@ -17,10 +17,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-
-use crate::checks::buildifier::resolve_bazel_target_executable;
 
 use super::{BinaryBinding, BinaryRequirement};
 
@@ -102,4 +101,71 @@ fn override_binding(name: &str, config: &toml::Value) -> Option<Result<BinaryBin
             _ => Ok(binding),
         })
     })
+}
+
+/// Builds `target` and resolves its executable path via `bazel cquery --output=starlark`.
+/// Returns an absolute path to the built binary.
+///
+/// `pub(crate)` so tests can call it directly (gated e2e, parity).
+pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
+    let build_output = Command::new("bazel")
+        .arg("build")
+        .arg("--color=no")
+        .arg("--curses=no")
+        .arg("--noshow_progress")
+        .arg("--show_result=0")
+        .arg("--ui_event_filters=-info")
+        .arg(target)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to spawn `bazel build {target}`"))?;
+
+    if !build_output.status.success() {
+        let stderr = String::from_utf8_lossy(&build_output.stderr);
+        bail!(
+            "`bazel build {target}` failed (exit {}): {}",
+            build_output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let cquery_output = Command::new("bazel")
+        .arg("cquery")
+        .arg("--color=no")
+        .arg("--curses=no")
+        .arg("--noshow_progress")
+        .arg(target)
+        .arg("--output=starlark")
+        .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to spawn `bazel cquery {target}`"))?;
+
+    if !cquery_output.status.success() {
+        let stderr = String::from_utf8_lossy(&cquery_output.stderr);
+        bail!(
+            "`bazel cquery {target}` failed (exit {}): {}",
+            cquery_output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let raw = String::from_utf8_lossy(&cquery_output.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+
+    if raw.is_empty() {
+        bail!(
+            "bazel target `{target}` does not produce an executable \
+             (cquery returned an empty path)"
+        );
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo_root.join(path))
+    }
 }

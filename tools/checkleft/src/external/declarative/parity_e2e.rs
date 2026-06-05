@@ -1,23 +1,13 @@
-//! Hermetic end-to-end parity test: the **full** declarative pipeline driving a
-//! **real** buildifier binary, asserted equal to the built-in [`BuildifierCheck`]
-//! on the committed fixtures (`tests/fixtures/buildifier/`).
+//! Hermetic end-to-end correctness test for the declarative buildifier check.
 //!
-//! This closes the loop both buildifier spikes left open. The spike-era tests in
-//! [`super::tests`] prove *transform-level* parity (canned buildifier JSON →
-//! declarative `json` transform == built-in parser) and gate the real-binary
-//! tests behind `CHECKLEFT_SPIKE_E2E` because they shell out via `bazel build` /
-//! `bazel cquery`, which cannot run inside the hermetic test sandbox. Transform
-//! parity alone is not enough: it never exercises file selection, binary
-//! resolution, argument templating, the spawn, exit-code classification, or the
-//! batch-vs-per-file split. This test runs the entire path.
+//! Runs the full declarative pipeline — file selection → binary resolution →
+//! invocations → exit-code semantics → transforms — against a real buildifier
+//! binary staged via Bazel runfiles, and asserts the expected findings against
+//! the committed fixtures.
 //!
 //! The real buildifier is supplied as a Bazel test `data` dependency
 //! (`@buildifier_prebuilt//:buildifier`) and resolved from the test's runfiles —
-//! no nested Bazel, no network, fully hermetic. Both the built-in and the
-//! declarative check are pointed at that *same* binary (the built-in via
-//! `buildifier_path`, the declarative via a `needs.buildifier.path` config
-//! override) so the comparison isolates the framework's projection from any
-//! difference in the tool itself.
+//! no nested Bazel, no network, fully hermetic.
 //!
 //! # Exit-code semantics (empirically grounded)
 //!
@@ -29,20 +19,16 @@
 //! it emits no parseable JSON. So `0 -> findings` runs the transform over real
 //! output (which naturally yields zero findings when clean) while `default ->
 //! error` ensures a crash surfaces as a check error instead of masquerading as
-//! "clean". The built-in reaches the same place by ignoring the exit code and
-//! reading only the JSON; this test confirms the two strategies agree.
+//! "clean".
 
 use std::path::{Path, PathBuf};
 
-use crate::check::Check;
-use crate::checks::buildifier::BuildifierCheck;
 use crate::external::{
     ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation,
     parse_declarative_check_manifest, run_declarative_check,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Finding;
-use crate::source_tree::LocalSourceTree;
 
 /// The committed manifest — the canonical first-party buildifier definition.
 const MANIFEST: &str = include_str!("../../../checks/buildifier/check.yaml");
@@ -92,30 +78,14 @@ fn buildifier_from_runfiles() -> Option<PathBuf> {
     }
 }
 
-/// Run the built-in `BuildifierCheck` over `changeset`, pointed at `buildifier`.
-async fn run_builtin(buildifier: &Path, root: &Path, changeset: &ChangeSet) -> Vec<Finding> {
-    let mut config = toml::value::Table::new();
-    config.insert(
-        "buildifier_path".to_owned(),
-        toml::Value::String(buildifier.to_string_lossy().into_owned()),
-    );
-    let tree = LocalSourceTree::new(root).expect("local source tree");
-    BuildifierCheck
-        .run(changeset, &tree, &toml::Value::Table(config))
-        .await
-        .expect("built-in buildifier check runs")
-        .findings
-}
-
 /// Run the declarative check (the committed manifest) over `changeset`, with a
-/// `needs.buildifier.path` override pointing at the same `buildifier`.
+/// `needs.buildifier.path` override pointing at `buildifier`.
 fn run_declarative(
     buildifier: &Path,
     package: &ExternalCheckDeclarativePackage,
     root: &Path,
     changeset: &ChangeSet,
 ) -> Vec<Finding> {
-    // config = { needs = { buildifier = { path = "<buildifier>" } } }
     let mut path_table = toml::value::Table::new();
     path_table.insert(
         "path".to_owned(),
@@ -148,11 +118,6 @@ fn parse_manifest_package() -> ExternalCheckDeclarativePackage {
 }
 
 /// A total order over findings independent of the order each check emits them.
-/// The built-in interleaves format+lint per file; the declarative runtime groups
-/// all format findings, then all lint findings. The *set* must be identical, so we
-/// sort both by (path, line, column, message) before comparing. (path, line,
-/// column) alone is ambiguous — malformed.bzl line 11 carries two warnings at
-/// different columns — so message is the final tiebreak.
 fn sort_key(finding: &Finding) -> (String, u32, u32, String) {
     let location = finding.location.as_ref();
     (
@@ -170,11 +135,13 @@ fn sorted(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings
 }
 
-/// The full hermetic parity assertion. Materializes both committed fixtures into a
-/// temp workspace, runs the built-in and the declarative check over the same
-/// buildifier binary, and asserts identical findings.
+/// Full hermetic e2e assertion: materializes both committed fixtures into a temp
+/// workspace, runs the declarative check over the staged buildifier binary, and
+/// asserts expected finding shape (3 lint findings on malformed.bzl + 1 format
+/// finding on unformatted.bzl). If buildifier's defaults change this guards
+/// against a silently-empty result that would pass vacuously.
 #[tokio::test]
-async fn declarative_matches_builtin_on_committed_fixtures() {
+async fn declarative_produces_expected_findings_on_committed_fixtures() {
     let Some(buildifier) = buildifier_from_runfiles() else {
         return;
     };
@@ -197,34 +164,49 @@ async fn declarative_matches_builtin_on_committed_fixtures() {
     ]);
 
     let package = parse_manifest_package();
-    let builtin = run_builtin(&buildifier, temp.path(), &changeset).await;
-    let declarative = run_declarative(&buildifier, &package, temp.path(), &changeset);
-
-    // Shape sanity: 3 lint findings (malformed.bzl) + 1 format finding
-    // (unformatted.bzl). If buildifier's defaults change this guards against a
-    // silently-empty "parity" that would pass vacuously.
-    assert_eq!(
-        builtin.len(),
-        4,
-        "expected 4 built-in findings, got {builtin:#?}"
-    );
-    assert_eq!(
-        declarative.len(),
-        4,
-        "expected 4 declarative findings, got {declarative:#?}"
-    );
+    let findings = sorted(run_declarative(&buildifier, &package, temp.path(), &changeset));
 
     assert_eq!(
-        sorted(declarative),
-        sorted(builtin),
-        "declarative pipeline findings must match the built-in BuildifierCheck exactly"
+        findings.len(),
+        4,
+        "expected 4 findings (3 lint on malformed.bzl + 1 format on unformatted.bzl), got {findings:#?}"
+    );
+
+    let format_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.location.as_ref().map(|l| l.line.is_none()).unwrap_or(false))
+        .collect();
+    assert_eq!(format_findings.len(), 1, "expected exactly 1 format finding");
+    assert!(
+        format_findings[0].message.contains("formatting"),
+        "format finding message should mention 'formatting': {}",
+        format_findings[0].message
+    );
+
+    let lint_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.location.as_ref().map(|l| l.line.is_some()).unwrap_or(false))
+        .collect();
+    assert_eq!(lint_findings.len(), 3, "expected exactly 3 lint findings");
+    let messages: Vec<&str> = lint_findings.iter().map(|f| f.message.as_str()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("module-docstring")),
+        "expected a module-docstring warning; got {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("unused-variable")),
+        "expected an unused-variable warning; got {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("no-effect")),
+        "expected a no-effect warning; got {messages:?}"
     );
 }
 
-/// Single-file parity over only the lint fixture — isolates the per-file lint
+/// Single-file assertion over only the lint fixture — isolates the per-file lint
 /// invocation so a regression there is not masked by the format finding.
 #[tokio::test]
-async fn declarative_matches_builtin_on_lint_only_fixture() {
+async fn declarative_produces_expected_lint_findings_on_malformed_fixture() {
     let Some(buildifier) = buildifier_from_runfiles() else {
         return;
     };
@@ -239,9 +221,7 @@ async fn declarative_matches_builtin_on_lint_only_fixture() {
     }]);
 
     let package = parse_manifest_package();
-    let builtin = run_builtin(&buildifier, temp.path(), &changeset).await;
-    let declarative = run_declarative(&buildifier, &package, temp.path(), &changeset);
+    let findings = run_declarative(&buildifier, &package, temp.path(), &changeset);
 
-    assert_eq!(builtin.len(), 3, "expected 3 lint findings, got {builtin:#?}");
-    assert_eq!(sorted(declarative), sorted(builtin));
+    assert_eq!(findings.len(), 3, "expected 3 lint findings, got {findings:#?}");
 }

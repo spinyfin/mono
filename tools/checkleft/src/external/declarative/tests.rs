@@ -20,7 +20,6 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::checks::buildifier::{parse_format_output, parse_lint_output};
 use crate::external::{
     ExternalCheckPackageImplementation, parse_declarative_check_manifest,
     parse_external_check_package_manifest,
@@ -324,7 +323,7 @@ fn template_input_file_unavailable_in_batch_errors() {
     assert!(format!("{err:#}").contains("per_file mode"));
 }
 
-// ── transform-level parity with the built-in BuildifierCheck ────────────────────
+// ── transform-level tests ──────────────────────────────────────────────────────
 
 fn declarative_format_findings(stdout: &[u8]) -> Vec<Finding> {
     let package = parse_package();
@@ -343,45 +342,48 @@ fn declarative_lint_findings(stdout: &[u8], input_file: &str) -> Vec<Finding> {
 }
 
 #[test]
-fn format_transform_matches_builtin_on_unformatted() {
-    let declarative = declarative_format_findings(REAL_FORMAT_UNFORMATTED);
-    let builtin = parse_format_output(REAL_FORMAT_UNFORMATTED, Path::new("a/b/unformatted.bzl")).unwrap();
-    assert_eq!(declarative, builtin);
-    // Spot-check the load-bearing line-less property.
-    assert_eq!(declarative.len(), 1);
-    assert_eq!(declarative[0].location.as_ref().unwrap().line, None);
+fn format_transform_detects_unformatted_file() {
+    let findings = declarative_format_findings(REAL_FORMAT_UNFORMATTED);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, Severity::Warning);
+    assert!(
+        findings[0].message.contains("formatting"),
+        "expected a formatting message, got: {}",
+        findings[0].message
+    );
+    // Format findings carry no line number (file-level, not line-level).
+    assert_eq!(findings[0].location.as_ref().unwrap().line, None);
 }
 
 #[test]
-fn format_transform_matches_builtin_on_clean() {
-    let declarative = declarative_format_findings(REAL_FORMAT_CLEAN);
-    let builtin = parse_format_output(REAL_FORMAT_CLEAN, Path::new("a/b/clean.bzl")).unwrap();
-    assert_eq!(declarative, builtin);
-    assert!(declarative.is_empty());
+fn format_transform_no_finding_on_clean_file() {
+    let findings = declarative_format_findings(REAL_FORMAT_CLEAN);
+    assert!(findings.is_empty());
 }
 
 #[test]
-fn lint_transform_matches_builtin_on_warnings() {
-    let declarative = declarative_lint_findings(REAL_LINT_WARNINGS, "a/b/malformed.bzl");
-    let builtin = parse_lint_output(REAL_LINT_WARNINGS, Path::new("a/b/malformed.bzl")).unwrap();
-    assert_eq!(declarative, builtin, "declarative lint findings must match the built-in exactly");
-    assert_eq!(declarative.len(), 3);
-    // Path comes from invocation context (warnings carry no filename).
+fn lint_transform_produces_one_finding_per_warning() {
+    let findings = declarative_lint_findings(REAL_LINT_WARNINGS, "a/b/malformed.bzl");
+    assert_eq!(findings.len(), 3);
+    // Path comes from invocation context (warnings carry no filename in the JSON).
     assert_eq!(
-        declarative[0].location.as_ref().unwrap().path,
+        findings[0].location.as_ref().unwrap().path,
         Path::new("a/b/malformed.bzl")
     );
-    assert_eq!(declarative[0].location.as_ref().unwrap().line, Some(11));
-    assert_eq!(declarative[0].location.as_ref().unwrap().column, Some(1));
-    assert_eq!(declarative[0].severity, Severity::Warning);
+    assert_eq!(findings[0].location.as_ref().unwrap().line, Some(11));
+    assert_eq!(findings[0].location.as_ref().unwrap().column, Some(1));
+    assert_eq!(findings[0].severity, Severity::Warning);
+    assert!(
+        findings[0].message.contains("module-docstring"),
+        "first warning should be module-docstring, got: {}",
+        findings[0].message
+    );
 }
 
 #[test]
-fn lint_transform_matches_builtin_on_clean() {
-    let declarative = declarative_lint_findings(REAL_LINT_CLEAN, "a/b/clean.bzl");
-    let builtin = parse_lint_output(REAL_LINT_CLEAN, Path::new("a/b/clean.bzl")).unwrap();
-    assert_eq!(declarative, builtin);
-    assert!(declarative.is_empty());
+fn lint_transform_no_findings_on_clean_file() {
+    let findings = declarative_lint_findings(REAL_LINT_CLEAN, "a/b/clean.bzl");
+    assert!(findings.is_empty());
 }
 
 // ── exit semantics: a crash must surface as an error, never silent-clean ────────
@@ -449,9 +451,9 @@ fn e2e_bazel_resolver_resolves_buildifier() {
     if !spike_e2e_enabled() {
         return;
     }
-    // Exercises the framework-owned bazel resolver (reused from the built-in).
+    // Exercises the framework-owned bazel resolver.
     let root = workspace_root();
-    let resolved = crate::checks::buildifier::resolve_bazel_target_executable(
+    let resolved = super::resolve::resolve_bazel_target_executable(
         &root,
         "@buildifier_prebuilt//:buildifier",
     )
@@ -467,7 +469,7 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     // Full pipeline: file selection -> binary resolution (path override to the
     // bazel-resolved buildifier) -> invocations -> exit semantics -> transform.
     let root = workspace_root();
-    let buildifier = crate::checks::buildifier::resolve_bazel_target_executable(
+    let buildifier = super::resolve::resolve_bazel_target_executable(
         &root,
         "@buildifier_prebuilt//:buildifier",
     )
@@ -515,11 +517,10 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
         .collect();
     assert_eq!(lint.len(), 3, "expected 3 lint findings, got {:#?}", result.findings);
 
-    // Parity: the built-in parsers over the same buildifier output.
-    let builtin = parse_lint_output(REAL_LINT_WARNINGS, Path::new("a/b/malformed.bzl")).unwrap();
-    let categories_builtin: Vec<&str> = builtin.iter().map(|f| f.message.as_str()).collect();
-    let categories_declarative: Vec<&str> = lint.iter().map(|f| f.message.as_str()).collect();
-    assert_eq!(categories_declarative, categories_builtin);
+    let messages: Vec<&str> = lint.iter().map(|f| f.message.as_str()).collect();
+    assert!(messages.iter().any(|m| m.contains("module-docstring")), "expected module-docstring; got {messages:?}");
+    assert!(messages.iter().any(|m| m.contains("unused-variable")), "expected unused-variable; got {messages:?}");
+    assert!(messages.iter().any(|m| m.contains("no-effect")), "expected no-effect; got {messages:?}");
 }
 
 // ── jaq smoke test ─────────────────────────────────────────────────────────────
