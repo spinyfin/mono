@@ -633,6 +633,111 @@ fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
     events
 }
 
+/// Fetch the failing CI check runs for a specific commit SHA via the GitHub
+/// REST API. Used for merge-queue rebounce detection where the failing SHA is
+/// the synthetic merge commit (`before_commit_sha`) assembled by the queue on
+/// a `gh-readonly-queue/*` branch — not the PR head.
+///
+/// Returns failing checks as `RequiredCheckFailure` records so the
+/// `ci_remediations.failed_checks` JSON can carry the build URL, job id,
+/// and provider — the same data the CI-fix revision directive shows the
+/// worker for per-branch failures. Best-effort: any network or parse error
+/// returns an empty vec; the insert still succeeds with `"[]"` so the worker
+/// can attempt manual discovery.
+async fn fetch_failing_checks_for_commit(
+    pr_url: &str,
+    commit_sha: &str,
+) -> Vec<RequiredCheckFailure> {
+    let Some(owner_repo) = repo_from_pr_url(pr_url) else {
+        return Vec::new();
+    };
+    let api_path = format!("repos/{owner_repo}/commits/{commit_sha}/check-runs");
+    let output = Command::new("gh")
+        .args(["api", &api_path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                commit_sha,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "merge poller: gh api check-runs failed for merge-queue commit",
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                commit_sha,
+                "merge poller: failed to spawn gh for check-runs",
+            );
+            return Vec::new();
+        }
+    };
+    parse_check_runs_for_failures(&output.stdout)
+}
+
+/// Pure parser for the GitHub REST `/commits/{sha}/check-runs` response body.
+/// Returns `RequiredCheckFailure` records for every completed check with a
+/// failure-class conclusion. Extracted as a pure function for unit-testing
+/// without a live `gh` call.
+///
+/// GitHub REST check-run conclusions: `success`, `failure`, `neutral`,
+/// `cancelled`, `timed_out`, `action_required`, `skipped`, `stale`.
+/// Buildkite also emits `startup_failure` (a Buildkite-specific value that
+/// appears in the field even though it isn't in the GitHub schema).
+fn parse_check_runs_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
+    let body: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let runs = match body["check_runs"].as_array() {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    let mut failures = Vec::new();
+    for run in runs {
+        if run["status"].as_str() != Some("completed") {
+            continue;
+        }
+        let conclusion = match run["conclusion"].as_str() {
+            Some(c) => c,
+            None => continue,
+        };
+        if !matches!(
+            conclusion,
+            "failure" | "timed_out" | "action_required" | "startup_failure"
+        ) {
+            continue;
+        }
+        let name = run["name"].as_str().unwrap_or_default().to_owned();
+        // `details_url` points to the CI provider's build page (Buildkite
+        // URL, GHA run URL, etc.) — the equivalent of GraphQL `targetUrl`.
+        // Fall back to `html_url` (the GitHub check page) when absent.
+        let target_url = run["details_url"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| run["html_url"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let provider = provider_for_url(&target_url);
+        let provider_job_id = parse_provider_job_id(provider, &target_url);
+        failures.push(RequiredCheckFailure {
+            name,
+            conclusion: conclusion.to_owned(),
+            target_url,
+            provider,
+            provider_job_id,
+        });
+    }
+    failures
+}
+
 /// When `statusCheckRollup` is empty/null in `json_body`, fetches the
 /// legacy commit-status combined state (`pending` / `success` / `failure`
 /// / `error`) from GitHub's REST endpoint and returns it as a lowercase
@@ -1856,6 +1961,18 @@ async fn check_merge_queue_rebounce(
             );
             continue;
         };
+        // Fetch the failing CI checks for the synthetic merge commit so the
+        // worker revision directive can show the exact build URL, job id,
+        // and a log excerpt — without the worker having to rediscover them.
+        // Best-effort: an empty result falls back to generic instructions.
+        let failures =
+            fetch_failing_checks_for_commit(&candidate.pr_url, before_commit_sha).await;
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            before_commit_sha,
+            failing_checks = failures.len(),
+            "merge poller: fetched failing checks for merge-queue commit",
+        );
         if ci_watch::on_merge_queue_rebounce_detected(
             work_db,
             publisher,
@@ -1864,6 +1981,7 @@ async fn check_merge_queue_rebounce(
             None, // head_ref_oid not needed for rebounce (before_commit_sha is the key)
             before_commit_sha,
             &[], // labels not available here; opt-out check uses product flag only
+            &failures,
         )
         .await
         {
@@ -6545,6 +6663,101 @@ mod tests {
             }
         }"#;
         assert!(parse_dequeue_events_response(body).is_empty());
+    }
+
+    // --- parse_check_runs_for_failures ---
+
+    #[test]
+    fn parse_check_runs_for_failures_returns_failing_entries() {
+        let body = br#"{
+            "check_runs": [
+                {
+                    "name": "ci/build",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details_url": "https://buildkite.com/org/mono/builds/1666#job-abc",
+                    "html_url": "https://github.com/org/repo/runs/123"
+                },
+                {
+                    "name": "ci/lint",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "details_url": "https://buildkite.com/org/mono/builds/1666#job-xyz",
+                    "html_url": "https://github.com/org/repo/runs/124"
+                },
+                {
+                    "name": "ci/deploy",
+                    "status": "in_progress",
+                    "conclusion": null,
+                    "details_url": "https://buildkite.com/org/mono/builds/1667",
+                    "html_url": "https://github.com/org/repo/runs/125"
+                }
+            ]
+        }"#;
+        let failures = parse_check_runs_for_failures(body);
+        assert_eq!(failures.len(), 1, "only the failed completed check");
+        assert_eq!(failures[0].name, "ci/build");
+        assert_eq!(failures[0].conclusion, "failure");
+        assert_eq!(
+            failures[0].target_url,
+            "https://buildkite.com/org/mono/builds/1666#job-abc"
+        );
+        assert_eq!(failures[0].provider, CiProvider::Buildkite);
+        assert_eq!(failures[0].provider_job_id.as_deref(), Some("job-abc"));
+    }
+
+    #[test]
+    fn parse_check_runs_for_failures_timed_out_and_action_required() {
+        let body = br#"{
+            "check_runs": [
+                {
+                    "name": "slow-check",
+                    "status": "completed",
+                    "conclusion": "timed_out",
+                    "details_url": "https://buildkite.com/org/p/builds/42",
+                    "html_url": ""
+                },
+                {
+                    "name": "manual-check",
+                    "status": "completed",
+                    "conclusion": "action_required",
+                    "details_url": "https://github.com/org/repo/actions/runs/99/job/7",
+                    "html_url": ""
+                }
+            ]
+        }"#;
+        let failures = parse_check_runs_for_failures(body);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].name, "slow-check");
+        assert_eq!(failures[1].name, "manual-check");
+        assert_eq!(failures[1].provider, CiProvider::GithubActions);
+    }
+
+    #[test]
+    fn parse_check_runs_for_failures_falls_back_to_html_url_when_details_url_empty() {
+        let body = br#"{
+            "check_runs": [
+                {
+                    "name": "check",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details_url": "",
+                    "html_url": "https://github.com/org/repo/runs/42"
+                }
+            ]
+        }"#;
+        let failures = parse_check_runs_for_failures(body);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].target_url,
+            "https://github.com/org/repo/runs/42"
+        );
+    }
+
+    #[test]
+    fn parse_check_runs_for_failures_empty_on_malformed_json() {
+        assert!(parse_check_runs_for_failures(b"not json").is_empty());
+        assert!(parse_check_runs_for_failures(b"{}").is_empty());
     }
 
     /// Acceptance test for T831 / the CI-status invalidation gap: once a
