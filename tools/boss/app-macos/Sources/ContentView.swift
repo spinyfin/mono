@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var isSearchExpanded: Bool = false
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.openWindow) private var openWindow
+    @AppStorage("boss.ui.standardSearch") private var useStandardSearch: Bool = false
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -48,20 +49,40 @@ struct ContentView: View {
         // one NSV may live in the tree at a time. Designs remounts cheaply
         // (filesystem reads only) so structural conditional is safe here.
         ZStack {
-            NavigationSplitView(columnVisibility: $workColumnVisibility) {
-                sidebar
-            } detail: {
-                detail
+            // boss.ui.standardSearch OFF (default): custom WorkSearchToolbarItem below.
+            // boss.ui.standardSearch ON: SwiftUI .searchable() owns placement/focus/clear.
+            // Both branches keep the same opacity/hitTesting treatment so navigation-mode
+            // switching never tears down NSViews in agentsView (see comment above).
+            if useStandardSearch {
+                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                    sidebar
+                } detail: {
+                    detail
+                }
+                // Remove the system sidebarToggle only on non-Work tabs. On the Work
+                // tab, the system-provided toggle handles both expanded and collapsed
+                // states natively, giving exactly one toggle button in either state
+                // without a state-conditional custom button (the root cause of the
+                // T479/T612 recurrence: suppressing one button in one collapse state
+                // always left the other button visible in the opposite state).
+                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+                .opacity(model.navigationMode == .work ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .work)
+                .searchable(
+                    text: $model.workSearchText,
+                    placement: .toolbar,
+                    prompt: "Search tasks…"
+                )
+            } else {
+                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                    sidebar
+                } detail: {
+                    detail
+                }
+                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+                .opacity(model.navigationMode == .work ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .work)
             }
-            // Remove the system sidebarToggle only on non-Work tabs. On the Work
-            // tab, the system-provided toggle handles both expanded and collapsed
-            // states natively, giving exactly one toggle button in either state
-            // without a state-conditional custom button (the root cause of the
-            // T479/T612 recurrence: suppressing one button in one collapse state
-            // always left the other button visible in the opposite state).
-            .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-            .opacity(model.navigationMode == .work ? 1 : 0)
-            .allowsHitTesting(model.navigationMode == .work)
 
             agentsView
                 .opacity(model.navigationMode == .agents ? 1 : 0)
@@ -228,10 +249,12 @@ struct ContentView: View {
                 if model.navigationMode == .work {
                     WorkProjectFilterToolbarButton(model: model)
                     WorkGroupToolbarMenu(model: model)
-                    WorkSearchToolbarItem(
-                        model: model,
-                        isExpanded: $isSearchExpanded
-                    )
+                    if !useStandardSearch {
+                        WorkSearchToolbarItem(
+                            model: model,
+                            isExpanded: $isSearchExpanded
+                        )
+                    }
                 }
             }
 
@@ -243,8 +266,11 @@ struct ContentView: View {
                 UpdateBadgeToolbarButton(updateModel: updateModel)
             }
         }
-        .onChange(of: model.navigationMode) { _, _ in
+        .onChange(of: model.navigationMode) { _, newMode in
             isSearchExpanded = false
+            if useStandardSearch && newMode != .work {
+                model.workSearchText = ""
+            }
         }
         .alert(
             "Work Error",

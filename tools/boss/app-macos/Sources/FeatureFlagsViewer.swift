@@ -47,11 +47,12 @@ struct FeatureFlagsViewer: View {
 
     @ViewBuilder
     private var content: some View {
-        if chatModel.featureFlags.isEmpty {
-            emptyState
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                AppFeatureFlagsSection()
+                if chatModel.featureFlags.isEmpty {
+                    emptyEngineState
+                } else {
                     ForEach(groupedFlags, id: \.0) { (category, flagsInCategory) in
                         FeatureFlagSection(
                             category: category,
@@ -61,8 +62,8 @@ struct FeatureFlagsViewer: View {
                         }
                     }
                 }
-                .padding(14)
             }
+            .padding(14)
         }
     }
 
@@ -82,9 +83,9 @@ struct FeatureFlagsViewer: View {
         }
     }
 
-    private var emptyState: some View {
+    private var emptyEngineState: some View {
         VStack(spacing: 10) {
-            Text("No feature flags registered")
+            Text("No engine feature flags registered")
                 .font(.headline)
             Text("The engine returned an empty flag set. This is unexpected — the registry should contain at least one entry. Try Refresh, or check the engine log.")
                 .multilineTextAlignment(.center)
@@ -92,7 +93,76 @@ struct FeatureFlagsViewer: View {
                 .frame(maxWidth: 420)
         }
         .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Section for app-local feature flags (stored in UserDefaults via @AppStorage,
+/// not engine state). These take effect immediately without a restart.
+private struct AppFeatureFlagsSection: View {
+    @AppStorage("boss.ui.standardSearch") private var standardSearch: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("APP (LOCAL)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .tracking(0.5)
+            VStack(spacing: 0) {
+                appFlagRow(
+                    name: "boss.ui.standardSearch",
+                    description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead of the custom search item. Flip ON to validate the standard search path.",
+                    defaultEnabled: false,
+                    isOn: $standardSearch
+                )
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.gray.opacity(0.06))
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func appFlagRow(
+        name: String,
+        description: String,
+        defaultEnabled: Bool,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(name)
+                        .font(.system(.body, design: .monospaced).weight(.semibold))
+                        .textSelection(.enabled)
+                    if isOn.wrappedValue != defaultEnabled {
+                        Text("override")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(Color.accentColor.opacity(0.2))
+                            )
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                Text(description)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("default: \(defaultEnabled ? "ON" : "OFF")")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .padding(.top, 2)
+        }
+        .padding(12)
     }
 }
 
