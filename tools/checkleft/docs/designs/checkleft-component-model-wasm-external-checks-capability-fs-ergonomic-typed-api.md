@@ -96,11 +96,12 @@ author writes:                 fn check(input: CheckInput) -> Vec<Finding>
                                       |  (wit-bindgen generates the glue)
 guest crate (checkleft-check-sdk) --> wasm32-wasip2 component (exports checkleft:check world)
                                       |  cargo component build -> .wasm; bazel rule emits sha256
-manifest (mode=component) pins artifact_path + artifact_sha256 + reads globs + limits
+manifest (mode=component) pins artifact_path + artifact_sha256 + access-scope + limits
                                       |
 host (checkleft) -- component::bindgen! --> instantiate (cached .cwasm)
-   - builds per-invocation sandbox dir (hardlinks/symlinks allowlisted files)
-   - preopens sandbox dir as WASI root (guest reads via std::fs, no special API)
+   - invokes shared FS-sandbox module: resolves allowlist from declared access scope,
+     materialises files into per-invocation temp dir (preserving repo-relative paths)
+   - preopens sandbox root as WASI root (guest reads via std::fs, no special API)
    - epoch deadline + memory ResourceLimiter
    - calls list-checks() / run-check(name, input) -> list<finding>
 ```
@@ -147,14 +148,25 @@ interface types {
     suggested-fix: option<suggested-fix>,
   }
 
+  // How much of the repository a check declares it needs to read.
+  // Absent means modified-only (the default; safe for most checks).
+  variant access-scope {
+    // Only the files modified in the current changeset (default when absent).
+    modified-only,
+    // Every file in the repository tree.  Opt-in; host may apply extra scrutiny.
+    whole-repo,
+    // Union of the declared globs (repo-root-relative) plus all changeset files.
+    // The host intersects the glob expansion with a ceiling.
+    globs(list<string>),
+  }
+
   // Self-description for bundling/discovery.
   record check-descriptor {
     name: string,
     description: string,
     default-severity: severity,
-    // file globs (repo-root-relative) this check wants to read; the host
-    // intersects these with its ceiling to build the allowlist.
-    reads: list<string>,
+    // Declared file-access scope.  Absent means modified-only (the default).
+    access-scope: option<access-scope>,
   }
 
   variant check-error { unknown-check(string), failed(string) }
@@ -174,6 +186,7 @@ Design choices baked into the contract:
 
 - **`list-checks` + `run-check(name, input)`** make one component self-describing and able to export N checks (the "one artifact, N checks" requirement). The host instantiates once, calls `list-checks()` to enumerate, and dispatches by name.
 - **File access is via `std::fs`, not a WIT import.** The `wasm32-wasip2` target maps `std::fs` onto WASI-p2 interfaces that wasmtime services; the host enforces capability scoping by what it places in the preopen sandbox dir (see file-capability section). No checkleft-specific file API exists in the WIT world.
+- **`access-scope` declares the check's file-access appetite.** The default (absent or `modified-only`) gives a check only the files touched by the changeset — correct and safe for most checks. `whole-repo` is an explicit opt-in for checks that must traverse the full tree. `globs(patterns)` is for targeted cross-file reads (e.g. config files alongside source); modified files are always included. The shared FS-sandbox module (see §Shared FS sandbox module) resolves the declared scope into the materialised sandbox that the wasm runtime preopens as the WASI root.
 - **Config as `config-json`.** `toml::Value` is dynamic; modeling arbitrary config as WIT records would force a schema per check or a recursive `variant`. v1 passes config as a JSON string and the guest SDK deserializes it into the author's own `#[derive(Deserialize)]` config struct. (Open question Q1 — could later become a typed-per-check generic.)
 
 ### Guest SDK + build pipeline
@@ -183,16 +196,21 @@ Design choices baked into the contract:
 ```rust
 use checkleft_check_sdk::{check, CheckInput, Finding, Severity};
 
-#[check(name = "rust-giant-structs-use-builder", reads = ["**/*.rs"])]
+// No access_scope → modified-only by default: sandbox contains only changed files.
+#[check(name = "rust-giant-structs-use-builder")]
 fn run(input: CheckInput) -> Vec<Finding> {
     let cfg: MyConfig = input.config()?;              // serde over config-json
     let src = std::fs::read_to_string(&path)?;        // normal Rust; sandbox dir enforces access
     // ... pure analysis ...
     vec![Finding::error("…").at(path, line)]
 }
+
+// Example: a check that also needs Cargo.toml files alongside changed sources.
+#[check(name = "dep-policy", access_scope = globs(["**/Cargo.toml"]))]
+fn check_deps(input: CheckInput) -> Vec<Finding> { /* ... */ }
 ```
 
-  The `#[check]` macro registers the function in the component's `list-checks`/`run-check` dispatch table and records its `reads` globs as the declared capability request. Authors never touch the WIT bindings, pointers, or memory.
+  The `#[check]` macro registers the function in the component's `list-checks`/`run-check` dispatch table and records the declared `access-scope` (defaulting to `modified-only`). Authors never touch the WIT bindings, pointers, or memory.
 
 - **Build:** `cargo component build --target wasm32-wasip2` produces the component `.wasm`. The `wasm32-wasip2` target is required (not `wasm32-unknown-unknown`) because it maps `std::fs` onto WASI-p2 interfaces that the host services. A bazel rule wraps this for hermetic, reproducible builds and emits the sha256 that goes in the manifest. There is **no existing rules_rust wasm-component rule in this repo today** (the `musl/` tooling cross-compiles the *host* binary, not guests), so the bazel guest-build rule is real new infra and is sized accordingly in the task breakdown (T9).
 
@@ -205,14 +223,7 @@ fn run(input: CheckInput) -> Vec<Finding> {
 
 Checks read files with **ordinary `std::fs` APIs** — no checkleft-specific call, no special import. The `wasm32-wasip2` compilation target maps `std::fs` onto WASI-p2's filesystem interface, which `wasmtime` services on the host. Capability scoping is structural: the host controls what files the guest can reach by controlling what it preopens.
 
-- **Primary mechanism: WASI-p2 sandbox directory.** Before each invocation the host:
-  1. Computes the deny-by-default **allowlist** from: (a) all paths in `changeset.changed_files` (always readable), and (b) check-declared `reads` globs from `check-descriptor.reads` intersected with a host ceiling (repo root, read-only).
-  2. Creates a per-invocation **temp sandbox directory** and populates it with exactly the allowlisted files, placed at their repo-relative paths via hardlinks (same filesystem) or, if the source is a virtual/git-backed tree, by materializing the file content from the `SourceTree`.
-  3. Preopens the sandbox dir as the WASI root via `WasiCtxBuilder::preopened_dir(sandbox_dir, "/")`.
-
-  The guest's `std::fs::read_to_string("src/foo.rs")` resolves through the WASI preopen into the sandbox dir. The guest can only reach files that the host placed there — no custom ABI, no special function, just Rust.
-
-  Path normalization (`validate_relative_path`) and `..` traversal rejection still apply when building the allowlist; escape attempts fail because the sandbox dir simply does not contain the requested file.
+- **Primary mechanism: consume the shared FS sandbox module as the WASI preopen.** The shared FS sandbox module (§Shared FS sandbox module) accepts the changeset, the check's declared `access-scope` (`modified-only` by default), and the `SourceTree`, then produces a populated temp directory whose tree mirrors the allowlisted repo paths. The wasm runtime takes that directory and passes it to `WasiCtxBuilder::preopened_dir(sandbox_root, "/")`. The guest's `std::fs::read_to_string("src/foo.rs")` resolves through the WASI preopen into the sandbox dir — no custom ABI, no special function, just Rust. Path normalisation and `..` traversal rejection are applied inside the shared module; escape attempts fail because the sandbox dir simply does not contain the requested file.
 
 - **Alternative: custom/virtual host FS.** If materializing files to disk per invocation proves too expensive, or if in-memory virtual trees (e.g. base-revision via `TreeVersion::Base`) cannot practically be materialized, the host can instead implement a `wasmtime_wasi::Dir` backed by the `SourceTree` trait and plug it in without writing to disk. This is more flexible (no temp-dir I/O) but more complex to implement. Treated as a fallback / future optimization rather than the v1 default.
 
@@ -241,6 +252,63 @@ Checks read files with **ordinary `std::fs` APIs** — no checkleft-specific cal
   - Today (`sandbox-v1`): full `Module::new` compile **per invocation** — the dominant, repeated cost.
   - New: one-time compile (tens of ms) amortized into the `.cwasm` cache; subsequent runs pay deserialize (low ms) + instantiate (tens of µs) + the typed call. Net: repeated invocations get dramatically cheaper than the current recompile-every-time path.
   - vs. exec/declarative: avoids ~1-5 ms process spawn per invocation and OS-sandbox setup.
+
+## Shared FS sandbox module
+
+The per-invocation filesystem sandbox is designed as a **standalone, runtime-agnostic module**. It is not wasm-specific: the wasm runtime is the first consumer, but the declarative runtime (and any future exec runtime) can adopt it without any change to this module's interface. What differs across runtimes is only how they consume the sandbox root: the wasm runtime preopens it as the WASI root; a declarative runtime would pass it as a working directory or environment variable to a subprocess.
+
+### Interface
+
+**Inputs:**
+- `changeset: &ChangeSet` — the set of files modified in this change.
+- `scope: AccessScope` — the declared access scope (default: `ModifiedOnly`; see below).
+- `source_tree: &dyn SourceTree` — the repository file tree, used to materialise content for virtual or git-backed trees.
+- `ceiling: HostCeiling` — the host-enforced maximum (e.g. repo root, read-only); the module intersects the declared scope with this ceiling.
+
+**Behavior:**
+1. Resolve the **allowlist** from `scope`:
+   - `ModifiedOnly` (default): allowlist = `changeset.changed_files` paths only.
+   - `WholeRepo`: allowlist = all paths under the repo root, subject to `ceiling`.
+   - `Globs(patterns)`: allowlist = files matching `patterns` (repo-root-relative) ∪ `changeset.changed_files`, intersected with `ceiling`.
+2. Create a **per-invocation temp directory** and populate it with exactly the allowlisted files at their repo-relative paths via hardlinks (same filesystem) or by materialising content from `SourceTree` (virtual/git-backed trees).
+3. Apply **path normalisation** (`validate_relative_path`) and reject `..` traversal during allowlist resolution; escape attempts fail structurally.
+
+**Outputs:**
+- `sandbox_root: TempDir` — the populated sandbox directory. The caller is responsible for its lifetime; dropping it removes the sandbox.
+- `allowed_paths: Vec<RepoRelativePath>` — the materialised path list, for audit and logging.
+
+### Default access policy: modified-only
+
+**A check gets access only to the files it modified — by default.** `ModifiedOnly` is the safe, narrow default. Most checks inspect only the code being changed; granting the whole repo by default would silently give out-of-tree checks far broader access than they need.
+
+**Whole-repo is opt-in.** A check must explicitly declare `access-scope = whole-repo` (in its `check-descriptor` WIT field or in its manifest TOML) to receive the full repository tree. The host may surface this declaration to reviewers as a higher-trust requirement.
+
+**Globs are for targeted cross-file reads.** A check that needs specific supporting files beyond the changeset (e.g. `Cargo.toml` files alongside changed `.rs` files) declares `access-scope = { globs = ["**/Cargo.toml"] }`. Modified files are always included regardless of the glob list.
+
+### Access scope declaration
+
+Scope lives in the check's self-description:
+
+- **WIT `check-descriptor`** (wasm tier): the `access-scope: option<access-scope>` field. Absent means `modified-only`.
+- **Manifest TOML** (declarative tier, future): an `access_scope` key in the check descriptor block. Absent means `modified-only`.
+
+This keeps scope collocated with the check definition, not hidden in a separate config layer.
+
+### Wasm runtime consumption
+
+The wasm runtime is the first consumer. After obtaining the sandbox root from this module, it calls:
+
+```rust
+WasiCtxBuilder::new()
+    .preopened_dir(sandbox_root.path(), "/")
+    .build()
+```
+
+The guest component reads files with ordinary `std::fs` — no checkleft-specific call, no WIT import. Capability enforcement is structural: the sandbox dir does not contain unauthorised files, so a path that was not allowlisted simply does not exist from the guest's perspective.
+
+### Declarative runtime (future)
+
+The declarative runtime is **not wired to this module yet** — that is explicitly out of scope for v1. When it adopts the module, it will pass the sandbox root to the subprocess as a working directory or environment variable. No change to this module's interface is required at that point; the shared module's contract is already general enough to serve both consumers.
 
 ## Changes to the T1407 check-def provider + CHECKS source directive
 
@@ -286,20 +354,24 @@ Open questions to be settled by a human are captured in the sibling `*.attention
 Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks share a dependency level and may run in parallel. Effort hint ∈ `trivial | small | medium | large`.
 
 ### T1 — WIT contract package
-**Scope:** Add the in-tree `checkleft:check@0.1.0` WIT package (`types`, `host-fs`, `check` world) mirroring `input.rs`/`output.rs`. Includes a host-side `bindgen!` smoke test that the WIT compiles and a doc comment mapping each WIT record to its Rust counterpart. No behavior wired yet.
+**Scope:** Add the in-tree `checkleft:check@0.1.0` WIT package (`types`, `host-fs`, `check` world) mirroring `input.rs`/`output.rs`. Includes the `access-scope` variant type and the updated `check-descriptor` record (with `access-scope: option<access-scope>` replacing the former `reads` field). Includes a host-side `bindgen!` smoke test that the WIT compiles and a doc comment mapping each WIT record to its Rust counterpart. No behavior wired yet.
 **Effort:** small. **Depends on:** none.
 
 ### T2 — Guest SDK crate (`checkleft-check-sdk`)
-**Scope:** New guest crate wrapping `wit-bindgen` with the `#[check(name, reads)]` macro, the `list-checks`/`run-check` dispatch table, a `CheckInput::config::<T>()` serde helper over `config-json`, and a `host_fs` ergonomic wrapper. Ships a trivial example check that compiles to a component. Authors see only native structs.
+**Scope:** New guest crate wrapping `wit-bindgen` with the `#[check(name, access_scope?)]` macro (defaulting to `modified-only` when no `access_scope` is given), the `list-checks`/`run-check` dispatch table, and a `CheckInput::config::<T>()` serde helper over `config-json`. Ships a trivial example check that compiles to a component. Authors see only native structs and never touch WIT bindings or `access-scope` unless they need broader access.
 **Effort:** medium. **Depends on:** T1.
 
 ### T3 — Host component executor (typed call path)
 **Scope:** Rewrite `DefaultExternalCheckExecutor` to load a component, build a `Store<HostState>` and `Linker`, instantiate, and call `list-checks`/`run-check`, lifting `list<finding>` into `Finding`. No file capability or cache yet (stub `host-fs` that denies all). Replaces the core/fake-component paths' call mechanics.
 **Effort:** medium. **Depends on:** T1. *(Parallel with T2 — both depend only on T1.)*
 
-### T4 — WASI sandbox dir + file-capability enforcement
-**Scope:** Implement the per-invocation sandbox directory: compute the deny-by-default allowlist (changed files + check-declared `reads` globs ∩ host ceiling), create a temp dir, hardlink/symlink allowlisted files at their repo-relative paths (materializing content from `SourceTree` for virtual/git-backed trees), and preopen it as the WASI root via `WasiCtxBuilder`. The guest reads via normal `std::fs` — no host-imported function. Path normalization and `..` traversal rejection apply when building the allowlist. Tests for grant, deny, traversal-escape, and virtual-tree materialization.
-**Effort:** medium. **Depends on:** T3.
+### T3a — Shared FS sandbox module
+**Scope:** Implement the standalone, runtime-agnostic FS sandbox module defined in §Shared FS sandbox module. Inputs: a changeset, a declared `AccessScope` (defaulting to `ModifiedOnly`), a `SourceTree` reference, and a `HostCeiling`. Behavior: resolve the allowlist per the declared scope (`ModifiedOnly` → changeset paths only; `WholeRepo` → all paths under ceiling; `Globs(patterns)` → glob expansion ∪ changeset, intersected with ceiling), create a per-invocation temp directory, populate it by hardlink (same filesystem) or by materialising content from `SourceTree` for virtual/git-backed trees, preserving repo-relative paths, and apply path normalisation plus `..` traversal rejection throughout. Outputs: the sandbox-root `TempDir` and the materialised path list. Unit tests for all three scope variants, traversal-escape rejection, and virtual-tree materialisation. No WASI, no wasm dependency — pure Rust, consumable by any runtime.
+**Effort:** medium. **Depends on:** none. *(Pure Rust; can start immediately in parallel with T1.)*
+
+### T4 — WASI integration: consume shared FS sandbox module as preopen
+**Scope:** Wire the shared FS sandbox module (T3a) into the wasm executor: after T3a produces the sandbox root for the check's declared `access-scope`, call `WasiCtxBuilder::preopened_dir(sandbox_root, "/")` to create the `WasiCtx` and pass it into the `Store<HostState>`. The guest reads via `std::fs` with no checkleft-specific call; capability enforcement is structural. Integration tests for the full grant/deny/traversal-escape path exercised through a running wasm component.
+**Effort:** small. **Depends on:** T3, T3a.
 
 ### T5 — Limit / timeout policy
 **Scope:** Epoch-based deadline (engine epoch ticking + store deadline), memory `ResourceLimiter`, generous defaults, and manifest `limits.{timeout_ms,max_memory_mb}` overrides clamped by a host ceiling. Tests for timeout trip and memory cap trip.
@@ -322,8 +394,8 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 **Effort:** large. **Depends on:** T2.
 
 ### T10 — Port `rust-giant-structs-use-builder` as the end-to-end proof
-**Scope:** Re-author the check on the guest SDK (superseding the T1444 `sandbox-v1` port), build it via T9, bundle/resolve it via T8, and run it through the new host (T3-T6) in an end-to-end test that exercises a capability-scoped file read and a real finding. This is the project's acceptance proof.
-**Effort:** medium. **Depends on:** T2, T4, T8, T9. *(T5/T6 should also be landed for a realistic run, but are not strictly gating the proof's correctness.)*
+**Scope:** Re-author the check on the guest SDK (superseding the T1444 `sandbox-v1` port), build it via T9, bundle/resolve it via T8, and run it through the new host (T3-T6) in an end-to-end test that exercises a capability-scoped file read with the default `modified-only` scope and a real finding. This is the project's acceptance proof.
+**Effort:** medium. **Depends on:** T2, T3a, T4, T8, T9. *(T5/T6 should also be landed for a realistic run, but are not strictly gating the proof's correctness.)*
 
 ### T11 — Remove `sandbox-v1` runtime and dead capability surface
 **Scope:** Delete the hand-rolled core ABI and fake-component paths from `runtime.rs`, the `sandbox-v1` constants, and the inert wasm-tier `capabilities.commands` plumbing. Update tests/docs. Strictly after nothing resolves to `sandbox-v1`.
@@ -331,11 +403,11 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 
 ### Parallelism summary (task graph, not a linear list)
 
-- Depth 0: **T1**.
+- Depth 0: **T1** and **T3a** (both independent; T3a has no wasm or WIT dependency).
 - Depth 1 (after T1, parallel): **T2**, **T3**, **T7**.
-- Depth 2 (after T3, parallel): **T4**, **T5**, **T6**. (T9 also starts here, after T2.)
+- Depth 2 (after T3, parallel): **T4** (needs T3 + T3a), **T5**, **T6**. (T9 also starts here, after T2.)
 - Depth 3: **T8** (after T3, T7).
-- Depth 4: **T10** (after T2, T4, T8, T9).
+- Depth 4: **T10** (after T2, T3a, T4, T8, T9).
 - Depth 5: **T11** (after T8, T10).
 
 ### Deferred / future — not a v1 blocker
@@ -348,4 +420,4 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 - **Instance pooling / warm-pool** for very high check counts (instantiation is already cheap; revisit only if profiling demands it).
 - **Component signing / provenance** beyond sha256 pinning.
 
-**Effort estimate (whole project):** ~10-12 PRs. The host-side path (T1, T3-T8, T10, T11) is mostly `small`/`medium` and well-understood given the existing architecture. The dominant unknown is **T9 (bazel reproducible wasm-component build, `large`)**, which is new infrastructure; it can proceed in parallel with the host work once the SDK (T2) exists, so it need not serialize the critical path.
+**Effort estimate (whole project):** ~11-13 PRs. The host-side path (T1, T3-T8, T3a, T10, T11) is mostly `small`/`medium` and well-understood given the existing architecture. T3a (shared FS sandbox module) is a standalone `medium` that can run fully in parallel with T1 and the rest of the wasm runtime work. The dominant unknown remains **T9 (bazel reproducible wasm-component build, `large`)**, which is new infrastructure; it can proceed in parallel with the host work once the SDK (T2) exists, so it need not serialize the critical path.
