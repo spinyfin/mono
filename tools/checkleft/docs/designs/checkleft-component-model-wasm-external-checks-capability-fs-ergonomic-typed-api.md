@@ -133,7 +133,7 @@ interface types {
   }
 
   // Per-check config is dynamic (toml::Value today). v1 passes it as a JSON
-  // string the guest SDK deserializes with serde. See open question Q1.
+  // string the guest SDK deserializes with serde into the author's own config struct.
   record check-input { changeset: change-set, config-json: string }
 
   enum severity { error, warning, info }
@@ -187,7 +187,7 @@ Design choices baked into the contract:
 - **`list-checks` + `run-check(name, input)`** make one component self-describing and able to export N checks (the "one artifact, N checks" requirement). The host instantiates once, calls `list-checks()` to enumerate, and dispatches by name.
 - **File access is via `std::fs`, not a WIT import.** The `wasm32-wasip2` target maps `std::fs` onto WASI-p2 interfaces that wasmtime services; the host enforces capability scoping by what it places in the preopen sandbox dir (see file-capability section). No checkleft-specific file API exists in the WIT world.
 - **`access-scope` declares the check's file-access appetite.** The default (absent or `modified-only`) gives a check only the files touched by the changeset — correct and safe for most checks. `whole-repo` is an explicit opt-in for checks that must traverse the full tree. `globs(patterns)` is for targeted cross-file reads (e.g. config files alongside source); modified files are always included. The shared FS-sandbox module (see §Shared FS sandbox module) resolves the declared scope into the materialised sandbox that the wasm runtime preopens as the WASI root.
-- **Config as `config-json`.** `toml::Value` is dynamic; modeling arbitrary config as WIT records would force a schema per check or a recursive `variant`. v1 passes config as a JSON string and the guest SDK deserializes it into the author's own `#[derive(Deserialize)]` config struct. (Open question Q1 — could later become a typed-per-check generic.)
+- **Config as `config-json`.** `toml::Value` is dynamic; modeling arbitrary config as WIT records would force a schema per check or a recursive `variant`. v1 passes config as a JSON string and the guest SDK deserializes it into the author's own `#[derive(Deserialize)]` config struct. This is the recommended pragmatic choice; a typed-per-check generic is a possible future evolution but is not a v1 concern.
 
 ### Guest SDK + build pipeline
 
@@ -236,7 +236,7 @@ Checks read files with **ordinary `std::fs` APIs** — no checkleft-specific cal
 - **Epoch-based deadlines** replace fuel as the default timeout. The engine enables epoch interruption; a background thread (or the existing run scheduler) ticks the epoch, and the store sets an epoch deadline. Default: generous wall-clock budget (proposed 5 s), far above the prototype's tight fuel ceiling.
 - **Memory cap** via a `StoreLimits`/`ResourceLimiter` on the store (proposed default 256 MiB), configurable.
 - **Per-check / per-bundle overrides** in the manifest (`limits.timeout_ms`, `limits.max_memory_mb`), clamped by a host ceiling so an out-of-tree manifest cannot grant itself unbounded resources. Trusted bundles can opt into a relaxed tier.
-- Fuel remains available as an optional secondary determinism knob (useful for reproducible CI) but is **off by default** in favor of epoch deadlines. (Open question Q3.)
+- Fuel remains available as an opt-in determinism knob (useful for reproducible CI) but is **off by default** in favor of epoch deadlines.
 
 ### Bundling / discovery format
 
@@ -322,8 +322,8 @@ T1407 (PR 1402) gives us the bundled-def provider and the `check_definitions` CH
 
 ## Disposition of prior work
 
-- **T1397 / PR 1376 (`sandbox-v1` prototype): SUPERSEDE.** Delete the hand-rolled core ABI path (`checkleft_run`, manual `read_memory`/`write_memory`/`ensure_memory_capacity`/`decode_output_range`) and the fake `(string)->(string)` "component" path from `runtime.rs`. **Salvage:** sha256 pinning (`validate_artifact_sha256`), the `ExternalCheckExecutor`/provider/runner architecture, the manifest-parsing scaffolding, and the engine-construction skeleton.
-- **T1444 / PR 1410 (`giant-struct-no-builder` ported to `sandbox-v1`): SUPERSEDE.** It is reference-only and built on the ABI being removed. Re-port the check onto the new component model as the end-to-end proof (final migration task), then close the old port.
+- **T1397 / PR 1376 (`sandbox-v1` prototype): SUPERSEDE.** Delete the hand-rolled core ABI path (`checkleft_run`, manual `read_memory`/`write_memory`/`ensure_memory_capacity`/`decode_output_range`) and the fake `(string)->(string)` "component" path from `runtime.rs`. **Salvage:** sha256 pinning (`validate_artifact_sha256`), the `ExternalCheckExecutor`/provider/runner architecture, the manifest-parsing scaffolding, and the engine-construction skeleton. **There is no parallel dual-tier migration period:** `sandbox-v1` is removed immediately once the component path lands (T11). No new checks are registered against `sandbox-v1` after T7 merges.
+- **T1444 / PR 1410 (`giant-struct-no-builder` ported to `sandbox-v1`): SUPERSEDE.** It is reference-only and built on the ABI being removed. Re-port the check onto the new component model as the end-to-end proof (T10), then close the old port at the same time T11 deletes `sandbox-v1`.
 - **T1371 / PR 1372 (Rust-only restriction): KEEP.** It aligns with the Rust/wit-bindgen sweet spot and the v1 non-goal of multi-language guests.
 - **T1407 / PR 1402 (bundled provider + CHECKS source directive): REWORK** to load the component format, as detailed above.
 
@@ -334,10 +334,10 @@ T1407 (PR 1402) gives us the bundled-def provider and the `check_definitions` CH
 - **Bazel guest-build infra is new.** There is no rules_rust wasm-component rule in this repo today. Building reproducible `wasm32` components under bazel (hermetic toolchain, deterministic output, sha emission) is the largest single unknown; sized as `large` (T9).
 - **WASI-p2 is the file-access path, not just a stub.** Because `wasm32-wasip2` maps `std::fs` onto WASI-p2 interfaces, the host must link `wasmtime-wasi` with a properly built `WasiCtx` (sandbox dir preopen). Any mismatch between the wasmtime-wasi version and the guest's WASI-p2 expectations surfaces at instantiation time. Mitigation: same workspace-level wasmtime pin that governs the component ABI.
 - **Sandbox dir I/O cost.** Each invocation creates and tears down a temp dir with hardlinks/symlinks (or materialized content for virtual trees). On high-throughput CI runs this is measurable I/O. Mitigation: measure in T4; the custom/virtual host-FS alternative avoids disk writes entirely if profiling demands it.
-- **Epoch timeouts are non-deterministic.** A wall-clock deadline can fire differently across machines. Acceptable given generous defaults; fuel remains available for CI determinism if needed (Q3).
+- **Epoch timeouts are non-deterministic.** A wall-clock deadline can fire differently across machines. Acceptable given generous defaults; fuel is available as an opt-in knob for CI determinism.
 - **Migration scope is small but real.** Only `giant-struct-no-builder` exists as a wasm-tier check today, so migration risk is low — but the proof must be genuinely end-to-end (authored via the SDK, built via the bazel rule, resolved via the provider, run via the new host).
 
-Open questions to be settled by a human are captured in the sibling `*.attentions.json` manifest. In summary they are: (Q1) config as JSON-string vs. typed-per-check vs. WIT records; (Q2) resolved — WASI-p2 is central to the design and `wasmtime-wasi` is always linked; (Q3) epoch-only vs. fuel-also default; (Q4) sandbox-dir vs. custom/virtual host-FS for per-file capability enforcement (host-imported `read-file` ABI is not a valid choice); (Q5) remove `sandbox-v1` immediately vs. keep dual support during migration.
+All open questions are now resolved. Summary of decisions: (Q1) **resolved** — config crosses the WIT boundary as a JSON string (`config-json`); guest SDK deserializes with serde into the author's own struct; (Q2) **resolved** — WASI-p2 is central to the design and `wasmtime-wasi` is always linked; (Q3) **resolved** — epoch-based wall-clock deadline is the default; fuel is available as an opt-in determinism knob but is off by default; (Q4) sandbox-dir is the v1 default; custom/virtual host-FS is a deferred optimisation if profiling demands it (host-imported `read-file` ABI remains off the table); (Q5) **resolved** — `sandbox-v1` is removed immediately once the component path lands (T11), with no parallel dual-tier period.
 
 ## Migration plan
 
