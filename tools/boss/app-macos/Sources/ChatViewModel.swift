@@ -2447,6 +2447,29 @@ final class ChatViewModel: ObservableObject {
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }
 
+    /// All `kind == "revision"` tasks whose `parentTaskId` matches the
+    /// supplied id, regardless of status. Used by the transcript viewer
+    /// to label executions from the full revision chain.
+    func allRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        let matches: (WorkTask) -> Bool = {
+            $0.kind == "revision" && $0.parentTaskId == parentID
+        }
+        var result: [WorkTask] = []
+        for tasks in tasksByProjectID.values {
+            result.append(contentsOf: tasks.filter(matches))
+        }
+        for chores in choresByProductID.values {
+            result.append(contentsOf: chores.filter(matches))
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            result.append(contentsOf: revisions.filter(matches))
+        }
+        for tasks in productLevelTasksByProductID.values {
+            result.append(contentsOf: tasks.filter(matches))
+        }
+        return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+    }
+
     private func productID(for nodeID: WorkNodeID?) -> String? {
         switch nodeID {
         case .product(let productID):
