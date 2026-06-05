@@ -62,8 +62,8 @@ impl JsonTransform {
         })?;
         let context = RenderContext { input_file, exit_code };
         let mut findings = Vec::new();
-        for item in self.selector.select(&root) {
-            findings.push(self.finding.render(item, context)?);
+        for item in self.selector.select(&root)? {
+            findings.push(self.finding.render(&item, context)?);
         }
         Ok(findings)
     }

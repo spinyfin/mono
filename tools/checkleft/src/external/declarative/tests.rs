@@ -139,19 +139,19 @@ applies_to = ["**/*.bzl"]
 fn selector_filters_files_by_formatted_flag() {
     let selector = Selector::parse(".files[] | select(.formatted == false)").unwrap();
     let root: Value = serde_json::from_slice(REAL_FORMAT_UNFORMATTED).unwrap();
-    let rows = selector.select(&root);
+    let rows = selector.select(&root).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("filename").unwrap(), "a/b/unformatted.bzl");
 
     let clean: Value = serde_json::from_slice(REAL_FORMAT_CLEAN).unwrap();
-    assert!(selector.select(&clean).is_empty());
+    assert!(selector.select(&clean).unwrap().is_empty());
 }
 
 #[test]
 fn selector_flattens_nested_warnings() {
     let selector = Selector::parse(".files[].warnings[]").unwrap();
     let root: Value = serde_json::from_slice(REAL_LINT_WARNINGS).unwrap();
-    let rows = selector.select(&root);
+    let rows = selector.select(&root).unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get("category").unwrap(), "module-docstring");
 }
