@@ -1721,9 +1721,9 @@ fn compose_revision_directive(
     }
     out.push('\n');
     out.push_str("## Workspace state\n");
-    out.push_str("The engine pre-positioned this workspace: it ran `jj git fetch` and `jj new <PR-head-sha>`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+    out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
     out.push('\n');
-    out.push_str("**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head — e.g. the pre-positioning step failed):\n");
+    out.push_str("**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n");
     out.push_str("```\n");
     out.push_str("jj git fetch\n");
     out.push_str("# Find the PR branch bookmark (look for boss/exec_... ending in @origin):\n");

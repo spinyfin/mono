@@ -82,6 +82,7 @@ pub trait HostAdapter: Send + Sync {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
+        resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease>;
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
@@ -101,19 +102,6 @@ pub trait HostAdapter: Send + Sync {
     /// success. Called only when the task's `pr_url` is non-empty; the normal
     /// `create_change` path is used otherwise.
     async fn checkout_pr_head_for_review(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String>;
-
-    /// For `revision_implementation` executions: pre-position the leased
-    /// workspace on a fresh editable change on top of the (immutable) PR
-    /// head.  Unlike `checkout_pr_head_for_review`, which uses `jj edit` to
-    /// move the working copy to the remote commit itself, this uses `jj new`
-    /// to create a child change the revision worker can actually edit.
-    /// Returns the parent head SHA for event logging.
-    async fn position_revision_workspace(
         &self,
         workspace_path: &Path,
         pr_url: &str,
@@ -224,9 +212,10 @@ impl HostAdapter for LocalHostAdapter {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
+        resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease> {
         self.cube_client
-            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty)
+            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr)
             .await
     }
 
@@ -257,15 +246,6 @@ impl HostAdapter for LocalHostAdapter {
         repo_slug: &str,
     ) -> Result<String> {
         checkout_pr_head_local(workspace_path, pr_url, repo_slug).await
-    }
-
-    async fn position_revision_workspace(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String> {
-        position_revision_workspace_local(workspace_path, pr_url, repo_slug).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
@@ -348,68 +328,6 @@ async fn checkout_pr_head_local(
         if !output.status.success() {
             return Err(anyhow!(
                 "`jj edit {head_sha}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    Ok(head_sha)
-}
-
-/// Run `jj git fetch` + `jj new <head_sha>` locally in `workspace_path`
-/// to place the working copy on a fresh editable child change above the
-/// PR head.  Called by [`LocalHostAdapter::position_revision_workspace`].
-/// Unlike [`checkout_pr_head_local`], which uses `jj edit` (suitable for
-/// reviewers reading the code), this uses `jj new` so the revision worker
-/// gets a mutable working copy it can actually edit.
-async fn position_revision_workspace_local(
-    workspace_path: &Path,
-    pr_url: &str,
-    repo_slug: &str,
-) -> Result<String> {
-    let pr_number = crate::completion::pr_number_from_url(pr_url)
-        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-
-    // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
-    let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
-
-    // 2. Fetch remote refs so jj knows about the head commit.
-    {
-        let output = Command::new("jj")
-            .args(["git", "fetch"])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .context("failed to spawn `jj git fetch`")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj git fetch` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    // 3. Create an editable child change on top of the immutable PR head.
-    //    `jj new <sha>` is correct — `jj edit <sha>` would land on an
-    //    immutable remote commit and prevent the worker from making changes.
-    {
-        let output = Command::new("jj")
-            .args(["new", &head_sha])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn `jj new {head_sha}`"))?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj new {head_sha}` failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -658,6 +576,7 @@ impl HostAdapter for SshHostAdapter {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
+        resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease> {
         #[derive(Deserialize)]
         struct LeasePayload {
@@ -669,12 +588,16 @@ impl HostAdapter for SshHostAdapter {
             workspace_id: String,
             workspace_path: PathBuf,
         }
+        let resume_pr_str = resume_pr.map(|n| n.to_string());
         let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
         if let Some(prefer) = prefer_workspace_id {
             args.extend_from_slice(&["--prefer", prefer]);
         }
         if allow_dirty {
             args.push("--allow-dirty");
+        }
+        if let Some(n) = resume_pr_str.as_deref() {
+            args.extend_from_slice(&["--resume-pr", n]);
         }
         let payload: LeasePayload = serde_json::from_value(self.run_cube_json(&args).await?)
             .context("decoding remote `cube workspace lease` payload")?;
@@ -791,53 +714,6 @@ impl HostAdapter for SshHostAdapter {
         if !output.success() {
             return Err(anyhow!(
                 "`jj edit {head_sha}` failed on {host}: {}",
-                output.stderr.trim()
-            ));
-        }
-
-        Ok(head_sha)
-    }
-
-    async fn position_revision_workspace(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String> {
-        let pr_number = crate::completion::pr_number_from_url(pr_url)
-            .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-        let host = &self.transport.host_id;
-
-        let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
-
-        let workspace = workspace_path.display().to_string();
-        let fetch_cmd = format!("cd '{}' && jj git fetch", workspace);
-        let output = self
-            .transport
-            .run(&["sh", "-c", &fetch_cmd])
-            .await
-            .with_context(|| format!("failed to run `jj git fetch` on remote host {host}"))?;
-        if !output.success() {
-            return Err(anyhow!(
-                "`jj git fetch` failed on {host}: {}",
-                output.stderr.trim()
-            ));
-        }
-
-        // Create an editable child change on top of the immutable PR head.
-        // `jj new` is correct — `jj edit` would land on an immutable remote
-        // commit and prevent the worker from making changes.
-        let new_cmd = format!("cd '{}' && jj new '{head_sha}'", workspace);
-        let output = self
-            .transport
-            .run(&["sh", "-c", &new_cmd])
-            .await
-            .with_context(|| {
-                format!("failed to run `jj new {head_sha}` on remote host {host}")
-            })?;
-        if !output.success() {
-            return Err(anyhow!(
-                "`jj new {head_sha}` failed on {host}: {}",
                 output.stderr.trim()
             ));
         }
