@@ -8,7 +8,6 @@ CheckInfo = provider(
         "launcher": "Executable File produced by local_check for checkleft to invoke.",
         "implementation_name": "Generated implementation id used in check indexes.",
         "manifest": "Manifest file written by local_check.",
-        "provenance_target": "Wrapped binary's target label (retained for tooling; not written to the declarative manifest).",
     },
 )
 
@@ -32,14 +31,11 @@ def _toml_string(value):
         value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"),
     )
 
-def _render_declarative_passthrough_manifest(check_id, executable_path, args, provenance_target):
+def _render_declarative_passthrough_manifest(check_id, executable_path, args):
     # A repo-local check binary is modelled as a single declarative invocation with
     # the `passthrough` transform: the binary emits a checkleft findings document
     # (`{"findings":[…]}`) on stdout, which the framework returns unchanged. This is
     # the unified replacement for the former `exec-v1` runtime.
-    #
-    # `provenance_target` is accepted for call-site compatibility but not emitted:
-    # the declarative manifest schema does not carry a `[provenance]` table.
     arg_entries = [_toml_string(arg) for arg in args] + [_toml_string("{{files}}")]
     lines = [
         "id = {}".format(_toml_string(check_id)),
@@ -154,7 +150,6 @@ exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
             check_id = check_id,
             executable_path = _workspace_bin_path(launcher),
             args = ctx.attr.exec_args,
-            provenance_target = str(ctx.attr.binary.label),
         ),
     )
 
@@ -174,7 +169,6 @@ exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
             launcher = launcher,
             implementation_name = implementation_name,
             manifest = manifest,
-            provenance_target = str(ctx.attr.binary.label),
         ),
     ]
 
@@ -251,7 +245,6 @@ def _check_index_impl(ctx):
                 check_id = info.check_id,
                 executable_path = _workspace_bin_path(info.launcher),
                 args = info.args,
-                provenance_target = info.provenance_target,
             ),
         )
         generated_manifests.append(manifest)
