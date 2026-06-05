@@ -382,3 +382,45 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     let categories_declarative: Vec<&str> = lint.iter().map(|f| f.message.as_str()).collect();
     assert_eq!(categories_declarative, categories_builtin);
 }
+
+// ── jaq smoke test ─────────────────────────────────────────────────────────────
+
+/// `empty` is not in jaq_core::core() in 1.x; register it as a native.
+fn jaq_empty_run<'a>(
+    _: jaq_interpret::Args<'a>,
+    _: (jaq_interpret::Ctx<'a>, jaq_interpret::Val),
+) -> jaq_interpret::ValRs<'a> {
+    Box::new(core::iter::empty::<jaq_interpret::ValR>())
+}
+
+/// Prove that jaq-interpret parses and evaluates a filter with no C deps.
+#[test]
+fn jaq_deps_compile_and_evaluate() {
+    use jaq_interpret::{Ctx, FilterT as _, Native, ParseCtx, RcIter, Val};
+    use serde_json::json;
+
+    let (stdlib_defs, errs) =
+        jaq_parse::parse("def select(f): if f then . else empty end;", jaq_parse::defs());
+    assert!(errs.is_empty(), "stdlib parse errors: {errs:?}");
+
+    let (f, errs) = jaq_parse::parse(".a | select(.b == 1)", jaq_parse::main());
+    assert!(errs.is_empty(), "parse errors: {errs:?}");
+
+    let mut ctx = ParseCtx::new(Vec::new());
+    ctx.insert_natives(jaq_core::core());
+    ctx.insert_native("empty".to_string(), 0, Native::new(jaq_empty_run));
+    ctx.insert_defs(stdlib_defs.unwrap_or_default());
+    let filter = ctx.compile(f.unwrap());
+    assert!(ctx.errs.is_empty(), "compile errors: {} error(s)", ctx.errs.len());
+
+    let inputs = RcIter::new(core::iter::empty());
+    let ctx = Ctx::new([], &inputs);
+    let input = Val::from(json!({"a": {"b": 1}}));
+
+    let output: Vec<serde_json::Value> = filter
+        .run((ctx, input))
+        .map(|r| serde_json::Value::from(r.unwrap()))
+        .collect();
+
+    assert_eq!(output, vec![json!({"b": 1})]);
+}

@@ -41,6 +41,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 globset = { workspace = true }
+jaq-core = { workspace = true }
+jaq-interpret = { workspace = true }
+jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
