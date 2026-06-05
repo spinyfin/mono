@@ -167,6 +167,29 @@ pub enum FrontendRequest {
         input: AddDependencyInput,
     },
 
+    /// Register a new remote SSH host. The engine stores the row,
+    /// then eagerly pushes the `boss-remote-run` wrapper and runs
+    /// capability discovery — identical to `bossctl hosts add`. On
+    /// success replies with [`FrontendEvent::HostResult`]. On failure
+    /// replies with [`FrontendEvent::Error`] with a human-readable
+    /// message. The host row is created before the push; if the push
+    /// fails the host is left disabled (same policy as the CLI).
+    AddHost {
+        id: String,
+        ssh_target: String,
+        #[serde(default = "default_pool_size")]
+        pool_size: i64,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+
+    /// Add one user-defined capability tag to a registered host.
+    /// Replies with [`FrontendEvent::HostUpdated`] on success.
+    AddHostTag {
+        host_id: String,
+        tag: String,
+    },
+
     /// Record the human's answer for one attention member (`atn_…`).
     /// Replies with [`FrontendEvent::AttentionGroupUpdated`] carrying
     /// the group's updated state.
@@ -588,6 +611,13 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Full details for one registered host, including all capabilities.
+    /// Replies with [`FrontendEvent::HostResult`] or
+    /// [`FrontendEvent::Error`] when the id is unknown.
+    GetHost {
+        id: String,
+    },
+
     GetRun {
         id: String,
     },
@@ -823,6 +853,11 @@ pub enum FrontendRequest {
     /// Read-only; no side effects.
     ListFeatureFlags,
 
+    /// All registered hosts with their enabled state and capabilities.
+    /// Includes the built-in `local` host. Replies with
+    /// [`FrontendEvent::HostsList`].
+    ListHosts,
+
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
@@ -1050,6 +1085,22 @@ pub enum FrontendRequest {
         input: RemoveDependencyInput,
     },
 
+    /// Deregister a remote host. Fails for the built-in `local` host
+    /// (matching the `bossctl hosts remove` invariant). Replies with
+    /// [`FrontendEvent::HostRemoved`] on success or
+    /// [`FrontendEvent::Error`] on failure.
+    RemoveHost {
+        id: String,
+    },
+
+    /// Remove one user-defined capability tag from a host. Only user
+    /// tags can be removed; auto-discovered tags are managed by the
+    /// engine heartbeat. Replies with [`FrontendEvent::HostUpdated`].
+    RemoveHostTag {
+        host_id: String,
+        tag: String,
+    },
+
     ReorderProjectTasks {
         project_id: String,
         task_ids: Vec<String>,
@@ -1164,6 +1215,14 @@ pub enum FrontendRequest {
     /// state and is the round-trip "the engine has reloaded" signal
     /// the debug pane uses to render the toggle as committed.
     SetFeatureFlag { name: String, enabled: bool },
+
+    /// Enable or disable a registered host. Disabled hosts receive no
+    /// new work dispatches. Replies with [`FrontendEvent::HostUpdated`]
+    /// on success or [`FrontendEvent::Error`] when the id is unknown.
+    SetHostEnabled {
+        id: String,
+        enabled: bool,
+    },
 
     /// Per-slot toggle for the live-status summarizer. When
     /// `enabled = false`, the engine stops calling the summarizer for
@@ -1997,6 +2056,19 @@ pub enum FrontendEvent {
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.
     SettingSet { key: String, enabled: bool },
+    /// Response to [`FrontendRequest::ListHosts`]: every registered
+    /// host (including `local`) with its capabilities.
+    HostsList { hosts: Vec<HostSnapshot> },
+    /// Response to [`FrontendRequest::GetHost`] or
+    /// [`FrontendRequest::AddHost`]: one host with all capabilities.
+    HostResult { host: HostSnapshot },
+    /// Response to [`FrontendRequest::SetHostEnabled`],
+    /// [`FrontendRequest::AddHostTag`], or
+    /// [`FrontendRequest::RemoveHostTag`]: the updated host snapshot.
+    HostUpdated { host: HostSnapshot },
+    /// Response to [`FrontendRequest::RemoveHost`]: the host has been
+    /// deleted. `id` is the id that was removed.
+    HostRemoved { id: String },
     /// Response to [`FrontendRequest::MetricsShowLive`]: the
     /// in-memory snapshot for `name`. `entry` is `None` when no
     /// counter or gauge with that name is registered in the current
@@ -2330,6 +2402,49 @@ pub struct EngineHealthIssue {
     /// Multi-line body with the remediation steps (e.g. which env var
     /// to set and where to restart). The UI wraps and renders verbatim.
     pub body: String,
+}
+
+/// One registered host plus all its current capabilities.
+/// Wire type for [`FrontendEvent::HostsList`], [`FrontendEvent::HostResult`],
+/// and [`FrontendEvent::HostUpdated`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostSnapshot {
+    /// Short identifier. `"local"` is the built-in host; remote hosts
+    /// use whatever name was given to `bossctl hosts add` / `AddHost`.
+    pub id: String,
+    /// SSH target string (e.g. `user@hostname` or an SSH alias).
+    /// `None` for the `local` host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
+    /// Maximum concurrent worker slots on this host.
+    pub pool_size: i64,
+    /// Whether the host will accept new work dispatches.
+    pub enabled: bool,
+    /// ISO-8601 timestamp of the last successful heartbeat. `None`
+    /// when the host has never been seen (newly registered).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    /// Human-readable description of the last error, when the host is
+    /// in a degraded state (e.g. wrapper push failed at registration).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_text: Option<String>,
+    /// ISO-8601 timestamp of host registration.
+    pub created_at: String,
+    /// All capabilities on this host (both auto-discovered and
+    /// user-tagged), ordered source-then-name.
+    pub capabilities: Vec<HostCapabilitySnapshot>,
+}
+
+/// One capability on a host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostCapabilitySnapshot {
+    pub capability: String,
+    /// `"auto"` (engine-discovered) or `"user"` (manually tagged).
+    pub source: String,
+}
+
+fn default_pool_size() -> i64 {
+    1
 }
 
 /// Snapshot of one per-installation setting's static metadata + current
