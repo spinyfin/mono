@@ -1769,8 +1769,8 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
-        WorkspaceCommand::RebaseOntoMain => {
-            workspace_rebase_onto_main(&mut store, database_path, runner)
+        WorkspaceCommand::Rebase => {
+            workspace_rebase(&mut store, database_path, runner)
         }
     }
 }
@@ -1975,13 +1975,14 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
     }
 }
 
-/// Rebase the current workspace's boss branch onto the latest main.
+/// Rebase the current workspace's boss branch onto the repo's integration branch.
 ///
-/// Implements `cube workspace rebase-onto-main`. Encodes the correct jj recipe
+/// Implements `cube workspace rebase`. Encodes the correct jj recipe
 /// so agents do not hand-roll it and trip over the `@origin` and
-/// `--ignore-immutable` gotchas. Safe to call multiple times (idempotent when
-/// already up-to-date).
-fn workspace_rebase_onto_main(
+/// `--ignore-immutable` gotchas. The target branch is read from the repo pool
+/// configuration (`main_branch` field) — not hardcoded. Safe to call multiple
+/// times (idempotent when already up-to-date).
+fn workspace_rebase(
     store: &mut Store,
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
@@ -2130,7 +2131,7 @@ fn workspace_rebase_onto_main(
             conflicted_files.join(", ")
         };
         eprintln!(
-            "cube: rebase-onto-main: {boss_branch_name} rebased onto {main_branch}; \
+            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch}; \
              conflicts in working copy: {file_hint}"
         );
         RunResult::new(
@@ -2149,7 +2150,7 @@ fn workspace_rebase_onto_main(
         )
     } else {
         eprintln!(
-            "cube: rebase-onto-main: {boss_branch_name} rebased onto {main_branch} cleanly"
+            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch} cleanly"
         );
         RunResult::new(
             format!(

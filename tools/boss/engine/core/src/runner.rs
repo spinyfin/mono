@@ -1893,11 +1893,12 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
         "Run the cube rebase command — it encodes the correct jj recipe automatically \
          and avoids the `@origin` / immutable-heads pitfalls agents commonly hit:\n\n\
          ```\n\
-         cube workspace rebase-onto-main\n\
+         cube workspace rebase\n\
          ```\n\n\
-         This command: fetches the latest `main` from GitHub, resolves this workspace's \
-         boss branch automatically (no branch name argument needed), rebases it onto `main` \
-         with `--ignore-immutable`, and reports a clear signal:\n\n\
+         This command: fetches the latest integration branch from GitHub, resolves this \
+         workspace's boss branch automatically (no branch name argument needed), rebases \
+         it onto the repo's configured integration branch with `--ignore-immutable`, and \
+         reports a clear signal:\n\n\
          - `REBASED_CLEAN` — no conflicts; skip to step 4 (push).\n\
          - `REBASED_WITH_CONFLICTS` — conflicts are materialized in the working copy. \
          Inspect with `jj st` and `jj resolve --list`, read the diagnosis below for what \
