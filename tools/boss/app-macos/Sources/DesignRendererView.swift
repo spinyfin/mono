@@ -127,7 +127,8 @@ struct DesignRendererView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 720)
+                .frame(maxWidth: .infinity)
             }
             .textSelection(.enabled)
             .task(id: content.filePath) {
