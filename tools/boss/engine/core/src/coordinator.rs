@@ -4116,16 +4116,14 @@ fn workspace_root_is_cube_default(workspace_root: &Path) -> bool {
 
 /// Body for the `repo_cold_pool` advisory. Mirrors the design doc Q6
 /// recommendation block so the user gets the exact `cube repo ensure`
-/// override invocation, pre-filled with this repo's origin.
+/// invocation, pre-filled with this repo's origin.
 fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
     format!(
         "First dispatch against `{repo_id}` ({origin}).\n\
          Cube auto-provisioned a pool at `{workspace_root}` with prefix `{prefix}`.\n\n\
-         To customize, run:\n\n\
+         To re-register with a non-default origin, run:\n\n\
          ```\n\
-         cube repo ensure --origin {origin} \\\n    \
-             --workspace-root ~/Documents/dev/workspaces \\\n    \
-             --workspace-prefix {repo_id}-agent\n\
+         cube repo ensure --origin {origin}\n\
          ```\n\n\
          Each pool has a configurable workspace count (concurrent workers per repo). \
          For multi-repo products this matters — see \
