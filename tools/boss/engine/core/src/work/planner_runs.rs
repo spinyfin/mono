@@ -20,7 +20,8 @@ pub struct ClaimPlannerRunInput<'a> {
 /// Patch applied by [`WorkDb::update_planner_run`]. All fields are
 /// optional: only `Some` values overwrite the stored column; `None`
 /// leaves it unchanged. Every call also bumps `updated_at` to now.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PlannerRunPatch {
     pub outcome: Option<String>,
     pub doc_ref: Option<String>,

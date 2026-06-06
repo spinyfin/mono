@@ -1803,7 +1803,8 @@ pub const PLANNER_OUTCOME_SKIPPED_ALREADY_POPULATED: &str = "skipped_already_pop
 ///
 /// Design: `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
 /// §"Durable audit trail".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PlannerRun {
     pub id: String,
     pub project_id: String,
