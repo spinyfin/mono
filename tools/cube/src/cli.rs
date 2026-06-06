@@ -53,38 +53,6 @@ pub enum RepoCommand {
         #[arg(long, conflicts_with = "reponame")]
         origin: Option<String>,
     },
-    /// [Deprecated] Add or update repo pool configuration.
-    ///
-    /// Use `cube repo ensure --origin <url>` instead. `repo ensure` infers
-    /// workspace-root, workspace-prefix, and source from sane defaults; it
-    /// also handles the full resolve-or-materialize lifecycle in one step.
-    ///
-    /// `repo add` remains for power users who need explicit overrides, but it
-    /// now derives the same defaults as `ensure` when flags are omitted, and
-    /// it no longer writes source=null (which caused a prior outage by
-    /// silently skipping the clone on a later `repo ensure`).
-    Add {
-        /// Stable repo identifier such as `mono`.
-        repo: String,
-        /// Origin URL for the repo.
-        #[arg(long)]
-        origin: String,
-        /// Integration branch name.
-        #[arg(long, default_value = "main")]
-        main_branch: String,
-        /// Root directory containing reusable workspaces.
-        /// Defaults to the same workspace root that `cube repo ensure` infers.
-        #[arg(long)]
-        workspace_root: Option<String>,
-        /// Shared prefix for workspaces in the pool.
-        /// Defaults to `{repo}-agent-`.
-        #[arg(long)]
-        workspace_prefix: Option<String>,
-        /// Source path used for future workspace creation.
-        /// Defaults to the same repo root that `cube repo ensure` infers.
-        #[arg(long)]
-        source: Option<String>,
-    },
     /// List known repo pools.
     List,
     /// Show repo pool configuration.

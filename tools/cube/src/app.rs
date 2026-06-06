@@ -293,46 +293,6 @@ fn run_repo(
                 }),
             )
         }
-        RepoCommand::Add {
-            repo,
-            origin,
-            main_branch,
-            workspace_root,
-            workspace_prefix,
-            source,
-        } => {
-            eprintln!("cube: `repo add` is deprecated — use `cube repo ensure --origin {origin}` instead.");
-            let defaults = if let Some(d) = repo_ensure_defaults {
-                d.clone()
-            } else {
-                default_repo_ensure_defaults()?
-            };
-            let workspace_root = workspace_root
-                .map(PathBuf::from)
-                .unwrap_or_else(|| defaults.workspace_root.clone());
-            let workspace_prefix = workspace_prefix
-                .unwrap_or_else(|| format!("{repo}-agent-"));
-            // Never write source=null: derive the default path when --source is omitted.
-            let source = source
-                .map(PathBuf::from)
-                .unwrap_or_else(|| defaults.repo_root.join(&repo));
-            let config = RepoRecord {
-                repo,
-                origin,
-                main_branch,
-                workspace_root,
-                workspace_prefix,
-                source: Some(source),
-                clone_command: None,
-            };
-            let record = store.upsert_repo(&config)?;
-            RunResult::new(
-                format!("Registered repo `{}`.", record.repo),
-                json!({
-                    "repo": record,
-                }),
-            )
-        }
         RepoCommand::List => {
             let repos = store.list_repos()?;
             let message = format_repo_list(&repos);
@@ -528,10 +488,10 @@ fn ensure_repo_by_name(
 /// Heal a degenerate repo record whose `source` is `None` by deriving the
 /// standard path and persisting it. Returns the (possibly updated) record.
 ///
-/// This is the fix for the incident root cause: `cube repo add` without
-/// `--source` writes `source=null`, and a later `cube repo ensure` would find
-/// the existing record and call `materialize_repo_source_if_missing`, which
-/// early-returns when `source` is `None` — so the clone was silently skipped.
+/// A repo record with `source=null` can arise from direct store writes or
+/// legacy operator scripts. A later `cube repo ensure` would find the existing
+/// record and call `materialize_repo_source_if_missing`, which early-returns
+/// when `source` is `None` — so the clone was silently skipped.
 /// Now `ensure` heals the record first so the clone always runs.
 fn heal_source_if_missing(
     store: &Store,
@@ -5088,39 +5048,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_add_and_info_round_trip() {
-        let (_tempdir, database_path) = with_database_path();
-
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            "/tmp/workspaces",
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            "/tmp/mono",
-        ]);
-        let add_result = run_with_dependencies(add, Some(&database_path), &FakeRunner::default())
-            .expect("repo add should succeed");
-        assert_eq!(add_result.message, "Registered repo `mono`.");
-        assert_eq!(add_result.payload["repo"]["repo"], "mono");
-
-        let info = Cli::parse_from(["cube", "repo", "info", "mono"]);
-        let info_result = run_with_dependencies(info, Some(&database_path), &FakeRunner::default())
-            .expect("repo info should succeed");
-        assert_eq!(
-            info_result.payload["repo"]["workspace_prefix"],
-            "mono-agent-"
-        );
-        assert_eq!(info_result.payload["repo"]["source"], "/tmp/mono");
-    }
-
-    #[test]
     fn repo_list_reports_empty_store() {
         let (_tempdir, database_path) = with_database_path();
 
@@ -5150,21 +5077,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("mono")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &defaults.repo_root.join("mono").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: Some(defaults.repo_root.join("mono")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -5200,21 +5126,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("mono");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &source_path.display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: Some(source_path.clone()),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ls_remote_symref(
@@ -5456,21 +5381,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         // Pre-register `mono` with an on-disk source so materialize is a no-op.
         std::fs::create_dir_all(defaults.repo_root.join("mono")).expect("source dir");
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &defaults.repo_root.join("mono").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: Some(defaults.repo_root.join("mono")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         // A resolver is configured, but the slug match (step 1) wins first, so
         // no clone command runs at all.
@@ -5819,33 +5743,30 @@ mod tests {
 
     #[test]
     fn repo_ensure_heals_source_null_from_prior_add() {
-        // Reproduces the incident root cause: `cube repo add` without --source
-        // writes source=null. A later `cube repo ensure` must heal the record
-        // (derive the default source path) and clone instead of silently no-op'ing.
+        // Reproduces the incident root cause: a repo record with source=null
+        // causes `cube repo ensure` to silently skip cloning. Ensure heals the
+        // record (derives the default source path) and clones instead.
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("mono");
 
-        // Register via `add` without --source → source=null in the DB.
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        // add now derives a default source, so the record will have source set.
-        // But we simulate the old broken state by setting source=null via the store
-        // after the add to ensure heal logic fires.
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        // Register a repo record, then patch source=null to simulate a degenerate record.
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: Some(source_path.clone()),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
-        // Patch the stored record to set source=null, simulating the pre-fix state
-        // where `repo add` wrote source=null.
+        // Patch the stored record to set source=null, simulating the degenerate state.
         {
             let conn = rusqlite::Connection::open(&database_path).expect("db conn");
             conn.execute(
@@ -5917,21 +5838,20 @@ mod tests {
         // Create the source dir with a .git/ but no .jj/ (pre-fix state).
         std::fs::create_dir_all(source_path.join(".git")).expect("create .git");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &source_path.display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: Some(source_path.clone()),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         // The runner must see a `jj git init --colocate` call.
         let runner = FakeRunner::new(vec![ExpectedCommand::ok(
@@ -6015,21 +5935,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "bduff",
-            "--origin",
-            "git@github.com:linkedin-sandbox/bduff.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "bduff-agent-",
-            "--source",
-            &defaults.repo_root.join("bduff").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "bduff".to_string(),
+                origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "bduff-agent-".to_string(),
+                source: Some(defaults.repo_root.join("bduff")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6056,21 +5975,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "bduff",
-            "--origin",
-            "org-132020694@github.com:linkedin-sandbox/bduff.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "bduff-agent-",
-            "--source",
-            &defaults.repo_root.join("bduff").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "bduff".to_string(),
+                origin: "org-132020694@github.com:linkedin-sandbox/bduff.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "bduff-agent-".to_string(),
+                source: Some(defaults.repo_root.join("bduff")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6098,21 +6016,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("ci-infra")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "ci-infra",
-            "--origin",
-            "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "ci-infra-agent-",
-            "--source",
-            &defaults.repo_root.join("ci-infra").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "ci-infra".to_string(),
+                origin: "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "ci-infra-agent-".to_string(),
+                source: Some(defaults.repo_root.join("ci-infra")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6140,21 +6057,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("ci-infra")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "ci-infra",
-            "--origin",
-            "git@github.com:linkedin-eng/ci-infra.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "ci-infra-agent-",
-            "--source",
-            &defaults.repo_root.join("ci-infra").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "ci-infra".to_string(),
+                origin: "git@github.com:linkedin-eng/ci-infra.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "ci-infra-agent-".to_string(),
+                source: Some(defaults.repo_root.join("ci-infra")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6181,21 +6097,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "bduff",
-            "--origin",
-            "git@github.com:linkedin-sandbox/bduff.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "bduff-agent-",
-            "--source",
-            &defaults.repo_root.join("bduff").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "bduff".to_string(),
+                origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "bduff-agent-".to_string(),
+                source: Some(defaults.repo_root.join("bduff")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6229,21 +6144,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("dev-infra")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "dev-infra",
-            "--origin",
-            "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "dev-infra-agent-",
-            "--source",
-            &defaults.repo_root.join("dev-infra").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "dev-infra".to_string(),
+                origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "dev-infra-agent-".to_string(),
+                source: Some(defaults.repo_root.join("dev-infra")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6277,21 +6191,20 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         std::fs::create_dir_all(defaults.repo_root.join("dev-infra")).expect("source dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "dev-infra",
-            "--origin",
-            "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git",
-            "--workspace-root",
-            &defaults.workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "dev-infra-agent-",
-            "--source",
-            &defaults.repo_root.join("dev-infra").display().to_string(),
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "dev-infra".to_string(),
+                origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: defaults.workspace_root.clone(),
+                workspace_prefix: "dev-infra-agent-".to_string(),
+                source: Some(defaults.repo_root.join("dev-infra")),
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let ensure = Cli::parse_from([
             "cube",
@@ -6332,19 +6245,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
@@ -6392,8 +6293,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(add_repo_cli(&workspace_root), Some(&database_path), &FakeRunner::default())
-            .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first_path = workspace_root.join("mono-agent-004");
         // lease_runner_for already encodes the fetch → bookmark-set → new
@@ -6419,8 +6319,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(add_repo_cli(&workspace_root), Some(&database_path), &FakeRunner::default())
-            .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
@@ -6456,19 +6355,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         // intentionally no workspace dirs created up front
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
@@ -6544,21 +6431,20 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "legacy",
-            "--origin",
-            "git@github.com:spinyfin/legacy.git",
-            "--main-branch",
-            "master",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "legacy-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "legacy".to_string(),
+                origin: "git@github.com:spinyfin/legacy.git".to_string(),
+                main_branch: "master".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "legacy-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let new_path = workspace_root.join("legacy-agent-001");
         let staging = workspace_root.join(".incoming-legacy-agent-001");
@@ -6627,21 +6513,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--main-branch",
-            "main",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
@@ -6714,19 +6586,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
@@ -6793,19 +6653,20 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "weird",
-            "--origin",
-            "git@github.com:spinyfin/weird.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "weird-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "weird".to_string(),
+                origin: "git@github.com:spinyfin/weird.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "weird-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         let staging = workspace_root.join(".incoming-weird-agent-001");
         let runner = FakeRunner::new(vec![
@@ -6867,19 +6728,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
@@ -6945,19 +6794,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Lease both existing workspaces first so the pool is exhausted
         for (path, task) in [
@@ -7070,19 +6907,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let preferred_path = workspace_root.join("mono-agent-005");
         let runner = FakeRunner::new(vec![
@@ -7128,19 +6953,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease takes mono-agent-005 (the preferred one).
         let preferred_path = workspace_root.join("mono-agent-005");
@@ -7211,19 +7024,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
@@ -7281,12 +7082,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-003").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first = workspace_root.join("mono-agent-003");
         let runner = FakeRunner::new(vec![
@@ -7329,12 +7125,7 @@ mod tests {
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
         std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let runner = FakeRunner::new(vec![
             // health-check 003 → dirty → skip
@@ -7393,12 +7184,7 @@ mod tests {
         let dirty_path = workspace_root.join("mono-agent-005");
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Seed the registry rows and mark mono-agent-005 dirty, mimicking a
         // crashed worker whose unpushed work was left behind. The normal
@@ -7481,12 +7267,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let runner = FakeRunner::new(vec![]);
         let err = run_with_dependencies(
@@ -7518,12 +7299,7 @@ mod tests {
         let busy_path = workspace_root.join("mono-agent-004");
         std::fs::create_dir_all(busy_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease takes mono-agent-004.
         let first_runner = FakeRunner::new(vec![
@@ -7621,12 +7397,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let runner = resume_pr_runner_for(&ws_path, 1364, "boss/exec_18b6_a1", "cafe1234");
@@ -7659,12 +7430,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let runner = resume_pr_runner_for(&ws_path, 42, "boss/exec_cold_b2", "deadc0de");
@@ -7697,12 +7463,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj"))
             .expect("ws-007 dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // --prefer mono-agent-007 → that workspace must be health-checked first
         // and then positioned on the PR head.
@@ -7737,12 +7498,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let runner = resume_pr_runner_for(&ws_path, 77, "boss/exec_fallback_d4", "b0b0b0b0");
@@ -7771,12 +7527,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let pr_json = r#"{"headRefName":"boss/exec_merged","headRefOid":"deadbeef","state":"MERGED"}"#;
@@ -7816,12 +7567,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let pr_json = r#"{"headRefName":"boss/exec_closed","headRefOid":"cafebabe","state":"CLOSED"}"#;
@@ -7861,12 +7607,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
             .expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let ws_path = workspace_root.join("mono-agent-004");
         let runner = lease_runner_for(&ws_path, "abc1234");
@@ -7895,12 +7636,7 @@ mod tests {
         std::fs::create_dir_all(conflicted_path.join(".jj")).expect("conflicted dir");
         std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let runner = FakeRunner::new(vec![
             // health-check 003 → conflicted (save as fallback, keep looking)
@@ -7951,12 +7687,7 @@ mod tests {
         std::fs::create_dir_all(path_003.join(".jj")).expect("003 dir");
         std::fs::create_dir_all(path_007.join(".jj")).expect("007 dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let runner = FakeRunner::new(vec![
             // health-check 003 → conflicted (save as first fallback)
@@ -8023,12 +7754,7 @@ mod tests {
         std::fs::create_dir_all(path_003.join(".jj")).expect("003 dir");
         std::fs::create_dir_all(path_007.join(".jj")).expect("007 dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // After health-checking 003 and 007 as dirty, the lease path falls
         // through to auto_create_workspace which clones a new workspace.
@@ -8108,12 +7834,7 @@ mod tests {
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
         std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Trigger a lease so health checks run and health_status is persisted.
         let lease_runner = FakeRunner::new(vec![
@@ -8171,12 +7892,7 @@ mod tests {
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
         std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Trigger a lease to run health checks and persist health_status.
         let lease_runner = FakeRunner::new(vec![
@@ -8236,12 +7952,7 @@ mod tests {
         let ws_path = workspace_root.join("mono-agent-003");
         std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&ws_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -8288,12 +7999,7 @@ mod tests {
         std::fs::create_dir_all(conflicted_path.join(".jj")).expect("conflicted dir");
         std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Run a lease that skips the conflicted workspace and picks the clean one.
         let lease_runner = FakeRunner::new(vec![
@@ -8343,19 +8049,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -8411,19 +8105,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -8537,19 +8219,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -8593,19 +8263,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // sync_workspaces is normally called inside lease, so trigger it
         // via list with the registry knowing about this workspace.
@@ -8626,19 +8284,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
@@ -8696,19 +8342,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
@@ -8758,23 +8392,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Sync the workspace into the registry by listing.
         // (sync runs as a side effect of operations like lease; here we
@@ -8824,23 +8442,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
@@ -8898,23 +8500,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
@@ -8967,23 +8553,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9044,23 +8614,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9111,23 +8665,7 @@ mod tests {
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9184,23 +8722,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9246,23 +8768,7 @@ mod tests {
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9307,23 +8813,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9442,23 +8932,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -9516,19 +8990,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
@@ -9613,19 +9075,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -9681,19 +9131,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -9741,19 +9179,7 @@ mod tests {
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(workspace_root.join("mono-agent-002").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let first_path = workspace_root.join("mono-agent-001");
         let runner = FakeRunner::new(vec![
@@ -9805,19 +9231,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -9893,19 +9307,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -10016,19 +9418,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
-        let add = Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
@@ -10182,19 +9572,17 @@ mod tests {
         FakeRunner::new(commands)
     }
 
-    fn add_repo_cli(workspace_root: &std::path::Path) -> Cli {
-        Cli::parse_from([
-            "cube",
-            "repo",
-            "add",
-            "mono",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-        ])
+    fn seed_mono_repo(workspace_root: &std::path::Path, database_path: &std::path::Path) {
+        let store = crate::store::Store::open_at(database_path).expect("store");
+        store.upsert_repo(&crate::metadata::RepoRecord {
+            repo: "mono".to_string(),
+            origin: "git@github.com:spinyfin/mono.git".to_string(),
+            main_branch: "main".to_string(),
+            workspace_root: workspace_root.to_path_buf(),
+            workspace_prefix: "mono-agent-".to_string(),
+            source: None,
+            clone_command: None,
+        }).expect("seed repo");
     }
 
     #[test]
@@ -10204,12 +9592,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         run_with_dependencies(
@@ -10247,12 +9630,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -10312,12 +9690,7 @@ mod tests {
         std::fs::create_dir_all(ws1_path.join(".jj")).expect("ws1 dir");
         std::fs::create_dir_all(ws2_path.join(".jj")).expect("ws2 dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Lease ws1 (001) — picks it first since it's clean. This also syncs
         // ws2 into the registry as free.
@@ -10389,12 +9762,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Lease then release to get the workspace into the registry as free.
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
@@ -10458,12 +9826,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -10517,12 +9880,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -10573,12 +9931,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -10630,12 +9983,7 @@ mod tests {
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -10685,12 +10033,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Set last_pool_gc_at to 25h ago so the next lease triggers gc.
         let old_ts = current_epoch_s().unwrap() - (25 * 60 * 60);
@@ -10729,12 +10072,7 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Set last_pool_gc_at to 1h ago — well within 24h.
         let recent_ts = current_epoch_s().unwrap() - 3600;
@@ -10782,12 +10120,7 @@ steps:
 "#,
         );
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease runs the deps step.
         let lease_runner = lease_runner_with_setup(
@@ -10870,12 +10203,7 @@ steps:
 "#,
         );
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_with_setup(
             &workspace_path,
@@ -10938,12 +10266,7 @@ steps:
 "#,
         );
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease: on-create runs once.
         let lease_runner = lease_runner_with_setup(
@@ -11024,12 +10347,7 @@ steps:
 "#,
         );
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let failing = ExpectedCommand {
             cwd: workspace_path.clone(),
@@ -11079,12 +10397,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-004");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First `jj git fetch` returns the stale-working-copy error.
         // The wrapper should run `jj workspace update-stale` once, then
@@ -11149,12 +10462,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-004");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // `jj git fetch` reports stale; `jj workspace update-stale`
         // itself fails. The lease must not pretend success — surface a
@@ -11206,12 +10514,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-004");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // `jj status` returns the op-log divergence error (exit 255,
         // "seems to be a sibling"). The wrapper should run
@@ -11275,12 +10578,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-004");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // `jj status` reports op-log divergence; `jj workspace update-stale`
         // itself fails. The lease must surface a StaleRecoveryFailed error
@@ -11333,12 +10631,7 @@ steps:
         // Simulate a workspace that has .git but no .jj.
         std::fs::create_dir_all(workspace_path.join(".git")).expect(".git dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // `jj status` returns the "no jj repo" error. The wrapper should
         // run `jj git init --colocate` once, then retry `jj status`. The
@@ -11407,12 +10700,7 @@ steps:
         // Intentionally no .jj/ or .git/ — this is the broken-empty state.
         std::fs::create_dir_all(&husk_path).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // After the husk is GC'd the pool is empty, so `next_workspace_id`
         // reuses the lowest slot. The runner expects only the clone + track +
@@ -11500,12 +10788,7 @@ steps:
         std::fs::create_dir_all(&husk_a).expect("husk a");
         std::fs::create_dir_all(&husk_b).expect("husk b");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Both husks GC'd → pool empty → fresh workspace takes the lowest slot.
         let new_path = workspace_root.join("mono-agent-001");
@@ -11568,12 +10851,7 @@ steps:
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
         std::fs::create_dir_all(&husk_path).expect("husk dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Health check visits 003 (dirty `status`) then 027 (broken-empty, no
         // jj call). The husk is GC'd; `next_workspace_id` over the surviving
@@ -11674,12 +10952,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-007");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // Seed a free row, then yank the directory out from under cube.
         {
@@ -11744,12 +11017,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -11815,12 +11083,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let lease_result = run_with_dependencies(
@@ -11889,12 +11152,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         {
             use crate::metadata::WorkspaceCandidate;
@@ -11936,40 +11194,29 @@ steps:
         std::fs::create_dir_all(workspace_root_b.join("other-agent-001").join(".jj"))
             .expect("workspace dir b");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@github.com:spinyfin/mono.git",
-                "--workspace-root",
-                &workspace_root_a.display().to_string(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo a");
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "other",
-                "--origin",
-                "git@github.com:spinyfin/other.git",
-                "--workspace-root",
-                &workspace_root_b.display().to_string(),
-                "--workspace-prefix",
-                "other-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo b");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root_a.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo a");
+            store.upsert_repo(&RepoRecord {
+                repo: "other".to_string(),
+                origin: "git@github.com:spinyfin/other.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root_b.clone(),
+                workspace_prefix: "other-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo b");
+        }
 
         // Seed both repos with one free row each, then wipe both dirs.
         {
@@ -12037,12 +11284,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let first = run_with_dependencies(
@@ -12164,12 +11406,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease — normal happy path.
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
@@ -12281,12 +11518,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
         let first = run_with_dependencies(
@@ -12351,12 +11583,7 @@ steps:
         let workspace_path = workspace_root.join("mono-agent-001");
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
-        run_with_dependencies(
-            add_repo_cli(&workspace_root),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo");
+        seed_mono_repo(&workspace_root, &database_path);
 
         // First lease — normal happy path.
         let lease_runner = lease_runner_for(&workspace_path, "abc1234");
@@ -14137,23 +13364,20 @@ steps:
         let workspace_root = tempdir.path().join("workspaces");
 
         // Register a repo.
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@example.com:org/mono.git",
-                "--workspace-root",
-                workspace_root.to_str().unwrap(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         // Populate two workspace rows directly via the store.
         {
@@ -14205,23 +13429,20 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
-        run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "repo",
-                "add",
-                "mono",
-                "--origin",
-                "git@example.com:org/mono.git",
-                "--workspace-root",
-                workspace_root.to_str().unwrap(),
-                "--workspace-prefix",
-                "mono-agent-",
-            ]),
-            Some(&database_path),
-            &FakeRunner::default(),
-        )
-        .expect("repo add");
+        {
+            use crate::metadata::RepoRecord;
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).expect("store");
+            store.upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            }).expect("seed repo");
+        }
 
         // Populate and lease one workspace.
         {
