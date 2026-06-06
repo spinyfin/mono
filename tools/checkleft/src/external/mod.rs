@@ -122,11 +122,21 @@ pub enum ExternalCheckPackageImplementation {
 }
 
 /// A WebAssembly Component Model check package parsed from a `mode = "component"`
-/// manifest.
+/// manifest, or assembled by the bundled provider from embedded bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckComponentPackage {
+    /// Repo-root-relative path to the `.wasm` artifact on disk. Empty for
+    /// bundled packages where the bytes are embedded via `artifact_bytes`.
     pub artifact_path: String,
     pub artifact_sha256: String,
+    /// Bytes embedded at compile time for first-party (bundled) components.
+    /// When `Some`, the executor loads these bytes directly instead of reading
+    /// `artifact_path` from disk. `artifact_path` is empty in this case.
+    pub artifact_bytes: Option<&'static [u8]>,
+    /// The check name to pass to `run-check`. For single-check manifests this
+    /// always equals the package `id`. For multi-check component bundles it
+    /// selects the specific export within the component.
+    pub check_name: String,
     pub limits: Option<ExternalCheckComponentLimits>,
     /// Optional allowlist of check IDs exported by this component. When present,
     /// must agree with what `list-checks` returns (defense-in-depth).
@@ -359,6 +369,7 @@ impl RawExternalCheckPackage {
             RawExternalCheckMode::Component => {
                 reject_declarative_fields(&declarative)?;
                 ExternalCheckPackageImplementation::Component(validate_component_implementation(
+                    &id,
                     artifact_path,
                     artifact_sha256,
                     limits,
@@ -389,6 +400,7 @@ impl RawExternalCheckPackage {
 }
 
 fn validate_component_implementation(
+    id: &str,
     artifact_path: Option<String>,
     artifact_sha256: Option<String>,
     limits: Option<RawExternalCheckComponentLimits>,
@@ -407,6 +419,8 @@ fn validate_component_implementation(
     Ok(ExternalCheckComponentPackage {
         artifact_path: required_some_relative_path_string("artifact_path", artifact_path)?,
         artifact_sha256: required_some_sha256("artifact_sha256", artifact_sha256)?,
+        artifact_bytes: None,
+        check_name: id.to_owned(),
         limits: validated_limits,
         checks: checks_allowlist,
         provenance,

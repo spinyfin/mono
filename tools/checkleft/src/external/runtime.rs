@@ -16,8 +16,9 @@ use super::component_bindings::Check as WitCheck;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
-    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCommandCapabilities, run_declarative_check,
+    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckComponentPackage,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCommandCapabilities,
+    run_declarative_check,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -277,93 +278,57 @@ impl DefaultExternalCheckExecutor {
             .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
         validate_artifact_sha256(package, artifact, &component_bytes)?;
 
-        let component = compile_component(&self.engine, &package.id, &component_bytes)?;
-        let linker = build_component_v1_linker(&self.engine)?;
+        run_component_check(
+            &self.engine,
+            &self.root,
+            package,
+            &package.id,
+            &component_bytes,
+            changeset,
+            source_tree,
+            config,
+        )
+    }
 
-        // Phase 1: instantiate with an empty WASI context (no preopens) to call
-        // list-checks() and discover the check's declared access-scope. The
-        // descriptor is purely static metadata; no filesystem access is needed.
-        let descriptors = {
-            let mut store = Store::new(&self.engine, HostState::with_empty_wasi());
-            configure_store_fuel(&mut store)?;
-            let instance = wasmtime(linker.instantiate(&mut store, &component))
-                .with_context(|| {
-                    format!("failed to instantiate component for `{}`", package.id)
-                })?;
-            let bindings = wasmtime(WitCheck::new(&mut store, &instance))
-                .with_context(|| {
-                    format!("failed to bind component exports for `{}`", package.id)
-                })?;
-            wasmtime(bindings.call_list_checks(&mut store))
-                .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?
+    fn execute_component_check(
+        &self,
+        package: &ExternalCheckPackage,
+        component: &ExternalCheckComponentPackage,
+        changeset: &ChangeSet,
+        source_tree: &dyn SourceTree,
+        config: &toml::Value,
+    ) -> Result<CheckResult> {
+        let component_bytes = if let Some(bytes) = component.artifact_bytes {
+            bytes.to_vec()
+        } else {
+            let artifact_path = self.resolve_artifact_path(&component.artifact_path)?;
+            fs::read(&artifact_path).with_context(|| {
+                format!("failed to read wasm artifact {}", artifact_path.display())
+            })?
         };
 
-        let check_name = &package.id;
-        let descriptor = descriptors
-            .iter()
-            .find(|d| d.name == *check_name)
-            .ok_or_else(|| {
-                let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-                anyhow::anyhow!(
-                    "component `{}` does not export a check named `{}`; available: [{}]",
-                    package.id,
-                    check_name,
-                    exported.join(", ")
-                )
-            })?;
-
-        let access_scope = lift_access_scope(descriptor.access_scope.as_ref());
-
-        // Build the capability sandbox from the declared scope. Files outside
-        // the scope are not materialized; the guest cannot name them.
-        let ceiling = HostCeiling::new(&self.root);
-        let sandbox = create_sandbox(changeset, access_scope, source_tree, &ceiling)
-            .with_context(|| format!("failed to create FS sandbox for check `{}`", package.id))?;
-
-        // Phase 2: re-instantiate with a WASI context that preopens the sandbox
-        // root at "/". The guest reads via std::fs with no checkleft-specific
-        // call; enforcement is structural (only sandboxed files exist).
-        let host_state = HostState::with_sandbox_root(sandbox.root.path()).with_context(|| {
-            format!("failed to configure WASI context for check `{}`", package.id)
-        })?;
-        let mut store = Store::new(&self.engine, host_state);
-        configure_store_fuel(&mut store)?;
-        let instance = wasmtime(linker.instantiate(&mut store, &component))
-            .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
-        let bindings = wasmtime(WitCheck::new(&mut store, &instance))
-            .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
-
-        let input = lower_check_input(changeset, config)?;
-        let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input))
-            .with_context(|| {
-                format!(
-                    "`run-check` call failed for check `{}` in component `{}`",
-                    check_name, package.id
-                )
-            })?;
-
-        let findings = run_result.map_err(|e| match e {
-            wit_types::CheckError::UnknownCheck(name) => anyhow::anyhow!(
-                "component `{}` does not know check `{}` (list-checks validation passed)",
+        let actual_sha256 = sha256_hex(&component_bytes);
+        if actual_sha256 != component.artifact_sha256 {
+            bail!(
+                "artifact sha256 mismatch for component package `{}` (artifact_path `{}`): \
+                 expected `{}`, got `{}`",
                 package.id,
-                name
-            ),
-            wit_types::CheckError::Failed(msg) => anyhow::anyhow!(
-                "check `{}` in component `{}` failed: {}",
-                check_name,
-                package.id,
-                msg
-            ),
-        })?;
+                component.artifact_path,
+                component.artifact_sha256,
+                actual_sha256
+            );
+        }
 
-        // `sandbox` is kept alive until here so the preopened directory persists
-        // for the entire run-check call above.
-        drop(sandbox);
-
-        Ok(CheckResult {
-            check_id: package.id.clone(),
-            findings: findings.into_iter().map(lift_finding).collect(),
-        })
+        run_component_check(
+            &self.engine,
+            &self.root,
+            package,
+            &component.check_name,
+            &component_bytes,
+            changeset,
+            source_tree,
+            config,
+        )
     }
 
     fn resolve_artifact_path(&self, artifact_path: &str) -> Result<PathBuf> {
@@ -384,14 +349,8 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
     ) -> Result<CheckResult> {
         match &package.implementation {
-            ExternalCheckPackageImplementation::Component(_component) => {
-                // Component-model executor is implemented in T3/T8. Packages
-                // parsed from `mode = "component"` manifests land here once the
-                // full runtime is wired up.
-                bail!(
-                    "component-model runtime for package `{}` is not yet implemented",
-                    package.id
-                )
+            ExternalCheckPackageImplementation::Component(component) => {
+                self.execute_component_check(package, component, changeset, source_tree, config)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
                 if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
@@ -547,6 +506,104 @@ fn call_component_run(
 
 fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
     wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
+}
+
+/// Instantiate a component from raw bytes and execute the named check via the
+/// `list-checks` / `run-check` WIT interface. Shared by both the file-based
+/// (`Component` implementation variant) and the legacy artifact-wrapped
+/// (`Artifact` with `runtime = "component-v1"`) execution paths.
+fn run_component_check(
+    engine: &Engine,
+    root: &Path,
+    package: &ExternalCheckPackage,
+    check_name: &str,
+    component_bytes: &[u8],
+    changeset: &ChangeSet,
+    source_tree: &dyn SourceTree,
+    config: &toml::Value,
+) -> Result<CheckResult> {
+    let component = compile_component(engine, &package.id, component_bytes)?;
+    let linker = build_component_v1_linker(engine)?;
+
+    // Phase 1: instantiate with an empty WASI context (no preopens) to call
+    // list-checks() and discover the check's declared access-scope. The
+    // descriptor is purely static metadata; no filesystem access is needed.
+    let descriptors = {
+        let mut store = Store::new(engine, HostState::with_empty_wasi());
+        configure_store_fuel(&mut store)?;
+        let instance = wasmtime(linker.instantiate(&mut store, &component))
+            .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
+        let bindings = wasmtime(WitCheck::new(&mut store, &instance))
+            .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
+        wasmtime(bindings.call_list_checks(&mut store))
+            .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?
+    };
+
+    let descriptor = descriptors
+        .iter()
+        .find(|d| d.name == check_name)
+        .ok_or_else(|| {
+            let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+            anyhow::anyhow!(
+                "component `{}` does not export a check named `{}`; available: [{}]",
+                package.id,
+                check_name,
+                exported.join(", ")
+            )
+        })?;
+
+    let access_scope = lift_access_scope(descriptor.access_scope.as_ref());
+
+    // Build the capability sandbox from the declared scope. Files outside
+    // the scope are not materialized; the guest cannot name them.
+    let ceiling = HostCeiling::new(root);
+    let sandbox = create_sandbox(changeset, access_scope, source_tree, &ceiling)
+        .with_context(|| format!("failed to create FS sandbox for check `{}`", package.id))?;
+
+    // Phase 2: re-instantiate with a WASI context that preopens the sandbox
+    // root at "/". The guest reads via std::fs with no checkleft-specific
+    // call; enforcement is structural (only sandboxed files exist).
+    let host_state = HostState::with_sandbox_root(sandbox.root.path()).with_context(|| {
+        format!("failed to configure WASI context for check `{}`", package.id)
+    })?;
+    let mut store = Store::new(engine, host_state);
+    configure_store_fuel(&mut store)?;
+    let instance = wasmtime(linker.instantiate(&mut store, &component))
+        .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
+    let bindings = wasmtime(WitCheck::new(&mut store, &instance))
+        .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
+
+    let input = lower_check_input(changeset, config)?;
+    let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input))
+        .with_context(|| {
+            format!(
+                "`run-check` call failed for check `{}` in component `{}`",
+                check_name, package.id
+            )
+        })?;
+
+    let findings = run_result.map_err(|e| match e {
+        wit_types::CheckError::UnknownCheck(name) => anyhow::anyhow!(
+            "component `{}` does not know check `{}` (list-checks validation passed)",
+            package.id,
+            name
+        ),
+        wit_types::CheckError::Failed(msg) => anyhow::anyhow!(
+            "check `{}` in component `{}` failed: {}",
+            check_name,
+            package.id,
+            msg
+        ),
+    })?;
+
+    // `sandbox` is kept alive until here so the preopened directory persists
+    // for the entire run-check call above.
+    drop(sandbox);
+
+    Ok(CheckResult {
+        check_id: package.id.clone(),
+        findings: findings.into_iter().map(lift_finding).collect(),
+    })
 }
 
 fn write_memory(memory: &Memory, store: &mut Store<()>, offset: usize, bytes: &[u8]) -> Result<()> {

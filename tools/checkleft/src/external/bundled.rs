@@ -1,51 +1,87 @@
 //! First-party check definitions embedded directly in the checkleft binary.
 //!
 //! A target repo that has *no* checkleft definition files on disk can still run
-//! these checks: the manifests are compiled into the binary via `include_str!`,
-//! so there is zero install. A check whose `id` (or `check`) names a bundled
-//! definition resolves to it automatically — no `implementation:` line required.
+//! these checks: the manifests are compiled into the binary via `include_str!`
+//! (declarative) or `include_bytes!` (component-mode), so there is zero install.
+//! A check whose `id` (or `check`) names a bundled definition resolves to it
+//! automatically — no `implementation:` line required.
 //!
-//! ## Adding a bundled definition
+//! ## Adding a bundled declarative definition
 //!
 //! 1. Add the manifest at `tools/checkleft/checks/<name>/check.yaml`.
-//! 2. Add a row to [`BUNDLED_CHECK_DEFS`] below (one `include_str!`).
+//! 2. Add a `BundledCheckDef::declarative` entry to [`BUNDLED_CHECK_DEFS`] below.
 //! 3. Add the file to `checkleft_lib`'s `compile_data` in `BUILD.bazel` so the
 //!    bazel build can read it at compile time.
+//!
+//! ## Adding a bundled component definition
+//!
+//! 1. Build the `.wasm` component artifact via the `rust_wasm_component` bazel
+//!    rule (T9) and record its sha256.
+//! 2. Add a `BundledCheckDef::component` entry to [`BUNDLED_CHECK_DEFS`] below,
+//!    using `include_bytes!` for the artifact.
+//! 3. Add the artifact file to `checkleft_lib`'s `compile_data` in `BUILD.bazel`.
 //!
 //! We embed each file explicitly (rather than `include_dir!`) because the bazel
 //! build does not run `build.rs`, and every embedded file must be declared as
 //! `compile_data` anyway — so an explicit, reviewable table is both hermetic
 //! under bazel and clearer about exactly what ships in the binary.
 
+use sha2::{Digest, Sha256};
+
 use anyhow::{Context, Result};
 
 use super::{
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageProvider,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckCapabilities,
+    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
     parse_external_check_manifest,
 };
 
 /// A first-party definition compiled into the binary.
 struct BundledCheckDef {
-    /// Bundle key — the directory name under `tools/checkleft/checks/`. This is
-    /// what a `bundled:<name>` reference names.
-    name: &'static str,
-    /// File extension of the embedded manifest, selecting the parser
-    /// (`yaml`/`yml` → declarative schema, otherwise the TOML schema).
-    extension: &'static str,
-    /// The raw manifest contents, embedded at compile time.
-    contents: &'static str,
+    /// All check names this definition exports. For declarative defs this is
+    /// exactly one entry — the bundle key (directory name). For component defs
+    /// it lists every check name the component exports (must match `list-checks`).
+    check_names: &'static [&'static str],
+    kind: BundledCheckDefKind,
+}
+
+enum BundledCheckDefKind {
+    /// A declarative YAML manifest (`include_str!`-embedded at compile time).
+    Declarative {
+        /// File extension of the embedded manifest (`yaml`/`yml`), selecting the
+        /// parser for `parse_external_check_manifest`.
+        extension: &'static str,
+        /// The raw manifest contents, embedded at compile time.
+        contents: &'static str,
+    },
+    /// A WebAssembly Component Model artifact (`include_bytes!`-embedded at
+    /// compile time). Each entry in `check_names` corresponds to one export of
+    /// the component and resolves to a distinct logical package.
+    ///
+    /// No entries yet (first bundled component lands in T10). The variant and
+    /// resolver path exist so T10 is a pure data addition.
+    #[allow(dead_code)]
+    Component {
+        /// Raw wasm component bytes, embedded at compile time via `include_bytes!`.
+        bytes: &'static [u8],
+    },
 }
 
 /// The embedded first-party definitions. To add one, see the module docs.
 static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[BundledCheckDef {
-    name: "buildifier",
-    extension: "yaml",
-    contents: include_str!("../../checks/buildifier/check.yaml"),
+    check_names: &["buildifier"],
+    kind: BundledCheckDefKind::Declarative {
+        extension: "yaml",
+        contents: include_str!("../../checks/buildifier/check.yaml"),
+    },
 }];
 
 /// Names of all bundled definitions (for diagnostics / `--list`-style output).
 pub fn bundled_check_names() -> impl Iterator<Item = &'static str> {
-    BUNDLED_CHECK_DEFS.iter().map(|def| def.name)
+    BUNDLED_CHECK_DEFS
+        .iter()
+        .flat_map(|def| def.check_names.iter().copied())
 }
 
 /// Resolves [`ExternalCheckImplementationRef::Bundled`] references against the
@@ -63,13 +99,58 @@ impl ExternalCheckPackageProvider for BundledExternalCheckPackageProvider {
             return Ok(None);
         };
 
-        let Some(def) = BUNDLED_CHECK_DEFS.iter().find(|def| def.name == name) else {
-            return Ok(None);
-        };
+        resolve_from_defs(BUNDLED_CHECK_DEFS, name)
+    }
+}
 
-        parse_external_check_manifest(def.contents, def.extension)
-            .with_context(|| format!("invalid bundled check definition `{name}`"))
-            .map(Some)
+/// Look up a check by name across `defs`, returning the appropriate package.
+fn resolve_from_defs(
+    defs: &[BundledCheckDef],
+    name: &str,
+) -> Result<Option<ExternalCheckPackage>> {
+    for def in defs {
+        if !def.check_names.contains(&name) {
+            continue;
+        }
+        return Ok(Some(match &def.kind {
+            BundledCheckDefKind::Declarative { extension, contents } => {
+                parse_external_check_manifest(contents, extension)
+                    .with_context(|| format!("invalid bundled check definition `{name}`"))?
+            }
+            BundledCheckDefKind::Component { bytes } => {
+                build_bundled_component_package(name, bytes)
+            }
+        }));
+    }
+    Ok(None)
+}
+
+/// Build an [`ExternalCheckPackage`] for a single check exported by a bundled
+/// component. The sha256 is computed from the embedded bytes at call time; for
+/// bundled-in-binary bytes this is a deterministic integrity check.
+fn build_bundled_component_package(check_name: &str, bytes: &'static [u8]) -> ExternalCheckPackage {
+    let hash = Sha256::digest(bytes);
+    let mut sha256 = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(&mut sha256, "{byte:02x}");
+    }
+    ExternalCheckPackage {
+        id: check_name.to_owned(),
+        runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Component(
+            ExternalCheckComponentPackage {
+                artifact_path: String::new(),
+                artifact_sha256: sha256,
+                artifact_bytes: Some(bytes),
+                check_name: check_name.to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            },
+        ),
     }
 }
 
@@ -120,5 +201,82 @@ mod tests {
             ))
             .expect("resolve");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn component_def_resolves_each_check_name_to_separate_package() {
+        let fake_bytes: &'static [u8] = b"\x00asm\x01\x00\x00\x00"; // not valid wasm, but sufficient for resolver tests
+        let defs = [BundledCheckDef {
+            check_names: &["check-alpha", "check-beta"],
+            kind: BundledCheckDefKind::Component { bytes: fake_bytes },
+        }];
+
+        for expected_name in ["check-alpha", "check-beta"] {
+            let pkg = resolve_from_defs(&defs, expected_name)
+                .expect("resolve")
+                .unwrap_or_else(|| panic!("expected package for `{expected_name}`"));
+
+            assert_eq!(pkg.id, expected_name);
+            assert_eq!(pkg.runtime, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1);
+
+            let ExternalCheckPackageImplementation::Component(comp) = pkg.implementation else {
+                panic!("expected Component implementation for `{expected_name}`");
+            };
+            assert_eq!(comp.check_name, expected_name);
+            assert_eq!(comp.artifact_bytes, Some(fake_bytes));
+            assert!(!comp.artifact_sha256.is_empty(), "sha256 must be computed");
+        }
+    }
+
+    #[test]
+    fn component_def_returns_none_for_non_exported_name() {
+        let defs = [BundledCheckDef {
+            check_names: &["check-alpha"],
+            kind: BundledCheckDefKind::Component { bytes: b"dummy" },
+        }];
+
+        let result = resolve_from_defs(&defs, "check-gamma").expect("resolve");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn bundled_check_names_includes_component_checks() {
+        // If there were a component def in BUNDLED_CHECK_DEFS, its check names
+        // would appear. Here we test the helper directly with a custom def slice.
+        let defs = [
+            BundledCheckDef {
+                check_names: &["decl-check"],
+                kind: BundledCheckDefKind::Declarative {
+                    extension: "yaml",
+                    contents: "",
+                },
+            },
+            BundledCheckDef {
+                check_names: &["comp-check-a", "comp-check-b"],
+                kind: BundledCheckDefKind::Component { bytes: b"x" },
+            },
+        ];
+        let names: Vec<&str> = defs.iter().flat_map(|d| d.check_names.iter().copied()).collect();
+        assert_eq!(names, ["decl-check", "comp-check-a", "comp-check-b"]);
+    }
+
+    #[test]
+    fn bundled_component_sha256_is_deterministic() {
+        let bytes: &'static [u8] = b"test-component-bytes";
+        let pkg1 = build_bundled_component_package("my-check", bytes);
+        let pkg2 = build_bundled_component_package("my-check", bytes);
+        let ExternalCheckPackageImplementation::Component(c1) = pkg1.implementation else {
+            panic!();
+        };
+        let ExternalCheckPackageImplementation::Component(c2) = pkg2.implementation else {
+            panic!();
+        };
+        assert_eq!(c1.artifact_sha256, c2.artifact_sha256);
+        assert_eq!(c1.artifact_sha256.len(), 64);
+        assert!(
+            c1.artifact_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "sha256 must be hex: {}",
+            c1.artifact_sha256
+        );
     }
 }

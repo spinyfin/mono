@@ -1019,3 +1019,99 @@ fn single_config_file_produces_no_coexistence_violation() {
         "expected no diagnostics for a single config file, got: {diagnostics:?}"
     );
 }
+
+#[test]
+fn exec_paths_resolves_component_check_from_toml_manifest() {
+    let temp = tempdir().expect("create temp dir");
+    // Lay down a component-mode check.toml (no yaml present for this check).
+    let defs_dir = temp.path().join("checks/my-component-check");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    fs::write(
+        defs_dir.join("check.toml"),
+        r#"
+id = "my-component-check"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "checks/my_component_check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#,
+    )
+    .expect("write component manifest");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["checks"]
+
+[[checks]]
+id = "my-component-check"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("my-component-check").expect("check exists");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::File(
+            Path::new("checks/my-component-check/check.toml").to_path_buf()
+        ))
+    );
+}
+
+#[test]
+fn exec_paths_yaml_wins_over_toml_when_both_present() {
+    // check.yaml takes precedence over check.toml in the same directory.
+    let temp = tempdir().expect("create temp dir");
+    let defs_dir = temp.path().join("checks/dual-format-check");
+    fs::create_dir_all(&defs_dir).expect("create def dir");
+    fs::write(
+        defs_dir.join("check.yaml"),
+        "id: dual-format-check\n",
+    )
+    .expect("write yaml def");
+    fs::write(
+        defs_dir.join("check.toml"),
+        r#"
+id = "dual-format-check"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "checks/dual.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#,
+    )
+    .expect("write toml def");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[check_definitions]
+exec_paths = ["checks"]
+
+[[checks]]
+id = "dual-format-check"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("dual-format-check").expect("check exists");
+    // yaml wins (checked first in find_in_exec_paths)
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::File(
+            Path::new("checks/dual-format-check/check.yaml").to_path_buf()
+        ))
+    );
+}
