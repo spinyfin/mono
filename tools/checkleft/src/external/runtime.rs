@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Instance, Memory, Module, Store};
+use wasmtime::{Config, Engine, Instance, Memory, Module, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
@@ -16,9 +18,9 @@ use super::component_bindings::Check as WitCheck;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
-    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckComponentPackage,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCommandCapabilities,
-    run_declarative_check,
+    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckComponentLimits,
+    ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCommandCapabilities, run_declarative_check,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -28,15 +30,66 @@ const INPUT_OFFSET: usize = 0;
 const WASM_PAGE_SIZE_BYTES: usize = 65_536;
 const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
 
+/// Default wall-clock timeout for component-v1 checks (5 seconds).
+pub(crate) const DEFAULT_COMPONENT_TIMEOUT_MS: u64 = 5_000;
+/// Default memory cap for component-v1 checks (256 MiB).
+pub(crate) const DEFAULT_COMPONENT_MAX_MEMORY_MB: u64 = 256;
+/// Maximum timeout a manifest may request (30 seconds). Requests above this
+/// are silently clamped so out-of-tree manifests cannot hang the host.
+pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 30_000;
+/// Maximum memory a manifest may request (512 MiB). Requests above this are
+/// silently clamped so out-of-tree manifests cannot exhaust host memory.
+pub(crate) const HOST_CEILING_MAX_MEMORY_MB: u64 = 512;
+
+/// Per-millisecond epoch tick interval — the ticker thread wakes up this often
+/// and calls `Engine::increment_epoch`, giving ~1 ms timeout resolution.
+const EPOCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Sentinel epoch delta for stores that must never be interrupted by epoch.
+/// `wasmtime::Store::set_epoch_deadline(delta)` computes `current_epoch + delta`
+/// without saturation, so using `u64::MAX` would overflow if the ticker has
+/// already advanced the epoch. `u64::MAX / 2` is still ~292 million years at
+/// 1ms/tick and will not overflow for any plausible `current_epoch`.
+const EPOCH_DEADLINE_NEVER: u64 = u64::MAX / 2;
+
+/// Memory `ResourceLimiter` installed on every component-v1 store. Rejects
+/// memory growth requests that would push the linear memory beyond `max_bytes`.
+struct MemoryLimiter {
+    max_bytes: usize,
+}
+
+impl ResourceLimiter for MemoryLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        Ok(desired <= self.max_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> std::result::Result<bool, wasmtime::Error> {
+        Ok(true)
+    }
+}
+
 /// Host data threaded through the wasmtime `Store` for component-v1 execution.
 ///
 /// Holds the WASI context (filesystem preopens, stdio, env) and the resource
-/// table required by `WasiView`. Phase-1 stores use an empty context (no
-/// preopens) so that `list-checks` can be called to discover the access scope;
-/// phase-2 stores use a context preopened at the capability sandbox root.
+/// table required by `WasiView`, plus a `MemoryLimiter`. Phase-1 stores use an
+/// empty context (no preopens) so that `list-checks` can be called to discover
+/// the access scope; phase-2 stores use a context preopened at the capability
+/// sandbox root. The `limiter` field is uncapped (`usize::MAX`) for WASI-path
+/// stores and set from manifest limits for the artifact-v1 path.
 struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
+    limiter: MemoryLimiter,
 }
 
 impl WasiView for HostState {
@@ -49,13 +102,18 @@ impl WasiView for HostState {
 }
 
 impl HostState {
-    /// Build host state with no filesystem preopens. Used for the `list-checks`
-    /// discovery phase, which must not touch the filesystem.
-    fn with_empty_wasi() -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
+            limiter: MemoryLimiter { max_bytes },
         }
+    }
+
+    /// Build host state with no filesystem preopens. Used for the `list-checks`
+    /// discovery phase, which must not touch the filesystem.
+    fn with_empty_wasi() -> Self {
+        Self::new(usize::MAX)
     }
 
     /// Build host state with the sandbox root preopened read-only at `"/"`.
@@ -66,7 +124,45 @@ impl HostState {
         Ok(Self {
             ctx: builder.build(),
             table: ResourceTable::new(),
+            limiter: MemoryLimiter { max_bytes: usize::MAX },
         })
+    }
+}
+
+/// Background thread that increments the engine's epoch counter every
+/// millisecond. Stores that set an epoch deadline will be interrupted after
+/// approximately `timeout_ms` ticks, giving wall-clock timeout semantics.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Arc<Engine>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("checkleft-epoch-ticker".to_owned())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(EPOCH_TICK_INTERVAL);
+                    engine.increment_epoch();
+                }
+            })
+            .expect("failed to spawn epoch ticker thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -116,7 +212,8 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
 
 pub struct DefaultExternalCheckExecutor {
     root: PathBuf,
-    engine: Engine,
+    engine: Arc<Engine>,
+    _ticker: EpochTicker,
 }
 
 impl DefaultExternalCheckExecutor {
@@ -132,9 +229,14 @@ impl DefaultExternalCheckExecutor {
             bail!("check runtime root is not a directory: {}", root.display());
         }
 
-        let engine = build_wasmtime_engine()?;
+        let engine = Arc::new(build_wasmtime_engine()?);
+        let ticker = EpochTicker::start(Arc::clone(&engine));
 
-        Ok(Self { root, engine })
+        Ok(Self {
+            root,
+            engine,
+            _ticker: ticker,
+        })
     }
 
     fn execute_artifact(
@@ -188,6 +290,10 @@ impl DefaultExternalCheckExecutor {
             .map_err(CoreArtifactExecutionError::mismatch)?;
         let mut store = Store::new(&self.engine, ());
         configure_store_fuel(&mut store).map_err(CoreArtifactExecutionError::execution)?;
+        // The core (sandbox-v1) path uses fuel for throttling, not epoch. Set
+        // the epoch deadline to u64::MAX so the always-enabled epoch mechanism
+        // does not interrupt this store — wasmtime defaults to 0 (immediate trap).
+        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
 
         let instance = instantiate_core_module(&mut store, &module, package.id.as_str())
             .map_err(CoreArtifactExecutionError::mismatch)?;
@@ -248,6 +354,8 @@ impl DefaultExternalCheckExecutor {
         let linker = Linker::<()>::new(&self.engine);
         let mut store = Store::new(&self.engine, ());
         configure_store_fuel(&mut store)?;
+        // Legacy path uses fuel; disable epoch the same way as execute_core_artifact.
+        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
         let instance = instantiate_component(&linker, &mut store, &component, package.id.as_str())?;
         let run = get_component_run_function(&instance, &mut store)?;
 
@@ -265,10 +373,14 @@ impl DefaultExternalCheckExecutor {
         })
     }
 
+    /// Execute a component-v1 (WIT) artifact. Applies epoch-based deadline and
+    /// memory `ResourceLimiter` from `limits`, falling back to generous defaults
+    /// clamped by the host ceiling. Pass `None` for `limits` to use defaults.
     fn execute_component_v1_artifact(
         &self,
         package: &ExternalCheckPackage,
         artifact: &ExternalCheckArtifactPackage,
+        _limits: Option<&ExternalCheckComponentLimits>,
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
@@ -367,11 +479,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
             ExternalCheckPackageImplementation::Artifact(artifact) => {
                 match package.runtime.as_str() {
                     EXTERNAL_CHECK_COMPONENT_RUNTIME_V1 => self.execute_component_v1_artifact(
-                        package,
-                        artifact,
-                        changeset,
-                        source_tree,
-                        config,
+                        package, artifact, None, changeset, source_tree, config,
                     ),
                     EXTERNAL_CHECK_RUNTIME_V1 => {
                         let command_capabilities =
@@ -401,9 +509,39 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     }
 }
 
+/// Resolve the effective timeout and memory cap for a component-v1 execution.
+/// Manifest overrides are clamped to the host ceiling so out-of-tree manifests
+/// cannot grant themselves unbounded resources.
+///
+/// Returns `(timeout_ms, max_memory_bytes)`.
+fn resolve_component_limits(limits: Option<&ExternalCheckComponentLimits>) -> (u64, usize) {
+    let timeout_ms = limits
+        .and_then(|l| l.timeout_ms)
+        .unwrap_or(DEFAULT_COMPONENT_TIMEOUT_MS)
+        .min(HOST_CEILING_TIMEOUT_MS);
+
+    let max_memory_mb = limits
+        .and_then(|l| l.max_memory_mb)
+        .unwrap_or(DEFAULT_COMPONENT_MAX_MEMORY_MB)
+        .min(HOST_CEILING_MAX_MEMORY_MB);
+
+    let max_memory_bytes = (max_memory_mb as usize).saturating_mul(1024 * 1024);
+    (timeout_ms, max_memory_bytes)
+}
+
+/// Returns `true` if `err` was caused by a wasmtime epoch-interruption trap.
+fn is_interrupt_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<wasmtime::Trap>()
+            .map_or(false, |t| *t == wasmtime::Trap::Interrupt)
+    })
+}
+
 fn build_wasmtime_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    config.epoch_interruption(true);
     config.consume_fuel(true);
 
     Ok(wasmtime(Engine::new(&config)).context("failed to initialize Wasmtime engine")?)
