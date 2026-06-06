@@ -133,7 +133,8 @@ impl CapabilitySet {
 
 /// Static data-half of a driver: binary, file layout, display labels.
 /// The behavioural half is the `AgentDriver` trait methods.
-#[derive(Debug, Clone)]
+#[derive(bon::Builder, Debug, Clone)]
+#[builder(on(String, into))]
 pub struct DriverDescriptor {
     /// Canonical slug in `tasks.driver` and CLI `--driver` flag
     /// (e.g. `"claude"`, `"copilot"`, `"codex"`).

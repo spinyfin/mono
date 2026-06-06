@@ -60,7 +60,7 @@ impl AgentDriver for ClaudeDriver {
         _settings_path: Option<&Path>,
         _non_opus_auto_mode: bool,
     ) -> String {
-        // TODO(driver-spawn): extract from effort::SpawnConfig::claude_invocation
+        // TODO(@brianduff,2026-12-31): extract from effort::SpawnConfig::claude_invocation
         unimplemented!("extracted in the Spawn capability task")
     }
 
@@ -70,22 +70,22 @@ impl AgentDriver for ClaudeDriver {
         _prompt_text: &str,
         _run_id: &str,
     ) -> anyhow::Result<()> {
-        // TODO(driver-workspace): extract from worker_setup::write_workspace_files
+        // TODO(@brianduff,2026-12-31): extract from worker_setup::write_workspace_files
         unimplemented!("extracted in the WorkspaceProvisioning task")
     }
 
     async fn write_permission_config(&self, _dest_dir: &Path) -> anyhow::Result<PathBuf> {
-        // TODO(driver-permission): extract from worker_setup::render_settings_json
+        // TODO(@brianduff,2026-12-31): extract from worker_setup::render_settings_json
         unimplemented!("extracted in the PermissionPolicy task")
     }
 
     fn agent_rules_preamble(&self) -> &'static str {
-        // TODO(driver-prompt): extract from worker_setup::render_claude_md
+        // TODO(@brianduff,2026-12-31): extract from worker_setup::render_claude_md
         unimplemented!("extracted in the PromptComposition task")
     }
 
     fn classify_error(&self, _raw_output: &str) -> WorkerErrorClass {
-        // TODO(driver-control): extract from transient_error::classify_claude_error
+        // TODO(@brianduff,2026-12-31): extract from transient_error::classify_claude_error
         unimplemented!("extracted in the ControlVerbs task")
     }
 }
