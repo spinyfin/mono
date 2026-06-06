@@ -30,6 +30,7 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -94,6 +95,7 @@ fn rescan_skips_gated_active_chore_silently() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -108,6 +110,7 @@ fn rescan_skips_gated_active_chore_silently() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -169,6 +172,7 @@ fn records_failed_execution_start_attempt() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -223,6 +227,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -309,6 +314,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -403,6 +409,7 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -459,6 +466,7 @@ fn dependency_add_list_and_remove_round_trip() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -473,6 +481,7 @@ fn dependency_add_list_and_remove_round_trip() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -595,6 +604,7 @@ fn dependency_add_refuses_cross_product_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -609,6 +619,7 @@ fn dependency_add_refuses_cross_product_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -654,6 +665,7 @@ fn deleting_a_task_drops_its_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -668,6 +680,7 @@ fn deleting_a_task_drops_its_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -721,6 +734,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -735,6 +749,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -796,6 +811,7 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -810,6 +826,7 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -866,6 +883,7 @@ fn auto_unblock_creates_ready_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -880,6 +898,7 @@ fn auto_unblock_creates_ready_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -948,6 +967,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -962,6 +982,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -976,6 +997,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1072,6 +1094,7 @@ fn prereq_regression_does_not_re_block_dependents() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1086,6 +1109,7 @@ fn prereq_regression_does_not_re_block_dependents() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1176,6 +1200,7 @@ fn cyclic_edges_do_not_loop_the_cascade() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1190,6 +1215,7 @@ fn cyclic_edges_do_not_loop_the_cascade() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1260,6 +1286,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1293,6 +1320,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1412,6 +1440,7 @@ fn manual_block_is_not_auto_unblocked() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1443,6 +1472,7 @@ fn manual_block_is_not_auto_unblocked() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1501,6 +1531,7 @@ fn refuses_manual_move_off_blocked_while_gated() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1515,6 +1546,7 @@ fn refuses_manual_move_off_blocked_while_gated() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1566,6 +1598,7 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1580,6 +1613,7 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1639,6 +1673,7 @@ fn request_execution_refuses_gated_work_item() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1653,6 +1688,7 @@ fn request_execution_refuses_gated_work_item() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1704,6 +1740,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1718,6 +1755,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1946,6 +1984,7 @@ fn create_via_round_trip_per_source() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1962,6 +2001,7 @@ fn create_via_round_trip_per_source() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2210,6 +2250,7 @@ fn redispatch_preserves_investigation_execution_kind() {
             description: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             priority: None,
             project_id: None,
             repo_remote_url: None,
@@ -2294,6 +2335,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
             description: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             priority: None,
             project_id: None,
             repo_remote_url: None,
@@ -2403,6 +2445,7 @@ fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
             description: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             priority: None,
             project_id: None,
             repo_remote_url: None,
@@ -2488,6 +2531,7 @@ fn cold_path_pr_detection_covers_investigations() {
             description: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             priority: None,
             project_id: None,
             repo_remote_url: None,

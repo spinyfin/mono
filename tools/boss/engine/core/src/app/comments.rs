@@ -526,6 +526,7 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+                    driver: None,
                     force_duplicate: false,
                 }) {
                     Ok(c) => c,

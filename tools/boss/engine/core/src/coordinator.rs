@@ -4342,6 +4342,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4432,6 +4433,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4512,6 +4514,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4587,6 +4590,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4695,6 +4699,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4709,6 +4714,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4812,6 +4818,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4919,6 +4926,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4977,6 +4985,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5068,6 +5077,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5110,6 +5120,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5157,6 +5168,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5227,6 +5239,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5411,6 +5424,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5640,6 +5654,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5844,6 +5859,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: Some(crate::work::EffortLevel::Trivial),
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -5856,6 +5872,7 @@ mod tests {
                 effort_level: Some(crate::work::EffortLevel::Trivial),
                 claude_effort: Some("low"),
                 model: "sonnet".to_owned(),
+                driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
             }),
             ..FakeExecutionRunner::default()
@@ -5915,6 +5932,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6034,6 +6052,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6122,6 +6141,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6215,6 +6235,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6433,6 +6454,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6507,6 +6529,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6640,6 +6663,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6720,6 +6744,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6790,6 +6815,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7071,6 +7097,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7085,6 +7112,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7160,6 +7188,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7223,6 +7252,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7298,6 +7328,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7390,6 +7421,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -7404,6 +7436,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -7505,6 +7538,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+            driver: None,
                     force_duplicate: false,
                 })
                 .unwrap();
@@ -7619,6 +7653,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7645,6 +7680,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7677,6 +7713,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7782,6 +7819,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7859,6 +7897,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7875,6 +7914,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -7989,6 +8029,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8009,6 +8050,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8088,6 +8130,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8104,6 +8147,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8248,6 +8292,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8393,6 +8438,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8461,6 +8507,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8542,6 +8589,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8566,6 +8614,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8679,6 +8728,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8781,6 +8831,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+            driver: None,
                     force_duplicate: false,
                 })
                 .unwrap();
@@ -8803,6 +8854,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -8983,6 +9035,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -9088,6 +9141,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();

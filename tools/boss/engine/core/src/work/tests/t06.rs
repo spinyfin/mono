@@ -30,6 +30,7 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -127,6 +128,7 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -234,6 +236,7 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -866,6 +869,7 @@ fn create_revision_inherits_repo_remote_url_from_root() {
             repo_remote_url: Some(root_repo.to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -934,6 +938,7 @@ fn create_revision_of_revision_inherits_repo_from_chain_root() {
             repo_remote_url: Some(root_repo.to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2185,6 +2190,7 @@ fn make_in_review_project_task(db: &WorkDb, product_id: &str, pr_url: &str) -> S
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

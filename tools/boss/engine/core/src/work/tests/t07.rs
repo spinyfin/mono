@@ -391,6 +391,7 @@ fn count_open_tasks_counts_only_open_statuses() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -452,6 +453,7 @@ fn count_open_tasks_counts_active_as_open() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

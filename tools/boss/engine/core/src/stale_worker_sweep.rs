@@ -460,6 +460,7 @@ mod tests {
                 priority: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 created_via: None,
                 autostart: true,
                 force_duplicate: false,

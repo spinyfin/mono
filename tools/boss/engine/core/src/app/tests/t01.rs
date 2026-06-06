@@ -1376,6 +1376,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1562,6 +1563,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1680,6 +1682,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

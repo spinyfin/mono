@@ -64,6 +64,7 @@ fn creates_tree_and_soft_deletes_chores() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -78,6 +79,7 @@ fn creates_tree_and_soft_deletes_chores() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -126,6 +128,7 @@ fn restore_work_item_clears_tombstone() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -262,6 +265,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .collect::<Vec<_>>();
@@ -327,6 +331,7 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
         CreateTaskInput {
@@ -340,6 +345,7 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     ];
@@ -388,6 +394,7 @@ fn create_many_chores_inserts_all_atomically() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .collect::<Vec<_>>();
@@ -432,6 +439,7 @@ fn work_tree_includes_runtime_status_per_task() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -446,6 +454,7 @@ fn work_tree_includes_runtime_status_per_task() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -525,6 +534,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -601,6 +611,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -615,6 +626,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -648,6 +660,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -662,6 +675,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -784,6 +798,7 @@ fn reorders_project_tasks() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -799,6 +814,7 @@ fn reorders_project_tasks() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -855,6 +871,7 @@ fn creates_and_lists_execution_entities() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1054,6 +1071,7 @@ fn reconciles_missing_executions_for_product_tree() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1069,6 +1087,7 @@ fn reconciles_missing_executions_for_product_tree() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1083,6 +1102,7 @@ fn reconciles_missing_executions_for_product_tree() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1160,6 +1180,7 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1175,6 +1196,7 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1264,6 +1286,7 @@ fn reconcile_waits_for_product_repo_remote_url() {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             ..WorkItemPatch::default()
         },
     )
@@ -1313,6 +1336,7 @@ fn reconcile_dispatches_chore_against_repo_override() {
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1511,6 +1535,7 @@ fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             ..WorkItemPatch::default()
         },
     )
@@ -1550,6 +1575,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1721,6 +1747,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1788,6 +1815,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1854,6 +1882,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1984,6 +2013,7 @@ fn start_execution_does_not_downgrade_done_chores() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2057,6 +2087,7 @@ fn reconcile_dispatches_active_chore_with_no_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2110,6 +2141,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2169,6 +2201,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2231,6 +2264,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2293,6 +2327,7 @@ fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

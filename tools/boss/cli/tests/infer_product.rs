@@ -222,6 +222,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )

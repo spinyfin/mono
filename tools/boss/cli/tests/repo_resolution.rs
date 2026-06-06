@@ -168,6 +168,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
             repo_remote_url: Some("git@github.com:foo/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )

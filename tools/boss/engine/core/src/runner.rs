@@ -817,12 +817,13 @@ pub(crate) async fn compose_worker_spawn(
     };
     // Fetch the product before composing the prompt so we can pass
     // editorial_rules and the PR template set into compose_execution_prompt.
-    let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
+    let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble, row_driver, product_default_driver) =
         match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
                 let product = work_db.get_product(&task.product_id).ok().flatten();
                 let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
                 let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
+                let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
                 let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
                 (
                     editorial_rules,
@@ -830,9 +831,11 @@ pub(crate) async fn compose_worker_spawn(
                     task.model_override.clone(),
                     product_default_model,
                     dispatch_preamble,
+                    task.driver.clone(),
+                    product_default_driver,
                 )
             }
-            _ => (None, None, None, None, None),
+            _ => (None, None, None, None, None, None, None),
         };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
@@ -1010,6 +1013,8 @@ pub(crate) async fn compose_worker_spawn(
         row_model_override.as_deref(),
         pool_model_override_for_worker_id(worker_id),
         product_default_model.as_deref(),
+        row_driver.as_deref(),
+        product_default_driver.as_deref(),
     );
     // Per-level prompt addendum lands at the very top of the file
     // (design §Q2: "concatenated to .claude/initial-prompt.txt
@@ -4259,6 +4264,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
@@ -4314,6 +4320,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Trivial),
             model_override: None,
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
@@ -4371,6 +4378,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Medium),
             model_override: Some("opus".to_owned()),
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
@@ -4419,6 +4427,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Large),
             model_override: None,
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
@@ -4470,6 +4479,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
@@ -4540,6 +4550,7 @@ mod pane_spawn_tests {
                 repo_remote_url: None,
                 effort_level: Some(EffortLevel::Trivial),
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4593,6 +4604,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Large),
             model_override: None,
+            driver: None,
             force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
@@ -4773,6 +4785,7 @@ mod pane_spawn_tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4889,6 +4902,7 @@ mod pane_spawn_tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();

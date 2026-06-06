@@ -114,6 +114,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -134,6 +135,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -241,6 +243,7 @@ async fn delete_then_restore_round_trip_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -321,6 +324,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -339,6 +343,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -409,6 +414,7 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -577,6 +583,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -672,6 +679,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -725,6 +733,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1040,6 +1049,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1056,6 +1066,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1188,6 +1199,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1205,6 +1217,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1222,6 +1235,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1238,6 +1252,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1416,6 +1431,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .collect();
@@ -1445,6 +1461,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .collect();
@@ -1475,6 +1492,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
         CreateTaskInput {
@@ -1488,6 +1506,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     ];
@@ -1819,6 +1838,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1841,6 +1861,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -1901,6 +1922,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             },
         })
@@ -1937,6 +1959,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             },
         })
@@ -2006,6 +2029,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             },
         })
@@ -2033,6 +2057,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             },
         })
@@ -2095,6 +2120,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             repo_remote_url: Some("git@github.com:foo/service.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2117,6 +2143,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2255,6 +2282,7 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2273,6 +2301,7 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2300,6 +2329,7 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: true,
         },
     )
@@ -2324,6 +2354,7 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2377,6 +2408,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2396,6 +2428,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             },
         })
@@ -2445,6 +2478,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2484,6 +2518,7 @@ async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )
@@ -2558,6 +2593,7 @@ async fn unlink_external_ref_clears_binding() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         },
     )

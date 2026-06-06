@@ -351,6 +351,7 @@ fn concurrent_writes_do_not_return_database_locked() {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap()
@@ -539,6 +540,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -736,6 +738,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -765,6 +768,7 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -904,6 +908,7 @@ fn effort_and_model_default_to_null_on_fresh_rows() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -940,6 +945,7 @@ fn effort_and_model_roundtrip_through_create_and_query() {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Large),
             model_override: Some("claude-opus-4-7".into()),
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -976,6 +982,7 @@ fn update_chore_sets_and_clears_effort_and_model() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1046,6 +1053,7 @@ fn update_chore_rejects_invalid_effort_level() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1151,6 +1159,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1210,6 +1219,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Trivial),
             model_override: Some("haiku".into()),
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1255,6 +1265,7 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1445,6 +1456,7 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap()
@@ -1527,6 +1539,7 @@ fn allocator_per_product_sequences_are_independent() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap()
@@ -1672,6 +1685,7 @@ fn unique_short_id_index_rejects_manual_duplicate() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1806,6 +1820,7 @@ fn create_chore_protocol_struct_carries_short_id() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1823,6 +1838,7 @@ fn create_chore_protocol_struct_carries_short_id() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1898,6 +1914,7 @@ fn work_tree_tasks_carry_short_id() {
         repo_remote_url: None,
         effort_level: None,
         model_override: None,
+            driver: None,
         force_duplicate: false,
     })
     .unwrap();
@@ -1939,6 +1956,7 @@ fn noop_status_patch_preserves_last_status_actor_for_task() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2069,6 +2087,7 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2137,6 +2156,7 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2151,6 +2171,7 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2272,6 +2293,7 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2333,6 +2355,7 @@ fn migration_normalises_empty_effort_level_to_null() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

@@ -139,6 +139,7 @@ fn conflict_resolution_round_trip() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -567,6 +568,7 @@ fn record_and_list_effort_escalations_round_trip() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -836,6 +838,7 @@ fn unique_index_rejects_duplicate_bound_rows() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -874,6 +877,7 @@ fn list_external_refs_includes_unbound_rows() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -918,6 +922,7 @@ fn import_chore_with_external_ref_is_atomic_and_findable() {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: true,
             },
             "github",
@@ -1317,6 +1322,7 @@ fn manual_override_writes_ci_failure_suppression() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1403,6 +1409,7 @@ fn manual_override_from_exhausted_writes_suppression() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1475,6 +1482,7 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1585,6 +1593,7 @@ fn manual_move_unrelated_to_ci_does_not_write_suppression() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

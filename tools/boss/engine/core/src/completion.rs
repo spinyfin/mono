@@ -4855,6 +4855,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -4922,6 +4923,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6085,6 +6087,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: true,
             })
             .unwrap();
@@ -6236,6 +6239,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6465,6 +6469,7 @@ PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6597,6 +6602,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6928,6 +6934,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -6976,6 +6983,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -8285,6 +8293,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();
@@ -10545,6 +10554,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+            driver: None,
                 force_duplicate: false,
             })
             .unwrap();

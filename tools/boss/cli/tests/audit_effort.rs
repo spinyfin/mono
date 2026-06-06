@@ -101,6 +101,7 @@ async fn create_chore(client: &mut BossClient, product_id: &str, name: &str, des
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                driver: None,
                 force_duplicate: false,
             },
         })

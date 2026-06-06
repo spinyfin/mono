@@ -81,6 +81,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -123,6 +124,7 @@ fn setup_product_and_chore() -> (WorkDb, String, String) {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -187,6 +189,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -257,6 +260,7 @@ fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, W
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap()
@@ -302,6 +306,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -369,6 +374,7 @@ fn make_chore_root(db: &WorkDb, product_id: &str, label: &str) -> String {
         repo_remote_url: None,
         effort_level: None,
         model_override: None,
+            driver: None,
         force_duplicate: false,
     })
     .unwrap()
@@ -406,6 +412,7 @@ fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
             repo_remote_url: None, // inherits from product
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -463,6 +470,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         blocked_signals: vec![],
         effort_level: None,
         model_override: None,
+            driver: None,
         ci_attempt_budget: None,
         ci_attempts_used: 0,
         ci_required_state: None,

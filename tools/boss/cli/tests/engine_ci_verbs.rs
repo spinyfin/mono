@@ -185,6 +185,7 @@ fn seed_chore_with_ci_attempt(
         repo_remote_url: None,
         effort_level: None,
         model_override: None,
+            driver: None,
         force_duplicate: false,
     })?;
     let pr_url = format!("https://github.com/test/boss/pull/{pr_number}");

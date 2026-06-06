@@ -36,6 +36,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -73,6 +74,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -97,6 +99,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -160,6 +163,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -193,6 +197,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -226,6 +231,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -321,6 +327,7 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -389,6 +396,7 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -472,6 +480,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -584,6 +593,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -675,6 +685,7 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -739,6 +750,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -801,6 +813,7 @@ fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -873,6 +886,7 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -926,6 +940,7 @@ fn demote_active_work_item_to_todo_resets_active_card() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1003,6 +1018,7 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1094,6 +1110,7 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1174,6 +1191,7 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1230,6 +1248,7 @@ fn reconcile_ignores_non_active_chores() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1244,6 +1263,7 @@ fn reconcile_ignores_non_active_chores() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1291,6 +1311,7 @@ fn reconcile_skips_no_autostart_chore_until_status_changes() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1320,6 +1341,7 @@ fn reconcile_skips_no_autostart_chore_until_status_changes() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1375,6 +1397,7 @@ fn reconcile_skips_in_review_chore() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1440,6 +1463,7 @@ fn no_autostart_direct_to_in_review_suppresses_dispatch() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1514,6 +1538,7 @@ fn cancel_running_execution_demotes_active_task() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1588,6 +1613,7 @@ fn rescan_redispatches_active_chore_with_terminal_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1646,6 +1672,7 @@ fn rescan_redispatches_active_chore_with_no_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1694,6 +1721,7 @@ fn rescan_skips_active_chore_with_live_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1977,6 +2005,7 @@ fn rescan_skips_no_autostart_active_chore() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2036,6 +2065,7 @@ fn start_execution_run_clears_autostart() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

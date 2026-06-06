@@ -50,6 +50,7 @@ fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

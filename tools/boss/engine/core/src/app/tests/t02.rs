@@ -39,6 +39,7 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -138,6 +139,7 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -239,6 +241,7 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -334,6 +337,7 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -455,6 +459,7 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -548,6 +553,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -716,6 +722,7 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -851,6 +858,7 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -971,6 +979,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1081,6 +1090,7 @@ async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() 
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1163,6 +1173,7 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1453,6 +1464,7 @@ fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -1989,6 +2001,7 @@ fn make_execution_for_test(server_state: &Arc<ServerState>) -> boss_protocol::Wo
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();
@@ -2205,6 +2218,7 @@ fn executions_list_returns_empty_for_task_with_no_executions() {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            driver: None,
             force_duplicate: false,
         })
         .unwrap();

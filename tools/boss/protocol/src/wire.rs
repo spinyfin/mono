@@ -1256,6 +1256,17 @@ pub enum FrontendRequest {
         enabled: bool,
     },
 
+    /// Set (or clear) a product's `default_driver`. `driver` is a
+    /// driver slug stored verbatim; `None` clears the column (the
+    /// engine resolves `NULL` to `"claude"`). The engine does NOT
+    /// validate the slug — driver registration is engine-side.
+    /// Returns the updated product wrapped in `WorkItemUpdated`.
+    SetProductDefaultDriver {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        driver: Option<String>,
+    },
+
     /// Set (or clear) a product's `default_model` per the
     /// effort-and-model-estimation design (PR #370). `model` is a
     /// claude model slug stored verbatim; `None` clears the column.
