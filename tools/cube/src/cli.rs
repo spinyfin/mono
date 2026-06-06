@@ -220,6 +220,21 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebase the current workspace's boss branch onto the latest main.
+    ///
+    /// Fetches the latest `main` and boss branches from the GitHub remote,
+    /// resolves this workspace's current `boss/exec_*` branch automatically
+    /// from the working copy state (no branch name argument required), rebases
+    /// it onto `main` using `--ignore-immutable` to handle jj's
+    /// immutable-heads constraint, and reports the result clearly.
+    ///
+    /// Leaves any resulting conflicts materialized in the working copy for the
+    /// agent to resolve. Exit signal:
+    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts.
+    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them.
+    ///
+    /// Run from inside the leased cube workspace directory.
+    RebaseOntoMain,
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)

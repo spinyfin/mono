@@ -1889,16 +1889,21 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          resolve the conflicts — **you are not adding new work to this PR.**\n\n",
     );
     out.push_str("### Rebase steps (replaces step 3)\n\n");
-    out.push_str(&format!("1. `jj edit {}`\n", attempt.head_branch));
-    out.push_str(&format!(
-        "2. `jj rebase -d {} -b {}`\n",
-        attempt.base_branch, attempt.head_branch,
-    ));
     out.push_str(
-        "3. If the rebase reports a conflict:\n\
-            - Inspect with `jj st`, `jj resolve --list <file>`.\n\
-            - Resolve each conflict. Read the conflict diagnosis below for what was\n  \
-              touched on the upstream side.\n\n",
+        "Run the cube rebase command — it encodes the correct jj recipe automatically \
+         and avoids the `@origin` / immutable-heads pitfalls agents commonly hit:\n\n\
+         ```\n\
+         cube workspace rebase-onto-main\n\
+         ```\n\n\
+         This command: fetches the latest `main` from GitHub, resolves this workspace's \
+         boss branch automatically (no branch name argument needed), rebases it onto `main` \
+         with `--ignore-immutable`, and reports a clear signal:\n\n\
+         - `REBASED_CLEAN` — no conflicts; skip to step 4 (push).\n\
+         - `REBASED_WITH_CONFLICTS` — conflicts are materialized in the working copy. \
+         Inspect with `jj st` and `jj resolve --list`, read the diagnosis below for what \
+         was touched on the upstream side, resolve each file, then continue to step 4.\n\n\
+         Do NOT hand-roll `jj rebase` manually — the correct flags differ from the bare \
+         form and agents reliably get them wrong.\n\n",
     );
     out.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
     match attempt
