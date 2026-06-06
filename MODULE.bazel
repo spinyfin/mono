@@ -68,6 +68,12 @@ use_repo(
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
+    # wasm32-wasip2 is the guest cross-compile target for checkleft external
+    # check components (see tools/checkleft/wasm). Registering it here downloads
+    # the wasm32-wasip2 std sysroot and a rust_toolchain whose
+    # target_compatible_with is [wasm32, wasi, wasi_preview_2] — unambiguous, so
+    # it is only ever selected for the //platforms:wasm32_wasip2 platform.
+    extra_target_triples = ["wasm32-wasip2"],
     rustfmt_version = "1.95.0",
     versions = ["1.95.0"],
 )
@@ -108,6 +114,21 @@ crate.from_cargo(
     name = "mono_crates",
     cargo_lockfile = "//:Cargo.lock",
     manifests = ["//:Cargo.toml"],
+    # rules_rust's default set plus wasm32-wasip2 so that the guest SDK and its
+    # deps (serde, serde_json, wit-bindgen) resolve for the Component Model
+    # check target built by //tools/checkleft/wasm:defs.bzl. Without wasip2
+    # here, crate_universe marks those deps `@platforms//:incompatible` for the
+    # //platforms:wasm32_wasip2 platform and the guest build fails at analysis.
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+        "wasm32-wasip2",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-nixos-gnu",
+    ],
 )
 use_repo(crate, "mono_crates")
 
@@ -128,6 +149,42 @@ use_repo(
 # Prebuilt GhosttyKit.xcframework for the Bazel installer.
 # Rebuild procedure: tools/boss/docs/runbooks/update-ghostty-prebuilt.md
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+# Hermetic, version-pinned wasm-tools binaries for the rust_wasm_component rule
+# (//tools/checkleft/wasm). wasm-tools componentizes/validates guest check
+# components and is selected per exec platform by the wasm_tools_toolchain
+# targets registered below. To bump: change _WASM_TOOLS_VERSION-equivalent here,
+# download the release tarballs, and update each sha256
+# (`shasum -a 256 wasm-tools-<ver>-<plat>.tar.gz`).
+http_archive(
+    name = "wasm_tools_aarch64_macos",
+    build_file = "//tools/checkleft/wasm:wasm_tools.BUILD",
+    sha256 = "ed0fdbdaa80a5c7ef434ac583e1d8df0b8e45d718b08edf28ec27a74e4029897",
+    strip_prefix = "wasm-tools-1.251.0-aarch64-macos",
+    urls = ["https://github.com/bytecodealliance/wasm-tools/releases/download/v1.251.0/wasm-tools-1.251.0-aarch64-macos.tar.gz"],
+)
+
+http_archive(
+    name = "wasm_tools_x86_64_linux",
+    build_file = "//tools/checkleft/wasm:wasm_tools.BUILD",
+    sha256 = "08d523676ec71d9afbae05aa4255041ce91bf2d325d87b7e722d190d558be689",
+    strip_prefix = "wasm-tools-1.251.0-x86_64-linux",
+    urls = ["https://github.com/bytecodealliance/wasm-tools/releases/download/v1.251.0/wasm-tools-1.251.0-x86_64-linux.tar.gz"],
+)
+
+http_archive(
+    name = "wasm_tools_aarch64_linux",
+    build_file = "//tools/checkleft/wasm:wasm_tools.BUILD",
+    sha256 = "9d5cbab8810ffa43b1ad4c57efdd0092c5be6e905d3bd330d7daba5ad7aaa31d",
+    strip_prefix = "wasm-tools-1.251.0-aarch64-linux",
+    urls = ["https://github.com/bytecodealliance/wasm-tools/releases/download/v1.251.0/wasm-tools-1.251.0-aarch64-linux.tar.gz"],
+)
+
+register_toolchains(
+    "//tools/checkleft/wasm:wasm_tools_aarch64_macos_toolchain",
+    "//tools/checkleft/wasm:wasm_tools_x86_64_linux_toolchain",
+    "//tools/checkleft/wasm:wasm_tools_aarch64_linux_toolchain",
+)
 
 http_archive(
     name = "ghostty_kit",

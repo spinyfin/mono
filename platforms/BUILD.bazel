@@ -30,3 +30,21 @@ platform(
     ],
     visibility = ["//tools/checkleft:__subpackages__"],
 )
+
+# WebAssembly Component Model guest target for checkleft external checks.
+#
+# The wasi_preview_2 constraint (from rules_rust) discriminates this from the
+# wasi_preview_1 default so that toolchain resolution selects the
+# wasm32-wasip2 Rust toolchain registered via MODULE.bazel's
+# extra_target_triples. The rust_wasm_component rule
+# (//tools/checkleft/wasm:defs.bzl) transitions guest crates onto this
+# platform before componentizing with wasm-tools.
+platform(
+    name = "wasm32_wasip2",
+    constraint_values = [
+        "@platforms//cpu:wasm32",
+        "@platforms//os:wasi",
+        "@rules_rust//rust/platform:wasi_preview_2",
+    ],
+    visibility = ["//tools/checkleft:__subpackages__"],
+)

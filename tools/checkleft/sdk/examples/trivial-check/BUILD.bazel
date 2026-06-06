@@ -1,5 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/checkleft/wasm:defs.bzl", "rust_wasm_component")
 
 # On the host target this builds a native shared library (.so / .dylib).
 # On wasm32-wasip2 (via T9's rust_wasm_component rule) it builds the component.
@@ -18,4 +20,24 @@ rust_shared_library(
     deps = [
         "//tools/checkleft/sdk:checkleft_check_sdk",
     ] + all_crate_deps(normal = True),
+)
+
+# T9: build the T2 sample check into a Component Model component end-to-end via
+# the rust_wasm_component rule. Produces trivial_check_component.wasm and
+# trivial_check_component.wasm.sha256 (the digest a CHECKS manifest pins).
+rust_wasm_component(
+    name = "trivial_check_component",
+    crate = ":trivial_check",
+    visibility = ["//tools/checkleft:__pkg__"],
+)
+
+# T9 CI smoke test: builds the sample check through the rule (which validates the
+# component with wasm-tools) and asserts the sha256 sidecar matches. Runs under
+# `bazel test //...`, proving the guest build pipeline is hermetic.
+sh_test(
+    name = "trivial_check_component_smoke_test",
+    size = "small",
+    srcs = ["//tools/checkleft/wasm:verify_component_sha.sh"],
+    args = ["$(rootpaths :trivial_check_component)"],
+    data = [":trivial_check_component"],
 )
