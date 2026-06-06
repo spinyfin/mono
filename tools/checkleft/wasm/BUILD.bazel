@@ -1,0 +1,95 @@
+"""Bazel infrastructure for building checkleft check guest crates into
+WebAssembly Component Model components (design doc §Build / T9).
+
+- `toolchain_type` + `wasm_tools_toolchain` instances expose a hermetic,
+  version-pinned wasm-tools per exec platform (binaries downloaded via
+  http_archive in //:MODULE.bazel; toolchains registered there too).
+- `componentize` is the sh_binary the rust_wasm_component rule drives.
+- The `rust_wasm_component` rule itself lives in defs.bzl.
+"""
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":toolchain.bzl", "wasm_tools_toolchain")
+
+package(default_visibility = ["//visibility:private"])
+
+# build_file for the wasm-tools http_archive repos declared in MODULE.bazel.
+exports_files(["wasm_tools.BUILD"])
+
+# Smoke-test verifier, consumed directly as sh_test srcs by rust_wasm_component
+# users (e.g. the T2 sample check in //tools/checkleft/sdk/examples).
+exports_files(
+    ["verify_component_sha.sh"],
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
+
+# Toolchain type for the hermetic wasm-tools CLI. Scoped to checkleft so the
+# rust_wasm_component rule (and its consumers) can request it, but it is not a
+# repo-wide public toolchain type.
+toolchain_type(
+    name = "toolchain_type",
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
+
+# Driver script for the rust_wasm_component rule. Visible to checkleft
+# subpackages because the rule references it as an implicit tool dependency from
+# the package where each rust_wasm_component target is declared.
+sh_binary(
+    name = "componentize",
+    srcs = ["componentize.sh"],
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
+
+# ── wasm-tools toolchains, one per supported exec platform ──────────────────
+# Each wraps the matching prebuilt binary; the toolchain() targets gate on
+# exec_compatible_with so resolution picks the right one for the build host.
+
+wasm_tools_toolchain(
+    name = "wasm_tools_aarch64_macos",
+    wasm_tools = "@wasm_tools_aarch64_macos//:wasm_tools",
+)
+
+wasm_tools_toolchain(
+    name = "wasm_tools_x86_64_linux",
+    wasm_tools = "@wasm_tools_x86_64_linux//:wasm_tools",
+)
+
+wasm_tools_toolchain(
+    name = "wasm_tools_aarch64_linux",
+    wasm_tools = "@wasm_tools_aarch64_linux//:wasm_tools",
+)
+
+# toolchain() wrappers; registered from //:MODULE.bazel. Toolchain resolution
+# bypasses target visibility, so these stay scoped to checkleft.
+toolchain(
+    name = "wasm_tools_aarch64_macos_toolchain",
+    exec_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+    toolchain = ":wasm_tools_aarch64_macos",
+    toolchain_type = ":toolchain_type",
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
+
+toolchain(
+    name = "wasm_tools_x86_64_linux_toolchain",
+    exec_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    toolchain = ":wasm_tools_x86_64_linux",
+    toolchain_type = ":toolchain_type",
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
+
+toolchain(
+    name = "wasm_tools_aarch64_linux_toolchain",
+    exec_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+    toolchain = ":wasm_tools_aarch64_linux",
+    toolchain_type = ":toolchain_type",
+    visibility = ["//tools/checkleft:__subpackages__"],
+)
