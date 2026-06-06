@@ -89,7 +89,7 @@ pub enum AbsenceDisposition {
 
 /// The capabilities a driver declares, plus optional per-capability
 /// absence-disposition overrides.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CapabilitySet {
     provided: HashSet<Capability>,
     /// Overrides the default absence disposition for specific capabilities this
@@ -349,6 +349,10 @@ mod tests {
             assert!(
                 !reqs.is_required_strict(Capability::StructuredOutput),
                 "{kind:?} should not require-strict StructuredOutput",
+            );
+            assert!(
+                !reqs.is_required_strict(Capability::ToolUseInterception),
+                "{kind:?} should not require-strict ToolUseInterception",
             );
         }
     }
