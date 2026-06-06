@@ -55,7 +55,8 @@ pub struct TaskBrief {
 }
 
 /// All inputs the Planner needs to produce a task-graph proposal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize)]
+#[builder(on(String, into))]
 pub struct PlannerInput {
     /// Full text of the merged design doc fetched live from GitHub.
     pub design_doc: String,
@@ -110,7 +111,8 @@ impl std::fmt::Display for Confidence {
 /// `handle` is a proposal-local identifier (e.g. `"schema-migration"`) used
 /// to reference this task in [`ProposedEdge`] dependency declarations.  The
 /// Materializer resolves handles to real task ids at apply time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize)]
+#[builder(on(String, into))]
 pub struct ProposedTask {
     /// Proposal-local identifier; referenced by [`ProposedEdge`].
     pub handle: String,
@@ -142,7 +144,8 @@ pub struct ProposedEdge {
 /// This is the shape the engine deserialises directly from the Anthropic
 /// structured-output call.  A JSON Schema for this type is exported by
 /// [`planner_output_schema`] for use as the forced tool-call `input_schema`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize)]
+#[builder(on(String, into))]
 pub struct PlannerOutput {
     pub tasks: Vec<ProposedTask>,
     /// Dependency edges between tasks, referenced by handle.
