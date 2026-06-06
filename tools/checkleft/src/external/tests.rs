@@ -399,3 +399,148 @@ fn composite_provider_reports_conflicts() {
         .expect_err("must fail");
     assert!(error.to_string().contains("multiple providers"));
 }
+
+#[test]
+fn composite_provider_resolves_component_package() {
+    let package = ExternalCheckPackage {
+        id: "my-check".to_owned(),
+        runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
+        api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: Default::default(),
+        implementation: ExternalCheckPackageImplementation::Component(
+            super::ExternalCheckComponentPackage {
+                artifact_path: "checks/my_check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
+                artifact_bytes: None,
+                check_name: "my-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            },
+        ),
+    };
+
+    let provider = CompositeExternalCheckPackageProvider::new(vec![
+        ConfiguredExternalCheckPackageProvider::new(
+            "bundled",
+            Arc::new(StaticProvider { package: None }),
+        ),
+        ConfiguredExternalCheckPackageProvider::new(
+            "file",
+            Arc::new(StaticProvider {
+                package: Some(package.clone()),
+            }),
+        ),
+    ]);
+
+    let resolved = provider
+        .resolve(
+            &ExternalCheckImplementationRef::parse("generated:my-check").expect("implementation"),
+        )
+        .expect("resolve")
+        .expect("package");
+
+    assert_eq!(resolved.id, "my-check");
+    assert!(matches!(
+        resolved.implementation,
+        ExternalCheckPackageImplementation::Component(_)
+    ));
+}
+
+#[test]
+fn composite_provider_no_conflict_when_only_one_resolves_component() {
+    let package = ExternalCheckPackage {
+        id: "unique-check".to_owned(),
+        runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
+        api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: Default::default(),
+        implementation: ExternalCheckPackageImplementation::Component(
+            super::ExternalCheckComponentPackage {
+                artifact_path: "checks/unique.wasm".to_owned(),
+                artifact_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_owned(),
+                artifact_bytes: None,
+                check_name: "unique-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            },
+        ),
+    };
+
+    let provider = CompositeExternalCheckPackageProvider::new(vec![
+        ConfiguredExternalCheckPackageProvider::new(
+            "p-hit",
+            Arc::new(StaticProvider {
+                package: Some(package),
+            }),
+        ),
+        ConfiguredExternalCheckPackageProvider::new(
+            "p-miss",
+            Arc::new(StaticProvider { package: None }),
+        ),
+    ]);
+
+    let resolved = provider
+        .resolve(
+            &ExternalCheckImplementationRef::parse("generated:unique-check")
+                .expect("implementation"),
+        )
+        .expect("resolve")
+        .expect("package");
+    assert_eq!(resolved.id, "unique-check");
+}
+
+#[test]
+fn component_package_check_name_matches_id_for_manifest_parsed() {
+    // Verify that validate_component_implementation sets check_name == id.
+    let manifest = r#"
+id = "workflow-shell-strict"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "checks/workflow_shell_strict.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#;
+    let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
+    let ExternalCheckPackageImplementation::Component(comp) = package.implementation else {
+        panic!("expected Component implementation");
+    };
+    assert_eq!(comp.check_name, "workflow-shell-strict");
+    assert_eq!(comp.check_name, package.id);
+    assert!(comp.artifact_bytes.is_none());
+}
+
+#[test]
+fn file_provider_resolves_component_toml_manifest() {
+    let temp = tempdir().expect("temp dir");
+    fs::create_dir_all(temp.path().join("checks/my-component-check")).expect("create dirs");
+    fs::write(
+        temp.path().join("checks/my-component-check/check.toml"),
+        r#"
+id = "my-component-check"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "checks/my_component_check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#,
+    )
+    .expect("write manifest");
+
+    let provider = FileExternalCheckPackageProvider::new(temp.path()).expect("provider");
+    let package = provider
+        .resolve(
+            &ExternalCheckImplementationRef::parse("checks/my-component-check/check.toml")
+                .expect("implementation"),
+        )
+        .expect("resolve")
+        .expect("package");
+
+    assert_eq!(package.id, "my-component-check");
+    let ExternalCheckPackageImplementation::Component(comp) = package.implementation else {
+        panic!("expected Component implementation");
+    };
+    assert_eq!(comp.check_name, "my-component-check");
+}

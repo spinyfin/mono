@@ -27,10 +27,14 @@ const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
 const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
-/// Canonical manifest filename within a definition directory.
-/// Used for both the embedded bundle (`checks/<name>/check.yaml`) and
-/// exec-path source directories (`<dir>/<name>/check.yaml`).
-const CHECK_DEF_FILE_NAME: &str = "check.yaml";
+/// Canonical manifest filename for declarative-mode definitions within a
+/// definition directory. Used for both the embedded bundle
+/// (`checks/<name>/check.yaml`) and exec-path source directories.
+const CHECK_DEF_FILE_NAME_YAML: &str = "check.yaml";
+/// Canonical manifest filename for component-mode (`mode = "component"`)
+/// definitions within a definition directory. `check.yaml` (declarative) is
+/// checked first; `check.toml` (component) is tried when yaml is absent.
+const CHECK_DEF_FILE_NAME_TOML: &str = "check.toml";
 
 /// Resolved `check_definitions` section from a CHECKS file. Controls where
 /// name-based definition resolution looks beyond the bundled set.
@@ -652,24 +656,29 @@ fn resolve_check_implementation(
     Ok(None)
 }
 
-/// Search `exec_paths` for a `<dir>/<name>/check.yaml` manifest, returning the
-/// repo-root-relative path if found. Returns `None` if no match exists.
+/// Search `exec_paths` for a `<dir>/<name>/check.yaml` (declarative) or
+/// `<dir>/<name>/check.toml` (component-mode) manifest, returning the
+/// repo-root-relative path if found. YAML is checked before TOML within each
+/// directory, preserving existing behaviour for declarative definitions.
+/// Returns `None` if no match exists in any exec_path.
 fn find_in_exec_paths(
     exec_paths: &[PathBuf],
     check_name: &str,
     repo_root: &Path,
 ) -> Result<Option<PathBuf>> {
     for exec_path in exec_paths {
-        let manifest_rel = exec_path.join(check_name).join(CHECK_DEF_FILE_NAME);
-        let manifest_abs = repo_root.join(&manifest_rel);
-        if manifest_abs.exists() {
-            validate_relative_path(&manifest_rel).with_context(|| {
-                format!(
-                    "resolved manifest path `{}` is not a safe relative path",
-                    manifest_rel.display()
-                )
-            })?;
-            return Ok(Some(manifest_rel));
+        for filename in [CHECK_DEF_FILE_NAME_YAML, CHECK_DEF_FILE_NAME_TOML] {
+            let manifest_rel = exec_path.join(check_name).join(filename);
+            let manifest_abs = repo_root.join(&manifest_rel);
+            if manifest_abs.exists() {
+                validate_relative_path(&manifest_rel).with_context(|| {
+                    format!(
+                        "resolved manifest path `{}` is not a safe relative path",
+                        manifest_rel.display()
+                    )
+                })?;
+                return Ok(Some(manifest_rel));
+            }
         }
     }
     Ok(None)
