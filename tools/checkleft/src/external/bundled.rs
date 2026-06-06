@@ -21,6 +21,13 @@
 //!    using `include_bytes!` for the artifact.
 //! 3. Add the artifact file to `checkleft_lib`'s `compile_data` in `BUILD.bazel`.
 //!
+//! ## Adding a legacy sandbox-v1 core-wasm definition
+//!
+//! For checks whose `mode = "wasm"` manifest schema was removed in T7 — runtime
+//! support is kept for backward compat pending T11 cleanup:
+//! 1. Add a constructor fn and a row in [`BUNDLED_ARTIFACT_DEFS`] below.
+//! 2. Keep the `check.toml` for documentation only (it is not parsed at runtime).
+//!
 //! We embed each file explicitly (rather than `include_dir!`) because the bazel
 //! build does not run `build.rs`, and every embedded file must be declared as
 //! `compile_data` anyway — so an explicit, reviewable table is both hermetic
@@ -31,7 +38,8 @@ use sha2::{Digest, Sha256};
 use anyhow::{Context, Result};
 
 use super::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckCapabilities,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1,
+    ExternalCheckArtifactPackage, ExternalCheckArtifactProvenance, ExternalCheckCapabilities,
     ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
     ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
     parse_external_check_manifest,
@@ -68,6 +76,18 @@ enum BundledCheckDefKind {
     },
 }
 
+/// A first-party bundled check whose package is constructed directly in code,
+/// bypassing the manifest parser. Used for legacy sandbox-v1 core-wasm artifacts
+/// whose `mode = "wasm"` manifest schema was removed in T7 — the runtime
+/// execution path (`ExternalCheckPackageImplementation::Artifact`) is kept for
+/// these checks pending T11 cleanup; only new manifests are blocked.
+struct BundledArtifactDef {
+    /// Bundle key, same lookup semantics as [`BundledCheckDef`]'s check names.
+    name: &'static str,
+    /// Returns the fully-constructed package for this check.
+    package: fn() -> ExternalCheckPackage,
+}
+
 /// The embedded first-party definitions. To add one, see the module docs.
 static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[BundledCheckDef {
     check_names: &["buildifier"],
@@ -77,11 +97,49 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[BundledCheckDef {
     },
 }];
 
+/// The embedded first-party legacy sandbox-v1 definitions constructed directly
+/// in code (see [`BundledArtifactDef`]).
+static BUNDLED_ARTIFACT_DEFS: &[BundledArtifactDef] = &[
+    // The giant-struct check as a sandbox-v1 wasm external check. Proves the
+    // custom *programmatic* external-check path; the built-in
+    // `rust-giant-structs-use-builder` stays as the parity reference.
+    // The manifest (checks/giant-struct-wasm/check.toml) uses the legacy
+    // `mode = "wasm"` schema which was removed in T7, so the package is
+    // constructed here directly instead.
+    BundledArtifactDef {
+        name: "giant-struct-wasm",
+        package: || ExternalCheckPackage {
+            id: "giant-struct-wasm".to_owned(),
+            runtime: EXTERNAL_CHECK_RUNTIME_V1.to_owned(),
+            api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+            capabilities: ExternalCheckCapabilities {
+                commands: vec!["cat".to_owned()],
+            },
+            implementation: ExternalCheckPackageImplementation::Artifact(
+                ExternalCheckArtifactPackage {
+                    artifact_path: "tools/checkleft/external-checks/giant-struct-wasm/giant_struct_wasm.wasm"
+                        .to_owned(),
+                    artifact_sha256: "f1443dc4ef77f2227662931abc2bb7e86ca0fcaf2322ca81195667b7980841f0"
+                        .to_owned(),
+                    provenance: Some(ExternalCheckArtifactProvenance {
+                        generator: Some("cargo".to_owned()),
+                        target: Some(
+                            "tools/checkleft/external-checks/giant-struct-wasm:lib (wasm32-unknown-unknown)"
+                                .to_owned(),
+                        ),
+                    }),
+                },
+            ),
+        },
+    },
+];
+
 /// Names of all bundled definitions (for diagnostics / `--list`-style output).
 pub fn bundled_check_names() -> impl Iterator<Item = &'static str> {
     BUNDLED_CHECK_DEFS
         .iter()
         .flat_map(|def| def.check_names.iter().copied())
+        .chain(BUNDLED_ARTIFACT_DEFS.iter().map(|def| def.name))
 }
 
 /// Resolves [`ExternalCheckImplementationRef::Bundled`] references against the
@@ -99,7 +157,15 @@ impl ExternalCheckPackageProvider for BundledExternalCheckPackageProvider {
             return Ok(None);
         };
 
-        resolve_from_defs(BUNDLED_CHECK_DEFS, name)
+        if let Some(result) = resolve_from_defs(BUNDLED_CHECK_DEFS, name)? {
+            return Ok(Some(result));
+        }
+
+        if let Some(def) = BUNDLED_ARTIFACT_DEFS.iter().find(|def| def.name == name) {
+            return Ok(Some((def.package)()));
+        }
+
+        Ok(None)
     }
 }
 
@@ -169,9 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_bundled_giant_struct_wasm_definition() {
+        let provider = BundledExternalCheckPackageProvider;
+        let package = provider
+            .resolve(&ExternalCheckImplementationRef::Bundled(
+                "giant-struct-wasm".to_owned(),
+            ))
+            .expect("resolve")
+            .expect("package");
+        assert_eq!(package.id, "giant-struct-wasm");
+        assert_eq!(package.runtime, EXTERNAL_CHECK_RUNTIME_V1);
+    }
+
+    #[test]
     fn every_bundled_definition_parses() {
-        // Guards against a stale `include_str!` row: each embedded manifest must
-        // parse cleanly so a target repo never hits a broken bundled def.
+        // Guards against a stale bundled def: each embedded definition must
+        // resolve cleanly so a target repo never hits a broken bundled def.
         let provider = BundledExternalCheckPackageProvider;
         for name in bundled_check_names() {
             provider

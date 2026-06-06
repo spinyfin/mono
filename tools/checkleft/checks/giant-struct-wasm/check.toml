@@ -1,0 +1,35 @@
+# Bundled sandbox-v1 wasm external-check manifest for the giant-struct check.
+#
+# This is the first-party check definition embedded in the checkleft binary (see
+# src/external/bundled.rs). A CHECKS file references it via the source directive
+# `bundled:giant-struct-wasm` — no on-disk definition file required in the target
+# repo. The definition points at the committed wasm artifact (built out-of-band by
+# tools/checkleft/external-checks/giant-struct-wasm/build.sh); `artifact_path` is
+# resolved relative to the checkleft runtime root (the repo root).
+#
+# This reimplements the built-in `rust-giant-structs-use-builder` check as a
+# *programmatic* wasm external check (it parses Rust with `syn`), proving the
+# custom programmatic external-check path end-to-end. The built-in stays in place
+# as the parity reference. See the crate's PROTOTYPE-NOTES.md.
+#
+# Regenerate `artifact_sha256` after rebuilding the wasm: run build.sh and paste
+# the printed value here.
+
+id = "giant-struct-wasm"
+mode = "wasm"
+runtime = "sandbox-v1"
+api_version = "v1"
+
+artifact_path = "tools/checkleft/external-checks/giant-struct-wasm/giant_struct_wasm.wasm"
+artifact_sha256 = "f1443dc4ef77f2227662931abc2bb7e86ca0fcaf2322ca81195667b7980841f0"
+
+[capabilities]
+# The guest reads each changed `.rs` file's contents via `cat <path>` through the
+# host `run_command` primitive (the sandbox-v1 ABI has no file-read primitive).
+# `cat` is in checkleft's production global command ceiling, so no policy
+# relaxation is needed for commands. See PROTOTYPE-NOTES.md.
+commands = ["cat"]
+
+[provenance]
+generator = "cargo"
+target = "tools/checkleft/external-checks/giant-struct-wasm:lib (wasm32-unknown-unknown)"

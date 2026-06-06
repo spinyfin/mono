@@ -16,6 +16,7 @@ rust_library(
     # inside bazel's sandbox during proc-macro / macro expansion.
     compile_data = [
         "checks/buildifier/check.yaml",
+        "checks/giant-struct-wasm/check.toml",
         "//tools/checkleft/wit:check.wit",
     ],
     crate_name = "checkleft",
@@ -69,6 +70,7 @@ rust_test(
     # time in component_bindings.rs. All are embedded/read at compile time.
     compile_data = [
         "checks/buildifier/check.yaml",
+        "checks/giant-struct-wasm/check.toml",
         "tests/fixtures/buildifier/malformed.bzl.fixture",
         "tests/fixtures/buildifier/unformatted.bzl.fixture",
         "//tools/checkleft/wit:check.wit",
@@ -114,6 +116,33 @@ rust_test(
     size = "small",
     srcs = ["tests/change_detection_e2e.rs"],
     compile_data = glob(["tests/fixtures/**"]),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":checkleft_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# End-to-end parity test for the giant-struct check running as a sandbox-v1 wasm
+# external check. Embeds the committed `giant_struct_wasm.wasm` via include_bytes!
+# (built out-of-band by external-checks/giant-struct-wasm/build.sh — there is no
+# wasm32 rust toolchain in MODULE.bazel), runs it through the real
+# DefaultExternalCheckExecutor (the guest reads files via the `cat` host command
+# primitive + parses with syn), and asserts byte-for-byte parity with the built-in
+# `rust-giant-structs-use-builder` check run via the public check registry. Its own
+# test binary because it sets CHECKLEFT_PROTOTYPE_SANDBOX_COMMANDS for the higher
+# wasm fuel ceiling (see the crate's PROTOTYPE-NOTES.md).
+rust_test(
+    name = "giant_struct_wasm_e2e_test",
+    size = "small",
+    srcs = ["tests/giant_struct_wasm_e2e.rs"],
+    compile_data = ["external-checks/giant-struct-wasm/giant_struct_wasm.wasm"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

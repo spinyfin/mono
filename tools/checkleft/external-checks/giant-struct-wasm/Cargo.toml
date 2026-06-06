@@ -1,0 +1,35 @@
+# PROTOTYPE-ONLY crate: the built-in `rust-giant-structs-use-builder` check
+# reimplemented as a sandbox-v1 wasm external check (proving the custom
+# *programmatic* external-check path end-to-end).
+#
+# Deliberately DETACHED from the monorepo Cargo workspace (note the empty
+# `[workspace]` table below). It targets wasm32-unknown-unknown with a wasm-only
+# dependency set and must NOT perturb the repo's Cargo.lock / crate_universe /
+# bazel build. It is built out-of-band via `build.sh` (cargo), not by bazel —
+# there is no wasm32 rust toolchain registered in MODULE.bazel. The built
+# `giant_struct_wasm.wasm` is committed alongside this crate and loaded by the
+# hermetic e2e test + the bundled check manifest.
+[package]
+name = "checkleft-giant-struct-wasm"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `syn` parses the Rust source the check inspects. `default-features = false`
+# drops the `proc-macro` feature so proc-macro2 uses its host/wasm fallback
+# (the real `proc_macro` bridge is unavailable on wasm32-unknown-unknown).
+# `full` + `parsing` are what `syn::parse_file` needs.
+syn = { version = "2", default-features = false, features = ["full", "parsing"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
