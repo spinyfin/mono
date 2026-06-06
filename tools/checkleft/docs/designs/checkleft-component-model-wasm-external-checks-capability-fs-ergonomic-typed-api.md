@@ -499,3 +499,7 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 - **Component signing / provenance** beyond sha256 pinning.
 
 **Effort estimate (whole project):** ~11-13 PRs. The host-side path (T1, T3-T8, T3a, T10, T11) is mostly `small`/`medium` and well-understood given the existing architecture. T3a (shared FS sandbox module) is a standalone `medium` that can run fully in parallel with T1 and the rest of the wasm runtime work. The dominant unknown remains **T9 (bazel rules for wasm component checks, `large`)**: a `wasm32-wasip2` toolchain registration, a hermetic `wasm_tools_toolchain`, and a `rust_wasm_component` custom rule are all new bazel infrastructure with no prior art in this repo. T9 is on the critical path to T10 (the end-to-end proof) but is otherwise parallel to T3-T8 and can proceed as soon as T2 lands. The host-side bazel build (standard `rules_rust`) lands incrementally with T3-T6 and does not depend on T9.
+
+## References
+
+- [How do you build a Rust wasm binary with Bazel? (Stack Overflow)](https://stackoverflow.com/questions/78168400/how-do-you-build-a-rust-wasm-binary-with-bazel) — A starting-point reference for the bazel Rust→wasm build pipeline. **Caveat:** this question is from 2024 (~2 years old at time of writing); `rules_rust` and the wasm/Component-Model tooling have moved since then. Do not treat it as gospel — verify any approach it suggests against current `rules_rust` and `wasm32-wasip2`/Component-Model tooling before relying on it.
