@@ -1,9 +1,8 @@
 //! Live design-doc fetcher.
 //!
-//! Fetches the raw content of a file at a specific git ref via
-//! `gh api /repos/<owner>/<repo>/contents/<path>?ref=<ref>`, reusing
-//! the same `Accept: application/vnd.github.raw` fetch shape used by
-//! [`crate::attentions_detector`].
+//! Wraps [`boss_github::contents::fetch_repo_file`] with Boss-specific
+//! retry logic and typed outcomes. Both this module and
+//! [`crate::attentions_detector`] share that single fetch implementation.
 //!
 //! This is an independent root component that feeds the Populator
 //! (task 7 of the auto-populate-project-tasks-on-design-pr-merge design).
@@ -19,10 +18,8 @@
 //! - **Unparseable `repo_remote_url`:** returned as
 //!   [`DocFetchOutcome::FetchFailed`] immediately, before any `gh` call.
 
-use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command;
 use tokio::time::sleep;
 
 /// Maximum number of `gh api` attempts. Covers the initial attempt plus two
@@ -109,47 +106,11 @@ enum FetchResult {
 }
 
 async fn do_fetch(owner: &str, repo: &str, path: &str, ref_name: &str) -> FetchResult {
-    let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
-    let ref_field = format!("ref={ref_name}");
-
-    let output = match Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "GET",
-            "-f",
-            &ref_field,
-            "-H",
-            "Accept: application/vnd.github.raw",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(err) => {
-            return FetchResult::Error(format!("failed to spawn `gh api {endpoint}`: {err}"));
-        }
-    };
-
-    if output.status.success() {
-        return FetchResult::Content(String::from_utf8_lossy(&output.stdout).into_owned());
+    match boss_github::contents::fetch_repo_file(owner, repo, path, ref_name).await {
+        Ok(Some(content)) => FetchResult::Content(content),
+        Ok(None) => FetchResult::NotFound,
+        Err(err) => FetchResult::Error(err.to_string()),
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("Not Found") || stderr.contains("404") {
-        return FetchResult::NotFound;
-    }
-
-    FetchResult::Error(format!(
-        "`gh api {endpoint}` failed (exit {:?}): {}",
-        output.status.code(),
-        stderr.trim()
-    ))
 }
 
 #[cfg(test)]
