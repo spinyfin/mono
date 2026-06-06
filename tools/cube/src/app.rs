@@ -301,11 +301,7 @@ fn run_repo(
             workspace_prefix,
             source,
         } => {
-            eprintln!(
-                "cube: `repo add` is deprecated — use `cube repo ensure --origin {origin}` instead. \
-                 `repo add` required --workspace-root/--workspace-prefix and could leave source=null, \
-                 which caused a prior outage by silently skipping the clone on a later `repo ensure`."
-            );
+            eprintln!("cube: `repo add` is deprecated — use `cube repo ensure --origin {origin}` instead.");
             let defaults = if let Some(d) = repo_ensure_defaults {
                 d.clone()
             } else {
