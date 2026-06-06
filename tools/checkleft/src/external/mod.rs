@@ -150,6 +150,7 @@ pub use provider::{
 };
 mod command_policy;
 pub use command_policy::ExternalCommandCapabilities;
+mod component_bindings;
 mod runtime;
 pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
 
