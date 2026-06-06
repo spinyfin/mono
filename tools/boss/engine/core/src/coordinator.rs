@@ -4115,16 +4115,15 @@ fn workspace_root_is_cube_default(workspace_root: &Path) -> bool {
 }
 
 /// Body for the `repo_cold_pool` advisory. Mirrors the design doc Q6
-/// recommendation block so the user gets the exact `cube repo add`
-/// override invocation, pre-filled with this repo's id and origin.
+/// recommendation block so the user gets the exact `cube repo ensure`
+/// override invocation, pre-filled with this repo's origin.
 fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
     format!(
         "First dispatch against `{repo_id}` ({origin}).\n\
          Cube auto-provisioned a pool at `{workspace_root}` with prefix `{prefix}`.\n\n\
          To customize, run:\n\n\
          ```\n\
-         cube repo add {repo_id} \\\n    \
-             --origin {origin} \\\n    \
+         cube repo ensure --origin {origin} \\\n    \
              --workspace-root ~/Documents/dev/workspaces \\\n    \
              --workspace-prefix {repo_id}-agent\n\
          ```\n\n\
@@ -5048,7 +5047,7 @@ mod tests {
         let item = cold_items[0];
         assert_eq!(item.status, "open");
         assert!(
-            item.body_markdown.contains("cube repo add mono"),
+            item.body_markdown.contains("cube repo ensure --origin git@github.com:spinyfin/mono.git"),
             "body should name the override command verbatim; got: {}",
             item.body_markdown,
         );
