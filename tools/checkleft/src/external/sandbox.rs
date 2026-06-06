@@ -16,16 +16,25 @@ pub enum AccessScope {
     ModifiedOnly,
     /// Every file in the repository tree. Opt-in; requires explicit declaration.
     WholeRepo,
-    /// Union of the declared glob patterns (repo-root-relative) plus all changeset files,
-    /// intersected with the host ceiling.
+    /// Union of the declared glob patterns (repo-root-relative) plus all changeset files.
     Globs(Vec<String>),
 }
 
-/// The host-enforced path ceiling: the maximum boundary for sandbox file access.
+/// The on-disk path of the repository root, used as the source location for
+/// the hardlink optimisation when populating the sandbox.
 ///
-/// Typically the repository root directory on disk. Used for the hardlink
-/// optimization when populating the sandbox: files are linked from
-/// `ceiling_path / repo_relative_path` when on the same filesystem.
+/// **Contract:** `path` must equal the root of the [`SourceTree`] passed to
+/// [`create_sandbox`].  All scope resolution and allowlist derivation delegates
+/// to the SourceTree (which enforces its own path-containment and symlink checks);
+/// the ceiling is consulted only by [`populate_sandbox_file`] when deciding
+/// whether to attempt a hardlink.  Because file discovery (`glob`, `exists`) is
+/// always routed through the SourceTree, the boundary property—no path outside
+/// the SourceTree root enters the sandbox—is upheld by the SourceTree, not by an
+/// independent intersection in the allowlist resolver.
+///
+/// Callers must uphold the invariant: if `ceiling.path != source_tree_root`, the
+/// hardlink source will diverge from the SourceTree content and the optimisation
+/// will silently serve stale data.
 pub struct HostCeiling {
     path: PathBuf,
 }
@@ -45,7 +54,7 @@ impl HostCeiling {
 pub struct SandboxResult {
     /// The populated sandbox directory. Dropping this removes the sandbox.
     pub root: TempDir,
-    /// The repo-relative paths that were materialized into the sandbox.
+    /// The repo-relative paths that were materialized into the sandbox, sorted.
     pub allowed_paths: Vec<PathBuf>,
 }
 
@@ -56,8 +65,13 @@ pub struct SandboxResult {
 /// hardlink when the sandbox is on the same filesystem as the ceiling; otherwise
 /// they are materialized via `source_tree.read_file`.
 ///
-/// Path normalization and `..` traversal rejection are applied throughout. Any
-/// path that would escape the sandbox fails the entire call.
+/// Path normalization and `..` traversal rejection are applied to all paths
+/// (changeset and glob-derived). Any path that would escape the sandbox fails
+/// the entire call. Symlink entries are always materialized via the SourceTree
+/// rather than hardlinked, so the SourceTree's containment checks apply.
+///
+/// **Invariant:** `ceiling.path` must equal the root of `source_tree`; see
+/// [`HostCeiling`] for details.
 pub fn create_sandbox(
     changeset: &ChangeSet,
     scope: AccessScope,
@@ -86,7 +100,7 @@ fn resolve_allowlist(
     scope: &AccessScope,
     source_tree: &dyn SourceTree,
 ) -> Result<Vec<PathBuf>> {
-    match scope {
+    let mut paths = match scope {
         AccessScope::ModifiedOnly => {
             let mut paths = Vec::new();
             for file in &changeset.changed_files {
@@ -97,13 +111,19 @@ fn resolve_allowlist(
                     paths.push(file.path.clone());
                 }
             }
-            Ok(paths)
+            paths
         }
 
         AccessScope::WholeRepo => {
-            source_tree
+            let glob_paths = source_tree
                 .glob("**")
-                .context("failed to enumerate whole-repo files")
+                .context("failed to enumerate whole-repo files")?;
+            for p in &glob_paths {
+                validate_relative_path(p).with_context(|| {
+                    format!("source tree returned invalid path: {}", p.display())
+                })?;
+            }
+            glob_paths
         }
 
         AccessScope::Globs(patterns) => {
@@ -125,16 +145,22 @@ fn resolve_allowlist(
                     .glob(pattern)
                     .with_context(|| format!("failed to expand glob pattern `{pattern}`"))?;
                 for p in matches {
+                    validate_relative_path(&p).with_context(|| {
+                        format!("source tree returned invalid path: {}", p.display())
+                    })?;
                     if seen.insert(p.clone()) {
                         paths.push(p);
                     }
                 }
             }
 
-            paths.sort();
-            Ok(paths)
+            paths
         }
-    }
+    };
+
+    // Sort all scopes for deterministic, consistent output.
+    paths.sort();
+    Ok(paths)
 }
 
 fn populate_sandbox_file(
@@ -150,14 +176,30 @@ fn populate_sandbox_file(
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
 
-    // Prefer a hardlink from the ceiling (zero extra disk, fast).
+    // Prefer a hardlink from the ceiling (zero extra disk, fast), but only when
+    // the source is a regular file.  Hard-linking a symlink copies the symlink
+    // reference rather than its target, which could point outside the ceiling and
+    // be followed by a check tool at runtime.  Routing symlinks through the
+    // SourceTree ensures its containment checks (resolve_checked_path) are applied.
     let source = ceiling.join(relative_path);
-    if fs::hard_link(&source, &dest).is_ok() {
-        return Ok(());
+    let source_is_symlink = fs::symlink_metadata(&source)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+
+    if !source_is_symlink {
+        if fs::hard_link(&source, &dest).is_ok() {
+            return Ok(());
+        }
     }
 
     // Fall back to materializing from the SourceTree. This handles virtual or
-    // git-backed trees and cross-filesystem situations where hardlinks fail.
+    // git-backed trees, cross-filesystem situations, and symlink entries (where
+    // the SourceTree's path-containment checks must be applied).
+    //
+    // Invariant: for disk-backed trees ceiling == source_tree root, so read_file
+    // and hard_link serve byte-identical content.  For virtual/git-backed trees
+    // the hardlink path is never taken (ceiling files do not exist on disk), so
+    // content always comes from the SourceTree and is authoritative by definition.
     let content = source_tree
         .read_file(relative_path)
         .with_context(|| format!("failed to read source file {}", relative_path.display()))?;
@@ -546,5 +588,111 @@ mod tests {
 
         let content = fs::read(result.root.path().join("src/real.rs")).expect("read hardlinked file");
         assert_eq!(content, b"fn real() {}");
+    }
+
+    // --- Ordering consistency ---
+
+    #[test]
+    fn modified_only_allowed_paths_are_sorted() {
+        let tree = MapSourceTree::new(&[
+            ("z.rs", b"fn z() {}"),
+            ("a.rs", b"fn a() {}"),
+            ("m.rs", b"fn m() {}"),
+        ]);
+        // Provide changeset in reverse-alphabetical order.
+        let cs = changeset(&["z.rs", "m.rs", "a.rs"]);
+        let ceiling = tempdir().unwrap();
+
+        let result =
+            create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+                .expect("create sandbox");
+
+        assert_eq!(
+            result.allowed_paths,
+            vec![
+                PathBuf::from("a.rs"),
+                PathBuf::from("m.rs"),
+                PathBuf::from("z.rs"),
+            ],
+            "allowed_paths must be sorted regardless of changeset order"
+        );
+    }
+
+    // --- Symlink handling ---
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_pointing_outside_ceiling_is_rejected() {
+        use std::os::unix::fs as unix_fs;
+
+        // Create a disk tree with a symlink pointing outside the tree root.
+        let inside = tempdir().expect("create inside dir");
+        let outside = tempdir().expect("create outside dir");
+
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"secret content").expect("write outside file");
+
+        // Place a symlink inside the tree that points to the outside file.
+        let link_path = inside.path().join("link.txt");
+        unix_fs::symlink(&outside_file, &link_path).expect("create symlink");
+
+        // Also write a regular file so the SourceTree is non-empty.
+        fs::write(inside.path().join("normal.rs"), b"fn ok() {}").expect("write normal file");
+
+        let tree = crate::source_tree::LocalSourceTree::new(inside.path())
+            .expect("create tree");
+
+        // WholeRepo would include link.txt via glob; the sandbox must reject it
+        // because LocalSourceTree.read_file rejects escaping symlinks.
+        let cs = ChangeSet::new(vec![]);
+        let err = create_sandbox(
+            &cs,
+            AccessScope::WholeRepo,
+            &tree,
+            &HostCeiling::new(inside.path()),
+        )
+        .unwrap_err();
+
+        let full_err = format!("{:#}", err);
+        assert!(
+            full_err.contains("symlink") || full_err.contains("escapes"),
+            "expected symlink-escape error, got: {full_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_within_ceiling_is_materialized_safely() {
+        use std::os::unix::fs as unix_fs;
+
+        // Symlink pointing to another file within the tree root — must succeed.
+        let dir = tempdir().expect("create dir");
+        fs::write(dir.path().join("target.rs"), b"fn target() {}").expect("write target");
+        unix_fs::symlink(dir.path().join("target.rs"), dir.path().join("link.rs"))
+            .expect("create symlink");
+
+        let tree = crate::source_tree::LocalSourceTree::new(dir.path()).expect("create tree");
+        let cs = ChangeSet::new(vec![]);
+
+        let result = create_sandbox(
+            &cs,
+            AccessScope::WholeRepo,
+            &tree,
+            &HostCeiling::new(dir.path()),
+        )
+        .expect("sandbox creation with safe symlink must succeed");
+
+        // Both entries are materialized; symlink is resolved to content.
+        assert!(
+            result.root.path().join("target.rs").exists(),
+            "target.rs must be in sandbox"
+        );
+        assert!(
+            result.root.path().join("link.rs").exists(),
+            "link.rs (resolved via SourceTree) must be in sandbox"
+        );
+        let link_content =
+            fs::read(result.root.path().join("link.rs")).expect("read link.rs content");
+        assert_eq!(link_content, b"fn target() {}");
     }
 }
