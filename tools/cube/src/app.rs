@@ -919,9 +919,10 @@ fn add_github_remote_and_track(
     })?;
 
     // Track the integration branch on the github remote so that local `<main>`
-    // follows GitHub rather than the stale local mirror. `is_no_such_remote_bookmark`
-    // is tolerated: it means the fetch above didn't bring down the branch (e.g.
-    // an empty or misconfigured remote), which is handled by the caller's error.
+    // follows GitHub rather than the stale local mirror. A missing `<main>@github`
+    // after fetch means the remote is empty or misconfigured; convert that into an
+    // explicit SetupStepFailed so provisioning fails loudly rather than silently
+    // leaving an untracked integration branch.
     let result = runner.run(&CommandInvocation {
         cwd: workspace_path.to_path_buf(),
         program: "jj".to_string(),
@@ -932,17 +933,36 @@ fn add_github_remote_and_track(
         ],
     });
     match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_no_such_remote_bookmark(&err) => Err(CubeError::SetupStepFailed {
-            step: "add_github_remote_and_track".to_string(),
-            error: format!(
-                "fresh clone at `{}` has no `{main_branch}` on the github remote after fetch; \
-                 cube cannot track the integration branch on the real upstream",
-                workspace_path.display()
-            ),
-        }),
-        Err(err) => Err(err),
+        Ok(_) => {}
+        Err(err) if is_no_such_remote_bookmark(&err) => {
+            return Err(CubeError::SetupStepFailed {
+                step: "add_github_remote_and_track".to_string(),
+                error: format!(
+                    "fresh clone at `{}` has no `{main_branch}` on the github remote after fetch; \
+                     cube cannot track the integration branch on the real upstream",
+                    workspace_path.display()
+                ),
+            });
+        }
+        Err(err) => return Err(err),
     }
+
+    // Untrack the mirror's integration branch so local `<main>` follows only
+    // the real GitHub upstream. Without this, local `<main>` tracks BOTH
+    // `<main>@origin` (stale mirror) and `<main>@github`, and a mid-session
+    // `jj git fetch` can leave `<main>` in a conflicted/divergent state —
+    // the same failure class this fix exists to prevent.
+    runner.run(&CommandInvocation {
+        cwd: workspace_path.to_path_buf(),
+        program: "jj".to_string(),
+        args: vec![
+            "bookmark".to_string(),
+            "untrack".to_string(),
+            format!("{main_branch}@origin"),
+        ],
+    })?;
+
+    Ok(())
 }
 
 /// Returns `true` when the error is `jj bookmark track`'s "no such
@@ -1484,7 +1504,6 @@ fn run_workspace(
                     &workspace.workspace_path,
                     &repo_record.main_branch,
                     prior_expired,
-                    repo_record.source.as_ref().map_or(false, |s| s.exists()),
                 ) {
                     let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                     return Err(error);
@@ -1594,7 +1613,6 @@ fn run_workspace(
                     database_path,
                     &workspace.workspace_path,
                     &repo_record.main_branch,
-                    repo_record.source.as_ref().map_or(false, |s| s.exists()),
                 )?;
                 // Opportunistically forget consumed boss/exec_* bookmarks.
                 // The fetch above already updated main, so do_fetch = false.
@@ -3608,8 +3626,8 @@ fn gc_aged_unhealthy_workspaces(
             continue;
         }
 
-        let (main_branch, has_source) = match store.get_repo(&record.repo).ok().flatten() {
-            Some(r) => (r.main_branch, r.source.as_ref().map_or(false, |s| s.exists())),
+        let main_branch = match store.get_repo(&record.repo).ok().flatten() {
+            Some(r) => r.main_branch,
             None => {
                 eprintln!(
                     "cube: unhealthy gc: {}: repo {} not found, skipping",
@@ -3630,7 +3648,6 @@ fn gc_aged_unhealthy_workspaces(
             database_path,
             &record.workspace_path,
             &main_branch,
-            has_source,
         ) {
             eprintln!(
                 "cube: unhealthy gc: {}: reset failed: {e}",
@@ -3831,9 +3848,8 @@ fn reset_workspace(
     database_path: Option<&Path>,
     workspace_path: &Path,
     main_branch: &str,
-    has_source: bool,
 ) -> Result<()> {
-    reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None, has_source)
+    reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None)
 }
 
 /// Resolve the GitHub remote name and `owner/repo` slug from `jj git remote
@@ -4037,7 +4053,6 @@ fn reset_workspace_guarded(
     workspace_path: &Path,
     main_branch: &str,
     prior_expired: Option<&crate::store::ExpiredLease>,
-    has_source: bool,
 ) -> Result<()> {
     audit_jj_op(database_path, workspace_path, "git", &["fetch"], prior_expired);
     run_jj(
@@ -4072,15 +4087,12 @@ fn reset_workspace_guarded(
         }
     }
 
-    // When the workspace was provisioned from a local source mirror, the real
-    // GitHub upstream is the `github` remote (not `origin`). Detect it so the
-    // fast-forward targets the current GitHub head rather than the potentially
-    // stale mirror snapshot. For direct-GitHub clones, `origin` is the upstream.
-    let upstream_remote = if has_source {
-        detect_upstream_tracking_remote(runner, database_path, workspace_path)
-    } else {
-        "origin".to_string()
-    };
+    // Detect the real upstream remote by URL so the fast-forward targets the
+    // current GitHub HEAD. For source-pool workspaces this resolves the `github`
+    // remote; for direct-GitHub clones it returns `origin`. Using URL-based
+    // detection (rather than a `has_source` proxy) means the correct remote is
+    // found even when the source mirror is later GC'd after provisioning.
+    let upstream_remote = detect_upstream_tracking_remote(runner, database_path, workspace_path);
     fast_forward_default_branch_to_origin(runner, database_path, workspace_path, main_branch, prior_expired, &upstream_remote)?;
 
     audit_jj_op(database_path, workspace_path, "new", &[main_branch], prior_expired);
@@ -4107,9 +4119,29 @@ fn detect_upstream_tracking_remote(
     let invocation =
         RealCommandRunner::invocation(workspace_path, "jj", &["git", "remote", "list"]);
     let remote_output = run_jj(runner, database_path, &invocation).unwrap_or_default();
-    parse_github_remote(&remote_output)
-        .map(|(name, _)| name)
-        .unwrap_or_else(|| "origin".to_string())
+    if let Some((name, _)) = parse_github_remote(&remote_output) {
+        return name;
+    }
+    // No github.com remote found. If origin points to a local path this is
+    // likely a source-pool workspace provisioned before the github-remote fix
+    // (it has only `origin = /local/mirror` and no `github` remote). Warn so
+    // operators know the workspace will keep fast-forwarding against the stale
+    // mirror until it is re-provisioned.
+    let origin_is_local = remote_output.lines().any(|line| {
+        let mut parts = line.splitn(2, |c: char| c.is_whitespace());
+        let name = parts.next().map(str::trim).unwrap_or_default();
+        let url = parts.next().map(str::trim).unwrap_or_default();
+        name == "origin" && (url.starts_with('/') || url.starts_with('.'))
+    });
+    if origin_is_local {
+        eprintln!(
+            "cube: warning: workspace at `{}` appears to be a pre-existing source-pool \
+             workspace (origin is a local path, no github.com remote found). Fast-forward \
+             will target the stale local mirror until the workspace is re-provisioned.",
+            workspace_path.display()
+        );
+    }
+    "origin".to_string()
 }
 
 /// Fast-forward the workspace's local default bookmark to the
@@ -6377,6 +6409,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -6451,6 +6484,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::revision_doesnt_exist(
                 first_path.clone(),
                 "jj",
@@ -6511,6 +6545,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -6600,6 +6635,7 @@ mod tests {
                 "",
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/legacy.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "master", "-r", "master@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "master"], ""),
             ExpectedCommand::ok(
@@ -6669,6 +6705,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -6747,6 +6784,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -6930,6 +6968,7 @@ mod tests {
             let runner = FakeRunner::new(vec![
                 ExpectedCommand::ok(path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
                 ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
+                ExpectedCommand::ok(path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
                 ExpectedCommand::ok(path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
                 ExpectedCommand::ok(path.clone(), "jj", &["new", "main"], ""),
                 ExpectedCommand::ok(
@@ -6972,6 +7011,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7039,6 +7079,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7086,6 +7127,7 @@ mod tests {
         let first_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7114,6 +7156,7 @@ mod tests {
         let second_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7156,6 +7199,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7214,6 +7258,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(first.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(first.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(first.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7259,6 +7304,7 @@ mod tests {
             // health-check 007 → clean → use
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7431,6 +7477,7 @@ mod tests {
         let first_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(busy_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(busy_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(busy_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(busy_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(busy_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7775,6 +7822,7 @@ mod tests {
             // health-check 007 → clean → use
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7839,6 +7887,7 @@ mod tests {
             ),
             // reset 003
             ExpectedCommand::ok(path_003.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(path_003.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(path_003.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(path_003.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7909,6 +7958,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7967,6 +8017,7 @@ mod tests {
             ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8025,6 +8076,7 @@ mod tests {
             ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8095,6 +8147,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&ws_path),
@@ -8137,6 +8190,7 @@ mod tests {
             ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8181,6 +8235,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8208,6 +8263,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -8237,6 +8293,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8264,6 +8321,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -8351,6 +8409,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8366,6 +8425,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -8416,6 +8476,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8474,6 +8535,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8574,6 +8636,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8632,6 +8695,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9002,6 +9066,7 @@ mod tests {
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9087,6 +9152,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9122,6 +9188,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9207,6 +9274,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9263,6 +9331,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9311,6 +9380,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9363,6 +9433,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9439,6 +9510,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9550,6 +9622,7 @@ mod tests {
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9626,6 +9699,7 @@ mod tests {
         FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9670,6 +9744,7 @@ mod tests {
     fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
         FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             gc_noop_command(workspace_path),
@@ -9685,6 +9760,7 @@ mod tests {
         let mut commands = vec![
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9774,6 +9850,7 @@ mod tests {
         // Release runner returns a consumed bookmark from the gc log query.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -9970,6 +10047,7 @@ mod tests {
         // Release runner: gc finds a closed pr/42 bookmark and forgets it.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             // exec sweep: no consumed exec bookmarks.
@@ -10023,6 +10101,7 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -10075,6 +10154,7 @@ mod tests {
         // Release runner: gc finds pr/7 but state is OPEN — no forget call.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -10127,6 +10207,7 @@ mod tests {
         // Release runner: remote list fails → pr sweep skipped, no extra commands.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -10280,6 +10361,7 @@ steps:
         // Release so we can re-lease cleanly.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -10424,6 +10506,7 @@ steps:
         };
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
@@ -10539,6 +10622,7 @@ steps:
                 "Working copy now at: abc1234",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -10656,6 +10740,7 @@ steps:
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -10772,6 +10857,7 @@ steps:
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -10855,6 +10941,7 @@ steps:
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -10940,6 +11027,7 @@ steps:
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -11006,6 +11094,7 @@ steps:
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -11462,6 +11551,7 @@ steps:
                 &["bookmark", "track", "master@origin"],
             ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -11679,6 +11769,7 @@ steps:
                 ],
                 probe_output,
             ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -13344,6 +13435,7 @@ steps:
     fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
         FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
             ExpectedCommand::ok(
                 ws_path.to_path_buf(),
                 "jj",
@@ -13668,6 +13760,8 @@ steps:
             ExpectedCommand::ok(staging.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
             // Track main on the github remote.
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@github"], ""),
+            // Untrack main@origin so local main only follows the real GitHub upstream.
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "untrack", "main@origin"], ""),
             // Reset sequence uses main@github for the fast-forward.
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n"),
