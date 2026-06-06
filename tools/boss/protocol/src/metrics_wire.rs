@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 /// [`FrontendEvent::MetricsShowLiveResult`]. Values are read directly
 /// from the engine's atomics so they are not subject to the 30s
 /// flush-staleness window.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct MetricLiveEntry {
     pub name: String,
     pub description: String,
