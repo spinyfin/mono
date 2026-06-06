@@ -10,10 +10,14 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
-    # First-party check definitions embedded in the binary via include_str!
-    # (see src/external/bundled.rs). Must be compile_data so the bundle is
-    # readable at compile time under bazel's sandbox.
-    compile_data = ["checks/buildifier/check.yaml"],
+    # First-party check definitions embedded via include_str! (bundled.rs) and
+    # the WIT package consumed by wasmtime::component::bindgen! at compile time
+    # (component_bindings.rs). Both must be compile_data so they are readable
+    # inside bazel's sandbox during proc-macro / macro expansion.
+    compile_data = [
+        "checks/buildifier/check.yaml",
+        "//tools/checkleft/wit:check.wit",
+    ],
     crate_name = "checkleft",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -60,12 +64,14 @@ rust_test(
     name = "checkleft_lib_test",
     size = "small",
     # check.yaml is the canonical buildifier definition; the fixtures back the
-    # hermetic parity test in src/external/declarative/parity_e2e.rs. All are
-    # embedded via include_str! so the test and the shipped definition cannot drift.
+    # hermetic parity test in src/external/declarative/parity_e2e.rs; check.wit
+    # is the WIT contract consumed by wasmtime::component::bindgen! at compile
+    # time in component_bindings.rs. All are embedded/read at compile time.
     compile_data = [
         "checks/buildifier/check.yaml",
         "tests/fixtures/buildifier/malformed.bzl.fixture",
         "tests/fixtures/buildifier/unformatted.bzl.fixture",
+        "//tools/checkleft/wit:check.wit",
     ],
     crate = ":checkleft_lib",
     # The real buildifier binary, staged into the test's runfiles so the

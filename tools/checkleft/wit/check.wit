@@ -1,0 +1,207 @@
+// WIT contract for checkleft external checks using the WebAssembly Component Model.
+//
+// Package: checkleft:check@0.1.0
+//
+// This file defines the typed interface between the checkleft host and
+// out-of-tree check components. The host uses `wasmtime::component::bindgen!`
+// to generate Rust bindings; check components use `wit-bindgen` (via the
+// `checkleft-check-sdk` guest crate) to implement the `check` world.
+//
+// Type correspondence (WIT → host Rust):
+//   change-kind       → input::ChangeKind
+//   changed-file      → input::ChangedFile
+//   file-line-delta   → input::FileLineDelta
+//   diff-hunk         → input::DiffHunk
+//   file-diff         → input::FileDiff
+//   change-set        → input::ChangeSet
+//   check-input       → (input::ChangeSet, toml::Value config)
+//   severity          → output::Severity
+//   location          → output::Location
+//   file-edit         → output::FileEdit
+//   suggested-fix     → output::SuggestedFix
+//   finding           → output::Finding
+//   access-scope      → (no host equivalent yet; used for sandbox policy)
+//   check-descriptor  → (no host equivalent yet; used for bundling/discovery)
+//   check-error       → anyhow::Error
+
+package checkleft:check@0.1.0;
+
+/// Typed data model for check inputs, outputs, and self-description.
+///
+/// Mirrors checkleft's host-side `input.rs` and `output.rs` so that
+/// lifting/lowering between the WIT layer and the host Rust types is
+/// mechanical. See the file-level comment above for the full mapping.
+interface types {
+    /// How a file changed relative to the prior revision.
+    /// Mirrors `input::ChangeKind`.
+    enum change-kind {
+        added,
+        modified,
+        deleted,
+        renamed,
+    }
+
+    /// A single file that changed in the current changeset.
+    /// Mirrors `input::ChangedFile`.
+    record changed-file {
+        path: string,
+        kind: change-kind,
+        /// Non-empty only when `kind = renamed`; the path before the rename.
+        old-path: option<string>,
+    }
+
+    /// Line-count delta for one file in the changeset.
+    /// Mirrors `input::FileLineDelta`.
+    record file-line-delta {
+        added-lines: u32,
+        removed-lines: u32,
+    }
+
+    /// One contiguous hunk of a unified diff.
+    /// Mirrors `input::DiffHunk`.
+    record diff-hunk {
+        old-start: u32,
+        old-lines: u32,
+        new-start: u32,
+        new-lines: u32,
+        added-lines: u32,
+        removed-lines: u32,
+    }
+
+    /// Diff hunks for a single file.
+    /// Mirrors `input::FileDiff`.
+    record file-diff {
+        path: string,
+        hunks: list<diff-hunk>,
+    }
+
+    /// The set of changes under review: modified files, diffs, and metadata.
+    /// Mirrors `input::ChangeSet`.
+    record change-set {
+        changed-files: list<changed-file>,
+        file-diffs: list<file-diff>,
+        commit-description: option<string>,
+        pr-description: option<string>,
+        change-id: option<string>,
+        repository: option<string>,
+    }
+
+    /// All input a check receives for one invocation.
+    ///
+    /// Per-check configuration is passed as a JSON string. The guest SDK
+    /// deserializes it into the author's own `#[derive(Deserialize)]` config
+    /// struct via serde. This avoids modeling arbitrary config as WIT records.
+    ///
+    /// Mirrors the combination of `input::ChangeSet` + `toml::Value` config
+    /// that `ExternalCheckExecutor::execute` accepts on the host side.
+    record check-input {
+        changeset: change-set,
+        /// Serialised TOML config for this check, re-encoded as JSON for
+        /// cross-language portability.
+        config-json: string,
+    }
+
+    /// Diagnostic severity, matching checkleft's display conventions.
+    /// Mirrors `output::Severity`.
+    enum severity {
+        error,
+        warning,
+        info,
+    }
+
+    /// Source location attached to a finding.
+    /// Mirrors `output::Location`.
+    record location {
+        path: string,
+        line: option<u32>,
+        column: option<u32>,
+    }
+
+    /// A single text substitution within a file.
+    /// Mirrors `output::FileEdit`.
+    record file-edit {
+        path: string,
+        old-text: string,
+        new-text: string,
+    }
+
+    /// An optional automated fix for a finding.
+    /// Mirrors `output::SuggestedFix`.
+    record suggested-fix {
+        description: string,
+        edits: list<file-edit>,
+    }
+
+    /// One diagnostic produced by a check.
+    /// Mirrors `output::Finding`.
+    record finding {
+        severity: severity,
+        message: string,
+        location: option<location>,
+        remediations: list<string>,
+        suggested-fix: option<suggested-fix>,
+    }
+
+    /// Declares how much of the repository a check needs to read.
+    ///
+    /// File access is enforced structurally by the host: for each invocation
+    /// the host builds a sandbox directory containing exactly the allowlisted
+    /// files (per the declared scope) and mounts it as the WASI filesystem
+    /// root. Guests read files with ordinary `std::fs` — no
+    /// checkleft-specific host import is needed.
+    ///
+    /// Absent from `check-descriptor.access-scope` means `modified-only`.
+    variant access-scope {
+        /// Only the files modified in the current changeset (the default).
+        modified-only,
+        /// Every file in the repository tree. Explicit opt-in; the host may
+        /// apply additional scrutiny to checks that declare this.
+        whole-repo,
+        /// The union of all changeset files plus the files matched by the
+        /// given repo-root-relative globs. The host intersects the expanded
+        /// set with a ceiling before populating the sandbox.
+        globs(list<string>),
+    }
+
+    /// Self-description returned by `list-checks`.
+    ///
+    /// One component may export multiple checks. The host calls `list-checks`
+    /// once after instantiation to enumerate them, then dispatches by name
+    /// via `run-check`. The `access-scope` field drives the sandbox policy
+    /// for that check's invocations.
+    record check-descriptor {
+        name: string,
+        description: string,
+        default-severity: severity,
+        /// Declared file-access scope. Absent (`none`) means `modified-only`.
+        access-scope: option<access-scope>,
+    }
+
+    /// Error variants returned by `run-check`.
+    variant check-error {
+        /// No check with the given name is exported by this component.
+        unknown-check(string),
+        /// The check ran but encountered a fatal error.
+        failed(string),
+    }
+}
+
+/// The world that a checkleft check component must implement.
+///
+/// File access is provided through the WASI filesystem interface (wasm32-wasip2).
+/// The host preopens a capability-scoped sandbox directory as the WASI root;
+/// guests read files with `std::fs` and see only the files the host allows.
+/// No checkleft-specific file import exists in this world.
+world check {
+    use types.{check-input, finding, check-descriptor, check-error};
+
+    /// Return a descriptor for every check exported by this component.
+    /// Called once by the host after instantiation.
+    export list-checks: func() -> list<check-descriptor>;
+
+    /// Run the named check and return its findings, or an error.
+    export run-check: func(
+        name: string,
+        input: check-input,
+    ) -> result<list<finding>, check-error>;
+}
