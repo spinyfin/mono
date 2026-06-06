@@ -25,6 +25,7 @@ The current `sandbox-v1` restrictions are not sacrosanct; a fresh-slate rewrite 
 - Checks run in-process (no per-invocation process spawn), AOT-compiled and cached, with a quantified cost story versus the current ABI and versus the exec/declarative alternative.
 - The existing executor/provider/runner architecture, sha256 artifact pinning, and CHECKS resolution semantics are preserved and reworked, not thrown away.
 - The end-to-end proof is porting `rust-giant-structs-use-builder` (currently a built-in; ported to `sandbox-v1` in T1444/PR 1410) onto the new model.
+- **Bazel is the required build path — for both the runtime and every check.** "You can build it with cargo" and "there is a shell script to build the check" are not acceptable endpoints. The bazel build is the real, supported path. Both the wasmtime host embedding and the out-of-tree guest components must build under bazel, including wit-bindgen guest-binding generation, wasm32-wasip2 cross-compilation, and the componentization step. Building custom bazel rules to support this is explicitly acceptable and expected (see §Build (bazel)).
 
 ## Non-goals
 
@@ -339,14 +340,83 @@ T1407 (PR 1402) gives us the bundled-def provider and the `check_definitions` CH
 
 All open questions are now resolved. Summary of decisions: (Q1) **resolved** — config crosses the WIT boundary as a JSON string (`config-json`); guest SDK deserializes with serde into the author's own struct; (Q2) **resolved** — WASI-p2 is central to the design and `wasmtime-wasi` is always linked; (Q3) **resolved** — epoch-based wall-clock deadline is the default; fuel is available as an opt-in determinism knob but is off by default; (Q4) sandbox-dir is the v1 default; custom/virtual host-FS is a deferred optimisation if profiling demands it (host-imported `read-file` ABI remains off the table); (Q5) **resolved** — `sandbox-v1` is removed immediately once the component path lands (T11), with no parallel dual-tier period.
 
+## Build (bazel)
+
+**Bazel is a hard requirement.** Both the wasmtime host runtime (checkleft's wasm executor) and the out-of-tree check components (guest modules) must be buildable entirely under bazel. "You can build it with cargo" is not an acceptable endpoint. "There is a shell script to build the check" is not an acceptable endpoint. The bazel build is the real, supported path for this project.
+
+### Host / runtime side
+
+The wasmtime host embedding (`tools/checkleft` and the new executor code) is standard Rust and builds under `rules_rust` with no new rule bodies:
+
+- `rust_library` / `rust_binary` targets cover the executor rewrite, the `wasmtime::component::bindgen!` macro expansion (a proc-macro, handled at compile time inside `rules_rust`), the `HostState` / `WasiCtx` wiring, and the limit-policy code.
+- The shared FS-sandbox module (T3a) is a pure-Rust `rust_library` with no wasm toolchain dependency; it builds like any other crate.
+- The AOT `.cwasm` precompile step is a **runtime** operation performed on first component load against a live `Engine`. It is not a build-time artifact and requires no bazel rule; the cache directory is a runtime side effect managed by the executor.
+- `wasmtime-wasi` is a normal Cargo dependency; `rules_rust` resolves it via the workspace `Cargo.lock`. No extra steps.
+
+### Guest / check side: what `rules_rust` does NOT provide
+
+**`rules_rust` ships a `rust_wasm_bindgen` rule. This is the wrong tool and must not be used.** `rust_wasm_bindgen` wraps the `wasm-bindgen` CLI, a JavaScript interop toolchain that targets `wasm32-unknown-unknown` for browser/Node consumption. It has no connection to WASI or the WebAssembly Component Model. Do not conflate the two.
+
+Building a `wasm32-wasip2` Component Model component requires a pipeline that `rules_rust` does not cover end-to-end:
+
+**Step 1 — Cross-compile to `wasm32-wasip2` with `rules_rust`.**
+`rules_rust` supports arbitrary Rust target triples, including wasm ones, via a registered `rust_toolchain` that names the cross-compile triple. `wasm32-wasip2` is a tier-2 Rust target (available from Rust 1.78+) and is the preferred guest triple for Component Model checks because it targets WASI Preview 2 interfaces natively, reducing or eliminating the need for an adapter module. A `wasm_wasip2_toolchain` bazel setup — registering the `wasm32-wasip2` Rust cross-compiler triple and its `std` sysroot — must be written. This is toolchain configuration (a `toolchain()` target and a `platform()` constraint), not a new rule body, but it is new infra that does not exist in this repo today.
+
+**Step 2 — Expose `.wit` files to the compiler sandbox.**
+`wit-bindgen` operates as a proc-macro inside the guest SDK (`checkleft-check-sdk`). The macro is triggered by `#[check]` at compile time within `rules_rust`. For the macro to locate the WIT source files, those files must be declared as `data` on the relevant `rust_library` target and accessible inside the bazel sandbox at the path the macro expects (via `wit-bindgen`'s `world` path argument). This is a **sandbox visibility configuration**, not a new rule. The `.wit` package lives at a declared bazel target (e.g. `//tools/checkleft/wit:check_wit`), and the guest SDK target declares it as `data`.
+
+**Step 3 — Componentization via `wasm-tools`.**
+This is the step with no upstream `rules_rust` support. After Step 1, the output is a core WebAssembly module (or a WASI-p2 module, depending on the Rust target). Promotion to a signed Component Model component requires running `wasm-tools component new`. If targeting `wasm32-wasip2` directly, the adapter may not be required, but a `wasm-tools component embed` or `wasm-tools component new` invocation is still needed to embed the WIT package metadata and produce a standard component binary:
+
+```
+wasm-tools component new <core.wasm> -o <component.wasm>
+# or, if targeting wasm32-wasip1 with an adapter:
+wasm-tools component new <core.wasm> \
+  --adapt wasi_snapshot_preview1=<wasip1-to-p2-adapter.wasm> \
+  -o <component.wasm>
+```
+
+**A new custom bazel rule is required for this step.** The rule, provisionally named `rust_wasm_component`, chains the `rules_rust` compile output through a hermetic `wasm-tools` toolchain invocation and produces the final `.wasm` component as a declared bazel output.
+
+**Step 4 — SHA-256 emission.**
+The manifest's `artifact_sha256` field must be pinned at build time, not computed at runtime. The `rust_wasm_component` rule (or a sidecar genrule) emits a `<component>.wasm.sha256` text file alongside the component. CI stamps the digest into the CHECKS source at build time.
+
+### Custom rules and toolchain declarations required
+
+| Rule / Declaration | Purpose | Upstream support |
+|---|---|---|
+| `wasm_wasip2_toolchain` | Register the `wasm32-wasip2` Rust cross-compiler triple and its sysroot under bazel | Configuration targets — no new rule body, but must be written; does not exist in-repo today |
+| `wasm_tools_toolchain` | Declare the `wasm-tools` CLI binary as a hermetic bazel toolchain, pinned to a specific version | New toolchain declaration |
+| `rust_wasm_component` | Compile a Rust guest crate to wasm via `rules_rust`, then componentize via `wasm-tools`, and emit a sha256 sidecar | **New custom rule** — not in `rules_rust` or any upstream |
+| `.wit` data exposure | Expose the `checkleft:check` WIT package as a declared bazel `data` dependency visible to the `wit-bindgen` proc-macro at compile time | `data` attribute on existing `rust_library` targets — no new rule |
+
+The `rust_wasm_component` rule is the largest single piece of new bazel infrastructure. It encapsulates the cross-compile + componentize + sha256-emit pipeline into one bazel target, so a check author writes a single target declaration:
+
+```python
+rust_wasm_component(
+    name = "my_check",
+    srcs = glob(["src/**/*.rs"]),
+    wit_package = "//tools/checkleft/wit:check_wit",
+    deps = ["//tools/checkleft/sdk:checkleft_check_sdk"],
+    visibility = ["//tools/checkleft:__pkg__"],
+)
+# Produces: my_check.wasm and my_check.wasm.sha256
+```
+
+### Scope of T9 (bazel rules for wasm component checks)
+
+T9 in the task breakdown covers this entire "Build (bazel)" guest-side pipeline. It is sized `large` because it is genuinely new infrastructure with no prior art in this repo: a `wasm32-wasip2` toolchain registration, a hermetic `wasm_tools_toolchain`, and the `rust_wasm_component` rule body. T9 depends on T2 (guest SDK) so that the SDK shape is stable before the rule is written and the first check is built through it in CI. T9 gates T10 (end-to-end proof) but is otherwise parallel to T3-T8 and may proceed as soon as T2 lands.
+
+The host-side bazel build (checkleft binary, executor, FS-sandbox module) is standard `rules_rust` and does not depend on T9. It lands incrementally alongside T3-T6 with no special gating.
+
 ## Migration plan
 
 1. **Phase 0 — Design (this document).**
 2. **Phase 1 — Contract + SDK.** Land the WIT package and the `checkleft-check-sdk` guest crate (T1, T2).
-3. **Phase 2 — Host runtime.** New component executor with `host-fs` allowlist, epoch/memory limits, and `.cwasm` cache (T3-T6).
+3. **Phase 2 — Host runtime.** New component executor with `host-fs` allowlist, epoch/memory limits, and `.cwasm` cache (T3-T6). Host-side bazel targets (`rules_rust`) land with the code; no custom rules needed.
 4. **Phase 3 — Manifest/provider/CHECKS rework + bundling** (T7, T8).
-5. **Phase 4 — Bazel guest-build rule** (T9).
-6. **Phase 5 — Proof.** Port `rust-giant-structs-use-builder` onto the SDK, build it via the bazel rule, resolve it via the provider, and run it through the new host with an end-to-end test (T10). This is the acceptance proof for the whole project.
+5. **Phase 4 — Bazel rules for wasm component checks** (T9): `wasm32-wasip2` toolchain, `wasm_tools_toolchain`, and `rust_wasm_component` rule. This is first-class migration work, not an afterthought, and is on the critical path to the end-to-end proof.
+6. **Phase 5 — Proof.** Port `rust-giant-structs-use-builder` onto the SDK, build it via the `rust_wasm_component` bazel rule (T9), resolve it via the provider, and run it through the new host with an end-to-end test (T10). The check must be built entirely under bazel — cargo is not the acceptance path. This is the proof for the whole project.
 7. **Phase 6 — Cleanup.** Remove `sandbox-v1` runtime paths and the inert wasm-tier command-capability surface (T11).
 
 ## Proposed implementation task breakdown
@@ -389,12 +459,20 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 **Scope:** Map one component artifact to N logical packages (one per `list-checks` export, carrying a `run-check` selector); rework the bundled provider (`bundled.rs`) to `include_bytes!` component bytes; ensure name-based resolution (bundled + exec-path CHECKS `check_definitions`) resolves to the right component+export. Tests across composite-provider resolution.
 **Effort:** medium. **Depends on:** T3, T7.
 
-### T9 — Bazel reproducible guest-build rule
-**Scope:** A hermetic bazel rule that builds a `checkleft-check-sdk` guest crate into a wasm component (`cargo component` / `wasm-tools` under a pinned toolchain), produces deterministic output, and emits the sha256 for the manifest. New infra (no existing wasm-component rule in-repo). Build a sample guest through it in CI.
+### T9 — Bazel rules for wasm component checks
+**Scope:** All new bazel infrastructure required to build a `checkleft-check-sdk` guest crate into a `wasm32-wasip2` Component Model component under bazel end-to-end. This is first-class migration work, not an afterthought. Concretely:
+
+1. **`wasm32-wasip2` toolchain registration.** Register the `wasm32-wasip2` Rust cross-compiler triple (and its pre-built `std` sysroot) as a `rust_toolchain` / `platform()` target pair under bazel. `rules_rust` supports arbitrary cross-compile triples; this is new toolchain configuration, not a new rule body, but it does not exist in-repo today.
+2. **`wasm_tools_toolchain`.** Declare the `wasm-tools` binary as a hermetic bazel toolchain, version-pinned, downloadable via `http_file` or a registry rule. This is required for the componentization step and must be reproducible across CI machines.
+3. **`rust_wasm_component` rule.** A custom Starlark rule that: (a) invokes `rules_rust`'s `rust_binary`-equivalent to compile to `wasm32-wasip2`, (b) passes the resulting `.wasm` through `wasm-tools component new` (with or without the wasip1 adapter, depending on the Rust target output), and (c) emits the final component `.wasm` and a `.wasm.sha256` sidecar as declared bazel outputs. The sha256 sidecar is what the CHECKS manifest pins.
+4. **`.wit` data exposure.** Declare the `checkleft:check@0.1.0` WIT package as a bazel file target visible to the `wit-bindgen` proc-macro at compile time (via `data` on the guest SDK `rust_library` target). Verify that the bazel sandbox exposes the WIT files at the path the macro expects.
+5. **CI smoke test.** Build the sample guest check (from T2) entirely through the new `rust_wasm_component` rule and verify the sha256 sidecar is produced. This confirms the pipeline is hermetic and reproducible before T10 depends on it.
+
+**What this is NOT:** `rules_rust`'s `rust_wasm_bindgen` rule wraps the `wasm-bindgen` CLI for JavaScript interop targeting `wasm32-unknown-unknown`. It has no connection to WASI or the Component Model. Do not use it; the `rust_wasm_component` rule described above is a separate new rule.
 **Effort:** large. **Depends on:** T2.
 
 ### T10 — Port `rust-giant-structs-use-builder` as the end-to-end proof
-**Scope:** Re-author the check on the guest SDK (superseding the T1444 `sandbox-v1` port), build it via T9, bundle/resolve it via T8, and run it through the new host (T3-T6) in an end-to-end test that exercises a capability-scoped file read with the default `modified-only` scope and a real finding. This is the project's acceptance proof.
+**Scope:** Re-author the check on the guest SDK (superseding the T1444 `sandbox-v1` port), build it via the `rust_wasm_component` bazel rule (T9) — **not via cargo, not via a shell script** — bundle/resolve it via T8, and run it through the new host (T3-T6) in an end-to-end test that exercises a capability-scoped file read with the default `modified-only` scope and a real finding. This is the project's acceptance proof; the proof is only valid if the check is built end-to-end under bazel.
 **Effort:** medium. **Depends on:** T2, T3a, T4, T8, T9. *(T5/T6 should also be landed for a realistic run, but are not strictly gating the proof's correctness.)*
 
 ### T11 — Remove `sandbox-v1` runtime and dead capability surface
@@ -420,4 +498,4 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 - **Instance pooling / warm-pool** for very high check counts (instantiation is already cheap; revisit only if profiling demands it).
 - **Component signing / provenance** beyond sha256 pinning.
 
-**Effort estimate (whole project):** ~11-13 PRs. The host-side path (T1, T3-T8, T3a, T10, T11) is mostly `small`/`medium` and well-understood given the existing architecture. T3a (shared FS sandbox module) is a standalone `medium` that can run fully in parallel with T1 and the rest of the wasm runtime work. The dominant unknown remains **T9 (bazel reproducible wasm-component build, `large`)**, which is new infrastructure; it can proceed in parallel with the host work once the SDK (T2) exists, so it need not serialize the critical path.
+**Effort estimate (whole project):** ~11-13 PRs. The host-side path (T1, T3-T8, T3a, T10, T11) is mostly `small`/`medium` and well-understood given the existing architecture. T3a (shared FS sandbox module) is a standalone `medium` that can run fully in parallel with T1 and the rest of the wasm runtime work. The dominant unknown remains **T9 (bazel rules for wasm component checks, `large`)**: a `wasm32-wasip2` toolchain registration, a hermetic `wasm_tools_toolchain`, and a `rust_wasm_component` custom rule are all new bazel infrastructure with no prior art in this repo. T9 is on the critical path to T10 (the end-to-end proof) but is otherwise parallel to T3-T8 and can proceed as soon as T2 lands. The host-side bazel build (standard `rules_rust`) lands incrementally with T3-T6 and does not depend on T9.
