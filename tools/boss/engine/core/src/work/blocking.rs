@@ -1378,6 +1378,37 @@ impl WorkDb {
         }
     }
 
+    /// Returns `true` when there is at least one engine-triggered
+    /// CI-fix revision (`created_via LIKE 'ci-fix:%'`) for the chore
+    /// `work_item_id` that is still in flight — i.e. its status is
+    /// `todo`, `active`, or `blocked` (waiting on a dependency that
+    /// is itself still running).
+    ///
+    /// Used by [`crate::ci_watch::on_ci_failure_detected`] as a
+    /// secondary pre-flight gate: after the primary gate (based on
+    /// the `ci_remediations` status column) passes, this check
+    /// prevents a new CI-fix revision from spawning while a prior
+    /// revision's worker is still in flight. The primary gate can be
+    /// bypassed when `try_retire_cleared_blocking_signal` marks the
+    /// `ci_remediations` row `succeeded` prematurely (the originally-
+    /// failing checks cleared on a re-trigger while the worker is
+    /// still running and has not yet pushed a fix commit).
+    pub fn has_in_flight_ci_fix_revision(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM tasks t
+             WHERE t.parent_task_id = ?1
+               AND t.kind = 'revision'
+               AND t.created_via LIKE 'ci-fix:%'
+               AND t.status IN ('todo', 'active', 'blocked')
+               AND t.deleted_at IS NULL",
+            params![work_item_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Does the work item have a `ci_failure_suppressions` row for
     /// `head_sha`? Set by manual moves out of `blocked: ci_failure`
     /// to keep the next probe from immediately re-flipping the row

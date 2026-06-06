@@ -326,6 +326,39 @@ pub async fn on_ci_failure_detected(
             return false;
         }
 
+    // Secondary pre-flight: gate on any ci-fix revision that is still
+    // in flight (status `todo`, `active`, or `blocked`). The primary gate
+    // above (ci_remediations status IN ('pending', 'running')) can be
+    // bypassed when `try_retire_cleared_blocking_signal` marks the row
+    // `succeeded` prematurely — specifically when the originally-failing
+    // checks are no longer in the failure set (e.g. a re-triggered flaky
+    // check now passes) while the revision worker is still running and has
+    // not pushed a fix commit. Without this guard, a new revision can spawn
+    // concurrently with the prior one, wasting the attempt budget and racing
+    // the same PR branch (observed: T1437→T1438→T1439 firing 4–6 min apart,
+    // shorter than one worker+CI cycle — issue T1431 / PR #1404).
+    match work_db.has_in_flight_ci_fix_revision(&candidate.work_item_id) {
+        Ok(true) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "ci_watch: ci-fix revision still in flight (worker active or blocked); \
+                 deferring to prevent overlapping attempts",
+            );
+            return false;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to check in-flight ci-fix revision; deferring",
+            );
+            return false;
+        }
+    }
+
     // The head sha is the discriminator for both the suppression
     // table and the `ci_remediations` unique key. Without it we can't
     // de-duplicate probes for the same failing head, so we leave the
