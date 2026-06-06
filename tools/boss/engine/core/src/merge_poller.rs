@@ -3941,6 +3941,113 @@ mod tests {
         );
     }
 
+    /// When the CI-remediation attempt budget is exhausted, `run_one_pass`
+    /// must (1) flip the parent to `blocked: ci_failure_exhausted`, (2) emit
+    /// the `CiRemediationExhausted` frontend event, and (3) create a
+    /// work-item-scoped `ci_remediation_exhausted` attention item so the
+    /// operator knows automated remediation gave up and why.
+    #[tokio::test]
+    async fn budget_exhausted_surfaces_attention_item() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/888";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-exhaust", pr);
+
+        // Pre-consume the default budget of 3 so the next detection
+        // sees `used (3) >= budget (3)` and hits the exhausted path.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET ci_attempts_used = 3 WHERE id = ?1",
+                rusqlite::params![chore],
+            )
+            .unwrap();
+        }
+
+        let probe = StubProbe::new();
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-exhaust")));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(
+            outcome.ci_flagged, 1,
+            "budget-exhausted path still counts as a ci_flagged transition",
+        );
+
+        // Parent must be in blocked: ci_failure_exhausted.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::Blocked);
+                assert_eq!(
+                    t.blocked_reason.as_deref(),
+                    Some("ci_failure_exhausted"),
+                    "blocked_reason must be ci_failure_exhausted when budget is spent",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // A work-item-scoped attention item must have been created.
+        let items = db.list_attention_items_for_work_item(&chore).unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "exactly one attention item should be filed on budget exhaustion",
+        );
+        let item = &items[0];
+        assert_eq!(
+            item.kind, "ci_remediation_exhausted",
+            "attention item must carry the ci_remediation_exhausted kind",
+        );
+        assert!(
+            item.work_item_id.as_deref() == Some(&chore),
+            "attention item must be work-item-scoped (no execution_id)",
+        );
+        assert!(
+            item.execution_id.is_none(),
+            "attention item must not be bound to an execution",
+        );
+        assert!(
+            item.body_markdown.contains(pr),
+            "attention body must include the PR URL",
+        );
+        assert!(
+            item.body_markdown.contains("ci/test"),
+            "attention body must include the failing check name",
+        );
+
+        // The AttentionItemCreated frontend event must also have been emitted.
+        let fe = publisher.frontend_events.lock().await;
+        let exhausted = fe
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    boss_protocol::FrontendEvent::CiRemediationExhausted { .. }
+                )
+            })
+            .count();
+        assert_eq!(exhausted, 1, "CiRemediationExhausted event must be emitted");
+        let attention_created = fe
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    boss_protocol::FrontendEvent::AttentionItemCreated { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            attention_created, 1,
+            "AttentionItemCreated event must be emitted alongside the exhausted event",
+        );
+    }
+
     /// Drives the CI state machine through the full lifecycle and pins three
     /// invariants:
     ///

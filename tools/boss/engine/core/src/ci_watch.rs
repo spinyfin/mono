@@ -34,7 +34,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent};
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent};
 #[cfg(test)]
 use boss_protocol::TaskKind;
 use serde::Serialize;
@@ -132,6 +132,75 @@ struct FailedCheckRecord<'a> {
     target_url: &'a str,
     provider: &'a str,
     provider_job_id: Option<&'a str>,
+}
+
+/// Attention kind used when CI remediation exhausts its attempt budget.
+const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
+
+/// Create a work-item-scoped attention item signalling that automated CI
+/// remediation gave up, and emit [`FrontendEvent::AttentionItemCreated`]
+/// so the UI surfaces it immediately. Best-effort: filing errors are
+/// logged and swallowed so the caller's main state transition still
+/// succeeds.
+///
+/// `failing_check_names` is the display list of check names included in
+/// the attention body. Pass `&[]` when the names are not available (e.g.
+/// merge-queue rebounce path where the failing SHA belongs to the
+/// synthetic merge commit rather than the PR head).
+async fn emit_exhausted_attention(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    product_id: &str,
+    work_item_id: &str,
+    pr_url: &str,
+    used: i64,
+    budget: i64,
+    failing_check_names: &[&str],
+) {
+    let checks_detail = if failing_check_names.is_empty() {
+        String::new()
+    } else {
+        let list = failing_check_names
+            .iter()
+            .map(|n| format!("- `{n}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\n**Failing checks:**\n{list}")
+    };
+    let body = format!(
+        "Auto-CI remediation exhausted its attempt budget ({used}/{budget}) on PR {pr_url} \
+         and will not spawn further fix revisions. Manual intervention is required to \
+         resolve the failing checks and re-queue the PR.{checks_detail}"
+    );
+    let title = format!("Auto-CI remediation exhausted ({used}/{budget} attempts)");
+    match work_db.create_attention_item(CreateAttentionItemInput {
+        execution_id: None,
+        work_item_id: Some(work_item_id.to_owned()),
+        kind: CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND.to_owned(),
+        status: None,
+        title,
+        body_markdown: body,
+        resolved_at: None,
+    }) {
+        Ok(item) => {
+            publisher
+                .publish_frontend_event_on_product(
+                    product_id,
+                    FrontendEvent::AttentionItemCreated { item },
+                )
+                .await;
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                pr_url,
+                used,
+                budget,
+                ?err,
+                "ci_watch: failed to file ci_remediation_exhausted attention item",
+            );
+        }
+    }
 }
 
 /// Detection-side entry point. Returns `true` when the parent
@@ -328,6 +397,19 @@ pub async fn on_ci_failure_detected(
                         },
                     )
                     .await;
+                let check_names: Vec<&str> =
+                    failures.iter().map(|f| f.name.as_str()).collect();
+                emit_exhausted_attention(
+                    work_db,
+                    publisher,
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    &candidate.pr_url,
+                    used,
+                    budget,
+                    &check_names,
+                )
+                .await;
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
@@ -802,6 +884,20 @@ pub async fn on_merge_queue_rebounce_detected(
                         },
                     )
                     .await;
+                // No per-check names available in the rebounce path (the
+                // failing SHA is the synthetic merge commit, not the PR
+                // head); pass an empty slice so the body omits the list.
+                emit_exhausted_attention(
+                    work_db,
+                    publisher,
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    &candidate.pr_url,
+                    used,
+                    budget,
+                    &[],
+                )
+                .await;
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
