@@ -1858,6 +1858,9 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
+        WorkspaceCommand::Rebase => {
+            workspace_rebase(&mut store, database_path, runner)
+        }
     }
 }
 
@@ -2058,6 +2061,199 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
             )));
         }
         Ok((path.to_string(), None))
+    }
+}
+
+/// Rebase the current workspace's boss branch onto the repo's integration branch.
+///
+/// Implements `cube workspace rebase`. Encodes the correct jj recipe
+/// so agents do not hand-roll it and trip over the `@origin` and
+/// `--ignore-immutable` gotchas. The target branch is read from the repo pool
+/// configuration (`main_branch` field) — not hardcoded. Safe to call multiple
+/// times (idempotent when already up-to-date).
+fn workspace_rebase(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+) -> Result<RunResult> {
+    let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+
+    // Look up this workspace in the registry to get the repo and main_branch.
+    let workspace = find_workspace_record(store, &cwd)?.ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "current directory `{}` is not a known cube workspace; \
+             run from inside a leased cube workspace.",
+            cwd.display()
+        ))
+    })?;
+    let repo_record = store
+        .get_repo(&workspace.repo)?
+        .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
+    let main_branch = repo_record.main_branch.clone();
+
+    // Resolve the GitHub remote name (the real upstream, not the local mirror).
+    let (github_remote, _owner_repo) =
+        resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+
+    // Fetch latest state — needed for both `main` and the boss branch.
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["git", "fetch", "--remote", &github_remote],
+        ),
+    )?;
+
+    // Detect the boss/exec_* branch from the ancestry of the current @.
+    // After `cube workspace lease --resume-pr`, the boss branch is at most one
+    // commit above @. We check 5 ancestors for robustness.
+    //
+    // The template outputs local bookmarks followed by remote bookmarks for each
+    // ancestor commit, space/newline-separated. We split on whitespace and pick
+    // the first boss/exec_* token, preferring a local bookmark over a remote one.
+    let ancestry_output = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: cwd.clone(),
+            program: "jj".to_string(),
+            args: vec![
+                "log".to_string(),
+                "-r".to_string(),
+                "ancestors(@, 5)".to_string(),
+                "--no-graph".to_string(),
+                "-T".to_string(),
+                r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#.to_string(),
+            ],
+        },
+    )?;
+
+    let mut boss_local: Option<String> = None;
+    let mut boss_remote: Option<String> = None;
+    for token in ancestry_output.split_whitespace() {
+        if token.starts_with("boss/exec_") {
+            if token.contains('@') {
+                boss_remote.get_or_insert_with(|| token.to_string());
+            } else {
+                boss_local.get_or_insert_with(|| token.to_string());
+            }
+        }
+    }
+
+    // Prefer the local bookmark; fall back to the remote ref.
+    let boss_ref = boss_local.as_deref().or(boss_remote.as_deref()).ok_or_else(|| {
+        CubeError::InvalidArgument(
+            "no boss/exec_* bookmark found in the 5 most recent ancestors of @; \
+             ensure the workspace is positioned on or after the boss branch commit."
+                .to_string(),
+        )
+    })?;
+
+    // Strip the @<remote> suffix to get the plain branch name for display.
+    let boss_branch_name = boss_ref.split('@').next().unwrap_or(boss_ref).to_string();
+
+    // Rebase the boss branch (and the working copy @ if it is a descendant)
+    // onto the latest main. --ignore-immutable is required because boss/exec_*
+    // commits referenced via their @<remote> form are in jj's immutable_heads().
+    let rebase_out = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: cwd.clone(),
+            program: "jj".to_string(),
+            args: vec![
+                "rebase".to_string(),
+                "-d".to_string(),
+                main_branch.clone(),
+                "-b".to_string(),
+                boss_ref.to_string(),
+                "--ignore-immutable".to_string(),
+            ],
+        },
+    )?;
+
+    // Check whether the rebase left any conflicts in the working copy.
+    // The jj `conflict` template field is true when a commit's tree contains
+    // unresolved conflict markers.
+    let conflict_check = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: cwd.clone(),
+            program: "jj".to_string(),
+            args: vec![
+                "log".to_string(),
+                "-r".to_string(),
+                "@".to_string(),
+                "--no-graph".to_string(),
+                "-T".to_string(),
+                r#"if(conflict, "CONFLICT", "CLEAN")"#.to_string(),
+            ],
+        },
+    )?;
+    let has_conflicts = conflict_check.trim() == "CONFLICT";
+
+    if has_conflicts {
+        // Best-effort: list conflicted files via `jj resolve --list`.
+        // Ignore errors — the list is informational; the agent can always
+        // run `jj resolve --list` or `jj st` directly.
+        let conflicted_files: Vec<String> = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["resolve", "--list"],
+            ))
+            .map(|out| {
+                out.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let file_hint = if conflicted_files.is_empty() {
+            "run `jj resolve --list` to see conflicted files".to_string()
+        } else {
+            conflicted_files.join(", ")
+        };
+        eprintln!(
+            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch}; \
+             conflicts in working copy: {file_hint}"
+        );
+        RunResult::new(
+            format!(
+                "REBASED_WITH_CONFLICTS: branch `{boss_branch_name}` rebased onto \
+                 `{main_branch}`. Conflicts are materialized in the working copy — \
+                 resolve them (see `jj resolve --list`, `jj st`) and push."
+            ),
+            json!({
+                "status": "conflicts",
+                "branch": boss_branch_name,
+                "main_branch": main_branch,
+                "conflicted_files": conflicted_files,
+                "rebase_output": rebase_out,
+            }),
+        )
+    } else {
+        eprintln!(
+            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch} cleanly"
+        );
+        RunResult::new(
+            format!(
+                "REBASED_CLEAN: branch `{boss_branch_name}` rebased onto `{main_branch}` \
+                 with no conflicts."
+            ),
+            json!({
+                "status": "clean",
+                "branch": boss_branch_name,
+                "main_branch": main_branch,
+                "conflicted_files": Vec::<String>::new(),
+                "rebase_output": rebase_out,
+            }),
+        )
     }
 }
 

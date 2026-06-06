@@ -235,6 +235,26 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebase the current workspace's boss branch onto the repo's integration branch.
+    ///
+    /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
+    /// and boss branches from the GitHub remote, resolves this workspace's
+    /// current `boss/exec_*` branch automatically from the working copy state
+    /// (no branch name argument required), rebases it onto the configured
+    /// integration branch using `--ignore-immutable` to handle jj's
+    /// immutable-heads constraint, and reports the result clearly.
+    ///
+    /// The target branch is read from the repo pool configuration
+    /// (`main_branch` field) — not hardcoded. Repos that use `master`,
+    /// `trunk`, or any other name are handled automatically.
+    ///
+    /// Leaves any resulting conflicts materialized in the working copy for the
+    /// agent to resolve. Exit signal:
+    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts.
+    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them.
+    ///
+    /// Run from inside the leased cube workspace directory.
+    Rebase,
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
