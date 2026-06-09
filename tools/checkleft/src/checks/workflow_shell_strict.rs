@@ -111,10 +111,10 @@ fn is_github_workflow_file(path: &Path) -> bool {
         return false;
     }
 
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yml") | Some("yaml") => true,
-        _ => false,
-    }
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("yml") | Some("yaml")
+    )
 }
 
 fn parse_workflow(contents: &str) -> Result<Value> {

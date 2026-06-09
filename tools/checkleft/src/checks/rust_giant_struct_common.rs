@@ -46,7 +46,7 @@ pub fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
             && attr
                 .parse_args::<syn::Ident>()
                 .ok()
-                .map_or(false, |id| id == "test")
+                .is_some_and(|id| id == "test")
     })
 }
 

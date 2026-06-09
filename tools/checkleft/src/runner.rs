@@ -35,7 +35,7 @@ enum ScheduledExecution {
         implementation_check_id: String,
     },
     ExternalResolved {
-        package: ExternalCheckPackage,
+        package: Box<ExternalCheckPackage>,
     },
     Invalid {
         message: String,
@@ -483,10 +483,10 @@ impl Runner {
             (String, String, String, String, String),
             ScheduledCheckRun,
         > = BTreeMap::new();
-        let mut grouped_diagnostics: BTreeMap<
-            (String, PathBuf, Option<u32>, Option<u32>, String, String),
-            CheckResult,
-        > = BTreeMap::new();
+        // Dedup key for config diagnostics:
+        // (check_id, path, line, column, message, remediation).
+        type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
+        let mut grouped_diagnostics: BTreeMap<DiagnosticGroupKey, CheckResult> = BTreeMap::new();
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -677,7 +677,9 @@ impl Runner {
             };
         }
 
-        ScheduledExecution::ExternalResolved { package }
+        ScheduledExecution::ExternalResolved {
+            package: Box::new(package),
+        }
     }
 }
 

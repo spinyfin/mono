@@ -444,13 +444,15 @@ impl DefaultExternalCheckExecutor {
         run_component_check(
             &self.engine,
             &self.root,
-            package,
-            &package.id,
-            &wasm_component,
-            limits,
-            changeset,
-            source_tree,
-            config,
+            ComponentRun {
+                package,
+                check_name: &package.id,
+                component: &wasm_component,
+                limits,
+                changeset,
+                source_tree,
+                config,
+            },
         )
     }
 
@@ -491,13 +493,15 @@ impl DefaultExternalCheckExecutor {
         run_component_check(
             &self.engine,
             &self.root,
-            package,
-            &component.check_name,
-            &wasm_component,
-            component.limits.as_ref(),
-            changeset,
-            source_tree,
-            config,
+            ComponentRun {
+                package,
+                check_name: &component.check_name,
+                component: &wasm_component,
+                limits: component.limits.as_ref(),
+                changeset,
+                source_tree,
+                config,
+            },
         )
     }
 
@@ -611,7 +615,7 @@ fn is_interrupt_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<wasmtime::Trap>()
-            .map_or(false, |t| *t == wasmtime::Trap::Interrupt)
+            .is_some_and(|t| *t == wasmtime::Trap::Interrupt)
     })
 }
 
@@ -621,7 +625,7 @@ fn build_wasmtime_engine() -> Result<Engine> {
     config.epoch_interruption(true);
     config.consume_fuel(true);
 
-    Ok(wasmtime(Engine::new(&config)).context("failed to initialize Wasmtime engine")?)
+    wasmtime(Engine::new(&config)).context("failed to initialize Wasmtime engine")
 }
 
 /// Build a component linker that includes all WASI preview-2 host interfaces.
@@ -727,17 +731,26 @@ fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
 /// `list-checks` / `run-check` WIT interface. Shared by both the file-based
 /// (`Component` implementation variant) and the legacy artifact-wrapped
 /// (`Artifact` with `runtime = "component-v1"`) execution paths.
-fn run_component_check(
-    engine: &Engine,
-    root: &Path,
-    package: &ExternalCheckPackage,
-    check_name: &str,
-    component: &Component,
-    limits: Option<&ExternalCheckComponentLimits>,
-    changeset: &ChangeSet,
-    source_tree: &dyn SourceTree,
-    config: &toml::Value,
-) -> Result<CheckResult> {
+struct ComponentRun<'a> {
+    package: &'a ExternalCheckPackage,
+    check_name: &'a str,
+    component: &'a Component,
+    limits: Option<&'a ExternalCheckComponentLimits>,
+    changeset: &'a ChangeSet,
+    source_tree: &'a dyn SourceTree,
+    config: &'a toml::Value,
+}
+
+fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Result<CheckResult> {
+    let ComponentRun {
+        package,
+        check_name,
+        component,
+        limits,
+        changeset,
+        source_tree,
+        config,
+    } = run;
     let (timeout_ticks, _max_memory_bytes) = resolve_component_limits(limits);
     let linker = build_component_v1_linker(engine)?;
 
@@ -750,7 +763,7 @@ fn run_component_check(
         // metadata so there is no meaningful wall-clock bound to enforce here.
         store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
         configure_store_fuel(&mut store)?;
-        let instance = wasmtime(linker.instantiate(&mut store, &component))
+        let instance = wasmtime(linker.instantiate(&mut store, component))
             .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
         let bindings = wasmtime(WitCheck::new(&mut store, &instance))
             .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
@@ -788,7 +801,7 @@ fn run_component_check(
     let mut store = Store::new(engine, host_state);
     store.set_epoch_deadline(timeout_ticks);
     configure_store_fuel(&mut store)?;
-    let instance = wasmtime(linker.instantiate(&mut store, &component))
+    let instance = wasmtime(linker.instantiate(&mut store, component))
         .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;

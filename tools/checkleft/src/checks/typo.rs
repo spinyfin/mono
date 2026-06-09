@@ -34,17 +34,12 @@ struct TypoRule {
     kind: MatchKind,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MatchKind {
     Substring,
+    #[default]
     Word,
-}
-
-impl Default for MatchKind {
-    fn default() -> Self {
-        Self::Word
-    }
 }
 
 #[derive(Debug, Deserialize)]

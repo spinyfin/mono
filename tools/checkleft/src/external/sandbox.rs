@@ -186,10 +186,8 @@ fn populate_sandbox_file(
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
 
-    if !source_is_symlink {
-        if fs::hard_link(&source, &dest).is_ok() {
-            return Ok(());
-        }
+    if !source_is_symlink && fs::hard_link(&source, &dest).is_ok() {
+        return Ok(());
     }
 
     // Fall back to materializing from the SourceTree. This handles virtual or

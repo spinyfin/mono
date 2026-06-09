@@ -404,12 +404,8 @@ async fn resolve_pr_description(
             return Some(raw);
         }
 
-    let Some(repository) = repository else {
-        return None;
-    };
-    let Some(change_id) = change_id else {
-        return None;
-    };
+    let repository = repository?;
+    let change_id = change_id?;
 
     info!(
         repository = repository,
@@ -501,10 +497,10 @@ fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Du
     let total_findings: usize = results.iter().map(|result| result.findings.len()).sum();
     if total_findings == 0 {
         return format!(
-            "{}: no findings ({} checks run in {})\n",
+            "{}: no findings ({} checks run in {}s)\n",
             style.paint_info("checks"),
             results.len(),
-            format!("{}s", elapsed.as_secs())
+            elapsed.as_secs()
         );
     }
 
