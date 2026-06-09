@@ -1,4 +1,5 @@
-//! GitHub App authentication helpers and URL parsing utilities for Boss tooling.
+//! GitHub App authentication helpers, URL parsing utilities, and CI
+//! check-run fetching for Boss tooling.
 //!
 //! Authentication works without `gh`: we sign a JWT with the App's RSA
 //! private key, exchange it for a short-lived installation access token,
@@ -9,9 +10,14 @@
 //! `BOSS_SHAKE_PRIVATE_KEY_PEM`. See `tools/boss/cli/README.md` for
 //! the one-time developer setup instructions.
 
+pub mod check_runs;
 pub mod contents;
 pub mod pr_url;
 
+pub use check_runs::{
+    CiProvider, RequiredCheckFailure, fetch_failing_checks_for_commit,
+    parse_check_runs_for_failures, parse_provider_job_id, provider_for_url,
+};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
