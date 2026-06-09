@@ -13719,21 +13719,18 @@ steps:
         let source_dir = tempdir.path().join("source").join("mono");
         std::fs::create_dir_all(&source_dir).expect("source dir");
 
-        let add = Cli::parse_from([
+        let ensure = Cli::parse_from([
             "cube",
             "repo",
-            "add",
-            "mono",
+            "ensure",
             "--origin",
             "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &source_dir.display().to_string(),
         ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        let ensure_defaults = RepoEnsureDefaults {
+            repo_root: source_dir.parent().unwrap().to_path_buf(),
+            workspace_root: workspace_root.clone(),
+        };
+        run_with_context(ensure, Some(&database_path), &FakeRunner::default(), Some(&ensure_defaults), None).expect("repo");
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
@@ -13795,21 +13792,18 @@ steps:
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(&source_dir).expect("source dir");
 
-        let add = Cli::parse_from([
+        let ensure = Cli::parse_from([
             "cube",
             "repo",
-            "add",
-            "mono",
+            "ensure",
             "--origin",
             "git@github.com:spinyfin/mono.git",
-            "--workspace-root",
-            &workspace_root.display().to_string(),
-            "--workspace-prefix",
-            "mono-agent-",
-            "--source",
-            &source_dir.display().to_string(),
         ]);
-        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+        let ensure_defaults = RepoEnsureDefaults {
+            repo_root: source_dir.parent().unwrap().to_path_buf(),
+            workspace_root: workspace_root.clone(),
+        };
+        run_with_context(ensure, Some(&database_path), &FakeRunner::default(), Some(&ensure_defaults), None).expect("repo");
 
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
