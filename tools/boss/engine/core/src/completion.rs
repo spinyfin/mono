@@ -1149,6 +1149,20 @@ impl WorkerCompletionHandler {
             }
         }
 
+        // Stamp the stop_seen marker so the merge poller's SHA-delta gate
+        // knows a real Stop event fired for this execution. The gate uses
+        // this flag to distinguish "recovery path: Stop fired but PR
+        // detection failed transiently" from "no Stop yet: worker is still
+        // running between turns". Best-effort — failure does not block the
+        // rest of on_stop_inner.
+        if let Err(err) = self.work_db.set_execution_stop_seen(execution_id) {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "stop event: failed to stamp stop_seen; SHA-delta recovery gate may not fire"
+            );
+        }
+
         // Maint task 6: an `automation_triage` execution never opens a PR.
         // Its Stop is resolved by the marker-protocol outcome detector
         // (`automation: task <id>` / `automation: skip — …`), not by PR
@@ -1770,7 +1784,34 @@ must not be asked to open one",
         // `Contributed` → finalize now (worker pushed to the bound PR).
         // `NoContribution` / `Inapplicable` → fall through; the cold path
         // returns quietly for revisions (no PR on their own branch).
+        //
+        // T1503/T1496 regression guard (Contributed arm only): for
+        // `revision_implementation` executions the `Contributed` outcome must
+        // only advance the revision to `in_review` after `on_stop_inner` has
+        // been called at least once (`stop_seen = true`). Without this guard
+        // the gate fires immediately when a *different* worker (e.g. the parent
+        // chore's still-active worker) pushes to the same PR between the
+        // snapshot time and the merge-poller check, misattributing those commits
+        // as the revision's contribution. `NoContribution` is intentionally
+        // exempt so the metadata-only CI-fix finalize path (issue #1252) keeps
+        // working without a Stop — it has its own separate marker guard.
         match self.evaluate_sha_delta_gate(execution_id, &execution).await {
+            ShaDeltaGateOutcome::Contributed { pr_url }
+                if execution.kind == ExecutionKind::RevisionImplementation
+                    && !self
+                        .work_db
+                        .execution_stop_seen(execution_id)
+                        .unwrap_or(false) =>
+            {
+                tracing::debug!(
+                    execution_id,
+                    pr_url = %pr_url,
+                    "pr-recheck: SHA-delta Contributed suppressed for revision — no Stop event \
+                     seen yet (T1503/T1496 guard; will fire once on_stop_inner stamps stop_seen)",
+                );
+                // Fall through to cold-path (returns AwaitingInput for revisions
+                // that have no branch of their own).
+            }
             ShaDeltaGateOutcome::Contributed { pr_url } => {
                 tracing::info!(
                     execution_id,
@@ -8857,11 +8898,19 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // through to the cold-path branch-keyed detector which always returns
         // None for revisions (they never open their own PR), so the revision
         // stayed in `active` indefinitely.
+        //
+        // The SHA-delta gate is gated on `stop_seen` (T1503/T1496 fix): it only
+        // fires after `on_stop_inner` has been called at least once. Here we
+        // stamp `stop_seen` manually to simulate a prior on_stop that failed
+        // transiently — this is the recovery path the gate is designed for.
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let (db, product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Stamp stop_seen to simulate on_stop_inner having been called (Stop
+        // fired but PR detection failed transiently — recovery path).
+        db.set_execution_stop_seen(&execution_id).unwrap();
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
         let detector = StubPrDetector::ok(None);
@@ -11711,5 +11760,126 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             rev_task.status, TaskStatus::InReview,
             "step 4: revision task must be in_review after clean reviewer pass",
         );
+    }
+
+    // ── T1503/T1496 regression: SHA-delta gate suppressed until Stop seen ───────
+
+    /// Regression (T1503/T1496): the SHA-delta gate in `recheck_for_pr` must
+    /// NOT fire for a `revision_implementation` execution before `on_stop_inner`
+    /// has been called (i.e. before `stop_seen` is stamped). Without this guard
+    /// the gate fires the moment ANY worker pushes to the parent PR — including
+    /// the parent chore's own still-active worker — misattributing those commits
+    /// as the revision's contribution and transitioning the revision to
+    /// `in_review` before the revision worker has done anything.
+    ///
+    /// After the fix: the gate returns `AwaitingInput` when `stop_seen = false`,
+    /// leaving the revision in `active` until `on_stop_inner` stamps the flag.
+    #[tokio::test]
+    async fn recheck_for_pr_sha_delta_suppressed_until_stop_seen() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // NOTE: stop_seen is NOT set — this simulates the revision worker
+        // having just been dispatched, pane spawned, but no Stop event yet.
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Branch verifier: SHA moved (simulates another worker, e.g. the
+        // parent chore's worker, pushing to the same PR after dispatch).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "SHA-delta gate must be suppressed when stop_seen = false; got {outcome:?}",
+        );
+        // Revision task must stay active — no premature in_review.
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Active,
+                    "revision must remain active when SHA-delta gate is suppressed; got {:?}",
+                    t.status,
+                );
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // No lease release — nothing was finalized.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "no cube lease must be released when gate is suppressed",
+        );
+    }
+
+    /// Complementary: once `on_stop_inner` stamps `stop_seen`, the SHA-delta
+    /// gate fires normally (recovery path). This ensures the T1503 fix does not
+    /// regress the T848 fix.
+    #[tokio::test]
+    async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Stamp stop_seen — simulates on_stop_inner having been called but
+        // PR detection failing transiently.
+        db.set_execution_stop_seen(&execution_id).unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Branch verifier: SHA moved (revision worker pushed).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "SHA-delta gate must fire after stop_seen is set; got {outcome:?}",
+        );
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
     }
 }

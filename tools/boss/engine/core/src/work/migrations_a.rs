@@ -309,6 +309,26 @@ pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
+/// `stop_seen`: boolean signal (INTEGER 0/1) stamped by `on_stop_inner` the
+/// first time a Stop event fires for an execution. The SHA-delta gate in
+/// `recheck_for_pr` uses this as a guard for `revision_implementation`
+/// executions: it only fires the gate after a Stop has been observed, ensuring
+/// that the gate acts as a recovery path (Stop fired but PR detection failed
+/// transiently) rather than a primary detector. Without this guard, a commit
+/// pushed to the parent PR by *another* worker between the snapshot time and
+/// the merge-poller check fires `Contributed`, transitioning the revision to
+/// `in_review` before the revision worker has done any work (T1503/T1496
+/// regression).
+pub(crate) fn migrate_work_executions_stop_seen(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "stop_seen")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN stop_seen INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
     table_has_column(conn, "work_executions", column)
 }
