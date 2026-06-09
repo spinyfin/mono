@@ -327,8 +327,24 @@ enum EngineDataDirSandbox {
 /// the `boss-event` shim with absolute paths so the hook fires
 /// regardless of `PATH`. The engine points the session at this via
 /// `claude --settings`; it is written outside the workspace tree.
+///
+/// The path-guard script is assumed to live in the default
+/// [`worker_settings_dir`] alongside the generated settings file.
+/// Use [`render_settings_json_for_dir`] when writing to a different
+/// directory (e.g. in [`crate::driver::ClaudeDriver::write_permission_config`]).
 pub fn render_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Enabled);
+    let value = settings_value(input, EngineDataDirSandbox::Enabled, &worker_settings_dir());
+    serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+}
+
+/// Like [`render_settings_json`] but uses `settings_dir` as both the
+/// location where the path-guard script lives and the directory the
+/// generated settings file will be written to.
+///
+/// Called by [`crate::driver::ClaudeDriver::write_permission_config`]
+/// which writes settings and the guard script to an arbitrary `dest_dir`.
+pub fn render_settings_json_for_dir(input: &WorkerSetupInput, settings_dir: &Path) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Enabled, settings_dir);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
@@ -398,11 +414,28 @@ const REVISION_PR_GUARD_COMMAND: &str = concat!(
 /// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
 /// shim (typically the bare `boss-event` resolved on the remote PATH).
 pub fn render_remote_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Disabled);
+    let value = settings_value(input, EngineDataDirSandbox::Disabled, &worker_settings_dir());
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
-fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
+/// Like [`render_remote_settings_json`] but uses `settings_dir` as the
+/// directory the generated settings file will be written to.
+///
+/// Called by [`crate::driver::ClaudeDriver::write_permission_config`]
+/// for remote workers writing to an arbitrary `dest_dir`.
+pub fn render_remote_settings_json_for_dir(
+    input: &WorkerSetupInput,
+    settings_dir: &Path,
+) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Disabled, settings_dir);
+    serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+}
+
+fn settings_value(
+    input: &WorkerSetupInput,
+    sandbox: EngineDataDirSandbox,
+    settings_dir: &Path,
+) -> serde_json::Value {
     // Inline-prefix all env vars the shim needs. `BOSS_RUN_ID` is the
     // load-bearing one for live-worker-state correlation: if it's
     // missing from the shim's env, the splice that adds `_boss_run_id`
@@ -469,10 +502,11 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     if sandbox == EngineDataDirSandbox::Enabled
         && let Some(state_dir) = input.events_socket_path.parent()
     {
+        let guard_script = settings_dir.join(PATH_GUARD_SCRIPT_NAME);
         let guard_command = format!(
             "BOSS_DATA_DIR={dir} python3 {script}",
             dir = shell_escape(&state_dir.display().to_string()),
-            script = shell_escape(&path_guard_script_path().display().to_string()),
+            script = shell_escape(&guard_script.display().to_string()),
         );
         pre_tool_use_hooks.push(serde_json::json!({
             "matcher": "*",
