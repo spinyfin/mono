@@ -358,8 +358,12 @@ impl WorkDb {
         // on kind='followup' tasks (PR-review follow-ups created when the
         // reviewed PR merges before findings are addressed).
         migrate_tasks_followup_provenance_columns(&conn)?;
+        // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
+        // to `attentions` and create the `attention_merges` provenance ledger.
+        // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
+        migrate_attentions_score_and_merges(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '20')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '21')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
