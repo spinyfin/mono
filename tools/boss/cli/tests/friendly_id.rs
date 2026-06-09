@@ -139,19 +139,11 @@ async fn create_task(client: &mut BossClient, product_id: &str, project_id: &str
 async fn create_chore(client: &mut BossClient, product_id: &str, name: &str) -> Result<Task> {
     match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product_id.to_owned(),
-                name: name.to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product_id)
+                .name(name)
+                .autostart(false)
+                .build(),
         })
         .await?
     {

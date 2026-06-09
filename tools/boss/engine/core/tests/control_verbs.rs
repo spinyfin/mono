@@ -125,19 +125,10 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
 
     let chore = match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "test chore".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("test chore")
+                .build(),
         })
         .await?
     {
@@ -852,24 +843,16 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
 
     let chore = match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Parked chore".to_owned(),
-                description: None,
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Parked chore")
                 // The bug scenario: --no-autostart leaves the chore in
                 // `todo` with no execution, waiting for an explicit
                 // schedule trigger (drag-to-Doing or `bossctl work
                 // start`). Without the fix, the drag does not trigger
                 // dispatch and the card is "active" with no worker.
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -966,19 +949,11 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
 
     let chore = match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Parked chore".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Parked chore")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -1061,19 +1036,11 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
 
     let chore = match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Parked chore".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Parked chore")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -1306,19 +1273,11 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
 
     let chore = match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Unresolvable chore".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Unresolvable chore")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -1389,19 +1348,11 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         docs_repo: None,
         worker_branch_prefix: None,
     })?;
-    let chore = work_db.create_chore(CreateChoreInput {
-        product_id: product.id.clone(),
-        name: "C".to_owned(),
-        description: None,
-        autostart: false,
-        priority: None,
-        created_via: None,
-        repo_remote_url: None,
-        effort_level: None,
-        model_override: None,
-            driver: None,
-        force_duplicate: false,
-    })?;
+    let chore = work_db.create_chore(CreateChoreInput::builder()
+        .product_id(product.id.clone())
+        .name("C")
+        .autostart(false)
+        .build())?;
     work_db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1729,19 +1680,11 @@ async fn seed_two_conflict_resolutions(
         docs_repo: None,
         worker_branch_prefix: None,
     })?;
-    let chore = work_db.create_chore(CreateChoreInput {
-        product_id: product.id.clone(),
-        name: "C".to_owned(),
-        description: None,
-        autostart: false,
-        priority: None,
-        created_via: None,
-        repo_remote_url: None,
-        effort_level: None,
-        model_override: None,
-            driver: None,
-        force_duplicate: false,
-    })?;
+    let chore = work_db.create_chore(CreateChoreInput::builder()
+        .product_id(product.id.clone())
+        .name("C")
+        .autostart(false)
+        .build())?;
     work_db.update_work_item(
         &chore.id,
         WorkItemPatch {

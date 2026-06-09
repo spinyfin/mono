@@ -766,19 +766,14 @@ impl WorkDb {
         // 60-second recent-duplicate guard.
         let mut task = insert_chore_in_tx(
             &tx,
-            CreateChoreInput {
-                product_id: automation.product_id.clone(),
-                name: name.to_owned(),
-                description: description.map(str::to_owned),
-                autostart: true,
-                priority: None,
-                created_via: Some(boss_protocol::CREATED_VIA_ENGINE_AUTO.to_owned()),
-                repo_remote_url: automation.repo_remote_url.clone(),
-                effort_level: None,
-                model_override: None,
-                driver: None,
-                force_duplicate: true,
-            },
+            CreateChoreInput::builder()
+                .product_id(automation.product_id.clone())
+                .name(name)
+                .maybe_description(description.map(str::to_owned))
+                .created_via(boss_protocol::CREATED_VIA_ENGINE_AUTO)
+                .maybe_repo_remote_url(automation.repo_remote_url.clone())
+                .force_duplicate(true)
+                .build(),
         )?;
         tx.execute(
             "UPDATE tasks SET source_automation_id = ?2 WHERE id = ?1",

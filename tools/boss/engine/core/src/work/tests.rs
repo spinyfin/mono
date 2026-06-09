@@ -114,19 +114,10 @@ fn setup_product_and_chore() -> (WorkDb, String, String) {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Fix thing".into(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Fix thing")
+            .build())
         .unwrap();
     (db, product.id, chore.id)
 }
@@ -296,19 +287,11 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: format!("Chore-{label}"),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name(format!("Chore-{label}"))
+            .autostart(false)
+            .build())
         .unwrap();
     let exec = db
         .create_execution(
@@ -364,19 +347,11 @@ fn make_revision_product(db: &WorkDb, label: &str) -> String {
 
 /// Helper: create a chore (non-revision root) and return its id.
 fn make_chore_root(db: &WorkDb, product_id: &str, label: &str) -> String {
-    db.create_chore(CreateChoreInput {
-        product_id: product_id.to_owned(),
-        name: format!("Root chore {label}"),
-        description: None,
-        autostart: false,
-        priority: None,
-        created_via: None,
-        repo_remote_url: None,
-        effort_level: None,
-        model_override: None,
-            driver: None,
-        force_duplicate: false,
-    })
+    db.create_chore(CreateChoreInput::builder()
+        .product_id(product_id)
+        .name(format!("Root chore {label}"))
+        .autostart(false)
+        .build())
     .unwrap()
     .id
 }
@@ -402,19 +377,12 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
 /// Helper: create a chore and set its pr_url (to simulate "in review").
 fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product_id.to_owned(),
-            name: "Chore for revision tests".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None, // inherits from product
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product_id)
+            .name("Chore for revision tests")
+            .autostart(false)
+            // inherits from product
+            .build())
         .unwrap();
     let conn = db.connect().unwrap();
     conn.execute(

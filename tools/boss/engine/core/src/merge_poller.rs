@@ -2863,19 +2863,11 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: name.into(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_chore(CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .autostart(false)
+                .build())
             .unwrap();
         // Move chore directly to in_review with a pr_url, mirroring
         // the post-completion state.
@@ -3554,19 +3546,11 @@ mod tests {
         // Add an unsatisfied gating prerequisite, then model the strand
         // (blocked with a NULL reason) co-occurring with the live dependency.
         let prereq = db
-            .create_chore(CreateChoreInput {
-                product_id: product.clone(),
-                name: "Prereq".into(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_chore(CreateChoreInput::builder()
+                .product_id(product.clone())
+                .name("Prereq")
+                .autostart(false)
+                .build())
             .unwrap();
         db.add_dependency(AddDependencyInput {
             dependent: chore.clone(),
@@ -5967,19 +5951,11 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: name.into(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_chore(CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .autostart(false)
+                .build())
             .unwrap();
         let exec = db
             .create_execution(

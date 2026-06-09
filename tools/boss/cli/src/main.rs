@@ -3450,19 +3450,19 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
             let chore = create_chore(
                 &mut client,
-                CreateChoreInput {
-                    product_id: product.id,
-                    name,
-                    description,
-                    autostart: !ctx.no_autostart,
-                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                    created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: resolved_repo,
-                    effort_level: args.effort.map(EffortLevel::from),
-                    model_override,
-                    driver,
-                    force_duplicate: args.force_duplicate,
-                },
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name(name)
+                    .maybe_description(description)
+                    .autostart(!ctx.no_autostart)
+                    .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
+                    .created_via(CREATED_VIA_CLI)
+                    .maybe_repo_remote_url(resolved_repo)
+                    .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_model_override(model_override)
+                    .maybe_driver(driver)
+                    .force_duplicate(args.force_duplicate)
+                    .build(),
             )
             .await?;
             let chore = with_display_status(chore);
@@ -6781,19 +6781,14 @@ async fn run_chore_create_many(
                 "item {index}: chores do not have a project — remove `project_id`"
             )));
         }
-        inputs.push(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: item.name,
-            description: normalize_non_empty(Some(item.description)),
-            autostart: item.autostart.unwrap_or(default_autostart),
-            priority: item.priority,
-            created_via: Some(CREATED_VIA_CLI.to_owned()),
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        });
+        inputs.push(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name(item.name)
+            .maybe_description(normalize_non_empty(Some(item.description)))
+            .autostart(item.autostart.unwrap_or(default_autostart))
+            .maybe_priority(item.priority)
+            .created_via(CREATED_VIA_CLI)
+            .build());
     }
 
     let created = create_many_chores(client, CreateManyChoresInput { items: inputs }).await?;

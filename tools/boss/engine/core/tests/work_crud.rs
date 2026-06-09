@@ -125,19 +125,10 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
 
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Trim stale work".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Trim stale work")
+            .build(),
     )
     .await?;
     assert_eq!(chore.kind, TaskKind::Chore);
@@ -233,19 +224,10 @@ async fn delete_then_restore_round_trip_through_engine() -> Result<()> {
 
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Fat-fingered delete target".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Fat-fingered delete target")
+            .build(),
     )
     .await?;
     let short_id = chore.short_id.expect("chore has a short id");
@@ -333,19 +315,10 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
 
     let default_chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Default-priority chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Default-priority chore")
+            .build(),
     )
     .await?;
     assert_eq!(default_chore.priority, "medium");
@@ -404,19 +377,12 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
     // Create-with-override: the wire field lands on the row.
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Fix nimbus deploy".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Fix nimbus deploy")
+            .autostart(false)
+            .repo_remote_url("git@github.com:myorg/nimbus.git")
+            .build(),
     )
     .await?;
     assert_eq!(
@@ -669,19 +635,10 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
     .await?;
     let _chore = create_chore(
         &mut writer_client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "C".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .build(),
     )
     .await?;
 
@@ -723,19 +680,11 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
     .await?;
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Backfill PR".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Backfill PR")
+            .autostart(false)
+            .build(),
     )
     .await?;
     assert!(chore.pr_url.is_none());
@@ -1039,36 +988,18 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     .await?;
     let a = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "A".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("A")
+            .build(),
     )
     .await?;
     let b = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "B".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("B")
+            .build(),
     )
     .await?;
 
@@ -1242,19 +1173,11 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     .await?;
     let dependent_chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Update docs".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Update docs")
+            .autostart(false)
+            .build(),
     )
     .await?;
 
@@ -1451,19 +1374,11 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     assert_eq!(listed_tasks.iter().filter(|t| t.kind == TaskKind::Design).count(), 1,);
 
     let chore_inputs: Vec<CreateChoreInput> = (0..3)
-        .map(|i| CreateChoreInput {
-            product_id: product.id.clone(),
-            name: format!("Bulk chore {i}"),
-            description: None,
-            autostart: i == 0,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .map(|i| CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name(format!("Bulk chore {i}"))
+            .autostart(i == 0)
+            .build())
         .collect();
     let created_chores = match client
         .send_request(&FrontendRequest::CreateManyChores {
@@ -1851,19 +1766,11 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
 
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Trim stale work".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Trim stale work")
+            .autostart(false)
+            .build(),
     )
     .await?;
     assert!(
@@ -1949,19 +1856,12 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
     // Same enforcement for chores.
     match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Override chore attempt".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Override chore attempt")
+                .autostart(false)
+                .repo_remote_url("git@github.com:spinyfin/other.git")
+                .build(),
         })
         .await?
     {
@@ -2047,19 +1947,11 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
     // Same enforcement for chores.
     match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "No repo chore".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("No repo chore")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -2133,19 +2025,12 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
 
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Chore with repo".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Chore with repo")
+            .autostart(false)
+            .repo_remote_url("git@github.com:foo/other.git")
+            .build(),
     )
     .await?;
     assert_eq!(
@@ -2272,38 +2157,24 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
     // First create succeeds.
     let first = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "  Dedup Me  ".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("  Dedup Me  ")
+            .autostart(false)
+            .build(),
     )
     .await?;
 
     // Immediate retry (within 60 s) is rejected with structured info.
     let (existing_id, existing_short_id, blocked_name, age_secs) = create_chore_expect_duplicate(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Dedup Me".to_owned(), // trimmed match
-            description: Some("different description".to_owned()),
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dedup Me")
+            // trimmed match
+            .description("different description")
+            .autostart(false)
+            .build(),
     )
     .await?;
 
@@ -2319,19 +2190,12 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
     // force_duplicate bypasses the guard.
     let forced = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Dedup Me".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: true,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dedup Me")
+            .autostart(false)
+            .force_duplicate(true)
+            .build(),
     )
     .await?;
     assert_ne!(forced.id, first.id, "forced create must produce a new row");
@@ -2344,19 +2208,11 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
     delete_work_item(&mut client, &forced.id).await?;
     let after_delete = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Dedup Me".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dedup Me")
+            .autostart(false)
+            .build(),
     )
     .await?;
     assert_ne!(after_delete.id, first.id, "post-delete create must be a fresh row");
@@ -2508,19 +2364,11 @@ async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
     .await?;
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Link chore".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Link chore")
+            .autostart(false)
+            .build(),
     )
     .await?;
 
@@ -2583,19 +2431,11 @@ async fn unlink_external_ref_clears_binding() -> Result<()> {
     .await?;
     let chore = create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Unlink chore".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Unlink chore")
+            .autostart(false)
+            .build(),
     )
     .await?;
 

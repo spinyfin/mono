@@ -1366,19 +1366,11 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("c")
+            .autostart(false)
+            .build())
         .unwrap();
     let execution = server_state
         .work_db
@@ -1553,19 +1545,11 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("c")
+            .autostart(false)
+            .build())
         .unwrap();
     let execution = server_state
         .work_db
@@ -1672,19 +1656,11 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_chore(CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("c")
+            .autostart(false)
+            .build())
         .unwrap();
     let execution = server_state
         .work_db

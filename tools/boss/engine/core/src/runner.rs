@@ -4254,20 +4254,14 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn untagged_row_spawn_matches_engine_default() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Untagged chore".to_owned(),
-            description: Some("plain row, no effort/model".to_owned()),
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Untagged chore")
+            .description("plain row, no effort/model")
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         // The worker settings file lives outside the workspace; the
@@ -4310,20 +4304,15 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn trivial_row_spawn_uses_sonnet_at_low_effort() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Apply resize-cursor fix to nav divider".to_owned(),
-            description: Some("one-line CSS tweak".to_owned()),
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: Some(EffortLevel::Trivial),
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Apply resize-cursor fix to nav divider")
+            .description("one-line CSS tweak")
+            .effort_level(EffortLevel::Trivial)
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4368,20 +4357,16 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn medium_with_opus_override_uses_override_model_and_medium_addendum() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Add created_via provenance to chore/task creates".to_owned(),
-            description: Some("multi-file edit with judgement calls".to_owned()),
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: Some(EffortLevel::Medium),
-            model_override: Some("opus".to_owned()),
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Add created_via provenance to chore/task creates")
+            .description("multi-file edit with judgement calls")
+            .effort_level(EffortLevel::Medium)
+            .model_override("opus")
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4417,20 +4402,15 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn large_row_spawn_uses_opus_at_xhigh_with_planning_addendum() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Investigate isolated test instance".to_owned(),
-            description: Some("multi-subsystem investigation".to_owned()),
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: Some(EffortLevel::Large),
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Investigate isolated test instance")
+            .description("multi-subsystem investigation")
+            .effort_level(EffortLevel::Large)
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4469,22 +4449,14 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn product_default_model_fills_in_when_row_is_untagged() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Untagged on Sonnet-defaulted product".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
-            .await
-            .unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Untagged on Sonnet-defaulted product")
+            .build();
+        let (spawner, _chore) =
+            run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+                .await
+                .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4540,19 +4512,11 @@ mod pane_spawn_tests {
             })
             .unwrap();
         let chore = work_db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Trivial chore".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: Some(EffortLevel::Trivial),
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_chore(CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Trivial chore")
+                .effort_level(EffortLevel::Trivial)
+                .build())
             .unwrap();
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -4594,20 +4558,14 @@ mod pane_spawn_tests {
     #[tokio::test]
     async fn spawn_env_does_not_carry_effort_or_token_cap_env_vars() {
         let workspace = TempDir::new().unwrap();
-        let chore_input = CreateChoreInput {
-            product_id: String::new(),
-            name: "Any chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: Some(EffortLevel::Large),
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Any chore")
+            .effort_level(EffortLevel::Large)
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         // The forbidden list from design §Q2 plus the obvious
@@ -4775,19 +4733,10 @@ mod pane_spawn_tests {
             })
             .unwrap();
         let chore = work_db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Sort struct definitions".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_chore(CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Sort struct definitions")
+                .build())
             .unwrap();
         let ready = work_db
             .create_execution(
