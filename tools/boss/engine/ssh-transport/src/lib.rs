@@ -212,11 +212,30 @@ impl SshTransport {
         Ok(())
     }
 
-    /// Run a single command on the remote via the master connection.
-    /// Captures stdout + stderr. Does not stream; callers that need a
-    /// long-running worker stdio path (e.g. `spawn_worker`) build a
-    /// fresh `tokio::process::Command` configured with the same
-    /// `ControlPath` so they can capture pipes directly.
+    /// Run a command on the remote via the master connection, passing
+    /// `argv` as separate ssh arguments. Captures stdout + stderr.
+    ///
+    /// **Quoting contract.** `ssh` concatenates every element of `argv`
+    /// with a single space and hands the resulting string to the *remote
+    /// login shell* via its `-c` mechanism. The remote shell then
+    /// word-splits and evaluates that string as a command line. This
+    /// means:
+    ///
+    /// - Simple plain-argv calls like `&["mkdir", "-p", "~/dir"]` work
+    ///   fine — the join is `mkdir -p ~/dir`, which the remote shell
+    ///   evaluates correctly (including `~` expansion).
+    /// - **Multi-word script strings with shell metacharacters (`&&`, `|`,
+    ///   redirects, quoted strings) must NOT be passed as multiple tokens.**
+    ///   For example, `&["sh", "-c", "chmod 0755 f && mv f g"]` produces
+    ///   the remote string `sh -c chmod 0755 f && mv f g`. The remote
+    ///   login shell parses `sh -c chmod` as a command, with `0755` as
+    ///   `$0` and `f` as `$1` — `chmod` runs with zero arguments and
+    ///   prints its usage. Use [`run_shell`] for compound scripts instead.
+    ///
+    /// Does not stream; callers that need a long-running worker stdio
+    /// path (e.g. `spawn_worker`) build a fresh `tokio::process::Command`
+    /// configured with the same `ControlPath` so they can capture pipes
+    /// directly.
     pub async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
         let mut cmd = Command::new("ssh");
         cmd.args([
@@ -240,6 +259,20 @@ impl SshTransport {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    /// Run a shell script on the remote via the master connection.
+    ///
+    /// Passes `script` as a **single** ssh argument so ssh's space-join
+    /// delivers the intact string to the remote login shell. The remote
+    /// login shell then evaluates the entire string as a compound command,
+    /// handling `&&`, `|`, redirects, quoting, and `~` expansion correctly.
+    ///
+    /// Use this in place of `run(&["sh", "-c", script])`, which would
+    /// produce `sh -c <word1> <word2> …` on the remote and mis-parse a
+    /// compound command. See [`run`] for the full quoting contract.
+    pub async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+        self.run(&[script]).await
     }
 
     /// `scp` a local file to a remote path over the master connection.
@@ -432,6 +465,44 @@ fn sanitize_for_path(id: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ── Quoting-contract tests ────────────────────────────────────────────
+
+    #[test]
+    fn ssh_arg_join_semantics() {
+        // Document and verify the core quoting contract:
+        //
+        // ssh concatenates ALL trailing arguments with spaces and hands
+        // the resulting string to the remote login shell.  For a compound
+        // script like `chmod 0755 f && mv f g`:
+        //
+        //   BROKEN — three ssh args:
+        //     ["sh", "-c", "chmod 0755 f && mv f g"]
+        //     → joined: "sh -c chmod 0755 f && mv f g"
+        //     → remote login shell sees: `sh -c chmod` ($0=0755, $1=f)
+        //       — chmod runs with NO args, prints usage, exit 1
+        //
+        //   CORRECT — one ssh arg (what run_shell produces):
+        //     ["chmod 0755 f && mv f g"]
+        //     → joined: "chmod 0755 f && mv f g"
+        //     → remote login shell evaluates the full compound command ✓
+        let script = "chmod 0755 /tmp/f.new && mv /tmp/f.new /tmp/f";
+
+        let correct_argv = [script];
+        assert_eq!(
+            correct_argv.join(" "),
+            script,
+            "single-element join must deliver the script intact"
+        );
+        assert_eq!(correct_argv.len(), 1);
+
+        let broken_argv = ["sh", "-c", script];
+        let broken_joined = broken_argv.join(" ");
+        assert!(
+            broken_joined.starts_with("sh -c chmod"),
+            "multi-arg join produces 'sh -c <first-word> ...' — not a compound command: {broken_joined:?}"
+        );
+    }
 
     #[test]
     fn classify_disk_full() {

@@ -117,6 +117,11 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
     // 4. Atomic rename + chmod 0755 in one round-trip. POSIX rename(2)
     //    on the same filesystem is atomic; concurrent dispatches see
     //    either the old or the new wrapper, never a half-written file.
+    //
+    //    The script is passed via run_shell (single ssh arg) so the
+    //    remote login shell receives the full compound command intact.
+    //    Using run(&["sh", "-c", script]) would produce `sh -c chmod`
+    //    on the remote (chmod with no args → usage error → exit 1).
     let remote_final = remote_wrapper_path();
     let chmod_script = format!(
         "chmod 0755 {dir}/{name}.new && mv {dir}/{name}.new {final_}",
@@ -125,7 +130,7 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
         final_ = remote_final
     );
     let chmod = transport
-        .run(&["sh", "-c", chmod_script.as_str()])
+        .run_shell(&chmod_script)
         .await
         .with_context(|| format!("chmod+mv on host {}", transport.host_id))?;
     if !chmod.success() {
@@ -379,6 +384,35 @@ mod tests {
         assert_eq!(
             RUN_FAILURE_REASON_WRAPPER_PUSH_FAILED,
             "host_wrapper_push_failed"
+        );
+    }
+
+    #[test]
+    fn chmod_mv_script_round_trip() {
+        // Regression: step 4 of push_wrapper must produce a compound
+        // shell command that is a SINGLE ssh argument (so the remote
+        // login shell sees the full `chmod && mv` expression).
+        //
+        // The old broken form was run(&["sh", "-c", script]), which made
+        // ssh join to `sh -c chmod 0755 …` — the remote login shell
+        // parsed only the first word as the -c script and chmod received
+        // zero arguments, printing its usage and exiting non-zero.
+        let dir = expand_remote_dir();
+        let script = format!(
+            "chmod 0755 {dir}/{name}.new && mv {dir}/{name}.new {final_}",
+            name = REMOTE_WRAPPER_NAME,
+            final_ = remote_wrapper_path()
+        );
+        assert!(script.contains("chmod 0755"), "script must include chmod");
+        assert!(script.contains("&& mv"), "script must include mv after &&");
+        // Verify sh considers the script syntactically valid (no execution).
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .status()
+            .expect("sh must be available for syntax checking");
+        assert!(
+            status.success(),
+            "chmod+mv script must be valid shell syntax: {script:?}"
         );
     }
 }
