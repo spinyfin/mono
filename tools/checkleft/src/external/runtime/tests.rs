@@ -1,16 +1,23 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::external::{
     EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckArtifactPackage,
-    ExternalCheckCapabilities, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckCapabilities, ExternalCheckComponentLimits, ExternalCheckPackage,
+    ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
 use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
-use super::{DefaultExternalCheckExecutor, ExternalCheckExecutor, sha256_hex};
+use super::{
+    DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState,
+    MemoryLimiter, WASM_PAGE_SIZE_BYTES, build_wasmtime_engine, is_interrupt_error,
+    resolve_component_limits, sha256_hex,
+};
+use wasmtime::{Instance, Module, Store};
 
 #[test]
 fn executes_artifact_module_and_parses_findings() {
@@ -650,4 +657,177 @@ fn host_state_with_sandbox_root_preopens_the_directory() {
     // (Runtime behavior is verified by the full component integration path once a
     // test component binary is available.)
     drop(state);
+}
+
+// --- Limit / timeout policy tests (T5) ---
+
+#[test]
+fn resolve_limits_uses_defaults_when_none() {
+    let (timeout_ms, max_bytes) = resolve_component_limits(None);
+    assert_eq!(timeout_ms, super::DEFAULT_COMPONENT_TIMEOUT_MS);
+    assert_eq!(
+        max_bytes,
+        super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024
+    );
+}
+
+#[test]
+fn resolve_limits_respects_manifest_overrides() {
+    let limits = ExternalCheckComponentLimits {
+        timeout_ms: Some(2_000),
+        max_memory_mb: Some(64),
+    };
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    assert_eq!(timeout_ms, 2_000);
+    assert_eq!(max_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn resolve_limits_clamps_to_host_ceiling() {
+    let limits = ExternalCheckComponentLimits {
+        timeout_ms: Some(super::HOST_CEILING_TIMEOUT_MS + 60_000),
+        max_memory_mb: Some(super::HOST_CEILING_MAX_MEMORY_MB + 256),
+    };
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    assert_eq!(timeout_ms, super::HOST_CEILING_TIMEOUT_MS);
+    assert_eq!(
+        max_bytes,
+        super::HOST_CEILING_MAX_MEMORY_MB as usize * 1024 * 1024
+    );
+}
+
+#[test]
+fn resolve_limits_partial_override_timeout_only() {
+    let limits = ExternalCheckComponentLimits {
+        timeout_ms: Some(1_000),
+        max_memory_mb: None,
+    };
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    assert_eq!(timeout_ms, 1_000);
+    assert_eq!(
+        max_bytes,
+        super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024
+    );
+}
+
+#[test]
+fn resolve_limits_partial_override_memory_only() {
+    let limits = ExternalCheckComponentLimits {
+        timeout_ms: None,
+        max_memory_mb: Some(128),
+    };
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    assert_eq!(timeout_ms, super::DEFAULT_COMPONENT_TIMEOUT_MS);
+    assert_eq!(max_bytes, 128 * 1024 * 1024);
+}
+
+#[test]
+fn memory_limiter_allows_growth_within_cap() {
+    let mut limiter = MemoryLimiter {
+        max_bytes: 1024 * 1024,
+    };
+    assert!(
+        wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 512 * 1024, None).unwrap(),
+        "growth within cap should be allowed"
+    );
+}
+
+#[test]
+fn memory_limiter_allows_growth_exactly_at_cap() {
+    let mut limiter = MemoryLimiter {
+        max_bytes: 1024 * 1024,
+    };
+    assert!(
+        wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 1024 * 1024, None).unwrap(),
+        "growth exactly at cap should be allowed"
+    );
+}
+
+#[test]
+fn memory_limiter_rejects_growth_beyond_cap() {
+    let mut limiter = MemoryLimiter {
+        max_bytes: 512 * 1024,
+    };
+    assert!(
+        !wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 1024 * 1024, None).unwrap(),
+        "growth beyond cap should be rejected"
+    );
+}
+
+/// Verifies that the epoch-interruption mechanism fires when the deadline is
+/// exceeded. Uses a tight spin loop to guarantee an epoch check point is hit.
+/// This exercises the engine configuration and epoch-deadline semantics used by
+/// `execute_component_v1_artifact`.
+#[test]
+fn epoch_deadline_interrupts_spin_loop() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+
+    let wasm = wat::parse_str("(module (func (export \"spin\") (loop (br 0))))").unwrap();
+    let module = Module::new(&engine, &wasm).unwrap();
+
+    let mut store: Store<()> = Store::new(&engine, ());
+    // Disable fuel limit so only the epoch fires.
+    store.set_fuel(u64::MAX).unwrap();
+    // Deadline = 1 tick from now.
+    store.set_epoch_deadline(1);
+
+    // Advance epoch past the deadline before executing.
+    engine.increment_epoch();
+    engine.increment_epoch();
+
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let spin: wasmtime::TypedFunc<(), ()> =
+        instance.get_typed_func(&mut store, "spin").unwrap();
+    let err = spin
+        .call(&mut store, ())
+        .map_err(anyhow::Error::from)
+        .expect_err("execution should be interrupted by epoch deadline");
+
+    assert!(
+        is_interrupt_error(&err),
+        "expected epoch Trap::Interrupt, got: {err:#}"
+    );
+}
+
+/// Verifies that the `ResourceLimiter` causes `memory.grow` to return -1 when
+/// the requested size would exceed the cap installed on the store. Uses
+/// `HostState` and `MemoryLimiter` directly to mirror what
+/// `execute_component_v1_artifact` sets up.
+#[test]
+fn memory_cap_trip_via_resource_limiter() {
+    let engine = build_wasmtime_engine().unwrap();
+
+    // Allow exactly 1 wasm page (64 KiB).
+    let one_page = WASM_PAGE_SIZE_BYTES;
+    let mut store: Store<HostState> = Store::new(&engine, HostState::new(one_page));
+    store.limiter(|state| &mut state.limiter);
+    store.set_fuel(u64::MAX).unwrap();
+    // This test exercises the ResourceLimiter, not epoch timeout. Disable epoch
+    // so the default epoch-0 deadline does not trap immediately.
+    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+
+    // Module starts with 1 page and tries to grow by 1 more.
+    let wasm = wat::parse_str(
+        r#"(module
+  (memory (export "memory") 1)
+  (func (export "try_grow") (result i32)
+    i32.const 1
+    memory.grow
+  )
+)"#,
+    )
+    .unwrap();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let try_grow: wasmtime::TypedFunc<(), i32> =
+        instance.get_typed_func(&mut store, "try_grow").unwrap();
+
+    // memory.grow returns -1 (as i32) when the ResourceLimiter rejects growth.
+    let result = try_grow
+        .call(&mut store, ())
+        .expect("call itself should succeed");
+    assert_eq!(
+        result, -1,
+        "memory.grow must return -1 when the cap is exceeded"
+    );
 }
