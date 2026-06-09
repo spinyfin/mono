@@ -412,6 +412,10 @@ impl WorkDb {
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker
         // rather than bumping it. Left at '22'.
+        // P1203 task 1: add score + merged_into_attention_id + linked_work_item_id
+        // to `attentions` and create the `attention_merges` provenance ledger.
+        // Design: tools/boss/docs/designs/notification-dedup-scoring.md §"Data model".
+        migrate_attentions_score_and_merges(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '23')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

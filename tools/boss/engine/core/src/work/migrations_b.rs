@@ -1439,6 +1439,70 @@ pub(crate) fn migrate_tasks_review_cycle_columns(conn: &Connection) -> Result<()
     Ok(())
 }
 
+/// Add `score`, `merged_into_attention_id`, and `linked_work_item_id` columns
+/// to `attentions`, and create the `attention_merges` provenance ledger table
+/// with all its indexes. Schema defined in
+/// `tools/boss/docs/designs/notification-dedup-scoring.md` §"Data model".
+///
+/// - `score INTEGER NOT NULL DEFAULT 1` — count of independent reports folded
+///   into this item. Default `1` so existing rows read as "reported once".
+/// - `merged_into_attention_id TEXT` — set by the sweep when this item is
+///   retired into a canonical; also marks `answer_state = 'merged'` items as
+///   permanently inert.
+/// - `linked_work_item_id TEXT` — set on a Medium-confidence `WorkItemDup` verdict;
+///   the item remains open but carries a cross-reference chip to the covering
+///   work item.
+///
+/// `attention_merges` is the append-only fold-provenance ledger: one row per
+/// fold, indexed for efficient canonical-lookup, work-item-lookup, and the
+/// pair-unique sweep-idempotency constraint that prevents double-counting.
+pub(crate) fn migrate_attentions_score_and_merges(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "attentions", "score")? {
+        conn.execute(
+            "ALTER TABLE attentions ADD COLUMN score INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "attentions", "merged_into_attention_id")? {
+        conn.execute(
+            "ALTER TABLE attentions ADD COLUMN merged_into_attention_id TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "attentions", "linked_work_item_id")? {
+        conn.execute(
+            "ALTER TABLE attentions ADD COLUMN linked_work_item_id TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS attention_merges (
+             id                      TEXT PRIMARY KEY,
+             canonical_attention_id  TEXT REFERENCES attentions(id),
+             canonical_work_item_id  TEXT,
+             product_id              TEXT NOT NULL,
+             trigger                 TEXT NOT NULL,
+             duplicate_attention_id  TEXT,
+             candidate_summary       TEXT NOT NULL,
+             candidate_source        TEXT,
+             model                   TEXT NOT NULL,
+             decision_rationale      TEXT,
+             edits_applied           TEXT,
+             created_at              TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS attention_merges_canonical_idx
+             ON attention_merges(canonical_attention_id, created_at)
+             WHERE canonical_attention_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS attention_merges_work_item_idx
+             ON attention_merges(canonical_work_item_id, created_at)
+             WHERE canonical_work_item_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS attention_merges_pair_uq
+             ON attention_merges(canonical_attention_id, duplicate_attention_id)
+             WHERE duplicate_attention_id IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
 /// Create the `planner_runs` audit-ledger table and its UNIQUE partial
 /// index (the per-project idempotency gate).
 ///
