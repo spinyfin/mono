@@ -1390,3 +1390,44 @@ pub(crate) fn migrate_tasks_review_cycle_columns(conn: &Connection) -> Result<()
     }
     Ok(())
 }
+
+/// Create the `planner_runs` audit-ledger table and its UNIQUE partial
+/// index (the per-project idempotency gate).
+///
+/// Schema matches the design doc §"Durable audit trail":
+/// one row per Planner invocation, inserted as `outcome = 'running'`
+/// on claim and updated to a terminal outcome on completion.
+///
+/// The UNIQUE partial index `planner_runs_one_per_project` enforces at
+/// most one live row (`outcome IN ('running','staged','applied')`) per
+/// `project_id`, making concurrent triggers, poller restarts, and manual
+/// retries all safe — exactly one populate per project.
+///
+/// Design: `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
+pub(crate) fn migrate_planner_runs_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS planner_runs (
+             id             TEXT PRIMARY KEY,
+             project_id     TEXT NOT NULL,
+             product_id     TEXT NOT NULL,
+             design_task_id TEXT,
+             caller         TEXT NOT NULL,
+             doc_ref        TEXT,
+             model          TEXT,
+             input_summary  TEXT,
+             raw_output     TEXT,
+             effort_audit   TEXT,
+             notes          TEXT,
+             outcome        TEXT NOT NULL,
+             result_summary TEXT,
+             created_at     TEXT NOT NULL,
+             updated_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS planner_runs_project_idx
+             ON planner_runs(project_id, created_at);
+         CREATE UNIQUE INDEX IF NOT EXISTS planner_runs_one_per_project
+             ON planner_runs(project_id)
+             WHERE outcome IN ('running','staged','applied');",
+    )?;
+    Ok(())
+}

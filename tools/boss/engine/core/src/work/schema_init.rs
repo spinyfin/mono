@@ -335,8 +335,14 @@ impl WorkDb {
         // P992 task 9: loop termination & bounds — per-PR review cycle
         // counter and last-reviewed SHA for the no-op skip gate.
         migrate_tasks_review_cycle_columns(&conn)?;
+        // P783 task 2: planner_runs audit ledger + per-project idempotency gate.
+        // The UNIQUE partial index is created here (after the table) so SQLite
+        // can resolve the `outcome` column. `CREATE TABLE IF NOT EXISTS` +
+        // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
+        // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
+        migrate_planner_runs_table(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '19')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '20')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

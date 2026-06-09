@@ -1762,7 +1762,86 @@ pub struct EffortEscalation {
     pub rule_id: Option<String>,
 }
 
+// ---- planner_runs outcome constants ----
+// Used by the Populator, WorkDb accessors, and any caller that needs to
+// interpret a `PlannerRun.outcome` value without hard-coding string literals.
 
+/// Planner run has been claimed; the Populator is executing.
+pub const PLANNER_OUTCOME_RUNNING: &str = "running";
+/// Planner run succeeded and tasks were created with `autostart = false`
+/// (staged, awaiting operator release).
+pub const PLANNER_OUTCOME_STAGED: &str = "staged";
+/// Tasks were created and released (dispatching). Reserved for future use
+/// when the auto-dispatch path is enabled.
+pub const PLANNER_OUTCOME_APPLIED: &str = "applied";
+/// Design doc had no task-breakdown section; clean no-op.
+pub const PLANNER_OUTCOME_NO_BREAKDOWN: &str = "no_breakdown";
+/// Proposal exceeded the `max_tasks` cap; rejected whole.
+pub const PLANNER_OUTCOME_REJECTED_TOO_MANY: &str = "rejected_too_many";
+/// Proposal contained a dependency cycle; rejected whole.
+pub const PLANNER_OUTCOME_REJECTED_CYCLE: &str = "rejected_cycle";
+/// Design doc fetch failed after bounded retries.
+pub const PLANNER_OUTCOME_FETCH_FAILED: &str = "fetch_failed";
+/// Design doc returned 404 (moved or deleted since merge).
+pub const PLANNER_OUTCOME_DOC_MISSING: &str = "doc_missing";
+/// LLM call failed or returned invalid output after retries.
+pub const PLANNER_OUTCOME_PLANNER_FAILED: &str = "planner_failed";
+/// Project already has implementation tasks; populate skipped to avoid
+/// merging with pre-seeded work.
+pub const PLANNER_OUTCOME_SKIPPED_PRE_SEEDED: &str = "skipped_pre_seeded";
+/// A prior `running`/`staged`/`applied` row already exists for this
+/// project; this invocation is a duplicate and was skipped.
+pub const PLANNER_OUTCOME_SKIPPED_ALREADY_POPULATED: &str = "skipped_already_populated";
+
+/// One row in the `planner_runs` audit ledger.
+///
+/// Every Planner invocation writes exactly one row (inserted as
+/// `outcome = 'running'` on claim, then updated to a terminal outcome on
+/// completion). The UNIQUE partial index `planner_runs_one_per_project`
+/// enforces at most one live row (`outcome IN ('running','staged','applied')`)
+/// per `project_id`, making this table the per-project idempotency gate.
+///
+/// Design: `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
+/// §"Durable audit trail".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct PlannerRun {
+    pub id: String,
+    pub project_id: String,
+    pub product_id: String,
+    /// The `kind = 'design'` task whose PR merge triggered this run.
+    /// `None` for operator-initiated runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_task_id: Option<String>,
+    /// What initiated this run: `"merge_trigger"` | `"operator"` | `"replan"`.
+    pub caller: String,
+    /// `"<repo_remote_url>|<ref>|<path>"` of the doc fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_ref: Option<String>,
+    /// Model slug used for the Planner call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Short summary of the Planner's input (doc length, project name,
+    /// existing-task count). For the operator audit view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_summary: Option<String>,
+    /// Verbatim structured JSON returned by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<String>,
+    /// The `[effort-classification]` lines emitted per proposed task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_audit: Option<String>,
+    /// Free-text rationale from the Planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// One of the `PLANNER_OUTCOME_*` constants.
+    pub outcome: String,
+    /// Human-readable summary of what was created/skipped/rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
 
 /// Allowed values for `tasks.effort_level`. Per design §"Naming" /
 /// §Q1: `trivial | small | medium | large | max`. Stored as TEXT

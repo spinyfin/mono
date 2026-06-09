@@ -131,6 +131,7 @@ rust_library(
         "src/work/migrations_a.rs",
         "src/work/migrations_b.rs",
         "src/work/output_types.rs",
+        "src/work/planner_runs.rs",
         "src/work/pr_flow.rs",
         "src/work/pr_state.rs",
         "src/work/products_design.rs",
