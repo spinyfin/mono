@@ -799,11 +799,7 @@ async fn maybe_spawn_ci_revision(
 /// on the `ci_remediations` row so the worker revision directive can embed
 /// a concrete excerpt. Skips silently when no job id is available or the
 /// log fetch fails — the worker can always fetch the full log manually.
-async fn fetch_and_store_log_excerpt(
-    work_db: &WorkDb,
-    attempt: &CiRemediation,
-    failures: &[RequiredCheckFailure],
-) {
+async fn fetch_and_store_log_excerpt(work_db: &WorkDb, attempt: &CiRemediation, failures: &[RequiredCheckFailure]) {
     let Some(first_with_job) = failures.iter().find(|f| f.provider_job_id.is_some()) else {
         return;
     };
@@ -853,7 +849,6 @@ pub async fn on_merge_queue_rebounce_detected(
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     head_ref_name: Option<&str>,
-    _head_ref_oid: Option<&str>,
     before_commit_sha: &str,
     labels: &[String],
     failures: &[RequiredCheckFailure],

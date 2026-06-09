@@ -2764,10 +2764,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         Some(md) => out.push_str(&md),
         None => {
             if is_rebounce {
-                let sha_hint = attempt
-                    .before_commit_sha
-                    .as_deref()
-                    .unwrap_or("<synthetic-merge-sha>");
+                let sha_hint = attempt.before_commit_sha.as_deref().unwrap_or("<synthetic-merge-sha>");
                 out.push_str(&format!(
                     "_The engine did not capture the failing checks for this merge-queue rebounce. \
                      Do NOT use `gh pr checks` — it shows the PR-head checks, which are green. \
