@@ -1981,9 +1981,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         ));
         out.push_str(
             "> **Important**: this is a **merge-queue rebounce**, not a per-PR CI failure.\n\
-             > - The PR's own required checks are **green** on its head SHA. Do NOT look at them.\n\
-             > - The failure happened on the **synthetic merge commit** GitHub assembled when the PR\n\
-             >   entered the queue. See `Synthetic merge SHA` below.\n\
+             > - The PR's own required checks are **green** on its head SHA.\n\
+             > - **`gh pr checks` will show green** — this is expected and does NOT mean CI passed.\n\
+             >   Do NOT run `gh pr checks` and conclude there is nothing to fix. The actual failing\n\
+             >   build is on the **synthetic merge commit** on a `gh-readonly-queue/*` branch,\n\
+             >   listed under \"Failing required checks\" below with its build URL and job id.\n\
              > - Root cause: something landed on `main` between this PR's CI run and its queue turn\n\
              >   that is semantically incompatible. After fixing, **re-enqueue** the PR.\n\n",
         );
@@ -2013,10 +2015,26 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     out.push_str("### Failing required checks\n\n");
     match render_failed_checks_markdown(&attempt.failed_checks) {
         Some(md) => out.push_str(&md),
-        None => out.push_str(
-            "_The engine did not record a parseable `failed_checks` blob for this attempt. \
-             Read `gh pr checks` to enumerate the failing required checks before deciding the fix._\n",
-        ),
+        None => {
+            if is_rebounce {
+                let sha_hint = attempt
+                    .before_commit_sha
+                    .as_deref()
+                    .unwrap_or("<synthetic-merge-sha>");
+                out.push_str(&format!(
+                    "_The engine did not capture the failing checks for this merge-queue rebounce. \
+                     Do NOT use `gh pr checks` — it shows the PR-head checks, which are green. \
+                     Instead, fetch the check runs for the synthetic merge SHA directly: \
+                     `gh api repos/<owner>/<repo>/commits/{sha_hint}/check-runs \
+                     | jq '.check_runs[] | select(.conclusion == \"failure\") | {{name, details_url}}'`._\n",
+                ));
+            } else {
+                out.push_str(
+                    "_The engine did not record a parseable `failed_checks` blob for this attempt. \
+                     Read `gh pr checks` to enumerate the failing required checks before deciding the fix._\n",
+                );
+            }
+        }
     }
     out.push('\n');
 
@@ -2098,13 +2116,31 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 .as_deref()
                 .unwrap_or("<synthetic-merge-sha>");
             out.push_str(&format!(
-                "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
-                 (whose checks are green). Use the per-provider CLI:\n\n\
+                "The failing job ran on the **synthetic merge SHA `{sha_hint}`** \
+                 (`gh-readonly-queue/*` branch), NOT the PR head. \
+                 Use the pre-filled commands in \"Ready-to-run Buildkite log commands\" above \
+                 if shown; otherwise fall back to the provider CLI:\n\n\
                  - Buildkite: `bk job log --pipeline <slug> --build-number <N> <job-uuid>` \
-                 (slug and build number are in the check's `target_url`; job UUIDs come from \
-                 `bk build view <N> --pipeline <slug>`)\n\
-                 - GitHub Actions: `gh run view --log-failed --job <job-id>` (job id from failing check URL)\n\n",
+                 (slug and build number are in the check's `target_url` above; job UUIDs come \
+                 from `bk build view <N> --pipeline <slug>`)\n\
+                 - GitHub Actions: `gh run view --log-failed --job <job-id>` \
+                 (job id from the failing check URL above)\n\n",
             ));
+            out.push_str("Engine-collected log excerpt (from the synthetic merge commit's failing job):\n\n");
+            match attempt.log_excerpt.as_deref().map(str::trim) {
+                Some(tail) if !tail.is_empty() => {
+                    out.push_str("```\n");
+                    out.push_str(tail);
+                    out.push_str("\n```\n\n");
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "_No pre-fetched log excerpt is available for this attempt. \
+                         Use the commands above to fetch directly from the synthetic merge \
+                         SHA `{sha_hint}`._\n\n",
+                    ));
+                }
+            }
         } else {
             out.push_str("Engine-collected log excerpt (failing job tail):\n\n");
             match attempt.log_excerpt.as_deref().map(str::trim) {

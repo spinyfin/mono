@@ -1385,6 +1385,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         None,
         "synthetic-merge-sha-abc",
         &[],
+        &[],
     )
     .await;
     assert!(flipped, "rebounce detection must flip chore to ci_failure");
@@ -1434,6 +1435,62 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     );
 }
 
+/// When reconciliation detects a merge-queue rebounce and is supplied with
+/// the failing check data (from `fetch_failing_checks_for_commit`), those
+/// checks must be stored on the `ci_remediations` row so the revision
+/// directive can show the worker the exact build URL and job id — not just
+/// generic "look for a failing build" instructions.
+#[tokio::test]
+async fn rebounce_stores_failing_checks_from_failures_slice() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/999";
+    let (product, chore) = make_in_review(&db, "C-rebounce-checks", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let failures = vec![RequiredCheckFailure {
+        name: "ci/build".into(),
+        conclusion: "failure".into(),
+        target_url: "https://buildkite.com/org/mono/builds/1666#job-abc-uuid".into(),
+        provider: CiProvider::Buildkite,
+        provider_job_id: Some("job-abc-uuid".into()),
+    }];
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature-branch"),
+        None,
+        "synthetic-merge-sha-xyz",
+        &[],
+        &failures,
+    )
+    .await;
+    assert!(flipped, "rebounce detection must flip chore to ci_failure");
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("active attempt row");
+
+    // The failed_checks JSON must carry the Buildkite check so the revision
+    // directive can show the worker a pre-filled `bk job log` command.
+    let checks: Vec<serde_json::Value> =
+        serde_json::from_str(&attempt.failed_checks).expect("valid JSON");
+    assert!(!checks.is_empty(), "failed_checks must not be empty when failures were supplied");
+    assert_eq!(checks[0]["name"].as_str(), Some("ci/build"));
+    assert_eq!(checks[0]["provider"].as_str(), Some("buildkite"));
+    assert_eq!(checks[0]["provider_job_id"].as_str(), Some("job-abc-uuid"));
+    assert!(
+        checks[0]["target_url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("builds/1666"),
+        "target_url must contain the build number"
+    );
+}
+
 /// THE REGRESSION (T604 / PR #690 04:44Z miss): a clean head-branch CI
 /// probe must NOT clear a `merge_queue_rebounce` block.
 ///
@@ -1458,6 +1515,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
         Some("feature-branch"),
         None,
         "synthetic-sha-xyz",
+        &[],
         &[],
     )
     .await;
@@ -1505,6 +1563,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         None,
         "sha-A",
         &[],
+        &[],
     )
     .await;
     // Repeat for the same SHA (as would happen when the same dequeue event
@@ -1516,6 +1575,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         Some("feature"),
         None,
         "sha-A",
+        &[],
         &[],
     )
     .await;
@@ -1566,6 +1626,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
         Some("feature"),
         None,
         "sha-Q",
+        &[],
         &[],
     )
     .await;
@@ -1635,6 +1696,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         None,
         "sha-merge-1",
         &[],
+        &[],
     )
     .await;
     assert!(first, "first rebounce must flip chore to ci_failure");
@@ -1698,6 +1760,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         None,
         "sha-merge-1",
         &[],
+        &[],
     )
     .await;
     assert!(sha1_replay, "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)");
@@ -1728,6 +1791,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         Some("feature"),
         None,
         "sha-merge-2",
+        &[],
         &[],
     )
     .await;

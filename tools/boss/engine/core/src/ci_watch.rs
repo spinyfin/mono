@@ -791,10 +791,53 @@ async fn maybe_spawn_ci_revision(
         "ci_watch: spawned engine-triggered revision for CI failure",
     );
 
+    // Pre-spawn log fetch: capture the tail of the first known-failing job
+    // and store it so the revision directive can show a concrete excerpt to
+    // the worker. Best-effort — a failure here is logged at debug and does
+    // not prevent the revision from running.
+    fetch_and_store_log_excerpt(work_db, attempt, failures).await;
+
     // Nudge the scheduler so the reconcile loop dispatches the revision's
     // `revision_implementation` execution promptly.
     publisher.kick_scheduler();
     true
+}
+
+/// Best-effort: fetch the tail of the first failing job's log and store it
+/// on the `ci_remediations` row so the worker revision directive can embed
+/// a concrete excerpt. Skips silently when no job id is available or the
+/// log fetch fails — the worker can always fetch the full log manually.
+async fn fetch_and_store_log_excerpt(
+    work_db: &WorkDb,
+    attempt: &CiRemediation,
+    failures: &[RequiredCheckFailure],
+) {
+    let Some(first_with_job) = failures.iter().find(|f| f.provider_job_id.is_some()) else {
+        return;
+    };
+    let Some(job_id) = first_with_job.provider_job_id.as_deref() else {
+        return;
+    };
+    let reader = crate::ci_log_reader::reader_for(first_with_job.provider);
+    match reader.read_log_tail(job_id, 100).await {
+        Ok(log) if !log.is_empty() => {
+            if let Err(err) = work_db.set_ci_remediation_log_excerpt(&attempt.id, &log) {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "ci_watch: failed to store pre-spawn log excerpt",
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                ?err,
+                "ci_watch: pre-spawn log fetch failed; excerpt will be absent",
+            );
+        }
+    }
 }
 
 /// Entry point for merge-queue rebounce detection.
@@ -821,6 +864,7 @@ pub async fn on_merge_queue_rebounce_detected(
     _head_ref_oid: Option<&str>,
     before_commit_sha: &str,
     labels: &[String],
+    failures: &[RequiredCheckFailure],
 ) -> bool {
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
@@ -979,7 +1023,7 @@ pub async fn on_merge_queue_rebounce_detected(
         head_sha_at_trigger: before_commit_sha.to_owned(),
         attempt_kind: "fix".to_owned(),
         consumes_budget: 1,
-        failed_checks: "[]".to_owned(),
+        failed_checks: encode_failed_checks(failures),
         failure_kind: "merge_queue_rebounce".to_owned(),
         before_commit_sha: Some(before_commit_sha.to_owned()),
     });
@@ -1038,7 +1082,7 @@ pub async fn on_merge_queue_rebounce_detected(
                 publisher,
                 &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
                 candidate,
-                &[], // no per-check failures for rebounce; directive uses failure_kind
+                failures,
                 a,
             )
             .await;
