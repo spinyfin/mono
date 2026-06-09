@@ -32,7 +32,7 @@
 //! fallback path runs on the next sweep. The staging cache is the
 //! hot path; the reconstruction path is the cold path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 use regex::Regex;
@@ -125,6 +125,58 @@ pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> O
         PR_URL_RE.find(text).map(|m| m.as_str().to_owned())
     };
     scan("stdout").or_else(|| scan("stderr"))
+}
+
+/// In-memory `execution_id` set tracking revision workers that ran a push
+/// command (`jj git push`) since the last Stop event. Populated by the
+/// `PostToolUse` hook dispatcher; consumed (and cleared) by
+/// `WorkerCompletionHandler::on_stop_inner`'s SHA-delta gate.
+///
+/// A revision worker that pushed is far more likely to be the source of a
+/// SHA delta than the concurrently-active parent worker. `take` returns
+/// `true` and clears the flag so the evidence is consumed at the Stop
+/// boundary that acted on it.
+#[derive(Debug, Default)]
+pub struct StagedRevisionPushCache {
+    inner: Mutex<HashSet<String>>,
+}
+
+impl StagedRevisionPushCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the revision execution `execution_id` ran a push command.
+    /// Idempotent — calling twice for the same id is a no-op.
+    pub fn record(&self, execution_id: &str) {
+        self.inner
+            .lock()
+            .expect("StagedRevisionPushCache mutex poisoned")
+            .insert(execution_id.to_owned());
+    }
+
+    /// Check whether a push was staged for `execution_id` and clear it.
+    /// Returns `true` if a push was recorded; `false` otherwise.
+    pub fn take(&self, execution_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("StagedRevisionPushCache mutex poisoned")
+            .remove(execution_id)
+    }
+}
+
+/// Check whether a Bash `tool_input` command is a `jj git push` (or
+/// `git push`) invocation that would advance a branch on the remote. Used
+/// to populate the [`StagedRevisionPushCache`] for revision workers.
+///
+/// Returns `true` for `jj git push …` commands (excluding `--dry-run`).
+/// Plain `git push` is intentionally excluded — revision workers in this
+/// repo use `jj` exclusively.
+pub fn is_revision_push_command(tool_input: &serde_json::Value) -> bool {
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    command.contains("jj git push") && !command.contains("--dry-run")
 }
 
 /// Check whether a Bash `tool_input` command is a deliberate `gh pr`

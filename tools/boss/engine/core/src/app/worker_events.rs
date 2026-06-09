@@ -291,6 +291,27 @@ pub(super) async fn dispatch_live_worker_state(
                             }
                         }
                     } // else (is_gh_pr_command)
+
+                    // Revision push detection: record when a revision worker
+                    // runs `jj git push` so the on_stop_inner SHA-delta gate
+                    // can confirm the revision was the one that moved the PR
+                    // head (not a concurrently-active parent worker).
+                    if crate::pr_url_capture::is_revision_push_command(tool_input) {
+                        let execution_id = run_id;
+                        match server_state.work_db.get_execution(execution_id) {
+                            Ok(execution)
+                                if execution.kind
+                                    == crate::work::ExecutionKind::RevisionImplementation =>
+                            {
+                                server_state.staged_revision_pushes.record(execution_id);
+                                tracing::info!(
+                                    execution_id,
+                                    "revision_push_capture: staged push evidence for revision",
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
