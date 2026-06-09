@@ -2,6 +2,19 @@ use super::*;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
+use crate::driver::{AgentDriver, ClaudeDriver};
+
+/// Convenience wrapper: render CLAUDE.md using the ClaudeDriver's preamble and
+/// config_dir. Tests that care about exact content should pass driver info
+/// explicitly, but most tests just need the rendered string for a Claude worker.
+fn claude_md_for(input: &WorkerSetupInput) -> String {
+    render_claude_md(
+        input,
+        ClaudeDriver.agent_rules_preamble(),
+        ClaudeDriver.descriptor().config_dir,
+    )
+}
+
 /// Serializes tests that touch the *shared* worker-settings dir
 /// (`worker_settings_dir()`, a fixed `$TMPDIR` path). `write_workspace_files`
 /// truncate-writes the global `boss-path-guard.py` there; a concurrent
@@ -134,7 +147,7 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
 #[test]
 fn claude_md_mentions_workspace_and_lease() {
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(rendered.contains(input.workspace_path.to_str().unwrap()));
     assert!(rendered.contains(&input.lease_id));
     assert!(rendered.contains("`jj`"));
@@ -147,7 +160,7 @@ fn claude_md_warns_origin_is_a_local_mirror() {
     // mirror, not GitHub, and that pushes must be confirmed against
     // GitHub's head sha — never against the remote they pushed to.
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(rendered.contains("LOCAL MIRROR"));
     assert!(rendered.contains("ls-remote"));
     assert!(rendered.contains(".head.sha") || rendered.contains(".commit.sha"));
@@ -156,7 +169,7 @@ fn claude_md_warns_origin_is_a_local_mirror() {
 #[test]
 fn claude_md_forbids_editor_fallthrough_for_commit_messages() {
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     // The rule must explicitly call out `-m` and the editor
     // fallthrough so a worker that grepped only for "commit" still
     // hits the guidance.
@@ -463,7 +476,7 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
 fn triage_kind_renders_triage_claude_md_without_pr_mandate() {
     let mut input = sample_input();
     input.worker_kind = WorkerKind::Triage;
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     // Routed to the triage CLAUDE.md: restates the marker contract.
     assert!(
         rendered.contains("automation: task") && rendered.contains("automation: skip"),
@@ -516,7 +529,7 @@ fn claude_md_warns_against_touching_boss_state_dir() {
     // a soft soft-rule in the CLAUDE.md system prompt to know
     // it's off-limits. Belt-and-suspenders.
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(
         rendered.contains("Library/Application Support/Boss"),
         "CLAUDE.md must call out the Boss state dir explicitly",
@@ -583,7 +596,7 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
         worker_kind: WorkerKind::Standard,
     };
 
-    let written = write_workspace_files(&input).unwrap();
+    let written = write_workspace_files(&input, &ClaudeDriver).unwrap();
 
     assert!(written.claude_md_path.exists());
     assert!(written.settings_path.exists());
@@ -643,7 +656,7 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
         worker_kind: WorkerKind::Standard,
     };
 
-    write_workspace_files(&input).unwrap();
+    write_workspace_files(&input, &ClaudeDriver).unwrap();
 
     // The redirected HOME now has a ~/.claude.json marking this
     // workspace as trusted, so the worker's claude session skips the
@@ -891,7 +904,7 @@ fn write_workspace_files_purges_leaked_in_tree_settings() {
         worker_kind: WorkerKind::Standard,
     };
 
-    write_workspace_files(&input).unwrap();
+    write_workspace_files(&input, &ClaudeDriver).unwrap();
 
     let settings = claude_dir.join("settings.json");
     // The leaked prior run's hook must be gone after setup; only
@@ -907,7 +920,7 @@ fn write_workspace_files_purges_leaked_in_tree_settings() {
 #[test]
 fn claude_md_warns_against_force_tracking_dot_claude() {
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     // The CLAUDE.md must remind workers not to override the
     // engine's gitignore — otherwise a worker that runs into a
     // status surprise might `jj file track` the engine plumbing
@@ -922,7 +935,7 @@ fn claude_md_pr_section_is_front_and_centre() {
     // immediately after the intro. If a future edit buries it
     // again, this test will fail and the writer can move it back.
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     let pr_offset = rendered
         .find("Pull requests are the deliverable")
         .expect("expected the strengthened PR heading to be present");
@@ -967,7 +980,7 @@ fn write_workspace_files_overwrites_existing_files() {
         worker_kind: WorkerKind::Standard,
     };
 
-    write_workspace_files(&input).unwrap();
+    write_workspace_files(&input, &ClaudeDriver).unwrap();
     let contents = std::fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
     assert!(contents.contains("new-lease"));
     assert!(!contents.contains("stale content"));
@@ -982,7 +995,7 @@ fn claude_dir_for_appends_dot_claude() {
 #[test]
 fn claude_md_has_cube_pr_ensure_section() {
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(
         rendered.contains("Creating a PR from a jj workspace"),
         "expected a 'Creating a PR from a jj workspace' section",
@@ -1002,7 +1015,7 @@ fn claude_md_has_cube_pr_ensure_section() {
 fn claude_md_explains_no_git_at_workspace_root() {
     // Workers must know why bare `gh` calls fail before reaching for the fix.
     let input = sample_input();
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(
         rendered.contains("fatal: not a git repository") || rendered.contains("no `.git/`"),
         "expected an explanation of why bare gh fails in a jj workspace",
@@ -1013,7 +1026,7 @@ fn claude_md_explains_no_git_at_workspace_root() {
 fn claude_md_draft_directive_present_when_enabled() {
     let mut input = sample_input();
     input.draft_pr_mode = true;
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(
         rendered.contains("--draft"),
         "CLAUDE.md must include --draft directive when draft_pr_mode is true",
@@ -1027,7 +1040,7 @@ fn claude_md_draft_directive_present_when_enabled() {
 #[test]
 fn claude_md_draft_directive_absent_when_disabled() {
     let input = sample_input(); // draft_pr_mode: false
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(
         !rendered.contains("--draft"),
         "CLAUDE.md must NOT include --draft directive when draft_pr_mode is false",
@@ -1038,7 +1051,7 @@ fn claude_md_draft_directive_absent_when_disabled() {
 fn reviewer_claude_md_states_read_only_mandate() {
     let mut input = sample_input();
     input.worker_kind = WorkerKind::Reviewer;
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     // Must contain the read-only mandate section.
     assert!(
         rendered.contains("Read-only mandate"),
@@ -1074,7 +1087,7 @@ fn reviewer_claude_md_states_read_only_mandate() {
 fn reviewer_claude_md_mentions_allowed_read_only_tools() {
     let mut input = sample_input();
     input.worker_kind = WorkerKind::Reviewer;
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(rendered.contains("gh pr diff"), "must mention gh pr diff");
     assert!(rendered.contains("gh pr view"), "must mention gh pr view");
     assert!(rendered.contains("jj log"), "must mention jj log");
@@ -1084,7 +1097,7 @@ fn reviewer_claude_md_mentions_allowed_read_only_tools() {
 fn standard_claude_md_is_unchanged_by_reviewer_branch() {
     // Verify the reviewer kind change does not affect standard workers.
     let input = sample_input(); // WorkerKind::Standard
-    let rendered = render_claude_md(&input);
+    let rendered = claude_md_for(&input);
     assert!(rendered.contains("Pull requests are the deliverable"));
     assert!(rendered.contains("cube pr ensure"));
     assert!(rendered.contains("LOCAL MIRROR"));
@@ -1429,7 +1442,7 @@ fn write_workspace_files_writes_path_guard_script_outside_workspace() {
         task_kind: Some("chore".into()),
         worker_kind: WorkerKind::Standard,
     };
-    write_workspace_files(&input).unwrap();
+    write_workspace_files(&input, &ClaudeDriver).unwrap();
 
     let script = path_guard_script_path();
     assert!(script.exists(), "gate script must be written: {}", script.display());
