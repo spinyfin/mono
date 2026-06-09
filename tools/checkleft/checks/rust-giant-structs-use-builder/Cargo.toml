@@ -1,0 +1,17 @@
+[package]
+name = "checkleft-rust-giant-structs-use-builder"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check: flag Rust structs with too many named fields that lack a builder derive"
+
+# cdylib is required to compile this crate as a wasm component.
+# On the host target this produces a native shared library; on wasm32-wasip2
+# it produces the component .wasm artifact via the rust_wasm_component bazel rule.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+checkleft-check-sdk = { path = "../../sdk" }
+wit-bindgen = "0.51"
+serde = { workspace = true, features = ["derive"] }
+syn = { workspace = true }

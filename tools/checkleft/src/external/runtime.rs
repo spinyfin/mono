@@ -426,7 +426,7 @@ impl DefaultExternalCheckExecutor {
         &self,
         package: &ExternalCheckPackage,
         artifact: &ExternalCheckArtifactPackage,
-        _limits: Option<&ExternalCheckComponentLimits>,
+        limits: Option<&ExternalCheckComponentLimits>,
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
@@ -447,6 +447,7 @@ impl DefaultExternalCheckExecutor {
             package,
             &package.id,
             &wasm_component,
+            limits,
             changeset,
             source_tree,
             config,
@@ -493,6 +494,7 @@ impl DefaultExternalCheckExecutor {
             package,
             &component.check_name,
             &wasm_component,
+            component.limits.as_ref(),
             changeset,
             source_tree,
             config,
@@ -731,10 +733,12 @@ fn run_component_check(
     package: &ExternalCheckPackage,
     check_name: &str,
     component: &Component,
+    limits: Option<&ExternalCheckComponentLimits>,
     changeset: &ChangeSet,
     source_tree: &dyn SourceTree,
     config: &toml::Value,
 ) -> Result<CheckResult> {
+    let (timeout_ticks, _max_memory_bytes) = resolve_component_limits(limits);
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call
@@ -742,6 +746,9 @@ fn run_component_check(
     // descriptor is purely static metadata; no filesystem access is needed.
     let descriptors = {
         let mut store = Store::new(engine, HostState::with_empty_wasi());
+        // list-checks must never be interrupted by epoch; it returns static
+        // metadata so there is no meaningful wall-clock bound to enforce here.
+        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
         configure_store_fuel(&mut store)?;
         let instance = wasmtime(linker.instantiate(&mut store, &component))
             .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
@@ -779,6 +786,7 @@ fn run_component_check(
         format!("failed to configure WASI context for check `{}`", package.id)
     })?;
     let mut store = Store::new(engine, host_state);
+    store.set_epoch_deadline(timeout_ticks);
     configure_store_fuel(&mut store)?;
     let instance = wasmtime(linker.instantiate(&mut store, &component))
         .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
@@ -787,11 +795,19 @@ fn run_component_check(
 
     let input = lower_check_input(changeset, config)?;
     let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input))
-        .with_context(|| {
-            format!(
-                "`run-check` call failed for check `{}` in component `{}`",
-                check_name, package.id
-            )
+        .map_err(|err| {
+            if is_interrupt_error(&err) {
+                anyhow::anyhow!(
+                    "check `{}` in component `{}` exceeded its {timeout_ticks} ms wall-clock limit",
+                    check_name,
+                    package.id,
+                )
+            } else {
+                err.context(format!(
+                    "`run-check` call failed for check `{}` in component `{}`",
+                    check_name, package.id
+                ))
+            }
         })?;
 
     let findings = run_result.map_err(|e| match e {

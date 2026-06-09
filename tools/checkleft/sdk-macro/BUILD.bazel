@@ -11,6 +11,7 @@ rust_proc_macro(
     visibility = [
         "//tools/checkleft/sdk:__pkg__",
         "//tools/checkleft/sdk/examples/trivial-check:__pkg__",
+        "//tools/checkleft/checks/rust-giant-structs-use-builder:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )
