@@ -13,8 +13,9 @@ use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_eve
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
-    ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionInput, ProgressFidelity,
+    ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+    WorkerErrorClass,
 };
 
 // ---------------------------------------------------------------------------
@@ -474,9 +475,19 @@ impl AgentDriver for ClaudeDriver {
         Ok(())
     }
 
-    async fn write_permission_config(&self, _dest_dir: &Path) -> anyhow::Result<PathBuf> {
-        // TODO(@brianduff,2026-12-31): extract from worker_setup::render_settings_json
-        unimplemented!("extracted in the PermissionPolicy task")
+    async fn write_permission_config(&self, _input: &PermissionInput, _dest_dir: &Path) -> anyhow::Result<PathBuf> {
+        // TODO(@brianduff,2026-12-31): the settings/deny-rule rendering this
+        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`
+        // + the reviewer/triage/answer-agent rule builders and path-guard
+        // constants) still lives in `boss_engine::worker_setup` (core). It
+        // can no longer be called from here: `driver` was extracted into its
+        // own crate (main@0e2c856a1b1d) with a one-way `core -> driver`
+        // dependency, so this crate cannot depend back on core. Completing
+        // this method requires porting that rendering logic down into this
+        // crate (mirroring the `WorkspaceProvisioning` helpers already moved
+        // into this file), which is a separate migration from the interface
+        // change made here.
+        unimplemented!("blocked on migrating worker_setup's settings/deny-rule rendering into the driver crate")
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
