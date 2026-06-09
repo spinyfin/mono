@@ -14,7 +14,8 @@ use boss_protocol::TaskKind;
 /// the abstract deny-set and autonomy mode rendered into backend-specific form
 /// (for Claude Code: settings.json deny rules + permission-mode; for a future
 /// Copilot driver: `--deny-tool` filters + equivalent autonomy flag).
-#[derive(Debug, Clone)]
+#[derive(bon::Builder, Debug, Clone)]
+#[builder(on(String, into))]
 pub struct PermissionInput {
     /// Worker posture — determines the per-kind deny rules (reviewer read-only,
     /// triage blanket-write deny, standard implementation no extras) and the
