@@ -1119,7 +1119,8 @@ impl WorkDb {
 /// event: which candidate was reconciled into which canonical (or suppressed
 /// as a work-item dup / sensibility), the model that decided, the rationale,
 /// and any bounded edits applied to the canonical.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct AttentionMerge {
     pub id: String,
     /// Set for `AttentionDup` folds; `None` for `WorkItemDup` / sensibility.
@@ -1144,7 +1145,8 @@ pub struct AttentionMerge {
 }
 
 /// Input for inserting one `attention_merges` row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct InsertAttentionMergeInput {
     pub canonical_attention_id: Option<String>,
     pub canonical_work_item_id: Option<String>,
