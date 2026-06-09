@@ -44,10 +44,9 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
 ///
-/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine
-/// auto-tracks the latest snapshot per family without requiring a
-/// code change on each model release. `Max` uses the pinned
-/// `"claude-fable-5"` id because Fable has no short alias yet.
+/// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the
+/// engine auto-tracks the latest snapshot per family without requiring
+/// a code change on each model release.
 /// Direct-API summarization (see [`crate::live_status::SUMMARY_MODEL`])
 /// still uses a pinned model — that path doesn't go through the
 /// worker CLI.
@@ -62,12 +61,12 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// lower it back to Haiku.
 ///
 /// Tier ordering, highest to lowest:
-/// Fable 5 (`claude-fable-5`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
+/// Fable (`fable`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
         EffortLevel::Large => "opus",
-        EffortLevel::Max => "claude-fable-5",
+        EffortLevel::Max => "fable",
     }
 }
 
@@ -460,7 +459,7 @@ mod tests {
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
-        assert_eq!(max.model, "claude-fable-5");
+        assert_eq!(max.model, "fable");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
@@ -712,12 +711,12 @@ mod tests {
     #[test]
     fn max_effort_dispatches_on_fable() {
         let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
-        assert_eq!(cfg.model, "claude-fable-5");
+        assert_eq!(cfg.model, "fable");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
         assert!(
-            inv.contains("--model claude-fable-5"),
-            "Max effort must use claude-fable-5, got: {inv:?}",
+            inv.contains("--model fable"),
+            "Max effort must use fable, got: {inv:?}",
         );
         assert!(
             inv.contains("--permission-mode auto"),

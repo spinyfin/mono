@@ -6,7 +6,7 @@ private let logger = Logger(subsystem: "com.boss.app", category: "BossPaneModel"
 /// The exact claude invocation typed into the Boss-session shell on startup.
 /// Stored here (not computed on the fly) so callers can surface it for
 /// diagnostics without parsing the TerminalLaunchSpec.
-let bossPaneClaudeInvocation = "claude --permission-mode auto"
+let bossPaneClaudeInvocation = "claude --model fable --permission-mode auto"
 
 /// Owns the single libghostty pane that hosts the Boss session — a
 /// Claude Code session with a coordinator-flavoured system prompt
