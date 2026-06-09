@@ -1885,20 +1885,12 @@ fn redispatch_preserves_investigation_execution_kind() {
         })
         .unwrap();
     let investigation = db
-        .create_investigation(boss_protocol::CreateInvestigationInput {
-            product_id: product.id.clone(),
-            autostart: true,
-            force_duplicate: false,
-            name: "Root-cause: lint gap".to_owned(),
-            created_via: None,
-            description: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            priority: None,
-            project_id: None,
-            repo_remote_url: None,
-        })
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Root-cause: lint gap")
+                .build(),
+        )
         .unwrap();
 
     // First dispatch: a live worker is assumed, so the execution is
@@ -1970,20 +1962,12 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
         })
         .unwrap();
     let investigation = db
-        .create_investigation(boss_protocol::CreateInvestigationInput {
-            product_id: product.id.clone(),
-            autostart: true,
-            force_duplicate: false,
-            name: "Feasibility: source checkleft from a prebuilts repo".to_owned(),
-            created_via: None,
-            description: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            priority: None,
-            project_id: None,
-            repo_remote_url: None,
-        })
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Feasibility: source checkleft from a prebuilts repo")
+                .build(),
+        )
         .unwrap();
 
     let exec = db
@@ -2080,20 +2064,12 @@ fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
         })
         .unwrap();
     let investigation = db
-        .create_investigation(boss_protocol::CreateInvestigationInput {
-            product_id: product.id.clone(),
-            autostart: true,
-            force_duplicate: false,
-            name: "Feasibility redispatch".to_owned(),
-            created_via: None,
-            description: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            priority: None,
-            project_id: None,
-            repo_remote_url: None,
-        })
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Feasibility redispatch")
+                .build(),
+        )
         .unwrap();
 
     let first = db
@@ -2166,20 +2142,12 @@ fn cold_path_pr_detection_covers_investigations() {
         })
         .unwrap();
     let investigation = db
-        .create_investigation(boss_protocol::CreateInvestigationInput {
-            product_id: product.id.clone(),
-            autostart: true,
-            force_duplicate: false,
-            name: "Feasibility cold-path".to_owned(),
-            created_via: None,
-            description: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            priority: None,
-            project_id: None,
-            repo_remote_url: None,
-        })
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Feasibility cold-path")
+                .build(),
+        )
         .unwrap();
 
     let exec = db

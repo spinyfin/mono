@@ -1193,13 +1193,17 @@ pub struct CreateExecutionInput {
 /// are product-level work items optionally scoped to a project) and
 /// uses `kind = 'investigation'` on insert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateInvestigationInput {
     pub product_id: String,
     /// See [`CreateChoreInput::autostart`].
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
 
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
 
     pub name: String,

@@ -4840,20 +4840,13 @@ mod pane_spawn_tests {
             })
             .unwrap();
         let task = work_db
-            .create_task(CreateTaskInput {
-                product_id: product.id.clone(),
-                project_id: project.id.clone(),
-                name: "Tag dispatch logs with execution kind".to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            })
+            .create_task(
+                CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name("Tag dispatch logs with execution kind")
+                    .build(),
+            )
             .unwrap();
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(

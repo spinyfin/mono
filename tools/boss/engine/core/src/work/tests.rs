@@ -70,20 +70,13 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "T".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("T")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -169,20 +162,13 @@ fn set_design_doc_input(project_id: &str, path: &str) -> SetProjectDesignDocInpu
 /// the attention item to.
 fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkExecution {
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product_id.to_owned(),
-            project_id: project_id.to_owned(),
-            name: "Schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id)
+                .project_id(project_id)
+                .name("Schema")
+                .build(),
+        )
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
@@ -240,20 +226,14 @@ fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, W
             ).unwrap();
         id
     } else {
-        db.create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Task".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Task")
+                .autostart(false)
+                .build(),
+        )
         .unwrap()
         .id
     };

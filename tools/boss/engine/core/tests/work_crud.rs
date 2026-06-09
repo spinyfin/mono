@@ -103,20 +103,12 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
 
     let task = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Wire socket client".to_owned(),
-            description: Some("extract reusable BossClient".to_owned()),
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Wire socket client")
+            .description("extract reusable BossClient")
+            .build(),
     )
     .await?;
     assert_eq!(task.kind, TaskKind::ProjectTask);
@@ -295,20 +287,12 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
 
     let high_task = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "High-priority task".to_owned(),
-            description: None,
-            autostart: true,
-            priority: Some("high".to_owned()),
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("High-priority task")
+            .priority("high")
+            .build(),
     )
     .await?;
     assert_eq!(high_task.priority, "high");
@@ -538,20 +522,11 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
     .await?;
     let task = create_task(
         &mut writer_client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Wire subscription".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Wire subscription")
+            .build(),
     )
     .await?;
 
@@ -1119,56 +1094,32 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     .await?;
     let prereq1 = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Land migration".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Land migration")
+            .autostart(false)
+            .build(),
     )
     .await?;
     let prereq2 = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Tune retries".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Tune retries")
+            .autostart(false)
+            .build(),
     )
     .await?;
     let target = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Roll out feature".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Roll out feature")
+            .autostart(false)
+            .build(),
     )
     .await?;
     let dependent_chore = create_chore(
@@ -1343,19 +1294,14 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     .await?;
 
     let task_inputs: Vec<CreateTaskInput> = (0..4)
-        .map(|i| CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: format!("Bulk task {i}"),
-            description: Some(format!("desc {i}")),
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
+        .map(|i| {
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name(format!("Bulk task {i}"))
+                .description(format!("desc {i}"))
+                .autostart(false)
+                .build()
         })
         .collect();
     let created_tasks = match client
@@ -1396,34 +1342,18 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     // A bad item in the batch (unknown project) rolls back the whole
     // transaction — no new tasks land.
     let bad_inputs = vec![
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Should not survive".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: "proj_nope".to_owned(),
-            name: "Bad ref".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Should not survive")
+            .autostart(false)
+            .build(),
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id("proj_nope")
+            .name("Bad ref")
+            .autostart(false)
+            .build(),
     ];
     match client
         .send_request(&FrontendRequest::CreateManyTasks {
@@ -1742,20 +1672,12 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
 
     let task = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Wire socket client".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Wire socket client")
+            .autostart(false)
+            .build(),
     )
     .await?;
     assert!(
@@ -1818,20 +1740,13 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
 
     match client
         .send_request(&FrontendRequest::CreateTask {
-            input: CreateTaskInput {
-                product_id: product.id.clone(),
-                project_id: project.id.clone(),
-                name: "Override attempt".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Override attempt")
+                .autostart(false)
+                .repo_remote_url("git@github.com:spinyfin/other.git")
+                .build(),
         })
         .await?
     {
@@ -1918,20 +1833,12 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
 
     match client
         .send_request(&FrontendRequest::CreateTask {
-            input: CreateTaskInput {
-                product_id: product.id.clone(),
-                project_id: project.id.clone(),
-                name: "No repo".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("No repo")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -2001,20 +1908,13 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
 
     let task = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Repo override".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:foo/service.git".to_owned()),
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Repo override")
+            .autostart(false)
+            .repo_remote_url("git@github.com:foo/service.git")
+            .build(),
     )
     .await?;
     assert_eq!(
@@ -2253,40 +2153,24 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
 
     let first = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Unique Task".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Unique Task")
+            .autostart(false)
+            .build(),
     )
     .await?;
 
     // Retry blocked.
     match client
         .send_request(&FrontendRequest::CreateTask {
-            input: CreateTaskInput {
-                product_id: product.id.clone(),
-                project_id: project.id.clone(),
-                name: "Unique Task".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-            driver: None,
-                force_duplicate: false,
-            },
+            input: CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Unique Task")
+                .autostart(false)
+                .build(),
         })
         .await?
     {
@@ -2323,20 +2207,12 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
     .await?;
     let cross = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: other_product.id.clone(),
-            project_id: other_project.id.clone(),
-            name: "Unique Task".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(other_product.id.clone())
+            .project_id(other_project.id.clone())
+            .name("Unique Task")
+            .autostart(false)
+            .build(),
     )
     .await?;
     assert_ne!(cross.id, first.id, "same name in different product must be allowed",);

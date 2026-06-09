@@ -53,20 +53,13 @@ fn creates_tree_and_soft_deletes_chores() {
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Backend schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Backend schema")
+                .build(),
+        )
         .unwrap();
     let chore = db
         .create_chore(CreateChoreInput::builder()
@@ -236,19 +229,14 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
         .unwrap();
 
     let inputs = (0..5)
-        .map(|i| CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: format!("Task {i}"),
-            description: Some(format!("d{i}")),
-            autostart: i % 2 == 0,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
+        .map(|i| {
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name(format!("Task {i}"))
+                .description(format!("d{i}"))
+                .autostart(i % 2 == 0)
+                .build()
         })
         .collect::<Vec<_>>();
     let created = db.create_many_tasks(CreateManyTasksInput { items: inputs }).unwrap();
@@ -302,34 +290,16 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
     // Item 1 references a non-existent project. The whole batch
     // must roll back — no rows visible after the failure.
     let inputs = vec![
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Good".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: "proj_does_not_exist".to_owned(),
-            name: "Bad".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Good")
+            .build(),
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id("proj_does_not_exist")
+            .name("Bad")
+            .build(),
     ];
     let err = db
         .create_many_tasks(CreateManyTasksInput { items: inputs })
@@ -702,36 +672,22 @@ fn reorders_project_tasks() {
         })
         .unwrap();
     let first = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "One".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("One")
+                .build(),
+        )
         .unwrap();
     let second = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Two".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Two")
+                .build(),
+        )
         .unwrap();
 
     db.reorder_project_tasks(&project.id, &[second.id.clone(), first.id.clone()])
@@ -775,20 +731,13 @@ fn creates_and_lists_execution_entities() {
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Schema")
+                .build(),
+        )
         .unwrap();
 
     let execution = db
@@ -975,36 +924,22 @@ fn reconciles_missing_executions_for_product_tree() {
         })
         .unwrap();
     let first_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "First".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("First")
+                .build(),
+        )
         .unwrap();
     let second_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Second".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Second")
+                .build(),
+        )
         .unwrap();
     let chore = db
         .create_chore(CreateChoreInput::builder()
@@ -1075,36 +1010,22 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
         })
         .unwrap();
     let first_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "First".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("First")
+                .build(),
+        )
         .unwrap();
     let second_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Second".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Second")
+                .build(),
+        )
         .unwrap();
 
     // Mark the auto-created design task done so first_task takes

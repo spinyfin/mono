@@ -2141,20 +2141,14 @@ fn make_in_review_project_task(db: &WorkDb, product_id: &str, pr_url: &str) -> S
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product_id.to_owned(),
-            project_id: project.id.clone(),
-            name: "Project task for revision tests".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.to_owned())
+                .project_id(project.id.clone())
+                .name("Project task for revision tests")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     db.connect()
         .unwrap()

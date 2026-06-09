@@ -3337,20 +3337,20 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
             let task = create_task(
                 &mut client,
-                CreateTaskInput {
-                    product_id: product.id,
-                    project_id: project.id,
-                    name,
-                    description,
-                    autostart: !ctx.no_autostart,
-                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                    created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: resolved_repo,
-                    effort_level: args.effort.map(EffortLevel::from),
-                    model_override,
-                    driver,
-                    force_duplicate: args.force_duplicate,
-                },
+                CreateTaskInput::builder()
+                    .product_id(product.id)
+                    .project_id(project.id)
+                    .name(name)
+                    .maybe_description(description)
+                    .autostart(!ctx.no_autostart)
+                    .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
+                    .created_via(CREATED_VIA_CLI)
+                    .maybe_repo_remote_url(resolved_repo)
+                    .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_model_override(model_override)
+                    .maybe_driver(driver)
+                    .force_duplicate(args.force_duplicate)
+                    .build(),
             )
             .await?;
             let task = with_display_status(task);
@@ -6237,20 +6237,20 @@ async fn run_create_investigation(
     validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
     let task = create_investigation(
         client,
-        CreateInvestigationInput {
-            product_id: product.id,
-            project_id,
-            name: name.clone(),
-            description,
-            autostart: !ctx.no_autostart,
-            priority: args.priority.map(|p| p.as_str().to_owned()),
-            created_via: Some("cli".to_owned()),
-            repo_remote_url: args.repo_remote_url,
-            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
-            model_override,
-            driver,
-            force_duplicate: args.force_duplicate,
-        },
+        CreateInvestigationInput::builder()
+            .product_id(product.id)
+            .maybe_project_id(project_id)
+            .name(name.clone())
+            .maybe_description(description)
+            .autostart(!ctx.no_autostart)
+            .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
+            .created_via("cli")
+            .maybe_repo_remote_url(args.repo_remote_url)
+            .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
+            .maybe_model_override(model_override)
+            .maybe_driver(driver)
+            .force_duplicate(args.force_duplicate)
+            .build(),
     )
     .await?;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
@@ -6329,18 +6329,18 @@ async fn run_create_revision(
     validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
     let task = create_revision_rpc(
         client,
-        CreateRevisionInput {
-            parent_task_id: parent_id,
-            description: description.clone(),
-            name,
-            priority: args.priority.map(|p| p.as_str().to_owned()),
-            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
-            model_override,
-            driver,
-            force_duplicate: args.force_duplicate,
-            created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
-            autostart: !ctx.no_autostart,
-        },
+        CreateRevisionInput::builder()
+            .parent_task_id(parent_id)
+            .description(description.clone())
+            .maybe_name(name)
+            .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
+            .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
+            .maybe_model_override(model_override)
+            .maybe_driver(driver)
+            .force_duplicate(args.force_duplicate)
+            .created_via(boss_protocol::CREATED_VIA_CLI)
+            .autostart(!ctx.no_autostart)
+            .build(),
     )
     .await?;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
@@ -6732,20 +6732,17 @@ async fn run_task_create_many(
                 }
             },
         };
-        inputs.push(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id,
-            name: item.name,
-            description: normalize_non_empty(Some(item.description)),
-            autostart: item.autostart.unwrap_or(default_autostart),
-            priority: item.priority,
-            created_via: Some(CREATED_VIA_CLI.to_owned()),
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            driver: None,
-            force_duplicate: false,
-        });
+        inputs.push(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project_id)
+                .name(item.name)
+                .maybe_description(normalize_non_empty(Some(item.description)))
+                .autostart(item.autostart.unwrap_or(default_autostart))
+                .maybe_priority(item.priority)
+                .created_via(CREATED_VIA_CLI)
+                .build(),
+        );
     }
 
     let count = inputs.len();
