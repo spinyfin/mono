@@ -861,6 +861,14 @@ impl ServerState {
         let feature_flags_for_handler = feature_flags.clone();
         let feature_flags_for_state = feature_flags.clone();
 
+        // Boot-time dedup sweep gate (design: notification-dedup-scoring.md §7).
+        // With the flag off (the default) this is a no-op. When on, a one-shot
+        // background task will be spawned here to sweep existing Attention items
+        // for near-duplicates as a backstop — not yet implemented.
+        if feature_flags.is_enabled("notification_dedup") {
+            // TODO(P1203): spawn one-shot dedup sweep background task.
+        }
+
         // Load per-installation settings. Same boot contract as feature
         // flags: a missing or unreadable file falls back to registry
         // defaults; parse failures are logged but don't block startup.
