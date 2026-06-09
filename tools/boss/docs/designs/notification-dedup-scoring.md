@@ -13,6 +13,10 @@ That substrate already dedupes **exact** matches at two granularities:
 
 What it does **not** catch is the case this project targets: two agents flag *the same concern* but compute *different grouping keys* (different source runs, different phrasings, different anchors). Exact-match dedup can't see that "The migration in `schema_init.rs` is missing an index on `created_at`" (an `Attention` item inside task A's card) and "Add an index for the attention-items query — full scans on startup" (an `Attention` item inside task B's card) are the same thing. Today those become two separate `Attention` items in separate cards. We want an LLM to recognize the near-duplicate at the **item** level, fold it into one **canonical** `Attention`, **increment a score** on that canonical item each time it happens, and surface the score as a priority affordance — all behind a feature flag, off by default.
 
+A second distinct failure mode motivates a scope extension: attentions are sometimes created that duplicate **existing scheduled work items** — tasks, chores, revisions, or projects already tracked and actioned in Boss. The human is then forced to track the same concern in two places (Notifications window + work-item view), creating confusion and cognitive overhead. The dedup decision must therefore compare a candidate attention against **both** existing open attentions *and* existing work items in relevant non-terminal states. "This attention is already covered by scheduled row T<n>" is a suppress/link verdict on equal footing with attention-vs-attention dup.
+
+Beyond strict duplication, a **sensibility filter** may also winnow attentions that are stale, self-evidently moot, or not actionable. The bar here is deliberately conservative — a false suppression of a real attention is worse than letting a near-dup through. Any suppression must record provenance so suppressed items are auditable, never silently dropped.
+
 ### What is already built vs. what this adds
 
 | Already implemented | This project adds |
@@ -24,6 +28,8 @@ What it does **not** catch is the case this project targets: two agents flag *th
 | `merge_poller` background-sweep pattern (`run_one_pass`) | A bounded, idempotent **startup sweep** over existing `Attention` items |
 | `AttentionsView` Notifications window | A score/priority affordance + score-aware ordering |
 | `boss-feature-flags` framework (`FeatureFlagsStore`, debug-pane toggle) | A `notification_dedup` flag registered in the `REGISTRY` with `default_enabled: false`, togglable live from Debug → Feature Flags |
+| Work-item DB (tasks, chores, revisions, projects) | **Taxonomy-aware verdict**: compare candidate against open work items in non-terminal states; suppress/link when "already covered by T\<n>" |
+| (none) | **Sensibility filter**: LLM judgment that an attention is stale/moot/not-actionable; suppress only on High confidence with auditable provenance |
 
 ## Naming
 
@@ -34,6 +40,10 @@ What it does **not** catch is the case this project targets: two agents flag *th
 - **Score** — an integer on each `Attention`: the number of independent reports folded into it. A fresh `Attention` has score `1`. Each fold increments it.
 - **Fold** — the act of reconciling a duplicate into a canonical: `score += 1`, write an `attention_merges` row, optionally apply bounded edits, and (sweep path) retire the loser item. If folding empties a card's open items, retire the card too.
 - **`attention_merges`** — the durable provenance ledger; one row per fold. Records which `Attention` was folded into which canonical `Attention`, the model, the decision rationale, and any edits applied. Also the sweep's idempotency key.
+- **Work-item dup** — a candidate or existing `Attention` that is already covered by a scheduled work item (task, chore, revision, project) in a non-terminal state. Verdict: suppress-with-pointer at High confidence; link (create with a `linked_work_item_id`) at Medium confidence.
+- **Sensibility filter** — the LLM judgment that an `Attention` is stale, moot, or not currently actionable, independent of whether an explicit dup target exists. Gated by a separate sub-flag; only suppresses on High confidence with a stated reason.
+- **Suppress-with-pointer** — a verdict where the candidate `Attention` is never persisted (creation path) or retired in the sweep, with a durable provenance row that records the covering work-item id or sensibility reason. Never a silent drop.
+- **`WorkItemBrief`** — the compact rendering of a work item (id, kind, title, one-line description/status) passed to the dedup-decision LLM alongside `AttentionBrief` items to enable taxonomy-aware comparison.
 
 ---
 
@@ -46,6 +56,8 @@ What it does **not** catch is the case this project targets: two agents flag *th
 - Keep the comparison set **tractable** — bounded candidate sets at creation, bucketed comparisons at sweep, no O(n²) blow-up.
 - Make the sweep **idempotent**: safe to run repeatedly, never thrashing or looping notifications.
 - **Layer on, don't replace**, the existing exact dedup. The cheap deterministic `grouping_key` / `content_key` paths run first and unchanged; the LLM only adjudicates what exact matching leaves ambiguous.
+- Compare candidates against **work items** (tasks, chores, revisions, projects in non-terminal states) as well as open `Attention` items — "already covered by T<n>" is a valid suppress/link verdict so the human ends up with ONE place to track a concern.
+- Apply a conservative **sensibility filter** that suppresses attentions that are stale, moot, or not actionable — with a high-confidence threshold, a stated reason, and full audit provenance. Suppressed items are retained and inspectable, never silently dropped.
 
 ## Non-goals
 
@@ -54,6 +66,7 @@ What it does **not** catch is the case this project targets: two agents flag *th
 - **Cross-product dedup.** The comparison scope is a single product. An `Attention` in product A never folds into one in product B.
 - **Replacing exact dedup with the LLM.** `grouping_key` / `content_key` remain the first and cheapest line; the LLM is strictly additive.
 - **Embeddings / a vector index.** v1 uses a cheap lexical prefilter + an LLM adjudication. A learned embedding index is a future optimization, not a v1 blocker.
+- **Mini coordinator agent at creation time.** Spawning a full LLM agent with `boss` CLI access for every creation-time dedup verdict is too slow (seconds per invocation) and too expensive for the synchronous creation path. The structured-context approach (DB snapshot + single LLM call) covers the same judgment without the latency; the mini-agent is noted as a potential future escalation path for edge cases that require external API queries. See Alternative E below.
 - **Rewriting notification content wholesale.** Canonical-edit-on-merge is deliberately *minor and bounded* (see Chosen approach); it is not a summarization or merge-of-bodies feature.
 - **A periodic background sweep on a timer.** The sweep runs on engine startup only (the project's stated "likely just on startup, since it should rarely be needed"); a recurring timer is explicitly deferred.
 
@@ -79,9 +92,17 @@ Spawn a normal Claude worker whose prompt is "look at the open notifications and
 
 **Rejected.** This is the wrong tool for a tight, frequent, structured decision. A worker is heavyweight (a cube lease, a full agent session), slow, costly, and returns prose we'd have to parse. It also can't be invoked synchronously inside the notification-creation transaction. The decision here is a bounded prose-to-JSON transform — exactly what the existing engine-internal Anthropic substrate (`pane_summary.rs`) does for pane summaries — so a direct, structured-output API call is the right shape. (Same reasoning the [`auto-populate-project-tasks-on-design-pr-merge`](auto-populate-project-tasks-on-design-pr-merge.md) design used to reject an interactive worker for its Planner.)
 
+### Alternative E — Mini coordinator agent with `boss` CLI access
+
+Spawn a small LLM agent that has access to the `boss` CLI. Given a candidate attention, it queries what work items and attentions already exist (e.g. `boss task list --product P<n>`, `boss attention list`, etc.) and returns a verdict: keep / suppress-as-dup-of-X / merge-into-X. The agent assembles a dynamic picture of current state at decision time.
+
+**Evaluated for taxonomy-aware and sensibility judgments; not chosen as the primary mechanism.** The mini-agent has genuine strengths: it can adapt its queries to the candidate, handle edge cases the prompt can't anticipate, and detect staleness that a static snapshot might miss (e.g. referencing an external PR that was just closed). However, the creation-time path is synchronous — every attention creation blocks on the verdict. An agent that runs CLI sub-commands takes several seconds per invocation at minimum, making the creation path unacceptably slow under any real load. It is also significantly more expensive (multiple LLM calls + tool calls per decision vs. a single cheap-tier call) and non-deterministic (harder to test, harder to reason about failure modes). The dynamic-query capability is also largely unnecessary for the common cases: Boss stores all work items in a shared SQLite DB that the engine can query directly; the "dynamically assembled state" the agent builds via CLI is a slower, costlier read of the same data.
+
+**Retained as a future escalation path** for complex sensibility edge cases where the static DB snapshot genuinely cannot answer the question — for example, an attention that references an external repository's PR state, where staleness detection requires an API call outside the local DB. For v1, the structured-context approach (Alternative D) is chosen for all paths.
+
 ### Alternative D (chosen) — Engine-internal LLM dedup decision at the Attention (item) level, layered on exact dedup, at creation + startup sweep
 
-Keep exact dedup as the first line. When (and only when) a new `Attention` would be persisted and exact matching does not apply, run an engine-internal structured-output LLM call against a bounded set of existing open `Attention` items across the product; if it returns a canonical match, fold instead of create (`score += 1`, provenance row, bounded edit, empty-card cleanup). A bounded, idempotent startup sweep applies the same decision to existing `Attention` items as a backstop. Everything behind an off-by-default flag. This is the rest of the document.
+Keep exact dedup as the first line. When (and only when) a new `Attention` would be persisted and exact matching does not apply, run an engine-internal structured-output LLM call against a bounded set of (a) existing open `Attention` items and (b) work items in non-terminal states, all within the same product; if it returns a canonical attention match, fold instead of create (`score += 1`, provenance row, bounded edit, empty-card cleanup); if it returns a work-item match, suppress-with-pointer or link per the confidence tier. The same call also applies the sensibility filter (is this attention stale/moot?). A bounded, idempotent startup sweep applies the same decision to existing `Attention` items as a backstop. Everything behind off-by-default flags (one parent flag + sub-flags for taxonomy and sensibility). This is the rest of the document.
 
 ---
 
@@ -151,6 +172,14 @@ ALTER TABLE attentions ADD COLUMN score INTEGER NOT NULL DEFAULT 1;
 - **Mapper + protocol.** `score: i64` is added to `boss_protocol::Attention` (a struct — additive optional fields need only `#[builder(default = 1)]`) and read in `map_attention` (`engine/core/src/work/mappers.rs`), which must explicitly map the new column (DB mappers stay struct-literal per repo convention).
 - **Card-level score affordance.** The `AttentionGroup` protocol type may expose a derived `max_item_score` or `total_score` field computed from its members, for UI rendering — but the source of truth is on `attentions`, not `attention_groups`.
 
+#### `linked_work_item_id` on `attentions` (Medium-confidence work-item dup)
+
+```sql
+ALTER TABLE attentions ADD COLUMN linked_work_item_id TEXT;  -- nullable, e.g. "T42"
+```
+
+Set when a `WorkItemDup` verdict comes back at Medium confidence at creation time or during the sweep: the attention is created/retained normally but stamped with the covering work item's id. The UI renders a "see T<n>" cross-reference chip. This is the single field that gives the human a one-click path from a still-visible attention to the canonical work item. Excluded from the comparison set once set? No — a linked attention remains open and actionable; the human dismisses it when they're satisfied the work item covers it.
+
 #### `merged_into_attention_id` on `attentions` (sweep retirement)
 
 ```sql
@@ -170,21 +199,27 @@ One row per fold — the durable record that a fold happened, why, and what chan
 ```sql
 CREATE TABLE IF NOT EXISTS attention_merges (
   id                      TEXT PRIMARY KEY,        -- merge_<...>
-  canonical_attention_id  TEXT NOT NULL REFERENCES attentions(id),
+  -- Exactly one of canonical_attention_id / canonical_work_item_id is set per row.
+  canonical_attention_id  TEXT REFERENCES attentions(id),  -- set for AttentionDup
+  canonical_work_item_id  TEXT,                    -- set for WorkItemDup / sensibility (T<n>, C<n>, etc.)
   product_id              TEXT NOT NULL,
-  trigger                 TEXT NOT NULL,           -- 'creation' | 'sweep'
+  trigger                 TEXT NOT NULL,           -- 'creation' | 'sweep' | 'sensibility'
   -- Creation-time: the candidate is never persisted, so we capture its identity inline.
   -- Sweep: the loser is a real row; its id is recorded and it is retired (merged_into_attention_id).
   duplicate_attention_id  TEXT,                    -- set for 'sweep'; NULL for 'creation'
   candidate_summary       TEXT NOT NULL,           -- the rendered candidate Attention text (what was folded)
   candidate_source        TEXT,                    -- source_run_id / source_task_id / source_kind of the dup
   model                   TEXT NOT NULL,           -- model slug used for the decision
-  decision_rationale      TEXT,                    -- the LLM's short "why duplicate" note (verbatim)
+  decision_rationale      TEXT,                    -- the LLM's short "why" note (verbatim)
   edits_applied           TEXT,                    -- JSON: per-field before/after, or NULL if none
   created_at              TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attention_merges_canonical_idx
-  ON attention_merges(canonical_attention_id, created_at);
+  ON attention_merges(canonical_attention_id, created_at)
+  WHERE canonical_attention_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS attention_merges_work_item_idx
+  ON attention_merges(canonical_work_item_id, created_at)
+  WHERE canonical_work_item_id IS NOT NULL;
 -- Sweep idempotency: never fold the same (canonical item, duplicate item) pair twice.
 CREATE UNIQUE INDEX IF NOT EXISTS attention_merges_pair_uq
   ON attention_merges(canonical_attention_id, duplicate_attention_id)
@@ -204,7 +239,17 @@ A pure transform reusing the existing engine-internal Anthropic substrate (`pane
 
 pub struct DedupInput {
     pub candidate: AttentionBrief,        // rendered candidate Attention (kind, assoc, item text)
-    pub existing: Vec<AttentionBrief>,    // the bounded comparison set (top-K Attention items)
+    pub existing_attentions: Vec<AttentionBrief>,   // top-K open Attention items (same product)
+    pub existing_work_items: Vec<WorkItemBrief>,    // non-terminal work items (same product)
+    pub sensibility_check: bool,          // whether to also evaluate keep/suppress-sensibility
+}
+
+pub struct WorkItemBrief {
+    pub work_item_id: String,             // "T<n>" | "C<n>" | "R<n>" | "P<n>"
+    pub kind: String,                     // "task" | "chore" | "revision" | "project"
+    pub title: String,
+    pub status: String,                   // non-terminal state string for context
+    pub description_snippet: String,      // first ~200 chars
 }
 
 pub struct AttentionBrief {
@@ -216,11 +261,17 @@ pub struct AttentionBrief {
 }
 
 pub struct DedupDecision {
-    pub is_duplicate: bool,
-    pub canonical_attention_id: Option<String>, // which existing Attention item, when is_duplicate
+    pub verdict: DedupVerdict,
     pub confidence: Confidence,            // High | Medium | Low
     pub rationale: String,                 // short "why" — persisted to attention_merges
-    pub proposed_edits: Vec<CanonicalEdit>, // bounded; may be empty
+    pub proposed_edits: Vec<CanonicalEdit>, // bounded; may be empty; only valid for AttentionDup
+}
+
+pub enum DedupVerdict {
+    Keep,                                   // not a dup, not stale — persist normally
+    AttentionDup { canonical_attention_id: String }, // fold into canonical Attention
+    WorkItemDup  { work_item_id: String },  // covered by a scheduled work item
+    Sensibility  { reason: String },        // stale/moot/not-actionable; High confidence only
 }
 
 pub struct CanonicalEdit {
@@ -232,8 +283,9 @@ pub enum EditableField { RationaleAppend, DescriptionAppend }
 pub enum Confidence { High, Medium, Low }
 ```
 
-- **Structured output is enforced**, not requested: a single forced tool call whose input schema is `DedupDecision` (the same forced-tool pattern the codebase will need; `pane_summary` currently uses plain text, so this is the one substrate extension). The engine deserializes straight into the Rust type; a deserialization failure is a decision failure (fail safe → treat as *not* a duplicate, create normally), never parse-and-hope.
-- **`is_duplicate` requires a `canonical_attention_id` that is in the input set.** A hallucinated id → treated as not-a-duplicate (fail safe, create normally). Validated in engine code, not trusted from the model.
+- **Structured output is enforced**, not requested: a single forced tool call whose input schema is `DedupDecision` (the same forced-tool pattern the codebase will need; `pane_summary` currently uses plain text, so this is the one substrate extension). The engine deserializes straight into the Rust type; a deserialization failure is a decision failure (fail safe → treat as `Keep`, create normally), never parse-and-hope.
+- **`AttentionDup` requires a `canonical_attention_id` that is in `existing_attentions`.** `WorkItemDup` requires a `work_item_id` that is in `existing_work_items`. A hallucinated id for either variant → treated as `Keep` (fail safe). Validated in engine code, not trusted from the model.
+- **`Sensibility` verdict is only acted on at `High` confidence.** `Medium` or `Low` sensibility → treat as `Keep`. The asymmetry (dup folds on High/Medium, sensibility suppresses only on High) reflects the higher cost of a false-positive sensibility suppression.
 - **Only the candidate folds into an existing canonical item** — the decision never proposes creating, deleting, or merging two *existing* items at creation time (that is the sweep's job, and even there only loser→canonical).
 
 #### Model / effort tier
@@ -268,6 +320,42 @@ The naive "compare all pairs" is O(n²). Instead:
 
 Removing `association` and `group_id` from the bucket key means product-level buckets are larger. Tractability is maintained via: (a) the recency window, (b) per-bucket caps, and (c) the embeddings prefilter as the primary scaling lever once available (see R6). **Do NOT reintroduce a per-task/association or per-card partition to keep cost down** — that is exactly what breaks the feature.
 
+#### Work-item side of the comparison set (taxonomy-aware dedup)
+
+When `notification_dedup_taxonomy` is enabled, `DedupInput.existing_work_items` is populated alongside the attention set:
+
+- **Work-item kinds:** tasks, chores, revisions, projects — all four.
+- **Non-terminal states:** any state that is not a terminal/closed state. Concretely: tasks and chores in `open | in_progress | review | paused`; revisions in `in_progress | in_review`; projects in `planned | active`. The query is `WHERE state NOT IN ('done','cancelled','archived','merged','closed')` scoped to the same product.
+- **Scope: same product, no recency window.** Unlike attentions (where a recency window prevents the comparison set growing unboundedly), work items in non-terminal states are by definition still active — a task open for three months is still work the human is tracking. Include all non-terminal items in the product. If the combined set (attentions + work items) exceeds K, attentions rank above work items as the primary dup target; work items beyond the cap are `log()`-ed, not silently dropped.
+- **K (combined cap):** raise the per-call cap to accommodate both sets (e.g. K ≤ 24 attentions + 24 work items = 48 total). Open question R15 covers the concrete value.
+- **The LLM prompt** receives the two lists under distinct headings ("Existing open notifications:" and "Existing scheduled work items:") so it can make the distinction clear in its rationale.
+
+#### Work-item dup verdict handling
+
+| Verdict | Confidence | Action at creation | Action in sweep |
+|---|---|---|---|
+| `WorkItemDup { work_item_id }` | High | Suppress-with-pointer: do not create the Attention; write an `attention_merges` row with `canonical_work_item_id` set. | Retire the loser Attention: `answer_state='merged'`, `merged_into_attention_id` = NULL, `canonical_work_item_id` set in the merge row. |
+| `WorkItemDup { work_item_id }` | Medium | Link: create the Attention normally but set `linked_work_item_id` on the new row; badge it in the UI. | Leave open; update `linked_work_item_id` if not already set. |
+| `WorkItemDup { work_item_id }` | Low | Keep: create normally. | Leave open. |
+
+This means the human ends up with ONE place to track a concern at High confidence (the work item), while Medium keeps the attention visible but cross-referenced.
+
+**Score on work-item dup:** The score concept (§2) is defined as a count of independent `Attention` reports folded into a canonical `Attention`. When the dup target is a work item, there is no canonical `Attention` to increment. Score is **not incremented** for `WorkItemDup` verdicts in v1. The `attention_merges` row records `canonical_work_item_id` for provenance; a future enhancement could surface a "N related attentions suppressed" counter on the work item itself, but that is deferred (see R11).
+
+#### Sensibility filter
+
+When `notification_dedup_sensibility` is enabled, the same `decide_dedup` call also evaluates whether the candidate attention is stale, moot, or not actionable (`sensibility_check: true`). This is a combined judgment, not a second LLM call. The model is given the candidate attention and asked: "Is this attention already covered by an existing item? Separately, is this attention itself still actionable — or is it stale (references something that no longer exists or is resolved) or not actionable (too vague to act on)?" The verdict `Sensibility { reason }` is returned only at High confidence; Medium and Low are treated as `Keep`.
+
+**Conservative bar — false suppression is worse than a false positive:**
+
+- The model must give a specific, verifiable reason for suppression (e.g. "references PR #42 which is now merged" or "task T<n> already explicitly covers this"). Vague sensibility reasons (e.g. "this seems low priority") are insufficient and must be rejected in the engine's verdict validation.
+- The engine validates that a `Sensibility` reason is non-empty and references a specific, checkable fact, not a subjective judgment. Anything failing this check is treated as `Keep`.
+- `Sensibility` suppression is **never applied to already-answered or already-linked attentions** — the filter only affects candidates at creation time, and open items in the sweep.
+
+**Provenance for sensibility suppressions:**
+
+The `attention_merges` table is extended with `trigger = 'sensibility'` (alongside existing `'creation'` and `'sweep'`). The `candidate_summary` and `decision_rationale` fields record what was suppressed and why. Suppressed items are retained (creation path: never persisted — the inline `candidate_summary` in the merge row is the only record; sweep path: `answer_state='merged'`, `merged_into_attention_id` NULL, trigger='sensibility'). An operator can query `SELECT * FROM attention_merges WHERE trigger = 'sensibility'` to audit every sensibility suppression.
+
 ### 5. Canonical-edit-on-merge — bounded + recorded
 
 The LLM **may** fold new information from the duplicate into the canonical, but tightly constrained. The canonical is an individual `Attention` item:
@@ -283,8 +371,11 @@ Boss has a feature-flag framework (`boss-feature-flags` crate, `tools/boss/engin
 
 This flag fits the framework's "manual opt-in" pattern (the README's `default_enabled: false` case) — it gates a new risk-bearing LLM path that operators should be able to enable deliberately and kill instantly if it misbehaves.
 
-- **Registry entry** (`tools/boss/engine/feature-flags/src/lib.rs`):
+Three flags are registered. All default `false` (off-safe). The sub-flags are only meaningful when the parent flag is on, but they are independent entries in the registry (no hierarchy in the framework; the consumer code checks `parent AND sub`).
+
+- **Registry entries** (`tools/boss/engine/feature-flags/src/lib.rs`):
   ```rust
+  // Parent flag — gates the entire dedup LLM path (attention-vs-attention + score + sweep)
   FeatureFlagSpec {
       name: "notification_dedup",
       description: "Run LLM near-duplicate detection when persisting an Attention item \
@@ -293,11 +384,32 @@ This flag fits the framework's "manual opt-in" pattern (the README's `default_en
       category: "notifications",
       default_enabled: false,
   }
+  // Sub-flag — taxonomy-aware comparison against scheduled work items
+  FeatureFlagSpec {
+      name: "notification_dedup_taxonomy",
+      description: "Include non-terminal work items (tasks, chores, revisions, projects) \
+                    in the dedup comparison set. Requires notification_dedup. Off by default.",
+      category: "notifications",
+      default_enabled: false,
+  }
+  // Sub-flag — sensibility filter (stale / moot / not-actionable suppression)
+  FeatureFlagSpec {
+      name: "notification_dedup_sensibility",
+      description: "Also evaluate whether a candidate Attention is stale or not actionable, \
+                    and suppress on High confidence. Requires notification_dedup. Off by default.",
+      category: "notifications",
+      default_enabled: false,
+  }
   ```
-- **Default: `false` (off-safe).** With the flag off: the creation-time LLM check is never reached (exact dedup runs exactly as today), and the startup sweep is not scheduled. The score column still exists on `attentions` and defaults to `1`, so the data model is forward-compatible whether or not the flag is ever turned on.
-- **Consumer pattern:** `feature_flags.is_enabled("notification_dedup")`. Two read sites — the creation path (after exact dedup, before the prefilter) and the boot-time sweep scheduler. No scattered conditionals. The `FeatureFlagsStore` is available at both sites via the existing `Arc<FeatureFlagsStore>` threading (`ServerState::feature_flags`, `Runner::feature_flags`).
-- **Degradation independent of the flag:** even with the flag *on*, a `NoApiKey` / `ApiError` / timeout outcome fails safe to "create normally" (creation) or "skip this bucket" (sweep) — the absence of an API key never blocks notification creation. (Mirrors how `live_status` degrades on `NoApiKey`.)
-- **Live toggle from the debug pane:** because the flag is in the registry, an operator can flip it via Debug → Feature Flags with immediate effect. No rebuild, no restart required. This is the primary kill switch if the dedup logic misbehaves in production.
+- **Default: `false` for all three (off-safe).** With all flags off: exact dedup runs as today, no LLM calls, no sweep. The score column and `attention_merges` table exist in the DB and are forward-compatible.
+- **Consumer pattern:**
+  - `is_enabled("notification_dedup")` — two sites: creation path (after exact dedup, before prefilter) and boot-time sweep scheduler.
+  - `is_enabled("notification_dedup") && is_enabled("notification_dedup_taxonomy")` — one site: the prefilter that populates `existing_work_items`.
+  - `is_enabled("notification_dedup") && is_enabled("notification_dedup_sensibility")` — one site: the `sensibility_check: true` flag in `DedupInput`.
+  All three read from the `Arc<FeatureFlagsStore>` already available via `ServerState::feature_flags` / `Runner::feature_flags`.
+- **Rationale for sub-flags:** attention-vs-attention dedup, taxonomy-aware dedup, and the sensibility filter have different risk profiles and should be independently rollable. An operator might confidently enable `notification_dedup` while holding back `notification_dedup_sensibility` until the suppression logic has been validated on real data. Sub-flags allow surgical rollout without a code change.
+- **Degradation independent of the flags:** even with all flags on, `NoApiKey` / `ApiError` / timeout fails safe to "create normally" (creation) or "skip bucket" (sweep) — no flag configuration can block notification creation.
+- **Live toggle from the debug pane:** all three are in the registry, so Debug → Feature Flags can flip any of them with immediate effect. No rebuild or restart required. The parent flag is the master kill switch.
 
 ### 7. Startup sweep — trigger & idempotency
 
@@ -317,7 +429,8 @@ This flag fits the framework's "manual opt-in" pattern (the README's `default_en
   - A **score badge** on items (and their parent card) when `score > 1` (e.g. a "×3" / "3 agents flagged this" chip), styled as a priority cue.
   - **Score-aware ordering** of open groups: the current open list (newest-first) becomes **max-item-score-desc, then created-at-desc**, so cards containing the most-corroborated items rise to the top. (A small, contained change to the `openGroups` computed property.)
   - **Merge provenance affordance:** where an item was edited by a merge, a subtle "edited by merge" marker; the item's detail can surface the `attention_merges` rationale ("folded 2 duplicate reports").
-- No new window or RPC surface beyond the score field and a read of `attention_merges` for the provenance detail.
+  - **Work-item cross-reference chip:** when an attention has `linked_work_item_id` set (Medium-confidence work-item dup), show a "see T<n>" chip linking to the covering work item. Tapping/clicking navigates to that work item.
+- No new window or RPC surface beyond the score field, the `linked_work_item_id` field, and a read of `attention_merges` for the provenance detail.
 
 ### 9. Edge cases
 
@@ -337,6 +450,13 @@ This flag fits the framework's "manual opt-in" pattern (the README's `default_en
 | Partial-card folding: only one item in a card is a dup | Fold that item only; the other items in the same card remain open and unchanged. The card itself is not retired. |
 | Empty-card cleanup: folding the last open item in a card | After retiring the loser item, check for remaining open members. If none remain, retire the card (`state = 'dismissed'`, `dismissed_at = now()`). Runs inside the fold transaction. |
 | `answer_state = 'merged'` (new terminal state) | The loser item is in a terminal state; excluded from actionable lists, from the comparison set, and from card-emptiness checks. |
+| `notification_dedup_taxonomy` off | `existing_work_items` is empty; no work-item comparison; `WorkItemDup` verdict impossible. Existing attention dedup proceeds as before. |
+| Work item transitions to terminal state after High-confidence suppress | The suppressed attention was never persisted (creation path) — nothing to recover. If the operator wants the concern re-surfaced, they dismiss+reopen the work item or let the source agent re-flag. (Auditable via `attention_merges`.) |
+| `WorkItemDup` Medium confidence | Attention is created with `linked_work_item_id` set. UI shows a "see T<n>" cross-reference chip; the human can dismiss the attention if it's truly redundant. |
+| LLM returns `WorkItemDup` with a work_item_id not in `existing_work_items` | Hallucinated id — treated as `Keep` (fail safe). Validated in engine code before acting. |
+| `Sensibility` at Medium or Low confidence | Treated as `Keep`; candidate created normally. Only High confidence triggers a sensibility suppression. |
+| `Sensibility` with a vague or non-specific reason | Engine rejects the verdict (reason fails validation); treated as `Keep`. Prevents model from suppressing on subjective grounds. |
+| `notification_dedup_sensibility` off | `sensibility_check: false` in `DedupInput`; model is not asked the sensibility question; `Sensibility` verdict impossible. |
 
 ---
 
@@ -360,31 +480,51 @@ This flag fits the framework's "manual opt-in" pattern (the README's `default_en
 
 **R9 — `answer_state = 'merged'` as a new terminal state.** Adding a new member state requires updating every `answer_state` check in the codebase (list queries, state-machine guards, UI rendering). The sweep retirement path writes this value; all read sites must treat it as terminal. *Open:* confirm the full set of `answer_state` consumers before implementing.
 
+**R10 — Verdict space for `WorkItemDup`: suppress vs. link threshold.** Proposed: High → suppress-with-pointer (attention never created); Medium → link (attention created, `linked_work_item_id` set). *Open:* is Medium-confidence link the right call, or should Medium also suppress? The risk asymmetry (false suppression worse than missed dup) favors linking over suppressing at Medium, but an operator may prefer cleaner Notifications window even at the cost of occasional false suppresses. Settle before implementing task 5 (dedup-at-creation).
+
+**R11 — Score on work-item dup.** Proposed: score is NOT incremented when the dup target is a work item (no canonical `Attention` to increment). A future `suppressed_attention_count` field on the work item protocol type would track "N related attentions suppressed" as a signal — but deferred. *Open:* confirm that score-not-incremented is acceptable for v1; if not, decide where the count lives.
+
+**R12 — Single flag vs. sub-flags for taxonomy-aware and sensibility behavior.** Proposed: three independent flags (`notification_dedup`, `notification_dedup_taxonomy`, `notification_dedup_sensibility`) allowing incremental rollout of each capability. *Open:* confirm sub-flag approach is acceptable, or simplify to one flag gating all three behaviors together.
+
+**R13 — Sensibility filter conservatism: is reason-validation in engine code sufficient?** The proposed safeguard (engine rejects a `Sensibility` verdict whose reason string fails a "specific, checkable fact" validation) is necessarily heuristic. *Open:* what is the concrete validation rule? Proposals: (a) reason must contain a reference to a specific entity id (T<n>, PR #n, file path); (b) reason length > N chars (prevents "stale"); (c) separate whitelist of acceptable reason templates. This is important to settle before implementing the sensibility filter task.
+
+**R14 — Startup sweep + sensibility filter scope.** The sweep is designed for attention-vs-attention folding. *Open:* should the sweep also apply the sensibility filter to existing open attentions (evaluate whether already-persisted attentions are now stale)? The primary use case for sensibility is at creation time (catching bad attentions before they appear), and sweep-based sensibility would retire items the human may have already seen. Proposed: sensibility filter is creation-path-only in v1; the sweep applies attention-vs-attention folding + work-item dup detection only.
+
+**R15 — Combined comparison-set cap K for taxonomy-aware dedup.** Proposed: K ≤ 48 total (24 attentions + 24 work items), attentions ranked first. *Open:* the right split depends on typical product sizes (how many open tasks vs. open attentions). If products regularly have 50+ open tasks, the work-item side needs its own prefilter (e.g. most-recently-updated N work items) before the combined cap. Settle by measuring real product sizes before implementing task 4a (taxonomy prefilter).
+
 ---
 
 ## Proposed implementation task breakdown
 
 PR-sized tasks in dependency order. Effort hints: `trivial | small | medium | large`. Tasks at the same depth with no edge between them may run in parallel.
 
-1. **Schema + score field + provenance ledger** (`boss-engine`). Idempotent migration adding `score INTEGER NOT NULL DEFAULT 1` and `merged_into_attention_id TEXT` to `attentions`; adding `answer_state = 'merged'` as a recognized terminal value; creating the `attention_merges` table + its indexes (item-level ids, including the pair-unique sweep-idempotency index). Add `score` (and the atomic `UPDATE ... SET score = score + ?` increment helper) and `merged_into_attention_id` to `map_attention` / list queries; add `score: i64` to `boss_protocol::Attention` with `#[builder(default = 1)]`; `WorkDb` accessors for `attention_merges` (insert/list); empty-card-cleanup helper (count open members after fold). **Effort:** `medium`. **Depends on:** none.
+1. **Schema + score field + provenance ledger** (`boss-engine`). Idempotent migration adding `score INTEGER NOT NULL DEFAULT 1`, `merged_into_attention_id TEXT`, and `linked_work_item_id TEXT` to `attentions`; adding `answer_state = 'merged'` as a recognized terminal value; creating the `attention_merges` table + its indexes (item-level ids including the pair-unique sweep-idempotency index, plus the `canonical_work_item_id` index for taxonomy dup provenance queries). Add `score`, `merged_into_attention_id`, `linked_work_item_id` to `map_attention` / list queries; add `score: i64` and `linked_work_item_id: Option<String>` to `boss_protocol::Attention` (with `#[builder(default = 1)]` and `#[builder(default)]` respectively); `WorkDb` accessors for `attention_merges` (insert/list/count-by-work-item); empty-card-cleanup helper (count open members after fold). **Effort:** `medium`. **Depends on:** none.
 
-2. **Feature-flag plumbing** (`boss-feature-flags`, `boss-engine`). Append the `notification_dedup` `FeatureFlagSpec` (with `default_enabled: false`, `category: "notifications"`) to `REGISTRY` in `tools/boss/engine/feature-flags/src/lib.rs`. Add `is_enabled("notification_dedup")` checks at the two consumer sites (creation path in `attentions.rs`, boot-time sweep scheduler in `app.rs`), reading from the `Arc<FeatureFlagsStore>` already available at both sites. No behavior change yet — just the gate, defaulting off, with a live debug-pane toggle. **Effort:** `trivial`. **Depends on:** none.
+2. **Feature-flag plumbing** (`boss-feature-flags`, `boss-engine`). Append all three `FeatureFlagSpec` entries (`notification_dedup`, `notification_dedup_taxonomy`, `notification_dedup_sensibility`, all `default_enabled: false`, `category: "notifications"`) to `REGISTRY` in `tools/boss/engine/feature-flags/src/lib.rs`. Add the two `is_enabled("notification_dedup")` checks (creation path in `attentions.rs`, boot-time sweep scheduler in `app.rs`) and the two sub-flag checks (taxonomy prefilter, sensibility flag in `DedupInput`). No behavior change yet — just the gates, all defaulting off, with live debug-pane toggles. **Effort:** `trivial`. **Depends on:** none.
 
-3. **Structured-output dedup-decision substrate + contract** (`boss-protocol`, `boss-engine`). Define `DedupInput` / `DedupDecision` / `AttentionBrief` / `CanonicalEdit` / `Confidence` in `boss-protocol`; add a reusable `structured_call` helper alongside `pane_summary::claude_short_summary` (forced tool call / JSON-schema-constrained output, typed outcomes modeled on `SummarizerOutcome`); implement `decide_dedup(DedupInput) -> Result<DedupDecision>` with the system prompt, model-tier constant (default Haiku), `max_tokens` bound, and engine-side validation (canonical attention id ∈ input set; else not-a-dup). No callers yet. **Effort:** `large`. **Depends on:** none (but the prefilter/rendering helpers in task 4 consume its types).
+3. **Structured-output dedup-decision substrate + contract** (`boss-protocol`, `boss-engine`). Define `DedupInput` / `DedupDecision` / `DedupVerdict` / `AttentionBrief` / `WorkItemBrief` / `CanonicalEdit` / `Confidence` in `boss-protocol`; add a reusable `structured_call` helper alongside `pane_summary::claude_short_summary` (forced tool call / JSON-schema-constrained output, typed outcomes modeled on `SummarizerOutcome`); implement `decide_dedup(DedupInput) -> Result<DedupDecision>` with the system prompt (covering attention dup, work-item dup, and sensibility judgments in a single call), model-tier constant (default Haiku), `max_tokens` bound, and engine-side validation (canonical attention id ∈ `existing_attentions`; work item id ∈ `existing_work_items`; sensibility reason non-empty and entity-specific; else `Keep`). No callers yet. **Effort:** `large`. **Depends on:** none (but the prefilter/rendering helpers in task 4 consume its types).
 
 4. **Comparison-set prefilter + rendering helpers** (`boss-engine`). The `AttentionBrief` renderer (item → prose, including association and parent group as context) and the creation-time prefilter (same product, recency window, widened top-K with same-association as a mild tiebreaker only — cross-task, cross-card items must enter the top-K). Pure, unit-testable; shared by creation and sweep. **Effort:** `medium`. **Depends on:** 3 (for the `AttentionBrief` type).
 
-5. **Dedup-at-creation path** (`boss-engine`). Hook into `create_attention` / `reconcile_attentions` at the "would persist a new `Attention` item" point: when flag on and exact dedup misses, run prefilter → `decide_dedup`; on a High/Medium duplicate, fold (atomic `score += 1` on the canonical item, `attention_merges` row with `trigger='creation'`, suppress the candidate item, return the canonical) inside the existing transaction; else create normally. Fail-safe on any LLM error. **Effort:** `large`. **Depends on:** 1, 2, 3, 4.
+4a. **Taxonomy prefilter + `WorkItemBrief` rendering** (`boss-engine`). Query open work items (tasks, chores, revisions, projects) in non-terminal states for the same product; render each as a `WorkItemBrief`; populate `DedupInput.existing_work_items` up to the per-kind cap; `log()` any overflow. Gated by `notification_dedup_taxonomy`. Pure, unit-testable; shared by creation and sweep. **Effort:** `small`. **Depends on:** 3 (for `WorkItemBrief`), 2 (for the sub-flag check).
+
+5. **Dedup-at-creation path** (`boss-engine`). Hook into `create_attention` / `reconcile_attentions` at the "would persist a new `Attention` item" point: when `notification_dedup` on and exact dedup misses, run prefilter (task 4) + taxonomy prefilter if `notification_dedup_taxonomy` on (task 4a) → `decide_dedup`; handle each verdict:
+   - `AttentionDup` High/Medium → fold (atomic `score += 1` on canonical item, `attention_merges` row `trigger='creation'`, suppress candidate, return canonical);
+   - `WorkItemDup` High → suppress-with-pointer (`attention_merges` row with `canonical_work_item_id`, no Attention row created);
+   - `WorkItemDup` Medium → create Attention with `linked_work_item_id` set;
+   - `Sensibility` High (if sensibility flag on) → suppress with `attention_merges` row `trigger='sensibility'`;
+   - all else → create normally.
+   Fail-safe on any LLM error. **Effort:** `large`. **Depends on:** 1, 2, 3, 4, 4a.
 
 6. **Canonical-edit-on-merge (bounded + recorded)** (`boss-engine`). Apply `DedupDecision.proposed_edits` under the bounds (append-only to `rationale` / `proposed_description`, open-items-only, length caps), record before/after in `attention_merges.edits_applied`, drop+`log()` over-budget edits. Consumed by both the creation and sweep folds. *Separable — could ship as `future` (score-only folds in v1) per R5.* **Effort:** `medium`. **Depends on:** 1, 5.
 
-7. **Startup sweep** (`boss-engine`). Boot-time one-shot background task (flag-gated), `merge_poller`-style: bucket open `Attention` items by `(product[, kind])` — **not** by association/task or card, so cross-task dups are visible within each bucket — apply recency window, deterministic canonical (lowest parent `short_id`, then earliest item `created_at`), batched per-bucket `decide_dedup`, cluster-fold losers (`score += n` on canonical item, retire via `merged_into_attention_id` + `answer_state='merged'`, one `attention_merges` row each, empty-card cleanup for each affected group), per-bucket cap with `log()` remainder. Idempotent via the pair-unique index + retired-item exclusion + deterministic canonical. **Effort:** `large`. **Depends on:** 1, 2, 3, 4 (6 if edits-on-sweep wanted).
+7. **Startup sweep** (`boss-engine`). Boot-time one-shot background task (flag-gated), `merge_poller`-style: bucket open `Attention` items by `(product[, kind])` — **not** by association/task or card, so cross-task dups are visible within each bucket — apply recency window, deterministic canonical (lowest parent `short_id`, then earliest item `created_at`), batched per-bucket `decide_dedup` (with `existing_work_items` populated if taxonomy flag on; `sensibility_check: false` in the sweep per R14), cluster-fold losers (`score += n` on canonical item, retire via `merged_into_attention_id` + `answer_state='merged'`, one `attention_merges` row each, empty-card cleanup for each affected group), per-bucket cap with `log()` remainder. `WorkItemDup` High → retire loser with `canonical_work_item_id` in the merge row. Idempotent via the pair-unique index + retired-item exclusion + deterministic canonical. **Effort:** `large`. **Depends on:** 1, 2, 3, 4, 4a (6 if edits-on-sweep wanted).
 
 8. **UI priority surfacing** (`app-macos`). `score` badge on items and their parent card (`score > 1`), score-desc-then-recency ordering of open groups (using max item score), and a merge-provenance affordance ("edited by merge" marker + folded-count detail reading `attention_merges`). Thin client over the score field + a provenance read. **Effort:** `medium`. **Depends on:** 1 (score in protocol/events); benefits from 5/7 producing real scores but does not block on them.
 
-9. **Tests: end-to-end dedup + idempotency** (`boss-engine`). Fixtures of near-duplicate `Attention` items (different grouping keys, different cards, same concern); assert creation-time fold (score++, suppression, provenance), partial-card folding (other items in same card untouched), sweep clustering + double-run idempotency (no double count), empty-card cleanup (card retired when last open item folded), flag-off no-op, fail-safe-on-no-api-key, and edit-bounds enforcement. **Effort:** `large`. **Depends on:** 5, 7 (6 if shipped).
+9. **Tests: end-to-end dedup + idempotency** (`boss-engine`). Fixtures of near-duplicate `Attention` items (different grouping keys, different cards, same concern); assert creation-time fold (score++, suppression, provenance), partial-card folding (other items in same card untouched), sweep clustering + double-run idempotency (no double count), empty-card cleanup (card retired when last open item folded), flag-off no-op, fail-safe-on-no-api-key, edit-bounds enforcement. Also: taxonomy-aware fixtures (attention dup of existing task → suppress-with-pointer at High, linked at Medium), sensibility fixtures (stale attention suppressed with reason, vague reason rejected → Keep), `WorkItemDup` with hallucinated id → Keep, sensibility at Medium → Keep. **Effort:** `large`. **Depends on:** 5, 7 (6 if shipped).
 
-**Parallelism / graph.** Depth 0 (no deps): **1**, **2**, **3** run in parallel. Depth 1: **4** (needs 3). Depth 2: **5** (needs 1,2,3,4) and **8** (needs 1) run in parallel. Depth 3: **6** (needs 1,5) and **7** (needs 1,2,3,4) run in parallel. Depth 4: **9** (needs 5,7[,6]).
+**Parallelism / graph.** Depth 0 (no deps): **1**, **2**, **3** run in parallel. Depth 1: **4** and **4a** (both need 3; 4a also needs 2) run in parallel. Depth 2: **5** (needs 1,2,3,4,4a) and **8** (needs 1) run in parallel. Depth 3: **6** (needs 1,5) and **7** (needs 1,2,3,4,4a) run in parallel. Depth 4: **9** (needs 5,7[,6]).
 
 **Deferred / not a v1 blocker:**
 - **Canonical-edit-on-merge (task 6)** — `future` if R5 lands on score-only folds for v1; the fold path (task 5/7) works without it.
