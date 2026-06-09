@@ -1400,22 +1400,13 @@ pub(crate) fn migrate_tasks_review_cycle_columns(conn: &Connection) -> Result<()
 /// pair-unique sweep-idempotency constraint that prevents double-counting.
 pub(crate) fn migrate_attentions_score_and_merges(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "attentions", "score")? {
-        conn.execute(
-            "ALTER TABLE attentions ADD COLUMN score INTEGER NOT NULL DEFAULT 1",
-            [],
-        )?;
+        conn.execute("ALTER TABLE attentions ADD COLUMN score INTEGER NOT NULL DEFAULT 1", [])?;
     }
     if !table_has_column(conn, "attentions", "merged_into_attention_id")? {
-        conn.execute(
-            "ALTER TABLE attentions ADD COLUMN merged_into_attention_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE attentions ADD COLUMN merged_into_attention_id TEXT", [])?;
     }
     if !table_has_column(conn, "attentions", "linked_work_item_id")? {
-        conn.execute(
-            "ALTER TABLE attentions ADD COLUMN linked_work_item_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE attentions ADD COLUMN linked_work_item_id TEXT", [])?;
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS attention_merges (

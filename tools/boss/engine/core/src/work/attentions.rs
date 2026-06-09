@@ -1060,7 +1060,8 @@ impl WorkDb {
 /// event: which candidate was reconciled into which canonical (or suppressed
 /// as a work-item dup / sensibility), the model that decided, the rationale,
 /// and any bounded edits applied to the canonical.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct AttentionMerge {
     pub id: String,
     /// Set for `AttentionDup` folds; `None` for `WorkItemDup` / sensibility.
@@ -1085,7 +1086,8 @@ pub struct AttentionMerge {
 }
 
 /// Input for inserting one `attention_merges` row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct InsertAttentionMergeInput {
     pub canonical_attention_id: Option<String>,
     pub canonical_work_item_id: Option<String>,
@@ -1160,10 +1162,7 @@ impl WorkDb {
     /// List all `attention_merges` rows for a canonical `Attention` id,
     /// ordered chronologically. Used to render the merge-provenance affordance
     /// in the Notifications UI ("folded N duplicate reports").
-    pub fn list_attention_merges_for_canonical(
-        &self,
-        canonical_attention_id: &str,
-    ) -> Result<Vec<AttentionMerge>> {
+    pub fn list_attention_merges_for_canonical(&self, canonical_attention_id: &str) -> Result<Vec<AttentionMerge>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, canonical_attention_id, canonical_work_item_id,
@@ -1206,11 +1205,7 @@ impl WorkDb {
 
     /// Transaction-aware variant of [`Self::retire_group_if_empty`] for use
     /// inside an existing transaction.
-    pub(crate) fn retire_group_if_empty_in_tx(
-        &self,
-        conn: &Connection,
-        group_id: &str,
-    ) -> Result<bool> {
+    pub(crate) fn retire_group_if_empty_in_tx(&self, conn: &Connection, group_id: &str) -> Result<bool> {
         let group = match query_attention_group(conn, group_id)? {
             Some(g) => g,
             None => return Ok(false),
