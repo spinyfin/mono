@@ -44,11 +44,12 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
 ///
-/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine
-/// auto-tracks the latest snapshot per family without requiring a
-/// code change on each model release. Direct-API summarization
-/// (see [`crate::live_status::SUMMARY_MODEL`]) still uses a pinned
-/// model — that path doesn't go through the worker CLI.
+/// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the
+/// engine auto-tracks the latest snapshot per family without requiring
+/// a code change on each model release.
+/// Direct-API summarization (see [`crate::live_status::SUMMARY_MODEL`])
+/// still uses a pinned model — that path doesn't go through the
+/// worker CLI.
 ///
 /// `Trivial` maps to `sonnet`, NOT `haiku`. Per issue #746 ("don't
 /// use haiku") boss must never dispatch a worker on Haiku: on the
@@ -58,10 +59,14 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// [`claude_effort_for_level`]); only the model floor is raised to
 /// Sonnet. This is the same resolution #746 closed with — do not
 /// lower it back to Haiku.
+///
+/// Tier ordering, highest to lowest:
+/// Fable (`fable`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
-        EffortLevel::Large | EffortLevel::Max => "opus",
+        EffortLevel::Large => "opus",
+        EffortLevel::Max => "fable",
     }
 }
 
@@ -144,7 +149,7 @@ impl SpawnConfig {
             cmd.push_str(" --effort ");
             cmd.push_str(effort);
         }
-        if model_is_opus(&self.model) || non_opus_auto_mode {
+        if model_requires_auto_permissions(&self.model) || non_opus_auto_mode {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");
@@ -166,6 +171,19 @@ impl SpawnConfig {
 /// return `false`.
 pub fn model_is_opus(model: &str) -> bool {
     model.to_ascii_lowercase().contains("opus")
+}
+
+/// Returns `true` iff the resolved model slug belongs to the Fable family
+/// (the highest-tier model, above Opus). Matching is case-insensitive: any
+/// id that contains the substring `"fable"` counts as Fable.
+pub fn model_is_fable(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("fable")
+}
+
+/// Returns `true` iff the model requires `--permission-mode auto` due to its
+/// tier (Fable or Opus). Used by [`SpawnConfig::claude_invocation`].
+pub fn model_requires_auto_permissions(model: &str) -> bool {
+    model_is_opus(model) || model_is_fable(model)
 }
 
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
@@ -441,7 +459,7 @@ mod tests {
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
-        assert_eq!(max.model, "opus");
+        assert_eq!(max.model, "fable");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
@@ -649,6 +667,61 @@ mod tests {
         assert!(!model_is_opus("haiku"));
         assert!(!model_is_opus("sonnet"));
         assert!(!model_is_opus(""));
+    }
+
+    #[test]
+    fn model_is_fable_recognises_fable_variants() {
+        assert!(model_is_fable("claude-fable-5"));
+        assert!(model_is_fable("CLAUDE-FABLE-5"));
+        assert!(model_is_fable("fable"));
+    }
+
+    #[test]
+    fn model_is_fable_rejects_non_fable_models() {
+        assert!(!model_is_fable("claude-opus-4-8"));
+        assert!(!model_is_fable("claude-sonnet-4-6"));
+        assert!(!model_is_fable("opus"));
+        assert!(!model_is_fable(""));
+    }
+
+    #[test]
+    fn fable_model_gets_permission_mode_auto() {
+        // Fable is the highest tier — like Opus it must use --permission-mode auto.
+        for model in ["claude-fable-5", "fable"] {
+            for non_opus_auto_mode in [false, true] {
+                let cfg = SpawnConfig {
+                    effort_level: None,
+                    claude_effort: None,
+                    model: model.to_owned(),
+                    prompt_addendum: None,
+                };
+                let inv = cfg.claude_invocation(non_opus_auto_mode, None);
+                assert!(
+                    inv.contains("--permission-mode auto"),
+                    "Fable model {model:?} must carry --permission-mode auto, got: {inv:?}",
+                );
+                assert!(
+                    !inv.contains("--dangerously-skip-permissions"),
+                    "Fable model {model:?} must NOT carry --dangerously-skip-permissions, got: {inv:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_effort_dispatches_on_fable() {
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
+        assert_eq!(cfg.model, "fable");
+        assert_eq!(cfg.claude_effort, Some("max"));
+        let inv = cfg.claude_invocation(false, None);
+        assert!(
+            inv.contains("--model fable"),
+            "Max effort must use fable, got: {inv:?}",
+        );
+        assert!(
+            inv.contains("--permission-mode auto"),
+            "Fable (max effort) must use --permission-mode auto, got: {inv:?}",
+        );
     }
 
     #[test]
