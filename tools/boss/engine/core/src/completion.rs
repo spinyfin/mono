@@ -869,6 +869,12 @@ pub struct WorkerCompletionHandler {
     /// the staging path get the same behaviour they always had —
     /// nothing is staged → fall through to `pr_detector`.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// In-memory set recording `revision_implementation` executions that ran a
+    /// `jj git push` command since their last Stop boundary. Populated by the
+    /// `PostToolUse` hook dispatcher; consumed (and cleared) by
+    /// `on_stop_inner`'s SHA-delta `Contributed` gate to distinguish the
+    /// revision's own push from a concurrent parent-worker push.
+    staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
     /// Toggleable feature flags (incident 001 AI #5). Consulted by
     /// `on_stop_inner` and `recheck_for_pr` to decide whether the
     /// cold-path PR fallback is permitted to run. Defaults to a
@@ -962,6 +968,9 @@ impl WorkerCompletionHandler {
             pane_releaser,
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
+            staged_revision_pushes: Arc::new(
+                crate::pr_url_capture::StagedRevisionPushCache::new(),
+            ),
             feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(
                 std::path::PathBuf::new(),
             )),
@@ -982,6 +991,17 @@ impl WorkerCompletionHandler {
     /// per-execution artifact in a tempdir; production leaves the default.
     pub fn with_structured_output_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.structured_output_dir = dir;
+        self
+    }
+
+    /// Wire an externally-owned [`StagedRevisionPushCache`] into this handler.
+    /// Called by `app.rs` so the PostToolUse dispatcher and on_stop_inner share
+    /// the same cache instance.
+    pub fn with_staged_revision_pushes(
+        mut self,
+        cache: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    ) -> Self {
+        self.staged_revision_pushes = cache;
         self
     }
 
@@ -1149,12 +1169,26 @@ impl WorkerCompletionHandler {
             }
         }
 
+        // Capture whether stop_seen was already set BEFORE stamping it so the
+        // SHA-delta gate below can distinguish "first stop" from "subsequent
+        // stop". For revision_implementation executions the gate uses this to
+        // decide whether to require explicit push evidence (already_stop_seen=true
+        // means this is a multi-turn stop where a parent push could have moved
+        // the head without the revision contributing).
+        let already_stop_seen = self
+            .work_db
+            .execution_stop_seen(execution_id)
+            .unwrap_or(false);
+
         // Stamp the stop_seen marker so the merge poller's SHA-delta gate
-        // knows a real Stop event fired for this execution. The gate uses
-        // this flag to distinguish "recovery path: Stop fired but PR
-        // detection failed transiently" from "no Stop yet: worker is still
-        // running between turns". Best-effort — failure does not block the
-        // rest of on_stop_inner.
+        // knows at least one Stop boundary has been observed for this
+        // execution. Best-effort — failure does not block the rest of
+        // on_stop_inner.
+        //
+        // Note: waiting_human is set immediately at pane spawn
+        // (PaneSpawnRunner), so it does NOT indicate a terminal worker. The
+        // Stop hook fires after every assistant turn. stop_seen = true means
+        // "at least one turn boundary has been observed" — not "worker is done."
         if let Err(err) = self.work_db.set_execution_stop_seen(execution_id) {
             tracing::warn!(
                 execution_id,
@@ -1325,10 +1359,14 @@ impl WorkerCompletionHandler {
         // at worker exit. With no staged URL on a still-`running`
         // execution we MUST NOT fall through to `detect_pr` — the
         // worker is alive and any positive result would race against
-        // its own in-flight push. Reserve the fallback for
-        // genuinely-terminal worker sessions, which in the engine's
-        // execution lifecycle are stamped `waiting_human` (set by
-        // `finish_execution_run` after `PaneSpawnRunner` returns).
+        // its own in-flight push.
+        //
+        // Note: `waiting_human` is set immediately at pane spawn
+        // (PaneSpawnRunner), NOT at worker exit — the worker is still
+        // actively running turns when in `waiting_human`. This gate
+        // is useful only as a coarse filter: `running` executions are
+        // between their start_execution_run and finish_execution_run
+        // calls and are guaranteed not to be pane-based workers.
         if execution.status != ExecutionStatus::WaitingHuman {
             tracing::debug!(
                 execution_id,
@@ -1342,15 +1380,106 @@ impl WorkerCompletionHandler {
         // PR bound to it (`task.pr_url` populated by an earlier run's
         // on-Stop machinery), use that URL as the authoritative
         // identifier — never branch-search. If the bound PR's head
-        // SHA moved during this run (vs the snapshot captured at run
-        // start in `execution.pr_head_before`), the worker
-        // contributed and we should finalize without nudging. If the
-        // PR did not move, queue the nudge directly and skip the
-        // cold-path detector entirely (its branch-keyed search would
-        // miss the bound PR on a resume, producing the false-positive
-        // nudge loop this gate exists to prevent).
+        // SHA moved since the last Stop boundary (captured in
+        // `execution.pr_head_before`) AND the revision has push evidence
+        // (it ran `jj git push` in this turn, or this is the first stop
+        // boundary), stamp `revision_stop_contributed_head` and finalize.
+        // Without push evidence on a subsequent stop, the head movement
+        // is attributed to the concurrently-active parent worker and we
+        // absorb the new baseline without finalizing so the revision can
+        // push on its next turn.
         match self.evaluate_sha_delta_gate(execution_id, &execution).await {
-            ShaDeltaGateOutcome::Contributed { pr_url } => {
+            ShaDeltaGateOutcome::Contributed { pr_url, head_now } => {
+                if execution.kind == ExecutionKind::RevisionImplementation {
+                    let push_staged = self.staged_revision_pushes.take(execution_id);
+                    // For the first stop (already_stop_seen=false) treat the push as
+                    // the revision's own contribution even without an explicit push
+                    // event — single-turn revisions push and stop in one turn, and the
+                    // pre-first-Stop window was already guarded by recheck_for_pr.
+                    // For subsequent stops (already_stop_seen=true) require push
+                    // evidence, because the parent worker may have pushed between turns.
+                    let is_revision_contribution = push_staged || !already_stop_seen;
+                    if is_revision_contribution {
+                        // Stamp the head we're about to finalize on; recheck_for_pr
+                        // uses this for T848 recovery if finalization fails transiently.
+                        if let Err(err) = self
+                            .work_db
+                            .set_revision_stop_contributed_head(execution_id, &head_now)
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                ?err,
+                                "stop event: failed to stamp revision_stop_contributed_head; \
+                                 recheck_for_pr T848 recovery may not fire",
+                            );
+                        }
+                        return self
+                            .finalize_pr_transition(
+                                execution_id,
+                                pr_url,
+                                WorkerPrCompletionTarget::InReview,
+                                "stop_sha_delta",
+                            )
+                            .await;
+                    }
+                    // already_stop_seen=true with no push evidence: parent pushed.
+                    // Absorb the head into the baseline and fall through to the
+                    // NoContribution nudge path so the revision continues working.
+                    tracing::info!(
+                        execution_id,
+                        pr_url = %pr_url,
+                        head_now = %head_now,
+                        "stop event: revision SHA-delta Contributed suppressed \
+                         (already_stop_seen=true, no push evidence) — parent push assumed; \
+                         absorbing baseline",
+                    );
+                    if let Err(err) = self
+                        .work_db
+                        .set_execution_pr_head_before(execution_id, &head_now)
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            ?err,
+                            "stop event: failed to absorb pr_head_before after parent-push \
+                             suppression; next turn may re-trigger spuriously",
+                        );
+                    }
+                    // Fall through to the NoContribution arm's nudge logic.
+                    // We reach the nudge_or_park below directly.
+                    let _pr_url_for_nudge = pr_url;
+                    // Restructure: fall through by using a shared helper.
+                    // Inline the NoContribution nudge path here.
+                    if let Some(outcome) = self
+                        .try_retire_cleared_blocking_signal(execution_id, &execution, &_pr_url_for_nudge)
+                        .await
+                    {
+                        return outcome;
+                    }
+                    if let Some(outcome) = self
+                        .try_finalize_metadata_only_fix_on_stop(
+                            execution_id,
+                            &execution,
+                            &_pr_url_for_nudge,
+                        )
+                        .await
+                    {
+                        return outcome;
+                    }
+                    tracing::info!(
+                        execution_id,
+                        bound_pr_url = %_pr_url_for_nudge,
+                        "stop event: revision absorbed parent push — nudging to push to the existing PR",
+                    );
+                    return self
+                        .nudge_or_park(
+                            &execution,
+                            &probe_push_to_existing_pr(&_pr_url_for_nudge),
+                            &format!("nocontribution:{_pr_url_for_nudge}"),
+                            Some(&_pr_url_for_nudge),
+                            StopOutcome::AwaitingInput,
+                        )
+                        .await;
+                }
                 return self
                     .finalize_pr_transition(
                         execution_id,
@@ -1360,7 +1489,7 @@ impl WorkerCompletionHandler {
                     )
                     .await;
             }
-            ShaDeltaGateOutcome::NoContribution { pr_url } => {
+            ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Before nudging, check whether the blocking signal (conflict /
                 // CI) is already cleared — e.g. a sibling resolver fixed the
                 // conflict before this run started. If so, retire the attempt
@@ -1755,6 +1884,12 @@ must not be asked to open one",
         // staged URL was missed. Skipping for `running` keeps the
         // fallback off in-flight workers even when the poller's
         // candidate query picks them up by race.
+        //
+        // Note: waiting_human is set immediately at pane spawn
+        // (PaneSpawnRunner), so it does NOT indicate a terminal worker.
+        // The check is still useful as a coarse filter because `running`
+        // executions are between their start_execution_run and
+        // finish_execution_run calls and are never WaitingHuman.
         if execution.status != ExecutionStatus::WaitingHuman {
             tracing::debug!(
                 execution_id,
@@ -1768,55 +1903,85 @@ must not be asked to open one",
         // task's own `pr_url` (chore resume) or `execution.pr_url` for
         // `revision_implementation` tasks (which never open their own PR but
         // push commits to the parent PR) — check whether the bound PR's HEAD
-        // SHA moved since this execution started.
+        // SHA moved since the last Stop boundary.
         //
         // This is the primary recovery path for `revision_implementation`
         // executions: the cold-path branch-keyed detector always returns None
         // for revisions because they have no branch of their own. The SHA-delta
         // gate is therefore the only fallback that can advance a revision from
-        // `active` to `in_review` when `on_stop_inner` failed transiently (e.g.
-        // a GitHub API timeout during the SHA fetch, or an engine restart
-        // between execution start and Stop).  Without this gate the merge-poller
-        // sweep repeatedly calls `recheck_for_pr`, finds no PR on the revision's
-        // branch, and silently returns — leaving the revision stranded in `doing`
-        // even after the worker successfully pushed its commit (reproduces T848).
+        // `active` to `in_review` when `on_stop_inner` failed transiently (T848).
         //
-        // `Contributed` → finalize now (worker pushed to the bound PR).
-        // `NoContribution` / `Inapplicable` → fall through; the cold path
-        // returns quietly for revisions (no PR on their own branch).
+        // For `revision_implementation` executions the `Contributed` arm uses
+        // `revision_stop_contributed_head` (stamped by `on_stop_inner` when it
+        // confirmed the revision's own push) as the finalization gate:
         //
-        // T1503/T1496 regression guard (Contributed arm only): for
-        // `revision_implementation` executions the `Contributed` outcome must
-        // only advance the revision to `in_review` after `on_stop_inner` has
-        // been called at least once (`stop_seen = true`). Without this guard
-        // the gate fires immediately when a *different* worker (e.g. the parent
-        // chore's still-active worker) pushes to the same PR between the
-        // snapshot time and the merge-poller check, misattributing those commits
-        // as the revision's contribution. `NoContribution` is intentionally
-        // exempt so the metadata-only CI-fix finalize path (issue #1252) keeps
-        // working without a Stop — it has its own separate marker guard.
+        // - `head_now == revision_stop_contributed_head` → T848 recovery: the
+        //   revision pushed this exact head, on_stop_inner attempted finalization
+        //   but failed transiently; retry now.
+        // - `head_now != revision_stop_contributed_head` (including NULL) → head
+        //   moved from a *different* worker (parent chore's concurrent push);
+        //   absorb the new baseline so subsequent sweeps don't re-trigger.
+        //
+        // Non-revision executions (chore resumes) finalize unconditionally on
+        // `Contributed`. `NoContribution` is exempt from all of the above — the
+        // metadata-only CI-fix path (issue #1252) has its own separate gate.
         match self.evaluate_sha_delta_gate(execution_id, &execution).await {
-            ShaDeltaGateOutcome::Contributed { pr_url }
-                if execution.kind == ExecutionKind::RevisionImplementation
-                    && !self
-                        .work_db
-                        .execution_stop_seen(execution_id)
-                        .unwrap_or(false) =>
+            ShaDeltaGateOutcome::Contributed { pr_url, head_now }
+                if execution.kind == ExecutionKind::RevisionImplementation =>
             {
+                let committed_head = self
+                    .work_db
+                    .get_revision_stop_contributed_head(execution_id)
+                    .unwrap_or(None);
+                if committed_head.as_deref() == Some(head_now.as_str()) {
+                    // T848 recovery: on_stop_inner confirmed this head was the
+                    // revision's own push; finalize now.
+                    tracing::info!(
+                        execution_id,
+                        pr_url = %pr_url,
+                        head_now = %head_now,
+                        "pr-recheck: revision_stop_contributed_head matches current head — \
+                         finalising (T848 recovery)",
+                    );
+                    return self
+                        .finalize_pr_transition(
+                            execution_id,
+                            pr_url,
+                            WorkerPrCompletionTarget::InReview,
+                            "pr_recheck_sha_delta",
+                        )
+                        .await;
+                }
+                // Head moved but revision_stop_contributed_head doesn't match
+                // (or was never set): attribute to the parent worker and absorb.
                 tracing::debug!(
                     execution_id,
                     pr_url = %pr_url,
-                    "pr-recheck: SHA-delta Contributed suppressed for revision — no Stop event \
-                     seen yet (T1503/T1496 guard; will fire once on_stop_inner stamps stop_seen)",
+                    head_now = %head_now,
+                    committed_head = ?committed_head,
+                    "pr-recheck: revision Contributed suppressed — head_now does not match \
+                     revision_stop_contributed_head (parent push or no prior on_stop Contributed); \
+                     absorbing baseline",
                 );
-                // Fall through to cold-path (returns AwaitingInput for revisions
-                // that have no branch of their own).
+                if let Err(err) = self
+                    .work_db
+                    .set_execution_pr_head_before(execution_id, &head_now)
+                {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "pr-recheck: failed to advance pr_head_before baseline after \
+                         suppression; next sweep may re-trigger spuriously",
+                    );
+                }
+                // Fall through to cold-path (returns AwaitingInput for revisions).
             }
-            ShaDeltaGateOutcome::Contributed { pr_url } => {
+            ShaDeltaGateOutcome::Contributed { pr_url, head_now: _ } => {
                 tracing::info!(
                     execution_id,
                     pr_url = %pr_url,
-                    "pr-recheck: SHA-delta gate: bound PR head moved — finalising without cold-path detector",
+                    "pr-recheck: SHA-delta gate: bound PR head moved since last Stop — \
+                     finalising without cold-path detector",
                 );
                 return self
                     .finalize_pr_transition(
@@ -1827,7 +1992,7 @@ must not be asked to open one",
                     )
                     .await;
             }
-            ShaDeltaGateOutcome::NoContribution { pr_url } => {
+            ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Bound PR did not advance during this run. For most resumes
                 // the cold-path detector below returns quietly for revisions
                 // and the next sweep retries, waiting for a push that moves
@@ -4363,6 +4528,7 @@ must not be asked to open one",
             );
             ShaDeltaGateOutcome::NoContribution {
                 pr_url: bound_pr_url,
+                head_now,
             }
         } else {
             tracing::info!(
@@ -4372,7 +4538,7 @@ must not be asked to open one",
                 head_now = %head_now,
                 "sha-delta gate: bound PR head moved — contribution verified"
             );
-            ShaDeltaGateOutcome::Contributed { pr_url: bound_pr_url }
+            ShaDeltaGateOutcome::Contributed { pr_url: bound_pr_url, head_now }
         }
     }
 }
@@ -4392,13 +4558,17 @@ enum ShaDeltaGateOutcome {
     /// The chore had a bound `pr_url`, snapshot+current SHA were
     /// fetched, and the SHAs differ — this run moved the bound PR.
     /// Caller should finalize via `finalize_pr_transition(InReview)`.
-    Contributed { pr_url: String },
+    /// `head_now` is the fetched current head; callers that suppress
+    /// this outcome should persist it as the new baseline so subsequent
+    /// sweeps do not re-trigger on the same delta.
+    Contributed { pr_url: String, head_now: String },
     /// The chore had a bound `pr_url`, snapshot+current SHA were
     /// fetched, and the SHAs are equal — this run did not move the
     /// bound PR. Caller nudges the worker to push to the *existing*
     /// bound PR (never `gh pr create`), bounded by the circuit breaker,
     /// without falling through to the cold-path branch detector.
-    NoContribution { pr_url: String },
+    /// `head_now` is the fetched current head (== baseline).
+    NoContribution { pr_url: String, head_now: String },
     /// The gate could not evaluate (no bound PR, no snapshot, or a
     /// fetch failure). Caller falls through to the existing
     /// branch-keyed cold-path detector — preserves pre-change
@@ -8908,9 +9078,18 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let (db, product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
-        // Stamp stop_seen to simulate on_stop_inner having been called (Stop
-        // fired but PR detection failed transiently — recovery path).
+        // Stamp stop_seen and revision_stop_contributed_head to simulate
+        // on_stop_inner having observed Contributed (revision pushed "bbbb")
+        // and attempted finalization, which failed transiently. The recovery
+        // gate in recheck_for_pr requires revision_stop_contributed_head to
+        // match the current head so it knows the head movement was the
+        // revision's own contribution, not a concurrent parent push.
         db.set_execution_stop_seen(&execution_id).unwrap();
+        db.set_revision_stop_contributed_head(
+            &execution_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
         // Cold-path detector returns None — correct for revisions which
         // have no branch of their own.
         let detector = StubPrDetector::ok(None);
@@ -11833,26 +12012,46 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
     }
 
-    /// Complementary: once `on_stop_inner` stamps `stop_seen`, the SHA-delta
-    /// gate fires normally (recovery path). This ensures the T1503 fix does not
-    /// regress the T848 fix.
+    /// T848 recovery: once `on_stop_inner` stamps `revision_stop_contributed_head`
+    /// (the head it observed when the revision's own push was confirmed) and
+    /// `recheck_for_pr` sees the same head still at the PR, it finalizes.
+    /// This represents the recovery path: on_stop_inner detected the revision's
+    /// contribution and attempted to finalize but failed transiently, so
+    /// pr_head_before was NOT advanced. The merge poller retries until it
+    /// succeeds.
+    ///
+    /// The discriminator is `revision_stop_contributed_head == head_now`
+    /// (not just stop_seen): without it, a concurrent parent push would look
+    /// identical to the revision's own push from the merge-poller's perspective.
     #[tokio::test]
     async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        // head_before = "aaaa": the baseline from execution start (or last
+        // on_stop_inner NoContribution sweep). The revision worker pushed "bbbb"
+        // and on_stop_inner's Contributed arm tried but failed to finalize —
+        // so pr_head_before stays at "aaaa" (not advanced), preserving the
+        // delta for merge-poller recovery.
         let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let (db, _product_id, revision_id, execution_id) =
             revision_fixture(workspace.path(), parent_pr_url, head_before);
-        // Stamp stop_seen — simulates on_stop_inner having been called but
-        // PR detection failing transiently.
+        // Stamp stop_seen and revision_stop_contributed_head to simulate
+        // on_stop_inner having confirmed the revision's own push ("bbbb")
+        // and attempted finalization (which failed transiently).
         db.set_execution_stop_seen(&execution_id).unwrap();
+        db.set_revision_stop_contributed_head(
+            &execution_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
         let probes = Arc::new(RecordingProbeQueuer::default());
-        // Branch verifier: SHA moved (revision worker pushed).
+        // Branch verifier: SHA at "bbbb" (revision worker's own push, still
+        // the PR head because on_stop_inner's finalize failed before advancing).
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier
             .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
@@ -11881,5 +12080,294 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
             other => panic!("expected task, got {other:?}"),
         }
+    }
+
+    /// Regression (multi-turn revision, foreign push absorbed): after `on_stop_inner`
+    /// stamps `stop_seen` and the pre-stop suppression path has advanced
+    /// `pr_head_before` to absorb a parent-chore push ("bbbb"), the merge poller
+    /// must NOT advance the revision if the head has not moved since the last
+    /// Stop boundary. The revision worker is still active between turns.
+    ///
+    /// This tests the case the reviewer flagged: stop_seen=true but the SHA move
+    /// is attributable to a different (parent) worker. Because the suppression path
+    /// in `recheck_for_pr` already advanced `pr_head_before` to the parent's commit,
+    /// the next merge-poller sweep finds no new delta and leaves the revision active.
+    #[tokio::test]
+    async fn recheck_for_pr_sha_delta_suppressed_when_baseline_matches_current_head() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        // Simulate: parent chore's worker pushed "bbbb" before the first Stop.
+        // The pre-stop suppression path advanced pr_head_before to "bbbb".
+        // The revision has NOT pushed anything; PR head is still "bbbb".
+        let head_before_after_absorption = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before_after_absorption);
+        // stop_seen = true: first Stop has already fired (advancing the baseline).
+        db.set_execution_stop_seen(&execution_id).unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Branch verifier: current head is still "bbbb" (no new push since the
+        // last Stop boundary). The foreign push was already absorbed into the
+        // baseline, so this is a NoContribution from the gate's perspective.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "revision must stay active when head has not moved since last Stop boundary; \
+             foreign push already absorbed into baseline (got {outcome:?})",
+        );
+        // Revision task must remain active.
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Active,
+                    "revision must remain active; no new push since last Stop (got {:?})",
+                    t.status,
+                );
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "no cube lease must be released when no contribution detected",
+        );
+    }
+
+    /// The pre-first-Stop suppression path must advance `pr_head_before` to the
+    /// current head. This ensures subsequent merge-poller sweeps (once stop_seen
+    /// becomes true) compare against the post-parent-push head rather than the
+    /// stale execution-start head, preventing re-triggering on the same delta.
+    #[tokio::test]
+    async fn recheck_for_pr_pre_stop_suppression_advances_pr_head_before_baseline() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        // Execution-start baseline.
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, _revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // NOTE: stop_seen is NOT set — pre-first-Stop window.
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Parent pushed "bbbb" before the first Stop.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "pre-stop suppression must return AwaitingInput; got {outcome:?}",
+        );
+        // The baseline must have been advanced to the parent's commit "bbbb".
+        // After on_stop_inner stamps stop_seen, the next sweep will compare
+        // current head against "bbbb" — not "aaaa" — preventing re-triggering.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.pr_head_before.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "pre-stop suppression must advance pr_head_before to current head \
+             so subsequent sweeps don't re-trigger on the same stale delta",
+        );
+    }
+
+    /// Multi-turn foreign-push guard (recheck_for_pr path): when stop_seen=true
+    /// but `revision_stop_contributed_head` is NOT set (on_stop_inner never
+    /// observed a Contributed outcome for this execution), a head movement caused
+    /// by a *different* worker (e.g. the parent chore's still-active worker)
+    /// must NOT advance the revision to `in_review`. The baseline is absorbed
+    /// so subsequent sweeps don't re-trigger on the same foreign delta.
+    ///
+    /// Scenario: stop_seen=true (multi-turn revision), pr_head_before=aaaa,
+    /// parent pushes bbbb; revision made no commit → revision stays Active.
+    #[tokio::test]
+    async fn recheck_for_pr_foreign_push_post_stop_does_not_finalize_revision() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // stop_seen = true: at least one stop has been observed.
+        db.set_execution_stop_seen(&execution_id).unwrap();
+        // revision_stop_contributed_head is NOT set: on_stop_inner never
+        // confirmed the revision's own push (the head movement is from
+        // the parent worker, not this revision).
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Parent chore worker pushed "bbbb" — head moved from the revision's
+        // baseline, but the revision did not author this commit.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "foreign push after stop_seen must NOT finalize the revision; \
+             revision_stop_contributed_head is absent (parent pushed, not revision); \
+             got {outcome:?}",
+        );
+        // Revision task must remain active — not prematurely in_review.
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Active,
+                    "revision must remain active when head was moved by a different \
+                     worker (no revision_stop_contributed_head set); got {:?}",
+                    t.status,
+                );
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // No lease release — nothing was finalized.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "no cube lease must be released when gate is suppressed",
+        );
+        // The baseline must have been advanced to absorb the foreign push.
+        // Subsequent sweeps won't re-trigger on the same delta.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.pr_head_before.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "foreign push must be absorbed into baseline to prevent re-triggering",
+        );
+    }
+
+    /// Multi-turn foreign-push guard (on_stop_inner path): when stop_seen was
+    /// already true (multi-turn revision, already_stop_seen=true) and no push
+    /// was staged in `StagedRevisionPushCache`, a head movement caused by the
+    /// parent worker must NOT advance the revision to `in_review`. The Contributed
+    /// arm must absorb the baseline and fall through to the nudge path.
+    ///
+    /// Scenario: already_stop_seen=true, pr_head_before=aaaa, parent pushes bbbb;
+    /// no push staged for this execution → revision stays Active (nudge fired).
+    #[tokio::test]
+    async fn on_stop_foreign_push_post_stop_does_not_finalize_revision() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Stamp stop_seen BEFORE calling on_stop so already_stop_seen=true
+        // inside on_stop_inner (simulating a multi-turn revision's second+ stop).
+        db.set_execution_stop_seen(&execution_id).unwrap();
+        // Do NOT record a push in StagedRevisionPushCache — the revision ran
+        // no push command this turn.
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Parent chore worker pushed "bbbb" — head moved but revision did not
+        // author this commit.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        // on_stop_inner must NOT finalize — it must nudge (AwaitingInput).
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "on_stop_inner must not finalize revision when already_stop_seen=true \
+             and no push was staged (parent push assumed); got {outcome:?}",
+        );
+        // Revision task must remain active.
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Active,
+                    "revision must stay active when SHA-delta Contributed is \
+                     suppressed at multi-turn stop with no push evidence; got {:?}",
+                    t.status,
+                );
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // No lease release — revision is not done.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "no cube lease must be released when on_stop_inner suppresses Contributed",
+        );
+        // The baseline must have been advanced to absorb the foreign push.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.pr_head_before.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "on_stop_inner must absorb foreign push into pr_head_before baseline",
+        );
     }
 }

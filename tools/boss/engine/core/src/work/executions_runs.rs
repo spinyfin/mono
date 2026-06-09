@@ -698,6 +698,47 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Stamp `revision_stop_contributed_head` to record that
+    /// `on_stop_inner`'s SHA-delta `Contributed` arm observed `sha` as the
+    /// current PR head for a `revision_implementation` execution. Used by
+    /// `recheck_for_pr` as the T848 recovery gate: it only finalizes when the
+    /// current head matches this stamped value — not on any arbitrary head
+    /// movement from a concurrently-active parent worker.
+    pub fn set_revision_stop_contributed_head(
+        &self,
+        execution_id: &str,
+        sha: &str,
+    ) -> Result<()> {
+        if sha.is_empty() {
+            bail!("set_revision_stop_contributed_head: sha must be non-empty");
+        }
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET revision_stop_contributed_head = ?2 WHERE id = ?1",
+            params![execution_id, sha],
+        )?;
+        Ok(())
+    }
+
+    /// Return the `revision_stop_contributed_head` value for `execution_id`,
+    /// or `None` if it has never been set (on_stop_inner has not yet observed
+    /// a `Contributed` outcome for this execution).
+    pub fn get_revision_stop_contributed_head(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let head: Option<String> = conn
+            .query_row(
+                "SELECT revision_stop_contributed_head FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(head)
+    }
+
     /// Snapshot the bound PR's description/body captured at run start.
     /// Baseline for the metadata-only CI-fix finalize gate (issue #1252):
     /// `on_stop` diffs the live body against this to detect an

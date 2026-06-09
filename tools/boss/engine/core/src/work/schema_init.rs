@@ -351,6 +351,12 @@ impl WorkDb {
         // time a Stop fires; the gate checks it before running the SHA delta
         // comparison.
         migrate_work_executions_stop_seen(&conn)?;
+        // `revision_stop_contributed_head`: SHA that on_stop_inner's Contributed arm
+        // observed for a revision_implementation execution. recheck_for_pr uses this
+        // as the T848 recovery gate: only finalize when head matches the SHA on_stop
+        // previously attempted to finalize on — not on any head movement from a
+        // concurrently-active parent worker.
+        migrate_work_executions_revision_stop_contributed_head(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '20')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
