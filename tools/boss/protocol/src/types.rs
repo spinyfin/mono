@@ -87,6 +87,17 @@ pub struct Attention {
     /// (from a model pass over a transcript or doc).
     #[builder(default = "structured".to_string())]
     pub confidence_source: String,
+    /// Count of independent reports folded into this item. `1` for a freshly
+    /// created item; incremented each time a near-duplicate is reconciled into
+    /// this canonical. Surfaced as a priority signal in the Notifications UI.
+    #[builder(default = 1)]
+    pub score: i64,
+    /// Set to the covering work-item id (e.g. `"T42"`) on a Medium-confidence
+    /// `WorkItemDup` verdict. The attention remains open but carries a UI
+    /// cross-reference chip to the work item. `None` for items without a
+    /// detected work-item duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_work_item_id: Option<String>,
 }
 
 
