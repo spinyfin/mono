@@ -1185,13 +1185,20 @@ impl WorkerCompletionHandler {
                             false
                         }
                         Err(err) => {
+                            // Transient API failure: cannot verify this turn, but do NOT
+                            // discard the staged URL. The cold-path detector runs below
+                            // as a fallback for this Stop. On the next merge-poller sweep
+                            // the staged URL is still present and verification is retried —
+                            // dropping here would strand the worker if the cold path also
+                            // fails. A definitive branch-name mismatch (the Ok(head_ref)
+                            // arm above) still evicts the URL immediately.
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
                                 ?err,
-                                "stop event: branch verification failed; dropping staged URL for safety",
+                                "stop event: branch verification failed transiently; \
+                                 keeping staged URL for retry on next sweep",
                             );
-                            self.staged_pr_urls.forget(execution_id);
                             false
                         }
                     },
@@ -1594,13 +1601,18 @@ must not be asked to open one",
                             false
                         }
                         Err(err) => {
+                            // Transient API failure: cannot verify this pass. Keep the
+                            // staged URL so the next sweep can retry verification rather
+                            // than falling back to the cold-path detector indefinitely.
+                            // Only a definitive branch-name mismatch (Ok arm above) evicts
+                            // the entry.
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
                                 ?err,
-                                "pr-recheck: branch verification failed; dropping staged URL for safety",
+                                "pr-recheck: branch verification failed transiently; \
+                                 keeping staged URL for retry on next sweep",
                             );
-                            self.staged_pr_urls.forget(execution_id);
                             false
                         }
                     },
@@ -4680,6 +4692,19 @@ mod tests {
         async fn set_body(&self, body: Result<String, String>) {
             *self.body_result.lock().await = body;
         }
+
+        /// Verifier that always returns a transient API error from
+        /// `fetch_pr_head_ref`. Used to test that a branch-verification
+        /// failure does NOT discard the staged URL (it is preserved for
+        /// the next sweep to retry).
+        fn err(message: &str) -> Arc<Self> {
+            Arc::new(Self {
+                result: Err(message.to_owned()),
+                head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
+                diff_line_count_result: Mutex::new(Ok(999)),
+                body_result: Mutex::new(Ok(String::new())),
+            })
+        }
     }
 
     #[async_trait]
@@ -5387,6 +5412,234 @@ mod tests {
         assert!(
             staged_pr_urls.get(&execution_id).is_none(),
             "mismatched staged URL must be cleared from the cache",
+        );
+    }
+
+    /// Regression for the 2026-06-09 incident (exec_18b7882532b66c00_14b):
+    /// a chore worker pushed a branch, opened a PR, and ended its turn at a
+    /// clean Stop boundary. The engine processed none of it: the PR was never
+    /// detected, the row never left `active`, and the worker session was never
+    /// released.
+    ///
+    /// Root cause: when the staged URL's branch verification call failed
+    /// transiently (GitHub API error), the staged URL was discarded. If the
+    /// cold-path detector also failed (same transient window), the engine
+    /// returned `DetectorFailed` with no probe, no attention item, and no
+    /// retry. Subsequent merge-poller `recheck_for_pr` sweeps had no staged
+    /// URL to retry and kept returning quietly if `detect_pr` also returned
+    /// `None`, leaving the worker at `waiting_for_input` indefinitely.
+    ///
+    /// The fix: do NOT discard the staged URL on a transient verification
+    /// error — only on a definitive branch-name mismatch. This ensures the
+    /// URL survives for the next sweep to retry.
+    #[tokio::test]
+    async fn on_stop_staged_url_preserved_when_branch_verification_errors() {
+        // Verifier returns a transient error; detector returns the correct
+        // PR so we can confirm the cold-path ran this turn AND the staged URL
+        // is still in the cache for the next sweep's retry.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1449"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/1449",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        // Verification errors — simulates the transient GitHub API failure
+        // that caused the 2026-06-09 incident.
+        .with_branch_verifier(StubBranchVerifier::err("GitHub API timeout"))
+        // Bypass the reviewer so on_stop goes straight to in_review (not
+        // PendingReview), making the transition observable in one step.
+        .with_max_review_cycles(0);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        // The cold-path detector was able to find the PR this turn and
+        // advanced the task even though branch verification errored.
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/1449"),
+            "cold path must still run after a transient verification error; got {outcome:?}",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "chore must advance to in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/1449"),
+                    "pr_url must be bound",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // The staged URL is cleared once finalization succeeds (not
+        // prematurely on verification error).
+        assert!(
+            staged_pr_urls.get(&execution_id).is_none(),
+            "staged URL must be cleared after successful finalization",
+        );
+        // Slot must be freed.
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "pane must be torn down",
+        );
+    }
+
+    /// Regression test for the happy path: worker opens a PR and stops →
+    /// chore advances to `in_review` with `pr_url` bound and the worker slot
+    /// freed. Covers the direct `in_review` transition (reviewer bypassed via
+    /// `max_review_cycles = 0`) to keep the assertion simple and focused on
+    /// the fundamental Stop → in_review invariant.
+    #[tokio::test]
+    async fn on_stop_chore_pr_opened_advances_to_in_review_slot_freed() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // Cold-path detector is not reached (staged URL takes the primary
+        // path), but wire it with a wrong URL so any accidental fall-through
+        // would produce an observable wrong `pr_url`.
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/1449",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(
+            &expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None),
+        ))
+        // Bypass reviewer: go directly to in_review so the transition is
+        // visible without a second execution.
+        .with_max_review_cycles(0);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/1449"),
+            "worker that opened a PR and stopped must produce PrDetected; got {outcome:?}",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "chore must be in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/1449"),
+                    "pr_url must match the staged URL",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Staged URL is cleared once DB write succeeds.
+        assert!(
+            staged_pr_urls.get(&execution_id).is_none(),
+            "staged URL must be cleared after successful finalization",
+        );
+        // Slot freed.
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released on successful PR completion",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "pane must be torn down on successful PR completion",
+        );
+        // No probe queued — the PR was already detected.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must be queued when the PR is already open",
+        );
+    }
+
+    /// Mirror of `on_stop_staged_url_preserved_when_branch_verification_errors`
+    /// for the merge-poller `recheck_for_pr` path: a transient verification
+    /// error must not evict the staged URL between sweeps.
+    #[tokio::test]
+    async fn recheck_staged_url_preserved_when_branch_verification_errors() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1449"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/1449",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_branch_verifier(StubBranchVerifier::err("transient API failure"))
+        .with_max_review_cycles(0);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        // Cold path picked up the PR even though verification errored.
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/1449"),
+            "recheck must advance on cold-path hit after transient verification error; got {outcome:?}",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "chore must be in_review after recheck");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/1449"),
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "recheck must release the cube lease on success",
         );
     }
 
