@@ -784,6 +784,17 @@ pub(crate) fn reconcile_revision_execution(
                 )?;
             }
         }
+        Some(existing)
+            if existing.kind == ExecutionKind::RevisionImplementation
+                && existing.status.is_live() =>
+        {
+            // A live execution (running or waiting_human) is already in
+            // progress — do not spawn a duplicate worker. Without this arm
+            // the `_ =>` branch fires for every reconcile tick while the
+            // execution is waiting_human, creating an unbounded cascade of
+            // ready executions and spawning multiple concurrent workers on
+            // the same revision task (T1503/T1496 regression).
+        }
         _ => {
             // No matching execution yet (or previous is terminal) — create one.
             let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {

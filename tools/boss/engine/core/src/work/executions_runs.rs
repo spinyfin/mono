@@ -723,6 +723,38 @@ impl WorkDb {
     /// callers may invoke once per execution start (or skip when no
     /// PR is bound). Empty `sha` is rejected — pass `None` semantics
     /// by simply not calling.
+    /// Stamp the "stop event was observed" marker for this execution.
+    /// Called by `on_stop_inner` the first time a Stop event fires.
+    /// The SHA-delta gate in `recheck_for_pr` checks this before running
+    /// for `revision_implementation` executions: the gate must only fire
+    /// *after* a Stop has been seen (as a recovery path for transient
+    /// failures), never while the revision worker is still running
+    /// between turns. Idempotent.
+    pub fn set_execution_stop_seen(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET stop_seen = 1 WHERE id = ?1",
+            params![execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return `true` if `on_stop_inner` has been called at least once for
+    /// this execution (i.e. the `stop_seen` flag is set). Returns `false`
+    /// for unknown execution IDs (treat as not seen, gate stays closed).
+    pub fn execution_stop_seen(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let seen: Option<i64> = conn
+            .query_row(
+                "SELECT stop_seen FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(seen.unwrap_or(0) != 0)
+    }
+
     pub fn set_execution_pr_head_before(&self, execution_id: &str, sha: &str) -> Result<()> {
         if sha.is_empty() {
             bail!("set_execution_pr_head_before: sha must be non-empty");

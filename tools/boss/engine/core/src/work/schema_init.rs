@@ -435,6 +435,16 @@ impl WorkDb {
         // instead of colliding with that row's UNIQUE slot forever
         // (T2396 / PR #1874).
         migrate_conflict_resolutions_widen_unique_key(&conn)?;
+        // Regression fix (T1503/T1496): SHA-delta gate in recheck_for_pr must
+        // only fire for revision executions after a Stop event has been
+        // observed, not the moment any commit lands on the parent PR. Without
+        // this guard the gate fires immediately when a *different* worker (e.g.
+        // the parent chore's worker, still active) pushes to the same PR,
+        // transitioning the revision to `in_review` before the revision worker
+        // has done any work. `stop_seen` is set by `on_stop_inner` the first
+        // time a Stop fires; the gate checks it before running the SHA delta
+        // comparison.
+        migrate_work_executions_stop_seen(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '24')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
