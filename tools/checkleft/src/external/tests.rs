@@ -363,14 +363,18 @@ version = 2
 fn composite_provider_reports_conflicts() {
     let package = ExternalCheckPackage {
         id: "domain-typo-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
+        runtime: "component-v1".to_owned(),
         api_version: "v1".to_owned(),
         capabilities: Default::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            super::ExternalCheckArtifactPackage {
+        implementation: ExternalCheckPackageImplementation::Component(
+            super::ExternalCheckComponentPackage {
                 artifact_path: "check.wasm".to_owned(),
                 artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
                 provenance: None,
             },
         ),

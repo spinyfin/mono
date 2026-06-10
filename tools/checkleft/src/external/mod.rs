@@ -7,10 +7,6 @@ use serde::Deserialize;
 
 use crate::path::validate_relative_path;
 
-/// Runtime tag for the legacy `sandbox-v1` wasm tier. Still referenced by
-/// `runtime.rs` execution for existing artifacts; no new manifests may use it
-/// (the `wasm` schema mode that selected it has been removed — see T7).
-pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
 /// Runtime tag for the `component` tier (WebAssembly Component Model). The
 /// `component` manifest mode selects this runtime.
 pub const EXTERNAL_CHECK_COMPONENT_RUNTIME_V1: &str = "component-v1";
@@ -112,9 +108,6 @@ pub enum ExternalCheckPackageImplementation {
     /// The `component` tier: a WebAssembly Component Model artifact with
     /// capability-scoped file access and resource limits.
     Component(ExternalCheckComponentPackage),
-    /// The legacy `sandbox-v1` wasm tier: a sandboxed core wasm artifact.
-    /// Kept for runtime execution compatibility pending T11 cleanup.
-    Artifact(ExternalCheckArtifactPackage),
     /// The `declarative` tier: framework-owned invocations + declarative
     /// transforms. Subsumes the former `exec` tier (via the `passthrough`
     /// transform).
@@ -153,13 +146,6 @@ pub struct ExternalCheckComponentLimits {
     pub max_memory_mb: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalCheckArtifactPackage {
-    pub artifact_path: String,
-    pub artifact_sha256: String,
-    pub provenance: Option<ExternalCheckArtifactProvenance>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalCheckArtifactProvenance {
@@ -168,9 +154,7 @@ pub struct ExternalCheckArtifactProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ExternalCheckCapabilities {
-    pub commands: Vec<String>,
-}
+pub struct ExternalCheckCapabilities {}
 
 pub trait ExternalCheckPackageProvider: Send + Sync {
     fn resolve(
@@ -187,8 +171,6 @@ pub use provider::{
     FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
     NoopExternalCheckPackageProvider,
 };
-mod command_policy;
-pub use command_policy::ExternalCommandCapabilities;
 mod component_bindings;
 mod runtime;
 pub use runtime::{
