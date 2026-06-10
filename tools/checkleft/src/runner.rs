@@ -194,13 +194,27 @@ impl Runner {
                     );
 
                     join_set.spawn(async move {
-                        external_executor
-                            .execute(&package, &run_changeset, source_tree.as_ref(), &run_config)
-                            .map(|mut result| {
-                                result.check_id = configured_check_id.clone();
-                                apply_policy_to_result(result, &run_policy, &run_changeset)
-                            })
-                            .map_err(|err| (configured_check_id, err))
+                        // The executor is synchronous but wasmtime-wasi internally calls
+                        // block_on, which panics if a Tokio runtime is already active on
+                        // the thread.  spawn_blocking moves execution onto a thread-pool
+                        // thread where no runtime is running.
+                        let check_id_clone = configured_check_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            external_executor
+                                .execute(
+                                    &package,
+                                    &run_changeset,
+                                    source_tree.as_ref(),
+                                    &run_config,
+                                )
+                                .map(|mut result| {
+                                    result.check_id = configured_check_id.clone();
+                                    apply_policy_to_result(result, &run_policy, &run_changeset)
+                                })
+                                .map_err(|err| (configured_check_id, err))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err((check_id_clone, anyhow!("executor panicked: {e}"))))
                     });
                 }
                 ScheduledExecution::Invalid {
@@ -287,15 +301,15 @@ impl Runner {
             let default_mode = resolved.stale_exclusion_mode();
 
             for check in resolved.enabled() {
-                // External checks audit through their own protocol, which is out of
-                // scope here; only built-in checks participate.
-                if check.implementation.is_some() {
-                    continue;
-                }
                 let mode = check.policy.stale_exclusion_mode.unwrap_or(default_mode);
                 let Some(severity) = mode.severity() else {
                     continue; // audit disabled for this check
                 };
+                // Only checks that have a native built-in can participate in
+                // stale-exclusion auditing.  Pure external/component checks that
+                // have no native counterpart are silently skipped here; bundled
+                // component checks that also have a native built-in (transition
+                // period) use the built-in's evaluate_exclusion.
                 let Some(built_in) = self.registry.get(&check.check) else {
                     continue;
                 };

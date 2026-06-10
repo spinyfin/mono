@@ -11,6 +11,7 @@ use crate::check::{Check, CheckRegistry, ConfiguredCheck};
 use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
 use crate::external::{
+    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor,
     ExternalCheckArtifactPackage, ExternalCheckExecutor, ExternalCheckImplementationRef,
     ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
     parse_external_check_package_manifest,
@@ -644,10 +645,14 @@ pub struct ServerState {
 async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry).expect("register built-ins");
-    let runner = Runner::new(
+    // Use the full external stack so bundled component checks resolve and execute.
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let runner = Runner::with_external(
         Arc::new(registry),
         Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(BundledExternalCheckPackageProvider),
+        Arc::new(executor),
     );
     runner
         .run_changeset(&ChangeSet::new(vec![ChangedFile {

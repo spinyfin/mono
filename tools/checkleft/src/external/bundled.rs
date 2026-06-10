@@ -58,10 +58,6 @@ enum BundledCheckDefKind {
     /// A WebAssembly Component Model artifact (`include_bytes!`-embedded at
     /// compile time). Each entry in `check_names` corresponds to one export of
     /// the component and resolves to a distinct logical package.
-    ///
-    /// No entries yet (first bundled component lands in T10). The variant and
-    /// resolver path exist so T10 is a pure data addition.
-    #[allow(dead_code)]
     Component {
         /// Raw wasm component bytes, embedded at compile time via `include_bytes!`.
         bytes: &'static [u8],
@@ -69,13 +65,25 @@ enum BundledCheckDefKind {
 }
 
 /// The embedded first-party definitions. To add one, see the module docs.
-static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[BundledCheckDef {
-    check_names: &["buildifier"],
-    kind: BundledCheckDefKind::Declarative {
-        extension: "yaml",
-        contents: include_str!("../../checks/buildifier/check.yaml"),
+static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
+    BundledCheckDef {
+        check_names: &["buildifier"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/buildifier/check.yaml"),
+        },
     },
-}];
+    BundledCheckDef {
+        check_names: &["rust-giant-structs-use-builder"],
+        kind: BundledCheckDefKind::Component {
+            // Bytes come from the checkleft_wasm_bundle micro-library so the
+            // generated wasm artifact lives in that target's compile_data, not
+            // in checkleft_lib's.  That separation keeps checkleft_lib in
+            // "source mode" and preserves CARGO_MANIFEST_DIR for bindgen!.
+            bytes: checkleft_wasm_bundle::WASM,
+        },
+    },
+];
 
 /// Names of all bundled definitions (for diagnostics / `--list`-style output).
 pub fn bundled_check_names() -> impl Iterator<Item = &'static str> {

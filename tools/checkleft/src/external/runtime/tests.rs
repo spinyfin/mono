@@ -831,3 +831,131 @@ fn memory_cap_trip_via_resource_limiter() {
         "memory.grow must return -1 when the cap is exceeded"
     );
 }
+
+// --- T10: rust-giant-structs-use-builder end-to-end test ---
+//
+// This is the acceptance proof for the CM-wasm project: the check is authored
+// on the guest SDK, built end-to-end under bazel via the rust_wasm_component
+// rule (T9), bundled via the BundledExternalCheckPackageProvider (T8), and run
+// through the full component-v1 host (T3-T6) with a modified-only sandbox.
+
+#[test]
+fn bundled_giant_structs_check_finds_violation_in_rs_file() {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
+        ExternalCheckPackageProvider as _,
+    };
+    use std::path::Path;
+
+    // A Rust source file with a 6-field struct and no builder derive — must trigger.
+    const VIOLATION_SOURCE: &str = r#"pub struct GiantStruct {
+    a: String,
+    b: String,
+    c: String,
+    d: String,
+    e: String,
+    f: String,
+}
+"#;
+
+    // Create a sandbox with the .rs file as the only changed file.
+    let temp = tempdir().expect("temp dir");
+    fs::write(temp.path().join("src.rs"), VIOLATION_SOURCE).expect("write source");
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    // Resolve the bundled component package for the check.
+    let provider = BundledExternalCheckPackageProvider;
+    let package = provider
+        .resolve(&ExternalCheckImplementationRef::Bundled(
+            "rust-giant-structs-use-builder".to_owned(),
+        ))
+        .expect("resolve")
+        .expect("bundled package must exist");
+
+    // Run through the full component-v1 host with modified-only sandbox (the default).
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let result = executor
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert_eq!(result.check_id, "rust-giant-structs-use-builder");
+    assert_eq!(result.findings.len(), 1, "expected exactly one finding for GiantStruct");
+
+    let finding = &result.findings[0];
+    assert!(
+        finding.message.contains("GiantStruct"),
+        "finding message must mention the struct name; got: {}",
+        finding.message
+    );
+    assert!(
+        finding.message.contains("bon::Builder"),
+        "finding message must mention bon::Builder; got: {}",
+        finding.message
+    );
+    // Location must point at the .rs file the guest read from the sandbox.
+    let loc = finding.location.as_ref().expect("finding must have location");
+    assert_eq!(loc.path, Path::new("src.rs"));
+}
+
+/// Verifies the modified-only scope: a file that was NOT in the changeset must
+/// not be read even when it contains violations — the sandbox excludes it.
+#[test]
+fn bundled_giant_structs_check_skips_files_not_in_changeset() {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
+        ExternalCheckPackageProvider as _,
+    };
+
+    const VIOLATION_SOURCE: &str = r#"pub struct GiantStruct {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+
+    let temp = tempdir().expect("temp dir");
+    // Write the file but do NOT include it in the changeset.
+    fs::write(temp.path().join("out_of_scope.rs"), VIOLATION_SOURCE).expect("write source");
+    // The changeset only contains a harmless file.
+    fs::write(temp.path().join("empty.rs"), "").expect("write empty");
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("empty.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let provider = BundledExternalCheckPackageProvider;
+    let package = provider
+        .resolve(&ExternalCheckImplementationRef::Bundled(
+            "rust-giant-structs-use-builder".to_owned(),
+        ))
+        .expect("resolve")
+        .expect("bundled package must exist");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let result = executor
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert!(
+        result.findings.is_empty(),
+        "out-of-scope file must not be read; got {} finding(s)",
+        result.findings.len()
+    );
+}
