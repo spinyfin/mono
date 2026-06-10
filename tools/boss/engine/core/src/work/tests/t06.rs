@@ -2598,3 +2598,111 @@ fn abandoned_conflict_resolution_revision_execution_has_no_run_row() {
         "no transcript path must be recorded for an execution that was never dispatched",
     );
 }
+
+// ── T1503/T1496 regression: revision rows must not jump to in_review ─────────
+// while their execution is live.
+
+/// Regression (T1503/T1496): `reconcile_revision_execution` must NOT create a
+/// duplicate `ready` execution when the revision task already has a live
+/// (`running` or `waiting_human`) execution. Before the fix the `_ =>` arm
+/// fired for every reconcile tick while the execution was `waiting_human`
+/// (because `waiting_human.can_reconcile()` is `false`, so neither of the two
+/// update arms matched), producing an unbounded cascade of `ready` rows that
+/// each spawned a fresh worker — up to 8+ concurrent workers on the same
+/// revision task.
+///
+/// After the fix a new arm explicitly matches `is_live()` executions and
+/// returns early without creating anything.
+#[test]
+fn reconcile_does_not_create_duplicate_execution_for_live_revision() {
+    let db = WorkDb::open(temp_db_path("revision-no-dup-live")).unwrap();
+    let product_id = make_revision_product(&db, "no-dup-live");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1425";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+    // First reconcile creates the initial ready execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1, "first reconcile must create exactly one execution");
+    assert_eq!(execs[0].1, "ready");
+
+    // Simulate pane spawn: coordinator sets task active, execution → waiting_human.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'waiting_human' WHERE id = ?1",
+        rusqlite::params![execs[0].0],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![revision_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Second reconcile — the live execution guard must prevent a duplicate.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs_after = executions_for(&db, &revision_id);
+    assert_eq!(
+        execs_after.len(),
+        1,
+        "reconcile must not create a duplicate execution while a live one exists: {execs_after:?}",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "active",
+        "revision must remain active while its execution is live",
+    );
+
+    // Third reconcile: idempotent — still no duplicate.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs_third = executions_for(&db, &revision_id);
+    assert_eq!(
+        execs_third.len(),
+        1,
+        "repeated reconcile must remain idempotent for live revision: {execs_third:?}",
+    );
+}
+
+/// Variant: same guard applies when the execution is `running` (not just
+/// `waiting_human`). A running execution is also `is_live()` and must not
+/// receive a duplicate.
+#[test]
+fn reconcile_does_not_create_duplicate_execution_for_running_revision() {
+    let db = WorkDb::open(temp_db_path("revision-no-dup-running")).unwrap();
+    let product_id = make_revision_product(&db, "no-dup-running");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1426";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+    // First reconcile creates the initial ready execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].1, "ready");
+
+    // Simulate execution in running state.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+        rusqlite::params![execs[0].0],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![revision_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Reconcile must not create a duplicate.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs_after = executions_for(&db, &revision_id);
+    assert_eq!(
+        execs_after.len(),
+        1,
+        "reconcile must not create a duplicate execution while execution is running: {execs_after:?}",
+    );
+    assert_eq!(task_status(&db, &revision_id), "active");
+}
