@@ -99,7 +99,6 @@ pub struct ExternalCheckPackage {
     pub id: String,
     pub runtime: String,
     pub api_version: String,
-    pub capabilities: ExternalCheckCapabilities,
     pub implementation: ExternalCheckPackageImplementation,
 }
 
@@ -152,9 +151,6 @@ pub struct ExternalCheckArtifactProvenance {
     pub generator: Option<String>,
     pub target: Option<String>,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ExternalCheckCapabilities {}
 
 pub trait ExternalCheckPackageProvider: Send + Sync {
     fn resolve(
@@ -261,7 +257,6 @@ impl RawDeclarativeCheckManifest {
             id,
             runtime,
             api_version,
-            capabilities: ExternalCheckCapabilities::default(),
             implementation: ExternalCheckPackageImplementation::Declarative(
                 declarative::validate_declarative_implementation(declarative_fields)?,
             ),
@@ -377,7 +372,6 @@ impl RawExternalCheckPackage {
             id,
             runtime,
             api_version,
-            capabilities: ExternalCheckCapabilities::default(),
             implementation,
         })
     }

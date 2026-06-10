@@ -94,7 +94,6 @@ allow_bypass = true
             id: "different-id".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
             implementation: ExternalCheckPackageImplementation::Component(
                 ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
@@ -156,7 +155,6 @@ allow_bypass = true
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
             implementation: ExternalCheckPackageImplementation::Component(
                 ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
@@ -299,7 +297,6 @@ severity = "error"
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
             implementation: ExternalCheckPackageImplementation::Component(
                 ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
@@ -375,7 +372,6 @@ allow_bypass = true
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
             implementation: ExternalCheckPackageImplementation::Component(
                 ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
@@ -455,7 +451,6 @@ implementation = "generated:domain-typo-check"
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
             implementation: ExternalCheckPackageImplementation::Component(
                 ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),

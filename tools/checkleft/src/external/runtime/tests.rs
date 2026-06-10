@@ -4,9 +4,8 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::external::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckCapabilities,
-    ExternalCheckComponentLimits, ExternalCheckComponentPackage, ExternalCheckPackage,
-    ExternalCheckPackageImplementation,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
+    ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
 use crate::output::Severity;
@@ -42,7 +41,6 @@ fn component_v1_non_component_bytes_give_compile_error() {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
         implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
             artifact_path: "check.wasm".to_owned(),
             artifact_sha256,
@@ -87,7 +85,6 @@ fn component_v1_digest_mismatch_is_rejected() {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
         implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
             artifact_path: "check.wasm".to_owned(),
             artifact_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
