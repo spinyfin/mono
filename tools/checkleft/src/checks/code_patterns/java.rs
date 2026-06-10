@@ -141,7 +141,7 @@ fn find_imports(root: Node<'_>, source: &[u8]) -> HashMap<String, String> {
             continue;
         }
         let segments = node_named_children_text(child, source);
-        if segments.iter().any(|segment| *segment == "*") {
+        if segments.contains(&"*") {
             continue;
         }
         let Some(full_path) = segments.last() else {

@@ -96,17 +96,12 @@ pub struct CheckPolicyConfig {
 /// [`Warn`](StaleExclusionMode::Warn); a repo can set it to
 /// [`Error`](StaleExclusionMode::Error) to fail CI on dead exclusions, or
 /// [`Off`](StaleExclusionMode::Off) to disable the audit entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StaleExclusionMode {
     Off,
+    #[default]
     Warn,
     Error,
-}
-
-impl Default for StaleExclusionMode {
-    fn default() -> Self {
-        Self::Warn
-    }
 }
 
 impl StaleExclusionMode {
@@ -628,12 +623,11 @@ fn resolve_check_implementation(
     let in_bundled = is_bundled_check_name(check_name);
 
     // When allow_override_bundled, exec_paths take priority over bundled.
-    if definitions.allow_override_bundled {
-        if let Some(root) = repo_root {
-            if let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)? {
-                return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
-            }
-        }
+    if definitions.allow_override_bundled
+        && let Some(root) = repo_root
+        && let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)?
+    {
+        return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
     }
 
     // Bundled defs (embedded in binary, zero install).
@@ -644,12 +638,11 @@ fn resolve_check_implementation(
     }
 
     // exec_paths at lower priority (when bundled does not win).
-    if !definitions.allow_override_bundled {
-        if let Some(root) = repo_root {
-            if let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)? {
-                return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
-            }
-        }
+    if !definitions.allow_override_bundled
+        && let Some(root) = repo_root
+        && let Some(file_ref) = find_in_exec_paths(&definitions.exec_paths, check_name, root)?
+    {
+        return Ok(Some(ExternalCheckImplementationRef::File(file_ref)));
     }
 
     // Not found in bundled or exec_paths → None (falls through to Rust built-in registry).
@@ -930,16 +923,16 @@ fn apply_external_checks_file(
 
     // Reject exec_paths in external configs — they would reach into the consuming
     // repo's local filesystem, which is the same trust boundary as a File implementation ref.
-    if let Some(raw_defs) = &external_checks_file.parsed.check_definitions {
-        if !raw_defs.exec_paths.is_empty() {
-            bail!(
-                "`check_definitions.exec_paths` is not allowed in an external checks config ({}); \
-                 a directory path source would reach into the consuming repo's local filesystem",
-                external_checks_file.source_label
-            );
-        }
-        // allow_override_bundled without exec_paths is a no-op for remote configs, ignore.
+    if let Some(raw_defs) = &external_checks_file.parsed.check_definitions
+        && !raw_defs.exec_paths.is_empty()
+    {
+        bail!(
+            "`check_definitions.exec_paths` is not allowed in an external checks config ({}); \
+             a directory path source would reach into the consuming repo's local filesystem",
+            external_checks_file.source_label
+        );
     }
+    // allow_override_bundled without exec_paths is a no-op for remote configs, ignore.
 
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();

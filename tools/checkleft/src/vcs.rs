@@ -421,10 +421,8 @@ fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
         stripped
     } else if let Some(stripped) = remote_url.strip_prefix("https://github.com/") {
         stripped
-    } else if let Some(stripped) = remote_url.strip_prefix("ssh://git@github.com/") {
-        stripped
     } else {
-        return None;
+        remote_url.strip_prefix("ssh://git@github.com/")?
     };
 
     let repo_path = repo_path.trim_end_matches(".git").trim_matches('/');

@@ -101,7 +101,7 @@ impl ConfiguredCheck for ParsedConfig {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if !changed_file.path.extension().map_or(false, |e| e == "rs") {
+            if changed_file.path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
             if let Some(globs) = &self.exclude_files {
@@ -293,6 +293,7 @@ fn struct_is_giant(
 /// Collect `(name, explicit_field_count)` for every struct literal in `items` that:
 /// - sets more than `max_fields` explicitly-named fields, AND
 /// - has no functional-update spread (`..rest`).
+///
 /// Items inside `#[cfg(test)]` modules/functions are skipped.
 fn collect_large_literals_in_items(
     items: &[syn::Item],
@@ -322,20 +323,17 @@ fn collect_large_literals_in_items(
                 for trait_item in &t.items {
                     if let syn::TraitItem::Fn(f) = trait_item
                         && let Some(body) = &f.default
-                            && !in_test_mod {
-                                collect_large_in_block(body, max_fields, out);
-                            }
+                        && !in_test_mod
+                    {
+                        collect_large_in_block(body, max_fields, out);
+                    }
                 }
             }
-            syn::Item::Const(c) => {
-                if !in_test_mod {
-                    collect_large_in_expr(&c.expr, max_fields, out);
-                }
+            syn::Item::Const(c) if !in_test_mod => {
+                collect_large_in_expr(&c.expr, max_fields, out);
             }
-            syn::Item::Static(s) => {
-                if !in_test_mod {
-                    collect_large_in_expr(&s.expr, max_fields, out);
-                }
+            syn::Item::Static(s) if !in_test_mod => {
+                collect_large_in_expr(&s.expr, max_fields, out);
             }
             syn::Item::Mod(m) => {
                 let is_test = has_cfg_test(&m.attrs);

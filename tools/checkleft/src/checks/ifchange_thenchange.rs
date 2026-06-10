@@ -132,7 +132,7 @@ fn analyze_changed_file(
         ) {
             Ok(parsed) => Some(parsed),
             Err(finding) => {
-                parse_findings.push(finding);
+                parse_findings.push(*finding);
                 None
             }
         }
@@ -151,7 +151,7 @@ fn analyze_changed_file(
         ) {
             Ok(parsed) => Some(parsed),
             Err(finding) => {
-                parse_findings.push(finding);
+                parse_findings.push(*finding);
                 None
             }
         }
@@ -198,10 +198,9 @@ fn parse_versioned_file(
     version: TreeVersion,
     finding_path: &Path,
     severity: Severity,
-) -> std::result::Result<ParsedIfChangeFile, Finding> {
-    let contents = tree
-        .read_file_versioned(path, version)
-        .map_err(|error| Finding {
+) -> std::result::Result<ParsedIfChangeFile, Box<Finding>> {
+    let contents = tree.read_file_versioned(path, version).map_err(|error| {
+        Box::new(Finding {
             severity,
             message: format!(
                 "failed to read `{}` for ifchange analysis: {error}",
@@ -214,32 +213,37 @@ fn parse_versioned_file(
             }),
             remediations: vec![],
             suggested_fix: None,
-        })?;
-    let contents = String::from_utf8(contents).map_err(|error| Finding {
-        severity,
-        message: format!(
-            "failed to parse `{}` for ifchange analysis as utf-8: {error}",
-            path.display()
-        ),
-        location: Some(Location {
-            path: finding_path.to_path_buf(),
-            line: None,
-            column: None,
-        }),
-        remediations: vec![],
-        suggested_fix: None,
+        })
+    })?;
+    let contents = String::from_utf8(contents).map_err(|error| {
+        Box::new(Finding {
+            severity,
+            message: format!(
+                "failed to parse `{}` for ifchange analysis as utf-8: {error}",
+                path.display()
+            ),
+            location: Some(Location {
+                path: finding_path.to_path_buf(),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: None,
+        })
     })?;
 
-    parse_ifchange_file(path, &contents).map_err(|error| Finding {
-        severity,
-        message: error.to_string(),
-        location: Some(Location {
-            path: finding_path.to_path_buf(),
-            line: None,
-            column: None,
-        }),
-        remediations: vec![],
-        suggested_fix: None,
+    parse_ifchange_file(path, &contents).map_err(|error| {
+        Box::new(Finding {
+            severity,
+            message: error.to_string(),
+            location: Some(Location {
+                path: finding_path.to_path_buf(),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: None,
+        })
     })
 }
 

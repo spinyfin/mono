@@ -134,11 +134,7 @@ impl ConfiguredCheck for ParsedConfig {
                 continue;
             }
 
-            if !changed_file
-                .path
-                .extension()
-                .map_or(false, |e| e == "rs")
-            {
+            if changed_file.path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
 

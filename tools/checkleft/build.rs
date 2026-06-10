@@ -35,12 +35,11 @@ fn extract_wasmtime_version_from_lock(lock: &str) -> Option<String> {
         if line == r#"name = "wasmtime""# {
             in_wasmtime_package = true;
         }
-        if in_wasmtime_package {
-            if let Some(rest) = line.strip_prefix("version = \"") {
-                if let Some(v) = rest.strip_suffix('"') {
-                    return Some(v.to_owned());
-                }
-            }
+        if in_wasmtime_package
+            && let Some(rest) = line.strip_prefix("version = \"")
+            && let Some(v) = rest.strip_suffix('"')
+        {
+            return Some(v.to_owned());
         }
     }
     None
