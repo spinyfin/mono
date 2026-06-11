@@ -868,17 +868,20 @@ impl RevisionSource for AtomicU64 {
 }
 
 #[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
     /// Dedicated pool for automation triage and automation-produced task
     /// executions. Sized independently from the main pool (default 3) so
     /// maintenance work never contends with interactive dispatch.
+    #[builder(default = WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE))]
     automation_pool: WorkerPool,
     /// Dedicated pool for `pr_review` reviewer executions. Sized
     /// independently (default small — see [`DEFAULT_REVIEW_POOL_SIZE`]) so
     /// review latency and always-Opus review spend stay isolated from both
     /// the main and automation pools.
+    #[builder(default = WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE))]
     review_pool: WorkerPool,
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
@@ -891,6 +894,7 @@ pub struct ExecutionCoordinator {
     /// [`crate::host_adapter::SshHostAdapterProvider`] via
     /// [`Self::set_host_adapter_provider`].
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
+    #[builder(default = Arc::new(NoopExecutionPublisher))]
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
     /// no-op so legacy tests and short-lived callers don't need to
@@ -898,10 +902,12 @@ pub struct ExecutionCoordinator {
     /// [`crate::dispatch_events::JsonlFileSink`] via
     /// [`ExecutionCoordinator::set_dispatch_events`] before
     /// scheduling starts.
+    #[builder(default = Arc::new(NoopDispatchEventSink))]
     dispatch_events: Arc<dyn DispatchEventSink>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
+    #[builder(default)]
     scheduling_active: AtomicBool,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
@@ -911,6 +917,7 @@ pub struct ExecutionCoordinator {
     /// the drain loop instead of being silently dropped. Closes the
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
+    #[builder(default)]
     scheduling_pending: AtomicBool,
     /// Repo origin URLs the cold-pool probe has already inspected in
     /// this engine's lifetime. The probe runs once per URL on the
@@ -919,10 +926,12 @@ pub struct ExecutionCoordinator {
     /// round-trip and the attention-item write. Engine restart resets
     /// this; per `multi-repo-work-modeling.md` R4 the deduplication
     /// scope is engine-lifetime, not durable.
+    #[builder(default)]
     repo_cold_probe_seen: Mutex<HashSet<String>>,
     /// Backoff delays between successive pre-start retry attempts.
     /// Defaults to [`PRE_START_RETRY_DELAYS`]. Tests may override via
     /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
+    #[builder(default = PRE_START_RETRY_DELAYS.to_vec())]
     pre_start_retry_delays: Vec<Duration>,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the lease counters pre-registered so tests that do not call
@@ -934,14 +943,17 @@ pub struct ExecutionCoordinator {
     /// the `WorkerCompletionHandler` via
     /// [`Self::set_execution_started_hook`] so the SHA-delta gate
     /// can snapshot the bound chore PR's head SHA at run start.
+    #[builder(default = Arc::new(NoopExecutionStartedHook))]
     execution_started_hook: Arc<dyn ExecutionStartedHook>,
     /// Global dispatch-pause flag. When `true`, `drain_ready_queue` exits
     /// immediately without claiming any slots. Seeded from the `dispatch_paused`
     /// metadata key at engine startup; persisted there on every toggle so the
     /// pause survives an engine restart.
+    #[builder(default)]
     dispatch_paused: AtomicBool,
     /// Epoch seconds when dispatch was last paused. Zero means "not paused".
     /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
+    #[builder(default)]
     dispatch_paused_since_epoch_s: AtomicU64,
 }
 
