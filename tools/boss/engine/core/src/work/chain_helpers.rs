@@ -1,5 +1,18 @@
 use super::*;
 
+/// `true` when `created_via` identifies the revision as an engine-managed
+/// kind that is automatically resolved when the parent PR merges: a
+/// merge-conflict-resolution revision or a CI-fix revision.
+///
+/// A conflicting PR cannot merge while still conflicted; a CI-failing PR
+/// cannot merge while CI is failing — so by the time the parent PR merges,
+/// those issues were already resolved.  Archiving the revision silently
+/// avoids a dangling attention item or a spurious follow-up chore.
+pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
+    created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        || created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX)
+}
+
 /// Walk `tasks.parent_task_id` from `task_id` to find the originating
 /// non-revision task (the "chain root") — the task that owns the PR.
 ///
@@ -112,55 +125,105 @@ pub(crate) fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str)
     Ok(ids)
 }
 
-/// Block every revision in the chain whose status is still
-/// pre-dispatch (i.e. the worker never finished pushing a commit) when
-/// the parent PR merges or closes.  These revisions can no longer
-/// deliver to the parent PR's branch (it's gone), so they must not be
-/// dispatched.
+/// Reconcile every pending revision in the chain when the parent PR merges
+/// or closes externally.  The three cases handled here mirror the design doc:
 ///
-/// Revisions already in `in_review` are handled by
-/// [`flip_in_review_revisions_to_done`] (their commit rode the PR to
-/// completion).  Revisions already `done`, `archived`, or
-/// `blocked: parent_pr_closed` are already in a terminal or equivalent
-/// state and are skipped.
+/// 1. **Moot kinds** (`merge-conflict:*` / `ci-fix:*`) — the PR could not have
+///    merged without those issues being resolved.  Archive silently; no
+///    follow-up is needed.
 ///
-/// Each newly blocked revision gets a `work_attention_items` row so
-/// the kanban card explains what happened and points the operator to
-/// `boss task create` for follow-up work.
+/// 2. **Non-moot, active (WIP)** — the worker was mid-flight but the PR target
+///    is gone.  Create a standalone chore with `autostart = true` so the work
+///    is restarted on a fresh PR.  Archive the revision.  The in-flight
+///    execution is stopped by the merge-poller's `stop_active_revision_executions`
+///    call that runs immediately after this function returns.
+///
+/// 3. **Non-moot, in backlog** (`todo` / `blocked` for another reason) — the
+///    work hasn't started yet.  Create a standalone chore with
+///    `autostart = false` so the operator controls when it runs.  Archive the
+///    revision.
+///
+/// `in_review` revisions are handled by [`flip_in_review_revisions_to_done`]
+/// (their commit rode the PR to merge).  Terminal revisions (`done`,
+/// `archived`, `cancelled`) and revisions already blocked with
+/// `parent_pr_closed` are skipped.
 pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_root_id: &str, now: &str) -> Result<()> {
     let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
     if revision_ids.is_empty() {
         return Ok(());
     }
     for rev_id in &revision_ids {
-        let rows_changed = conn.execute(
-            "UPDATE tasks
-             SET status            = 'blocked',
-                 blocked_reason    = 'parent_pr_closed',
-                 last_status_actor = 'engine',
-                 updated_at        = ?2
-             WHERE id = ?1
-               AND kind = 'revision'
-               AND status NOT IN ('blocked', 'done', 'archived', 'in_review')
-               AND deleted_at IS NULL",
-            params![rev_id, now],
-        )?;
-        if rows_changed > 0 {
+        let Some(rev) = query_task(conn, rev_id)? else {
+            continue;
+        };
+        if matches!(
+            rev.status,
+            TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
+        ) {
+            continue;
+        }
+        if rev.status == TaskStatus::Blocked
+            && rev.blocked_reason.as_deref() == Some("parent_pr_closed")
+        {
+            continue;
+        }
+
+        if is_moot_revision_kind(&rev.created_via) {
+            let rows_changed = conn.execute(
+                "UPDATE tasks
+                 SET status            = 'archived',
+                     last_status_actor = 'engine',
+                     updated_at        = ?2
+                 WHERE id = ?1
+                   AND kind = 'revision'
+                   AND deleted_at IS NULL",
+                params![rev_id, now],
+            )?;
+            if rows_changed > 0 {
+                tracing::info!(
+                    revision_id = %rev_id,
+                    chain_root_id,
+                    created_via = %rev.created_via,
+                    "block_pending_revisions: moot revision archived \
+                     (merge-conflict/CI-fix; parent PR merged)",
+                );
+            }
+        } else {
+            let is_wip = rev.status == TaskStatus::Active;
+            let new_chore = insert_chore_in_tx(
+                conn,
+                CreateChoreInput {
+                    product_id: rev.product_id.clone(),
+                    autostart: is_wip,
+                    force_duplicate: true,
+                    name: rev.name.clone(),
+                    created_via: Some(CREATED_VIA_ENGINE_AUTO.to_owned()),
+                    description: Some(rev.description.clone()),
+                    effort_level: rev.effort_level,
+                    model_override: rev.model_override.clone(),
+                    priority: Some(rev.priority.clone()),
+                    repo_remote_url: rev.repo_remote_url.clone(),
+                },
+            )?;
+            conn.execute(
+                "UPDATE tasks
+                 SET status            = 'archived',
+                     last_status_actor = 'engine',
+                     updated_at        = ?2
+                 WHERE id = ?1
+                   AND kind = 'revision'
+                   AND deleted_at IS NULL",
+                params![rev_id, now],
+            )?;
             tracing::info!(
                 revision_id = %rev_id,
+                new_chore_id = %new_chore.id,
                 chain_root_id,
-                "block_pending_revisions: parent PR closed/merged; blocking revision",
+                is_wip,
+                "block_pending_revisions: revision converted to standalone chore \
+                 (parent PR merged; chore will {})",
+                if is_wip { "auto-dispatch" } else { "stay in backlog" },
             );
-            let attn_id = next_id("attn");
-            conn.execute(
-                "INSERT INTO work_attention_items
-                     (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at)
-                 VALUES (?1, NULL, ?2, 'revision_parent_closed', 'open',
-                         'Parent PR merged while revision was pending',
-                         'The parent task''s PR was merged or closed before this revision could push its commit. The revision cannot be delivered. File a new chore (`boss task create`) to continue the work on the updated main branch.',
-                         ?3)",
-                params![attn_id, rev_id, now],
-            )?;
         }
     }
     Ok(())

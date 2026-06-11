@@ -1458,12 +1458,13 @@ fn create_revision_skips_done_revision_as_tail() {
 
 // ── block_pending_revisions_on_parent_close / parent-PR-merged invalidation ─
 
-/// When the parent PR merges, a `todo` revision must be blocked with
-/// `parent_pr_closed` and an attention item surfaced.
+/// When the parent PR merges, a human-filed `todo` revision must be converted
+/// to a standalone backlog chore (autostart=false) and the revision itself
+/// archived.  The operator's ask is preserved in the new chore's description.
 #[test]
-fn mark_chore_pr_merged_blocks_todo_revision() {
-    let db = WorkDb::open(temp_db_path("rev-invalidate-todo")).unwrap();
-    let product_id = make_revision_product(&db, "inv-todo");
+fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
+    let db = WorkDb::open(temp_db_path("rev-convert-todo")).unwrap();
+    let product_id = make_revision_product(&db, "conv-todo");
     let pr_url = "https://github.com/spinyfin/mono/pull/805";
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
@@ -1471,31 +1472,36 @@ fn mark_chore_pr_merged_blocks_todo_revision() {
     let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
     assert_eq!(revision.status, TaskStatus::Todo);
 
-    // Simulate the parent PR merging.
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
-    // The revision must now be blocked.
+    // The revision must now be archived.
     let rev_after = match db.get_work_item(&revision.id).unwrap() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
         rev_after.status,
-        TaskStatus::Blocked,
-        "todo revision must be blocked after parent PR merges"
+        TaskStatus::Archived,
+        "todo revision must be archived after parent PR merges",
     );
-    assert_eq!(
-        rev_after.blocked_reason.as_deref(),
-        Some("parent_pr_closed"),
-        "blocked_reason must be 'parent_pr_closed'"
-    );
+    assert_eq!(rev_after.blocked_reason, None, "archived revision must have no blocked_reason");
 
-    // An attention item must be present for the revision.
-    let attn = db.list_attention_items_for_work_item(&revision.id).unwrap();
+    // A new standalone chore must carry the revision's name/description.
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    let new_chore = chores
+        .iter()
+        .find(|c| c.id != parent_id && c.name == revision.name);
     assert!(
-        attn.iter().any(|a| a.kind == "revision_parent_closed"),
-        "attention item 'revision_parent_closed' must be created for a blocked revision; got: {attn:?}",
+        new_chore.is_some(),
+        "a new standalone chore must be created from the revision; chores: {chores:?}",
     );
+    let new_chore = new_chore.unwrap();
+    assert_eq!(
+        new_chore.description, revision.description,
+        "converted chore must carry the revision's description",
+    );
+    assert!(!new_chore.autostart, "backlog-converted revision must yield a non-autostart chore");
+    assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
 }
 
 /// A revision already in `in_review` must be flipped to `done` (not
@@ -1566,6 +1572,113 @@ fn mark_chore_pr_merged_does_not_re_block_done_revision() {
         rev_after.blocked_reason, None,
         "done revision must not acquire a blocked_reason"
     );
+}
+
+/// A merge-conflict-resolution revision is moot by construction — the PR
+/// cannot merge while the conflict stands.  When the parent PR merges the
+/// revision must be archived silently (no follow-up chore, no attention item).
+#[test]
+fn mark_chore_pr_merged_retires_moot_merge_conflict_revision() {
+    let db = WorkDb::open(temp_db_path("rev-moot-merge-conflict")).unwrap();
+    let product_id = make_revision_product(&db, "moot-crz");
+    let pr_url = "https://github.com/spinyfin/mono/pull/820";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // Create a conflict-resolution revision the same way `conflict_watch` does.
+    let crz_id = "crz_fake_for_moot_test";
+    let rev_id = insert_conflict_revision_row(&db, &product_id, &parent_id, crz_id);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    assert_eq!(
+        task_status(&db, &rev_id),
+        "archived",
+        "moot merge-conflict revision must be archived when parent PR merges",
+    );
+
+    // No standalone chore must be spawned for a moot revision.
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    assert!(
+        !chores.iter().any(|c| c.id != parent_id),
+        "no new chore must be created for a moot revision; chores: {chores:?}",
+    );
+}
+
+/// A CI-fix revision is moot by construction — the PR cannot merge while CI
+/// is failing.  Archive it silently without creating a follow-up chore.
+#[test]
+fn mark_chore_pr_merged_retires_moot_ci_fix_revision() {
+    let db = WorkDb::open(temp_db_path("rev-moot-ci-fix")).unwrap();
+    let product_id = make_revision_product(&db, "moot-ci");
+    let pr_url = "https://github.com/spinyfin/mono/pull/821";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let rem_id = "rem_fake_for_moot_test";
+    let rev_id = insert_ci_fix_revision_row(&db, &product_id, &parent_id, rem_id);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    assert_eq!(
+        task_status(&db, &rev_id),
+        "archived",
+        "moot CI-fix revision must be archived when parent PR merges",
+    );
+
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    assert!(
+        !chores.iter().any(|c| c.id != parent_id),
+        "no new chore must be created for a moot CI-fix revision; chores: {chores:?}",
+    );
+}
+
+/// An `active` (WIP) human-filed revision must be converted to a standalone
+/// chore with `autostart = true` so the work is immediately redispatched on a
+/// fresh PR.  The revision itself is archived.
+#[test]
+fn mark_chore_pr_merged_converts_active_revision_to_autostart_chore() {
+    let db = WorkDb::open(temp_db_path("rev-convert-active")).unwrap();
+    let product_id = make_revision_product(&db, "conv-active");
+    let pr_url = "https://github.com/spinyfin/mono/pull/822";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    // Simulate the revision being dispatched (worker running).
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![revision.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    assert_eq!(
+        task_status(&db, &revision.id),
+        "archived",
+        "active (WIP) revision must be archived after parent PR merges",
+    );
+
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    let new_chore = chores
+        .iter()
+        .find(|c| c.id != parent_id && c.name == revision.name);
+    assert!(
+        new_chore.is_some(),
+        "a new standalone chore must be created for a WIP revision; chores: {chores:?}",
+    );
+    let new_chore = new_chore.unwrap();
+    assert_eq!(
+        new_chore.description, revision.description,
+        "converted chore must carry the revision's description",
+    );
+    assert!(
+        new_chore.autostart,
+        "WIP-converted revision must yield an autostart chore (restart immediately)",
+    );
+    assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
 }
 
 /// `list_active_revision_executions_for_chain` returns executions with a

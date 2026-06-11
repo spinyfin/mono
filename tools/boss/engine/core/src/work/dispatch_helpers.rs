@@ -509,39 +509,87 @@ pub(crate) fn reconcile_revision_execution(
         }
     };
 
-    // Cached dispatch-time gate: if the chain root is `done`, the PR has
-    // merged or been closed.  Auto-block the revision so it doesn't get
-    // dispatched into an already-merged branch.
+    // Dispatch-time catch-up gate: if the chain root is already `done` or
+    // `archived` the parent PR has merged.  Apply the same three-branch logic
+    // as `block_pending_revisions_on_parent_close` for revisions that slipped
+    // through (engine restart, creation-after-merge edge cases).
     if chain_root_task.status == TaskStatus::Done || chain_root_task.status == TaskStatus::Archived {
+        // Skip revisions already in a terminal state.  `block_pending_revisions_on_parent_close`
+        // may have processed this revision already; the task struct we hold here was
+        // snapshot before that ran, so guard with a fresh status read.
+        let fresh_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![task.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let is_terminal = fresh_status.as_deref().map_or(true, |s| {
+            matches!(s, "done" | "archived" | "cancelled" | "in_review")
+        });
+        let already_closed = fresh_status.as_deref() == Some("blocked")
+            && task.blocked_reason.as_deref() == Some("parent_pr_closed");
+        if is_terminal || already_closed {
+            return Ok(());
+        }
+
         let now = now_string();
-        let rows_changed = conn.execute(
-            "UPDATE tasks
-             SET status = 'blocked',
-                 blocked_reason = 'parent_pr_closed',
-                 last_status_actor = 'engine',
-                 updated_at = ?2
-             WHERE id = ?1
-               AND status NOT IN ('blocked', 'done', 'archived')
-               AND deleted_at IS NULL",
-            params![task.id, now],
-        )?;
-        if rows_changed > 0 {
+        if is_moot_revision_kind(&task.created_via) {
+            let rows_changed = conn.execute(
+                "UPDATE tasks
+                 SET status            = 'archived',
+                     last_status_actor = 'engine',
+                     updated_at        = ?2
+                 WHERE id = ?1
+                   AND kind = 'revision'
+                   AND deleted_at IS NULL",
+                params![task.id, now],
+            )?;
+            if rows_changed > 0 {
+                tracing::info!(
+                    task_id = %task.id,
+                    chain_root_id = %chain_root_task.id,
+                    created_via = %task.created_via,
+                    "reconcile_revision: moot revision archived at dispatch-time \
+                     (merge-conflict/CI-fix; parent PR merged)",
+                );
+            }
+        } else {
+            let is_wip = task.status == TaskStatus::Active;
+            let new_chore = insert_chore_in_tx(
+                conn,
+                CreateChoreInput {
+                    product_id: task.product_id.clone(),
+                    autostart: is_wip,
+                    force_duplicate: true,
+                    name: task.name.clone(),
+                    created_via: Some(CREATED_VIA_ENGINE_AUTO.to_owned()),
+                    description: Some(task.description.clone()),
+                    effort_level: task.effort_level,
+                    model_override: task.model_override.clone(),
+                    priority: Some(task.priority.clone()),
+                    repo_remote_url: task.repo_remote_url.clone(),
+                },
+            )?;
+            conn.execute(
+                "UPDATE tasks
+                 SET status            = 'archived',
+                     last_status_actor = 'engine',
+                     updated_at        = ?2
+                 WHERE id = ?1
+                   AND kind = 'revision'
+                   AND deleted_at IS NULL",
+                params![task.id, now],
+            )?;
             tracing::info!(
                 task_id = %task.id,
+                new_chore_id = %new_chore.id,
                 chain_root_id = %chain_root_task.id,
-                "reconcile_revision: chain root is done; blocked revision (parent PR closed/merged)",
+                is_wip,
+                "reconcile_revision: revision converted to standalone chore at dispatch-time \
+                 (parent PR merged; chore will {})",
+                if is_wip { "auto-dispatch" } else { "stay in backlog" },
             );
-            // Surface as an attention item on the revision task.
-            let attn_id = next_id("attn");
-            conn.execute(
-                "INSERT INTO work_attention_items
-                     (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at)
-                 VALUES (?1, NULL, ?2, 'revision_parent_closed', 'open',
-                         'Parent PR closed before revision dispatched',
-                         'The parent task''s PR was merged or closed before this revision could be dispatched. File a new task if further changes are needed.',
-                         ?3)",
-                params![attn_id, task.id, now],
-            )?;
         }
         return Ok(());
     }
