@@ -47,7 +47,7 @@ const CHECK_ID: &str = "rust/giant-structs";
 ///   struct in that file.
 ///
 /// For a one-off exception in a PR, use:
-///   BYPASS_RUST_GIANT_STRUCTS_USE_BUILDER=<specific reason>
+///   BYPASS_RUST_GIANT_STRUCTS=<specific reason>
 /// in the PR or commit description (requires `allow_bypass = true` in policy).
 pub struct RustGiantStructsUseBuilderCheck;
 

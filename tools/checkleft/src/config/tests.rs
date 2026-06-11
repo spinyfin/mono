@@ -474,10 +474,10 @@ id = "my-check"
 #[test]
 fn allow_override_bundled_makes_exec_path_win_over_bundled() {
     let temp = tempdir().expect("create temp dir");
-    // Lay down a local copy of the bundled format/bazel def (subdirectory format).
-    let defs_dir = temp.path().join("tools/checkleft/checks/format/bazel");
+    // Lay down a local copy of the bundled format/bazel def using the flat layout.
+    let defs_dir = temp.path().join("tools/checkleft/checks/format");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: format/bazel\n").expect("write def");
+    fs::write(defs_dir.join("bazel.yaml"), "id: format/bazel\n").expect("write def");
 
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -502,7 +502,7 @@ id = "format/bazel"
     assert_eq!(
         check.implementation,
         Some(ExternalCheckImplementationRef::File(
-            Path::new("tools/checkleft/checks/format/bazel/check.yaml").to_path_buf()
+            Path::new("tools/checkleft/checks/format/bazel.yaml").to_path_buf()
         ))
     );
 }
@@ -510,10 +510,10 @@ id = "format/bazel"
 #[test]
 fn bundled_wins_over_exec_path_by_default() {
     let temp = tempdir().expect("create temp dir");
-    // Lay down a local copy of the bundled format/bazel def (subdirectory format).
-    let defs_dir = temp.path().join("checks/format/bazel");
+    // Lay down a local copy of the bundled format/bazel def using the flat layout.
+    let defs_dir = temp.path().join("checks/format");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: format/bazel\n").expect("write def");
+    fs::write(defs_dir.join("bazel.yaml"), "id: format/bazel\n").expect("write def");
 
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -1055,13 +1055,13 @@ id = "my-component-check"
 
 #[test]
 fn exec_paths_yaml_wins_over_toml_when_both_present() {
-    // check.yaml takes precedence over check.toml in the same directory.
+    // Flat .yaml takes precedence over flat .toml in the same exec_path.
     let temp = tempdir().expect("create temp dir");
-    let defs_dir = temp.path().join("checks/dual-format-check");
+    let defs_dir = temp.path().join("checks");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: dual-format-check\n").expect("write yaml def");
+    fs::write(defs_dir.join("dual-format-check.yaml"), "id: dual-format-check\n").expect("write yaml def");
     fs::write(
-        defs_dir.join("check.toml"),
+        defs_dir.join("dual-format-check.toml"),
         r#"
 id = "dual-format-check"
 mode = "component"
@@ -1091,11 +1091,11 @@ id = "dual-format-check"
         .expect("resolve checks");
 
     let check = checks.get("dual-format-check").expect("check exists");
-    // yaml wins (checked first in find_in_exec_paths)
+    // flat .yaml wins (checked first in find_in_exec_paths)
     assert_eq!(
         check.implementation,
         Some(ExternalCheckImplementationRef::File(
-            Path::new("checks/dual-format-check/check.yaml").to_path_buf()
+            Path::new("checks/dual-format-check.yaml").to_path_buf()
         ))
     );
 }
