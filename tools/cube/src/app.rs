@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bon::Builder;
 use console::{Style, style};
 use git_utils::pr_bookmark;
 use git_utils::repo_slug::{
@@ -7616,16 +7615,19 @@ mod tests {
         let head_branch = "boss/exec_18b66112a0c4b750_5c8";
         let remote_ref = format!("{head_branch}@{github_remote}");
         let pr_bm = format!("pr/{pr_number}");
-        let pr_json = format!(
-            r#"{{"headRefName":"{head_branch}","headRefOid":"abcdef1234567890","state":"OPEN"}}"#
-        );
+        let pr_json = format!(r#"{{"headRefName":"{head_branch}","headRefOid":"abcdef1234567890","state":"OPEN"}}"#);
         let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
         // The unpushed-check revset: pr/654 ~ ancestors(boss/exec_18b66112a0c4b750_5c8@github)
         let unpushed_revset = format!("{pr_bm} ~ ancestors({remote_ref})");
 
         let runner = FakeRunner::new(vec![
             // Health check
-            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             // Resolve github remote
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], &remote_list),
             // Fetch from GitHub remote
@@ -7634,7 +7636,15 @@ mod tests {
             ExpectedCommand::ok(
                 ws_path.clone(),
                 "gh",
-                &["pr", "view", &pr_number.to_string(), "-R", "spinyfin/mono", "--json", "headRefName,headRefOid,state"],
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "headRefName,headRefOid,state",
+                ],
                 &pr_json,
             ),
             // First bookmark set attempt fails — local pr/654 has diverged
