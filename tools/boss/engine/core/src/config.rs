@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -80,8 +81,14 @@ pub struct WorkConfig {
 
 impl WorkConfig {
     pub fn load_from_env() -> Result<Self> {
-        let cwd = resolve_runtime_cwd()?;
-        let db_path = match std::env::var_os("BOSS_DB_PATH") {
+        Self::load_from(|k| std::env::var_os(k))
+    }
+
+    /// Load config from an explicit env lookup rather than the process
+    /// environment. Tests call this directly so they never mutate global state.
+    pub fn load_from(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
+        let cwd = resolve_runtime_cwd_with(&lookup)?;
+        let db_path = match lookup("BOSS_DB_PATH") {
             Some(path) => PathBuf::from(path),
             None => default_db_path()?,
         };
@@ -90,54 +97,15 @@ impl WorkConfig {
         // A smaller default left slots 5–8 idle while the dispatcher
         // silently no-op'd new work. `BOSS_WORKER_POOL_SIZE` still
         // overrides for callers that genuinely want fewer workers.
-        let worker_pool_size = std::env::var("BOSS_WORKER_POOL_SIZE")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .with_context(|| format!("could not parse BOSS_WORKER_POOL_SIZE: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(MAX_WORKER_POOL_SIZE);
-        let automation_pool_size = std::env::var("BOSS_AUTOMATION_POOL_SIZE")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .with_context(|| format!("could not parse BOSS_AUTOMATION_POOL_SIZE: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(MAX_AUTOMATION_POOL_SIZE);
-        let review_pool_size = std::env::var("BOSS_REVIEW_POOL_SIZE")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .with_context(|| format!("could not parse BOSS_REVIEW_POOL_SIZE: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
-        let max_review_cycles = std::env::var("BOSS_MAX_REVIEW_CYCLES")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .with_context(|| format!("could not parse BOSS_MAX_REVIEW_CYCLES: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
-        let min_review_changed_lines = std::env::var("BOSS_MIN_REVIEW_CHANGED_LINES")
-            .ok()
-            .map(|raw| {
-                raw.parse::<u64>()
-                    .with_context(|| format!("could not parse BOSS_MIN_REVIEW_CHANGED_LINES: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
-        let max_review_embed_diff_lines = std::env::var("BOSS_MAX_EMBED_DIFF_LINES")
-            .ok()
-            .map(|raw| {
-                raw.parse::<u64>()
-                    .with_context(|| format!("could not parse BOSS_MAX_EMBED_DIFF_LINES: {raw}"))
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
+        let worker_pool_size = lookup_usize(&lookup, "BOSS_WORKER_POOL_SIZE")?.unwrap_or(MAX_WORKER_POOL_SIZE);
+        let automation_pool_size =
+            lookup_usize(&lookup, "BOSS_AUTOMATION_POOL_SIZE")?.unwrap_or(MAX_AUTOMATION_POOL_SIZE);
+        let review_pool_size = lookup_usize(&lookup, "BOSS_REVIEW_POOL_SIZE")?.unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
+        let max_review_cycles = lookup_usize(&lookup, "BOSS_MAX_REVIEW_CYCLES")?.unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
+        let min_review_changed_lines =
+            lookup_u64(&lookup, "BOSS_MIN_REVIEW_CHANGED_LINES")?.unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
+        let max_review_embed_diff_lines =
+            lookup_u64(&lookup, "BOSS_MAX_EMBED_DIFF_LINES")?.unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -148,6 +116,30 @@ impl WorkConfig {
             .min_review_changed_lines(min_review_changed_lines)
             .max_review_embed_diff_lines(max_review_embed_diff_lines)
             .build())
+    }
+}
+
+fn lookup_usize(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<usize>> {
+    match lookup(name) {
+        None => Ok(None),
+        Some(val) => {
+            let raw = val.to_string_lossy().into_owned();
+            raw.parse::<usize>()
+                .with_context(|| format!("could not parse {name}: {raw}"))
+                .map(Some)
+        }
+    }
+}
+
+fn lookup_u64(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<u64>> {
+    match lookup(name) {
+        None => Ok(None),
+        Some(val) => {
+            let raw = val.to_string_lossy().into_owned();
+            raw.parse::<u64>()
+                .with_context(|| format!("could not parse {name}: {raw}"))
+                .map(Some)
+        }
     }
 }
 
@@ -268,8 +260,8 @@ fn parse_command_line(env_var: &str, command_line: String) -> Result<(String, Ve
     Ok((command.clone(), args.to_vec()))
 }
 
-fn resolve_runtime_cwd() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BUILD_WORKSPACE_DIRECTORY") {
+fn resolve_runtime_cwd_with(lookup: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    if let Some(path) = lookup("BUILD_WORKSPACE_DIRECTORY") {
         let candidate = PathBuf::from(path);
         if candidate.is_dir() {
             return Ok(candidate);
@@ -291,255 +283,152 @@ fn default_db_path() -> Result<PathBuf> {
 mod tests {
     use super::{
         DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES,
-        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
+        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
     };
-    use std::path::PathBuf;
+    use std::ffi::OsString;
 
     #[test]
     fn prefers_bazel_workspace_directory_when_present() {
-        let original = std::env::var_os("BUILD_WORKSPACE_DIRECTORY");
         let tempdir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("BUILD_WORKSPACE_DIRECTORY", tempdir.path());
-        }
-
-        let cwd = resolve_runtime_cwd().unwrap();
-        assert_eq!(cwd, PathBuf::from(tempdir.path()));
-
-        match original {
-            Some(value) => unsafe {
-                std::env::set_var("BUILD_WORKSPACE_DIRECTORY", value);
-            },
-            None => unsafe {
-                std::env::remove_var("BUILD_WORKSPACE_DIRECTORY");
-            },
-        }
+        let db_path = tempdir.path().join("state.db");
+        // Can't use env_map here because tempdir paths are runtime values,
+        // so build the closure directly.
+        let config = WorkConfig::load_from(|k| match k {
+            "BUILD_WORKSPACE_DIRECTORY" => Some(OsString::from(tempdir.path())),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.cwd, tempdir.path());
     }
 
-    /// `WorkConfig::load_from_env` must default to the hard cap
-    /// (`MAX_WORKER_POOL_SIZE`) when `BOSS_WORKER_POOL_SIZE` is unset,
+    /// `WorkConfig::load_from` must default to the hard cap
+    /// (`MAX_WORKER_POOL_SIZE`) when `BOSS_WORKER_POOL_SIZE` is absent,
     /// matching the macOS app's slot count. A lower default left
     /// slots 5–8 unallocated and silently dropped any drag-to-Doing
     /// dispatch once slots 1–4 were busy.
     #[test]
     fn worker_pool_size_defaults_to_max_when_env_unset() {
-        // Force the test to take the unset branch even when the host
-        // shell exports a custom pool size.
-        let original_pool = std::env::var_os("BOSS_WORKER_POOL_SIZE");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
-        unsafe {
-            std::env::remove_var("BOSS_WORKER_POOL_SIZE");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let db_path_str = tempdir.path().join("state.db");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.worker_pool_size, MAX_WORKER_POOL_SIZE);
-
-        unsafe {
-            match original_pool {
-                Some(value) => std::env::set_var("BOSS_WORKER_POOL_SIZE", value),
-                None => std::env::remove_var("BOSS_WORKER_POOL_SIZE"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
     #[test]
     fn automation_pool_size_defaults_to_max_when_env_unset() {
-        let original_pool = std::env::var_os("BOSS_AUTOMATION_POOL_SIZE");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
-        unsafe {
-            std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let db_path_str = tempdir.path().join("state.db");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.automation_pool_size, MAX_AUTOMATION_POOL_SIZE);
-
-        unsafe {
-            match original_pool {
-                Some(value) => std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", value),
-                None => std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
     #[test]
     fn automation_pool_size_reads_from_env() {
-        let original_pool = std::env::var_os("BOSS_AUTOMATION_POOL_SIZE");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
-        unsafe {
-            std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", "2");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let db_path_str = tempdir.path().join("state.db");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_AUTOMATION_POOL_SIZE" => Some(OsString::from("2")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.automation_pool_size, 2);
-
-        unsafe {
-            match original_pool {
-                Some(value) => std::env::set_var("BOSS_AUTOMATION_POOL_SIZE", value),
-                None => std::env::remove_var("BOSS_AUTOMATION_POOL_SIZE"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
-    // Default-and-override are checked in a single test (rather than the
-    // two-test pattern used elsewhere) so the two cases can't run in
-    // parallel and race on the shared process-global `BOSS_REVIEW_POOL_SIZE`:
-    // `config::tests` all land in the multi-threaded `engine_lib_test_rest`
-    // shard.
     #[test]
     fn review_pool_size_defaults_and_reads_from_env() {
-        let original_pool = std::env::var_os("BOSS_REVIEW_POOL_SIZE");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
+        let db_path_str = tempdir.path().join("state.db");
 
-        // Unset → falls back to the small default.
-        unsafe {
-            std::env::remove_var("BOSS_REVIEW_POOL_SIZE");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        // Absent → falls back to the small default.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.review_pool_size, DEFAULT_REVIEW_POOL_SIZE);
 
-        // Set → the env value wins.
-        unsafe {
-            std::env::set_var("BOSS_REVIEW_POOL_SIZE", "1");
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        // Present → the explicit value wins.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_REVIEW_POOL_SIZE" => Some(OsString::from("1")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.review_pool_size, 1);
-
-        unsafe {
-            match original_pool {
-                Some(value) => std::env::set_var("BOSS_REVIEW_POOL_SIZE", value),
-                None => std::env::remove_var("BOSS_REVIEW_POOL_SIZE"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
-    // Combined default+override test to avoid parallelism races on the
-    // shared BOSS_MIN_REVIEW_CHANGED_LINES env var.
     #[test]
     fn min_review_changed_lines_defaults_and_reads_from_env() {
-        let original_lines = std::env::var_os("BOSS_MIN_REVIEW_CHANGED_LINES");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
+        let db_path_str = tempdir.path().join("state.db");
 
-        unsafe {
-            std::env::remove_var("BOSS_MIN_REVIEW_CHANGED_LINES");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.min_review_changed_lines, DEFAULT_MIN_REVIEW_CHANGED_LINES);
 
-        unsafe {
-            std::env::set_var("BOSS_MIN_REVIEW_CHANGED_LINES", "10");
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_MIN_REVIEW_CHANGED_LINES" => Some(OsString::from("10")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.min_review_changed_lines, 10);
-
-        unsafe {
-            match original_lines {
-                Some(value) => std::env::set_var("BOSS_MIN_REVIEW_CHANGED_LINES", value),
-                None => std::env::remove_var("BOSS_MIN_REVIEW_CHANGED_LINES"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
-    // Default-and-override are in a single test to avoid parallelism races
-    // on the shared BOSS_MAX_REVIEW_CYCLES env var (same pattern as
-    // review_pool_size_defaults_and_reads_from_env).
     #[test]
     fn max_review_cycles_defaults_and_reads_from_env() {
-        let original_cycles = std::env::var_os("BOSS_MAX_REVIEW_CYCLES");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
+        let db_path_str = tempdir.path().join("state.db");
 
-        // Unset → falls back to the hardcoded default (3).
-        unsafe {
-            std::env::remove_var("BOSS_MAX_REVIEW_CYCLES");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        // Absent → falls back to the hardcoded default (3).
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.max_review_cycles, DEFAULT_MAX_REVIEW_CYCLES);
 
-        // Set → the env value wins.
-        unsafe {
-            std::env::set_var("BOSS_MAX_REVIEW_CYCLES", "5");
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        // Present → the explicit value wins.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_MAX_REVIEW_CYCLES" => Some(OsString::from("5")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.max_review_cycles, 5);
-
-        unsafe {
-            match original_cycles {
-                Some(value) => std::env::set_var("BOSS_MAX_REVIEW_CYCLES", value),
-                None => std::env::remove_var("BOSS_MAX_REVIEW_CYCLES"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 
     #[test]
     fn max_embed_diff_lines_defaults_and_reads_from_env() {
-        let original = std::env::var_os("BOSS_MAX_EMBED_DIFF_LINES");
-        let original_db = std::env::var_os("BOSS_DB_PATH");
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("state.db");
+        let db_path_str = tempdir.path().join("state.db");
 
-        unsafe {
-            std::env::remove_var("BOSS_MAX_EMBED_DIFF_LINES");
-            std::env::set_var("BOSS_DB_PATH", &db_path);
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.max_review_embed_diff_lines, DEFAULT_MAX_EMBED_DIFF_LINES);
 
-        unsafe {
-            std::env::set_var("BOSS_MAX_EMBED_DIFF_LINES", "200");
-        }
-        let config = WorkConfig::load_from_env().expect("config loads");
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_MAX_EMBED_DIFF_LINES" => Some(OsString::from("200")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
         assert_eq!(config.max_review_embed_diff_lines, 200);
-
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var("BOSS_MAX_EMBED_DIFF_LINES", value),
-                None => std::env::remove_var("BOSS_MAX_EMBED_DIFF_LINES"),
-            }
-            match original_db {
-                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
-                None => std::env::remove_var("BOSS_DB_PATH"),
-            }
-        }
     }
 }
