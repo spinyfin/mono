@@ -14,6 +14,11 @@
 //! A CHECKS-config override may substitute a different binding per declared name,
 //! keeping CHECKS.yaml thin (enable + repo-specific overrides only) while the
 //! definition lives in the package manifest.
+//!
+//! When a Bazel binding is declared alongside a `fallback.path`, hermetic resolution
+//! failure is non-fatal: the framework logs a loud warning to stderr naming the
+//! reason and the resolved fallback binary, then continues. Without a fallback
+//! declared, failure is an error.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,26 +37,63 @@ pub fn resolve_all(
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut resolved = BTreeMap::new();
     for (name, requirement) in needs {
-        let binding = override_binding(name, config)
+        let override_binding = override_binding(name, config)
             .transpose()
-            .with_context(|| format!("invalid config override for binary `{name}`"))?
-            .unwrap_or_else(|| requirement.default.clone());
-        let path = resolve_one(repo_root, name, &binding)
-            .with_context(|| format!("failed to resolve declared binary `{name}`"))?;
+            .with_context(|| format!("invalid config override for binary `{name}`"))?;
+
+        let path = if let Some(binding) = override_binding {
+            resolve_binding(repo_root, &binding)
+                .with_context(|| format!("failed to resolve declared binary `{name}`"))?
+        } else {
+            resolve_requirement(repo_root, name, requirement)?
+        };
+
         resolved.insert(name.clone(), path);
     }
     Ok(resolved)
 }
 
-fn resolve_one(repo_root: &Path, name: &str, binding: &BinaryBinding) -> Result<PathBuf> {
+/// Resolve using the default binding, falling back if declared and bazel fails.
+fn resolve_requirement(repo_root: &Path, name: &str, requirement: &BinaryRequirement) -> Result<PathBuf> {
+    match &requirement.default {
+        BinaryBinding::Path(_) => resolve_binding(repo_root, &requirement.default)
+            .with_context(|| format!("failed to resolve declared binary `{name}`")),
+        BinaryBinding::Bazel(target) => match resolve_bazel_target_executable(repo_root, target) {
+            Ok(path) => Ok(path),
+            Err(err) => {
+                if let Some(fallback) = &requirement.fallback {
+                    let fallback_path = resolve_binding(repo_root, fallback).with_context(|| {
+                        format!("hermetic resolution of `{name}` failed AND fallback resolution also failed")
+                    })?;
+                    let version = binary_version_string(&fallback_path);
+                    eprintln!(
+                        "warning: checkleft: `{name}`: hermetic toolchain unresolved ({err:#}); \
+                         falling back to PATH binary `{}` ({})",
+                        fallback_path.display(),
+                        if version.is_empty() {
+                            "version unknown".to_owned()
+                        } else {
+                            version
+                        }
+                    );
+                    Ok(fallback_path)
+                } else {
+                    Err(err).with_context(|| {
+                        format!(
+                            "failed to resolve declared binary `{name}`; \
+                             declare `needs.{name}.fallback.path` for non-Bazel environments"
+                        )
+                    })
+                }
+            }
+        },
+    }
+}
+
+fn resolve_binding(repo_root: &Path, binding: &BinaryBinding) -> Result<PathBuf> {
     match binding {
         BinaryBinding::Path(path) => Ok(resolve_path_binding(repo_root, path)),
-        BinaryBinding::Bazel(target) => resolve_bazel_target_executable(repo_root, target).with_context(|| {
-            format!(
-                "bazel resolution of `{name}` target `{target}` failed; this resolver needs a \
-                     Bazel workspace — set a `path` override for standalone use"
-            )
-        }),
+        BinaryBinding::Bazel(target) => resolve_bazel_target_executable(repo_root, target),
     }
 }
 
@@ -74,6 +116,17 @@ fn resolve_path_binding(repo_root: &Path, path: &str) -> PathBuf {
     } else {
         repo_root.join(candidate)
     }
+}
+
+/// Returns the trimmed first line of `binary --version`, or an empty string on failure.
+pub fn binary_version_string(binary: &Path) -> String {
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.lines().next().unwrap_or("").trim().to_owned())
+        .unwrap_or_default()
 }
 
 /// Read an optional binding override from `config` at `needs.<name>.{path|bazel}`.

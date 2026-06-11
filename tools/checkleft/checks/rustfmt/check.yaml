@@ -1,0 +1,56 @@
+id: rustfmt
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.rs"
+
+# Binary resolution:
+#   - In a Bazel workspace (mono CI): the hermetic rustfmt from rules_rust is used
+#     automatically. The channel (stable or nightly) depends on rustfmt_version in
+#     MODULE.bazel. Currently this repo pins rustfmt_version = "1.95.0" (stable).
+#   - In non-Bazel repos or local dev: the fallback `path: "rustfmt"` uses whatever
+#     rustfmt is on PATH, and the framework warns loudly on stderr so you know the
+#     hermetic toolchain was skipped.
+#   - Missing rustfmt: the framework converts the spawn failure to a check error
+#     finding — the process does not crash.
+needs:
+  rustfmt:
+    default:
+      bazel: "@rules_rust//tools/upstream_wrapper:rustfmt"
+    fallback:
+      path: "rustfmt"
+
+invocations:
+  - id: format
+    run: rustfmt
+    mode: per_file
+    args:
+      # --check: exit 0 when the file is already formatted, exit 1 when it needs
+      # reformatting. Works on both stable and nightly rustfmt without any
+      # unstable-features flag.
+      - "--check"
+      # -l: print the names of files that need reformatting to stdout (one per
+      # line). Combined with exit 1, this lets the linelist transform distinguish
+      # "file needs formatting" (stdout non-empty) from operational errors like
+      # parse failures (stdout empty, still exit 1).
+      - "-l"
+      # --config-path={{repo_root}} pins discovery to the repo root regardless of
+      # where checkleft is invoked from, preventing user-level ~/.config/rustfmt/
+      # from leaking into CI. The repo must have a rustfmt.toml at its root (with
+      # `edition` set). {{repo_root}} is expanded by the declarative framework to
+      # the absolute path of the repository root at invocation time.
+      - "--config-path={{repo_root}}"
+      - "{{file}}"
+    # With --check, rustfmt exits 0 when the file is already formatted; exit 1 means
+    # either violations (file paths on stdout via -l) or an operational error (no
+    # stdout). The linelist transform distinguishes these two cases.
+    exit:
+      "0": ok
+      "1": findings
+      default: error
+    transform:
+      kind: linelist
+      message: "file needs rustfmt formatting"
+      remediations:
+        - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{input.file}}`."

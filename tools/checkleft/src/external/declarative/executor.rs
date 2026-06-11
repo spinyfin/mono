@@ -45,10 +45,57 @@ pub fn run_declarative_check(
         findings.extend(run_invocation(repo_root, &binaries, invocation, &files)?);
     }
 
+    // Deduplicate: some tools (e.g. rustfmt with per-file + module-tree recursion)
+    // report the same file via multiple code paths. Keep first occurrence of each
+    // (check_id, path, line, column, message, severity) tuple.
+    findings = dedup_findings(findings);
+
     Ok(CheckResult {
         check_id: package_id.to_owned(),
         findings,
     })
+}
+
+/// Remove findings that describe the same location + issue as an earlier finding.
+/// Key is `(path, line, column, message, severity)` — remediations are intentionally
+/// excluded: two invocations may reach the same file via different code paths (e.g.
+/// rustfmt recursing from a module root and directly from the child file), producing
+/// the same issue but with slightly different remediation text.
+fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    use std::collections::HashSet;
+    type Key = (Option<PathBuf>, Option<u32>, Option<u32>, String, u8);
+    let mut seen: HashSet<Key> = HashSet::new();
+    let mut out: Vec<Finding> = Vec::with_capacity(findings.len());
+    for f in findings {
+        let key: Key = (
+            f.location.as_ref().map(|l| l.path.clone()),
+            f.location.as_ref().and_then(|l| l.line),
+            f.location.as_ref().and_then(|l| l.column),
+            f.message.clone(),
+            f.severity as u8,
+        );
+        if seen.insert(key) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Strip `repo_root` from any absolute finding paths so every finding emitted by
+/// the declarative runtime is repo-relative. This is a framework-level guarantee:
+/// tools may receive absolute paths (e.g. when the hermetic Bazel toolchain wrapper
+/// canonicalizes inputs) and echo them back — the framework normalises before the
+/// finding reaches the runner.
+fn normalize_finding_paths(findings: &mut Vec<Finding>, repo_root: &Path) {
+    for finding in findings.iter_mut() {
+        if let Some(location) = &mut finding.location {
+            if location.path.is_absolute() {
+                if let Ok(relative) = location.path.strip_prefix(repo_root) {
+                    location.path = relative.to_path_buf();
+                }
+            }
+        }
+    }
 }
 
 /// Select non-deleted changed files matching any `applies_to` glob, sorted for
@@ -86,40 +133,52 @@ fn run_invocation(
         )
     })?;
 
-    match invocation.mode {
+    let mut findings = match invocation.mode {
         InvocationMode::Batch => {
-            let args = expand_batch_args(&invocation.args, files);
+            let args = expand_batch_args(repo_root, &invocation.args, files);
             let output = spawn(repo_root, binary, &args, &invocation.id)?;
-            classify_and_project(invocation, &output, None)
+            classify_and_project(invocation, &output, None)?
         }
         InvocationMode::PerFile => {
             let mut findings = Vec::new();
             for file in files {
-                let args = expand_per_file_args(&invocation.args, file);
+                let args = expand_per_file_args(repo_root, &invocation.args, file);
                 let output = spawn(repo_root, binary, &args, &invocation.id)?;
                 findings.extend(classify_and_project(invocation, &output, Some(file))?);
             }
-            Ok(findings)
+            findings
         }
-    }
+    };
+
+    // Normalize absolute paths to repo-relative. Tools invoked via the hermetic
+    // Bazel toolchain wrapper may receive absolute input paths and echo them back;
+    // the framework strips the repo root prefix before the finding reaches the runner.
+    normalize_finding_paths(&mut findings, repo_root);
+    Ok(findings)
 }
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.
-fn expand_batch_args(args: &[String], files: &[String]) -> Vec<String> {
+/// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
+fn expand_batch_args(repo_root: &Path, args: &[String], files: &[String]) -> Vec<String> {
+    let repo_root_str = repo_root.to_string_lossy();
     let mut expanded = Vec::with_capacity(args.len() + files.len());
     for arg in args {
         if arg == "{{files}}" {
             expanded.extend(files.iter().cloned());
         } else {
-            expanded.push(arg.clone());
+            expanded.push(arg.replace("{{repo_root}}", &*repo_root_str));
         }
     }
     expanded
 }
 
 /// In per-file mode `{{file}}` is substituted in place within each arg.
-fn expand_per_file_args(args: &[String], file: &str) -> Vec<String> {
-    args.iter().map(|arg| arg.replace("{{file}}", file)).collect()
+/// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
+fn expand_per_file_args(repo_root: &Path, args: &[String], file: &str) -> Vec<String> {
+    let repo_root_str = repo_root.to_string_lossy();
+    args.iter()
+        .map(|arg| arg.replace("{{file}}", file).replace("{{repo_root}}", &*repo_root_str))
+        .collect()
 }
 
 struct InvocationOutput {
@@ -153,10 +212,24 @@ fn classify_and_project(
 ) -> Result<Vec<Finding>> {
     match invocation.exit.classify(output.exit_code) {
         ExitOutcome::Ok => Ok(Vec::new()),
-        ExitOutcome::Findings => invocation
-            .transform
-            .apply(&output.stdout, output.exit_code, input_file)
-            .with_context(|| format!("transform for invocation `{}` failed", invocation.id)),
+        ExitOutcome::Findings => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            invocation
+                .transform
+                .apply(&output.stdout, output.exit_code, input_file)
+                .with_context(|| {
+                    let file_note = input_file.map(|f| format!(" (file: {f})")).unwrap_or_default();
+                    let stderr_trimmed = stderr.trim();
+                    if stderr_trimmed.is_empty() {
+                        format!("transform for invocation `{}`{file_note} failed", invocation.id)
+                    } else {
+                        format!(
+                            "transform for invocation `{}`{file_note} failed; tool stderr:\n{stderr_trimmed}",
+                            invocation.id
+                        )
+                    }
+                })
+        }
         ExitOutcome::Error => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(

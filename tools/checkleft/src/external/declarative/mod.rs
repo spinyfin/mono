@@ -70,6 +70,11 @@ pub struct ExternalCheckDeclarativePackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryRequirement {
     pub default: BinaryBinding,
+    /// Optional fallback when the default (bazel) binding fails to resolve.
+    /// When set and bazel resolution fails, the framework uses the fallback and
+    /// emits a loud warning to stderr so the operator knows hermetic resolution
+    /// was skipped.
+    pub fallback: Option<BinaryBinding>,
 }
 
 /// How a declared binary is resolved to a concrete executable path.
@@ -160,6 +165,8 @@ impl RawDeclarativeFields {
 #[serde(deny_unknown_fields)]
 pub(super) struct RawBinaryRequirement {
     default: RawBinaryBinding,
+    #[serde(default)]
+    fallback: Option<RawBinaryBinding>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +198,12 @@ struct RawTransform {
     select: Option<String>,
     #[serde(default)]
     finding: Option<RawFinding>,
+    /// `linelist` transform: fixed message for each file-level finding.
+    #[serde(default)]
+    message: Option<String>,
+    /// `linelist` transform: optional remediation strings.
+    #[serde(default)]
+    remediations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,15 +254,32 @@ pub(super) fn validate_declarative_implementation(
 }
 
 fn validate_requirement(name: &str, raw: RawBinaryRequirement) -> Result<BinaryRequirement> {
-    let binding = match (raw.default.bazel, raw.default.path) {
+    let default = parse_binding(name, "default", raw.default)?;
+    let fallback = raw.fallback.map(|f| parse_binding(name, "fallback", f)).transpose()?;
+    if fallback.is_some() && !matches!(default, BinaryBinding::Bazel(_)) {
+        bail!(
+            "binary `{name}` declares a `fallback` but `default` is not a `bazel` binding; \
+             fallback is only meaningful when the primary binding is `bazel`"
+        );
+    }
+    Ok(BinaryRequirement { default, fallback })
+}
+
+fn parse_binding(name: &str, field: &str, raw: RawBinaryBinding) -> Result<BinaryBinding> {
+    match (raw.bazel, raw.path) {
         (Some(_), Some(_)) => {
-            bail!("binary `{name}` default binding must set exactly one of `bazel` or `path`, not both")
+            bail!("binary `{name}` {field} binding must set exactly one of `bazel` or `path`, not both")
         }
-        (Some(bazel), None) => BinaryBinding::Bazel(non_empty(&format!("needs.{name}.default.bazel"), bazel)?),
-        (None, Some(path)) => BinaryBinding::Path(non_empty(&format!("needs.{name}.default.path"), path)?),
-        (None, None) => bail!("binary `{name}` default binding must set one of `bazel` or `path`"),
-    };
-    Ok(BinaryRequirement { default: binding })
+        (Some(bazel), None) => Ok(BinaryBinding::Bazel(non_empty(
+            &format!("needs.{name}.{field}.bazel"),
+            bazel,
+        )?)),
+        (None, Some(path)) => Ok(BinaryBinding::Path(non_empty(
+            &format!("needs.{name}.{field}.path"),
+            path,
+        )?)),
+        (None, None) => bail!("binary `{name}` {field} binding must set one of `bazel` or `path`"),
+    }
 }
 
 fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvocation) -> Result<Invocation> {
@@ -266,6 +296,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
     };
 
     validate_args_for_mode(&id, mode, &raw.args)?;
+    validate_arg_template_refs(&id, &raw.args)?;
     let exit = validate_exit(&id, raw.exit)?;
     let transform = validate_transform(&id, raw.transform)?;
 
@@ -291,6 +322,30 @@ fn validate_args_for_mode(id: &str, mode: InvocationMode, args: &[String]) -> Re
         }
         _ => Ok(()),
     }
+}
+
+/// Reject args that contain `{{...}}` tokens the framework doesn't recognise.
+/// Unrecognised tokens would silently pass through unexpanded to the tool.
+fn validate_arg_template_refs(id: &str, args: &[String]) -> Result<()> {
+    for arg in args {
+        let mut rest = arg.as_str();
+        while let Some(open) = rest.find("{{") {
+            let after = &rest[open + 2..];
+            let close = after
+                .find("}}")
+                .ok_or_else(|| anyhow::anyhow!("invocation `{id}` arg has unterminated `{{{{` in `{arg}`"))?;
+            let inner = &after[..close];
+            match inner {
+                "files" | "file" | "repo_root" => {}
+                other => bail!(
+                    "invocation `{id}` arg contains unknown template ref `{{{{{other}}}}}` \
+                     (recognized in args: `{{{{files}}}}`, `{{{{file}}}}`, `{{{{repo_root}}}}`)"
+                ),
+            }
+            rest = &after[close + 2..];
+        }
+    }
+    Ok(())
 }
 
 fn validate_exit(id: &str, raw: BTreeMap<String, String>) -> Result<ExitSemantics> {
@@ -355,12 +410,43 @@ fn validate_transform(id: &str, raw: RawTransform) -> Result<transform::Transfor
             }
             Ok(transform::Transform::Passthrough)
         }
+        // Line-list transform: the binary prints one file path per stdout line for
+        // files with violations. Each non-empty line becomes one file-level finding.
+        // If the tool exits non-zero with no output, the transform treats it as an
+        // operational error rather than "clean" (prevents silent swallowing of
+        // rustfmt parse errors, which also exit 1 but produce no file-list output).
+        "linelist" => {
+            if raw.select.is_some() {
+                bail!("linelist transform for invocation `{id}` must not set `select`");
+            }
+            if raw.finding.is_some() {
+                bail!("linelist transform for invocation `{id}` must not set `finding`");
+            }
+            let raw_message = raw
+                .message
+                .ok_or_else(|| anyhow::anyhow!("linelist transform for invocation `{id}` requires `message`"))?;
+            let parse = |field: &str, value: String| -> Result<Template> {
+                Template::parse(&value)
+                    .map_err(|err| anyhow::anyhow!("invocation `{id}` linelist.{field} is invalid: {err}"))
+            };
+            let message = parse("message", raw_message)?;
+            let remediations = raw
+                .remediations
+                .into_iter()
+                .map(|r| parse("remediations[]", r))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(transform::Transform::LineList(transform::LineListTransform {
+                message,
+                remediations,
+                severity: Severity::Warning,
+            }))
+        }
         // Future strategy slot — intentionally unbuilt. A `regex` strategy would
         // parse stdout lines; a `sarif` strategy would map SARIF results. Both fit
         // the same `(stdout, exit_code, context) → Vec<Finding>` seam;
         // richer/computed transforms are where the wasm pure-function tier takes over.
         "regex" | "sarif" => bail!(
-            "transform kind `{}` is reserved for a future spike; only `json` and `passthrough` are implemented",
+            "transform kind `{}` is reserved for a future spike; only `json`, `passthrough`, and `linelist` are implemented",
             raw.kind
         ),
         other => bail!("invocation `{id}` has unknown transform kind `{other}`"),
