@@ -4563,7 +4563,8 @@ fn cleanup_workspace_logs(workspace_id: &str) -> Result<()> {
 /// Summary of a workspace row touched by the missing-directory reconciler.
 /// Surfaced through `cube workspace list --json` and also fed to per-row
 /// audit events so the operator has a paper trail.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 struct ReconciledRow {
     repo: String,
     workspace_id: String,
