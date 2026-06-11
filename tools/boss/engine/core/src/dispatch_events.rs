@@ -261,7 +261,8 @@ impl Outcome {
 /// deliberately wide — readers don't need to know about every field
 /// and a writer that doesn't yet have a value emits `null` rather
 /// than dropping the key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DispatchEvent {
     pub ts_epoch_ms: u128,
     pub stage: String,
