@@ -42,7 +42,8 @@ pub fn resolve_all(
             .with_context(|| format!("invalid config override for binary `{name}`"))?;
 
         let path = if let Some(binding) = override_binding {
-            resolve_binding(repo_root, &binding).with_context(|| format!("failed to resolve declared binary `{name}`"))?
+            resolve_binding(repo_root, &binding)
+                .with_context(|| format!("failed to resolve declared binary `{name}`"))?
         } else {
             resolve_requirement(repo_root, name, requirement)?
         };
@@ -69,7 +70,11 @@ fn resolve_requirement(repo_root: &Path, name: &str, requirement: &BinaryRequire
                         "warning: checkleft: `{name}`: hermetic toolchain unresolved ({err:#}); \
                          falling back to PATH binary `{}` ({})",
                         fallback_path.display(),
-                        if version.is_empty() { "version unknown".to_owned() } else { version }
+                        if version.is_empty() {
+                            "version unknown".to_owned()
+                        } else {
+                            version
+                        }
                     );
                     Ok(fallback_path)
                 } else {

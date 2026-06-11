@@ -683,7 +683,10 @@ fn rustfmt_linelist_multiple_files_produce_multiple_findings() {
     let stdout = b"src/a.rs\nsrc/b.rs\n";
     let findings = rustfmt_linelist_findings(stdout, 1);
     assert_eq!(findings.len(), 2, "two unformatted files should produce two findings");
-    let paths: Vec<&Path> = findings.iter().map(|f| f.location.as_ref().unwrap().path.as_path()).collect();
+    let paths: Vec<&Path> = findings
+        .iter()
+        .map(|f| f.location.as_ref().unwrap().path.as_path())
+        .collect();
     assert!(paths.contains(&Path::new("src/a.rs")));
     assert!(paths.contains(&Path::new("src/b.rs")));
 }

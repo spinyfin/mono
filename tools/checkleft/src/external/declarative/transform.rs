@@ -181,7 +181,11 @@ impl LineListTransform {
             .map(|path| Finding {
                 severity: self.severity,
                 message: self.message.clone(),
-                location: Some(Location { path: PathBuf::from(path), line: None, column: None }),
+                location: Some(Location {
+                    path: PathBuf::from(path),
+                    line: None,
+                    column: None,
+                }),
                 remediations: self.remediations.clone(),
                 suggested_fix: None,
             })

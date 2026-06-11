@@ -270,8 +270,14 @@ fn parse_binding(name: &str, field: &str, raw: RawBinaryBinding) -> Result<Binar
         (Some(_), Some(_)) => {
             bail!("binary `{name}` {field} binding must set exactly one of `bazel` or `path`, not both")
         }
-        (Some(bazel), None) => Ok(BinaryBinding::Bazel(non_empty(&format!("needs.{name}.{field}.bazel"), bazel)?)),
-        (None, Some(path)) => Ok(BinaryBinding::Path(non_empty(&format!("needs.{name}.{field}.path"), path)?)),
+        (Some(bazel), None) => Ok(BinaryBinding::Bazel(non_empty(
+            &format!("needs.{name}.{field}.bazel"),
+            bazel,
+        )?)),
+        (None, Some(path)) => Ok(BinaryBinding::Path(non_empty(
+            &format!("needs.{name}.{field}.path"),
+            path,
+        )?)),
         (None, None) => bail!("binary `{name}` {field} binding must set one of `bazel` or `path`"),
     }
 }
