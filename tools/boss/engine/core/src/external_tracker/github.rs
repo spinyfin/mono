@@ -17,7 +17,8 @@ use super::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Deserialized shape of `products.external_tracker_config` for GitHub.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct GitHubConfig {
     pub org: String,
     pub repo: String,
