@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bon::Builder;
 use console::{Style, style};
 use git_utils::pr_bookmark;
 use git_utils::repo_slug::{
@@ -2814,9 +2815,7 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/")
-                        && let Ok(n) = n_str.parse::<u64>()
-                    {
+                    if let Some(n) = name.strip_prefix("pr/").and_then(|s| s.parse::<u64>().ok()) {
                         pr_number = Some(n);
                     }
                 } else {
