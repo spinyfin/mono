@@ -434,6 +434,8 @@ pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<O
 /// engine knows at detection time is required, everything the engine
 /// stamps post-spawn (`head_sha_after`, `cube_lease_id`, …) is
 /// omitted.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Clone)]
 pub struct ConflictResolutionInsertInput {
     pub product_id: String,
@@ -450,6 +452,8 @@ pub struct ConflictResolutionInsertInput {
 /// the `ci_remediations` schema for the engine-known fields at
 /// detection time. `consumes_budget` is `1` for `attempt_kind='fix'`
 /// and `0` for `'retrigger'` per design §Q3.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Clone)]
 pub struct CiRemediationInsertInput {
     pub product_id: String,

@@ -364,6 +364,8 @@ impl Drop for PidFileGuard {
     }
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct ServerState {
     work_db: Arc<WorkDb>,
     execution_coordinator: Arc<ExecutionCoordinator>,

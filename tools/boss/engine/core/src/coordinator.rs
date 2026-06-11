@@ -270,6 +270,8 @@ pub struct CubeWorkspaceStatus {
 /// Used by the cold-pool probe in [`ExecutionCoordinator::schedule_execution`]
 /// to decide whether the auto-provisioned defaults are worth flagging
 /// to the operator. See `multi-repo-work-modeling.md` Q6.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeRepoSummary {
     pub repo_id: String,
@@ -1033,6 +1035,8 @@ impl RevisionSource for AtomicU64 {
     }
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,

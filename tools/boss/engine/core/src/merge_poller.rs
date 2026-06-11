@@ -166,6 +166,8 @@ pub fn init(registry: &Registry) {
 /// The "four-state" naming in the design doc refers to the leaf
 /// values of [`PrLifecycleState`] — `Open(...)` (with its own
 /// mergeability + ci sub-state), `Merged`, `ClosedUnmerged`.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrLifecycleProbe {
     pub url: String,
@@ -1211,6 +1213,8 @@ fn classify_state(
 }
 
 /// Outcome of one sweep. Used for logging and tests.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub merged: usize,

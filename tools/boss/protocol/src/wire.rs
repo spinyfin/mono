@@ -2431,7 +2431,8 @@ pub struct SettingSnapshot {
 /// [`FrontendEvent::WorkspacePoolSummaryResult`]. Mirrors
 /// `CubeWorkspaceStatus` plus an optional engine-side annotation
 /// that maps a workspace's current lease to the execution holding it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkspacePoolEntry {
     pub workspace_id: String,
     pub workspace_path: String,

@@ -2457,6 +2457,8 @@ enum OutputMode {
     Json,
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Serialize)]
 struct CliReferenceDocument {
     cli: &'static str,
@@ -8200,6 +8202,8 @@ enum LintSeverity {
 /// the current pointer fields (so the user can see what's set), the
 /// reason the finding fired, and a copy-pasteable `suggested_fix`
 /// CLI invocation.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 #[derive(Debug, Clone, Serialize)]
 struct LintDesignDocEntry {
     project_id: String,
