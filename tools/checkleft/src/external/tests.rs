@@ -247,16 +247,16 @@ fn rejects_empty_bundled_name() {
 #[test]
 fn accepts_namespaced_bundled_name() {
     let result = ExternalCheckImplementationRef::parse("bundled:namespace/name").expect("must succeed");
-    assert_eq!(result, ExternalCheckImplementationRef::Bundled("namespace/name".to_owned()));
+    assert_eq!(
+        result,
+        ExternalCheckImplementationRef::Bundled("namespace/name".to_owned())
+    );
 }
 
 #[test]
 fn rejects_bundled_name_with_deep_path() {
     let error = ExternalCheckImplementationRef::parse("bundled:foo/bar/baz").expect_err("must fail");
-    assert!(
-        error.to_string().contains("deeper path"),
-        "unexpected error: {error}"
-    );
+    assert!(error.to_string().contains("deeper path"), "unexpected error: {error}");
 }
 
 #[test]

@@ -190,7 +190,10 @@ mod tests {
         assert_eq!(bypass_name_for_check_id("format/bazel"), "BYPASS_FORMAT_BAZEL");
         assert_eq!(bypass_name_for_check_id("lint/rust"), "BYPASS_LINT_RUST");
         assert_eq!(bypass_name_for_check_id("lint/bazel"), "BYPASS_LINT_BAZEL");
-        assert_eq!(bypass_name_for_check_id("rust/giant-structs"), "BYPASS_RUST_GIANT_STRUCTS");
+        assert_eq!(
+            bypass_name_for_check_id("rust/giant-structs"),
+            "BYPASS_RUST_GIANT_STRUCTS"
+        );
     }
 
     #[test]

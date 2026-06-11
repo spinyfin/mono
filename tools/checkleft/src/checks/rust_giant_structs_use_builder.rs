@@ -285,10 +285,7 @@ impl ConfiguredCheck for ParsedConfig {
 }
 
 fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<ParsedConfig> {
-    let raw: RawConfig = config
-        .clone()
-        .try_into()
-        .context("invalid rust/giant-structs config")?;
+    let raw: RawConfig = config.clone().try_into().context("invalid rust/giant-structs config")?;
 
     let max_fields = match raw.max_fields {
         Some(v) => usize::try_from(v).context("`max_fields` must be a non-negative integer")?,

@@ -186,7 +186,11 @@ async fn declarative_produces_expected_findings_on_committed_fixtures() {
         format_findings[0].message
     );
 
-    assert_eq!(lint_findings.len(), 3, "expected 3 lint findings on malformed.bzl, got {lint_findings:#?}");
+    assert_eq!(
+        lint_findings.len(),
+        3,
+        "expected 3 lint findings on malformed.bzl, got {lint_findings:#?}"
+    );
     let lint_messages: Vec<&str> = lint_findings.iter().map(|f| f.message.as_str()).collect();
     assert!(
         lint_messages.iter().any(|m| m.contains("module-docstring")),
