@@ -2408,7 +2408,8 @@ enum OutputMode {
     Json,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(bon::Builder, Debug, Serialize)]
+#[builder(on(String, into))]
 struct CliReferenceDocument {
     cli: &'static str,
     usage_rules: Vec<&'static str>,
@@ -6374,9 +6375,13 @@ async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: ByPrArgs) ->
         }
         1 => {
             let matched = with_display_pr_match(matches.into_iter().next().expect("len checked == 1"));
-            print_entity(ctx, &serde_json::json!({ "match": &matched, "matches": [&matched] }), || {
-                print_pr_match(&matched);
-            })
+            print_entity(
+                ctx,
+                &serde_json::json!({ "match": &matched, "matches": [&matched] }),
+                || {
+                    print_pr_match(&matched);
+                },
+            )
         }
         _ => {
             let matched: Vec<PrWorkItemMatch> = matches.into_iter().map(with_display_pr_match).collect();
@@ -8063,7 +8068,8 @@ enum LintSeverity {
 /// the current pointer fields (so the user can see what's set), the
 /// reason the finding fired, and a copy-pasteable `suggested_fix`
 /// CLI invocation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(bon::Builder, Debug, Clone, Serialize)]
+#[builder(on(String, into))]
 struct LintDesignDocEntry {
     project_id: String,
     project_slug: String,
