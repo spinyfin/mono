@@ -553,7 +553,8 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 struct ApiPr {
     url: String,
     state: String,
@@ -817,6 +818,8 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// state in the work DB, release the cube lease, publish the right
 /// invalidation events. Stateless — keeps the wiring side at the call
 /// site (`app.rs`) thin.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerCompletionHandler {
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
@@ -5802,6 +5805,81 @@ mod tests {
         assert_eq!(execution.status, ExecutionStatus::Cancelled);
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert!(execution.cube_lease_id.is_none());
+    }
+
+    /// Regression guard for the "delete-while-doing" lifecycle bug: deleting a
+    /// work item while its worker is actively running must tear down the worker
+    /// fully — process kill, pool slot release, and cube lease release — not
+    /// just mark the DB row terminal (the T1089 cancel-without-reap failure
+    /// mode).
+    ///
+    /// `handle_delete_work_item` detects a live execution and spawns
+    /// `cancel_and_release` on the completion handler. This test drives that
+    /// call directly and verifies all three observable side effects:
+    ///
+    /// 1. `pane.calls` contains the execution id — `release_pane` was invoked,
+    ///    which is the proxy for "OS process tree was signalled and the pool
+    ///    slot was freed" (the production `release_worker_pane` calls
+    ///    `reap_worker_process_tree` + `release_worker_and_kick` once
+    ///    `release_pane` returns `Reaped`).
+    /// 2. `cube.release_calls` contains the lease id — the cube workspace
+    ///    lease was freed so the workspace slot returns to the pool.
+    /// 3. `execution.status` == `Cancelled` — the DB row is terminal so the
+    ///    orphan sweep and reconciler will not re-dispatch it.
+    #[tokio::test]
+    async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execution() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture_running(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes,
+        );
+
+        // This is the call that handle_delete_work_item spawns when it detects
+        // a live execution for a work item being deleted.
+        handler
+            .cancel_and_release(&execution_id, "work item deleted while a worker was active")
+            .await;
+
+        // 1. Pane releaser was invoked — the production implementation
+        //    signals the OS process tree (SIGTERM → SIGKILL) and frees the
+        //    worker pool slot via release_worker_and_kick.
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "release_pane must be called with the execution id so the OS process tree is signalled and the pool slot freed",
+        );
+
+        // 2. Cube workspace lease was released — the workspace is back in
+        //    the pool for future dispatches and the slot is not permanently
+        //    occupied.
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube workspace lease must be released so the pool slot is not permanently occupied",
+        );
+
+        // 3. Execution row is terminal — the orphan sweep and reconciler
+        //    will not re-dispatch the deleted work item.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Cancelled,
+            "execution must be marked Cancelled so the reconciler never re-dispatches the deleted item",
+        );
+        assert!(
+            execution.cube_lease_id.is_none(),
+            "cube_lease_id must be cleared from the execution row after the lease is released",
+        );
     }
 
     #[tokio::test]
