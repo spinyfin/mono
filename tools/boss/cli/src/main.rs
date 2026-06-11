@@ -6374,27 +6374,20 @@ async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: ByPrArgs) ->
         }
         1 => {
             let matched = with_display_pr_match(matches.into_iter().next().expect("len checked == 1"));
-            print_entity(ctx, &serde_json::json!({ "match": &matched }), || {
+            print_entity(ctx, &serde_json::json!({ "match": &matched, "matches": [&matched] }), || {
                 print_pr_match(&matched);
             })
         }
         _ => {
-            let repos: Vec<String> = matches
-                .iter()
-                .map(|m| {
-                    m.owner
-                        .pr_url
-                        .as_deref()
-                        .map(repo_url_from_pr_url)
-                        .unwrap_or("<unknown>")
-                        .to_owned()
-                })
-                .collect();
-            Err(CliError::usage(format!(
-                "PR #{} exists in repos {}; pass --repo to disambiguate",
-                args.pr_number,
-                repos.join(", "),
-            )))
+            let matched: Vec<PrWorkItemMatch> = matches.into_iter().map(with_display_pr_match).collect();
+            print_entity(ctx, &serde_json::json!({ "matches": &matched }), || {
+                for (i, m) in matched.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    print_pr_match(m);
+                }
+            })
         }
     }
 }
