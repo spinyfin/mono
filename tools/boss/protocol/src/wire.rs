@@ -2420,7 +2420,8 @@ pub struct SettingSnapshot {
 /// [`FrontendEvent::WorkspacePoolSummaryResult`]. Mirrors
 /// `CubeWorkspaceStatus` plus an optional engine-side annotation
 /// that maps a workspace's current lease to the execution holding it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkspacePoolEntry {
     pub workspace_id: String,
     pub workspace_path: String,
@@ -3013,7 +3014,7 @@ mod sorted_request_variants_test {
             .take_while(|l| *l != "}")
             .filter_map(|l| {
                 let t = l.trim();
-                if t.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if t.chars().next().is_some_and(|c| c.is_uppercase()) {
                     // Extract just the variant name (up to the first
                     // non-alphanumeric character: space, `{`, or `,`).
                     t.split_once(|c: char| !c.is_alphanumeric())

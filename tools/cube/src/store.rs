@@ -36,7 +36,7 @@ impl EffectiveState {
         }
     }
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+    pub fn parse_str(raw: &str) -> Option<Self> {
         match raw {
             "free" => Some(Self::Free),
             "free-dirty" => Some(Self::FreeDirty),
@@ -62,7 +62,8 @@ pub struct WorkspaceListFilter<'a> {
 /// trail for the timeline ("`lease.expired_reclaimed`") and tell the
 /// reset path that the workspace it just claimed used to belong to
 /// someone — so destructive `jj new <main>` should be guarded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExpiredLease {
     pub workspace_id: String,
     pub lease_id: String,
@@ -458,7 +459,7 @@ impl Store {
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
                 params![repo, workspace_id],
-                |row| row_to_workspace_record(row),
+                row_to_workspace_record,
             )
             .map_err(CubeError::Storage)?;
         transaction.commit().map_err(CubeError::Storage)?;
@@ -1152,7 +1153,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         repo: row.get(0)?,
         workspace_id: row.get(1)?,
         workspace_path: row.get::<_, String>(2)?.into(),
-        state: WorkspaceState::from_str(&state_raw).ok_or_else(|| {
+        state: WorkspaceState::parse_str(&state_raw).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,
                 rusqlite::types::Type::Text,
@@ -1166,7 +1167,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         lease_expires_at_epoch_s: row.get(8)?,
         head_commit: row.get(9)?,
         last_release_reason: row.get(10)?,
-        health_status: health_raw.as_deref().and_then(WorkspaceHealth::from_str),
+        health_status: health_raw.as_deref().and_then(WorkspaceHealth::parse_str),
         unhealthy_since_epoch_s: row.get(12)?,
     })
 }

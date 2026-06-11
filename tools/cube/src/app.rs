@@ -1657,7 +1657,7 @@ fn run_workspace(
         }
         WorkspaceCommand::List { repo, state, holder } => {
             let parsed_effective_state = match state.as_deref() {
-                Some(raw) => Some(EffectiveState::from_str(raw).ok_or_else(|| {
+                Some(raw) => Some(EffectiveState::parse_str(raw).ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
                         "invalid --state `{raw}`; expected `free`, `free-dirty`, `free-conflicted`, or `leased`"
                     ))
@@ -2666,8 +2666,7 @@ fn resolve_pr_push_target(
             let head_branch = bm_out
                 .lines()
                 .map(str::trim)
-                .filter(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
-                .next()
+                .find(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
                 .ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
                         "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
@@ -2729,10 +2728,10 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/") {
-                        if let Ok(n) = n_str.parse::<u64>() {
-                            pr_number = Some(n);
-                        }
+                    if let Some(n_str) = name.strip_prefix("pr/")
+                        && let Ok(n) = n_str.parse::<u64>()
+                    {
+                        pr_number = Some(n);
                     }
                 } else {
                     head_branch = Some(name.to_string());
@@ -4305,7 +4304,8 @@ fn cleanup_workspace_logs(workspace_id: &str) -> Result<()> {
 /// Summary of a workspace row touched by the missing-directory reconciler.
 /// Surfaced through `cube workspace list --json` and also fed to per-row
 /// audit events so the operator has a paper trail.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 struct ReconciledRow {
     repo: String,
     workspace_id: String,
