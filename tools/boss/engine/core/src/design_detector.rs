@@ -23,11 +23,9 @@
 //!   branch (typically `main`). If the project has no path yet, the
 //!   full pointer is written.
 
-use std::process::Stdio;
-
 use anyhow::{Context, Result};
-use tokio::process::Command;
 
+use crate::gh_spawn::gh_output;
 use crate::work::WorkDb;
 use boss_protocol::SetProjectDesignDocInput;
 
@@ -323,13 +321,7 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
 }
 
 async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
-    let output = Command::new("gh")
-        .args(["pr", "view", pr_url, "--json", "files,headRefName,baseRefName"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
+    let output = gh_output(&["pr", "view", pr_url, "--json", "files,headRefName,baseRefName"])
         .await
         .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
 
