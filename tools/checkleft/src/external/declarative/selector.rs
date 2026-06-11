@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use jaq_interpret::{Ctx, Filter, FilterT as _, Native, ParseCtx, RcIter, Val, ValR, ValRs};
 use serde_json::Value;
 

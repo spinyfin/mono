@@ -51,4 +51,4 @@ invocations:
       kind: linelist
       message: "file needs rustfmt formatting"
       remediations:
-        - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{file}}`."
+        - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{input.file}}`."

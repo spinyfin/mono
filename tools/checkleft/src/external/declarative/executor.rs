@@ -13,13 +13,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSetBuilder};
 
 use crate::input::{ChangeKind, ChangeSet};
 use crate::output::{CheckResult, Finding};
 
-use super::{ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode, resolve};
+use super::{resolve, ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode};
 
 /// Run a declarative check end-to-end. `repo_root` is the working directory
 /// invocations run from (and the Bazel workspace, when the `bazel` resolver is used).
@@ -45,10 +45,57 @@ pub fn run_declarative_check(
         findings.extend(run_invocation(repo_root, &binaries, invocation, &files)?);
     }
 
+    // Deduplicate: some tools (e.g. rustfmt with per-file + module-tree recursion)
+    // report the same file via multiple code paths. Keep first occurrence of each
+    // (check_id, path, line, column, message, severity) tuple.
+    findings = dedup_findings(findings);
+
     Ok(CheckResult {
         check_id: package_id.to_owned(),
         findings,
     })
+}
+
+/// Remove findings that describe the same location + issue as an earlier finding.
+/// Key is `(path, line, column, message, severity)` — remediations are intentionally
+/// excluded: two invocations may reach the same file via different code paths (e.g.
+/// rustfmt recursing from a module root and directly from the child file), producing
+/// the same issue but with slightly different remediation text.
+fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    use std::collections::HashSet;
+    type Key = (Option<PathBuf>, Option<u32>, Option<u32>, String, u8);
+    let mut seen: HashSet<Key> = HashSet::new();
+    let mut out: Vec<Finding> = Vec::with_capacity(findings.len());
+    for f in findings {
+        let key: Key = (
+            f.location.as_ref().map(|l| l.path.clone()),
+            f.location.as_ref().and_then(|l| l.line),
+            f.location.as_ref().and_then(|l| l.column),
+            f.message.clone(),
+            f.severity as u8,
+        );
+        if seen.insert(key) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Strip `repo_root` from any absolute finding paths so every finding emitted by
+/// the declarative runtime is repo-relative. This is a framework-level guarantee:
+/// tools may receive absolute paths (e.g. when the hermetic Bazel toolchain wrapper
+/// canonicalizes inputs) and echo them back — the framework normalises before the
+/// finding reaches the runner.
+fn normalize_finding_paths(findings: &mut Vec<Finding>, repo_root: &Path) {
+    for finding in findings.iter_mut() {
+        if let Some(location) = &mut finding.location {
+            if location.path.is_absolute() {
+                if let Ok(relative) = location.path.strip_prefix(repo_root) {
+                    location.path = relative.to_path_buf();
+                }
+            }
+        }
+    }
 }
 
 /// Select non-deleted changed files matching any `applies_to` glob, sorted for
@@ -86,11 +133,11 @@ fn run_invocation(
         )
     })?;
 
-    match invocation.mode {
+    let mut findings = match invocation.mode {
         InvocationMode::Batch => {
             let args = expand_batch_args(&invocation.args, files);
             let output = spawn(repo_root, binary, &args, &invocation.id)?;
-            classify_and_project(invocation, &output, None)
+            classify_and_project(invocation, &output, None)?
         }
         InvocationMode::PerFile => {
             let mut findings = Vec::new();
@@ -99,9 +146,15 @@ fn run_invocation(
                 let output = spawn(repo_root, binary, &args, &invocation.id)?;
                 findings.extend(classify_and_project(invocation, &output, Some(file))?);
             }
-            Ok(findings)
+            findings
         }
-    }
+    };
+
+    // Normalize absolute paths to repo-relative. Tools invoked via the hermetic
+    // Bazel toolchain wrapper may receive absolute input paths and echo them back;
+    // the framework strips the repo root prefix before the finding reaches the runner.
+    normalize_finding_paths(&mut findings, repo_root);
+    Ok(findings)
 }
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.

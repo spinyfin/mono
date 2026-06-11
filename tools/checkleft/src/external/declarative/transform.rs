@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -26,6 +26,11 @@ use crate::output::{Finding, Location, Severity};
 
 use super::selector::Selector;
 use super::template::{RenderContext, Template};
+
+/// Sentinel JSON item used when rendering templates that have no JSON item context
+/// (e.g. linelist). Any `{{item.*}}` ref resolves to `None` → runtime error, which
+/// correctly rejects item-path refs in non-JSON transforms.
+const NO_JSON_ITEM: &Value = &Value::Null;
 
 /// A declared projection strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +51,7 @@ impl Transform {
         match self {
             Transform::Json(json) => json.apply(stdout, exit_code, input_file),
             Transform::Passthrough => passthrough(stdout),
-            Transform::LineList(ll) => ll.apply(stdout, exit_code),
+            Transform::LineList(ll) => ll.apply(stdout, exit_code, input_file),
         }
     }
 }
@@ -156,15 +161,19 @@ impl FindingTemplate {
 /// If the tool exits non-zero but stdout is empty, the transform returns an error
 /// rather than "clean". This distinguishes formatting violations (file paths printed)
 /// from operational errors like parse failures (exit 1, no output).
+///
+/// `message` and `remediations` are templates; the only useful ref in this context
+/// is `{{input.file}}` (the file passed to the per-file invocation). Unknown refs
+/// are rejected at check-load time by the template parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineListTransform {
-    pub message: String,
-    pub remediations: Vec<String>,
+    pub message: Template,
+    pub remediations: Vec<Template>,
     pub severity: Severity,
 }
 
 impl LineListTransform {
-    fn apply(&self, stdout: &[u8], exit_code: Option<i32>) -> Result<Vec<Finding>> {
+    fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
         let text = std::str::from_utf8(stdout).context("linelist transform: stdout is not valid UTF-8")?;
         let paths: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         if paths.is_empty() && exit_code != Some(0) {
@@ -176,17 +185,24 @@ impl LineListTransform {
                 exit_code
             );
         }
+        let context = RenderContext { input_file, exit_code };
+        let message = self.message.render(NO_JSON_ITEM, context)?;
+        let remediations = self
+            .remediations
+            .iter()
+            .map(|r| r.render(NO_JSON_ITEM, context))
+            .collect::<Result<Vec<_>>>()?;
         Ok(paths
             .into_iter()
             .map(|path| Finding {
                 severity: self.severity,
-                message: self.message.clone(),
+                message: message.clone(),
                 location: Some(Location {
                     path: PathBuf::from(path),
                     line: None,
                     column: None,
                 }),
-                remediations: self.remediations.clone(),
+                remediations: remediations.clone(),
                 suggested_fix: None,
             })
             .collect())

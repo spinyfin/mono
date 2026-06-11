@@ -21,7 +21,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::external::{
-    ExternalCheckPackageImplementation, parse_declarative_check_manifest, parse_external_check_package_manifest,
+    parse_declarative_check_manifest, parse_external_check_package_manifest, ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::{Finding, Severity};
@@ -766,5 +766,185 @@ fn rustfmt_missing_binary_degrades_to_check_error() {
     assert!(
         msg.contains("nonexistent_rustfmt_binary_xyz") || msg.contains("spawn") || msg.contains("format"),
         "error message should reference the binary or spawn failure; got: {msg}"
+    );
+}
+
+// ── path normalisation (issue: absolute paths from hermetic toolchain) ──────────
+
+#[test]
+fn linelist_absolute_paths_are_normalised_to_repo_relative() {
+    // When the hermetic Bazel rustfmt wrapper canonicalises the input path, it
+    // echoes back an absolute path. The framework must strip the repo-root prefix
+    // before emitting the finding.
+    let findings = rustfmt_linelist_findings(b"/repo/root/tools/src/lib.rs\n", 1);
+    // Without normalization the path stays absolute — this is what the transform
+    // itself returns; normalization is the executor's responsibility.
+    assert_eq!(
+        findings[0].location.as_ref().unwrap().path,
+        Path::new("/repo/root/tools/src/lib.rs"),
+        "transform should preserve the path as-is; normalization happens in the executor"
+    );
+
+    // Normalization happens inside run_invocation. Verify it via run_declarative_check
+    // by wiring up a tiny shell script that prints an absolute path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_root = tempfile::tempdir().expect("temp repo root");
+        std::fs::write(repo_root.path().join("rustfmt.toml"), "edition = \"2021\"\n").expect("write rustfmt.toml");
+
+        // Fake rustfmt that always exits 1 and prints an absolute path
+        let script_path = repo_root.path().join("fake_rustfmt.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\necho '{}/tools/src/lib.rs'\nexit 1\n",
+                repo_root.path().display()
+            ),
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let manifest = RUSTFMT_MANIFEST.replace(
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            &format!("path: \"{}\"", script_path.display()),
+        );
+        let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
+        let declarative = match package.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => d,
+            other => panic!("expected declarative, got {other:?}"),
+        };
+
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: std::path::PathBuf::from("tools/src/lib.rs"),
+            kind: crate::input::ChangeKind::Modified,
+            old_path: None,
+        }]);
+
+        let result = super::run_declarative_check(
+            repo_root.path(),
+            "rustfmt",
+            &declarative,
+            &changeset,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("run succeeds");
+
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "expected one finding; got: {:#?}",
+            result.findings
+        );
+        assert_eq!(
+            result.findings[0].location.as_ref().unwrap().path,
+            Path::new("tools/src/lib.rs"),
+            "absolute path must be normalised to repo-relative"
+        );
+    }
+}
+
+// ── duplicate findings (issue: module-tree recursion causes double-reporting) ───
+
+#[test]
+fn duplicate_findings_across_module_tree_are_deduplicated() {
+    // Simulate rustfmt being invoked per-file for both mod.rs and one of its
+    // declared submodule files. When mod.rs recurses into the submodule, both
+    // invocations emit a finding for the submodule file — the dedup pass in the
+    // executor must collapse them to one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_root = tempfile::tempdir().expect("temp repo root");
+        std::fs::write(repo_root.path().join("rustfmt.toml"), "edition = \"2021\"\n").expect("write rustfmt.toml");
+
+        // Fake rustfmt: always prints "src/lib.rs" and exits 1, regardless of
+        // which file was passed. This simulates rustfmt recursing into a submodule
+        // from both the parent and the child invocations.
+        let script_path = repo_root.path().join("fake_rustfmt.sh");
+        std::fs::write(&script_path, "#!/bin/sh\necho 'src/lib.rs'\nexit 1\n").expect("write script");
+        let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let manifest = RUSTFMT_MANIFEST.replace(
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            &format!("path: \"{}\"", script_path.display()),
+        );
+        let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
+        let declarative = match package.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => d,
+            other => panic!("expected declarative, got {other:?}"),
+        };
+
+        // Two files in the changeset — simulating mod.rs + child both in the PR.
+        let changeset = ChangeSet::new(vec![
+            ChangedFile {
+                path: std::path::PathBuf::from("src/mod.rs"),
+                kind: crate::input::ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: std::path::PathBuf::from("src/lib.rs"),
+                kind: crate::input::ChangeKind::Modified,
+                old_path: None,
+            },
+        ]);
+
+        let result = super::run_declarative_check(
+            repo_root.path(),
+            "rustfmt",
+            &declarative,
+            &changeset,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("run succeeds");
+
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "duplicate findings for src/lib.rs must be deduplicated to one; got: {:#?}",
+            result.findings
+        );
+        assert_eq!(
+            result.findings[0].location.as_ref().unwrap().path,
+            Path::new("src/lib.rs")
+        );
+    }
+}
+
+// ── template validation (issue: {{file}} silently rendered raw) ──────────────────
+
+#[test]
+fn linelist_rejects_unknown_template_var_in_remediations_at_parse_time() {
+    // {{file}} is not a valid template ref; the check should be rejected at
+    // manifest-load time so operators see the error immediately.
+    let manifest = RUSTFMT_MANIFEST.replace("{{input.file}}", "{{file}}");
+    let err = parse_declarative_check_manifest(&manifest).expect_err("manifest with {{file}} must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown template ref") || msg.contains("{{file}}"),
+        "error must name the bad ref; got: {msg}"
+    );
+}
+
+#[test]
+fn linelist_remediations_substitute_input_file() {
+    // {{input.file}} in the remediation text should expand to the file passed to
+    // the per-file invocation.
+    let findings = rustfmt_linelist_findings(b"src/lib.rs\n", 1);
+    assert_eq!(findings.len(), 1);
+    let remediation = &findings[0].remediations[0];
+    assert!(
+        remediation.contains("src/lib.rs"),
+        "remediation must contain the input file path `src/lib.rs`; got: {remediation}"
+    );
+    assert!(
+        !remediation.contains("{{"),
+        "remediation must not contain unsubstituted template vars; got: {remediation}"
     );
 }

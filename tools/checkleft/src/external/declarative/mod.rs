@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::Deserialize;
 
 use crate::output::Severity;
@@ -397,12 +397,22 @@ fn validate_transform(id: &str, raw: RawTransform) -> Result<transform::Transfor
             if raw.finding.is_some() {
                 bail!("linelist transform for invocation `{id}` must not set `finding`");
             }
-            let message = raw
+            let raw_message = raw
                 .message
                 .ok_or_else(|| anyhow::anyhow!("linelist transform for invocation `{id}` requires `message`"))?;
+            let parse = |field: &str, value: String| -> Result<Template> {
+                Template::parse(&value)
+                    .map_err(|err| anyhow::anyhow!("invocation `{id}` linelist.{field} is invalid: {err}"))
+            };
+            let message = parse("message", raw_message)?;
+            let remediations = raw
+                .remediations
+                .into_iter()
+                .map(|r| parse("remediations[]", r))
+                .collect::<Result<Vec<_>>>()?;
             Ok(transform::Transform::LineList(transform::LineListTransform {
                 message,
-                remediations: raw.remediations,
+                remediations,
                 severity: Severity::Warning,
             }))
         }
