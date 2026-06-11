@@ -553,7 +553,8 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 struct ApiPr {
     url: String,
     state: String,
@@ -817,6 +818,8 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// state in the work DB, release the cube lease, publish the right
 /// invalidation events. Stateless — keeps the wiring side at the call
 /// site (`app.rs`) thin.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerCompletionHandler {
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
