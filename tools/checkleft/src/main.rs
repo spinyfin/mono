@@ -509,11 +509,14 @@ async fn resolve_pr_description(
 /// 3. VCS fallback: `git branch --show-current` / jj bookmark.
 fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
     // Buildkite always exposes the branch; skip merge-queue synthetic branches.
-    if let Some(branch) = env.buildkite_branch.as_deref()
+    if let Some(branch) = env
+        .buildkite_branch
+        .as_deref()
         .filter(|b| !b.starts_with("gh-readonly-queue/"))
-        .and_then(|b| normalize_optional_description(Some(b.to_owned()))) {
-            return Some(branch);
-        }
+        .and_then(|b| normalize_optional_description(Some(b.to_owned())))
+    {
+        return Some(branch);
+    }
 
     // GitHub Actions: GITHUB_HEAD_REF on pull_request events.
     if let Some(branch) = normalize_optional_description(env.github_head_ref.clone()) {
@@ -521,12 +524,15 @@ fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
     }
 
     // GitHub Actions: parse refs/heads/{branch} from GITHUB_REF on push events.
-    if let Some(branch) = env.github_ref.as_deref()
+    if let Some(branch) = env
+        .github_ref
+        .as_deref()
         .and_then(|r| r.strip_prefix("refs/heads/"))
         .map(|b| b.trim().to_owned())
-        .filter(|b| !b.is_empty()) {
-            return Some(branch);
-        }
+        .filter(|b| !b.is_empty())
+    {
+        return Some(branch);
+    }
 
     // VCS fallback for local runs and any CI not covered above.
     normalize_optional_description(vcs.current_branch().ok())
@@ -563,7 +569,11 @@ fn try_gh_auth_token() -> Option<String> {
     if output.status.success() {
         let raw = String::from_utf8(output.stdout).ok()?;
         let trimmed = raw.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
     } else {
         None
     }

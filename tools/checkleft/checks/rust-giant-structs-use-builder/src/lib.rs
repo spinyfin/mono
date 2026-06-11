@@ -146,10 +146,10 @@ fn find_struct_line(source: &str, struct_name: &str) -> u32 {
     let search = format!("struct {struct_name}");
     for (i, line) in source.lines().enumerate() {
         let candidate = strip_visibility(line.trim_start());
-        if let Some(after) = candidate.strip_prefix(&search) {
-            if after.is_empty() || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')) {
-                return (i + 1) as u32;
-            }
+        if let Some(after) = candidate.strip_prefix(&search)
+            && (after.is_empty() || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')))
+        {
+            return (i + 1) as u32;
         }
     }
     1
@@ -171,9 +171,9 @@ fn strip_visibility(line: &str) -> &str {
 }
 
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().ok().map_or(false, |id| id == "test")
-    })
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().ok().is_some_and(|id| id == "test"))
 }
 
 fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {

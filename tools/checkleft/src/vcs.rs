@@ -178,7 +178,14 @@ impl Vcs {
                 let output = run_command(
                     &self.root,
                     "jj",
-                    &["log", "-r", "@", "--no-graph", "-T", "bookmarks.map(|b| b.name()).join(\"\\n\")"],
+                    &[
+                        "log",
+                        "-r",
+                        "@",
+                        "--no-graph",
+                        "-T",
+                        "bookmarks.map(|b| b.name()).join(\"\\n\")",
+                    ],
                 )?;
                 output
                     .lines()
@@ -230,15 +237,9 @@ pub async fn github_pull_request_description(
 /// Look up the open PR number for a branch via the GitHub API.
 /// Returns the PR number as a string (e.g. "42"), or None if no open PR is
 /// found, auth fails, or any error occurs (all failures are best-effort).
-pub async fn github_pr_number_for_branch(
-    repository: &str,
-    branch: &str,
-    github_token: Option<&str>,
-) -> Option<String> {
+pub async fn github_pr_number_for_branch(repository: &str, branch: &str, github_token: Option<&str>) -> Option<String> {
     let owner = repository.split('/').next()?;
-    let url = format!(
-        "https://api.github.com/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1"
-    );
+    let url = format!("https://api.github.com/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1");
     ensure_rustls_provider();
     let client = reqwest::Client::new();
     let mut request = client
