@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -33,6 +33,9 @@ pub enum Transform {
     Json(JsonTransform),
     /// Identity: the binary already emitted checkleft findings JSON on stdout.
     Passthrough,
+    /// Line-list: each non-empty stdout line is a file path with a violation.
+    /// Used with tools like `rustfmt --check -l` that print one file per line.
+    LineList(LineListTransform),
     // Future: Regex(RegexTransform), Sarif(SarifTransform).
 }
 
@@ -43,6 +46,7 @@ impl Transform {
         match self {
             Transform::Json(json) => json.apply(stdout, exit_code, input_file),
             Transform::Passthrough => passthrough(stdout),
+            Transform::LineList(ll) => ll.apply(stdout, exit_code),
         }
     }
 }
@@ -143,5 +147,44 @@ impl FindingTemplate {
             .parse::<u32>()
             .with_context(|| format!("finding.{field} rendered to `{rendered}`, which is not a line/column number"))?;
         Ok(Some(parsed))
+    }
+}
+
+/// The `linelist` strategy: the binary prints one file path per line on stdout for
+/// files that have violations. Each non-empty line becomes one file-level finding.
+///
+/// If the tool exits non-zero but stdout is empty, the transform returns an error
+/// rather than "clean". This distinguishes formatting violations (file paths printed)
+/// from operational errors like parse failures (exit 1, no output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineListTransform {
+    pub message: String,
+    pub remediations: Vec<String>,
+    pub severity: Severity,
+}
+
+impl LineListTransform {
+    fn apply(&self, stdout: &[u8], exit_code: Option<i32>) -> Result<Vec<Finding>> {
+        let text = std::str::from_utf8(stdout).context("linelist transform: stdout is not valid UTF-8")?;
+        let paths: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if paths.is_empty() && exit_code != Some(0) {
+            // Non-zero exit with no file output is an operational error (e.g. a parse
+            // failure), not a "no violations" result.
+            bail!(
+                "linelist transform: tool exited {:?} with no output; this indicates an \
+                 operational error (e.g. parse failure), not a clean result",
+                exit_code
+            );
+        }
+        Ok(paths
+            .into_iter()
+            .map(|path| Finding {
+                severity: self.severity,
+                message: self.message.clone(),
+                location: Some(Location { path: PathBuf::from(path), line: None, column: None }),
+                remediations: self.remediations.clone(),
+                suggested_fix: None,
+            })
+            .collect())
     }
 }
