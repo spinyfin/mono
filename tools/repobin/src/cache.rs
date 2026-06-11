@@ -57,6 +57,7 @@ impl RepoCache {
         let lock_path = self.dir.join("lock");
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -427,7 +428,7 @@ fn repo_dir_name(url: &str) -> String {
 
 fn url_slug(url: &str) -> String {
     let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let last = trimmed.rsplit(|c| matches!(c, '/' | ':')).next().unwrap_or("");
+    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
     last.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(40)

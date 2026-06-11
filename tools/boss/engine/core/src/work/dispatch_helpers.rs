@@ -1302,7 +1302,7 @@ mod tests {
     fn retired_status_none_for_empty_attempt_id() {
         let db = open_db();
         let conn = db.connect().unwrap();
-        let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}");
+        let created_via = CREATED_VIA_MERGE_CONFLICT_PREFIX.to_string();
         assert_eq!(
             retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
             None,

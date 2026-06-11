@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RepoRecord {
     pub repo: String,
     pub origin: String,
@@ -31,7 +32,7 @@ impl WorkspaceState {
         }
     }
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+    pub fn parse_str(raw: &str) -> Option<Self> {
         match raw {
             "free" => Some(Self::Free),
             "leased" => Some(Self::Leased),
@@ -63,7 +64,7 @@ impl WorkspaceHealth {
         }
     }
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+    pub fn parse_str(raw: &str) -> Option<Self> {
         match raw {
             "clean" => Some(Self::Clean),
             "dirty" => Some(Self::Dirty),
@@ -73,7 +74,8 @@ impl WorkspaceHealth {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkspaceRecord {
     pub repo: String,
     pub workspace_id: String,
@@ -103,7 +105,8 @@ pub struct WorkspaceCandidate {
     pub workspace_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ChangeRecord {
     pub change_id: String,
     pub repo: String,

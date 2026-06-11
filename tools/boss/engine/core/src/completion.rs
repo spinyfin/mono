@@ -553,7 +553,8 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 struct ApiPr {
     url: String,
     state: String,
@@ -817,6 +818,8 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// state in the work DB, release the cube lease, publish the right
 /// invalidation events. Stateless — keeps the wiring side at the call
 /// site (`app.rs`) thin.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerCompletionHandler {
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
@@ -837,6 +840,7 @@ pub struct WorkerCompletionHandler {
     /// Defaults to an empty cache so test sites that don't exercise
     /// the staging path get the same behaviour they always had —
     /// nothing is staged → fall through to `pr_detector`.
+    #[builder(default = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()))]
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
     /// Toggleable feature flags (incident 001 AI #5). Consulted by
     /// `on_stop_inner` and `recheck_for_pr` to decide whether the
@@ -844,6 +848,7 @@ pub struct WorkerCompletionHandler {
     /// store whose only state is the registry defaults — tests that
     /// don't wire one in get the historical behaviour
     /// (`detect_pr_cold_fallback` defaults ON).
+    #[builder(default = Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())))]
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
     /// Layer-2 defence-in-depth verifier. Before a staged PR URL drives
     /// the in_review transition, the verifier fetches the PR's
@@ -855,11 +860,17 @@ pub struct WorkerCompletionHandler {
     /// Defaults to `CommandBranchVerifier` (shells out to `gh pr view`).
     /// Tests that exercise the staged-URL path must wire in a stub via
     /// [`Self::with_branch_verifier`] to avoid live network calls.
+    #[builder(default = Arc::new(CommandBranchVerifier::new()))]
     branch_verifier: Arc<dyn BranchVerifier>,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the PR-capture counters pre-registered so tests that do not
     /// call `with_metrics` still get valid increments. Production wires
     /// in the shared engine registry via `with_metrics` after construction.
+    #[builder(default = {
+        let m = Arc::new(Registry::new());
+        register_metrics(&m);
+        m
+    })]
     metrics: Arc<Registry>,
     /// GitHub probe used for the on-transition CI-status pre-fetch.
     /// When a task moves to Review the handler spawns a background task
@@ -867,6 +878,7 @@ pub struct WorkerCompletionHandler {
     /// from the first poll rather than waiting for the merge-poller sweep.
     /// Defaults to [`NoopMergeProbe`]; production wires in the shared
     /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
+    #[builder(default = Arc::new(NoopMergeProbe))]
     merge_probe: Arc<dyn MergeProbe>,
     /// Circuit breaker for the auto-nudge loop. Every nudge site routes
     /// through [`Self::nudge_or_park`], which records the nudge against
@@ -875,10 +887,12 @@ pub struct WorkerCompletionHandler {
     /// nudged again (the Worf-incident fix). Shared via `Arc` so the
     /// per-execution counters survive across the multiple `on_stop`
     /// calls of a single worker session. Defaults to a fresh breaker.
+    #[builder(default = Arc::new(NudgeBreaker::new()))]
     nudge_breaker: Arc<NudgeBreaker>,
     /// Cap on consecutive unproductive auto-nudges before the breaker
     /// trips. Defaults to [`DEFAULT_MAX_UNPRODUCTIVE_NUDGES`]; tests
     /// override it via [`Self::with_max_unproductive_nudges`].
+    #[builder(default = DEFAULT_MAX_UNPRODUCTIVE_NUDGES)]
     max_unproductive_nudges: u32,
     /// Maximum number of automated reviewer passes per PR (P992 design §7).
     /// When a producing task's `review_cycle` reaches this value the engine
@@ -886,6 +900,7 @@ pub struct WorkerCompletionHandler {
     /// Defaults to [`crate::config::DEFAULT_MAX_REVIEW_CYCLES`]; production
     /// wires in the value from `WorkConfig` via
     /// [`Self::with_max_review_cycles`].
+    #[builder(default = crate::config::DEFAULT_MAX_REVIEW_CYCLES)]
     max_review_cycles: usize,
     /// Minimum changed-line count required to trigger a reviewer pass when
     /// `last_reviewed_sha` is set (P992 design §8). Pushes whose effective
@@ -894,11 +909,13 @@ pub struct WorkerCompletionHandler {
     /// means skip only when the diff is literally empty (pure rebase with
     /// no file-content changes). Production wires in the value from
     /// `WorkConfig` via [`Self::with_min_review_changed_lines`].
+    #[builder(default = crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES)]
     min_review_changed_lines: u64,
     /// PR state checker passed to `create_revision` in
     /// `finalize_pr_review_pass`. Defaults to [`GhPrStateChecker`] (shells
     /// out to `gh pr view`); tests inject `FakePrStateChecker::always(Open)`
     /// via [`Self::with_pr_state_checker`] to avoid live network calls.
+    #[builder(default = Arc::new(crate::work::GhPrStateChecker))]
     pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
     /// Engine-owned base directory for worker structured-output artifacts
     /// (review findings / task followups). Mirrors the dir the spawn path
@@ -906,6 +923,7 @@ pub struct WorkerCompletionHandler {
     /// same in production. Tests point it at a tempdir via
     /// [`Self::with_structured_output_dir`] so they can seed/inspect the
     /// artifact without touching the shared system temp dir.
+    #[builder(default = crate::structured_output::default_dir())]
     structured_output_dir: std::path::PathBuf,
 }
 
@@ -10502,7 +10520,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         review_result_json: Option<&str>,
     ) -> (Arc<WorkDb>, String, String, String, String) {
-        let transcript_jsonl = review_result_json.map(|j| make_review_transcript_jsonl(j));
+        let transcript_jsonl = review_result_json.map(make_review_transcript_jsonl);
         pr_review_exec_fixture_with_jsonl(workspace_path, transcript_jsonl.as_deref())
     }
 
