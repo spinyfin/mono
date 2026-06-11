@@ -467,12 +467,8 @@ mod tests {
         review_pool_size: usize,
     ) -> (Arc<ExecutionCoordinator>, WorkerPool) {
         let review_pool = WorkerPool::new_review(review_pool_size);
-        let mut coordinator = ExecutionCoordinator::new(
-            db,
-            WorkerPool::new(pool_size),
-            Arc::new(NoopCube),
-            Arc::new(NoopRunner),
-        );
+        let mut coordinator =
+            ExecutionCoordinator::new(db, WorkerPool::new(pool_size), Arc::new(NoopCube), Arc::new(NoopRunner));
         coordinator.set_review_pool(review_pool.clone());
         (Arc::new(coordinator), review_pool)
     }

@@ -868,6 +868,7 @@ impl RevisionSource for AtomicU64 {
 }
 
 #[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
