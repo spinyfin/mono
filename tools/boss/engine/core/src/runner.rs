@@ -4601,6 +4601,110 @@ mod pane_spawn_tests {
         assert_eq!(spawn.prompt_addendum, None);
     }
 
+    /// Regression for T1647: `PaneSpawnRunner::run_execution` must return
+    /// `ReviewerPaneAlive` (not `WaitingHuman`) for `PrReview` executions so
+    /// the execution stays in `running` while the reviewer pane is alive.
+    ///
+    /// This pins the runner.rs change at the `PaneSpawnRunner` level.
+    /// Reverting `run_execution` back to always returning `WaitingHuman`
+    /// would cause this test to fail even if the badge-SQL test in t01.rs
+    /// still passes.
+    #[tokio::test]
+    async fn pr_review_execution_yields_reviewer_pane_alive() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Some chore being reviewed".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg.clone(), work_db.clone(), flags.clone());
+        runner.set_server_state(weak.clone());
+
+        // Build a PrReview execution; no pr_url on the chore is fine —
+        // the runner falls back to the generic prompt, which is irrelevant
+        // to the wait_state assertion.
+        let mut pr_review_exec = sample_execution(workspace.path());
+        pr_review_exec.kind = ExecutionKind::PrReview;
+        pr_review_exec.work_item_id = chore.id.clone();
+
+        let outcome = runner
+            .run_execution(
+                "review-1",
+                &pr_review_exec,
+                &WorkItem::Chore(chore.clone()),
+                workspace.path(),
+                Some("change-pr-review"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.wait_state,
+            RunWaitState::ReviewerPaneAlive,
+            "PaneSpawnRunner must return ReviewerPaneAlive for PrReview executions so the \
+             execution stays in running (not waiting_human) while the reviewer pane is alive"
+        );
+
+        // Verify that a non-PrReview kind still yields WaitingHuman.
+        let runner2 = PaneSpawnRunner::new(cfg, work_db, flags);
+        runner2.set_server_state(weak);
+        let mut chore_exec = sample_execution(workspace.path());
+        chore_exec.kind = ExecutionKind::ChoreImplementation;
+        chore_exec.work_item_id = chore.id.clone();
+
+        let outcome2 = runner2
+            .run_execution(
+                "worker-1",
+                &chore_exec,
+                &WorkItem::Chore(chore),
+                workspace.path(),
+                Some("change-chore"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome2.wait_state,
+            RunWaitState::WaitingHuman,
+            "PaneSpawnRunner must return WaitingHuman for non-PrReview executions"
+        );
+    }
+
     /// **No env vars related to effort or token caps appear on the
     /// worker subprocess.** Design §Q2 §"Knobs explicitly not in v1"
     /// rejects `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `MAX_THINKING_TOKENS`,
