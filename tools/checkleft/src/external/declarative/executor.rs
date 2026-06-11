@@ -212,10 +212,24 @@ fn classify_and_project(
 ) -> Result<Vec<Finding>> {
     match invocation.exit.classify(output.exit_code) {
         ExitOutcome::Ok => Ok(Vec::new()),
-        ExitOutcome::Findings => invocation
-            .transform
-            .apply(&output.stdout, output.exit_code, input_file)
-            .with_context(|| format!("transform for invocation `{}` failed", invocation.id)),
+        ExitOutcome::Findings => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            invocation
+                .transform
+                .apply(&output.stdout, output.exit_code, input_file)
+                .with_context(|| {
+                    let file_note = input_file.map(|f| format!(" (file: {f})")).unwrap_or_default();
+                    let stderr_trimmed = stderr.trim();
+                    if stderr_trimmed.is_empty() {
+                        format!("transform for invocation `{}`{file_note} failed", invocation.id)
+                    } else {
+                        format!(
+                            "transform for invocation `{}`{file_note} failed; tool stderr:\n{stderr_trimmed}",
+                            invocation.id
+                        )
+                    }
+                })
+        }
         ExitOutcome::Error => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
