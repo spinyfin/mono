@@ -53,6 +53,19 @@ pub enum RunWaitState {
     /// [`PaneSpawnRunner::run_execution`] and the T981 mid-spawn-cancel
     /// collision this closes.
     CancelledDuringSpawn,
+    /// A `pr_review` reviewer pane was successfully spawned. The pane is
+    /// alive and the reviewer agent is actively working. The execution
+    /// stays in `running` (not `waiting_human`) until the Stop hook fires
+    /// and `finalize_pr_review_pass` transitions it to `completed` via
+    /// `record_worker_pr_completion`. Workspace is retained so the reviewer
+    /// pane can continue.
+    ///
+    /// Using `running` (rather than `waiting_human`) is what keeps the
+    /// "AI reviewing" badge visible on kanban cards for the duration of
+    /// the review — the badge queries `pr_review` executions in `running`
+    /// status. `waiting_human` is semantically wrong here: nobody is waiting
+    /// for a human while the reviewer agent is working.
+    ReviewerPaneAlive,
 }
 
 impl RunWaitState {
@@ -67,6 +80,8 @@ impl RunWaitState {
             // drives a status transition for this variant. Report the
             // terminal status for completeness.
             RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
+            // Reviewer pane is alive; execution stays `running`.
+            RunWaitState::ReviewerPaneAlive => ExecutionStatus::Running,
         }
     }
 
@@ -581,8 +596,20 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         }
 
+        // A `pr_review` reviewer pane stays in `running` after spawn so that
+        // the "AI reviewing" kanban badge remains visible while the reviewer
+        // agent is actively working. `waiting_human` is only correct once the
+        // review is done and a human must act; the execution transitions to
+        // `completed` when the Stop hook fires and `finalize_pr_review_pass`
+        // calls `record_worker_pr_completion`. All other execution kinds use
+        // `WaitingHuman` — the normal post-spawn park state.
+        let wait_state = if execution.kind == ExecutionKind::PrReview {
+            RunWaitState::ReviewerPaneAlive
+        } else {
+            RunWaitState::WaitingHuman
+        };
         Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
+            wait_state,
             result_summary: Some(format!(
                 "Spawned worker pane in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
                 started.slot_id, started.shell_pid,
