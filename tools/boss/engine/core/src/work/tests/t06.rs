@@ -1484,13 +1484,14 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
         TaskStatus::Archived,
         "todo revision must be archived after parent PR merges",
     );
-    assert_eq!(rev_after.blocked_reason, None, "archived revision must have no blocked_reason");
+    assert_eq!(
+        rev_after.blocked_reason, None,
+        "archived revision must have no blocked_reason"
+    );
 
     // A new standalone chore must carry the revision's name/description.
     let chores = db.list_chores(&product_id, None, false).unwrap();
-    let new_chore = chores
-        .iter()
-        .find(|c| c.id != parent_id && c.name == revision.name);
+    let new_chore = chores.iter().find(|c| c.id != parent_id && c.name == revision.name);
     assert!(
         new_chore.is_some(),
         "a new standalone chore must be created from the revision; chores: {chores:?}",
@@ -1500,7 +1501,10 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
         new_chore.description, revision.description,
         "converted chore must carry the revision's description",
     );
-    assert!(!new_chore.autostart, "backlog-converted revision must yield a non-autostart chore");
+    assert!(
+        !new_chore.autostart,
+        "backlog-converted revision must yield a non-autostart chore"
+    );
     assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
 }
 
@@ -1662,9 +1666,7 @@ fn mark_chore_pr_merged_converts_active_revision_to_autostart_chore() {
     );
 
     let chores = db.list_chores(&product_id, None, false).unwrap();
-    let new_chore = chores
-        .iter()
-        .find(|c| c.id != parent_id && c.name == revision.name);
+    let new_chore = chores.iter().find(|c| c.id != parent_id && c.name == revision.name);
     assert!(
         new_chore.is_some(),
         "a new standalone chore must be created for a WIP revision; chores: {chores:?}",

@@ -9,8 +9,7 @@ use super::*;
 /// those issues were already resolved.  Archiving the revision silently
 /// avoids a dangling attention item or a spurious follow-up chore.
 pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
-    created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
-        || created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX)
+    created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) || created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX)
 }
 
 /// Walk `tasks.parent_task_id` from `task_id` to find the originating
@@ -162,9 +161,7 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
         ) {
             continue;
         }
-        if rev.status == TaskStatus::Blocked
-            && rev.blocked_reason.as_deref() == Some("parent_pr_closed")
-        {
+        if rev.status == TaskStatus::Blocked && rev.blocked_reason.as_deref() == Some("parent_pr_closed") {
             continue;
         }
 

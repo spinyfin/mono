@@ -524,11 +524,11 @@ pub(crate) fn reconcile_revision_execution(
                 |r| r.get(0),
             )
             .optional()?;
-        let is_terminal = fresh_status.as_deref().map_or(true, |s| {
-            matches!(s, "done" | "archived" | "cancelled" | "in_review")
-        });
-        let already_closed = fresh_status.as_deref() == Some("blocked")
-            && task.blocked_reason.as_deref() == Some("parent_pr_closed");
+        let is_terminal = fresh_status
+            .as_deref()
+            .map_or(true, |s| matches!(s, "done" | "archived" | "cancelled" | "in_review"));
+        let already_closed =
+            fresh_status.as_deref() == Some("blocked") && task.blocked_reason.as_deref() == Some("parent_pr_closed");
         if is_terminal || already_closed {
             return Ok(());
         }
