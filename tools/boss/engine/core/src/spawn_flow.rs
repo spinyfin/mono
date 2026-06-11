@@ -67,7 +67,8 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct StartWorkerInput {
     pub run_id: String,
     pub lease_id: String,

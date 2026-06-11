@@ -95,7 +95,8 @@ pub enum WorkerKind {
 /// All the inputs a worker-config render needs. The shape is
 /// deliberately minimal — anything more (project-specific guidance,
 /// allowlisted tools) lives in higher layers and is rendered separately.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerSetupInput {
     /// Run id this spawn corresponds to. Baked into the hook command
     /// in the worker settings file as a `BOSS_RUN_ID=<run_id>` inline-assignment
