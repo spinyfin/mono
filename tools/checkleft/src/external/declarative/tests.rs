@@ -21,7 +21,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::external::{
-    parse_declarative_check_manifest, parse_external_check_package_manifest, ExternalCheckPackageImplementation,
+    ExternalCheckPackageImplementation, parse_declarative_check_manifest, parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::{Finding, Severity};

@@ -9,7 +9,7 @@
 //!   pass, whose warning objects carry no filename — the path comes from context.
 //! - `{{exit_code}}` — invocation context: the process exit code.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::Value;
 
 /// A parsed template: an ordered list of literal/ref parts.

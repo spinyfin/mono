@@ -13,13 +13,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
 
 use crate::input::{ChangeKind, ChangeSet};
 use crate::output::{CheckResult, Finding};
 
-use super::{resolve, ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode};
+use super::{ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode, resolve};
 
 /// Run a declarative check end-to-end. `repo_root` is the working directory
 /// invocations run from (and the Bazel workspace, when the `bazel` resolver is used).

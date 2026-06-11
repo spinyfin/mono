@@ -24,8 +24,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::external::{
-    parse_declarative_check_manifest, run_declarative_check, ExternalCheckDeclarativePackage,
-    ExternalCheckPackageImplementation,
+    ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation, parse_declarative_check_manifest,
+    run_declarative_check,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Finding;
