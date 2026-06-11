@@ -270,7 +270,8 @@ pub struct CubeWorkspaceStatus {
 /// Used by the cold-pool probe in [`ExecutionCoordinator::schedule_execution`]
 /// to decide whether the auto-provisioned defaults are worth flagging
 /// to the operator. See `multi-repo-work-modeling.md` Q6.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CubeRepoSummary {
     pub repo_id: String,
     pub origin: String,
@@ -289,9 +290,12 @@ pub trait CubeClient: Send + Sync {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease>;
     async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
+    /// Position the working copy in `workspace_path` as a fresh editable
+    /// child commit atop PR `pr`'s current head. Delegates to
+    /// `cube workspace goto --workspace <path> --pr <n>`. Idempotent.
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -390,7 +394,6 @@ impl CubeClient for CommandCubeClient {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease> {
         #[derive(Deserialize)]
         struct LeasePayload {
@@ -404,16 +407,12 @@ impl CubeClient for CommandCubeClient {
             workspace_path: PathBuf,
         }
 
-        let resume_pr_str = resume_pr.map(|n| n.to_string());
         let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
         if let Some(prefer) = prefer_workspace_id {
             args.extend_from_slice(&["--prefer", prefer]);
         }
         if allow_dirty {
             args.push("--allow-dirty");
-        }
-        if let Some(n) = resume_pr_str.as_deref() {
-            args.extend_from_slice(&["--resume-pr", n]);
         }
         let payload: LeasePayload = serde_json::from_value(self.run_json(&args).await?)
             .context("failed to decode `cube workspace lease` payload")?;
@@ -586,6 +585,23 @@ impl CubeClient for CommandCubeClient {
                 source: r.source,
             })
             .collect())
+    }
+
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        let workspace_arg = workspace_path.display().to_string();
+        let pr_str = pr.to_string();
+        let _ = self
+            .run_json(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                &workspace_arg,
+                "--pr",
+                &pr_str,
+            ])
+            .await?;
+        Ok(())
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
@@ -1033,6 +1049,7 @@ impl RevisionSource for AtomicU64 {
     }
 }
 
+#[derive(bon::Builder)]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
@@ -2202,12 +2219,9 @@ impl ExecutionCoordinator {
             )
             .await;
 
-        // For pr_review and revision_implementation executions with a PR URL,
-        // pass --resume_pr to cube during the lease so it handles workspace
-        // positioning (fetch + pr/<n> bookmark + `jj new`). The fallback
-        // workspace also receives resume_pr — cube's cold path recovers the
-        // head from GitHub via `gh pr view` when pr/<n> is absent.
-        let resume_pr: Option<u64> = match execution.kind {
+        // PR number to pass to `cube workspace goto` after the lease.
+        // Set for pr_review and revision_implementation executions that have a PR URL.
+        let pr_for_goto: Option<u64> = match execution.kind {
             ExecutionKind::RevisionImplementation => execution
                 .pr_url
                 .as_deref()
@@ -2224,7 +2238,7 @@ impl ExecutionCoordinator {
         };
 
         let lease = match self
-            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, resume_pr, &adapter)
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
             .await
         {
             Ok(lease) => lease,
@@ -2272,38 +2286,88 @@ impl ExecutionCoordinator {
         }
         let change_title = execution_change_title(execution, &work_item);
 
-        // pr_review and revision_implementation executions whose lease received
-        // --resume_pr are already positioned: cube ran `jj git fetch` + `jj new
-        // pr/<n>` so the workspace is on a fresh editable child of the PR head.
-        // For reviews the reviewer reads files there; for revisions the worker
-        // edits there. No separate action needed; emit an event for the timeline.
-        let positioned_by_lease = resume_pr.is_some()
-            && matches!(
-                execution.kind,
-                ExecutionKind::PrReview | ExecutionKind::RevisionImplementation
-            );
+        // For PR-targeting executions, run `cube workspace goto --workspace <path>
+        // --pr <n>` AFTER the lease to position the working copy on the PR branch
+        // head. This must happen before handing the workspace to the worker.
+        // If positioning fails, abort dispatch with a diagnosable stage.
+        if let Some(pr) = pr_for_goto {
+            let goto_repr = adapter.command_repr(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                &lease.workspace_path.display().to_string(),
+                "--pr",
+                &pr.to_string(),
+            ]);
+            match adapter.goto_workspace(&lease.workspace_path, pr).await {
+                Ok(()) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        kind = execution.kind.as_str(),
+                        workspace_path = %lease.workspace_path.display(),
+                        pr,
+                        "workspace positioned via cube workspace goto",
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::CubeWorkspacePositioned, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_cube_invocation(goto_repr)
+                                .with_details(serde_json::json!({
+                                    "pr": pr,
+                                    "kind": execution.kind.as_str(),
+                                })),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                        tracing::error!(
+                            ?release_err,
+                            lease_id = %lease.lease_id,
+                            "failed to release workspace after goto positioning failure"
+                        );
+                    }
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(
+                                Stage::CubeWorkspacePositioningFailed,
+                                DispatchOutcome::Error,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_cube_invocation(goto_repr),
+                        )
+                        .await;
+                    self.record_start_failure(
+                        Arc::clone(self),
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        "cube_workspace_positioning_failed",
+                        "Cube `workspace goto` positioning failed",
+                        &err,
+                    )?;
+                    return Err(err);
+                }
+            }
+        }
 
-        let change: Option<CubeChangeHandle> = if positioned_by_lease {
-            tracing::info!(
-                execution_id = %execution.id,
-                kind = execution.kind.as_str(),
-                workspace_path = %lease.workspace_path.display(),
-                "workspace positioned by cube --resume_pr during lease",
-            );
-            self.dispatch_events
-                .emit(
-                    DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_cube_lease(&lease.lease_id)
-                        .with_cube_workspace(&lease.workspace_id)
-                        .with_details(serde_json::json!({
-                            "pr_positioned_by_lease": true,
-                            "kind": execution.kind.as_str(),
-                        })),
-                )
-                .await;
+        // For PR-targeting executions the workspace is now positioned on the PR
+        // head — skip create_change (there is nothing to create; the worker edits
+        // or reviews the branch directly). For all other executions create a fresh
+        // jj change via `cube change create`.
+        let change: Option<CubeChangeHandle> = if pr_for_goto.is_some() {
             None
         } else {
             // Normal path (pr_review without a PR URL, and all non-review/
@@ -2714,7 +2778,6 @@ impl ExecutionCoordinator {
         worker_id: &str,
         repo: &CubeRepoHandle,
         task: &str,
-        resume_pr: Option<u64>,
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
@@ -2755,16 +2818,12 @@ impl ExecutionCoordinator {
 
         // Build the lease args for attempt 1 so we can attach the
         // exact command to both the attempted and failed events.
-        let resume_pr_str = resume_pr.map(|n| n.to_string());
         let mut attempt1_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
         if let Some(p) = prefer {
             attempt1_args.extend_from_slice(&["--prefer", p]);
         }
         if allow_dirty {
             attempt1_args.push("--allow-dirty");
-        }
-        if let Some(n) = resume_pr_str.as_deref() {
-            attempt1_args.extend_from_slice(&["--resume-pr", n]);
         }
         let attempt1_repr = adapter.command_repr(&attempt1_args);
 
@@ -2791,7 +2850,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
-            .invoke_lease(repo, task, prefer, allow_dirty, resume_pr, CUBE_LEASE_TIMEOUT, adapter)
+            .invoke_lease(repo, task, prefer, allow_dirty, CUBE_LEASE_TIMEOUT, adapter)
             .await
         {
             Ok(lease) => {
@@ -2847,10 +2906,7 @@ impl ExecutionCoordinator {
             return Err(first_err);
         }
 
-        let mut attempt2_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
-        if let Some(n) = resume_pr_str.as_deref() {
-            attempt2_args.extend_from_slice(&["--resume-pr", n]);
-        }
+        let attempt2_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
         let attempt2_repr = adapter.command_repr(&attempt2_args);
 
         self.dispatch_events
@@ -2872,7 +2928,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, false, resume_pr, CUBE_LEASE_TIMEOUT, adapter)
+            .invoke_lease(repo, task, None, false, CUBE_LEASE_TIMEOUT, adapter)
             .await
         {
             Ok(lease) => {
@@ -2922,13 +2978,12 @@ impl ExecutionCoordinator {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
         timeout: Duration,
         adapter: &Arc<dyn HostAdapter>,
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
-            adapter.lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty, resume_pr),
+            adapter.lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty),
         )
         .await
         {
@@ -3968,13 +4023,14 @@ mod tests {
     };
 
     /// Recorded args for each `lease_workspace` call:
-    /// `(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr)`.
-    type LeaseCall = (String, String, Option<String>, bool, Option<u64>);
+    /// `(repo_id, task, prefer_workspace_id, allow_dirty)`.
+    type LeaseCall = (String, String, Option<String>, bool);
 
     #[derive(Default)]
     struct FakeCubeClient {
         ensure_calls: Mutex<Vec<String>>,
         lease_calls: Mutex<Vec<LeaseCall>>,
+        goto_calls: Mutex<Vec<(String, u64)>>,
         create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
         status_calls: Mutex<Vec<PathBuf>>,
@@ -4003,6 +4059,7 @@ mod tests {
         /// retry when `preferred_workspace_id=null`.
         fail_first_n_leases: usize,
         fail_create: bool,
+        fail_goto: bool,
         next_workspace_id: Mutex<Option<String>>,
         /// Canned response for `list_workspaces` — lets a test model cube
         /// reporting a workspace still leased to a dead worker so the
@@ -4045,7 +4102,6 @@ mod tests {
             task: &str,
             prefer_workspace_id: Option<&str>,
             allow_dirty: bool,
-            resume_pr: Option<u64>,
         ) -> Result<CubeWorkspaceLease> {
             let mut calls = self.lease_calls.lock().await;
             let call_index = calls.len();
@@ -4054,7 +4110,6 @@ mod tests {
                 task.to_owned(),
                 prefer_workspace_id.map(str::to_owned),
                 allow_dirty,
-                resume_pr,
             ));
             drop(calls);
             if self.fail_lease {
@@ -4093,6 +4148,17 @@ mod tests {
             Ok(CubeChangeHandle {
                 change_id: "chg-1".to_owned(),
             })
+        }
+
+        async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
+            self.goto_calls
+                .lock()
+                .await
+                .push((workspace_path.display().to_string(), pr));
+            if self.fail_goto {
+                return Err(anyhow!("cube workspace goto failed"));
+            }
+            Ok(())
         }
 
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -6387,7 +6453,7 @@ mod tests {
         };
 
         let result = coordinator
-            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", None, &coordinator.host_adapter)
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
             .await;
         assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
@@ -6470,7 +6536,7 @@ mod tests {
         };
 
         let _ = coordinator
-            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", None, &coordinator.host_adapter)
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", &coordinator.host_adapter)
             .await;
 
         let releases = cube.force_release_calls.lock().await;
@@ -9105,11 +9171,10 @@ mod tests {
     }
 
     /// When a `pr_review` execution has a non-empty `pr_url` on its task,
-    /// `schedule_execution` must lease the workspace with `--resume_pr <n>` and
-    /// must NOT call `create_change`. Cube's `--resume_pr` positioning (during
-    /// the lease) replaces the old post-lease `checkout_pr_head_for_review` call.
+    /// `schedule_execution` must call `cube workspace goto` after the lease to
+    /// position the workspace on the PR head, and must NOT call `create_change`.
     #[tokio::test]
-    async fn pr_review_with_pr_url_leases_with_resume_pr_not_create_change() {
+    async fn pr_review_with_pr_url_positions_via_goto_not_create_change() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9145,29 +9210,29 @@ mod tests {
         let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
-        // lease_workspace was called with resume_pr = Some(42) for PR #42.
-        let calls = cube.lease_calls.lock().await;
-        assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
-        assert_eq!(
-            calls[0].4,
-            Some(42),
-            "lease_workspace must receive resume_pr = Some(42) for PR #42"
-        );
-        drop(calls);
+        // goto_workspace must have been called with pr=42.
+        let goto_calls = cube.goto_calls.lock().await;
+        assert_eq!(goto_calls.len(), 1, "goto_workspace must be called exactly once");
+        assert_eq!(goto_calls[0].1, 42, "goto_workspace must receive pr=42 for PR #42");
+        drop(goto_calls);
 
-        // create_change must NOT have been called — positioning happened in cube.
+        // lease_workspace must NOT have received resume_pr (it no longer exists).
+        let lease_calls = cube.lease_calls.lock().await;
+        assert_eq!(lease_calls.len(), 1, "lease_workspace must be called exactly once");
+        drop(lease_calls);
+
+        // create_change must NOT have been called — positioning happened via goto.
         assert!(
             cube.create_calls.lock().await.is_empty(),
             "create_change must not be called for the reviewer positioning path"
         );
     }
 
-    /// When a `pr_review` lease fails (which now includes `--resume_pr`
-    /// positioning), `schedule_execution` must record a
-    /// `cube_workspace_lease_failed` start failure and must not release a
-    /// workspace (none was acquired).
+    /// When the `cube workspace lease` call fails for a `pr_review` execution,
+    /// `schedule_execution` must record a `cube_workspace_lease_failed` start
+    /// failure and must not release a workspace (none was acquired).
     #[tokio::test]
-    async fn pr_review_lease_with_resume_pr_failure_records_start_failure() {
+    async fn pr_review_lease_failure_records_start_failure() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9184,8 +9249,6 @@ mod tests {
             )
             .unwrap();
 
-        // fail_lease simulates cube's --resume_pr positioning failing inside
-        // the `cube workspace lease` call itself (e.g. PR not found, merged PR).
         let cube = Arc::new(FakeCubeClient {
             fail_lease: true,
             ..FakeCubeClient::default()
@@ -9204,10 +9267,7 @@ mod tests {
             .expect("review pool slot available");
 
         let result = coordinator.schedule_execution(&execution, &worker_id).await;
-        assert!(
-            result.is_err(),
-            "schedule_execution must fail when the lease (including --resume_pr) fails"
-        );
+        assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
         // No workspace was ever leased so there is nothing to release.
         assert!(
@@ -9220,6 +9280,61 @@ mod tests {
         assert!(
             items.iter().any(|i| i.kind == "cube_workspace_lease_failed"),
             "expected a cube_workspace_lease_failed attention item, got {:?}",
+            items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// When `cube workspace goto` fails for a `pr_review` execution, dispatch must
+    /// fail loudly with a `cube_workspace_positioning_failed` attention item.
+    #[tokio::test]
+    async fn pr_review_goto_failure_records_positioning_failed() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/7";
+        let (_, chore_id) = make_pr_review_fixture(&db, Some(pr_url));
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_goto: true,
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner::default());
+
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("review pool slot available");
+
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(result.is_err(), "schedule_execution must fail when goto fails");
+
+        // The workspace was leased and must be released after goto failure.
+        assert_eq!(
+            cube.release_calls.lock().await.len(),
+            1,
+            "workspace must be released after goto failure"
+        );
+
+        // A cube_workspace_positioning_failed attention item must exist.
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == "cube_workspace_positioning_failed"),
+            "expected a cube_workspace_positioning_failed attention item, got {:?}",
             items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
         );
     }
@@ -9266,15 +9381,11 @@ mod tests {
             "schedule_execution must succeed on the create_change path: {result:?}"
         );
 
-        // lease_workspace must NOT have received resume_pr — no pr_url means
-        // no PR positioning during the lease.
-        let calls = cube.lease_calls.lock().await;
-        assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
-        assert_eq!(
-            calls[0].4, None,
-            "lease_workspace must NOT receive resume_pr when pr_url is absent"
+        // goto_workspace must NOT have been called — no pr_url means no PR positioning.
+        assert!(
+            cube.goto_calls.lock().await.is_empty(),
+            "goto_workspace must not be called when pr_url is absent"
         );
-        drop(calls);
 
         // create_change must have been called once.
         assert_eq!(
@@ -9285,11 +9396,10 @@ mod tests {
     }
 
     /// When a `revision_implementation` execution has a non-empty `pr_url`,
-    /// `schedule_execution` must lease the workspace with `--resume_pr <n>` and
-    /// must NOT call `create_change`. Cube's `--resume_pr` positioning (during
-    /// the lease) replaces the old post-lease `position_revision_workspace` call.
+    /// `schedule_execution` must call `cube workspace goto` after the lease to
+    /// position the workspace on the PR head, and must NOT call `create_change`.
     #[tokio::test]
-    async fn revision_with_pr_url_leases_with_resume_pr_not_create_change() {
+    async fn revision_with_pr_url_positions_via_goto_not_create_change() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9329,17 +9439,13 @@ mod tests {
         let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
-        // lease_workspace was called with resume_pr = Some(99) for PR #99.
-        let calls = cube.lease_calls.lock().await;
-        assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
-        assert_eq!(
-            calls[0].4,
-            Some(99),
-            "lease_workspace must receive resume_pr = Some(99) for PR #99"
-        );
-        drop(calls);
+        // goto_workspace must have been called with pr=99.
+        let goto_calls = cube.goto_calls.lock().await;
+        assert_eq!(goto_calls.len(), 1, "goto_workspace must be called exactly once");
+        assert_eq!(goto_calls[0].1, 99, "goto_workspace must receive pr=99 for PR #99");
+        drop(goto_calls);
 
-        // create_change must NOT have been called — positioning happened in cube.
+        // create_change must NOT have been called — positioning happened via goto.
         assert!(
             cube.create_calls.lock().await.is_empty(),
             "create_change must not be called for the revision positioning path"
@@ -9347,11 +9453,11 @@ mod tests {
     }
 
     /// When a `revision_implementation` lease fails (which now includes
-    /// `--resume_pr` positioning), `schedule_execution` must record a
-    /// `cube_workspace_lease_failed` start failure and must not have acquired a
-    /// workspace to release.
+    /// When the `cube workspace lease` call fails for a `revision_implementation`
+    /// execution, `schedule_execution` must record a `cube_workspace_lease_failed`
+    /// start failure and must not have acquired a workspace to release.
     #[tokio::test]
-    async fn revision_lease_with_resume_pr_failure_records_start_failure() {
+    async fn revision_lease_failure_records_start_failure() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9369,8 +9475,6 @@ mod tests {
             )
             .unwrap();
 
-        // fail_lease simulates cube's --resume_pr positioning failing inside
-        // the `cube workspace lease` call itself (e.g. PR not found, merged PR).
         let cube = Arc::new(FakeCubeClient {
             fail_lease: true,
             ..FakeCubeClient::default()
@@ -9389,10 +9493,7 @@ mod tests {
             .expect("worker pool slot available");
 
         let result = coordinator.schedule_execution(&execution, &worker_id).await;
-        assert!(
-            result.is_err(),
-            "schedule_execution must fail when the lease (including --resume_pr) fails"
-        );
+        assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
         // No workspace was ever leased so there is nothing to release.
         assert!(

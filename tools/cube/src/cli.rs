@@ -215,14 +215,51 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Position the working copy on the head of a PR branch.
+    ///
+    /// Fetches from the GitHub remote, resolves the given bookmark or PR
+    /// head, and creates a fresh editable child commit atop the resolved
+    /// tip (`jj new <branch>@<remote>`). Idempotent: if `@` already
+    /// has the resolved tip as a direct parent, the `jj new` step is
+    /// skipped. Fails with a clear error if the bookmark does not exist
+    /// on the remote.
+    ///
+    /// Exactly one of `--bookmark` or `--pr` must be supplied. `--workspace`
+    /// is optional; when omitted the command operates on the current directory.
+    ///
+    /// Run from inside the leased cube workspace directory (or pass `--workspace`).
+    Goto {
+        /// Absolute workspace path. If omitted, uses the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Branch bookmark to position on (e.g. `boss/exec_18b7d99_2af`).
+        /// A trailing `@<remote>` suffix is accepted and stripped.
+        /// Mutually exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Position on the head of PR N. Resolves the head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+    },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
     /// and boss branches from the GitHub remote, resolves this workspace's
-    /// current `boss/exec_*` branch automatically from the working copy state
-    /// (no branch name argument required), rebases it onto the configured
-    /// integration branch using `--ignore-immutable` to handle jj's
-    /// immutable-heads constraint, and reports the result clearly.
+    /// `boss/exec_*` branch, rebases it onto the configured integration branch
+    /// using `--ignore-immutable` to handle jj's immutable-heads constraint,
+    /// and — on a clean rebase — advances and pushes the boss bookmark so the
+    /// PR is updated in one verb (nothing left manual).
+    ///
+    /// Branch resolution when no explicit override is given: the nearest
+    /// `boss/exec_*` bookmark in `@`'s 5-ancestor window. When the workspace
+    /// is pre-positioned via `cube workspace goto` (the engine's normal path),
+    /// this window always contains the right bookmark. For repositioned or
+    /// manually managed workspaces, use `--bookmark` or `--pr` to override.
+    ///
+    /// Self-heals a mispositioned `@`: when `@` is not in the ancestry of the
+    /// resolved boss branch, the command repositions the workspace onto the
+    /// boss head before rebasing.
     ///
     /// The target branch is read from the repo pool configuration
     /// (`main_branch` field) — not hardcoded. Repos that use `master`,
@@ -230,11 +267,28 @@ pub enum WorkspaceCommand {
     ///
     /// Leaves any resulting conflicts materialized in the working copy for the
     /// agent to resolve. Exit signal:
-    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts.
-    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them.
+    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts (and the boss
+    ///     bookmark was advanced + pushed unless `--no-push`).
+    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them,
+    ///     then push with `jj git push -b <bookmark>`.
     ///
     /// Run from inside the leased cube workspace directory.
-    Rebase,
+    Rebase {
+        /// Explicitly name the `boss/exec_*` bookmark to rebase (e.g.
+        /// `boss/exec_18b7d99385981508_2af`). Overrides auto-discovery. A
+        /// trailing `@<remote>` suffix is accepted and stripped. Mutually
+        /// exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Rebase the branch backing PR N. Resolves N's head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+        /// Rebase only; do not advance/push the boss bookmark afterward. Use
+        /// when you intend to push manually.
+        #[arg(long)]
+        no_push: bool,
+    },
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
@@ -945,6 +999,80 @@ mod tests {
             }
             _ => panic!("expected workspace gc command"),
         }
+    }
+
+    #[test]
+    fn workspace_goto_accepts_pr_flag() {
+        let cli = Cli::parse_from(["cube", "workspace", "goto", "--pr", "1467"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert!(bookmark.is_none());
+                assert_eq!(pr, Some(1467));
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_accepts_bookmark_flag() {
+        let cli = Cli::parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc_01"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert_eq!(bookmark.as_deref(), Some("boss/exec_abc_01"));
+                assert!(pr.is_none());
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_accepts_workspace_flag() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "goto",
+            "--workspace",
+            "/ws/mono-agent-007",
+            "--pr",
+            "42",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("/ws/mono-agent-007"));
+                assert!(bookmark.is_none());
+                assert_eq!(pr, Some(42));
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_rejects_both_bookmark_and_pr() {
+        let result = Cli::try_parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc", "--pr", "42"]);
+        assert!(result.is_err(), "--bookmark and --pr must be mutually exclusive");
     }
 
     #[test]

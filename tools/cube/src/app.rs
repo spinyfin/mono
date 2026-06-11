@@ -1850,7 +1850,14 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
-        WorkspaceCommand::Rebase => workspace_rebase(&mut store, database_path, runner),
+        WorkspaceCommand::Goto {
+            workspace,
+            bookmark,
+            pr,
+        } => workspace_goto(database_path, runner, workspace, bookmark, pr),
+        WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
+            workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
+        }
     }
 }
 
@@ -2046,14 +2053,239 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
     }
 }
 
-/// Rebase the current workspace's boss branch onto the repo's integration branch.
+/// Position the workspace working copy on the head of a PR branch.
 ///
-/// Implements `cube workspace rebase`. Encodes the correct jj recipe
-/// so agents do not hand-roll it and trip over the `@origin` and
-/// `--ignore-immutable` gotchas. The target branch is read from the repo pool
-/// configuration (`main_branch` field) — not hardcoded. Safe to call multiple
-/// times (idempotent when already up-to-date).
-fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dyn CommandRunner) -> Result<RunResult> {
+/// Implements `cube workspace goto`. Fetches from the GitHub remote, resolves
+/// the branch (by name or PR number), sets up the local bookmark, and creates
+/// a fresh editable child commit atop the remote tip. Idempotent: if `@`
+/// already has the remote tip as a direct parent, the `jj new` step is skipped.
+fn workspace_goto(
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    workspace: Option<String>,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+) -> Result<RunResult> {
+    let cwd: PathBuf = match workspace {
+        Some(ref p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(CubeError::Io)?,
+    };
+
+    let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
+    )?;
+
+    let branch: String = if let Some(b) = bookmark {
+        strip_remote_suffix(&b).to_string()
+    } else if let Some(n) = pr {
+        let n_str = n.to_string();
+        let json = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "gh",
+                &["pr", "view", &n_str, "-R", &owner_repo, "--json", "headRefName,state"],
+            ))
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
+        let pr_info: serde_json::Value = serde_json::from_str(&json)?;
+        let state = pr_info.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        if state == "MERGED" || state == "CLOSED" {
+            return Err(CubeError::InvalidArgument(format!(
+                "PR {n} ({owner_repo}) is {state} — cannot position on a non-open PR. \
+                 Use `cube workspace lease` without `--goto` for a fresh task, or verify the PR number."
+            )));
+        }
+        pr_info
+            .get("headRefName")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no headRefName from GitHub"))
+            })?
+            .to_string()
+    } else {
+        return Err(CubeError::InvalidArgument(
+            "cube workspace goto: either --bookmark or --pr must be provided".to_string(),
+        ));
+    };
+
+    let remote_ref = format!("{branch}@{github_remote}");
+
+    if runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+        ))
+        .is_err()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "branch `{branch}` was not found on remote `{github_remote}` \
+             (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
+             or pass `--pr <n>` to let cube resolve the head from GitHub."
+        )));
+    }
+
+    // Set the local bookmark to track the remote head (idempotent; --allow-backwards
+    // handles any local divergence).
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
+        ),
+    )?;
+
+    // Also set the pr/<n> bookmark when the caller specified --pr so that
+    // `cube pr push` and `cube workspace rebase` can find the PR number later.
+    if let Some(n) = pr {
+        let pr_bm = pr_bookmark::pr_bookmark_name(n);
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref]),
+        )?;
+    }
+
+    // Idempotency check: if @ already has <remote_ref> as a direct parent,
+    // skip `jj new` — the workspace is already positioned correctly.
+    let already_positioned = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                &format!("{remote_ref} & ::@"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+        ))
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false);
+
+    if !already_positioned {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["new", &remote_ref]),
+        )?;
+    }
+
+    RunResult::new(
+        format!("Positioned working copy on {branch}."),
+        json!({
+            "branch": branch,
+            "remote_ref": remote_ref,
+            "already_positioned": already_positioned,
+        }),
+    )
+}
+
+/// Options controlling boss-branch resolution and the push half of
+/// `workspace rebase`. Separated from CLI parsing so the core
+/// [`rebase_workspace_branch`] is unit-testable with explicit inputs.
+struct RebaseOpts {
+    /// Explicit `--bookmark` (a trailing `@<remote>` suffix is tolerated).
+    explicit_bookmark: Option<String>,
+    /// Explicit `--pr` number; resolves the PR's head branch from GitHub.
+    explicit_pr: Option<u64>,
+    /// Skip the post-rebase advance + push (rebase only).
+    no_push: bool,
+}
+
+/// Strip a trailing `@<remote>` suffix from a bookmark ref, yielding the plain
+/// bookmark name. `boss/exec_x@origin` → `boss/exec_x`; a name without `@` is
+/// returned unchanged.
+fn strip_remote_suffix(reference: &str) -> &str {
+    reference.split('@').next().unwrap_or(reference)
+}
+
+/// Boss bookmark nearest `@` (within 5 ancestors).
+/// Returns `None` when `@` is not positioned on a boss branch.
+fn boss_branch_from_ancestry(runner: &dyn CommandRunner, cwd: &Path) -> Option<String> {
+    let out = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "ancestors(@, 5)",
+                "--no-graph",
+                "-T",
+                r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#,
+            ],
+        ))
+        .ok()?;
+    let mut local: Option<String> = None;
+    let mut remote: Option<String> = None;
+    for token in out.split_whitespace() {
+        if token.starts_with("boss/exec_") {
+            if token.contains('@') {
+                remote.get_or_insert_with(|| strip_remote_suffix(token).to_string());
+            } else {
+                local.get_or_insert_with(|| token.to_string());
+            }
+        }
+    }
+    local.or(remote)
+}
+
+/// Resolve the plain `boss/exec_*` branch name to rebase, deterministically:
+/// explicit `--bookmark` → explicit `--pr` (GitHub head branch) → the worker's
+/// own exec id (env) → ancestry fast path → repo-wide unique match. Every
+/// failure names what was considered and the exact disambiguating command.
+fn resolve_boss_branch(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, opts: &RebaseOpts) -> Result<String> {
+    if let Some(b) = &opts.explicit_bookmark {
+        return Ok(strip_remote_suffix(b).to_string());
+    }
+
+    if let Some(n) = opts.explicit_pr {
+        let n_str = n.to_string();
+        let json = runner
+            .run(&RealCommandRunner::invocation(
+                cwd,
+                "gh",
+                &["pr", "view", &n_str, "-R", owner_repo, "--json", "headRefName"],
+            ))
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo} via gh: {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        let head = value.get("headRefName").and_then(|v| v.as_str()).ok_or_else(|| {
+            CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no headRefName from gh"))
+        })?;
+        return Ok(head.to_string());
+    }
+
+    // Default: use the boss bookmark nearest @ in the 5-ancestor window.
+    // With `cube workspace goto` guaranteeing pre-positioning, this window
+    // always contains the right bookmark. Pass --bookmark or --pr to override.
+    if let Some(name) = boss_branch_from_ancestry(runner, cwd) {
+        return Ok(name);
+    }
+
+    Err(CubeError::InvalidArgument(
+        "no `boss/exec_*` bookmark found in the 5 ancestors of `@`. \
+         The workspace must be positioned on a PR branch before rebase. \
+         Run `cube workspace goto --pr <n>` to position it, or pass \
+         `--bookmark <boss/exec_...>` / `--pr <n>` to override."
+            .to_string(),
+    ))
+}
+
+fn workspace_rebase(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+    no_push: bool,
+) -> Result<RunResult> {
     let cwd = std::env::current_dir().map_err(CubeError::Io)?;
 
     // Look up this workspace in the registry to get the repo and main_branch.
@@ -2070,110 +2302,154 @@ fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dy
     let main_branch = repo_record.main_branch.clone();
 
     // Resolve the GitHub remote name (the real upstream, not the local mirror).
-    let (github_remote, _owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+    let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
 
+    let opts = RebaseOpts {
+        explicit_bookmark: bookmark,
+        explicit_pr: pr,
+        no_push,
+    };
+
+    rebase_workspace_branch(
+        runner,
+        database_path,
+        &cwd,
+        &main_branch,
+        &github_remote,
+        &owner_repo,
+        &opts,
+    )
+}
+
+/// Testable core of `workspace rebase`: discovery → self-heal positioning →
+/// rebase → (on a clean rebase) advance + push the boss bookmark. Takes the
+/// resolved repo context explicitly so it can be unit-tested with a scripted
+/// [`CommandRunner`].
+fn rebase_workspace_branch(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    main_branch: &str,
+    github_remote: &str,
+    owner_repo: &str,
+    opts: &RebaseOpts,
+) -> Result<RunResult> {
     // Fetch latest state — needed for both `main` and the boss branch.
     run_jj(
         runner,
         database_path,
-        &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
+        &RealCommandRunner::invocation(cwd, "jj", &["git", "fetch", "--remote", github_remote]),
     )?;
 
-    // Detect the boss/exec_* branch from the ancestry of the current @.
-    // After `cube workspace lease --resume-pr`, the boss branch is at most one
-    // commit above @. We check 5 ancestors for robustness.
-    //
-    // The template outputs local bookmarks followed by remote bookmarks for each
-    // ancestor commit, space/newline-separated. We split on whitespace and pick
-    // the first boss/exec_* token, preferring a local bookmark over a remote one.
-    let ancestry_output = run_jj(
-        runner,
-        database_path,
-        &CommandInvocation {
-            cwd: cwd.clone(),
-            program: "jj".to_string(),
-            args: vec![
-                "log".to_string(),
-                "-r".to_string(),
-                "ancestors(@, 5)".to_string(),
-                "--no-graph".to_string(),
-                "-T".to_string(),
-                r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#.to_string(),
-            ],
-        },
-    )?;
+    let boss_branch = resolve_boss_branch(runner, cwd, owner_repo, opts)?;
+    let remote_ref = format!("{boss_branch}@{github_remote}");
 
-    let mut boss_local: Option<String> = None;
-    let mut boss_remote: Option<String> = None;
-    for token in ancestry_output.split_whitespace() {
-        if token.starts_with("boss/exec_") {
-            if token.contains('@') {
-                boss_remote.get_or_insert_with(|| token.to_string());
-            } else {
-                boss_local.get_or_insert_with(|| token.to_string());
-            }
-        }
+    // The boss branch must exist on the remote (a PR points at it). Probe it so
+    // a clear, actionable error beats jj's raw "revision doesn't exist".
+    if runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+        ))
+        .is_err()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "boss branch `{boss_branch}` was not found on remote `{github_remote}` (looked for \
+             `{remote_ref}`). Confirm the bookmark name and that the branch is pushed, or pass \
+             `--bookmark <name>` / `--pr <n>`."
+        )));
     }
 
-    // Prefer the local bookmark; fall back to the remote ref.
-    let boss_ref = boss_local.as_deref().or(boss_remote.as_deref()).ok_or_else(|| {
-        CubeError::InvalidArgument(
-            "no boss/exec_* bookmark found in the 5 most recent ancestors of @; \
-             ensure the workspace is positioned on or after the boss branch commit."
-                .to_string(),
-        )
-    })?;
+    // Self-heal a mispositioned `@`. When `@` is not on/after the boss head
+    // (the common engine pre-positioning gap — `@` parented on main), it is not
+    // part of the branch `jj rebase -b` moves, so the resolution would not land
+    // in the working copy. Reposition `@` onto the boss head first.
+    let positioned = !runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                &format!("{remote_ref} & ::@"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+        ))
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
+    if !positioned {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(cwd, "jj", &["new", &remote_ref]),
+        )?;
+    }
 
-    // Strip the @<remote> suffix to get the plain branch name for display.
-    let boss_branch_name = boss_ref.split('@').next().unwrap_or(boss_ref).to_string();
+    // Establish a tracked local bookmark at the fetched remote head so it
+    // follows the rebase and is pushable afterward. `--allow-backwards`
+    // resolves a divergent/conflicted local bookmark; the subsequent
+    // `bookmark track` clears the "Non-tracking remote bookmark exists" push
+    // footgun (best-effort: it errors when already tracking, which is fine).
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["bookmark", "set", &boss_branch, "-r", &remote_ref, "--allow-backwards"],
+        ),
+    )?;
+    let _ = runner.run(&RealCommandRunner::invocation(
+        cwd,
+        "jj",
+        &["bookmark", "track", &remote_ref],
+    ));
 
-    // Rebase the boss branch (and the working copy @ if it is a descendant)
-    // onto the latest main. --ignore-immutable is required because boss/exec_*
-    // commits referenced via their @<remote> form are in jj's immutable_heads().
+    // Rebase the boss branch (and the descendant `@`) onto the freshly-fetched
+    // integration branch. Target the remote-tracking `<main>@<remote>` ref, not
+    // a local `<main>` bookmark: the latter may be stale or absent in a cold
+    // workspace (jj clone leaves only `main@<remote>`). --ignore-immutable is
+    // required because the boss commit is referenced via its immutable
+    // `@<remote>` form.
+    let main_ref = format!("{main_branch}@{github_remote}");
     let rebase_out = run_jj(
         runner,
         database_path,
-        &CommandInvocation {
-            cwd: cwd.clone(),
-            program: "jj".to_string(),
-            args: vec![
-                "rebase".to_string(),
-                "-d".to_string(),
-                main_branch.clone(),
-                "-b".to_string(),
-                boss_ref.to_string(),
-                "--ignore-immutable".to_string(),
-            ],
-        },
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["rebase", "-b", &boss_branch, "-d", &main_ref, "--ignore-immutable"],
+        ),
     )?;
 
-    // Check whether the rebase left any conflicts in the working copy.
-    // The jj `conflict` template field is true when a commit's tree contains
-    // unresolved conflict markers.
+    // Check whether the rebase left any conflicts in the working copy. The jj
+    // `conflict` template field is true when a commit's tree has conflicts.
     let conflict_check = run_jj(
         runner,
         database_path,
-        &CommandInvocation {
-            cwd: cwd.clone(),
-            program: "jj".to_string(),
-            args: vec![
-                "log".to_string(),
-                "-r".to_string(),
-                "@".to_string(),
-                "--no-graph".to_string(),
-                "-T".to_string(),
-                r#"if(conflict, "CONFLICT", "CLEAN")"#.to_string(),
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                r#"if(conflict, "CONFLICT", "CLEAN")"#,
             ],
-        },
+        ),
     )?;
     let has_conflicts = conflict_check.trim() == "CONFLICT";
 
     if has_conflicts {
-        // Best-effort: list conflicted files via `jj resolve --list`.
-        // Ignore errors — the list is informational; the agent can always
-        // run `jj resolve --list` or `jj st` directly.
+        // Best-effort: list conflicted files. Ignore errors — informational.
         let conflicted_files: Vec<String> = runner
-            .run(&RealCommandRunner::invocation(&cwd, "jj", &["resolve", "--list"]))
+            .run(&RealCommandRunner::invocation(cwd, "jj", &["resolve", "--list"]))
             .map(|out| {
                 out.lines()
                     .map(str::trim)
@@ -2188,40 +2464,86 @@ fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dy
         } else {
             conflicted_files.join(", ")
         };
+        let push_cmd = format!(
+            "jj bookmark set {boss_branch} -r @ --allow-backwards && jj git push -b {boss_branch} --remote {github_remote}"
+        );
         eprintln!(
-            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch}; \
+            "cube: workspace rebase: {boss_branch} rebased onto {main_branch}; \
              conflicts in working copy: {file_hint}"
         );
-        RunResult::new(
+        return RunResult::new(
             format!(
-                "REBASED_WITH_CONFLICTS: branch `{boss_branch_name}` rebased onto \
-                 `{main_branch}`. Conflicts are materialized in the working copy — \
-                 resolve them (see `jj resolve --list`, `jj st`) and push."
+                "REBASED_WITH_CONFLICTS: branch `{boss_branch}` rebased onto `{main_branch}`. \
+                 Conflicts are materialized in the working copy — resolve them (see \
+                 `jj resolve --list`, `jj st`), then advance and push with `{push_cmd}`."
             ),
             json!({
                 "status": "conflicts",
-                "branch": boss_branch_name,
+                "branch": boss_branch,
                 "main_branch": main_branch,
                 "conflicted_files": conflicted_files,
+                "pushed": false,
                 "rebase_output": rebase_out,
             }),
-        )
-    } else {
-        eprintln!("cube: workspace rebase: {boss_branch_name} rebased onto {main_branch} cleanly");
-        RunResult::new(
+        );
+    }
+
+    // Clean rebase. The local `boss_branch` bookmark followed the rebase to the
+    // new head, so it is ready to advance the PR.
+    if opts.no_push {
+        eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly (push skipped)");
+        return RunResult::new(
             format!(
-                "REBASED_CLEAN: branch `{boss_branch_name}` rebased onto `{main_branch}` \
-                 with no conflicts."
+                "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts. \
+                 Push skipped (--no-push); update the PR with \
+                 `jj git push -b {boss_branch} --remote {github_remote}`."
             ),
             json!({
                 "status": "clean",
-                "branch": boss_branch_name,
+                "branch": boss_branch,
                 "main_branch": main_branch,
                 "conflicted_files": Vec::<String>::new(),
+                "pushed": false,
                 "rebase_output": rebase_out,
             }),
-        )
+        );
     }
+
+    // Finish the job: push the rebased bookmark. jj's compare-and-swap push
+    // (the remote-tracking ref must match the actual remote, which it does
+    // after the fetch above) safely replaces the remote head with the rebased
+    // commit — the legitimate, expected shape of a rebase, not a force-flag
+    // anomaly. Surface a lease mismatch clearly instead of letting the worker
+    // reach for force flags.
+    if let Err(err) = runner.run(&RealCommandRunner::invocation(
+        cwd,
+        "jj",
+        &["git", "push", "-b", &boss_branch, "--remote", github_remote],
+    )) {
+        return Err(CubeError::InvalidArgument(format!(
+            "rebase of `{boss_branch}` onto `{main_branch}` succeeded, but pushing it to \
+             `{github_remote}` failed: {err}. If the remote head moved since the fetch, re-run \
+             `cube workspace rebase`; otherwise push manually with \
+             `jj git push -b {boss_branch} --remote {github_remote}`."
+        )));
+    }
+    verify_push_reached_github(runner, cwd, owner_repo, &boss_branch)?;
+
+    eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly and pushed");
+    RunResult::new(
+        format!(
+            "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts \
+             and pushed to `{github_remote}` — the PR is updated."
+        ),
+        json!({
+            "status": "clean",
+            "branch": boss_branch,
+            "main_branch": main_branch,
+            "conflicted_files": Vec::<String>::new(),
+            "pushed": true,
+            "rebase_output": rebase_out,
+        }),
+    )
 }
 
 /// Create or reuse a GitHub PR for the current jj bookmark.
@@ -2666,8 +2988,7 @@ fn resolve_pr_push_target(
             let head_branch = bm_out
                 .lines()
                 .map(str::trim)
-                .filter(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
-                .next()
+                .find(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
                 .ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
                         "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
@@ -2729,10 +3050,10 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/") {
-                        if let Ok(n) = n_str.parse::<u64>() {
-                            pr_number = Some(n);
-                        }
+                    if let Some(n_str) = name.strip_prefix("pr/")
+                        && let Ok(n) = n_str.parse::<u64>()
+                    {
+                        pr_number = Some(n);
                     }
                 } else {
                     head_branch = Some(name.to_string());
@@ -4305,7 +4626,8 @@ fn cleanup_workspace_logs(workspace_id: &str) -> Result<()> {
 /// Summary of a workspace row touched by the missing-directory reconciler.
 /// Surfaced through `cube workspace list --json` and also fed to per-row
 /// audit events so the operator has a paper trail.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 struct ReconciledRow {
     repo: String,
     workspace_id: String,
@@ -4799,10 +5121,10 @@ mod tests {
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
     use super::{
-        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
-        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_stdin_path,
-        render_boss_infra_exclude_block, resolve_body_file, run_with_context, run_with_dependencies,
-        upsert_managed_exclude,
+        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RebaseOpts,
+        RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces,
+        is_stdin_path, rebase_workspace_branch, render_boss_infra_exclude_block, resolve_body_file, run_with_context,
+        run_with_dependencies, upsert_managed_exclude, workspace_goto,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -11939,6 +12261,500 @@ steps:
             matches!(err, CubeError::CommandFailed { .. }),
             "expected CommandFailed, got {err:?}"
         );
+    }
+
+    // ───────────────────────── workspace rebase ─────────────────────────
+    //
+    // `rebase_workspace_branch` is the testable core of `cube workspace
+    // rebase`: deterministic boss-branch discovery, mispositioned-`@`
+    // self-heal, the rebase itself, and the finish-the-job advance + push.
+    // These tests drive it with a scripted `FakeRunner` (strict command
+    // sequence) so each jj/gh invocation is pinned exactly.
+
+    const REBASE_CWD: &str = "/ws";
+    const REBASE_REMOTE: &str = "github";
+    const REBASE_OWNER_REPO: &str = "spinyfin/mono";
+    const ANCESTRY_TMPL: &str = r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#;
+    const CONFLICT_TMPL: &str = r#"if(conflict, "CONFLICT", "CLEAN")"#;
+
+    fn rebase_cwd() -> PathBuf {
+        PathBuf::from(REBASE_CWD)
+    }
+
+    /// A scripted command expectation whose result is an error — for probing
+    /// "revision doesn't exist" and push-failure paths.
+    fn failing_cmd(cwd: PathBuf, program: &str, args: &[&str], stderr: &str) -> ExpectedCommand {
+        let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        ExpectedCommand {
+            cwd,
+            program: program.to_string(),
+            args: args_owned.clone(),
+            result: Err(CubeError::CommandFailed {
+                program: program.to_string(),
+                args: args_owned,
+                status: Some(1),
+                stderr: stderr.to_string(),
+            }),
+            creates_dir: None,
+        }
+    }
+
+    fn rebase_opts(bookmark: Option<&str>, pr: Option<u64>, no_push: bool) -> RebaseOpts {
+        RebaseOpts {
+            explicit_bookmark: bookmark.map(str::to_string),
+            explicit_pr: pr,
+            no_push,
+        }
+    }
+
+    /// The `jj git fetch` that every rebase begins with.
+    fn fetch_cmd() -> ExpectedCommand {
+        ExpectedCommand::ok(rebase_cwd(), "jj", &["git", "fetch", "--remote", REBASE_REMOTE], "")
+    }
+
+    /// Existence probe for `<branch>@<remote>` → resolves a commit id.
+    fn remote_exists_cmd(branch: &str, sha: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{REBASE_REMOTE}");
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+            sha,
+        )
+    }
+
+    /// Positioned probe: `<branch>@<remote> & ::@` → empty means mispositioned.
+    fn positioned_cmd(branch: &str, out: &str) -> ExpectedCommand {
+        let revset = format!("{branch}@{REBASE_REMOTE} & ::@");
+        ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+            out,
+        )
+    }
+
+    /// The track + set + rebase + conflict-check quartet shared by every
+    /// rebase that gets as far as actually rebasing. `conflict` selects the
+    /// conflict-check verdict ("CLEAN" / "CONFLICT").
+    fn set_track_rebase_check_cmds(branch: &str, conflict: &str) -> Vec<ExpectedCommand> {
+        let remote_ref = format!("{branch}@{REBASE_REMOTE}");
+        vec![
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["bookmark", "set", branch, "-r", &remote_ref, "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(rebase_cwd(), "jj", &["bookmark", "track", &remote_ref], ""),
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["rebase", "-b", branch, "-d", "main@github", "--ignore-immutable"],
+                "rebased",
+            ),
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
+                conflict,
+            ),
+        ]
+    }
+
+    /// Push + verify, the clean-rebase tail.
+    fn push_and_verify_cmds(branch: &str) -> Vec<ExpectedCommand> {
+        let api_path = format!("repos/{REBASE_OWNER_REPO}/branches/{branch}");
+        vec![
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["git", "push", "-b", branch, "--remote", REBASE_REMOTE],
+                "",
+            ),
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+                "pushed1",
+            ),
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "gh",
+                &["api", &api_path, "--jq", ".commit.sha"],
+                "pushed1",
+            ),
+        ]
+    }
+
+    fn run_rebase(runner: &FakeRunner, opts: &RebaseOpts) -> Result<super::RunResult> {
+        rebase_workspace_branch(
+            runner,
+            None,
+            &rebase_cwd(),
+            "main",
+            REBASE_REMOTE,
+            REBASE_OWNER_REPO,
+            opts,
+        )
+    }
+
+    #[test]
+    fn rebase_happy_path_positioned_clean_then_pushes() {
+        let branch = "boss/exec_abc";
+        let mut cmds = vec![
+            fetch_cmd(),
+            // ancestry fast path finds the boss bookmark
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["log", "-r", "ancestors(@, 5)", "--no-graph", "-T", ANCESTRY_TMPL],
+                "boss/exec_abc boss/exec_abc@github\n",
+            ),
+            remote_exists_cmd(branch, "aaa111"),
+            positioned_cmd(branch, "aaa111"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(push_and_verify_cmds(branch));
+
+        let runner = FakeRunner::new(cmds);
+        let result = run_rebase(&runner, &rebase_opts(None, None, false)).expect("clean rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["status"], "clean");
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["pushed"], true);
+        assert!(result.message.starts_with("REBASED_CLEAN"));
+    }
+
+    #[test]
+    fn rebase_not_positioned_errors_with_goto_hint() {
+        // Without `cube workspace goto` pre-positioning, ancestry finds nothing
+        // and rebase errors with a clear message pointing at the remedy.
+        let cmds = vec![
+            fetch_cmd(),
+            // ancestry: @ on main, no boss bookmark in 5 ancestors
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "jj",
+                &["log", "-r", "ancestors(@, 5)", "--no-graph", "-T", ANCESTRY_TMPL],
+                "main main@github\n",
+            ),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let err = run_rebase(&runner, &rebase_opts(None, None, false)).expect_err("not positioned");
+        runner.assert_exhausted();
+        let msg = format!("{err}");
+        assert!(msg.contains("boss/exec_*"), "names the expected pattern: {msg}");
+        assert!(msg.contains("cube workspace goto"), "points at the remedy: {msg}");
+    }
+
+    #[test]
+    fn rebase_explicit_bookmark_skips_discovery_and_strips_remote_suffix() {
+        // Multiple bookmarks may exist; --bookmark picks one with no discovery
+        // queries, and a trailing @<remote> suffix is stripped.
+        let branch = "boss/exec_xyz";
+        let mut cmds = vec![fetch_cmd(), remote_exists_cmd(branch, "ccc")];
+        cmds.push(positioned_cmd(branch, "ccc"));
+        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(push_and_verify_cmds(branch));
+
+        let runner = FakeRunner::new(cmds);
+        // pass the @origin form; expect it stripped to the plain name
+        let result =
+            run_rebase(&runner, &rebase_opts(Some("boss/exec_xyz@github"), None, false)).expect("explicit rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["pushed"], true);
+    }
+
+    #[test]
+    fn rebase_pr_arg_resolves_head_branch_from_github() {
+        let branch = "boss/exec_pr7";
+        let mut cmds = vec![
+            fetch_cmd(),
+            ExpectedCommand::ok(
+                rebase_cwd(),
+                "gh",
+                &["pr", "view", "7", "-R", REBASE_OWNER_REPO, "--json", "headRefName"],
+                r#"{"headRefName":"boss/exec_pr7"}"#,
+            ),
+            remote_exists_cmd(branch, "e1"),
+            positioned_cmd(branch, "e1"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.extend(push_and_verify_cmds(branch));
+
+        let runner = FakeRunner::new(cmds);
+        let result = run_rebase(&runner, &rebase_opts(None, Some(7), false)).expect("pr rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["pushed"], true);
+    }
+
+    #[test]
+    fn rebase_conflicts_skip_push_and_name_the_bookmark() {
+        let branch = "boss/exec_c";
+        let mut cmds = vec![
+            fetch_cmd(),
+            remote_exists_cmd(branch, "f1"),
+            positioned_cmd(branch, "f1"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, "CONFLICT"));
+        cmds.push(ExpectedCommand::ok(
+            rebase_cwd(),
+            "jj",
+            &["resolve", "--list"],
+            "src/foo.rs\nsrc/bar.rs\n",
+        ));
+
+        let runner = FakeRunner::new(cmds);
+        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("conflict rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["status"], "conflicts");
+        assert_eq!(result.payload["pushed"], false);
+        assert_eq!(result.payload["conflicted_files"][0], "src/foo.rs");
+        assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
+        assert!(
+            result.message.contains("jj git push -b boss/exec_c"),
+            "conflict message names the exact push command: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn rebase_no_push_flag_skips_advance_and_push() {
+        let branch = "boss/exec_np";
+        let mut cmds = vec![
+            fetch_cmd(),
+            remote_exists_cmd(branch, "g1"),
+            positioned_cmd(branch, "g1"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        // no push/verify commands expected
+
+        let runner = FakeRunner::new(cmds);
+        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, true)).expect("no-push rebase");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["status"], "clean");
+        assert_eq!(result.payload["pushed"], false);
+        assert!(result.message.contains("Push skipped"), "message: {}", result.message);
+    }
+
+    #[test]
+    fn rebase_branch_missing_on_remote_errors_clearly() {
+        let branch = "boss/exec_missing";
+        let remote_ref = format!("{branch}@{REBASE_REMOTE}");
+        let cmds = vec![
+            fetch_cmd(),
+            failing_cmd(
+                rebase_cwd(),
+                "jj",
+                &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+                "Error: Revision \"boss/exec_missing@github\" doesn't exist",
+            ),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect_err("missing branch");
+        runner.assert_exhausted();
+        let msg = format!("{err}");
+        assert!(msg.contains("was not found on remote"), "{msg}");
+        assert!(msg.contains(branch), "{msg}");
+    }
+
+    #[test]
+    fn rebase_push_failure_surfaces_clear_error_without_force_flags() {
+        let branch = "boss/exec_pf";
+        let mut cmds = vec![
+            fetch_cmd(),
+            remote_exists_cmd(branch, "h1"),
+            positioned_cmd(branch, "h1"),
+        ];
+        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
+        cmds.push(failing_cmd(
+            rebase_cwd(),
+            "jj",
+            &["git", "push", "-b", branch, "--remote", REBASE_REMOTE],
+            "Error: remote bookmark changed",
+        ));
+
+        let runner = FakeRunner::new(cmds);
+        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect_err("push failed");
+        runner.assert_exhausted();
+        let msg = format!("{err}");
+        assert!(msg.contains("pushing it to"), "{msg}");
+        assert!(msg.contains("re-run"), "guides re-running, not forcing: {msg}");
+        assert!(!msg.contains("--force"), "must not suggest a force flag: {msg}");
+    }
+
+    // ───────────────────────── workspace goto ─────────────────────────
+    //
+    // `workspace_goto` is the testable core of `cube workspace goto`:
+    // fetch → resolve branch → probe existence → set bookmarks →
+    // idempotency check → `jj new` (or skip when already positioned).
+    // Tests drive it via `workspace_goto(None, &runner, Some(GOTO_CWD.into()), ...)`.
+
+    const GOTO_CWD: &str = "/goto-ws";
+    const GOTO_REMOTE: &str = "github";
+    const GOTO_OWNER_REPO: &str = "spinyfin/mono";
+
+    fn goto_cwd() -> PathBuf {
+        PathBuf::from(GOTO_CWD)
+    }
+
+    fn goto_remote_list_cmd() -> ExpectedCommand {
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["git", "remote", "list"],
+            &format!("origin\t/local/mirror\n{GOTO_REMOTE}\thttps://github.com/{GOTO_OWNER_REPO}\n"),
+        )
+    }
+
+    fn goto_fetch_cmd() -> ExpectedCommand {
+        ExpectedCommand::ok(goto_cwd(), "jj", &["git", "fetch", "--remote", GOTO_REMOTE], "")
+    }
+
+    fn goto_exists_cmd(branch: &str, sha: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+            sha,
+        )
+    }
+
+    fn goto_set_bookmark_cmd(branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["bookmark", "set", branch, "-r", &remote_ref, "--allow-backwards"],
+            "",
+        )
+    }
+
+    fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        let pr_bm = format!("pr/{pr}");
+        ExpectedCommand::ok(goto_cwd(), "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref], "")
+    }
+
+    fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
+        let revset = format!("{branch}@{GOTO_REMOTE} & ::@");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+            sha,
+        )
+    }
+
+    fn goto_new_cmd(branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(goto_cwd(), "jj", &["new", &remote_ref], "")
+    }
+
+    fn run_goto(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Result<super::RunResult> {
+        workspace_goto(
+            None,
+            runner,
+            Some(GOTO_CWD.to_string()),
+            bookmark.map(str::to_string),
+            pr,
+        )
+    }
+
+    #[test]
+    fn goto_bookmark_not_yet_positioned_creates_new_commit() {
+        let branch = "boss/exec_goto1";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            goto_exists_cmd(branch, "abc1"),
+            goto_set_bookmark_cmd(branch),
+            goto_positioned_cmd(branch, ""), // not yet positioned
+            goto_new_cmd(branch),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, Some(branch), None).expect("goto succeeds");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], false);
+    }
+
+    #[test]
+    fn goto_bookmark_already_positioned_skips_jj_new() {
+        let branch = "boss/exec_goto2";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            goto_exists_cmd(branch, "def2"),
+            goto_set_bookmark_cmd(branch),
+            goto_positioned_cmd(branch, "def2"), // already positioned
+                                                 // no jj new expected
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], true);
+    }
+
+    #[test]
+    fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
+        let branch = "boss/exec_gotopr";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            ExpectedCommand::ok(
+                goto_cwd(),
+                "gh",
+                &["pr", "view", "42", "-R", GOTO_OWNER_REPO, "--json", "headRefName,state"],
+                &format!(r#"{{"headRefName":"{branch}","state":"OPEN"}}"#),
+            ),
+            goto_exists_cmd(branch, "e42"),
+            goto_set_bookmark_cmd(branch),
+            goto_set_pr_bookmark_cmd(42, branch),
+            goto_positioned_cmd(branch, ""),
+            goto_new_cmd(branch),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, None, Some(42)).expect("pr goto");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], false);
+    }
+
+    #[test]
+    fn goto_missing_bookmark_errors_clearly() {
+        let branch = "boss/exec_missing";
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            failing_cmd(
+                goto_cwd(),
+                "jj",
+                &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+                &format!("Error: Revision \"{remote_ref}\" doesn't exist"),
+            ),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let err = run_goto(&runner, Some(branch), None).expect_err("missing bookmark");
+        runner.assert_exhausted();
+        let msg = format!("{err}");
+        assert!(msg.contains(branch), "names the branch: {msg}");
+        assert!(msg.contains("was not found on remote"), "{msg}");
+    }
+
+    #[test]
+    fn goto_requires_bookmark_or_pr() {
+        let cmds = vec![goto_remote_list_cmd(), goto_fetch_cmd()];
+        let runner = FakeRunner::new(cmds);
+        let err = run_goto(&runner, None, None).expect_err("requires arg");
+        let msg = format!("{err}");
+        assert!(msg.contains("--bookmark") || msg.contains("--pr"), "{msg}");
     }
 
     #[derive(Default)]

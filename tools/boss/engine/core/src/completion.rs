@@ -553,7 +553,8 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 struct ApiPr {
     url: String,
     state: String,
@@ -817,6 +818,7 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// state in the work DB, release the cube lease, publish the right
 /// invalidation events. Stateless — keeps the wiring side at the call
 /// site (`app.rs`) thin.
+#[derive(bon::Builder)]
 pub struct WorkerCompletionHandler {
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
@@ -4731,17 +4733,13 @@ mod tests {
         async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
             unreachable!("not used in completion tests")
         }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: Option<u64>,
-        ) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unreachable!("not used in completion tests")
         }
         async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+            unreachable!("not used in completion tests")
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unreachable!("not used in completion tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {

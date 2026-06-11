@@ -1728,7 +1728,7 @@ fn compose_revision_directive(
     }
     out.push('\n');
     out.push_str("## Workspace state\n");
-    out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+    out.push_str("The engine pre-positioned this workspace via `cube workspace goto`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
     out.push('\n');
     out.push_str(
         "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",

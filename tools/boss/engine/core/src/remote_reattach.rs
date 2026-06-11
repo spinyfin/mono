@@ -200,14 +200,7 @@ mod tests {
         async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
             unimplemented!()
         }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: Option<u64>,
-        ) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
@@ -220,6 +213,9 @@ mod tests {
             unimplemented!()
         }
         async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unimplemented!()
         }
         async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
