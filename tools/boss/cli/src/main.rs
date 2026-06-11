@@ -2873,9 +2873,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
         }
         ProductCommand::SetDefaultDriver(args) => {
             if !args.unset && args.driver.is_none() {
-                return Err(CliError::usage(
-                    "provide either --driver <slug> or --unset",
-                ));
+                return Err(CliError::usage("provide either --driver <slug> or --unset"));
             }
             let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
             let driver = if args.unset { None } else { args.driver };
@@ -6780,14 +6778,16 @@ async fn run_chore_create_many(
                 "item {index}: chores do not have a project — remove `project_id`"
             )));
         }
-        inputs.push(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name(item.name)
-            .maybe_description(normalize_non_empty(Some(item.description)))
-            .autostart(item.autostart.unwrap_or(default_autostart))
-            .maybe_priority(item.priority)
-            .created_via(CREATED_VIA_CLI)
-            .build());
+        inputs.push(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(item.name)
+                .maybe_description(normalize_non_empty(Some(item.description)))
+                .autostart(item.autostart.unwrap_or(default_autostart))
+                .maybe_priority(item.priority)
+                .created_via(CREATED_VIA_CLI)
+                .build(),
+        );
     }
 
     let created = create_many_chores(client, CreateManyChoresInput { items: inputs }).await?;
@@ -7670,10 +7670,8 @@ fn validate_driver_model_pair(driver: Option<&str>, model: Option<&str>) -> Resu
     }
     let Some(m) = model else { return Ok(()) };
     let m_lower = m.trim().to_ascii_lowercase();
-    let is_claude_slug = m_lower.starts_with("claude-")
-        || m_lower == "opus"
-        || m_lower == "sonnet"
-        || m_lower == "haiku";
+    let is_claude_slug =
+        m_lower.starts_with("claude-") || m_lower == "opus" || m_lower == "sonnet" || m_lower == "haiku";
     if is_claude_slug {
         return Err(CliError::usage(format!(
             "model slug `{m}` is for the Claude driver but `--driver {d}` was specified; \

@@ -20,10 +20,12 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
     let mut chore_ids = Vec::new();
     for index in 0..3 {
         let chore = db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Chore {index}"))
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(format!("Chore {index}"))
+                    .build(),
+            )
             .unwrap();
         chore_ids.push(chore.id);
     }
@@ -76,16 +78,20 @@ fn rescan_skips_gated_active_chore_silently() {
         })
         .unwrap();
     let prereq = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Prereq")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Prereq")
+                .build(),
+        )
         .unwrap();
     let dependent = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Dependent")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Dependent")
+                .build(),
+        )
         .unwrap();
     // Add the blocks edge BEFORE flipping dependent to active so
     // its kanban transition lands on the gated path. We then set
@@ -135,10 +141,12 @@ fn records_failed_execution_start_attempt() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Cleanup")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -181,10 +189,12 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Cleanup")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -259,10 +269,12 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Cleanup")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -345,10 +357,12 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("ISO chore")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("ISO chore")
+                .build(),
+        )
         .unwrap();
 
     // Hand-roll an ISO 8601 timestamp into the row to mimic the
@@ -393,16 +407,20 @@ fn dependency_add_list_and_remove_round_trip() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
 
     let edge = db
@@ -513,16 +531,10 @@ fn dependency_add_refuses_cross_product_edges() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(p1.id)
-            .name("Alpha task")
-            .build())
+        .create_chore(CreateChoreInput::builder().product_id(p1.id).name("Alpha task").build())
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(p2.id)
-            .name("Beta task")
-            .build())
+        .create_chore(CreateChoreInput::builder().product_id(p2.id).name("Beta task").build())
         .unwrap();
     let err = db
         .add_dependency(AddDependencyInput {
@@ -556,16 +568,20 @@ fn deleting_a_task_drops_its_dependency_edges() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
@@ -607,16 +623,20 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     // Sanity: A starts as `todo` (default).
     let a0 = db.get_work_item(&a.id).unwrap();
@@ -666,16 +686,20 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
@@ -720,16 +744,20 @@ fn auto_unblock_creates_ready_execution() {
         })
         .unwrap();
     let prereq = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("prereq")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("prereq")
+                .build(),
+        )
         .unwrap();
     let dep = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("dependent")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("dependent")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: dep.id.clone(),
@@ -786,22 +814,28 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
         })
         .unwrap();
     let dependent = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let prereq_b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     let prereq_c = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("C")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("C")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
@@ -886,16 +920,20 @@ fn prereq_regression_does_not_re_block_dependents() {
         })
         .unwrap();
     let dependent = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let prereq = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
@@ -974,16 +1012,20 @@ fn cyclic_edges_do_not_loop_the_cascade() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
 
     // Insert both edges directly to bypass `would_create_cycle`
@@ -1042,11 +1084,13 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
 
     // Parent chore — will transition to in_review.
     let parent = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product_id.clone())
-            .name("Parent chore")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Parent chore")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // Revision task — should unblock on parent reaching `in_review`.
@@ -1068,10 +1112,12 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
 
     // Non-revision (chore) dependent — must NOT unblock on in_review.
     let chore_dep = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product_id.clone())
-            .name("Chore dependent")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Chore dependent")
+                .build(),
+        )
         .unwrap();
 
     // Gate both dependents on the parent.
@@ -1179,10 +1225,12 @@ fn manual_block_is_not_auto_unblocked() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     // Human moves A to `blocked` (no edges yet).
     db.update_work_item(
@@ -1202,10 +1250,12 @@ fn manual_block_is_not_auto_unblocked() {
     // prereq should not flip the manually-blocked row off
     // `blocked` (last_status_actor stays `human`).
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.update_work_item(
         &b.id,
@@ -1252,16 +1302,20 @@ fn refuses_manual_move_off_blocked_while_gated() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
@@ -1301,16 +1355,20 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
@@ -1358,16 +1416,20 @@ fn request_execution_refuses_gated_work_item() {
         })
         .unwrap();
     let a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("A")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("A")
+                .build(),
+        )
         .unwrap();
     let b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("B")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("B")
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: a.id.clone(),
@@ -1407,16 +1469,20 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
         })
         .unwrap();
     let prereq = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("prereq")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("prereq")
+                .build(),
+        )
         .unwrap();
     let dependent = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("dependent")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("dependent")
+                .build(),
+        )
         .unwrap();
     // Add the edge: dependent is gated by prereq.
     db.add_dependency(AddDependencyInput {
@@ -1633,21 +1699,25 @@ fn create_via_round_trip_per_source() {
         .unwrap();
 
     let cli_chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("from cli")
-            .autostart(false)
-            .created_via(boss_protocol::CREATED_VIA_CLI)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("from cli")
+                .autostart(false)
+                .created_via(boss_protocol::CREATED_VIA_CLI)
+                .build(),
+        )
         .unwrap();
     assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
 
     let unknown_chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("no source")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("no source")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
 

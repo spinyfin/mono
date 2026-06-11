@@ -47,11 +47,7 @@ impl WorkDb {
     /// `Some("")` clears the column (resolves to `"claude"` at dispatch).
     /// Any non-empty value is stored verbatim after a trim. Returns the
     /// updated product.
-    pub fn set_product_default_driver(
-        &self,
-        product_id: &str,
-        driver: Option<&str>,
-    ) -> Result<Product> {
+    pub fn set_product_default_driver(&self, product_id: &str, driver: Option<&str>) -> Result<Product> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;

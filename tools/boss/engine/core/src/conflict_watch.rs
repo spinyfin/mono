@@ -812,11 +812,13 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(name)
-                .autostart(false)
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(name)
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,

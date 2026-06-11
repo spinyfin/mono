@@ -817,26 +817,33 @@ pub(crate) async fn compose_worker_spawn(
     };
     // Fetch the product before composing the prompt so we can pass
     // editorial_rules and the PR template set into compose_execution_prompt.
-    let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble, row_driver, product_default_driver) =
-        match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                let product = work_db.get_product(&task.product_id).ok().flatten();
-                let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
-                let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
-                let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
-                let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-                (
-                    editorial_rules,
-                    task.effort_level,
-                    task.model_override.clone(),
-                    product_default_model,
-                    dispatch_preamble,
-                    task.driver.clone(),
-                    product_default_driver,
-                )
-            }
-            _ => (None, None, None, None, None, None, None),
-        };
+    let (
+        product_editorial_rules,
+        row_effort,
+        row_model_override,
+        product_default_model,
+        product_dispatch_preamble,
+        row_driver,
+        product_default_driver,
+    ) = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => {
+            let product = work_db.get_product(&task.product_id).ok().flatten();
+            let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
+            let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
+            let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
+            let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+            (
+                editorial_rules,
+                task.effort_level,
+                task.model_override.clone(),
+                product_default_model,
+                dispatch_preamble,
+                task.driver.clone(),
+                product_default_driver,
+            )
+        }
+        _ => (None, None, None, None, None, None, None),
+    };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.as_str(),
@@ -4259,9 +4266,7 @@ mod pane_spawn_tests {
             .name("Untagged chore")
             .description("plain row, no effort/model")
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         // The worker settings file lives outside the workspace; the
@@ -4310,9 +4315,7 @@ mod pane_spawn_tests {
             .description("one-line CSS tweak")
             .effort_level(EffortLevel::Trivial)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4364,9 +4367,7 @@ mod pane_spawn_tests {
             .effort_level(EffortLevel::Medium)
             .model_override("opus")
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4408,9 +4409,7 @@ mod pane_spawn_tests {
             .description("multi-subsystem investigation")
             .effort_level(EffortLevel::Large)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4453,10 +4452,9 @@ mod pane_spawn_tests {
             .product_id(String::new())
             .name("Untagged on Sonnet-defaulted product")
             .build();
-        let (spawner, _chore) =
-            run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
-                .await
-                .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4512,11 +4510,13 @@ mod pane_spawn_tests {
             })
             .unwrap();
         let chore = work_db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Trivial chore")
-                .effort_level(EffortLevel::Trivial)
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Trivial chore")
+                    .effort_level(EffortLevel::Trivial)
+                    .build(),
+            )
             .unwrap();
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -4563,9 +4563,7 @@ mod pane_spawn_tests {
             .name("Any chore")
             .effort_level(EffortLevel::Large)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         // The forbidden list from design §Q2 plus the obvious
@@ -4733,10 +4731,12 @@ mod pane_spawn_tests {
             })
             .unwrap();
         let chore = work_db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name("Sort struct definitions")
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Sort struct definitions")
+                    .build(),
+            )
             .unwrap();
         let ready = work_db
             .create_execution(

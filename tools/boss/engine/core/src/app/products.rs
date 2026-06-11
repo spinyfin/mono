@@ -145,12 +145,7 @@ pub(super) async fn handle_set_product_default_driver(ctx: Dispatch, req: Fronte
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,

@@ -1348,11 +1348,13 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         docs_repo: None,
         worker_branch_prefix: None,
     })?;
-    let chore = work_db.create_chore(CreateChoreInput::builder()
-        .product_id(product.id.clone())
-        .name("C")
-        .autostart(false)
-        .build())?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
     work_db.update_work_item(
         &chore.id,
         WorkItemPatch {
@@ -1680,11 +1682,13 @@ async fn seed_two_conflict_resolutions(
         docs_repo: None,
         worker_branch_prefix: None,
     })?;
-    let chore = work_db.create_chore(CreateChoreInput::builder()
-        .product_id(product.id.clone())
-        .name("C")
-        .autostart(false)
-        .build())?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
     work_db.update_work_item(
         &chore.id,
         WorkItemPatch {

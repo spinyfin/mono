@@ -473,7 +473,14 @@ mod tests {
         // Row: effort = medium, model_override = opus. Design §Q3 says
         // the override changes the model only; effort + addendum still
         // follow `effort_level`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, Some("claude-sonnet-4-6"), None, None);
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Medium),
+            Some("opus"),
+            None,
+            Some("claude-sonnet-4-6"),
+            None,
+            None,
+        );
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
@@ -481,7 +488,14 @@ mod tests {
 
     #[test]
     fn model_override_beats_product_default_when_effort_is_unset() {
-        let cfg = resolve_spawn_config(None, Some("claude-haiku-4-5-20251001"), None, Some("claude-opus-4-7"), None, None);
+        let cfg = resolve_spawn_config(
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            None,
+            Some("claude-opus-4-7"),
+            None,
+            None,
+        );
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
         assert_eq!(cfg.claude_effort, None);
         assert_eq!(cfg.prompt_addendum, None);

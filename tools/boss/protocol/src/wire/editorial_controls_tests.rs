@@ -1,7 +1,5 @@
 use super::*;
-use crate::types::{
-    BranchNaming, EditorialRules, RedactionKind, RedactionRule, TemplatePolicy, TrailerPolicy,
-};
+use crate::types::{BranchNaming, EditorialRules, RedactionKind, RedactionRule, TemplatePolicy, TrailerPolicy};
 
 #[test]
 fn editorial_rules_defaults_deserialize_from_empty_object() {
@@ -25,7 +23,9 @@ fn editorial_rules_round_trip() {
             kind: RedactionKind::Rewrite,
         }],
         template_policy: TemplatePolicy::Enforce,
-        branch_naming: BranchNaming::CustomPrefix { prefix: "bduff/".into() },
+        branch_naming: BranchNaming::CustomPrefix {
+            prefix: "bduff/".into(),
+        },
         commit_trailer_policy: TrailerPolicy::NoAiTrailer,
     };
     let json = serde_json::to_string(&rules).unwrap();
@@ -175,7 +175,9 @@ fn evaluate_editorial_rules_result_event_round_trips() {
 
 #[test]
 fn branch_naming_custom_prefix_round_trips() {
-    let naming = BranchNaming::CustomPrefix { prefix: "bduff/".into() };
+    let naming = BranchNaming::CustomPrefix {
+        prefix: "bduff/".into(),
+    };
     let json = serde_json::to_string(&naming).unwrap();
     assert!(json.contains("custom_prefix"), "serialized: {json}");
     assert!(json.contains("bduff/"), "serialized: {json}");
@@ -207,7 +209,11 @@ fn engine_pool_config_round_trips_through_serde() {
     assert!(json.contains("\"review_slots\":8"), "serialized: {json}");
     let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
     match parsed {
-        FrontendEvent::EnginePoolConfig { worker_slots, automation_slots, review_slots } => {
+        FrontendEvent::EnginePoolConfig {
+            worker_slots,
+            automation_slots,
+            review_slots,
+        } => {
             assert_eq!(worker_slots, 8);
             assert_eq!(automation_slots, 3);
             assert_eq!(review_slots, 8);
@@ -227,12 +233,10 @@ fn product_with_editorial_rules_round_trips() {
     // that `editorial_rules: null` from an absent product column
     // deserialises to `None`.
     let json_with = serde_json::json!({ "editorial_rules": rules });
-    let rules_back: EditorialRules =
-        serde_json::from_value(json_with["editorial_rules"].clone()).unwrap();
+    let rules_back: EditorialRules = serde_json::from_value(json_with["editorial_rules"].clone()).unwrap();
     assert_eq!(rules_back, rules);
 
     let json_null = serde_json::json!({ "editorial_rules": null });
-    let opt: Option<EditorialRules> =
-        serde_json::from_value(json_null["editorial_rules"].clone()).unwrap();
+    let opt: Option<EditorialRules> = serde_json::from_value(json_null["editorial_rules"].clone()).unwrap();
     assert!(opt.is_none());
 }

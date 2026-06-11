@@ -69,7 +69,7 @@ impl TestEngine {
     }
 
     fn db(&self) -> Result<WorkDb> {
-        WorkDb::open(self.db_path.clone()).map_err(Into::into)
+        WorkDb::open(self.db_path.clone())
     }
 }
 
@@ -175,11 +175,13 @@ fn seed_chore_with_ci_attempt(
     attempt_kind: &str,
     head_sha: &str,
 ) -> Result<(String, String)> {
-    let chore = db.create_chore(CreateChoreInput::builder()
-        .product_id(product_id)
-        .name(name)
-        .autostart(false)
-        .build())?;
+    let chore = db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product_id)
+            .name(name)
+            .autostart(false)
+            .build(),
+    )?;
     let pr_url = format!("https://github.com/test/boss/pull/{pr_number}");
     db.update_work_item(
         &chore.id,

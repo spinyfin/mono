@@ -209,20 +209,19 @@ mod tests {
     }
 
     fn create_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(CreateChoreInput::builder()
-            .product_id(product_id)
-            .name(name)
-            .build())
-        .unwrap()
-        .id
+        db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
+            .unwrap()
+            .id
     }
 
     fn create_chore_no_autostart(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(CreateChoreInput::builder()
-            .product_id(product_id)
-            .name(name)
-            .autostart(false)
-            .build())
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id)
+                .name(name)
+                .autostart(false)
+                .build(),
+        )
         .unwrap()
         .id
     }

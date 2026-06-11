@@ -1416,10 +1416,7 @@ pub(crate) fn migrate_tasks_driver_column(conn: &Connection) -> Result<()> {
 /// → `"claude"`.
 pub(crate) fn migrate_products_default_driver(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "default_driver")? {
-        conn.execute(
-            "ALTER TABLE products ADD COLUMN default_driver TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE products ADD COLUMN default_driver TEXT", [])?;
     }
     Ok(())
 }

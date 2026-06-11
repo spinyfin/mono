@@ -1196,8 +1196,7 @@ pub struct CreateExecutionInput {
 /// [`CreateChoreInput`] but adds `project_id` (investigation tasks
 /// are product-level work items optionally scoped to a project) and
 /// uses `kind = 'investigation'` on insert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateInvestigationInput {
     pub product_id: String,

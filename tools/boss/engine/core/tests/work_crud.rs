@@ -1320,11 +1320,13 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     assert_eq!(listed_tasks.iter().filter(|t| t.kind == TaskKind::Design).count(), 1,);
 
     let chore_inputs: Vec<CreateChoreInput> = (0..3)
-        .map(|i| CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name(format!("Bulk chore {i}"))
-            .autostart(i == 0)
-            .build())
+        .map(|i| {
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(format!("Bulk chore {i}"))
+                .autostart(i == 0)
+                .build()
+        })
         .collect();
     let created_chores = match client
         .send_request(&FrontendRequest::CreateManyChores {

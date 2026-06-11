@@ -341,11 +341,13 @@ fn concurrent_writes_do_not_return_database_locked() {
     // binds N PRs to N different chores in parallel.
     let chore_ids: Vec<String> = (0..WORKERS)
         .map(|i| {
-            db.create_chore(CreateChoreInput::builder()
-                .product_id(product.id.clone())
-                .name(format!("Concurrent chore {i}"))
-                .autostart(false)
-                .build())
+            db.create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(format!("Concurrent chore {i}"))
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap()
             .id
         })
@@ -522,11 +524,13 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
 
     // Implementation-kind tasks on the same product are unaffected.
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Implementation chore")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Implementation chore")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
@@ -712,11 +716,13 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
     // (bypassing the create invariant) so the resolver sees an
     // investigation row on a single-repo product.
     let investigation = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Investigation")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Investigation")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let conn = db.connect().unwrap();
     conn.execute(
@@ -734,11 +740,13 @@ fn resolve_repo_uses_docs_repo_for_investigation_kind() {
 
     // Implementation-kind tasks on the same product are unaffected.
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Implementation chore")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Implementation chore")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
     assert_eq!(
@@ -866,10 +874,12 @@ fn effort_and_model_default_to_null_on_fresh_rows() {
         .unwrap();
     assert!(product.default_model.is_none());
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Trivial fix")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Trivial fix")
+                .build(),
+        )
         .unwrap();
     assert!(chore.effort_level.is_none());
     assert!(chore.model_override.is_none());
@@ -894,12 +904,14 @@ fn effort_and_model_roundtrip_through_create_and_query() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Big investigation")
-            .effort_level(EffortLevel::Large)
-            .model_override("claude-opus-4-7")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Big investigation")
+                .effort_level(EffortLevel::Large)
+                .model_override("claude-opus-4-7")
+                .build(),
+        )
         .unwrap();
     assert_eq!(chore.effort_level, Some(EffortLevel::Large));
     assert_eq!(chore.model_override.as_deref(), Some("claude-opus-4-7"));
@@ -924,10 +936,12 @@ fn update_chore_sets_and_clears_effort_and_model() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Some work")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Some work")
+                .build(),
+        )
         .unwrap();
 
     // Set via update.
@@ -986,10 +1000,12 @@ fn update_chore_rejects_invalid_effort_level() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Some work")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Some work")
+                .build(),
+        )
         .unwrap();
 
     let err = db
@@ -1083,10 +1099,12 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Legacy chore")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Legacy chore")
+                .build(),
+        )
         .unwrap();
 
     {
@@ -1134,12 +1152,14 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     // Post-migration rows can carry any of the five enum
     // values; the round-trip continues to work.
     let after_chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Post-migration chore")
-            .effort_level(EffortLevel::Trivial)
-            .model_override("haiku")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Post-migration chore")
+                .effort_level(EffortLevel::Trivial)
+                .model_override("haiku")
+                .build(),
+        )
         .unwrap();
     assert_eq!(after_chore.effort_level, Some(EffortLevel::Trivial));
     assert_eq!(after_chore.model_override.as_deref(), Some("haiku"));
@@ -1173,10 +1193,12 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Pre-migration chore")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Pre-migration chore")
+                .build(),
+        )
         .unwrap();
     // Simulate the pre-migration state by NULL-ing whatever the
     // current schema initialised. `create_chore` already stores
@@ -1355,11 +1377,13 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
         let db = db.clone();
         let product_id = product.id.clone();
         handles.push(std::thread::spawn(move || {
-            db.create_chore(CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(format!("c{i}"))
-                .autostart(false)
-                .build())
+            db.create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name(format!("c{i}"))
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap()
         }));
     }
@@ -1430,11 +1454,13 @@ fn allocator_per_product_sequences_are_independent() {
         .unwrap();
 
     let mk_chore = |product_id: &str, name: &str| {
-        db.create_chore(CreateChoreInput::builder()
-            .product_id(product_id)
-            .name(name)
-            .autostart(false)
-            .build())
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id)
+                .name(name)
+                .autostart(false)
+                .build(),
+        )
         .unwrap()
     };
 
@@ -1568,11 +1594,13 @@ fn unique_short_id_index_rejects_manual_duplicate() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("c1")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c1")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let existing_short: i64 = {
         let conn = db.connect().unwrap();
@@ -1695,21 +1723,25 @@ fn create_chore_protocol_struct_carries_short_id() {
         .unwrap();
 
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("wire-test")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("wire-test")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     assert_eq!(chore.short_id, Some(1), "first chore in product gets short_id 1");
 
     // A second chore in the same product gets the next number.
     let chore2 = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("wire-test-2")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("wire-test-2")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     assert_eq!(chore2.short_id, Some(2));
 
@@ -1773,11 +1805,13 @@ fn work_tree_tasks_carry_short_id() {
         })
         .unwrap();
 
-    db.create_chore(CreateChoreInput::builder()
-        .product_id(product.id.clone())
-        .name("c1")
-        .autostart(false)
-        .build())
+    db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("c1")
+            .autostart(false)
+            .build(),
+    )
     .unwrap();
 
     let tree = db.get_work_tree(&product.id).unwrap();
@@ -1807,11 +1841,13 @@ fn noop_status_patch_preserves_last_status_actor_for_task() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("C")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("C")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // Simulate the engine having set the status by writing directly.
@@ -1930,11 +1966,13 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("C")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("C")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     {
@@ -1991,18 +2029,22 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
         })
         .unwrap();
     let chore_a = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-a")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-a")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let chore_b = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-b")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-b")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     // Two rows for chore_a with different attempt_kinds + statuses.
     let r1 = db
@@ -2112,11 +2154,13 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-budget")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-budget")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // Defaults: no per-PR override, product default = 3, used = 0.
@@ -2166,10 +2210,12 @@ fn migration_normalises_empty_effort_level_to_null() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Chore with empty effort")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Chore with empty effort")
+                .build(),
+        )
         .unwrap();
 
     // Manually write an empty string to simulate a legacy row.

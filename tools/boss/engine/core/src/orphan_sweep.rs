@@ -375,12 +375,14 @@ mod tests {
 
     fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
         let chore = db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product_id)
-                .name("test chore")
-                // repo_remote_url omitted: product already has one; the invariant
-                // disallows setting both.
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("test chore")
+                    // repo_remote_url omitted: product already has one; the invariant
+                    // disallows setting both.
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,

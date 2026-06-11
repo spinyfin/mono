@@ -129,11 +129,13 @@ fn conflict_resolution_round_trip() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("C")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("C")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     // Flip the chore into `blocked: merge_conflict` so the
     // insert path's UPDATE-tasks side stamps blocked_attempt_id.
@@ -550,11 +552,13 @@ fn record_and_list_effort_escalations_round_trip() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("Rename helper")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Rename helper")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let chore_id = chore.id.clone();
     let recorded = db
@@ -812,10 +816,12 @@ fn rebind_from_unbound_state() {
 fn unique_index_rejects_duplicate_bound_rows() {
     let (db, product_id, chore_id) = setup_product_and_chore();
     let chore2 = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product_id.clone())
-            .name("Second chore")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Second chore")
+                .build(),
+        )
         .unwrap();
     let raw = serde_json::json!({});
     db.set_external_ref(&chore_id, "github", "spinyfin/mono#77", &raw)
@@ -842,10 +848,12 @@ fn unique_index_rejects_duplicate_bound_rows() {
 fn list_external_refs_includes_unbound_rows() {
     let (db, product_id, chore_id) = setup_product_and_chore();
     let chore2 = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product_id.clone())
-            .name("Another chore")
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Another chore")
+                .build(),
+        )
         .unwrap();
 
     let raw = serde_json::json!({ "n": 1 });
@@ -1273,11 +1281,13 @@ fn manual_override_writes_ci_failure_suppression() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-manual")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-manual")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let pr_url = "https://github.com/foo/bar/pull/77".to_owned();
     db.update_work_item(
@@ -1352,11 +1362,13 @@ fn manual_override_from_exhausted_writes_suppression() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-exh")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-exh")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let pr_url = "https://github.com/foo/bar/pull/78".to_owned();
     db.update_work_item(
@@ -1417,11 +1429,13 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-churn")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-churn")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // 0 attempts → not rate-limited.
@@ -1520,11 +1534,13 @@ fn manual_move_unrelated_to_ci_does_not_write_suppression() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput::builder()
-            .product_id(product.id.clone())
-            .name("chore-noop")
-            .autostart(false)
-            .build())
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-noop")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let pr_url = "https://github.com/foo/bar/pull/79".to_owned();
     // to_do → in_review → to_do with no CI involvement. None of

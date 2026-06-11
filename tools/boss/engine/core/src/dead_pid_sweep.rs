@@ -442,10 +442,12 @@ mod tests {
 
     fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
         let chore = db
-            .create_chore(CreateChoreInput::builder()
-                .product_id(product_id)
-                .name("test chore")
-                .build())
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("test chore")
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,
