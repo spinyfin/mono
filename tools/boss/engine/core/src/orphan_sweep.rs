@@ -309,11 +309,13 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("orphan sweep tests don't invoke cube")
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {

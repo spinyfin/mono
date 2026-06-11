@@ -3142,11 +3142,13 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
         ) -> Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in merge_poller tests")
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<crate::coordinator::CubeChangeHandle> {
+            unreachable!("not used in merge_poller tests")
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             unreachable!("not used in merge_poller tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -5925,12 +5927,14 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
         ) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unreachable!()
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
+            Ok(())
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
             Ok(())

@@ -1850,6 +1850,9 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
+        WorkspaceCommand::Goto { workspace, bookmark, pr } => {
+            workspace_goto(database_path, runner, workspace, bookmark, pr)
+        }
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }
@@ -2048,13 +2051,135 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
     }
 }
 
-/// Rebase the current workspace's boss branch onto the repo's integration branch.
+/// Position the workspace working copy on the head of a PR branch.
 ///
-/// Implements `cube workspace rebase`. Encodes the correct jj recipe
-/// so agents do not hand-roll it and trip over the `@origin` and
-/// `--ignore-immutable` gotchas. The target branch is read from the repo pool
-/// configuration (`main_branch` field) — not hardcoded. Safe to call multiple
-/// times (idempotent when already up-to-date).
+/// Implements `cube workspace goto`. Fetches from the GitHub remote, resolves
+/// the branch (by name or PR number), sets up the local bookmark, and creates
+/// a fresh editable child commit atop the remote tip. Idempotent: if `@`
+/// already has the remote tip as a direct parent, the `jj new` step is skipped.
+fn workspace_goto(
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    workspace: Option<String>,
+    bookmark: Option<String>,
+    pr: Option<u64>,
+) -> Result<RunResult> {
+    let cwd: PathBuf = match workspace {
+        Some(ref p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(CubeError::Io)?,
+    };
+
+    let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
+    )?;
+
+    let branch: String = if let Some(b) = bookmark {
+        strip_remote_suffix(&b).to_string()
+    } else if let Some(n) = pr {
+        let n_str = n.to_string();
+        let json = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "gh",
+                &["pr", "view", &n_str, "-R", &owner_repo, "--json", "headRefName,state"],
+            ))
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
+        let pr_info: serde_json::Value = serde_json::from_str(&json)?;
+        let state = pr_info.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        if state == "MERGED" || state == "CLOSED" {
+            return Err(CubeError::InvalidArgument(format!(
+                "PR {n} ({owner_repo}) is {state} — cannot position on a non-open PR. \
+                 Use `cube workspace lease` without `--goto` for a fresh task, or verify the PR number."
+            )));
+        }
+        pr_info
+            .get("headRefName")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "PR {n} ({owner_repo}) returned no headRefName from GitHub"
+                ))
+            })?
+            .to_string()
+    } else {
+        return Err(CubeError::InvalidArgument(
+            "cube workspace goto: either --bookmark or --pr must be provided".to_string(),
+        ));
+    };
+
+    let remote_ref = format!("{branch}@{github_remote}");
+
+    if runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+        ))
+        .is_err()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "branch `{branch}` was not found on remote `{github_remote}` \
+             (looked for `{remote_ref}`). Confirm the bookmark exists and is pushed, \
+             or pass `--pr <n>` to let cube resolve the head from GitHub."
+        )));
+    }
+
+    // Set the local bookmark to track the remote head (idempotent; --allow-backwards
+    // handles any local divergence).
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["bookmark", "set", &branch, "-r", &remote_ref, "--allow-backwards"],
+        ),
+    )?;
+
+    // Also set the pr/<n> bookmark when the caller specified --pr so that
+    // `cube pr push` and `cube workspace rebase` can find the PR number later.
+    if let Some(n) = pr {
+        let pr_bm = pr_bookmark::pr_bookmark_name(n);
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref]),
+        )?;
+    }
+
+    // Idempotency check: if @ already has <remote_ref> as a direct parent,
+    // skip `jj new` — the workspace is already positioned correctly.
+    let already_positioned = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["log", "-r", &format!("{remote_ref} & ::@"), "--no-graph", "-T", "commit_id"],
+        ))
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false);
+
+    if !already_positioned {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(&cwd, "jj", &["new", &remote_ref]),
+        )?;
+    }
+
+    RunResult::new(
+        format!("Positioned working copy on {branch}."),
+        json!({
+            "branch": branch,
+            "remote_ref": remote_ref,
+            "already_positioned": already_positioned,
+        }),
+    )
+}
+
 /// Options controlling boss-branch resolution and the push half of
 /// `workspace rebase`. Separated from CLI parsing so the core
 /// [`rebase_workspace_branch`] is unit-testable with explicit inputs.
@@ -2063,10 +2188,6 @@ struct RebaseOpts {
     explicit_bookmark: Option<String>,
     /// Explicit `--pr` number; resolves the PR's head branch from GitHub.
     explicit_pr: Option<u64>,
-    /// Bookmark derived from the worker's own exec id (via
-    /// `BOSS_STRUCTURED_OUTPUT`), used as a discovery fast path. The wrapper
-    /// fills this from the environment; tests pass `None`.
-    exec_id_hint: Option<String>,
     /// Skip the post-rebase advance + push (rebase only).
     no_push: bool,
 }
@@ -2078,57 +2199,8 @@ fn strip_remote_suffix(reference: &str) -> &str {
     reference.split('@').next().unwrap_or(reference)
 }
 
-/// Derive the `boss/exec_*` bookmark name from the worker's environment.
-///
-/// Boss workers get no dedicated exec-id env var, but the engine always
-/// exports `BOSS_STRUCTURED_OUTPUT` pointing at `<dir>/<execution_id>.json`
-/// (see `boss-engine`'s `structured_output`). The engine pushes the branch
-/// `boss/<execution_id>` for that execution, so the artifact's file stem is
-/// exactly the exec id. Returns `None` when the var is unset or doesn't look
-/// like an `exec_*.json` artifact.
-fn boss_exec_bookmark_from_env() -> Option<String> {
-    let raw = std::env::var("BOSS_STRUCTURED_OUTPUT").ok()?;
-    let stem = Path::new(&raw).file_stem()?.to_str()?;
-    if stem.starts_with("exec_") {
-        Some(format!("boss/{stem}"))
-    } else {
-        None
-    }
-}
-
-/// Collect the distinct `boss/exec_*` bookmark names (local or
-/// remote-tracking) reachable anywhere in the repo, regardless of `@`'s
-/// position. Plain names with the `@<remote>` suffix stripped, de-duplicated
-/// and sorted for stable, deterministic error messages. This is the
-/// mispositioning-proof discovery the 5-ancestors heuristic could not do.
-fn all_boss_exec_bookmarks(runner: &dyn CommandRunner, cwd: &Path) -> Vec<String> {
-    let out = runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "jj",
-            &[
-                "log",
-                "-r",
-                r#"bookmarks(glob:"boss/exec_*") | remote_bookmarks(glob:"boss/exec_*")"#,
-                "--no-graph",
-                "-T",
-                r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#,
-            ],
-        ))
-        .unwrap_or_default();
-    let mut names: Vec<String> = out
-        .split_whitespace()
-        .filter(|t| t.starts_with("boss/exec_"))
-        .map(|t| strip_remote_suffix(t).to_string())
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// Boss bookmark nearest `@` (within 5 ancestors). The original fast path;
-/// returns `None` when `@` is mispositioned (e.g. parented on main), which is
-/// the signal to fall back to the repo-wide search.
+/// Boss bookmark nearest `@` (within 5 ancestors).
+/// Returns `None` when `@` is not positioned on a boss branch.
 fn boss_branch_from_ancestry(runner: &dyn CommandRunner, cwd: &Path) -> Option<String> {
     let out = runner
         .run(&RealCommandRunner::invocation(
@@ -2183,34 +2255,20 @@ fn resolve_boss_branch(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str,
         return Ok(head.to_string());
     }
 
-    // The worker's own exec id (from BOSS_STRUCTURED_OUTPUT) — authoritative,
-    // but only trusted when it actually names a bookmark present in this repo
-    // (a workspace may have been leased for a different exec).
-    if let Some(hint) = &opts.exec_id_hint
-        && all_boss_exec_bookmarks(runner, cwd).iter().any(|n| n == hint)
-    {
-        return Ok(hint.clone());
-    }
-
+    // Default: use the boss bookmark nearest @ in the 5-ancestor window.
+    // With `cube workspace goto` guaranteeing pre-positioning, this window
+    // always contains the right bookmark. Pass --bookmark or --pr to override.
     if let Some(name) = boss_branch_from_ancestry(runner, cwd) {
         return Ok(name);
     }
 
-    let all = all_boss_exec_bookmarks(runner, cwd);
-    match all.len() {
-        0 => Err(CubeError::InvalidArgument(
-            "no `boss/exec_*` bookmark found anywhere in this workspace. The workspace may not be \
-             positioned on a boss branch. Pass `--bookmark <boss/exec_...>` or `--pr <n>` explicitly, \
-             or run `cube workspace lease --resume_pr <n>` to position it first."
-                .to_string(),
-        )),
-        1 => Ok(all.into_iter().next().expect("len checked == 1")),
-        _ => Err(CubeError::InvalidArgument(format!(
-            "multiple `boss/exec_*` bookmarks are present and none was specified: {}. \
-             Re-run with `--bookmark <one-of-these>` or `--pr <n>` to choose.",
-            all.join(", ")
-        ))),
-    }
+    Err(CubeError::InvalidArgument(
+        "no `boss/exec_*` bookmark found in the 5 ancestors of `@`. \
+         The workspace must be positioned on a PR branch before rebase. \
+         Run `cube workspace goto --pr <n>` to position it, or pass \
+         `--bookmark <boss/exec_...>` / `--pr <n>` to override."
+            .to_string(),
+    ))
 }
 
 fn workspace_rebase(
@@ -2242,7 +2300,6 @@ fn workspace_rebase(
     let opts = RebaseOpts {
         explicit_bookmark: bookmark,
         explicit_pr: pr,
-        exec_id_hint: boss_exec_bookmark_from_env(),
         no_push,
     };
 
@@ -5061,7 +5118,7 @@ mod tests {
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RebaseOpts,
         RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces,
         is_stdin_path, rebase_workspace_branch, render_boss_infra_exclude_block, resolve_body_file, run_with_context,
-        run_with_dependencies, upsert_managed_exclude,
+        run_with_dependencies, upsert_managed_exclude, workspace_goto,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -12213,7 +12270,6 @@ steps:
     const REBASE_OWNER_REPO: &str = "spinyfin/mono";
     const ANCESTRY_TMPL: &str = r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#;
     const CONFLICT_TMPL: &str = r#"if(conflict, "CONFLICT", "CLEAN")"#;
-    const REPO_WIDE_REVSET: &str = r#"bookmarks(glob:"boss/exec_*") | remote_bookmarks(glob:"boss/exec_*")"#;
 
     fn rebase_cwd() -> PathBuf {
         PathBuf::from(REBASE_CWD)
@@ -12237,11 +12293,10 @@ steps:
         }
     }
 
-    fn rebase_opts(bookmark: Option<&str>, pr: Option<u64>, exec_hint: Option<&str>, no_push: bool) -> RebaseOpts {
+    fn rebase_opts(bookmark: Option<&str>, pr: Option<u64>, no_push: bool) -> RebaseOpts {
         RebaseOpts {
             explicit_bookmark: bookmark.map(str::to_string),
             explicit_pr: pr,
-            exec_id_hint: exec_hint.map(str::to_string),
             no_push,
         }
     }
@@ -12357,7 +12412,7 @@ steps:
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
-        let result = run_rebase(&runner, &rebase_opts(None, None, None, false)).expect("clean rebase");
+        let result = run_rebase(&runner, &rebase_opts(None, None, false)).expect("clean rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["status"], "clean");
         assert_eq!(result.payload["branch"], branch);
@@ -12366,12 +12421,10 @@ steps:
     }
 
     #[test]
-    fn rebase_mispositioned_at_on_main_self_heals_via_repo_wide_search() {
-        // The 2026-06-11 incident: @ parented on main, the boss bookmark only
-        // reachable at @origin. Ancestry can't see it; the repo-wide search
-        // finds the unique boss/exec_* bookmark and `jj new` repositions @.
-        let branch = "boss/exec_abc";
-        let mut cmds = vec![
+    fn rebase_not_positioned_errors_with_goto_hint() {
+        // Without `cube workspace goto` pre-positioning, ancestry finds nothing
+        // and rebase errors with a clear message pointing at the remedy.
+        let cmds = vec![
             fetch_cmd(),
             // ancestry: @ on main, no boss bookmark in 5 ancestors
             ExpectedCommand::ok(
@@ -12380,27 +12433,13 @@ steps:
                 &["log", "-r", "ancestors(@, 5)", "--no-graph", "-T", ANCESTRY_TMPL],
                 "main main@github\n",
             ),
-            // repo-wide search finds the unique remote-only boss bookmark
-            ExpectedCommand::ok(
-                rebase_cwd(),
-                "jj",
-                &["log", "-r", REPO_WIDE_REVSET, "--no-graph", "-T", ANCESTRY_TMPL],
-                "boss/exec_abc@github\n",
-            ),
-            remote_exists_cmd(branch, "aaa111"),
-            // positioned probe is EMPTY → mispositioned
-            positioned_cmd(branch, ""),
-            // self-heal: reposition @ onto the boss head
-            ExpectedCommand::ok(rebase_cwd(), "jj", &["new", "boss/exec_abc@github"], ""),
         ];
-        cmds.extend(set_track_rebase_check_cmds(branch, "CLEAN"));
-        cmds.extend(push_and_verify_cmds(branch));
-
         let runner = FakeRunner::new(cmds);
-        let result = run_rebase(&runner, &rebase_opts(None, None, None, false)).expect("self-healed rebase");
+        let err = run_rebase(&runner, &rebase_opts(None, None, false)).expect_err("not positioned");
         runner.assert_exhausted();
-        assert_eq!(result.payload["status"], "clean");
-        assert_eq!(result.payload["pushed"], true);
+        let msg = format!("{err}");
+        assert!(msg.contains("boss/exec_*"), "names the expected pattern: {msg}");
+        assert!(msg.contains("cube workspace goto"), "points at the remedy: {msg}");
     }
 
     #[test]
@@ -12415,39 +12454,11 @@ steps:
 
         let runner = FakeRunner::new(cmds);
         // pass the @origin form; expect it stripped to the plain name
-        let result = run_rebase(&runner, &rebase_opts(Some("boss/exec_xyz@github"), None, None, false))
+        let result = run_rebase(&runner, &rebase_opts(Some("boss/exec_xyz@github"), None, false))
             .expect("explicit rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["branch"], branch);
         assert_eq!(result.payload["pushed"], true);
-    }
-
-    #[test]
-    fn rebase_ambiguous_bookmarks_errors_with_candidates_and_disambiguator() {
-        let cmds = vec![
-            fetch_cmd(),
-            // ancestry finds nothing
-            ExpectedCommand::ok(
-                rebase_cwd(),
-                "jj",
-                &["log", "-r", "ancestors(@, 5)", "--no-graph", "-T", ANCESTRY_TMPL],
-                "main\n",
-            ),
-            // repo-wide finds TWO distinct boss bookmarks
-            ExpectedCommand::ok(
-                rebase_cwd(),
-                "jj",
-                &["log", "-r", REPO_WIDE_REVSET, "--no-graph", "-T", ANCESTRY_TMPL],
-                "boss/exec_one@github boss/exec_two@github\n",
-            ),
-        ];
-        let runner = FakeRunner::new(cmds);
-        let err = run_rebase(&runner, &rebase_opts(None, None, None, false)).expect_err("ambiguous");
-        runner.assert_exhausted();
-        let msg = format!("{err}");
-        assert!(msg.contains("boss/exec_one"), "names first candidate: {msg}");
-        assert!(msg.contains("boss/exec_two"), "names second candidate: {msg}");
-        assert!(msg.contains("--bookmark"), "points at the disambiguator: {msg}");
     }
 
     #[test]
@@ -12468,7 +12479,7 @@ steps:
         cmds.extend(push_and_verify_cmds(branch));
 
         let runner = FakeRunner::new(cmds);
-        let result = run_rebase(&runner, &rebase_opts(None, Some(7), None, false)).expect("pr rebase");
+        let result = run_rebase(&runner, &rebase_opts(None, Some(7), false)).expect("pr rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["branch"], branch);
         assert_eq!(result.payload["pushed"], true);
@@ -12491,7 +12502,7 @@ steps:
         ));
 
         let runner = FakeRunner::new(cmds);
-        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, None, false)).expect("conflict rebase");
+        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("conflict rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["status"], "conflicts");
         assert_eq!(result.payload["pushed"], false);
@@ -12516,7 +12527,7 @@ steps:
         // no push/verify commands expected
 
         let runner = FakeRunner::new(cmds);
-        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, None, true)).expect("no-push rebase");
+        let result = run_rebase(&runner, &rebase_opts(Some(branch), None, true)).expect("no-push rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["status"], "clean");
         assert_eq!(result.payload["pushed"], false);
@@ -12537,7 +12548,7 @@ steps:
             ),
         ];
         let runner = FakeRunner::new(cmds);
-        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, None, false)).expect_err("missing branch");
+        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect_err("missing branch");
         runner.assert_exhausted();
         let msg = format!("{err}");
         assert!(msg.contains("was not found on remote"), "{msg}");
@@ -12561,12 +12572,195 @@ steps:
         ));
 
         let runner = FakeRunner::new(cmds);
-        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, None, false)).expect_err("push failed");
+        let err = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect_err("push failed");
         runner.assert_exhausted();
         let msg = format!("{err}");
         assert!(msg.contains("pushing it to"), "{msg}");
         assert!(msg.contains("re-run"), "guides re-running, not forcing: {msg}");
         assert!(!msg.contains("--force"), "must not suggest a force flag: {msg}");
+    }
+
+    // ───────────────────────── workspace goto ─────────────────────────
+    //
+    // `workspace_goto` is the testable core of `cube workspace goto`:
+    // fetch → resolve branch → probe existence → set bookmarks →
+    // idempotency check → `jj new` (or skip when already positioned).
+    // Tests drive it via `workspace_goto(None, &runner, Some(GOTO_CWD.into()), ...)`.
+
+    const GOTO_CWD: &str = "/goto-ws";
+    const GOTO_REMOTE: &str = "github";
+    const GOTO_OWNER_REPO: &str = "spinyfin/mono";
+
+    fn goto_cwd() -> PathBuf {
+        PathBuf::from(GOTO_CWD)
+    }
+
+    fn goto_remote_list_cmd() -> ExpectedCommand {
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["git", "remote", "list"],
+            &format!("origin\t/local/mirror\n{GOTO_REMOTE}\thttps://github.com/{GOTO_OWNER_REPO}\n"),
+        )
+    }
+
+    fn goto_fetch_cmd() -> ExpectedCommand {
+        ExpectedCommand::ok(goto_cwd(), "jj", &["git", "fetch", "--remote", GOTO_REMOTE], "")
+    }
+
+    fn goto_exists_cmd(branch: &str, sha: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+            sha,
+        )
+    }
+
+    fn goto_set_bookmark_cmd(branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["bookmark", "set", branch, "-r", &remote_ref, "--allow-backwards"],
+            "",
+        )
+    }
+
+    fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        let pr_bm = format!("pr/{pr}");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["bookmark", "set", &pr_bm, "-r", &remote_ref],
+            "",
+        )
+    }
+
+    fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
+        let revset = format!("{branch}@{GOTO_REMOTE} & ::@");
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+            sha,
+        )
+    }
+
+    fn goto_new_cmd(branch: &str) -> ExpectedCommand {
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        ExpectedCommand::ok(goto_cwd(), "jj", &["new", &remote_ref], "")
+    }
+
+    fn run_goto(
+        runner: &FakeRunner,
+        bookmark: Option<&str>,
+        pr: Option<u64>,
+    ) -> Result<super::RunResult> {
+        workspace_goto(
+            None,
+            runner,
+            Some(GOTO_CWD.to_string()),
+            bookmark.map(str::to_string),
+            pr,
+        )
+    }
+
+    #[test]
+    fn goto_bookmark_not_yet_positioned_creates_new_commit() {
+        let branch = "boss/exec_goto1";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            goto_exists_cmd(branch, "abc1"),
+            goto_set_bookmark_cmd(branch),
+            goto_positioned_cmd(branch, ""),   // not yet positioned
+            goto_new_cmd(branch),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, Some(branch), None).expect("goto succeeds");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], false);
+    }
+
+    #[test]
+    fn goto_bookmark_already_positioned_skips_jj_new() {
+        let branch = "boss/exec_goto2";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            goto_exists_cmd(branch, "def2"),
+            goto_set_bookmark_cmd(branch),
+            goto_positioned_cmd(branch, "def2"),  // already positioned
+            // no jj new expected
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], true);
+    }
+
+    #[test]
+    fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
+        let branch = "boss/exec_gotopr";
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            ExpectedCommand::ok(
+                goto_cwd(),
+                "gh",
+                &["pr", "view", "42", "-R", GOTO_OWNER_REPO, "--json", "headRefName,state"],
+                &format!(r#"{{"headRefName":"{branch}","state":"OPEN"}}"#),
+            ),
+            goto_exists_cmd(branch, "e42"),
+            goto_set_bookmark_cmd(branch),
+            goto_set_pr_bookmark_cmd(42, branch),
+            goto_positioned_cmd(branch, ""),
+            goto_new_cmd(branch),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let result = run_goto(&runner, None, Some(42)).expect("pr goto");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["branch"], branch);
+        assert_eq!(result.payload["already_positioned"], false);
+    }
+
+    #[test]
+    fn goto_missing_bookmark_errors_clearly() {
+        let branch = "boss/exec_missing";
+        let remote_ref = format!("{branch}@{GOTO_REMOTE}");
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+            failing_cmd(
+                goto_cwd(),
+                "jj",
+                &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+                &format!("Error: Revision \"{remote_ref}\" doesn't exist"),
+            ),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let err = run_goto(&runner, Some(branch), None).expect_err("missing bookmark");
+        runner.assert_exhausted();
+        let msg = format!("{err}");
+        assert!(msg.contains(branch), "names the branch: {msg}");
+        assert!(msg.contains("was not found on remote"), "{msg}");
+    }
+
+    #[test]
+    fn goto_requires_bookmark_or_pr() {
+        let cmds = vec![
+            goto_remote_list_cmd(),
+            goto_fetch_cmd(),
+        ];
+        let runner = FakeRunner::new(cmds);
+        let err = run_goto(&runner, None, None).expect_err("requires arg");
+        let msg = format!("{err}");
+        assert!(msg.contains("--bookmark") || msg.contains("--pr"), "{msg}");
     }
 
     #[derive(Default)]
