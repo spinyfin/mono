@@ -97,18 +97,15 @@ impl WorkConfig {
         // A smaller default left slots 5–8 idle while the dispatcher
         // silently no-op'd new work. `BOSS_WORKER_POOL_SIZE` still
         // overrides for callers that genuinely want fewer workers.
-        let worker_pool_size = lookup_usize(&lookup, "BOSS_WORKER_POOL_SIZE")?
-            .unwrap_or(MAX_WORKER_POOL_SIZE);
-        let automation_pool_size = lookup_usize(&lookup, "BOSS_AUTOMATION_POOL_SIZE")?
-            .unwrap_or(MAX_AUTOMATION_POOL_SIZE);
-        let review_pool_size = lookup_usize(&lookup, "BOSS_REVIEW_POOL_SIZE")?
-            .unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
-        let max_review_cycles = lookup_usize(&lookup, "BOSS_MAX_REVIEW_CYCLES")?
-            .unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
-        let min_review_changed_lines = lookup_u64(&lookup, "BOSS_MIN_REVIEW_CHANGED_LINES")?
-            .unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
-        let max_review_embed_diff_lines = lookup_u64(&lookup, "BOSS_MAX_EMBED_DIFF_LINES")?
-            .unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
+        let worker_pool_size = lookup_usize(&lookup, "BOSS_WORKER_POOL_SIZE")?.unwrap_or(MAX_WORKER_POOL_SIZE);
+        let automation_pool_size =
+            lookup_usize(&lookup, "BOSS_AUTOMATION_POOL_SIZE")?.unwrap_or(MAX_AUTOMATION_POOL_SIZE);
+        let review_pool_size = lookup_usize(&lookup, "BOSS_REVIEW_POOL_SIZE")?.unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
+        let max_review_cycles = lookup_usize(&lookup, "BOSS_MAX_REVIEW_CYCLES")?.unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
+        let min_review_changed_lines =
+            lookup_u64(&lookup, "BOSS_MIN_REVIEW_CHANGED_LINES")?.unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
+        let max_review_embed_diff_lines =
+            lookup_u64(&lookup, "BOSS_MAX_EMBED_DIFF_LINES")?.unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
