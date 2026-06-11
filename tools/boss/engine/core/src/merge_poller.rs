@@ -5922,13 +5922,7 @@ mod tests {
         async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
             unreachable!()
         }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-        ) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {

@@ -1006,7 +1006,12 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "goto", "--pr", "1467"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Goto { workspace, bookmark, pr },
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
             } => {
                 assert!(workspace.is_none());
                 assert!(bookmark.is_none());
@@ -1021,7 +1026,12 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc_01"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Goto { workspace, bookmark, pr },
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
             } => {
                 assert!(workspace.is_none());
                 assert_eq!(bookmark.as_deref(), Some("boss/exec_abc_01"));
@@ -1044,7 +1054,12 @@ mod tests {
         ]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Goto { workspace, bookmark, pr },
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
             } => {
                 assert_eq!(workspace.as_deref(), Some("/ws/mono-agent-007"));
                 assert!(bookmark.is_none());

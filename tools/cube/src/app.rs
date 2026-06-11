@@ -1850,9 +1850,11 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
-        WorkspaceCommand::Goto { workspace, bookmark, pr } => {
-            workspace_goto(database_path, runner, workspace, bookmark, pr)
-        }
+        WorkspaceCommand::Goto {
+            workspace,
+            bookmark,
+            pr,
+        } => workspace_goto(database_path, runner, workspace, bookmark, pr),
         WorkspaceCommand::Rebase { bookmark, pr, no_push } => {
             workspace_rebase(&mut store, database_path, runner, bookmark, pr, no_push)
         }
@@ -2100,9 +2102,7 @@ fn workspace_goto(
             .get("headRefName")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                CubeError::InvalidArgument(format!(
-                    "PR {n} ({owner_repo}) returned no headRefName from GitHub"
-                ))
+                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no headRefName from GitHub"))
             })?
             .to_string()
     } else {
@@ -2157,7 +2157,14 @@ fn workspace_goto(
         .run(&RealCommandRunner::invocation(
             &cwd,
             "jj",
-            &["log", "-r", &format!("{remote_ref} & ::@"), "--no-graph", "-T", "commit_id"],
+            &[
+                "log",
+                "-r",
+                &format!("{remote_ref} & ::@"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
         ))
         .map(|out| !out.trim().is_empty())
         .unwrap_or(false);
@@ -2981,8 +2988,7 @@ fn resolve_pr_push_target(
             let head_branch = bm_out
                 .lines()
                 .map(str::trim)
-                .filter(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
-                .next()
+                .find(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
                 .ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
                         "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
@@ -3044,10 +3050,10 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/") {
-                        if let Ok(n) = n_str.parse::<u64>() {
-                            pr_number = Some(n);
-                        }
+                    if let Some(n_str) = name.strip_prefix("pr/")
+                        && let Ok(n) = n_str.parse::<u64>()
+                    {
+                        pr_number = Some(n);
                     }
                 } else {
                     head_branch = Some(name.to_string());
@@ -12454,8 +12460,8 @@ steps:
 
         let runner = FakeRunner::new(cmds);
         // pass the @origin form; expect it stripped to the plain name
-        let result = run_rebase(&runner, &rebase_opts(Some("boss/exec_xyz@github"), None, false))
-            .expect("explicit rebase");
+        let result =
+            run_rebase(&runner, &rebase_opts(Some("boss/exec_xyz@github"), None, false)).expect("explicit rebase");
         runner.assert_exhausted();
         assert_eq!(result.payload["branch"], branch);
         assert_eq!(result.payload["pushed"], true);
@@ -12631,12 +12637,7 @@ steps:
     fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
         let remote_ref = format!("{branch}@{GOTO_REMOTE}");
         let pr_bm = format!("pr/{pr}");
-        ExpectedCommand::ok(
-            goto_cwd(),
-            "jj",
-            &["bookmark", "set", &pr_bm, "-r", &remote_ref],
-            "",
-        )
+        ExpectedCommand::ok(goto_cwd(), "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref], "")
     }
 
     fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
@@ -12654,11 +12655,7 @@ steps:
         ExpectedCommand::ok(goto_cwd(), "jj", &["new", &remote_ref], "")
     }
 
-    fn run_goto(
-        runner: &FakeRunner,
-        bookmark: Option<&str>,
-        pr: Option<u64>,
-    ) -> Result<super::RunResult> {
+    fn run_goto(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Result<super::RunResult> {
         workspace_goto(
             None,
             runner,
@@ -12676,7 +12673,7 @@ steps:
             goto_fetch_cmd(),
             goto_exists_cmd(branch, "abc1"),
             goto_set_bookmark_cmd(branch),
-            goto_positioned_cmd(branch, ""),   // not yet positioned
+            goto_positioned_cmd(branch, ""), // not yet positioned
             goto_new_cmd(branch),
         ];
         let runner = FakeRunner::new(cmds);
@@ -12694,8 +12691,8 @@ steps:
             goto_fetch_cmd(),
             goto_exists_cmd(branch, "def2"),
             goto_set_bookmark_cmd(branch),
-            goto_positioned_cmd(branch, "def2"),  // already positioned
-            // no jj new expected
+            goto_positioned_cmd(branch, "def2"), // already positioned
+                                                 // no jj new expected
         ];
         let runner = FakeRunner::new(cmds);
         let result = run_goto(&runner, Some(branch), None).expect("idempotent goto");
@@ -12753,10 +12750,7 @@ steps:
 
     #[test]
     fn goto_requires_bookmark_or_pr() {
-        let cmds = vec![
-            goto_remote_list_cmd(),
-            goto_fetch_cmd(),
-        ];
+        let cmds = vec![goto_remote_list_cmd(), goto_fetch_cmd()];
         let runner = FakeRunner::new(cmds);
         let err = run_goto(&runner, None, None).expect_err("requires arg");
         let msg = format!("{err}");

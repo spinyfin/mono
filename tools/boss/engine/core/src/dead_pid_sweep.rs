@@ -370,13 +370,7 @@ mod tests {
         async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
             unimplemented!()
         }
-        async fn lease_workspace(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-        ) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
