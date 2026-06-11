@@ -49,7 +49,6 @@ checks:
         - engine/core/src/live_status_loop.rs::SlotDebugSnapshot
         - engine/core/src/live_status_loop.rs::DispatcherStatsSnapshot
         - engine/core/src/live_status_loop.rs::SlotConfig
-        - engine/core/src/spawn_flow.rs::StartWorkerInput
         - protocol/src/engine_app.rs::SpawnWorkerPaneInput
         - protocol/src/live_status_debug.rs::LiveStatusDebugReport
         - protocol/src/live_status_debug.rs::DispatcherStatsReport

@@ -24,11 +24,11 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
+use crate::driver::ClaudeDriver;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
 };
-use crate::driver::ClaudeDriver;
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
 
@@ -67,7 +67,8 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct StartWorkerInput {
     pub run_id: String,
     pub lease_id: String,

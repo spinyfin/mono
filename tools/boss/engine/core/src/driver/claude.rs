@@ -248,8 +248,7 @@ fn shell_escape(value: &str) -> String {
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// [`render_claude_md`][crate::worker_setup::render_claude_md].
-const CLAUDE_AGENT_RULES_PREAMBLE: &str =
-    "You are running inside a Boss-managed worker session. The engine\n\
+const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via claude hooks.";
 
@@ -313,8 +312,7 @@ impl AgentDriver for ClaudeDriver {
         // stays in sync with provision_workspace's write location.
         cmd.push_str(&format!(
             " \"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir,
-            CLAUDE_DESCRIPTOR.initial_prompt_filename,
+            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         ));
         cmd
     }
@@ -328,15 +326,9 @@ impl AgentDriver for ClaudeDriver {
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
     ///   the headless worker session
-    async fn provision_workspace(
-        &self,
-        workspace: &Path,
-        prompt_text: &str,
-        _run_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, _run_id: &str) -> anyhow::Result<()> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("creating {}", config_dir.display()))?;
+        std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
         let prompt_path = config_dir.join(CLAUDE_DESCRIPTOR.initial_prompt_filename);
         std::fs::write(&prompt_path, prompt_text)
@@ -888,8 +880,14 @@ mod tests {
     #[test]
     fn agent_rules_preamble_names_claude_hooks() {
         let preamble = ClaudeDriver.agent_rules_preamble();
-        assert!(preamble.contains("claude hooks"), "preamble must name 'claude hooks': {preamble}");
-        assert!(preamble.contains("Boss-managed"), "preamble must describe Boss session: {preamble}");
+        assert!(
+            preamble.contains("claude hooks"),
+            "preamble must name 'claude hooks': {preamble}"
+        );
+        assert!(
+            preamble.contains("Boss-managed"),
+            "preamble must describe Boss session: {preamble}"
+        );
     }
 
     #[tokio::test]
@@ -903,16 +901,23 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
         let original_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", fake_home.path()); }
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
 
         let driver = ClaudeDriver;
-        driver.provision_workspace(workspace.path(), "hello prompt", "run-1")
+        driver
+            .provision_workspace(workspace.path(), "hello prompt", "run-1")
             .await
             .unwrap();
 
         // Prompt file at the descriptor-derived path.
         let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
-        assert!(prompt_path.exists(), "prompt file must exist at {}", prompt_path.display());
+        assert!(
+            prompt_path.exists(),
+            "prompt file must exist at {}",
+            prompt_path.display()
+        );
         assert_eq!(std::fs::read_to_string(&prompt_path).unwrap(), "hello prompt");
 
         // Gitignore must exist and catch all files.
@@ -923,9 +928,7 @@ mod tests {
         // Pre-trust must have seeded ~/.claude.json.
         let claude_json = fake_home.path().join(".claude.json");
         assert!(claude_json.exists(), "~/.claude.json must have been written");
-        let val: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&claude_json).unwrap()
-        ).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         let key = workspace.path().display().to_string();
         assert_eq!(val["projects"][&key]["hasTrustDialogAccepted"], true);
 
@@ -941,8 +944,7 @@ mod tests {
         let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false);
         let expected_cat = format!(
             "\"$(cat {}/{})\"\n",
-            CLAUDE_DESCRIPTOR.config_dir,
-            CLAUDE_DESCRIPTOR.initial_prompt_filename,
+            CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         );
         assert!(
             cmd.contains(&expected_cat),

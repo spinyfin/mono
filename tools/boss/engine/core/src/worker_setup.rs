@@ -1400,7 +1400,10 @@ pub fn write_workspace_files(
     let gitignore_path = config_dir.join(".gitignore");
 
     let preamble = driver.agent_rules_preamble();
-    std::fs::write(&agent_rules_path, render_claude_md(input, preamble, descriptor.config_dir))?;
+    std::fs::write(
+        &agent_rules_path,
+        render_claude_md(input, preamble, descriptor.config_dir),
+    )?;
     std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)?;
 
     let settings_path = worker_settings_path(&input.workspace_path);
