@@ -9,11 +9,14 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
-use super::component_bindings::Check as WitCheck;
-use super::component_bindings::checkleft::check::types as wit_types;
+use super::component_bindings::v1::Check as WitCheck;
+use super::component_bindings::v1::checkleft::check::types as wit_types;
+use super::component_bindings::v2::CheckWithExclusionAudit as WitCheckV2;
+use super::component_bindings::v2::checkleft::check::types as wit_types_v2;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
@@ -197,6 +200,12 @@ impl Drop for EpochTicker {
     }
 }
 
+/// A dependency file's path and contents for stale-exclusion evaluation.
+pub struct ExclusionFileContent {
+    pub path: String,
+    pub content: String,
+}
+
 pub trait ExternalCheckExecutor: Send + Sync {
     fn execute(
         &self,
@@ -205,6 +214,38 @@ pub trait ExternalCheckExecutor: Send + Sync {
         source_tree: &dyn SourceTree,
         config: &toml::Value,
     ) -> Result<CheckResult>;
+
+    /// List the declared exclusions for `check_name` given its serialized config.
+    ///
+    /// `config_json` is the JSON-encoded per-check config.
+    /// `config_dir` is the CHECKS file directory relative to the repo root.
+    ///
+    /// Default implementation returns an empty vec (fail-safe: no exclusions).
+    fn list_exclusions(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _config_json: &str,
+        _config_dir: &str,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        Ok(Vec::new())
+    }
+
+    /// Evaluate whether a single exclusion is still load-bearing.
+    ///
+    /// `entry` is the exclusion key exactly as written in the CHECKS file.
+    /// `files` provides the contents of the dependency files.
+    ///
+    /// Default implementation returns `Unknown` (fail-safe).
+    fn evaluate_exclusion(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _entry: &str,
+        _files: &[ExclusionFileContent],
+    ) -> Result<ExclusionStatus> {
+        Ok(ExclusionStatus::Unknown)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -370,6 +411,112 @@ impl DefaultExternalCheckExecutor {
         }
         Ok(self.root.join(path))
     }
+
+    /// Load component bytes and sha256-verify them, returning the raw bytes.
+    fn load_component_bytes(&self, package: &ExternalCheckPackage, component: &ExternalCheckComponentPackage) -> Result<Vec<u8>> {
+        let bytes = if let Some(b) = component.artifact_bytes {
+            b.to_vec()
+        } else {
+            let path = self.resolve_artifact_path(&component.artifact_path)?;
+            fs::read(&path).with_context(|| format!("failed to read wasm artifact {}", path.display()))?
+        };
+        let actual = sha256_hex(&bytes);
+        if actual != component.artifact_sha256 {
+            bail!(
+                "artifact sha256 mismatch for component package `{}`: expected `{}`, got `{}`",
+                package.id, component.artifact_sha256, actual
+            );
+        }
+        Ok(bytes)
+    }
+
+    /// Try to instantiate the component with v2 bindings and call `list-exclusions`.
+    /// Returns an empty vec if the component doesn't implement the v2 world (fail-safe).
+    fn list_component_exclusions(
+        &self,
+        package: &ExternalCheckPackage,
+        component: &ExternalCheckComponentPackage,
+        check_name: &str,
+        config_json: &str,
+        config_dir: &str,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        if !self.ticker.is_alive() {
+            return Ok(Vec::new());
+        }
+        let bytes = self.load_component_bytes(package, component)?;
+        let wasm = self.load_or_compile_component(&package.id, &bytes, &component.artifact_sha256)?;
+        let linker = build_component_v1_linker(&self.engine)?;
+
+        let mut store = Store::new(&self.engine, HostState::with_empty_wasi());
+        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+
+        let instance = match wasmtime(linker.instantiate(&mut store, &wasm)) {
+            Ok(i) => i,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let bindings = match wasmtime(WitCheckV2::new(&mut store, &instance)) {
+            Ok(b) => b,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let raw = wasmtime(bindings.call_list_exclusions(&mut store, check_name, config_json, config_dir))
+            .with_context(|| format!("`list-exclusions` failed for component `{}`", package.id))?;
+
+        Ok(raw
+            .into_iter()
+            .map(|e| DeclaredExclusion {
+                entry: e.entry,
+                depends_on: e.depends_on.into_iter().map(PathBuf::from).collect(),
+            })
+            .collect())
+    }
+
+    /// Try to instantiate the component with v2 bindings and call `evaluate-exclusion`.
+    /// Returns `Unknown` if the component doesn't implement the v2 world (fail-safe).
+    fn evaluate_component_exclusion(
+        &self,
+        package: &ExternalCheckPackage,
+        component: &ExternalCheckComponentPackage,
+        check_name: &str,
+        entry: &str,
+        files: &[ExclusionFileContent],
+    ) -> Result<ExclusionStatus> {
+        if !self.ticker.is_alive() {
+            return Ok(ExclusionStatus::Unknown);
+        }
+        let bytes = self.load_component_bytes(package, component)?;
+        let wasm = self.load_or_compile_component(&package.id, &bytes, &component.artifact_sha256)?;
+        let linker = build_component_v1_linker(&self.engine)?;
+
+        let mut store = Store::new(&self.engine, HostState::with_empty_wasi());
+        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+
+        let instance = match wasmtime(linker.instantiate(&mut store, &wasm)) {
+            Ok(i) => i,
+            Err(_) => return Ok(ExclusionStatus::Unknown),
+        };
+        let bindings = match wasmtime(WitCheckV2::new(&mut store, &instance)) {
+            Ok(b) => b,
+            Err(_) => return Ok(ExclusionStatus::Unknown),
+        };
+
+        let wit_files: Vec<wit_types_v2::ExclusionFileContent> = files
+            .iter()
+            .map(|f| wit_types_v2::ExclusionFileContent {
+                path: f.path.clone(),
+                content: f.content.clone(),
+            })
+            .collect();
+
+        let status = wasmtime(bindings.call_evaluate_exclusion(&mut store, check_name, entry, &wit_files))
+            .with_context(|| format!("`evaluate-exclusion` failed for component `{}`", package.id))?;
+
+        Ok(match status {
+            wit_types_v2::ExclusionStatus::LoadBearing => ExclusionStatus::LoadBearing,
+            wit_types_v2::ExclusionStatus::Stale(reason) => ExclusionStatus::Stale { reason },
+            wit_types_v2::ExclusionStatus::Unknown => ExclusionStatus::Unknown,
+        })
+    }
 }
 
 impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
@@ -397,6 +544,32 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 run_declarative_check(&self.root, &package.id, declarative, changeset, config)
             }
         }
+    }
+
+    fn list_exclusions(
+        &self,
+        package: &ExternalCheckPackage,
+        check_name: &str,
+        config_json: &str,
+        config_dir: &str,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
+            return Ok(Vec::new());
+        };
+        self.list_component_exclusions(package, component, check_name, config_json, config_dir)
+    }
+
+    fn evaluate_exclusion(
+        &self,
+        package: &ExternalCheckPackage,
+        check_name: &str,
+        entry: &str,
+        files: &[ExclusionFileContent],
+    ) -> Result<ExclusionStatus> {
+        let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
+            return Ok(ExclusionStatus::Unknown);
+        };
+        self.evaluate_component_exclusion(package, component, check_name, entry, files)
     }
 }
 

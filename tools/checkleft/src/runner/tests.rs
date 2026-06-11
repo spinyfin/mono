@@ -767,3 +767,162 @@ fn scope_filter_is_noop_when_all_files_are_in_changeset() {
     super::scope_findings_to_changeset(&mut result, &all);
     assert_eq!(result.findings.len(), 2);
 }
+
+// ── stale-exclusion auditing via wasm component path ───────────────────────────
+
+/// Create a temp repo tree with a `tools/boss/CHECKS.toml` that configures
+/// `rust/giant-structs` with an `exclude_structs` entry for `ServerState`,
+/// and writes `app_source` to the referenced source file.
+fn boss_repo_with_app(settings: &str, app_source: &str) -> tempfile::TempDir {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("tools/boss/engine/src")).expect("create dirs");
+    fs::write(
+        temp.path().join("tools/boss/CHECKS.toml"),
+        format!(
+            r#"{settings}
+[[checks]]
+id = "rust/giant-structs"
+
+[checks.config]
+exclude_structs = ["engine/src/app.rs::ServerState"]
+"#
+        ),
+    )
+    .expect("write config");
+    fs::write(temp.path().join("tools/boss/engine/src/app.rs"), app_source).expect("write app");
+    temp
+}
+
+const SERVER_STATE_WITH_BUILDER: &str = r#"
+#[derive(bon::Builder)]
+pub struct ServerState {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+
+const SERVER_STATE_WITHOUT_BUILDER: &str = r#"
+pub struct ServerState {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+
+async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
+    use crate::external::{BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor};
+
+    let mut registry = crate::check::CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register built-ins");
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let runner = Runner::with_external(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(BundledExternalCheckPackageProvider),
+        Arc::new(executor),
+    );
+    runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("tools/boss/engine/src/app.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks")
+}
+
+#[tokio::test]
+async fn stale_exclusion_surfaced_on_checks_toml_when_struct_gains_builder() {
+    let temp = boss_repo_with_app("", SERVER_STATE_WITH_BUILDER);
+    let results = run_builder_audit(&temp).await;
+    // run_changeset produces two CheckResults with check_id == "rust/giant-structs":
+    // one from the normal pass (empty findings — the struct now has the builder) and
+    // one from the stale-exclusion audit.  Collect findings across both.
+    let stale_findings: Vec<_> = results
+        .iter()
+        .filter(|r| r.check_id == "rust/giant-structs")
+        .flat_map(|r| r.findings.iter())
+        .filter(|f| f.message.contains("no longer needed"))
+        .collect();
+    assert_eq!(
+        stale_findings.len(),
+        1,
+        "expected exactly one stale-exclusion finding; got: {:?}",
+        stale_findings
+    );
+    let finding = &stale_findings[0];
+    assert_eq!(finding.severity, Severity::Warning, "default mode is warn");
+    assert!(
+        finding.message.contains("engine/src/app.rs::ServerState"),
+        "finding message must name the exclusion entry; got: {}",
+        finding.message
+    );
+    assert_eq!(
+        finding.location.as_ref().map(|l| l.path.file_name().and_then(|n| n.to_str())),
+        Some(Some("CHECKS.toml")),
+        "finding must point at CHECKS.toml"
+    );
+}
+
+#[tokio::test]
+async fn load_bearing_exclusion_is_not_flagged() {
+    let temp = boss_repo_with_app("", SERVER_STATE_WITHOUT_BUILDER);
+    let results = run_builder_audit(&temp).await;
+    let no_stale = results.iter().find(|r| r.check_id == "rust/giant-structs");
+    if let Some(result) = no_stale {
+        let stale_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("no longer needed"))
+            .collect();
+        assert!(
+            stale_findings.is_empty(),
+            "load-bearing exclusion must not be flagged; got: {:?}",
+            stale_findings
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_exclusion_severity_setting_upgrades_to_error() {
+    let temp = boss_repo_with_app(
+        r#"[settings]
+stale_exclusion_severity = "error"
+"#,
+        SERVER_STATE_WITH_BUILDER,
+    );
+    let results = run_builder_audit(&temp).await;
+    // Collect stale-exclusion findings across all results for this check_id.
+    let stale_findings: Vec<_> = results
+        .iter()
+        .filter(|r| r.check_id == "rust/giant-structs")
+        .flat_map(|r| r.findings.iter())
+        .filter(|f| f.message.contains("no longer needed"))
+        .collect();
+    assert_eq!(stale_findings.len(), 1);
+    assert_eq!(
+        stale_findings[0].severity,
+        Severity::Error,
+        "stale_exclusion_severity=error must produce Error findings"
+    );
+}
+
+#[tokio::test]
+async fn stale_exclusion_severity_off_disables_audit() {
+    let temp = boss_repo_with_app(
+        r#"[settings]
+stale_exclusion_severity = "off"
+"#,
+        SERVER_STATE_WITH_BUILDER,
+    );
+    let results = run_builder_audit(&temp).await;
+    let stale_findings: Vec<_> = results
+        .iter()
+        .filter(|r| r.check_id == "rust/giant-structs")
+        .flat_map(|r| r.findings.iter())
+        .filter(|f| f.message.contains("no longer needed"))
+        .collect();
+    assert!(
+        stale_findings.is_empty(),
+        "stale_exclusion_severity=off must suppress all stale-exclusion findings; got: {:?}",
+        stale_findings
+    );
+}

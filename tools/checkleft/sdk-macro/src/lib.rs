@@ -235,12 +235,64 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
 
 struct ExportChecksInput {
     fns: Punctuated<Ident, Token![,]>,
+    exclusion_list_fn: Option<Ident>,
+    exclusion_eval_fn: Option<Ident>,
 }
 
 impl Parse for ExportChecksInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        // Parse a comma-separated list of check function names, optionally followed by:
+        //   , exclusion_audit: list_fn, eval_fn
+        let mut fns = Punctuated::new();
+        let mut exclusion_list_fn = None;
+        let mut exclusion_eval_fn = None;
+
+        while !input.is_empty() {
+            // Peek for `exclusion_audit:` keyword
+            if input.peek(Ident) {
+                let fork = input.fork();
+                let ident: Ident = fork.parse()?;
+                if ident == "exclusion_audit" && fork.peek(Token![:]) {
+                    // Consume the fork's progress in the real stream
+                    input.parse::<Ident>()?;
+                    input.parse::<Token![:]>()?;
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                    exclusion_list_fn = Some(input.parse::<Ident>()?);
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                    exclusion_eval_fn = Some(input.parse::<Ident>()?);
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                    break;
+                }
+            }
+            fns.push_value(input.parse()?);
+            if input.peek(Token![,]) {
+                // Peek ahead to check if next token is `exclusion_audit`
+                let comma_fork = input.fork();
+                comma_fork.parse::<Token![,]>()?;
+                if comma_fork.peek(Ident) {
+                    let ident_fork = comma_fork.fork();
+                    let ident: Ident = ident_fork.parse()?;
+                    if ident == "exclusion_audit" {
+                        input.parse::<Token![,]>()?;
+                        continue; // will pick up exclusion_audit on next iteration
+                    }
+                }
+                fns.push_punct(input.parse()?);
+            } else {
+                break;
+            }
+        }
+
         Ok(ExportChecksInput {
-            fns: Punctuated::parse_terminated(input)?,
+            fns,
+            exclusion_list_fn,
+            exclusion_eval_fn,
         })
     }
 }
@@ -254,8 +306,15 @@ impl Parse for ExportChecksInput {
 /// export_checks!(my_check, another_check);
 /// ```
 ///
-/// The macro generates `list-checks` and `run-check` wasm component exports
-/// so the guest crate compiles as a valid checkleft check component.
+/// To also participate in stale-exclusion auditing, provide hook functions:
+///
+/// ```rust,ignore
+/// export_checks!(my_check, exclusion_audit: list_exclusions_fn, evaluate_exclusion_fn);
+/// ```
+///
+/// The macro generates `list-checks`, `run-check`, `list-exclusions`, and
+/// `evaluate-exclusion` wasm component exports so the guest crate compiles as a
+/// valid `check-with-exclusion-audit` component.
 ///
 /// # Requirements
 ///
@@ -303,6 +362,41 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
+    // list_exclusions and evaluate_exclusion bodies depend on whether hooks were provided.
+    let list_exclusions_body = if let Some(list_fn) = &input.exclusion_list_fn {
+        quote! {
+            use ::checkleft_check_sdk::__private::ExclusionAuditEntry as _;
+            super::#list_fn(check_name, config_json, config_dir)
+                .into_iter()
+                .map(|e| W::DeclaredExclusion {
+                    entry: e.entry,
+                    depends_on: e.depends_on,
+                })
+                .collect()
+        }
+    } else {
+        quote! { ::std::vec![] }
+    };
+
+    let evaluate_exclusion_body = if let Some(eval_fn) = &input.exclusion_eval_fn {
+        quote! {
+            let sdk_files: ::std::vec::Vec<::checkleft_check_sdk::ExclusionFileContent> = files
+                .into_iter()
+                .map(|f| ::checkleft_check_sdk::ExclusionFileContent {
+                    path: f.path,
+                    content: f.content,
+                })
+                .collect();
+            match super::#eval_fn(check_name, entry, &sdk_files) {
+                ::checkleft_check_sdk::ExclusionStatus::LoadBearing => W::ExclusionStatus::LoadBearing,
+                ::checkleft_check_sdk::ExclusionStatus::Stale(reason) => W::ExclusionStatus::Stale(reason),
+                ::checkleft_check_sdk::ExclusionStatus::Unknown => W::ExclusionStatus::Unknown,
+            }
+        }
+    } else {
+        quote! { W::ExclusionStatus::Unknown }
+    };
+
     Ok(quote! {
         // The module is private; the wasm exports it generates are still
         // globally visible because they use #[no_mangle] / component ABI.
@@ -312,13 +406,15 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
             // Using `inline:` with the full WIT package declaration causes
             // wit-bindgen to nest types under `checkleft::check::types`
             // (matching the `checkleft:check@0.1.0` package namespace).
+            // We use `world: "check-with-exclusion-audit"` so the component
+            // always exports the v2 interface; the default list-exclusions /
+            // evaluate-exclusion return empty/unknown when no hooks are provided.
             ::wit_bindgen::generate!({
-                world: "check",
+                world: "check-with-exclusion-audit",
                 inline: #wit,
             });
 
             // Alias the generated types submodule for brevity.
-            // Path is relative to this module: checkleft::check::types
             use checkleft::check::types as W;
 
             // Bring the CheckEntry trait into scope so we can call .name(),
@@ -346,6 +442,27 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         #( #dispatch_arms )*
                         _ => ::core::result::Result::Err(W::CheckError::UnknownCheck(name)),
                     }
+                }
+
+                fn list_exclusions(
+                    check_name: ::std::string::String,
+                    config_json: ::std::string::String,
+                    config_dir: ::std::string::String,
+                ) -> ::std::vec::Vec<W::DeclaredExclusion> {
+                    let check_name = check_name.as_str();
+                    let config_json = config_json.as_str();
+                    let config_dir = config_dir.as_str();
+                    #list_exclusions_body
+                }
+
+                fn evaluate_exclusion(
+                    check_name: ::std::string::String,
+                    entry: ::std::string::String,
+                    files: ::std::vec::Vec<W::ExclusionFileContent>,
+                ) -> W::ExclusionStatus {
+                    let check_name = check_name.as_str();
+                    let entry = entry.as_str();
+                    #evaluate_exclusion_body
                 }
             }
 

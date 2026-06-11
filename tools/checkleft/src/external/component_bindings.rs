@@ -1,25 +1,31 @@
 // Host-side bindings generated from the `checkleft:check@0.1.0` WIT package.
 //
-// `wasmtime::component::bindgen!` reads `wit/check.wit` at compile time and
-// emits Rust types for every WIT record, enum, and variant, plus a trait
-// (`CheckPre` / `Check`) that the host uses to call `list-checks` and
-// `run-check` on a loaded component.
-//
-// In production code (T3 onward) these bindings are used by the component
-// executor. For T1 their presence here acts as a compile-time proof that the
-// WIT is syntactically valid and generates coherent Rust types.
-wasmtime::component::bindgen!({
-    world: "check",
-    path: "wit/check.wit",
-});
+// `v1` covers `world check` (the original two-export interface). `v2` covers
+// `world check-with-exclusion-audit` which adds `list-exclusions` and
+// `evaluate-exclusion`. The host uses `v1` for normal check execution (backward
+// compatible with all components) and attempts `v2` only for the stale-exclusion
+// audit path. Components that only implement `world check` fail the `v2`
+// instantiation; the host catches that and skips the audit (fail-safe).
+pub mod v1 {
+    wasmtime::component::bindgen!({
+        world: "check",
+        path: "wit/check.wit",
+    });
+}
+
+pub mod v2 {
+    wasmtime::component::bindgen!({
+        world: "check-with-exclusion-audit",
+        path: "wit/check.wit",
+    });
+}
 
 #[cfg(test)]
 mod tests {
-    use super::checkleft::check::types;
+    use super::v1::checkleft::check::types;
 
-    // Verify that the generated types are usable: construct a minimal
-    // `CheckDescriptor` and round-trip a `CheckError`. This exercises the
-    // lifted WIT types without requiring a real wasm component.
+    // Verify that the v1 generated types are usable: construct a minimal
+    // `CheckDescriptor` and round-trip a `CheckError`.
 
     #[test]
     fn check_descriptor_can_be_constructed() {
@@ -70,5 +76,25 @@ mod tests {
         };
         assert_eq!(finding.severity, types::Severity::Error);
         assert_eq!(finding.location.as_ref().unwrap().line, Some(42));
+    }
+
+    #[test]
+    fn v2_declared_exclusion_type_is_generated() {
+        use super::v2::checkleft::check::types as v2_types;
+        let excl = v2_types::DeclaredExclusion {
+            entry: "engine/src/app.rs::ServerState".to_owned(),
+            depends_on: vec!["engine/src/app.rs".to_owned()],
+        };
+        assert_eq!(excl.entry, "engine/src/app.rs::ServerState");
+        assert_eq!(excl.depends_on.len(), 1);
+    }
+
+    #[test]
+    fn v2_exclusion_status_variants_are_generated() {
+        use super::v2::checkleft::check::types as v2_types;
+        let lb = v2_types::ExclusionStatus::LoadBearing;
+        let stale = v2_types::ExclusionStatus::Stale("no longer needed".to_owned());
+        let unknown = v2_types::ExclusionStatus::Unknown;
+        let _ = (lb, stale, unknown);
     }
 }

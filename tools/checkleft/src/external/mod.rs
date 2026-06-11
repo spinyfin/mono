@@ -171,7 +171,10 @@ pub use provider::{
 };
 mod component_bindings;
 mod runtime;
-pub use runtime::{ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
+pub use runtime::{
+    ComponentAotCache, DefaultExternalCheckExecutor, ExclusionFileContent, ExternalCheckExecutor,
+    NoopExternalCheckExecutor,
+};
 pub mod sandbox;
 pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
 

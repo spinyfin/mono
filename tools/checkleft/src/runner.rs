@@ -9,10 +9,10 @@ use tokio::task::JoinSet;
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
-use crate::exclusion::ExclusionStatus;
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::external::{
-    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
+    ExclusionFileContent, ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -265,10 +265,10 @@ impl Runner {
     ///
     /// Unlike the normal pass, this reports on `CHECKS` files that did *not*
     /// change: an exclusion goes stale because a file it depends on changed. For every
-    /// changed file we resolve the checks that govern it, ask each built-in check for
-    /// its declared exclusions, and re-evaluate only those whose declared dependencies
-    /// intersect the changeset. A `Stale` verdict becomes a finding anchored on the
-    /// exclusion's line in the owning `CHECKS` file.
+    /// changed file we resolve the checks that govern it, ask each check for its declared
+    /// exclusions (via the native registry or the wasm v2 interface), and re-evaluate only
+    /// those whose declared dependencies intersect the changeset. A `Stale` verdict becomes
+    /// a finding anchored on the exclusion's line in the owning `CHECKS` file.
     async fn audit_stale_exclusions(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
         // Every path the diff touches, including deletions and rename sources: a stale
         // exclusion is triggered by a change to a file it depends on, and a deletion is
@@ -300,25 +300,60 @@ impl Runner {
                 let Some(severity) = mode.severity() else {
                     continue; // audit disabled for this check
                 };
-                // Only checks that have a native built-in can participate in
-                // stale-exclusion auditing.  Pure external/component checks that
-                // have no native counterpart are silently skipped here; bundled
-                // component checks that also have a native built-in (transition
-                // period) use the built-in's evaluate_exclusion.
-                let Some(built_in) = self.registry.get(&check.check) else {
-                    continue;
-                };
-                let Ok(configured) = built_in.configure_scoped(&check.config, check.source_path.parent()) else {
-                    // Misconfiguration is surfaced by the normal pass; stay quiet here.
-                    continue;
-                };
-                let declared = configured.declared_exclusions();
-                if declared.is_empty() {
-                    continue;
-                }
 
-                for exclusion in declared {
-                    // Empty dependency set => dependency unknown => never audit (fail safe).
+                // Get the declared exclusions for this check. Native built-ins take
+                // precedence; external component checks fall through to the wasm v2 path.
+                let declared: Vec<DeclaredExclusion> =
+                    if let Some(built_in) = self.registry.get(&check.check) {
+                        let Ok(configured) = built_in.configure_scoped(&check.config, check.source_path.parent()) else {
+                            // Misconfiguration is surfaced by the normal pass; stay quiet here.
+                            continue;
+                        };
+                        let exclusions = configured.declared_exclusions();
+                        if exclusions.is_empty() {
+                            continue;
+                        }
+                        // Evaluate using the native built-in path.
+                        self.audit_native_exclusions(
+                            check,
+                            exclusions,
+                            severity,
+                            &changed_paths,
+                            &mut audited,
+                            &mut config_text_cache,
+                            &mut findings_by_check,
+                            configured.as_ref(),
+                        )
+                        .await;
+                        continue;
+                    } else if let Some(implementation) = &check.implementation {
+                        // External/component check: resolve the package and call list-exclusions.
+                        let Ok(Some(package)) = self.external_package_provider.resolve(implementation) else {
+                            continue;
+                        };
+                        let config_json = match serde_json::to_string(&check.config) {
+                            Ok(j) => j,
+                            Err(_) => continue,
+                        };
+                        let config_dir = check.config_dir.to_string_lossy().into_owned();
+                        match self.external_executor.list_exclusions(&package, &check.check, &config_json, &config_dir) {
+                            Ok(exclusions) if !exclusions.is_empty() => exclusions,
+                            _ => continue,
+                        }
+                    } else {
+                        continue;
+                    };
+
+                // External (wasm) evaluation path.
+                let implementation = match &check.implementation {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let Ok(Some(package)) = self.external_package_provider.resolve(implementation) else {
+                    continue;
+                };
+
+                for exclusion in &declared {
                     if exclusion.depends_on.is_empty() {
                         continue;
                     }
@@ -334,13 +369,15 @@ impl Runner {
                         continue;
                     }
 
-                    let status = match configured
-                        .evaluate_exclusion(&exclusion, self.source_tree.as_ref())
-                        .await
-                    {
+                    let files = self.read_exclusion_files(&exclusion.depends_on);
+                    let status = match self.external_executor.evaluate_exclusion(
+                        &package,
+                        &check.check,
+                        &exclusion.entry,
+                        &files,
+                    ) {
                         Ok(status) => status,
                         Err(err) => {
-                            // Fail safe: an evaluation error is never reported as stale.
                             info!(
                                 check_id = %check.id,
                                 entry = %exclusion.entry,
@@ -381,6 +418,89 @@ impl Runner {
             .into_iter()
             .map(|(check_id, findings)| CheckResult { check_id, findings })
             .collect())
+    }
+
+    /// Audit exclusions for a native built-in check. Identical to the old single-path loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn audit_native_exclusions(
+        &self,
+        check: &crate::config::CheckConfig,
+        declared: Vec<DeclaredExclusion>,
+        severity: crate::output::Severity,
+        changed_paths: &HashSet<PathBuf>,
+        audited: &mut HashSet<(String, PathBuf, String)>,
+        config_text_cache: &mut HashMap<PathBuf, Option<String>>,
+        findings_by_check: &mut BTreeMap<String, Vec<Finding>>,
+        configured: &dyn crate::check::ConfiguredCheck,
+    ) {
+        for exclusion in declared {
+            if exclusion.depends_on.is_empty() {
+                continue;
+            }
+            if !exclusion
+                .depends_on
+                .iter()
+                .any(|dependency| changed_paths.contains(dependency))
+            {
+                continue;
+            }
+            let dedupe_key = (check.id.clone(), check.source_path.clone(), exclusion.entry.clone());
+            if !audited.insert(dedupe_key) {
+                continue;
+            }
+
+            let status = match configured.evaluate_exclusion(&exclusion, self.source_tree.as_ref()).await {
+                Ok(status) => status,
+                Err(err) => {
+                    info!(
+                        check_id = %check.id,
+                        entry = %exclusion.entry,
+                        error = %err,
+                        "stale-exclusion audit failed; skipping entry"
+                    );
+                    continue;
+                }
+            };
+            let ExclusionStatus::Stale { reason } = status else {
+                continue;
+            };
+
+            let line = self.locate_exclusion_line(&check.source_path, &exclusion.entry, config_text_cache);
+            findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                severity,
+                message: format!(
+                    "exclusion `{}` is no longer needed: {reason}; remove this entry.",
+                    exclusion.entry
+                ),
+                location: Some(Location {
+                    path: check.source_path.clone(),
+                    line,
+                    column: None,
+                }),
+                remediations: vec![format!(
+                    "Remove `{}` from this check's exclusions in {}.",
+                    exclusion.entry,
+                    check.source_path.display()
+                )],
+                suggested_fix: None,
+            });
+        }
+    }
+
+    /// Read the contents of dependency files for exclusion evaluation.
+    /// Files that cannot be read or contain non-UTF-8 bytes are silently skipped.
+    fn read_exclusion_files(&self, depends_on: &[PathBuf]) -> Vec<ExclusionFileContent> {
+        depends_on
+            .iter()
+            .filter_map(|dep_path| {
+                let bytes = self.source_tree.read_file(dep_path).ok()?;
+                let content = String::from_utf8(bytes).ok()?;
+                Some(ExclusionFileContent {
+                    path: dep_path.to_string_lossy().into_owned(),
+                    content,
+                })
+            })
+            .collect()
     }
 
     /// Find the 1-based line of `entry` in the `CHECKS` file at `source_path`, reading

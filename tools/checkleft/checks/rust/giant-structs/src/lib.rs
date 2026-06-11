@@ -23,7 +23,9 @@
 //! }
 //! ```
 
-use checkleft_check_sdk::{ChangeKind, CheckInput, Finding, check, export_checks};
+use checkleft_check_sdk::{
+    ChangeKind, CheckInput, DeclaredExclusion, ExclusionFileContent, ExclusionStatus, Finding, check, export_checks,
+};
 use serde::Deserialize;
 
 const DEFAULT_MAX_FIELDS: usize = 5;
@@ -94,7 +96,119 @@ fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
     findings
 }
 
-export_checks!(giant_structs_check);
+export_checks!(giant_structs_check, exclusion_audit: list_giant_struct_exclusions, evaluate_giant_struct_exclusion);
+
+// ── Stale-exclusion audit hooks ───────────────────────────────────────────────
+
+/// List declared exclusions for `rust/giant-structs` given its config.
+///
+/// Each entry in `exclude_structs` like `"engine/src/app.rs::ServerState"`
+/// maps to one DeclaredExclusion whose `depends_on` is the resolved repo-root-
+/// relative file path (config_dir + entry file part).
+pub fn list_giant_struct_exclusions(
+    _check_name: &str,
+    config_json: &str,
+    config_dir: &str,
+) -> Vec<DeclaredExclusion> {
+    let cfg: GiantStructsConfig = match serde_json::from_str(config_json) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let excludes = match cfg.exclude_structs {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    let prefix = if config_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{config_dir}/")
+    };
+
+    excludes
+        .into_iter()
+        .filter_map(|entry| {
+            let file_part = entry.split("::").next()?;
+            let dep_path = format!("{prefix}{file_part}");
+            Some(DeclaredExclusion::new(entry, vec![dep_path]))
+        })
+        .collect()
+}
+
+/// Evaluate whether a single `exclude_structs` entry is still load-bearing.
+///
+/// Reads the file from `files` (provided by the host), re-parses it, and
+/// checks whether the named struct still lacks the required builder derive.
+pub fn evaluate_giant_struct_exclusion(
+    _check_name: &str,
+    entry: &str,
+    files: &[ExclusionFileContent],
+) -> ExclusionStatus {
+    let Some((file_part, struct_name)) = entry.split_once("::") else {
+        return ExclusionStatus::Unknown;
+    };
+
+    // Find the dependency file in the provided contents.
+    let source = files
+        .iter()
+        .find(|f| {
+            // Match on the file_part suffix since the host provides full repo-root-relative paths.
+            f.path.ends_with(file_part)
+        })
+        .map(|f| f.content.as_str())
+        .unwrap_or("");
+
+    if source.is_empty() {
+        return ExclusionStatus::Unknown;
+    }
+
+    let parsed = match syn::parse_file(source) {
+        Ok(f) => f,
+        Err(_) => return ExclusionStatus::Unknown,
+    };
+
+    match find_struct_has_builder(&parsed.items, struct_name, true) {
+        Some(true) => ExclusionStatus::Stale(format!(
+            "`{struct_name}` now derives `bon::Builder` and no longer needs this exclusion"
+        )),
+        Some(false) => ExclusionStatus::LoadBearing,
+        None => ExclusionStatus::Stale(format!(
+            "`{struct_name}` no longer exists in `{file_part}`"
+        )),
+    }
+}
+
+/// Recursively walk `items` searching for the struct named `name`.
+/// Returns `Some(true)` if the struct has the required builder, `Some(false)` if it
+/// exists but lacks it, and `None` if the struct was not found anywhere in the tree.
+fn find_struct_has_builder(items: &[syn::Item], name: &str, use_bon: bool) -> Option<bool> {
+    for item in items {
+        match item {
+            syn::Item::Struct(s) if s.ident == name => {
+                return Some(has_required_builder(&s.attrs, use_bon));
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, sub_items)) = &m.content {
+                    if let Some(result) = find_struct_has_builder(sub_items, name, use_bon) {
+                        return Some(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Deserialize, Default)]
+struct GiantStructsConfig {
+    #[serde(default)]
+    exclude_structs: Option<Vec<String>>,
+    #[serde(default)]
+    max_fields: Option<usize>,
+    #[serde(default)]
+    builder: Option<String>,
+}
 
 // ── AST analysis ──────────────────────────────────────────────────────────────
 

@@ -184,6 +184,40 @@ interface types {
         /// The check ran but encountered a fatal error.
         failed(string),
     }
+
+    /// An exclusion entry a check declares for stale-exclusion auditing.
+    ///
+    /// Returned by `list-exclusions` in `world check-with-exclusion-audit`.
+    /// The host re-evaluates an exclusion only when at least one path in
+    /// `depends-on` appears in the current changeset.
+    record declared-exclusion {
+        /// The exclusion entry exactly as written in the CHECKS file.
+        entry: string,
+        /// Repo-root-relative files this exclusion depends on.
+        /// An empty list means the exclusion is never audited (fail-safe).
+        depends-on: list<string>,
+    }
+
+    /// The verdict for a single exclusion re-evaluated as if it were not configured.
+    ///
+    /// Returned by `evaluate-exclusion` in `world check-with-exclusion-audit`.
+    variant exclusion-status {
+        /// The exclusion is still needed: the target still violates the rule.
+        load-bearing,
+        /// The exclusion is no longer needed; the payload is a short human
+        /// explanation woven into the finding message.
+        stale(string),
+        /// Staleness could not be determined. Fail-safe; never reported as stale.
+        unknown,
+    }
+
+    /// A dependency file's path and contents, passed to `evaluate-exclusion`.
+    record exclusion-file-content {
+        /// Repo-root-relative path of the file.
+        path: string,
+        /// Full UTF-8 contents of the file.
+        content: string,
+    }
 }
 
 /// The world that a checkleft check component must implement.
@@ -204,4 +238,48 @@ world check {
         name: string,
         input: check-input,
     ) -> result<list<finding>, check-error>;
+}
+
+/// Extended world for checks that also participate in stale-exclusion auditing.
+///
+/// Components implementing this world export two additional functions alongside
+/// the standard `list-checks` and `run-check`. The host tries to instantiate a
+/// component with `check-with-exclusion-audit` bindings before falling back to
+/// the `check` world for normal execution, so old components remain compatible.
+world check-with-exclusion-audit {
+    use types.{
+        check-input, finding, check-descriptor, check-error,
+        declared-exclusion, exclusion-status, exclusion-file-content,
+    };
+
+    /// Return a descriptor for every check exported by this component.
+    export list-checks: func() -> list<check-descriptor>;
+
+    /// Run the named check and return its findings, or an error.
+    export run-check: func(
+        name: string,
+        input: check-input,
+    ) -> result<list<finding>, check-error>;
+
+    /// Return the declared exclusions for `check-name` given its CHECKS config.
+    ///
+    /// `config-json` is the JSON-encoded per-check config (same as `check-input.config-json`).
+    /// `config-dir` is the CHECKS.toml directory relative to the repo root (e.g.
+    /// `tools/boss`), used to resolve relative paths in exclusion entries.
+    export list-exclusions: func(
+        check-name: string,
+        config-json: string,
+        config-dir: string,
+    ) -> list<declared-exclusion>;
+
+    /// Evaluate whether a single exclusion is still load-bearing.
+    ///
+    /// `entry` is the exclusion key exactly as written in the CHECKS file.
+    /// `files` provides the dependency file contents resolved by the host.
+    /// Returns `load-bearing`, `stale`, or `unknown` (fail-safe).
+    export evaluate-exclusion: func(
+        check-name: string,
+        entry: string,
+        files: list<exclusion-file-content>,
+    ) -> exclusion-status;
 }
