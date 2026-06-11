@@ -691,7 +691,6 @@ check = "capture"
     assert_eq!(results[0].check_id, "spelling");
 }
 
-
 include!("tests_policy.rs");
 include!("tests_external.rs");
 
