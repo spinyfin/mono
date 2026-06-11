@@ -22,6 +22,9 @@ invocations:
     run: rustfmt
     mode: per_file
     args:
+      # --unstable-features is required to use --emit=json (which is a nightly-only
+      # rustfmt feature), even when running the nightly binary.
+      - "--unstable-features"
       - "--emit=json"
       # --config-path=. pins discovery to the repo root (cwd at invocation
       # time), preventing user-level ~/.config/rustfmt/ from leaking into CI.

@@ -618,6 +618,17 @@ fn rustfmt_config_path_arg_is_present() {
 }
 
 #[test]
+fn rustfmt_unstable_features_arg_is_present() {
+    // --unstable-features is required by rustfmt to enable --emit=json, even on nightly.
+    let package = parse_rustfmt_package();
+    let args = &package.invocations[0].args;
+    assert!(
+        args.iter().any(|a| a == "--unstable-features"),
+        "expected --unstable-features in rustfmt args (required for --emit=json); got: {args:?}"
+    );
+}
+
+#[test]
 fn rustfmt_clean_output_no_findings() {
     let findings = rustfmt_format_findings(RUSTFMT_CLEAN);
     assert!(findings.is_empty(), "clean rustfmt output must produce no findings");
