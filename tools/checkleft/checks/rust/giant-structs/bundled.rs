@@ -1,4 +1,4 @@
-/// Wasm component bytes for the rust-giant-structs-use-builder check, embedded
+/// Wasm component bytes for the rust/giant-structs check, embedded
 /// at compile time.  Lives in its own Bazel library so the generated wasm
 /// artifact (which is in compile_data) does not trigger rules_rust's
 /// "symlink-sources-to-bazel-out" mode inside the main checkleft_lib target.

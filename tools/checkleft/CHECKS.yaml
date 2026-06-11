@@ -6,7 +6,7 @@ checks:
 #
 # The buildifier check is now purely declarative (no built-in Rust code).
 # In this repo (mono), the root CHECKS.yaml points at the on-disk definition
-# via check_definitions.exec_paths so changes to checks/buildifier/check.yaml
+# via check_definitions.exec_paths so changes to checks/format/bazel.yaml
 # take effect immediately without recompiling the binary.
 #
 # In external repos, `- id: buildifier` with no check_definitions section uses

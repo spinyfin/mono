@@ -126,7 +126,7 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
-  - id: buildifier   # resolves to tools/checkleft/checks/buildifier/check.yaml
+  - id: format/bazel   # resolves to tools/checkleft/checks/format/bazel.yaml
 ```
 
 ## Pattern: Multiple instances of one implementation
