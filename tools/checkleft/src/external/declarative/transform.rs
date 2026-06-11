@@ -179,10 +179,13 @@ impl LineListTransform {
         if paths.is_empty() && exit_code != Some(0) {
             // Non-zero exit with no file output is an operational error (e.g. a parse
             // failure), not a "no violations" result.
+            let exit_desc = match exit_code {
+                Some(code) => format!("returned exit code {code}"),
+                None => "terminated without an exit code".to_string(),
+            };
             bail!(
-                "linelist transform: tool exited {:?} with no output; this indicates an \
-                 operational error (e.g. parse failure), not a clean result",
-                exit_code
+                "linelist transform: tool {exit_desc} and no output; this indicates an \
+                 operational error (e.g. parse failure), not a clean result"
             );
         }
         let context = RenderContext { input_file, exit_code };
