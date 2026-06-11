@@ -684,7 +684,8 @@ pub enum BranchNaming {
 /// when the task is `status='blocked'`, so the CLI can surface "now
 /// exhausted" vs "now in-flight". `None` when the parent is not blocked
 /// (e.g. `in_review` / `done`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CiBudgetSnapshot {
     pub work_item_id: String,
     pub effective: i64,
@@ -740,7 +741,8 @@ pub struct CiBudgetSnapshot {
 /// keep two probes on the same failure from creating two rows.
 /// `head_sha_after` brackets the worker's push (`None` on failure
 /// or for re-trigger-only attempts).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CiRemediation {
     pub id: String,
     pub product_id: String,
@@ -920,7 +922,8 @@ pub struct CommentResolution {
 /// `head_sha_before` / `head_sha_after` bracket the worker's push.
 /// `conflict_diagnosis` is structured JSON produced by the
 /// pre-spawn diagnosis collector — null until the engine fills it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ConflictResolution {
     pub id: String,
     pub product_id: String,
@@ -1034,7 +1037,8 @@ pub struct CreateAttentionInput {
     pub confidence_source: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateAttentionItemInput {
     pub body_markdown: String,
     pub kind: String,
@@ -1116,6 +1120,10 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1189,13 +1197,17 @@ pub struct CreateExecutionInput {
 /// are product-level work items optionally scoped to a project) and
 /// uses `kind = 'investigation'` on insert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateInvestigationInput {
     pub product_id: String,
     /// See [`CreateChoreInput::autostart`].
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
 
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
 
     pub name: String,
@@ -1210,6 +1222,10 @@ pub struct CreateInvestigationInput {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -1341,6 +1357,10 @@ pub struct CreateRevisionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     /// Short summary title for the revision card (1–10 words). When the
     /// coordinator supplies this, it is used verbatim as `tasks.name`;
     /// when absent the engine falls back to deriving a name from the first
@@ -1365,7 +1385,8 @@ pub struct CreateRevisionInput {
     pub autostart: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateRunInput {
     pub agent_id: String,
     pub execution_id: String,
@@ -1417,6 +1438,11 @@ pub struct CreateTaskInput {
     /// resolves per design §Q3 precedence. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// Explicit driver override. `None` → resolve via
+    /// `product.default_driver` → `"claude"`. Stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`), which is the right answer for the vast majority
@@ -1571,7 +1597,8 @@ pub enum EffortAuditAnnotation {
 /// per marker in the §Q4 corpus that matched at least one chore in
 /// the product (markers with zero matches are filtered out so the
 /// table stays scannable).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct EffortAuditMarkerRow {
     /// Of those, the count that subsequently raised an
     /// `[effort-escalation]` marker promoting the row to a higher
@@ -1611,7 +1638,8 @@ pub struct EffortAuditMarkerRow {
 /// Output shape for `boss product audit-effort <product>`. One
 /// snapshot of the marker corpus's under-classification rates
 /// against the recorded escalation events for a single product.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct EffortAuditReport {
     pub product_id: String,
     /// Epoch seconds when the audit was generated, for the
@@ -1666,7 +1694,8 @@ pub struct EffortAuditReport {
 /// names the §Q4 rule that fired (`"rule-2"`, `"rule-5"`, etc.) for
 /// the heuristic's own bookkeeping; the audit report does not
 /// depend on it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct EffortEscalation {
     pub id: String,
     pub product_id: String,
@@ -1891,7 +1920,8 @@ impl std::str::FromStr for ProjectStatus {
 /// shared list view but don't justify a column — currently
 /// `attempt_kind` for `ci` rows. The contract is "stringly typed
 /// extras"; consumers index by key and tolerate absence.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct EngineAttemptListEntry {
     pub id: String,
     pub product_id: String,
@@ -2082,6 +2112,13 @@ pub struct Product {
     /// migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+
+    /// Per-product default agent driver. `None` → fall through to the
+    /// engine default (`"claude"`). Stored verbatim — the engine does
+    /// not validate the slug. Precedence: `task.driver` →
+    /// `product.default_driver` → `"claude"` (design §Mix-and-match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_driver: Option<String>,
 
     /// Optional override repo for `kind = 'design'` tasks on this
     /// product. When set, design tasks resolve to this repo (the docs
@@ -2755,6 +2792,12 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Explicit agent driver override. `None` → resolve via
+    /// `product.default_driver` → engine default (`"claude"`).
+    /// Stored verbatim (design §Mix-and-match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     pub ordinal: Option<i64>,
     /// Soft FK to the `tasks.id` whose PR this revision targets. `None`
     /// for every non-`revision` row. Required (app-enforced) when
@@ -2942,7 +2985,8 @@ pub struct TruncationInfo {
     pub total_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkAttentionItem {
     pub id: String,
     pub body_markdown: String,
@@ -3188,7 +3232,8 @@ pub struct WorkItemDependencyView {
 /// mirror the corresponding `tasks.external_ref_*` columns; `web_url` is
 /// the canonical browser URL for the upstream issue (derived by the engine
 /// at read time, not stored). See the external-tracker sync design.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkItemExternalRef {
     /// Stable opaque id used as the reconciler's lookup key.
     /// For GitHub: `"spinyfin/mono#560"`.
@@ -3218,7 +3263,8 @@ pub struct WorkItemExternalRef {
     pub unbound_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkItemPatch {
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
@@ -3237,6 +3283,11 @@ pub struct WorkItemPatch {
     /// project. `None` → leave unchanged. `Some("")` → clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+
+    /// Product-level default driver. Only honoured on product-targeted
+    /// updates. `None` → leave unchanged. `Some("")` → clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_driver: Option<String>,
 
     pub description: Option<String>,
     /// Product-level design-task repo override. Only honoured on
@@ -3275,6 +3326,11 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Driver override. `None` → leave unchanged. `Some("")` → clear.
+    /// Any other string is stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     pub name: Option<String>,
     pub ordinal: Option<i64>,
     pub pr_url: Option<String>,
@@ -3290,7 +3346,8 @@ pub struct WorkItemPatch {
     pub worker_branch_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkRun {
     pub id: String,
     pub agent_id: String,
@@ -3305,7 +3362,8 @@ pub struct WorkRun {
     pub transcript_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkTree {
     pub chores: Vec<Task>,
     /// Every `work_item_dependencies` edge whose dependent belongs to

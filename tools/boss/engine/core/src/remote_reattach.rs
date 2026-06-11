@@ -287,18 +287,10 @@ mod tests {
             })
             .unwrap()
             .id;
-        db.create_chore(CreateChoreInput {
-            product_id: product,
-            name: "c".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            priority: None,
-            effort_level: None,
-            model_override: None,
-            created_via: None,
-            autostart: true,
-            force_duplicate: false,
-        })
+        db.create_chore(CreateChoreInput::builder()
+            .product_id(product)
+            .name("c")
+            .build())
         .unwrap()
         .id
     }
