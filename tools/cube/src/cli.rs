@@ -219,10 +219,25 @@ pub enum WorkspaceCommand {
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
     /// and boss branches from the GitHub remote, resolves this workspace's
-    /// current `boss/exec_*` branch automatically from the working copy state
-    /// (no branch name argument required), rebases it onto the configured
-    /// integration branch using `--ignore-immutable` to handle jj's
-    /// immutable-heads constraint, and reports the result clearly.
+    /// `boss/exec_*` branch, rebases it onto the configured integration branch
+    /// using `--ignore-immutable` to handle jj's immutable-heads constraint,
+    /// and — on a clean rebase — advances and pushes the boss bookmark so the
+    /// PR is updated in one verb (nothing left manual).
+    ///
+    /// Branch resolution is deterministic, not ancestry-of-`@` guesswork:
+    ///   1. `--bookmark boss/exec_X` (explicit) or `--pr N` (resolve the PR's
+    ///      head branch from GitHub) when given;
+    ///   2. otherwise the `BOSS_STRUCTURED_OUTPUT` env var (workers carry their
+    ///      own exec id there) is parsed for the exec id;
+    ///   3. otherwise the `boss/exec_*` bookmark nearest `@` (fast path);
+    ///   4. otherwise ALL `boss/exec_*` bookmarks reachable in the repo (local
+    ///      or `@<remote>`) — a unique match wins; multiple match → an error
+    ///      that lists them and the exact `--bookmark` command to disambiguate.
+    ///
+    /// Self-heals a mispositioned `@`: when `@` is parented on main (the common
+    /// engine pre-positioning gap) rather than on the boss branch, the command
+    /// repositions the workspace onto the boss head before rebasing — the
+    /// resolution then materialises in `@` for the agent.
     ///
     /// The target branch is read from the repo pool configuration
     /// (`main_branch` field) — not hardcoded. Repos that use `master`,
@@ -230,11 +245,28 @@ pub enum WorkspaceCommand {
     ///
     /// Leaves any resulting conflicts materialized in the working copy for the
     /// agent to resolve. Exit signal:
-    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts.
-    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them.
+    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts (and the boss
+    ///     bookmark was advanced + pushed unless `--no-push`).
+    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them,
+    ///     then push with `jj git push -b <bookmark>`.
     ///
     /// Run from inside the leased cube workspace directory.
-    Rebase,
+    Rebase {
+        /// Explicitly name the `boss/exec_*` bookmark to rebase (e.g.
+        /// `boss/exec_18b7d99385981508_2af`). Overrides auto-discovery. A
+        /// trailing `@<remote>` suffix is accepted and stripped. Mutually
+        /// exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Rebase the branch backing PR N. Resolves N's head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+        /// Rebase only; do not advance/push the boss bookmark afterward. Use
+        /// when you intend to push manually.
+        #[arg(long)]
+        no_push: bool,
+    },
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
