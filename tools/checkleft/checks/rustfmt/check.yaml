@@ -1,0 +1,48 @@
+id: rustfmt
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.rs"
+
+# Binary resolution:
+#   - In a Bazel workspace (mono CI): the hermetic nightly rustfmt from
+#     rules_rust is used automatically. It supports --emit=json.
+#   - In non-Bazel repos or local dev: override with `needs.rustfmt.path`
+#     in CHECKS.yaml (e.g. `path: "rustfmt"` to use the one on PATH).
+#   - Missing rustfmt: the framework converts the spawn failure to a check
+#     error finding — the process does not crash.
+needs:
+  rustfmt:
+    default:
+      bazel: "@rules_rust//tools/upstream_wrapper:rustfmt"
+
+invocations:
+  - id: format
+    run: rustfmt
+    mode: per_file
+    args:
+      - "--emit=json"
+      # --config-path=. pins discovery to the repo root (cwd at invocation
+      # time), preventing user-level ~/.config/rustfmt/ from leaking into CI.
+      # The repo must have a rustfmt.toml at its root (with `edition` set);
+      # see the repo-root rustfmt.toml added alongside this check.
+      - "--config-path=."
+      - "{{file}}"
+    # With --emit=json, rustfmt exits 0 whether the file is clean or
+    # misformatted; non-zero exit means a parse/operational error.
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: json
+      # rustfmt --emit=json outputs: [{name, mismatches:[{original_begin_line,...}]}]
+      # Flatten so each mismatch becomes one row with the file name attached.
+      select: ".[] | .name as $name | .mismatches[] | {name: $name, line: .original_begin_line}"
+      finding:
+        path: "{{item.name}}"
+        line: "{{item.line}}"
+        message: "file needs rustfmt formatting"
+        severity: warning
+        remediations:
+          - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{item.name}}`."

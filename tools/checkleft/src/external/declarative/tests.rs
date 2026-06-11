@@ -562,3 +562,148 @@ fn jaq_deps_compile_and_evaluate() {
 
     assert_eq!(output, vec![json!({"b": 1})]);
 }
+
+// ── rustfmt declarative check ──────────────────────────────────────────────────
+
+const RUSTFMT_MANIFEST: &str = include_str!("../../../checks/rustfmt/check.yaml");
+
+// Real rustfmt --emit=json output: top-level array, empty when clean.
+const RUSTFMT_CLEAN: &[u8] = b"[]";
+
+// rustfmt --emit=json output for a file with one formatting mismatch at line 3.
+const RUSTFMT_ONE_MISMATCH: &[u8] = br#"[{"name":"src/lib.rs","mismatches":[{"original_begin_line":3,"original_end_line":4,"expected_begin_line":3,"expected_end_line":3,"original":"    let x=1;\n","expected":"    let x = 1;\n"}]}]"#;
+
+// rustfmt --emit=json output for a file with two mismatches at lines 3 and 10.
+const RUSTFMT_TWO_MISMATCHES: &[u8] = br#"[{"name":"src/lib.rs","mismatches":[{"original_begin_line":3,"original_end_line":4,"expected_begin_line":3,"expected_end_line":3,"original":"    let x=1;\n","expected":"    let x = 1;\n"},{"original_begin_line":10,"original_end_line":11,"expected_begin_line":10,"expected_end_line":10,"original":"    let y=2;\n","expected":"    let y = 2;\n"}]}]"#;
+
+fn parse_rustfmt_package() -> ExternalCheckDeclarativePackage {
+    let package = parse_declarative_check_manifest(RUSTFMT_MANIFEST).expect("rustfmt manifest must parse");
+    assert_eq!(package.id, "rustfmt");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
+        other => panic!("expected declarative implementation, got {other:?}"),
+    }
+}
+
+fn rustfmt_format_findings(stdout: &[u8]) -> Vec<Finding> {
+    let package = parse_rustfmt_package();
+    assert_eq!(package.invocations.len(), 1);
+    package.invocations[0]
+        .transform
+        .apply(stdout, Some(0), Some("src/lib.rs"))
+        .expect("rustfmt transform")
+}
+
+#[test]
+fn rustfmt_manifest_parses_correctly() {
+    let package = parse_rustfmt_package();
+    assert_eq!(package.invocations.len(), 1);
+    assert_eq!(package.invocations[0].id, "format");
+    assert_eq!(package.invocations[0].mode, InvocationMode::PerFile);
+    assert!(package.needs.contains_key("rustfmt"));
+    assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
+    assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Error);
+    assert_eq!(package.invocations[0].exit.classify(None), ExitOutcome::Error);
+}
+
+#[test]
+fn rustfmt_config_path_arg_is_present() {
+    // --config-path=. prevents user-level ~/.config/rustfmt/ from leaking into CI.
+    let package = parse_rustfmt_package();
+    let args = &package.invocations[0].args;
+    assert!(
+        args.iter().any(|a| a == "--config-path=."),
+        "expected --config-path=. in rustfmt args to prevent user config from leaking; got: {args:?}"
+    );
+}
+
+#[test]
+fn rustfmt_clean_output_no_findings() {
+    let findings = rustfmt_format_findings(RUSTFMT_CLEAN);
+    assert!(findings.is_empty(), "clean rustfmt output must produce no findings");
+}
+
+#[test]
+fn rustfmt_mismatch_produces_finding_with_correct_path_and_line() {
+    let findings = rustfmt_format_findings(RUSTFMT_ONE_MISMATCH);
+    assert_eq!(findings.len(), 1, "one mismatch must produce one finding");
+    let f = &findings[0];
+    assert_eq!(f.severity, Severity::Warning);
+    let loc = f.location.as_ref().expect("finding must have a location");
+    assert_eq!(loc.path, Path::new("src/lib.rs"), "path must come from JSON name field");
+    assert_eq!(loc.line, Some(3), "line must be original_begin_line");
+    assert!(
+        f.message.contains("formatting"),
+        "message should mention formatting; got: {}",
+        f.message
+    );
+    assert!(
+        f.remediations.iter().any(|r| r.contains("cargo fmt")),
+        "remediation should mention cargo fmt; got: {:?}",
+        f.remediations
+    );
+}
+
+#[test]
+fn rustfmt_multiple_mismatches_produce_multiple_findings() {
+    let findings = rustfmt_format_findings(RUSTFMT_TWO_MISMATCHES);
+    assert_eq!(findings.len(), 2, "two mismatches must produce two findings; got: {findings:#?}");
+    // Lines should be the original_begin_line values: 3 and 10.
+    let lines: Vec<Option<u32>> = findings.iter().map(|f| f.location.as_ref().unwrap().line).collect();
+    assert!(lines.contains(&Some(3)), "expected a finding at line 3; got: {lines:?}");
+    assert!(lines.contains(&Some(10)), "expected a finding at line 10; got: {lines:?}");
+}
+
+#[test]
+fn rustfmt_nonzero_exit_is_error() {
+    // Exit 1 from rustfmt signals a parse error in the input file — must surface
+    // as a check error, never silently as "clean".
+    let package = parse_rustfmt_package();
+    assert_eq!(
+        package.invocations[0].exit.classify(Some(1)),
+        ExitOutcome::Error,
+        "exit 1 must be treated as an error (parse failure), not a clean result"
+    );
+}
+
+#[test]
+fn rustfmt_missing_binary_degrades_to_check_error() {
+    // When the rustfmt binary cannot be found, run_declarative_check returns
+    // Err — the runner converts this to an error-severity finding rather than
+    // panicking, so checkleft degrades gracefully.
+    use std::path::PathBuf;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("main.rs"), "fn main() {}\n").expect("write file");
+
+    let manifest = RUSTFMT_MANIFEST.replace(
+        "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"",
+        "path: \"nonexistent_rustfmt_binary_xyz\"",
+    );
+    let package = parse_declarative_check_manifest(&manifest).expect("modified manifest must parse");
+    let declarative = match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        other => panic!("expected declarative, got {other:?}"),
+    };
+
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("main.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let err = super::run_declarative_check(
+        temp.path(),
+        "rustfmt",
+        &declarative,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+    )
+    .expect_err("missing binary must produce an error, not a successful result");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("nonexistent_rustfmt_binary_xyz") || msg.contains("spawn") || msg.contains("format"),
+        "error message should reference the binary or spawn failure; got: {msg}"
+    );
+}
