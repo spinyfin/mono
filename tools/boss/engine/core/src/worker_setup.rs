@@ -125,6 +125,7 @@ pub struct WorkerSetupInput {
     /// When `true`, the CLAUDE.md includes a directive to use
     /// `--draft` when running `gh pr create`. Omitted when `false`
     /// so workers on default installs see no behaviour change.
+    #[builder(default = false)]
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
     /// Used to install kind-specific hook guards — currently a PreToolUse deny
@@ -142,6 +143,7 @@ pub struct WorkerSetupInput {
     /// worker settings file. Defaults to [`WorkerKind::Standard`] which adds
     /// no additional denies beyond the static sandbox rules. Set to
     /// [`WorkerKind::Reviewer`] to enforce the read-only mandate (§9).
+    #[builder(default = WorkerKind::Standard)]
     pub worker_kind: WorkerKind,
 }
 
