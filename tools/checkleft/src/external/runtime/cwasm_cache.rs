@@ -198,12 +198,11 @@ impl ComponentAotCache {
             if path.extension().and_then(|e| e.to_str()) != Some("cwasm") {
                 continue;
             }
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if now.duration_since(modified).unwrap_or_default() > max_age {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
+            if let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && now.duration_since(modified).unwrap_or_default() > max_age
+            {
+                let _ = fs::remove_file(&path);
             }
         }
         Ok(())

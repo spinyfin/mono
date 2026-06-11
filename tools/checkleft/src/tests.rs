@@ -6,9 +6,9 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 use checkleft::change_detection::environment::CiEnvironment;
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, github_auth_unavailable_warning,
-    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_results,
-    resolve_github_token_from_sources, sort_results_for_output,
+    ColorLevel, ExternalProviderMode, OutputStyle, github_auth_unavailable_warning, normalize_optional_description,
+    parse_external_provider_mode, parse_github_ref_pr_number, render_human_results, resolve_github_token_from_sources,
+    sort_results_for_output,
 };
 
 #[test]
@@ -437,18 +437,12 @@ fn parse_external_provider_mode_rejects_invalid_values() {
 
 #[test]
 fn github_ref_pr_number_extracts_from_merge_ref() {
-    assert_eq!(
-        parse_github_ref_pr_number("refs/pull/42/merge"),
-        Some("42".to_owned())
-    );
+    assert_eq!(parse_github_ref_pr_number("refs/pull/42/merge"), Some("42".to_owned()));
 }
 
 #[test]
 fn github_ref_pr_number_extracts_from_head_ref() {
-    assert_eq!(
-        parse_github_ref_pr_number("refs/pull/123/head"),
-        Some("123".to_owned())
-    );
+    assert_eq!(parse_github_ref_pr_number("refs/pull/123/head"), Some("123".to_owned()));
 }
 
 #[test]
@@ -479,10 +473,7 @@ fn detect_current_branch_uses_buildkite_branch() {
         ..env
     };
     // buildkite_branch takes priority
-    assert_eq!(
-        env_with_gha_too.buildkite_branch.as_deref(),
-        Some("boss/exec_abc123")
-    );
+    assert_eq!(env_with_gha_too.buildkite_branch.as_deref(), Some("boss/exec_abc123"));
 }
 
 #[test]
@@ -497,7 +488,9 @@ fn detect_current_branch_skips_merge_queue_branch() {
     // We can test this purely by calling detect_current_branch with a stub Vcs
     // only if Vcs is constructible without real FS. Since it's not, we validate
     // the intermediate logic by inspecting the filter predicate directly.
-    let bk_branch = env.buildkite_branch.as_deref()
+    let bk_branch = env
+        .buildkite_branch
+        .as_deref()
         .filter(|b| !b.starts_with("gh-readonly-queue/"))
         .map(|b| b.to_owned());
     assert_eq!(bk_branch, None, "merge-queue branch should be filtered out");
