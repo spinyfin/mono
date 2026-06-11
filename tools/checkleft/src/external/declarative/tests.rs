@@ -605,8 +605,8 @@ fn rustfmt_config_path_arg_is_present() {
     let package = parse_rustfmt_package();
     let args = &package.invocations[0].args;
     assert!(
-        args.iter().any(|a| a == "--config-path=."),
-        "expected --config-path=. in rustfmt args to prevent user config from leaking; got: {args:?}"
+        args.iter().any(|a| a == "--config-path={{repo_root}}"),
+        "expected --config-path={{{{repo_root}}}} in rustfmt args to pin config to repo root regardless of cwd; got: {args:?}"
     );
 }
 
@@ -915,6 +915,89 @@ fn duplicate_findings_across_module_tree_are_deduplicated() {
             Path::new("src/lib.rs")
         );
     }
+}
+
+// ── {{repo_root}} arg expansion ───────────────────────────────────────────────────
+
+#[test]
+fn rustfmt_repo_root_arg_expands_to_absolute_path() {
+    // When run_declarative_check is called, --config-path={{repo_root}} must be
+    // expanded to the absolute repo root before rustfmt is invoked. A fake rustfmt
+    // script prints its --config-path arg to stdout and exits 1 (→ "findings"); the
+    // linelist transform puts each stdout line into a finding's location.path, so we
+    // can assert the expanded path was passed to the tool.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_root = tempfile::tempdir().expect("temp repo root");
+        std::fs::write(repo_root.path().join("rustfmt.toml"), "edition = \"2021\"\n").expect("write rustfmt.toml");
+
+        // Print the --config-path=... arg to stdout and exit 1 (→ findings).
+        let script_path = repo_root.path().join("fake_rustfmt.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --config-path=*) echo \"$arg\"; exit 1;;\n  esac\ndone\nexit 0\n",
+        )
+        .expect("write script");
+        let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let manifest = RUSTFMT_MANIFEST.replace(
+            "bazel: \"@rules_rust//tools/upstream_wrapper:rustfmt\"\n    fallback:\n      path: \"rustfmt\"",
+            &format!("path: \"{}\"", script_path.display()),
+        );
+        let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
+        let declarative = match package.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => d,
+            other => panic!("expected declarative, got {other:?}"),
+        };
+
+        let changeset = crate::input::ChangeSet::new(vec![crate::input::ChangedFile {
+            path: std::path::PathBuf::from("src.rs"),
+            kind: crate::input::ChangeKind::Modified,
+            old_path: None,
+        }]);
+
+        let result = super::run_declarative_check(
+            repo_root.path(),
+            "rustfmt",
+            &declarative,
+            &changeset,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("run succeeds");
+
+        // The fake script prints exactly one line: --config-path=<path>. The linelist
+        // transform records it as finding.location.path (one finding, no line number).
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "expected one finding from --config-path echo; got: {:#?}",
+            result.findings
+        );
+        let path_str = result.findings[0].location.as_ref().unwrap().path.to_string_lossy();
+        let expected_config_arg = format!("--config-path={}", repo_root.path().display());
+        assert_eq!(
+            path_str.as_ref(),
+            expected_config_arg.as_str(),
+            "{{{{repo_root}}}} must expand to the absolute repo root; got: {path_str}"
+        );
+    }
+}
+
+#[test]
+fn args_rejects_unknown_template_ref_at_load_time() {
+    // An unrecognised {{...}} token in invocation args must be caught at manifest-load
+    // time, not silently passed through to the tool.
+    let manifest = RUSTFMT_MANIFEST.replace("{{repo_root}}", "{{unknown_var}}");
+    let err = parse_declarative_check_manifest(&manifest).expect_err("manifest with {{unknown_var}} must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown template ref") || msg.contains("unknown_var"),
+        "error must name the bad ref; got: {msg}"
+    );
 }
 
 // ── template validation (issue: {{file}} silently rendered raw) ──────────────────

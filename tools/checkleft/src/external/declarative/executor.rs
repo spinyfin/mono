@@ -135,14 +135,14 @@ fn run_invocation(
 
     let mut findings = match invocation.mode {
         InvocationMode::Batch => {
-            let args = expand_batch_args(&invocation.args, files);
+            let args = expand_batch_args(repo_root, &invocation.args, files);
             let output = spawn(repo_root, binary, &args, &invocation.id)?;
             classify_and_project(invocation, &output, None)?
         }
         InvocationMode::PerFile => {
             let mut findings = Vec::new();
             for file in files {
-                let args = expand_per_file_args(&invocation.args, file);
+                let args = expand_per_file_args(repo_root, &invocation.args, file);
                 let output = spawn(repo_root, binary, &args, &invocation.id)?;
                 findings.extend(classify_and_project(invocation, &output, Some(file))?);
             }
@@ -158,21 +158,27 @@ fn run_invocation(
 }
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.
-fn expand_batch_args(args: &[String], files: &[String]) -> Vec<String> {
+/// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
+fn expand_batch_args(repo_root: &Path, args: &[String], files: &[String]) -> Vec<String> {
+    let repo_root_str = repo_root.to_string_lossy();
     let mut expanded = Vec::with_capacity(args.len() + files.len());
     for arg in args {
         if arg == "{{files}}" {
             expanded.extend(files.iter().cloned());
         } else {
-            expanded.push(arg.clone());
+            expanded.push(arg.replace("{{repo_root}}", &*repo_root_str));
         }
     }
     expanded
 }
 
 /// In per-file mode `{{file}}` is substituted in place within each arg.
-fn expand_per_file_args(args: &[String], file: &str) -> Vec<String> {
-    args.iter().map(|arg| arg.replace("{{file}}", file)).collect()
+/// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
+fn expand_per_file_args(repo_root: &Path, args: &[String], file: &str) -> Vec<String> {
+    let repo_root_str = repo_root.to_string_lossy();
+    args.iter()
+        .map(|arg| arg.replace("{{file}}", file).replace("{{repo_root}}", &*repo_root_str))
+        .collect()
 }
 
 struct InvocationOutput {

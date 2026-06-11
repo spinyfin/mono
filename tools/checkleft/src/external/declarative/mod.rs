@@ -296,6 +296,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
     };
 
     validate_args_for_mode(&id, mode, &raw.args)?;
+    validate_arg_template_refs(&id, &raw.args)?;
     let exit = validate_exit(&id, raw.exit)?;
     let transform = validate_transform(&id, raw.transform)?;
 
@@ -321,6 +322,30 @@ fn validate_args_for_mode(id: &str, mode: InvocationMode, args: &[String]) -> Re
         }
         _ => Ok(()),
     }
+}
+
+/// Reject args that contain `{{...}}` tokens the framework doesn't recognise.
+/// Unrecognised tokens would silently pass through unexpanded to the tool.
+fn validate_arg_template_refs(id: &str, args: &[String]) -> Result<()> {
+    for arg in args {
+        let mut rest = arg.as_str();
+        while let Some(open) = rest.find("{{") {
+            let after = &rest[open + 2..];
+            let close = after
+                .find("}}")
+                .ok_or_else(|| anyhow::anyhow!("invocation `{id}` arg has unterminated `{{{{` in `{arg}`"))?;
+            let inner = &after[..close];
+            match inner {
+                "files" | "file" | "repo_root" => {}
+                other => bail!(
+                    "invocation `{id}` arg contains unknown template ref `{{{{{other}}}}}` \
+                     (recognized in args: `{{{{files}}}}`, `{{{{file}}}}`, `{{{{repo_root}}}}`)"
+                ),
+            }
+            rest = &after[close + 2..];
+        }
+    }
+    Ok(())
 }
 
 fn validate_exit(id: &str, raw: BTreeMap<String, String>) -> Result<ExitSemantics> {
