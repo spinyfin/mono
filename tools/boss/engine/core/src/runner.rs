@@ -624,7 +624,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 
     let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
 
-    let output = crate::gh_spawn::gh_output(&["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
+    let output = crate::gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
         .await
         .ok()?;
 
@@ -664,7 +664,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
 async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
-    let output = crate::gh_spawn::gh_output(&["pr", "diff", pr_url]).await.ok()?;
+    let output = crate::gh_invocation::gh_output(&["pr", "diff", pr_url]).await.ok()?;
 
     if !output.status.success() {
         tracing::warn!(

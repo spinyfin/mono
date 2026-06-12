@@ -50,7 +50,7 @@ use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
-use crate::gh_spawn::gh_output;
+use crate::gh_invocation::gh_output;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;

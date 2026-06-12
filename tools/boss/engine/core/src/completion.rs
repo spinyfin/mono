@@ -55,7 +55,7 @@ use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
-use crate::gh_spawn::run_gh;
+use crate::gh_invocation::run_gh;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };

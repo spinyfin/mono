@@ -71,7 +71,6 @@ rust_library(
         "src/external_tracker/reconcile/mod.rs",
         "src/external_tracker/reconcile/tests/tests_drift.rs",
         "src/gh_invocation.rs",
-        "src/gh_spawn.rs",
         "src/host_adapter.rs",
         "src/host_registry.rs",
         "src/host_scheduling.rs",
