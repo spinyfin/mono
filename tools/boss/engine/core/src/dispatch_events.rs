@@ -251,7 +251,8 @@ impl Outcome {
 /// deliberately wide — readers don't need to know about every field
 /// and a writer that doesn't yet have a value emits `null` rather
 /// than dropping the key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DispatchEvent {
     pub ts_epoch_ms: u128,
     pub stage: String,
@@ -276,6 +277,7 @@ pub struct DispatchEvent {
     pub cube_cwd: Option<String>,
     /// Per-stage open object; readers `jq` into this when they care.
     #[serde(default)]
+    #[builder(default)]
     pub details: serde_json::Value,
 }
 
@@ -537,7 +539,10 @@ mod tests {
         let value = serde_json::to_value(&event).unwrap();
         let obj = value.as_object().unwrap();
 
-        assert!(!obj.contains_key("error_message"), "error_message must be omitted on ok");
+        assert!(
+            !obj.contains_key("error_message"),
+            "error_message must be omitted on ok"
+        );
         assert!(!obj.contains_key("cube_command"), "cube_command must be omitted on ok");
         assert!(!obj.contains_key("cube_cwd"), "cube_cwd must be omitted on ok");
 
@@ -589,8 +594,8 @@ mod tests {
     /// they stay `None` and are omitted from the JSON object.
     #[test]
     fn with_cube_invocation_none_leaves_both_absent() {
-        let event = DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, Outcome::Ok, "exec-inv")
-            .with_cube_invocation(None);
+        let event =
+            DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, Outcome::Ok, "exec-inv").with_cube_invocation(None);
 
         assert!(event.cube_command.is_none());
         assert!(event.cube_cwd.is_none());
@@ -607,9 +612,7 @@ mod tests {
     #[test]
     fn with_error_flattens_full_anyhow_cause_chain() {
         let err = anyhow::anyhow!("connection refused").context("cube workspace lease failed");
-        let event =
-            DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, Outcome::Error, "exec-err")
-                .with_error(&err);
+        let event = DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, Outcome::Error, "exec-err").with_error(&err);
 
         let obj = serde_json::to_value(&event).unwrap();
         let message = obj["error_message"].as_str().unwrap();
@@ -728,7 +731,10 @@ mod tests {
         // serde serialization must agree with as_str so the JSON
         // `outcome` field and the in-memory identifier never diverge.
         for outcome in [Outcome::Ok, Outcome::Error, Outcome::Skipped] {
-            assert_eq!(serde_json::to_value(outcome).unwrap(), serde_json::json!(outcome.as_str()));
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!(outcome.as_str())
+            );
         }
     }
 }
