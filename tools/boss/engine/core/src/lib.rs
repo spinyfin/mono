@@ -35,7 +35,6 @@ pub mod events_socket;
 pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
 pub mod gh_invocation;
-pub(crate) mod gh_spawn;
 pub mod host_adapter;
 pub mod host_registry;
 pub mod host_scheduling;

@@ -1,5 +1,7 @@
-//! Shared classifier for `gh pr|issue <subcommand>` and `cube pr ensure`
-//! Bash invocations.
+//! Utilities for working with the `gh` CLI: command classification and
+//! subprocess spawn helpers.
+//!
+//! ## Command classification
 //!
 //! Two engine surfaces inspect the worker's Bash commands for `gh`
 //! invocations:
@@ -11,23 +13,13 @@
 //!
 //! Both need the same first step: decide whether a command string is a
 //! deliberate `gh pr` / `gh issue` invocation and, if so, which noun and
-//! subcommand it targets. This module is that single source of truth so
+//! subcommand it targets. [`classify`] is that single source of truth so
 //! the two paths can never drift on what counts as a `gh` call.
 //!
 //! The matcher tolerates the envelope workers actually emit — leading
 //! `GIT_DIR=…`-style env assignments (jj-backed workspaces lack a
 //! top-level `.git`, so `gh` is run with `GIT_DIR=.jj/repo/store/git`)
 //! and the command appearing after a shell delimiter (`&&`, `;`, `|`).
-//! It is the regex the editorial design names as the enforcement
-//! envelope:
-//!
-//! ```text
-//! ^\s*(GIT_DIR=\S+\s+)?gh\s+(pr|issue)\s+(create|edit|comment|review)\b
-//! ```
-//!
-//! generalised here to capture *any* subcommand (so the PR-URL path can
-//! ask for `view` / `list` too) and any number of env-assignment
-//! prefixes.
 //!
 //! ## `cube pr ensure` coverage
 //!
@@ -38,11 +30,22 @@
 //! outer `cube pr ensure ...` command. [`is_cube_pr_ensure`] detects this
 //! path so the editorial hook can enforce the same rules it applies to a
 //! literal `gh pr create`.
+//!
+//! ## Subprocess spawn helpers
+//!
+//! [`gh_output`] and [`run_gh`] are the shared spawn primitives for the
+//! engine's direct `gh` shellouts (completion, merge polling, runner,
+//! merge-when-ready, design detection). Every call site spawns `gh` with
+//! the identical stdio envelope (stdin null, stdout+stderr piped,
+//! `kill_on_drop(true)`); only the post-spawn handling varies.
 
 use std::borrow::Cow;
+use std::process::Output;
 use std::sync::LazyLock;
 
+use anyhow::{Context, Result, anyhow};
 use regex::Regex;
+use tokio::process::Command;
 
 /// Strip the CONTENT of single- and double-quoted strings from `cmd`,
 /// preserving the quote characters themselves. This prevents phrases like
@@ -176,6 +179,51 @@ pub fn is_cube_pr_ensure(command: &str) -> bool {
 pub fn is_editorial_candidate(command: &str) -> bool {
     (command.contains("gh ") && (command.contains(" pr ") || command.contains(" issue ")))
         || (command.contains("cube ") && command.contains(" pr ") && command.contains("ensure"))
+}
+
+// ── Subprocess spawn helpers ──────────────────────────────────────────────────
+
+/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop envelope
+/// (stdin null, stdout+stderr piped, `kill_on_drop(true)`) and return its
+/// raw [`Output`].
+///
+/// This is the shared spawn primitive: it deliberately performs no
+/// exit-code or stderr handling so each call site keeps its own tailored
+/// logic on top (`with_context`, `.ok()?`, bool-on-error, JSON vs string
+/// parsing). The returned `io::Result` is the spawn result — callers apply
+/// their own context (`.with_context(...)`, `.ok()?`, `.map_err(...)`).
+pub(crate) async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
+    Command::new("gh")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+/// Spawn `gh` via [`gh_output`] and return the trimmed stdout on success.
+/// `display` is a human-readable rendering of the command and is reused in
+/// both the spawn-failure context and the non-zero-exit error message
+/// (which also carries the captured stderr).
+///
+/// This is the happy-path convenience for sites that want a
+/// `Result<String>` with the conventional "spawn failed" / "command
+/// failed: <stderr>" error shape. Sites that need different exit-code
+/// handling (graceful degradation, JSON parsing) call [`gh_output`]
+/// directly.
+pub(crate) async fn run_gh(args: &[&str], display: &str) -> Result<String> {
+    let output = gh_output(args)
+        .await
+        .with_context(|| format!("failed to spawn `{display}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{display}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 #[cfg(test)]

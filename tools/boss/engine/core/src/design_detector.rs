@@ -25,7 +25,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::gh_spawn::gh_output;
+use crate::gh_invocation::gh_output;
 use crate::work::WorkDb;
 use boss_protocol::SetProjectDesignDocInput;
 

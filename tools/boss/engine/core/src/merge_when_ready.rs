@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow};
 
 use boss_github::pr_url::parse_pr_url_parts;
 
-use crate::gh_spawn::gh_output;
+use crate::gh_invocation::gh_output;
 
 /// Outcome of a successful [`gh_merge_when_ready`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
