@@ -23,7 +23,7 @@
 //! }
 //! ```
 
-use checkleft_check_sdk::{ChangeKind, CheckInput, Finding, check, export_checks};
+use checkleft_check_sdk::{ChangeKind, CheckInput, DeclaredExclusion, ExclusionStatus, Finding, check, export_checks};
 use serde::Deserialize;
 
 const DEFAULT_MAX_FIELDS: usize = 5;
@@ -35,6 +35,9 @@ struct Config {
     /// "bon" (default) or "derive_builder"
     #[serde(default)]
     builder: Option<String>,
+    /// Entries like "path/to/file.rs::StructName" that are exempt from the check.
+    #[serde(default)]
+    exclude_structs: Option<Vec<String>>,
 }
 
 #[check(
@@ -94,7 +97,62 @@ fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
     findings
 }
 
-export_checks!(giant_structs_check);
+fn giant_structs_declared_exclusions(config_json: &str) -> Vec<DeclaredExclusion> {
+    let cfg: Config = serde_json::from_str(config_json).unwrap_or_default();
+    let mut result = Vec::new();
+    for entry in cfg.exclude_structs.unwrap_or_default() {
+        if let Some((path_part, _struct_name)) = entry.split_once("::") {
+            result.push(DeclaredExclusion {
+                entry: entry.clone(),
+                depends_on: vec![path_part.to_owned()],
+            });
+        }
+    }
+    result
+}
+
+fn giant_structs_evaluate_exclusion(
+    config_json: &str,
+    excl: &DeclaredExclusion,
+    file_content: Option<&str>,
+) -> ExclusionStatus {
+    let cfg: Config = serde_json::from_str(config_json).unwrap_or_default();
+    let max_fields = cfg.max_fields.unwrap_or(DEFAULT_MAX_FIELDS);
+    let use_bon = cfg.builder.as_deref().unwrap_or("bon") != "derive_builder";
+
+    let Some((_path_part, struct_name)) = excl.entry.split_once("::") else {
+        return ExclusionStatus::Unknown;
+    };
+
+    let Some(source) = file_content else {
+        return ExclusionStatus::Stale(format!("the file containing `{struct_name}` was deleted"));
+    };
+
+    let parsed = match syn::parse_file(source) {
+        Ok(f) => f,
+        Err(_) => return ExclusionStatus::Unknown,
+    };
+
+    if collect_violations(&parsed.items, false, use_bon, max_fields)
+        .iter()
+        .any(|name| name == struct_name)
+    {
+        ExclusionStatus::LoadBearing
+    } else {
+        ExclusionStatus::Stale(format!(
+            "struct `{struct_name}` no longer violates the rule (it now has the required builder derive, or was removed)"
+        ))
+    }
+}
+
+export_checks!(
+    giant_structs_check,
+    exclusion_audit(
+        "rust/giant-structs",
+        giant_structs_declared_exclusions,
+        giant_structs_evaluate_exclusion
+    ),
+);
 
 // ── AST analysis ──────────────────────────────────────────────────────────────
 

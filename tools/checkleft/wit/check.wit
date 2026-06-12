@@ -184,6 +184,33 @@ interface types {
         /// The check ran but encountered a fatal error.
         failed(string),
     }
+
+    /// An exclusion entry declared by a check for stale-exclusion auditing.
+    ///
+    /// Returned by `declared-exclusions`. The host re-evaluates the exclusion
+    /// via `evaluate-exclusion` when at least one path in `depends-on` appears
+    /// in the changeset.
+    record declared-exclusion {
+        /// The exclusion entry exactly as written in the CHECKS file.
+        entry: string,
+        /// Config-file-relative paths this exclusion depends on.
+        /// Empty list means the exclusion is never audited (fail-safe).
+        depends-on: list<string>,
+    }
+
+    /// The verdict for a single exclusion re-evaluated as if it were not present.
+    ///
+    /// Checks must fail safe: when staleness cannot be proven, return `unknown`
+    /// rather than `stale`. A false stale finding trains authors to ignore the
+    /// check; a missed one merely leaves a dead entry for next time.
+    variant exclusion-status {
+        /// The exclusion is still required: the target still violates the rule.
+        load-bearing,
+        /// The exclusion is no longer required. Carries a short human reason.
+        stale(string),
+        /// Staleness could not be determined. Fail-safe default.
+        unknown,
+    }
 }
 
 /// The world that a checkleft check component must implement.
@@ -193,7 +220,7 @@ interface types {
 /// guests read files with `std::fs` and see only the files the host allows.
 /// No checkleft-specific file import exists in this world.
 world check {
-    use types.{check-input, finding, check-descriptor, check-error};
+    use types.{check-input, finding, check-descriptor, check-error, declared-exclusion, exclusion-status};
 
     /// Return a descriptor for every check exported by this component.
     /// Called once by the host after instantiation.
@@ -204,4 +231,23 @@ world check {
         name: string,
         input: check-input,
     ) -> result<list<finding>, check-error>;
+
+    /// Return all exclusion entries declared by the named check that are eligible
+    /// for stale-exclusion auditing. The host calls this once per check instance
+    /// when a file in `depends-on` appears in the changeset.
+    ///
+    /// Returns an empty list when the check does not participate in exclusion auditing.
+    export declared-exclusions: func(name: string, config-json: string) -> list<declared-exclusion>;
+
+    /// Re-evaluate a single exclusion as if it were not present and report whether
+    /// it is still needed. The host passes the current content of the file the
+    /// exclusion depends on, or `none` if the file was deleted.
+    ///
+    /// Returns `unknown` when staleness cannot be determined (fail-safe).
+    export evaluate-exclusion: func(
+        name: string,
+        config-json: string,
+        exclusion: declared-exclusion,
+        file-content: option<string>,
+    ) -> exclusion-status;
 }

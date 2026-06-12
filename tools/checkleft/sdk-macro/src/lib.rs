@@ -10,7 +10,6 @@ use syn::{
     Expr, ExprArray, ExprLit, Ident, ItemFn, Lit, LitStr, Token,
     parse::{Parse, ParseStream},
     parse_macro_input,
-    punctuated::Punctuated,
 };
 
 // The WIT contract embedded at proc-macro compile time so that export_checks!
@@ -233,15 +232,58 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
 // export_checks! function-like macro
 // ---------------------------------------------------------------------------
 
+/// One item in the `export_checks!(...)` argument list.
+enum ExportChecksItem {
+    /// A `#[check]`-annotated function to export.
+    Check(Ident),
+    /// Stale-exclusion audit hooks for a named check.
+    ExclusionAudit {
+        check_name: LitStr,
+        declared_fn: Ident,
+        eval_fn: Ident,
+    },
+}
+
+impl Parse for ExportChecksItem {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let ident: Ident = input.parse()?;
+        if ident == "exclusion_audit" {
+            let content;
+            syn::parenthesized!(content in input);
+            let check_name: LitStr = content.parse()?;
+            content.parse::<Token![,]>()?;
+            let declared_fn: Ident = content.parse()?;
+            content.parse::<Token![,]>()?;
+            let eval_fn: Ident = content.parse()?;
+            // Allow optional trailing comma inside parens.
+            if content.peek(Token![,]) {
+                content.parse::<Token![,]>()?;
+            }
+            Ok(ExportChecksItem::ExclusionAudit {
+                check_name,
+                declared_fn,
+                eval_fn,
+            })
+        } else {
+            Ok(ExportChecksItem::Check(ident))
+        }
+    }
+}
+
 struct ExportChecksInput {
-    fns: Punctuated<Ident, Token![,]>,
+    items: Vec<ExportChecksItem>,
 }
 
 impl Parse for ExportChecksInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        Ok(ExportChecksInput {
-            fns: Punctuated::parse_terminated(input)?,
-        })
+        let mut items = Vec::new();
+        while !input.is_empty() {
+            items.push(input.parse::<ExportChecksItem>()?);
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(ExportChecksInput { items })
     }
 }
 
@@ -272,9 +314,26 @@ pub fn export_checks(input: TokenStream) -> TokenStream {
 }
 
 fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
-    let fns: Vec<&Ident> = input.fns.iter().collect();
-    let entry_statics: Vec<proc_macro2::Ident> =
-        fns.iter().map(|id| format_ident!("__CHECKLEFT_ENTRY_{}", id)).collect();
+    // Separate check functions from exclusion audit registrations.
+    let mut check_fns: Vec<&Ident> = Vec::new();
+    let mut exclusion_audits: Vec<(&LitStr, &Ident, &Ident)> = Vec::new();
+    for item in &input.items {
+        match item {
+            ExportChecksItem::Check(id) => check_fns.push(id),
+            ExportChecksItem::ExclusionAudit {
+                check_name,
+                declared_fn,
+                eval_fn,
+            } => {
+                exclusion_audits.push((check_name, declared_fn, eval_fn));
+            }
+        }
+    }
+
+    let entry_statics: Vec<proc_macro2::Ident> = check_fns
+        .iter()
+        .map(|id| format_ident!("__CHECKLEFT_ENTRY_{}", id))
+        .collect();
 
     let wit = WIT_CONTENT;
 
@@ -303,10 +362,120 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
+    // declared_exclusions: dispatch arms from exclusion_audit(...) items
+    let decl_excl_arms: Vec<TokenStream2> = exclusion_audits
+        .iter()
+        .map(|(check_name, declared_fn, _eval_fn)| {
+            quote! {
+                #check_name => {
+                    return super::#declared_fn(&config_json)
+                        .into_iter()
+                        .map(to_wit_declared_exclusion)
+                        .collect();
+                }
+            }
+        })
+        .collect();
+
+    // evaluate_exclusion: dispatch arms from exclusion_audit(...) items
+    let eval_excl_arms: Vec<TokenStream2> = exclusion_audits
+        .iter()
+        .map(|(check_name, _declared_fn, eval_fn)| {
+            quote! {
+                #check_name => {
+                    return to_wit_exclusion_status(super::#eval_fn(
+                        &config_json,
+                        &sdk_excl,
+                        file_content.as_deref(),
+                    ));
+                }
+            }
+        })
+        .collect();
+
+    // Generate exclusion-audit method bodies. When there are no audit registrations the
+    // parameters are prefixed with `_` to suppress unused-variable warnings.
+    let exclusion_methods = if exclusion_audits.is_empty() {
+        quote! {
+            fn declared_exclusions(
+                _name: ::std::string::String,
+                _config_json: ::std::string::String,
+            ) -> ::std::vec::Vec<W::DeclaredExclusion> {
+                ::std::vec::Vec::new()
+            }
+
+            fn evaluate_exclusion(
+                _name: ::std::string::String,
+                _config_json: ::std::string::String,
+                _exclusion: W::DeclaredExclusion,
+                _file_content: ::core::option::Option<::std::string::String>,
+            ) -> W::ExclusionStatus {
+                W::ExclusionStatus::Unknown
+            }
+        }
+    } else {
+        quote! {
+            fn declared_exclusions(
+                name: ::std::string::String,
+                config_json: ::std::string::String,
+            ) -> ::std::vec::Vec<W::DeclaredExclusion> {
+                match name.as_str() {
+                    #( #decl_excl_arms )*
+                    _ => {}
+                }
+                ::std::vec::Vec::new()
+            }
+
+            fn evaluate_exclusion(
+                name: ::std::string::String,
+                config_json: ::std::string::String,
+                exclusion: W::DeclaredExclusion,
+                file_content: ::core::option::Option<::std::string::String>,
+            ) -> W::ExclusionStatus {
+                let sdk_excl = from_wit_declared_exclusion(exclusion);
+                match name.as_str() {
+                    #( #eval_excl_arms )*
+                    _ => {}
+                }
+                W::ExclusionStatus::Unknown
+            }
+        }
+    };
+
+    // Only generate the conversion helpers for exclusion types when needed.
+    let exclusion_conversions = if exclusion_audits.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn to_wit_declared_exclusion(e: ::checkleft_check_sdk::DeclaredExclusion) -> W::DeclaredExclusion {
+                W::DeclaredExclusion {
+                    entry: e.entry,
+                    depends_on: e.depends_on,
+                }
+            }
+
+            fn from_wit_declared_exclusion(e: W::DeclaredExclusion) -> ::checkleft_check_sdk::DeclaredExclusion {
+                ::checkleft_check_sdk::DeclaredExclusion {
+                    entry: e.entry,
+                    depends_on: e.depends_on,
+                }
+            }
+
+            fn to_wit_exclusion_status(s: ::checkleft_check_sdk::ExclusionStatus) -> W::ExclusionStatus {
+                match s {
+                    ::checkleft_check_sdk::ExclusionStatus::LoadBearing => W::ExclusionStatus::LoadBearing,
+                    ::checkleft_check_sdk::ExclusionStatus::Stale(reason) => W::ExclusionStatus::Stale(reason),
+                    ::checkleft_check_sdk::ExclusionStatus::Unknown => W::ExclusionStatus::Unknown,
+                }
+            }
+        }
+    };
+
     Ok(quote! {
         // The module is private; the wasm exports it generates are still
         // globally visible because they use #[no_mangle] / component ABI.
         #[doc(hidden)]
+        #[allow(clippy::too_many_arguments)] // wit_bindgen::generate! emits functions with many args from the WIT contract
         mod __checkleft_exports {
             // Generate WIT guest bindings from the embedded contract.
             // Using `inline:` with the full WIT package declaration causes
@@ -347,6 +516,8 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         _ => ::core::result::Result::Err(W::CheckError::UnknownCheck(name)),
                     }
                 }
+
+                #exclusion_methods
             }
 
             export!(__CheckleftComponent);
@@ -439,6 +610,8 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     }),
                 }
             }
+
+            #exclusion_conversions
         }
     })
 }

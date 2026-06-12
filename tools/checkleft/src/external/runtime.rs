@@ -9,6 +9,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
@@ -205,6 +206,37 @@ pub trait ExternalCheckExecutor: Send + Sync {
         source_tree: &dyn SourceTree,
         config: &toml::Value,
     ) -> Result<CheckResult>;
+
+    /// Return the declared exclusions for a component check. `config_dir` is the
+    /// directory of the CHECKS file (repo-root-relative), used to resolve any
+    /// config-file-relative paths in the returned `depends_on` lists.
+    ///
+    /// Returns an empty vec for implementations that do not support exclusion auditing.
+    fn declared_exclusions_for_component(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _config_json: &str,
+        _config_dir: &Path,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        Ok(vec![])
+    }
+
+    /// Re-evaluate a single exclusion and report whether it is still needed.
+    /// `file_content` is the current content of the depended-on file (repo-root-relative
+    /// path already resolved by the caller), or `None` when the file was deleted.
+    ///
+    /// Returns `Unknown` for implementations that do not support exclusion auditing.
+    fn evaluate_exclusion_for_component(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _config_json: &str,
+        _exclusion: &DeclaredExclusion,
+        _file_content: Option<&str>,
+    ) -> Result<ExclusionStatus> {
+        Ok(ExclusionStatus::Unknown)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -370,6 +402,32 @@ impl DefaultExternalCheckExecutor {
         }
         Ok(self.root.join(path))
     }
+
+    /// Load and compile the component for a lightweight exclusion-audit call.
+    /// Uses the AOT cache when available, same as normal execution.
+    fn load_component_for_audit(
+        &self,
+        package: &ExternalCheckPackage,
+        component: &ExternalCheckComponentPackage,
+    ) -> Result<Component> {
+        let component_bytes = if let Some(bytes) = component.artifact_bytes {
+            bytes.to_vec()
+        } else {
+            let artifact_path = self.resolve_artifact_path(&component.artifact_path)?;
+            fs::read(&artifact_path)
+                .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?
+        };
+        let actual_sha256 = sha256_hex(&component_bytes);
+        if actual_sha256 != component.artifact_sha256 {
+            bail!(
+                "artifact sha256 mismatch for component package `{}`: expected `{}`, got `{}`",
+                package.id,
+                component.artifact_sha256,
+                actual_sha256
+            );
+        }
+        self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)
+    }
 }
 
 impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
@@ -397,6 +455,73 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 run_declarative_check(&self.root, &package.id, declarative, changeset, config)
             }
         }
+    }
+
+    fn declared_exclusions_for_component(
+        &self,
+        package: &ExternalCheckPackage,
+        check_name: &str,
+        config_json: &str,
+        config_dir: &Path,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
+            return Ok(vec![]);
+        };
+        let wasm_component = self.load_component_for_audit(package, component)?;
+        let raw =
+            call_declared_exclusions(&self.engine, &wasm_component, check_name, config_json).with_context(|| {
+                format!(
+                    "`declared-exclusions` failed for check `{check_name}` in `{}`",
+                    package.id
+                )
+            })?;
+
+        // Resolve config-file-relative paths to repo-root-relative PathBuf.
+        let result = raw
+            .into_iter()
+            .map(|excl| DeclaredExclusion {
+                entry: excl.entry,
+                depends_on: excl.depends_on.into_iter().map(|rel| config_dir.join(rel)).collect(),
+            })
+            .collect();
+        Ok(result)
+    }
+
+    fn evaluate_exclusion_for_component(
+        &self,
+        package: &ExternalCheckPackage,
+        check_name: &str,
+        config_json: &str,
+        exclusion: &DeclaredExclusion,
+        file_content: Option<&str>,
+    ) -> Result<ExclusionStatus> {
+        let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
+            return Ok(ExclusionStatus::Unknown);
+        };
+        let wasm_component = self.load_component_for_audit(package, component)?;
+        let wit_excl = wit_types::DeclaredExclusion {
+            entry: exclusion.entry.clone(),
+            depends_on: exclusion
+                .depends_on
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        };
+        let status = call_evaluate_exclusion(
+            &self.engine,
+            &wasm_component,
+            check_name,
+            config_json,
+            wit_excl,
+            file_content,
+        )
+        .with_context(|| {
+            format!(
+                "`evaluate-exclusion` failed for check `{check_name}` in `{}`",
+                package.id
+            )
+        })?;
+        Ok(lift_exclusion_status(status))
     }
 }
 
@@ -597,6 +722,52 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         check_id: package.id.clone(),
         findings: findings.into_iter().map(lift_finding).collect(),
     })
+}
+
+// --- Exclusion-audit WIT calls (no filesystem, uses with_empty_wasi) ---
+
+fn call_declared_exclusions(
+    engine: &Engine,
+    component: &Component,
+    check_name: &str,
+    config_json: &str,
+) -> Result<Vec<wit_types::DeclaredExclusion>> {
+    let linker = build_component_v1_linker(engine)?;
+    let mut store = Store::new(engine, HostState::with_empty_wasi());
+    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    let instance = wasmtime(linker.instantiate(&mut store, component))
+        .context("failed to instantiate component for declared-exclusions")?;
+    let bindings =
+        wasmtime(WitCheck::new(&mut store, &instance)).context("failed to bind component for declared-exclusions")?;
+    wasmtime(bindings.call_declared_exclusions(&mut store, check_name, config_json))
+        .context("call_declared_exclusions failed")
+}
+
+fn call_evaluate_exclusion(
+    engine: &Engine,
+    component: &Component,
+    check_name: &str,
+    config_json: &str,
+    exclusion: wit_types::DeclaredExclusion,
+    file_content: Option<&str>,
+) -> Result<wit_types::ExclusionStatus> {
+    let linker = build_component_v1_linker(engine)?;
+    let mut store = Store::new(engine, HostState::with_empty_wasi());
+    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    let instance = wasmtime(linker.instantiate(&mut store, component))
+        .context("failed to instantiate component for evaluate-exclusion")?;
+    let bindings =
+        wasmtime(WitCheck::new(&mut store, &instance)).context("failed to bind component for evaluate-exclusion")?;
+    wasmtime(bindings.call_evaluate_exclusion(&mut store, check_name, config_json, &exclusion, file_content))
+        .context("call_evaluate_exclusion failed")
+}
+
+fn lift_exclusion_status(s: wit_types::ExclusionStatus) -> ExclusionStatus {
+    match s {
+        wit_types::ExclusionStatus::LoadBearing => ExclusionStatus::LoadBearing,
+        wit_types::ExclusionStatus::Stale(reason) => ExclusionStatus::Stale { reason },
+        wit_types::ExclusionStatus::Unknown => ExclusionStatus::Unknown,
+    }
 }
 
 // --- Type lowering: host types → WIT types ---
