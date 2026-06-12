@@ -300,79 +300,173 @@ impl Runner {
                 let Some(severity) = mode.severity() else {
                     continue; // audit disabled for this check
                 };
-                // Only checks that have a native built-in can participate in
-                // stale-exclusion auditing.  Pure external/component checks that
-                // have no native counterpart are silently skipped here; bundled
-                // component checks that also have a native built-in (transition
-                // period) use the built-in's evaluate_exclusion.
-                let Some(built_in) = self.registry.get(&check.check) else {
-                    continue;
-                };
-                let Ok(configured) = built_in.configure_scoped(&check.config, check.source_path.parent()) else {
-                    // Misconfiguration is surfaced by the normal pass; stay quiet here.
-                    continue;
-                };
-                let declared = configured.declared_exclusions();
-                if declared.is_empty() {
-                    continue;
-                }
-
-                for exclusion in declared {
-                    // Empty dependency set => dependency unknown => never audit (fail safe).
-                    if exclusion.depends_on.is_empty() {
+                if let Some(built_in) = self.registry.get(&check.check) {
+                    // Native built-in check path.
+                    let Ok(configured) = built_in.configure_scoped(&check.config, check.source_path.parent()) else {
+                        // Misconfiguration is surfaced by the normal pass; stay quiet here.
                         continue;
-                    }
-                    if !exclusion
-                        .depends_on
-                        .iter()
-                        .any(|dependency| changed_paths.contains(dependency))
-                    {
-                        continue;
-                    }
-                    let dedupe_key = (check.id.clone(), check.source_path.clone(), exclusion.entry.clone());
-                    if !audited.insert(dedupe_key) {
+                    };
+                    let declared = configured.declared_exclusions();
+                    if declared.is_empty() {
                         continue;
                     }
 
-                    let status = match configured
-                        .evaluate_exclusion(&exclusion, self.source_tree.as_ref())
-                        .await
-                    {
-                        Ok(status) => status,
+                    for exclusion in declared {
+                        if exclusion.depends_on.is_empty() {
+                            continue;
+                        }
+                        if !exclusion
+                            .depends_on
+                            .iter()
+                            .any(|dependency| changed_paths.contains(dependency))
+                        {
+                            continue;
+                        }
+                        let dedupe_key = (check.id.clone(), check.source_path.clone(), exclusion.entry.clone());
+                        if !audited.insert(dedupe_key) {
+                            continue;
+                        }
+
+                        let status = match configured
+                            .evaluate_exclusion(&exclusion, self.source_tree.as_ref())
+                            .await
+                        {
+                            Ok(status) => status,
+                            Err(err) => {
+                                info!(
+                                    check_id = %check.id,
+                                    entry = %exclusion.entry,
+                                    error = %err,
+                                    "stale-exclusion audit failed; skipping entry"
+                                );
+                                continue;
+                            }
+                        };
+                        let ExclusionStatus::Stale { reason } = status else {
+                            continue;
+                        };
+
+                        let line =
+                            self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
+                        findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                            severity,
+                            message: format!(
+                                "exclusion `{}` is no longer needed: {reason}; remove this entry.",
+                                exclusion.entry
+                            ),
+                            location: Some(Location {
+                                path: check.source_path.clone(),
+                                line,
+                                column: None,
+                            }),
+                            remediations: vec![format!(
+                                "Remove `{}` from this check's exclusions in {}.",
+                                exclusion.entry,
+                                check.source_path.display()
+                            )],
+                            suggested_fix: None,
+                        });
+                    }
+                } else if let Some(impl_ref) = &check.implementation {
+                    // Component (wasm) check path.
+                    let package = match self.external_package_provider.resolve(impl_ref) {
+                        Ok(Some(pkg)) => pkg,
+                        _ => continue,
+                    };
+                    let ExternalCheckPackageImplementation::Component(_) = &package.implementation else {
+                        continue;
+                    };
+                    let config_json = match serde_json::to_string(&check.config) {
+                        Ok(j) => j,
                         Err(err) => {
-                            // Fail safe: an evaluation error is never reported as stale.
-                            info!(
-                                check_id = %check.id,
-                                entry = %exclusion.entry,
-                                error = %err,
-                                "stale-exclusion audit failed; skipping entry"
-                            );
+                            info!(check_id = %check.id, error = %err, "failed to serialize config for exclusion audit");
                             continue;
                         }
                     };
-                    let ExclusionStatus::Stale { reason } = status else {
-                        continue;
-                    };
 
-                    let line = self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
-                    findings_by_check.entry(check.id.clone()).or_default().push(Finding {
-                        severity,
-                        message: format!(
-                            "exclusion `{}` is no longer needed: {reason}; remove this entry.",
-                            exclusion.entry
-                        ),
-                        location: Some(Location {
-                            path: check.source_path.clone(),
-                            line,
-                            column: None,
-                        }),
-                        remediations: vec![format!(
-                            "Remove `{}` from this check's exclusions in {}.",
-                            exclusion.entry,
-                            check.source_path.display()
-                        )],
-                        suggested_fix: None,
-                    });
+                    let declared = match self.external_executor.declared_exclusions_for_component(
+                        &package,
+                        &check.check,
+                        &config_json,
+                        &check.config_dir,
+                    ) {
+                        Ok(d) => d,
+                        Err(err) => {
+                            info!(check_id = %check.id, error = %err, "declared-exclusions call failed; skipping check");
+                            continue;
+                        }
+                    };
+                    if declared.is_empty() {
+                        continue;
+                    }
+
+                    for exclusion in declared {
+                        if exclusion.depends_on.is_empty() {
+                            continue;
+                        }
+                        if !exclusion
+                            .depends_on
+                            .iter()
+                            .any(|dependency| changed_paths.contains(dependency))
+                        {
+                            continue;
+                        }
+                        let dedupe_key = (check.id.clone(), check.source_path.clone(), exclusion.entry.clone());
+                        if !audited.insert(dedupe_key) {
+                            continue;
+                        }
+
+                        // Read the content of the first depended-on file (fail-safe: None = deleted).
+                        let file_content_bytes = exclusion
+                            .depends_on
+                            .first()
+                            .and_then(|dep| self.source_tree.read_file(dep).ok());
+                        let file_content_str: Option<String> =
+                            file_content_bytes.and_then(|bytes| String::from_utf8(bytes).ok());
+
+                        let status = match self.external_executor.evaluate_exclusion_for_component(
+                            &package,
+                            &check.check,
+                            &config_json,
+                            &exclusion,
+                            file_content_str.as_deref(),
+                        ) {
+                            Ok(s) => s,
+                            Err(err) => {
+                                info!(
+                                    check_id = %check.id,
+                                    entry = %exclusion.entry,
+                                    error = %err,
+                                    "stale-exclusion audit failed; skipping entry"
+                                );
+                                continue;
+                            }
+                        };
+                        let ExclusionStatus::Stale { reason } = status else {
+                            continue;
+                        };
+
+                        let line =
+                            self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
+                        findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                            severity,
+                            message: format!(
+                                "exclusion `{}` is no longer needed: {reason}; remove this entry.",
+                                exclusion.entry
+                            ),
+                            location: Some(Location {
+                                path: check.source_path.clone(),
+                                line,
+                                column: None,
+                            }),
+                            remediations: vec![format!(
+                                "Remove `{}` from this check's exclusions in {}.",
+                                exclusion.entry,
+                                check.source_path.display()
+                            )],
+                            suggested_fix: None,
+                        });
+                    }
                 }
             }
         }

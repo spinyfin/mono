@@ -196,6 +196,35 @@ impl Finding {
     }
 }
 
+/// An exclusion entry declared by a check for stale-exclusion auditing.
+///
+/// Returned by `CheckEntry::declared_exclusions`. The host re-evaluates the
+/// exclusion via `CheckEntry::evaluate_exclusion` when a path in `depends_on`
+/// appears in the changeset.
+#[derive(Debug, Clone)]
+pub struct DeclaredExclusion {
+    /// The exclusion entry exactly as written in the CHECKS file.
+    pub entry: String,
+    /// Config-file-relative paths this exclusion depends on.
+    /// An empty vec means the exclusion is never audited (fail-safe).
+    pub depends_on: Vec<String>,
+}
+
+/// The verdict for a single exclusion re-evaluated as if it were not present.
+///
+/// Checks must fail safe: when staleness cannot be proven, return `Unknown`
+/// rather than `Stale`. A false stale finding trains authors to ignore the check;
+/// a missed one merely leaves a dead entry for next time.
+#[derive(Debug, Clone)]
+pub enum ExclusionStatus {
+    /// The exclusion is still required: the target still violates the rule.
+    LoadBearing,
+    /// The exclusion is no longer required. Contains a short human reason.
+    Stale(String),
+    /// Staleness could not be determined. Fail-safe default.
+    Unknown,
+}
+
 /// Declares how much of the repository a check needs to read.
 ///
 /// Returned by `#[check(access_scope = ...)]` and stored in `CheckDescriptor`.
