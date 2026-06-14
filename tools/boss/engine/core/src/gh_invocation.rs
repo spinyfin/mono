@@ -33,19 +33,18 @@
 //!
 //! ## Subprocess spawn helpers
 //!
-//! [`gh_output`] and [`run_gh`] are the shared spawn primitives for the
+//! [`gh_output`] and [`run_gh`] are re-exported from `boss_github::spawn`.
+//! The implementation lives in the shared `boss-github` crate so both the
 //! engine's direct `gh` shellouts (completion, merge polling, runner,
-//! merge-when-ready, design detection). Every call site spawns `gh` with
-//! the identical stdio envelope (stdin null, stdout+stderr piped,
-//! `kill_on_drop(true)`); only the post-spawn handling varies.
+//! merge-when-ready, design detection) and the Contents helper share one
+//! copy. Every call site spawns `gh` with the identical stdio envelope
+//! (stdin null, stdout+stderr piped, `kill_on_drop(true)`); only the
+//! post-spawn handling varies.
 
 use std::borrow::Cow;
-use std::process::Output;
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, anyhow};
 use regex::Regex;
-use tokio::process::Command;
 
 /// Strip the CONTENT of single- and double-quoted strings from `cmd`,
 /// preserving the quote characters themselves. This prevents phrases like
@@ -182,49 +181,11 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 }
 
 // ── Subprocess spawn helpers ──────────────────────────────────────────────────
-
-/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop envelope
-/// (stdin null, stdout+stderr piped, `kill_on_drop(true)`) and return its
-/// raw [`Output`].
-///
-/// This is the shared spawn primitive: it deliberately performs no
-/// exit-code or stderr handling so each call site keeps its own tailored
-/// logic on top (`with_context`, `.ok()?`, bool-on-error, JSON vs string
-/// parsing). The returned `io::Result` is the spawn result — callers apply
-/// their own context (`.with_context(...)`, `.ok()?`, `.map_err(...)`).
-pub(crate) async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
-    Command::new("gh")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-}
-
-/// Spawn `gh` via [`gh_output`] and return the trimmed stdout on success.
-/// `display` is a human-readable rendering of the command and is reused in
-/// both the spawn-failure context and the non-zero-exit error message
-/// (which also carries the captured stderr).
-///
-/// This is the happy-path convenience for sites that want a
-/// `Result<String>` with the conventional "spawn failed" / "command
-/// failed: <stderr>" error shape. Sites that need different exit-code
-/// handling (graceful degradation, JSON parsing) call [`gh_output`]
-/// directly.
-pub(crate) async fn run_gh(args: &[&str], display: &str) -> Result<String> {
-    let output = gh_output(args)
-        .await
-        .with_context(|| format!("failed to spawn `{display}`"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`{display}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
+//
+// The implementation lives in the shared `boss-github` crate so engine and
+// the Contents helper share one copy. Re-exported here as `pub(crate)` so
+// all existing call sites within `boss-engine` need no changes.
+pub(crate) use boss_github::spawn::{gh_output, run_gh};
 
 #[cfg(test)]
 mod tests {
