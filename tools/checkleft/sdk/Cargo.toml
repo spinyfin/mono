@@ -6,6 +6,7 @@ description = "Guest SDK for authoring checkleft checks as WebAssembly Component
 
 [dependencies]
 checkleft-check-sdk-macro = { path = "../sdk-macro" }
+globset = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
