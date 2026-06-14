@@ -36,14 +36,12 @@
 //! URL itself, so the poller works fine inside the engine's process
 //! (no workspace context needed).
 
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json;
-use tokio::process::Command;
 use tokio::sync::Notify;
 
 use crate::blocking_signal::SignalKind;
@@ -52,6 +50,7 @@ use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
+use crate::gh_invocation::gh_output;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
@@ -166,7 +165,8 @@ pub fn init(registry: &Registry) {
 /// The "four-state" naming in the design doc refers to the leaf
 /// values of [`PrLifecycleState`] — `Open(...)` (with its own
 /// mergeability + ci sub-state), `Merged`, `ClosedUnmerged`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PrLifecycleProbe {
     pub url: String,
     pub state: PrLifecycleState,
@@ -429,32 +429,26 @@ impl CommandMergeProbe {
 #[async_trait]
 impl MergeProbe for CommandMergeProbe {
     async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                pr_url,
-                "--json",
-                // `statusCheckRollup` is a nested array we parse in
-                // Rust (design §Q1's "Composing the CI signal into
-                // the same probe"); the previous TSV-via-jq shape
-                // can't carry it without escaping headaches, so we
-                // take the raw JSON document from gh instead.
-                // `reviewDecision` and `reviews` are added to capture
-                // the review-required state for UI indicators.
-                // NOTE: `mergeQueueEntry` is intentionally omitted here —
-                // `gh pr view --json` does not expose it in all `gh` versions.
-                // Merge-queue state is queried separately via `gh api graphql`
-                // in `fetch_merge_queue_status` below.
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
+        let output = gh_output(&[
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            // `statusCheckRollup` is a nested array we parse in
+            // Rust (design §Q1's "Composing the CI signal into
+            // the same probe"); the previous TSV-via-jq shape
+            // can't carry it without escaping headaches, so we
+            // take the raw JSON document from gh instead.
+            // `reviewDecision` and `reviews` are added to capture
+            // the review-required state for UI indicators.
+            // NOTE: `mergeQueueEntry` is intentionally omitted here —
+            // `gh pr view --json` does not expose it in all `gh` versions.
+            // Merge-queue state is queried separately via `gh api graphql`
+            // in `fetch_merge_queue_status` below.
+            "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
+        ])
+        .await
+        .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
         if !output.status.success() {
             let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
             // "could not resolve to a Resource" / 404 means the PR
@@ -517,14 +511,7 @@ async fn fetch_merge_queue_status(pr_url: &str) -> bool {
     let query = format!(
         r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
     );
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
     let output = match output {
         Ok(o) if o.status.success() => o,
         _ => return false,
@@ -568,14 +555,7 @@ async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeue
     let query = format!(
         r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) {{ nodes {{ ... on RemovedFromMergeQueueEvent {{ reason beforeCommit {{ oid }} }} }} }} }} }} }}"#
     );
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
     let output = match output {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
@@ -643,10 +623,7 @@ async fn fetch_commit_combined_state_for_empty_rollup(json_body: &str, pr_url: &
         .filter(|s| !s.is_empty())?;
     let repo = repo_from_pr_url(pr_url)?;
     let api_path = format!("repos/{repo}/commits/{head_sha}/status");
-    let output = Command::new("gh")
-        .args(["api", &api_path, "--jq", "{state: .state, total_count: .total_count}"])
-        .stdin(Stdio::null())
-        .output()
+    let output = gh_output(&["api", &api_path, "--jq", "{state: .state, total_count: .total_count}"])
         .await
         .ok()?;
     if !output.status.success() {
@@ -1211,7 +1188,8 @@ fn classify_state(
 }
 
 /// Outcome of one sweep. Used for logging and tests.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct SweepOutcome {
     pub merged: usize,
     pub conflict_flagged: usize,
