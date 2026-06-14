@@ -88,8 +88,22 @@ impl WorkDb {
         } else {
             false
         };
-        // Demote the task only if it is still `active`.
-        let task_demoted = {
+        // Demote the task only if it is still `active` AND no other live
+        // execution is attached to the same work item. When two executions
+        // are running simultaneously (the double-dispatch scenario), stopping
+        // one must not pull the kanban card back to To-Do while the other
+        // worker is still active.
+        let other_live: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM work_executions
+             WHERE work_item_id = ?1
+               AND id != ?2
+               AND status IN ('running', 'waiting_human')",
+            params![execution.work_item_id, execution_id],
+            |row| row.get(0),
+        )?;
+        let task_demoted = if other_live > 0 {
+            false
+        } else {
             let affected = tx.execute(
                 "UPDATE tasks
                  SET status             = 'todo',
