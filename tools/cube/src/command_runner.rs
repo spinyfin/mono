@@ -25,11 +25,7 @@ pub trait CommandRunner {
     /// [`CommandRunner::run`]; test fakes complete instantly, so they need no
     /// timeout handling. [`RealCommandRunner`] overrides this to enforce the
     /// bound against a real child process.
-    fn run_with_timeout(
-        &self,
-        invocation: &CommandInvocation,
-        _timeout: Duration,
-    ) -> Result<String, CubeError> {
+    fn run_with_timeout(&self, invocation: &CommandInvocation, _timeout: Duration) -> Result<String, CubeError> {
         self.run(invocation)
     }
 }
@@ -89,11 +85,7 @@ impl CommandRunner for RealCommandRunner {
         }
     }
 
-    fn run_with_timeout(
-        &self,
-        invocation: &CommandInvocation,
-        timeout: Duration,
-    ) -> Result<String, CubeError> {
+    fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args)
             .current_dir(&invocation.cwd)

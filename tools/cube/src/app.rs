@@ -1574,7 +1574,12 @@ fn run_workspace(
                 // lock). Best-effort: if the lease is already gone the reset
                 // and release below surface it as LeaseNotFound as before.
                 let _ = store.heartbeat_lease(&lease, Some(current_epoch_s()? + DEFAULT_LEASE_TTL_SECS));
-                match reset_workspace(runner, database_path, &workspace.workspace_path, &repo_record.main_branch) {
+                match reset_workspace(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                ) {
                     Ok(()) => {
                         // Opportunistically forget consumed boss/exec_* bookmarks.
                         // The fetch above already updated main, so do_fetch = false.
@@ -4371,9 +4376,7 @@ fn is_retryable_network_error(err: &CubeError) -> bool {
         CubeError::CommandTimedOut { .. } => true,
         CubeError::CommandFailed { stderr, .. } => {
             let lowered = stderr.to_ascii_lowercase();
-            TRANSIENT_NETWORK_SIGNATURES
-                .iter()
-                .any(|sig| lowered.contains(sig))
+            TRANSIENT_NETWORK_SIGNATURES.iter().any(|sig| lowered.contains(sig))
         }
         _ => false,
     }
@@ -5182,10 +5185,9 @@ mod tests {
 
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
-        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces,
-        is_retryable_network_error, is_stdin_path, render_boss_infra_exclude_block, repo_lock_path,
-        resolve_body_file, resolve_checkleft_bin, run_checkleft_gate, run_checkleft_gate_impl,
-        run_with_context, run_with_dependencies, upsert_managed_exclude,
+        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_retryable_network_error,
+        is_stdin_path, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin,
+        run_checkleft_gate, run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -10482,7 +10484,9 @@ mod tests {
             state: std::sync::Mutex::new(GateState::default()),
             cv: std::sync::Condvar::new(),
         });
-        let runner = BlockingFetchRunner { gate: Arc::clone(&gate) };
+        let runner = BlockingFetchRunner {
+            gate: Arc::clone(&gate),
+        };
         let lock_path = repo_lock_path("mono", Some(&database_path)).expect("lock path");
 
         std::thread::scope(|scope| {
