@@ -235,6 +235,20 @@ pub(super) async fn handle_create_attention(ctx: Dispatch, req: FrontendRequest)
         unreachable!()
     };
     {
+        // Dedup gate (design: notification-dedup-scoring.md §6). With the flag
+        // off (the default) this block is a no-op and behaviour is identical to
+        // today's exact-match dedup inside create_attention. When the flag is
+        // on, the LLM dedup decision will run here (before create_attention) and
+        // may redirect to a canonical item instead — not yet implemented.
+        if server_state.feature_flags.is_enabled("notification_dedup") {
+            // Sub-flag: include non-terminal work items in the comparison set.
+            let _include_work_items =
+                server_state.feature_flags.is_enabled("notification_dedup_taxonomy");
+            // Sub-flag: also evaluate sensibility (stale/moot/not-actionable).
+            let _check_sensibility =
+                server_state.feature_flags.is_enabled("notification_dedup_sensibility");
+            // TODO(P1203): build DedupInput, run decide_dedup, act on verdict.
+        }
         match work_db.create_attention(input) {
             Ok((attention, group)) => {
                 // Live-update the Notifications window + doc viewer on
