@@ -2847,6 +2847,22 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub ai_reviewing: bool,
+
+    /// Resolved doc-link state for a **project-less** docs-backed work
+    /// item — chiefly `kind = 'investigation'`. Parity with the design
+    /// card's doc-link icon, which is resolved from the parent
+    /// *project's* `design_doc_*` columns; an investigation has no
+    /// project, so the engine resolves the task's own `doc_*` columns
+    /// (populated by the doc detector from the PR's changed files) into
+    /// the same `ProjectDesignDocState` the kanban already renders.
+    ///
+    /// This is a derived projection set by the engine's `get_work_tree`
+    /// path (not a stored DB column, and never set for design tasks —
+    /// those keep using the per-project resolution path). `None` when
+    /// the item has no per-task pointer (the common case), which hides
+    /// the affordance exactly like `ProjectDesignDocState::NotSet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_link_state: Option<ProjectDesignDocState>,
 }
 
 fn is_false(b: &bool) -> bool {

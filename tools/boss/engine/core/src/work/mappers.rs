@@ -216,6 +216,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // in single-item query paths (get_work_item etc.) where the derived
         // projection is not computed.
         ai_reviewing: false,
+        // Resolved per-task doc-link state for project-less docs-backed
+        // items (investigations). Computed by attach_task_doc_links in
+        // get_work_tree from the task's `doc_*` columns; None everywhere
+        // else (the standard SELECT omits those columns).
+        doc_link_state: None,
     })
 }
 
