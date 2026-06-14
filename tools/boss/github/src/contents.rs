@@ -3,9 +3,7 @@
 //! Uses `gh api` rather than a direct HTTP call so that credentials are
 //! handled by the `gh` CLI installation (same pattern as the rest of Boss).
 
-use std::process::Stdio;
-
-use tokio::process::Command;
+use crate::spawn::gh_output;
 
 /// Fetch the raw content of `path` from `owner/repo` at `ref_name` using
 /// `gh api`.
@@ -19,23 +17,17 @@ use tokio::process::Command;
 /// URL-encode slashed branch / ref names like `boss/exec_*` correctly.
 pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str) -> anyhow::Result<Option<String>> {
     let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "GET",
-            "-f",
-            &format!("ref={ref_name}"),
-            "-H",
-            "Accept: application/vnd.github.raw",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await?;
+    let output = gh_output(&[
+        "api",
+        &endpoint,
+        "--method",
+        "GET",
+        "-f",
+        &format!("ref={ref_name}"),
+        "-H",
+        "Accept: application/vnd.github.raw",
+    ])
+    .await?;
 
     if output.status.success() {
         return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));

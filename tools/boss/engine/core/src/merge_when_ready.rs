@@ -10,12 +10,11 @@
 //! which of the three paths was taken so the caller can surface a precise
 //! status label (`enqueued` / `merged` / `auto_merge_enabled`).
 
-use std::process::Stdio;
-
 use anyhow::{Result, anyhow};
-use tokio::process::Command;
 
 use boss_github::pr_url::parse_pr_url_parts;
+
+use crate::gh_invocation::gh_output;
 
 /// Outcome of a successful [`gh_merge_when_ready`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,13 +48,7 @@ impl MergeAction {
 /// message when the merge was rejected (conflicts, auth failure, PR not
 /// open, etc.).
 pub async fn gh_merge_when_ready(pr_url: &str) -> Result<MergeAction> {
-    let output = Command::new("gh")
-        .args(["pr", "merge", "--auto", "--squash", pr_url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
+    let output = gh_output(&["pr", "merge", "--auto", "--squash", pr_url])
         .await
         .map_err(|e| anyhow!("failed to spawn `gh pr merge`: {e}"))?;
 
@@ -95,14 +88,7 @@ async fn probe_in_merge_queue(pr_url: &str) -> bool {
     let query = format!(
         r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
     );
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
     let Ok(out) = output else { return false };
     if !out.status.success() {
         return false;
@@ -117,14 +103,7 @@ async fn probe_in_merge_queue(pr_url: &str) -> bool {
 /// Returns `true` when the PR's GitHub state is `MERGED`.
 /// Returns `false` on any error (graceful degradation).
 async fn probe_is_merged(pr_url: &str) -> bool {
-    let output = Command::new("gh")
-        .args(["pr", "view", pr_url, "--json", "state", "--jq", ".state"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let output = gh_output(&["pr", "view", pr_url, "--json", "state", "--jq", ".state"]).await;
     let Ok(out) = output else { return false };
     if !out.status.success() {
         return false;

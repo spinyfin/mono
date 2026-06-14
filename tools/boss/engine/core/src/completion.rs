@@ -40,12 +40,10 @@
 //! [`WorkDb::mark_chore_pr_merged`] for any chore in `in_review`
 //! whose `pr_url` is now in a merged GitHub state.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use tokio::process::Command;
 
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
@@ -57,6 +55,7 @@ use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
+use crate::gh_invocation::run_gh;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
@@ -485,30 +484,6 @@ impl BranchVerifier for CommandBranchVerifier {
     async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         fetch_pr_body_cmd(repo_slug, pr_number).await
     }
-}
-
-/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop
-/// settings used throughout this module, returning the trimmed stdout on
-/// success. `display` is a human-readable rendering of the command and is
-/// reused in both the spawn-failure context and the non-zero-exit error
-/// message (which also carries the captured stderr).
-async fn run_gh(args: &[&str], display: &str) -> Result<String> {
-    let output = Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `{display}`"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`{display}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return

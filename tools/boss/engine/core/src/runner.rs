@@ -635,8 +635,6 @@ pub(crate) struct ComposedWorkerSpawn {
 /// network or parse error — callers fall back to the URL-only prompt
 /// gracefully without blocking the spawn.
 async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrReviewContext> {
-    use std::process::Stdio;
-
     #[derive(serde::Deserialize)]
     struct PrViewResponse {
         #[serde(rename = "baseRefOid")]
@@ -653,13 +651,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 
     let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
 
-    let output = tokio::process::Command::new("gh")
-        .args(["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
+    let output = crate::gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
         .await
         .ok()?;
 
@@ -699,17 +691,7 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
 async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
-    use std::process::Stdio;
-
-    let output = tokio::process::Command::new("gh")
-        .args(["pr", "diff", pr_url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
+    let output = crate::gh_invocation::gh_output(&["pr", "diff", pr_url]).await.ok()?;
 
     if !output.status.success() {
         tracing::warn!(
