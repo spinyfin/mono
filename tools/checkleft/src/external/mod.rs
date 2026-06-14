@@ -171,9 +171,18 @@ pub use provider::{
 };
 mod component_bindings;
 mod runtime;
-pub use runtime::{ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
+pub use runtime::{
+    ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor, cache_file_name,
+    precompile_into_cache_dir,
+};
 pub mod sandbox;
 pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
+
+/// Test-only helpers shared across the component-runtime test modules
+/// (`runtime::tests`, `runner::tests`). Gated on `#[cfg(test)]` so the
+/// `runfiles` dependency it uses is only pulled in for `checkleft_lib_test`.
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)

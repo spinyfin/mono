@@ -120,3 +120,71 @@ rust_wasm_component = rule(
     },
     toolchains = ["//tools/checkleft/wasm:toolchain_type"],
 )
+
+# ── precompiled_cwasm_dir ─────────────────────────────────────────────────────
+
+def _precompiled_cwasm_dir_impl(ctx):
+    """Precompile each input wasm component to an AOT `.cwasm` fixture.
+
+    Runs the host `precompile_cwasm` tool over every `components` entry, writing
+    each result into a single output directory under its canonical cache-key
+    filename (`{cache_key}.cwasm`). The directory is therefore a ready-to-use
+    checkleft `.cwasm` cache: a test pointed at it (via
+    `DefaultExternalCheckExecutor::new_with_cache`, or the
+    `CHECKLEFT_CWASM_CACHE_DIR` override) deserializes the AOT artifact instead
+    of JIT-compiling the component at runtime.
+
+    The filename is content-derived (it folds in the artifact sha256, wasmtime
+    version, engine config and host target), so it cannot be declared at analysis
+    time — hence a TreeArtifact (`declare_directory`) output whose contents are
+    produced by the action.
+    """
+    out_dir = ctx.actions.declare_directory(ctx.label.name)
+
+    args = ctx.actions.args()
+    args.add(out_dir.path)
+
+    inputs = []
+    for comp in ctx.attr.components:
+        wasm = comp[WasmComponentInfo].component
+        args.add(wasm)
+        inputs.append(wasm)
+
+    ctx.actions.run(
+        executable = ctx.executable._precompile_tool,
+        arguments = [args],
+        inputs = depset(inputs),
+        outputs = [out_dir],
+        mnemonic = "PrecompileCwasm",
+        progress_message = "Precompiling .cwasm AOT fixtures for %{label}",
+    )
+
+    return [DefaultInfo(files = depset([out_dir]))]
+
+# The precompiled `.cwasm` is wasmtime-version + engine-config + host-target
+# specific. The `_precompile_tool` runs in the exec configuration, so its target
+# (host) must match the configuration the consuming test runs in for the fixture
+# to be a cache hit. For ordinary (non-cross-compiled) `bazel test` runs exec ==
+# target == host, so they match; a mismatch degrades safely to a cache miss
+# (the runtime would JIT) rather than an incorrect deserialize, because the
+# cache key already encodes the target triple.
+precompiled_cwasm_dir = rule(
+    implementation = _precompiled_cwasm_dir_impl,
+    doc = (
+        "Precompiles `rust_wasm_component` outputs to AOT `.cwasm` fixtures " +
+        "keyed identically to checkleft's runtime cache, for use as host-built " +
+        "test data."
+    ),
+    attrs = {
+        "components": attr.label_list(
+            doc = "rust_wasm_component targets whose .wasm outputs are precompiled to .cwasm.",
+            providers = [WasmComponentInfo],
+            mandatory = True,
+        ),
+        "_precompile_tool": attr.label(
+            default = "//tools/checkleft:precompile_cwasm",
+            executable = True,
+            cfg = "exec",
+        ),
+    },
+)

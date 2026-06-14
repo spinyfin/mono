@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("//tools/checkleft/musl:transition.bzl", "musl_binary")
+load("//tools/checkleft/wasm:defs.bzl", "precompiled_cwasm_dir")
 
 exports_files(["Cargo.toml"])
 
@@ -59,6 +60,46 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
+# Host tool: precompile each bundled wasm check component to an AOT `.cwasm`
+# whose filename is the canonical runtime cache key (src/external/runtime/
+# cwasm_cache.rs). Reuses checkleft_lib's `precompile_into_cache_dir`, so the
+# wasmtime engine config and cache-key axes are guaranteed identical to the
+# runtime — a mismatch would silently re-open the JIT path. Consumed by the
+# precompiled_cwasm_dir rule below.
+rust_binary(
+    name = "precompile_cwasm",
+    srcs = ["precompile_cwasm.rs"],
+    crate_root = "precompile_cwasm.rs",
+    edition = "2024",
+    # Used only as the implicit `_precompile_tool` of `precompiled_cwasm_dir`,
+    # whose rule is defined in //tools/checkleft/wasm. Bazel checks implicit-dep
+    # visibility against the rule's definition package, so that package needs to
+    # see it; same-package (//tools/checkleft) use is always allowed.
+    visibility = ["//tools/checkleft/wasm:__pkg__"],
+    deps = [
+        ":checkleft_lib",
+    ] + all_crate_deps(normal = True),
+)
+
+# Build-time AOT `.cwasm` fixtures for the bundled wasm check components, keyed to
+# the runtime cache axes (artifact sha256 / wasmtime version / engine config /
+# host target). Staged as `data` for checkleft_lib_test so the heavy
+# `rust/giant-structs` tests deserialize the precompiled artifact (~20 ms) rather
+# than JIT-compiling the component at runtime (~10 s in a debug test binary, and
+# stacking up under test parallelism) — the cost that approached the 60 s
+# small-test timeout. See
+# docs/investigations/checkleft-lib-test-wasm-compile-timeout.md.
+#
+# Host-built, not committed: the `.cwasm` is not portable across wasmtime
+# version / engine config / target, all of which the cache key already pins.
+precompiled_cwasm_dir(
+    name = "precompiled_cwasm",
+    components = [
+        "//tools/checkleft/checks/file/size:file_size_check_component",
+        "//tools/checkleft/checks/rust/giant-structs:rust_giant_structs_use_builder_component",
+    ],
+)
+
 # Statically-linked Linux binary via musl cross-compilation.
 # Builds checkleft for x86_64-unknown-linux-musl using the musl Rust toolchain
 # registered in MODULE.bazel plus the hermetic_cc_toolchain (Zig CC) for any
@@ -95,8 +136,20 @@ rust_test(
     # declarative pipeline can run hermetically (no nested bazel) and be compared
     # against the built-in BuildifierCheck. parity_e2e.rs resolves it from the
     # CHECKLEFT_E2E_BUILDIFIER runfiles path via @rules_rust//rust/runfiles.
-    data = ["@buildifier_prebuilt//:buildifier"],
-    env = {"CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)"},
+    #
+    # :precompiled_cwasm stages the build-time AOT `.cwasm` fixtures; the heavy
+    # rust/giant-structs tests point their executor cache at this directory
+    # (resolved from CHECKLEFT_PRECOMPILED_CWASM_DIR via runfiles in
+    # external::test_support) so they deserialize the component instead of
+    # JIT-compiling it at runtime.
+    data = [
+        ":precompiled_cwasm",
+        "@buildifier_prebuilt//:buildifier",
+    ],
+    env = {
+        "CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
+        "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
+    },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

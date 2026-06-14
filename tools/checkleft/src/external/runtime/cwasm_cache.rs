@@ -243,6 +243,63 @@ fn compute_cache_key(artifact_sha256: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Lowercase hex SHA-256 of a wasm component's bytes — the `artifact_sha256`
+/// axis of the cache key. Identical to the digest the runtime computes
+/// (`runtime::sha256_hex`) and to the one `bundled.rs` records, so the
+/// build-time fixture and the runtime lookup land on the same cache entry.
+fn artifact_sha256_hex(component_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(component_bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// The canonical cache-entry filename (`{cache_key}.cwasm`) for a wasm
+/// component's bytes — exactly what [`ComponentAotCache::load_or_compile`] looks
+/// up at runtime.
+///
+/// This is the single source of truth shared by the build-time precompile tool
+/// (which writes the fixture under this name) and the runtime cache (which reads
+/// it). Because it folds in every cache-key axis (artifact sha256, wasmtime
+/// version, engine config, host target), any drift on one of those axes shows up
+/// as a *missing fixture* — a loud parity-test failure — rather than a silent
+/// fall-back to JIT compilation.
+pub fn cache_file_name(component_bytes: &[u8]) -> String {
+    format!("{}.cwasm", compute_cache_key(&artifact_sha256_hex(component_bytes)))
+}
+
+/// Precompile a wasm component to an AOT `.cwasm` and write it into `cache_dir`
+/// under the canonical [`cache_file_name`], using the *same* wasmtime engine
+/// configuration as the runtime ([`super::build_wasmtime_engine`]).
+///
+/// This is the host-side build-tool entry point for the `checkleft_lib_test`
+/// wasm-compile-timeout fix: a Bazel rule runs it over each bundled component so
+/// the test — pointed at `cache_dir` via
+/// [`super::DefaultExternalCheckExecutor::new_with_cache`] or the
+/// `CHECKLEFT_CWASM_CACHE_DIR` override — deserializes the precompiled artifact
+/// (~20 ms) instead of JIT-compiling it (~10 s in a debug build, and stacking up
+/// under test parallelism).
+///
+/// Engine-config parity is guaranteed by reusing `build_wasmtime_engine`
+/// directly; decoupling it would silently produce a `.cwasm` the runtime cannot
+/// deserialize, re-opening the JIT path. The produced artifact is
+/// wasmtime-version + engine-config + host-target specific (all encoded in the
+/// cache key), so it is a host-build artifact, never a portable committed blob.
+pub fn precompile_into_cache_dir(cache_dir: &Path, component_bytes: &[u8]) -> Result<PathBuf> {
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create .cwasm output directory {}", cache_dir.display()))?;
+    let engine = super::build_wasmtime_engine()?;
+    let cache_path = cache_dir.join(cache_file_name(component_bytes));
+    let cwasm = from_wasmtime(engine.precompile_component(component_bytes))
+        .context("failed to precompile wasm component for build-time .cwasm fixture")?;
+    write_atomically(&cache_path, &cwasm)
+        .with_context(|| format!("failed to write precompiled .cwasm to {}", cache_path.display()))?;
+    Ok(cache_path)
+}
+
 /// Write `bytes` to `dest` atomically by writing to a sibling temp file then
 /// renaming.  On POSIX, rename(2) is atomic for same-filesystem paths; both
 /// the dest and the temp file are in `self.dir` so they share the filesystem.
@@ -493,6 +550,51 @@ mod tests {
 
         let mtime_after = cwasm_path.metadata().unwrap().modified().unwrap();
         assert_eq!(mtime_before, mtime_after, "cache hit must not rewrite the .cwasm file");
+    }
+
+    #[test]
+    fn precompile_into_cache_dir_writes_canonical_key() {
+        // The build-time fixture must be written under the exact filename the
+        // runtime cache looks up; otherwise the runtime cold-misses and JITs.
+        let component_bytes = wat::parse_str("(component)").expect("parse minimal component");
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("cwasm");
+
+        let written = precompile_into_cache_dir(&dir, &component_bytes).expect("precompile");
+        assert_eq!(
+            written.file_name().and_then(|n| n.to_str()),
+            Some(cache_file_name(&component_bytes).as_str()),
+            "fixture must be named by the canonical cache key"
+        );
+        assert!(written.exists(), "precompiled .cwasm must be written to the cache dir");
+    }
+
+    #[test]
+    fn runtime_cache_hits_precompiled_fixture_without_recompiling() {
+        // End-to-end parity: a fixture written by precompile_into_cache_dir must
+        // be a HIT for a runtime ComponentAotCache opened on the same dir, using
+        // the same engine config the runtime builds — proving the deserialize
+        // path is taken, not a fresh compile.
+        let component_bytes = wat::parse_str("(component)").expect("parse minimal component");
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("cwasm");
+
+        let written = precompile_into_cache_dir(&dir, &component_bytes).expect("precompile");
+        let mtime_before = written.metadata().unwrap().modified().unwrap();
+
+        // `super::super` is the `runtime` module that owns the engine builder.
+        let engine = super::super::build_wasmtime_engine().expect("runtime engine");
+        let sha256 = artifact_sha256_hex(&component_bytes);
+        let cache = ComponentAotCache::open(&dir).expect("open cache on fixture dir");
+        cache
+            .load_or_compile(&engine, "fixture-pkg", &component_bytes, &sha256)
+            .expect("runtime must deserialize the precompiled fixture");
+
+        let mtime_after = written.metadata().unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "runtime must deserialize the precompiled fixture, not recompile/rewrite it"
+        );
     }
 
     #[test]
