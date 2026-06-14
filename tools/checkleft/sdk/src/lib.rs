@@ -25,6 +25,8 @@
 
 // Re-export the proc macros so check authors only need `checkleft-check-sdk`.
 pub use checkleft_check_sdk_macro::{check, export_checks};
+// Re-export globset so check authors can compile glob patterns without an extra dep.
+pub use globset;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -95,6 +97,39 @@ impl CheckInput {
     /// `#[derive(Deserialize)]` config struct via serde.
     pub fn config<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(&self.config_json)
+    }
+
+    /// Returns `true` if `path` lies within the config subtree **and** matches
+    /// any pattern in `globs`.
+    ///
+    /// This encapsulates the `config_dir` strip-prefix logic so check authors
+    /// don't have to re-implement it. The rules are:
+    ///
+    /// - When `config_dir` is empty (repo-root CHECKS file), `path` is matched
+    ///   directly against `globs`.
+    /// - Otherwise `path` must start with `config_dir/`; the prefix is stripped
+    ///   before matching. Paths outside the subtree are never excluded.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let glob = globset::GlobBuilder::new("*.rs").build().unwrap();
+    /// let globs = globset::GlobSet::builder().add(glob).build().unwrap();
+    /// // Only files within the config subtree match.
+    /// assert!(input.is_excluded("tools/checkleft/foo.rs", &globs));
+    /// assert!(!input.is_excluded("other/foo.rs", &globs));
+    /// ```
+    pub fn is_excluded(&self, path: &str, globs: &globset::GlobSet) -> bool {
+        let relative = if self.config_dir.is_empty() {
+            path
+        } else {
+            let prefix = format!("{}/", self.config_dir);
+            match path.strip_prefix(prefix.as_str()) {
+                Some(r) => r,
+                None => return false,
+            }
+        };
+        globs.is_match(relative)
     }
 
     /// Construct a `CheckInput` from raw WIT-lifted parts.
@@ -346,6 +381,47 @@ mod tests {
         let input = empty_input();
         let cfg: Cfg = input.config().unwrap();
         assert!(!cfg.enabled);
+    }
+
+    fn make_globset(patterns: &[&str]) -> globset::GlobSet {
+        let mut builder = globset::GlobSet::builder();
+        for p in patterns {
+            builder.add(globset::Glob::new(p).unwrap());
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn is_excluded_empty_config_dir_matches_path_directly() {
+        let input = empty_input(); // config_dir = ""
+        let globs = make_globset(&["*.rs"]);
+        assert!(input.is_excluded("foo.rs", &globs));
+        assert!(!input.is_excluded("foo.txt", &globs));
+    }
+
+    #[test]
+    fn is_excluded_matches_within_config_dir_subtree() {
+        let mut input = empty_input();
+        input.config_dir = "tools/checkleft".to_owned();
+        let globs = make_globset(&["*.rs"]);
+        assert!(input.is_excluded("tools/checkleft/foo.rs", &globs));
+    }
+
+    #[test]
+    fn is_excluded_does_not_match_outside_config_dir_subtree() {
+        let mut input = empty_input();
+        input.config_dir = "tools/checkleft".to_owned();
+        let globs = make_globset(&["*.rs"]);
+        assert!(!input.is_excluded("other/foo.rs", &globs));
+        // Also: a path that is a prefix of config_dir but not within it.
+        assert!(!input.is_excluded("tools/foo.rs", &globs));
+    }
+
+    #[test]
+    fn is_excluded_no_match_empty_globset() {
+        let input = empty_input();
+        let globs = make_globset(&[]);
+        assert!(!input.is_excluded("foo.rs", &globs));
     }
 
     #[test]
