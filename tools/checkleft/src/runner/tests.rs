@@ -43,6 +43,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
         _changeset: &ChangeSet,
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
+        _config_dir: &std::path::Path,
     ) -> Result<CheckResult> {
         self.seen_packages
             .lock()
