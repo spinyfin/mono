@@ -568,7 +568,8 @@ pub(crate) fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGr
 ///  answer_state(4), created_at(5), answered_at(6),
 ///  question_type(7), prompt_text(8), choice_options(9), answer(10),
 ///  proposed_name(11), proposed_description(12), proposed_effort(13),
-///  proposed_work_kind(14), rationale(15), confidence_source(16)`.
+///  proposed_work_kind(14), rationale(15), confidence_source(16),
+///  score(17), linked_work_item_id(18)`.
 #[allow(dead_code)] // prepared for attention query handlers (app.rs stubs)
 pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
@@ -589,6 +590,8 @@ pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
         proposed_work_kind: row.get(14)?,
         rationale: row.get(15)?,
         confidence_source: row.get(16)?,
+        score: row.get(17)?,
+        linked_work_item_id: row.get(18)?,
     })
 }
 
