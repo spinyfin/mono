@@ -143,12 +143,19 @@ pub struct WorkerSetupInput {
     pub worker_kind: WorkerKind,
 }
 
-/// Render the worker-facing CLAUDE.md.
+/// Render the worker-facing agent-rules file (CLAUDE.md or equivalent).
 ///
-/// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific CLAUDE.md
+/// `preamble` is supplied by the driver via
+/// [`crate::driver::AgentDriver::agent_rules_preamble`] and names the
+/// hook mechanism and the config-dir gitignore contract.
+/// `config_dir` is the driver's `DriverDescriptor::config_dir`
+/// (e.g. `".claude"`) used to name the gitignored directory in the VCS
+/// instructions.
+///
+/// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific file
 /// that prominently states the read-only mandate and omits PR-creation
 /// instructions (reviewers never open or update PRs).
-pub fn render_claude_md(input: &WorkerSetupInput) -> String {
+pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer {
         return crate::pr_review::render_reviewer_claude_md(
             &input.lease_id,
@@ -172,9 +179,7 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     format!(
         "# Boss worker rules\n\
          \n\
-         You are running inside a Boss-managed worker session. The engine\n\
-         spawned you in a leased cube workspace and observes this session\n\
-         via claude hooks.\n\
+         {preamble}\n\
          \n\
          ## Pull requests are the deliverable\n\
          \n\
@@ -213,9 +218,9 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
            `jj git push -b <bookmark>` to publish.\n\
          - Never `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
-         - `.claude/` is gitignored by the engine. Do not force-track\n\
+         - `{config_dir}/` is gitignored by the engine. Do not force-track\n\
            or commit anything inside it (no `--force`,\n\
-           no `jj file track .claude/...`).\n\
+           no `jj file track {config_dir}/...`).\n\
          \n\
          ### Commit messages must be inline\n\
          \n\
@@ -826,11 +831,11 @@ fn shell_escape(value: &str) -> String {
 }
 
 /// Single-pattern gitignore body. `*` matches every entry in
-/// `.claude/` — including dotfiles and the `.gitignore` itself, since
-/// gitignore globs apply to leading-dot names. Both git and jj (with a
-/// git backend) honor this in-tree gitignore, so worker setup files
-/// stop appearing in `jj status` / `git status`.
-const CLAUDE_DIR_GITIGNORE: &str = "*\n";
+/// the driver's config dir — including dotfiles and the `.gitignore`
+/// itself, since gitignore globs apply to leading-dot names. Both git
+/// and jj (with a git backend) honor this in-tree gitignore, so worker
+/// setup files stop appearing in `jj status` / `git status`.
+pub(crate) const CLAUDE_DIR_GITIGNORE: &str = "*\n";
 
 /// Subdirectory (under the per-user system temp dir) that holds the
 /// worker settings files. Lives outside every workspace so the
@@ -1523,9 +1528,17 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// The settings file is never written into the workspace tree — see the
 /// module docs for why dropping session config into a VCS-visible path
 /// (`settings.json` or `settings.local.json`) is the bug this avoids.
-pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFiles> {
-    let claude_dir = input.workspace_path.join(".claude");
-    std::fs::create_dir_all(&claude_dir)?;
+///
+/// `driver` supplies the config-dir name, the agent-rules filename, and
+/// the hook-enforcement preamble (WorkspaceProvisioning + PromptComposition
+/// capabilities). Pass [`crate::driver::ClaudeDriver`] for the standard case.
+pub fn write_workspace_files(
+    input: &WorkerSetupInput,
+    driver: &dyn crate::driver::AgentDriver,
+) -> io::Result<WrittenFiles> {
+    let descriptor = driver.descriptor();
+    let config_dir = input.workspace_path.join(descriptor.config_dir);
+    std::fs::create_dir_all(&config_dir)?;
 
     // Reused (warm-cached) workspaces can carry a stale `.claude/
     // settings.json` written into the tree by an older engine build.
@@ -1535,17 +1548,18 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
     // the leak before the worker session reads its settings.
     purge_leaked_worker_hooks(&input.workspace_path);
 
-    // Pre-accept Claude Code's first-run folder-trust dialog for this
+    // Pre-accept the driver's first-run folder-trust dialog for this
     // workspace. Boss/cube created the workspace for the agent, so it is
     // trusted by construction; without this the headless worker wedges on
     // the dialog (no human to press "1"). Best-effort — see
     // [`pre_trust_workspace`].
     pre_trust_workspace(&input.workspace_path);
 
-    let claude_md_path = claude_dir.join("CLAUDE.md");
-    let gitignore_path = claude_dir.join(".gitignore");
+    let agent_rules_path = config_dir.join(descriptor.agent_rules_filename);
+    let gitignore_path = config_dir.join(".gitignore");
 
-    std::fs::write(&claude_md_path, render_claude_md(input))?;
+    let preamble = driver.agent_rules_preamble();
+    std::fs::write(&agent_rules_path, render_claude_md(input, preamble, descriptor.config_dir))?;
     std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)?;
 
     let settings_path = worker_settings_path(&input.workspace_path);
@@ -1560,7 +1574,7 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
     std::fs::write(&settings_path, render_settings_json(input))?;
 
     Ok(WrittenFiles {
-        claude_md_path,
+        claude_md_path: agent_rules_path,
         settings_path,
         gitignore_path,
     })
