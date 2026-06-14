@@ -2247,13 +2247,24 @@ fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dy
 /// override.
 ///
 /// Fail-open by construction: when no checkleft binary is found the gate
-/// is a no-op (the repo may not use checkleft, or the repobin-installed
-/// `bin/checkleft` may not be present in this checkout). The only refusal
-/// is a checkleft that actually reported errors. The binary is resolved
-/// from `CUBE_CHECKLEFT_BIN` (an override) then `<cwd>/bin/checkleft` (the
-/// repobin-installed path).
+/// is a no-op, but a clear warning is emitted to stderr so the skip is
+/// visible rather than silent. The only refusal is a checkleft that
+/// actually reported errors. Resolution order: see [`resolve_checkleft_bin`].
 fn run_checkleft_gate(cwd: &Path) -> Result<()> {
-    let Some(checkleft) = resolve_checkleft_bin(cwd) else {
+    run_checkleft_gate_impl(cwd, resolve_checkleft_bin(cwd))
+}
+
+/// Inner implementation: runs `checkleft run` using the given binary, or
+/// emits a skip warning and returns `Ok(())` when `checkleft` is `None`.
+/// Separated from [`run_checkleft_gate`] so tests can inject a pre-resolved
+/// binary without modifying global PATH.
+fn run_checkleft_gate_impl(cwd: &Path, checkleft: Option<PathBuf>) -> Result<()> {
+    let Some(checkleft) = checkleft else {
+        eprintln!(
+            "cube: checkleft not found via CUBE_CHECKLEFT_BIN, {}/bin/checkleft, or PATH \
+             — push gate SKIPPED",
+            cwd.display()
+        );
         return Ok(());
     };
 
@@ -2288,16 +2299,21 @@ fn run_checkleft_gate(cwd: &Path) -> Result<()> {
 }
 
 /// Resolve the checkleft binary to run for the push gate. Returns `None`
-/// when no checkleft is available (the gate then no-ops). Resolution
-/// order: `CUBE_CHECKLEFT_BIN` env override → `<cwd>/bin/checkleft` (the
-/// repobin-installed path).
+/// when no checkleft is available (the gate then no-ops with a warning).
+/// Resolution order mirrors the Layer-1 push-guard resolver:
+///   1. `CUBE_CHECKLEFT_BIN` env override (explicit path)
+///   2. `<cwd>/bin/checkleft` (repobin-installed artifact)
+///   3. `checkleft` on PATH (installed globally or via PATH-based repobin)
 fn resolve_checkleft_bin(cwd: &Path) -> Option<PathBuf> {
     if let Some(override_path) = std::env::var_os("CUBE_CHECKLEFT_BIN") {
         let path = PathBuf::from(override_path);
         return path.is_file().then_some(path);
     }
     let candidate = cwd.join("bin").join("checkleft");
-    candidate.is_file().then_some(candidate)
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    which::which("checkleft").ok()
 }
 
 /// Create or reuse a GitHub PR for the current jj bookmark.
@@ -4942,8 +4958,8 @@ mod tests {
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
         current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_stdin_path,
-        render_boss_infra_exclude_block, resolve_body_file, run_checkleft_gate, run_with_context,
-        run_with_dependencies, upsert_managed_exclude,
+        render_boss_infra_exclude_block, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
+        run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -4960,13 +4976,71 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
     }
 
+    /// Write an executable fake `checkleft` directly inside `dir` (not in a `bin/`
+    /// subdirectory) so it can be placed on PATH without being the `bin/checkleft`
+    /// repobin-artifact path.
+    fn write_fake_checkleft_to_dir(dir: &std::path::Path, exit_code: i32, stdout: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("checkleft");
+        let script = format!("#!/bin/sh\ncat <<'CHECKLEFT_EOF'\n{stdout}\nCHECKLEFT_EOF\nexit {exit_code}\n");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    /// Mutex serialising tests that mutate PATH or CUBE_CHECKLEFT_BIN.
+    /// env::set_var is not thread-safe; holding this lock prevents races
+    /// between concurrent test threads.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that saves PATH and CUBE_CHECKLEFT_BIN on construction and
+    /// restores them on drop. Always acquire `ENV_MUTEX` first.
+    struct CheckleftEnvGuard {
+        orig_path: Option<std::ffi::OsString>,
+        orig_cube_bin: Option<std::ffi::OsString>,
+    }
+
+    impl CheckleftEnvGuard {
+        fn with_path(new_path: &std::ffi::OsStr) -> Self {
+            let orig_path = std::env::var_os("PATH");
+            let orig_cube_bin = std::env::var_os("CUBE_CHECKLEFT_BIN");
+            unsafe {
+                std::env::set_var("PATH", new_path);
+                std::env::remove_var("CUBE_CHECKLEFT_BIN");
+            }
+            CheckleftEnvGuard {
+                orig_path,
+                orig_cube_bin,
+            }
+        }
+    }
+
+    impl Drop for CheckleftEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.orig_path {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+                match &self.orig_cube_bin {
+                    Some(v) => std::env::set_var("CUBE_CHECKLEFT_BIN", v),
+                    None => {}
+                }
+            }
+        }
+    }
+
     #[test]
-    fn checkleft_gate_passes_when_no_checkleft_binary() {
-        // A workspace without bin/checkleft must not block the push.
+    fn checkleft_gate_is_skipped_when_no_checkleft_anywhere() {
+        // When there is no bin/checkleft, no CUBE_CHECKLEFT_BIN, and no
+        // checkleft on PATH, the gate must emit a warning and proceed fail-open.
         let dir = TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_path(std::ffi::OsStr::new(""));
         assert!(
             run_checkleft_gate(dir.path()).is_ok(),
-            "gate must be a no-op when no checkleft binary is present",
+            "gate must be a no-op when no checkleft binary is present anywhere",
         );
     }
 
@@ -4990,6 +5064,54 @@ mod tests {
         };
         assert!(msg.contains("error[rustfmt]"), "refusal must echo the findings: {msg}");
         assert!(msg.contains("BYPASS_"), "refusal must include bypass guidance: {msg}");
+    }
+
+    #[test]
+    fn checkleft_gate_uses_path_fallback_and_blocks_on_errors() {
+        // Regression test: when bin/checkleft is absent and CUBE_CHECKLEFT_BIN is
+        // not set, the gate must find checkleft on PATH and block when that binary
+        // reports errors. This covers the cube workspace case where repobin-install
+        // has not run but checkleft is globally available (e.g. via ~/bin).
+        //
+        // To avoid leaking PATH mutations to concurrently-running tests, we:
+        //   1. Hold ENV_MUTEX for only as long as it takes to resolve the binary.
+        //   2. Call run_checkleft_gate_impl directly with the pre-resolved binary;
+        //      no PATH modification escapes beyond the resolve step.
+        let workspace = TempDir::new().unwrap();
+        let path_dir = TempDir::new().unwrap();
+        write_fake_checkleft_to_dir(path_dir.path(), 1, "error[rustfmt]: file needs formatting");
+
+        // Briefly acquire the lock, prepend path_dir to PATH, resolve the binary,
+        // then release the lock (CheckleftEnvGuard restores PATH on drop).
+        let resolved = {
+            let _lock = ENV_MUTEX.lock().unwrap();
+            let new_path = std::env::join_paths(
+                std::iter::once(path_dir.path().to_path_buf())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+            )
+            .unwrap();
+            let _env = CheckleftEnvGuard::with_path(&new_path);
+            // workspace has no bin/checkleft; CUBE_CHECKLEFT_BIN is cleared by guard.
+            // So resolve_checkleft_bin must fall through to the PATH fallback.
+            resolve_checkleft_bin(workspace.path())
+        }; // lock released and PATH restored here
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(path_dir.path().join("checkleft").as_path()),
+            "PATH fallback must resolve the fake checkleft from the prepended dir",
+        );
+
+        // Gate execution is independent of PATH; inject the resolved binary.
+        let err = run_checkleft_gate_impl(workspace.path(), resolved)
+            .expect_err("gate must block when PATH checkleft reports errors");
+        let CubeError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("error[rustfmt]"),
+            "refusal must echo the PATH-checkleft findings: {msg}",
+        );
     }
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
