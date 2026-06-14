@@ -39,6 +39,11 @@ impl WorkDb {
     /// to `in_review` by `on_stop` in a concurrent path) the demote is
     /// a no-op.
     ///
+    /// The demote is ALSO a no-op when `execution_id` is not the work
+    /// item's current (latest) execution — i.e. it has been superseded by
+    /// a redispatch. Stopping a superseded execution must never drag the
+    /// row (and its live replacement worker) back to `todo` (defect 4).
+    ///
     /// Returns `(execution_cancelled, task_demoted)` so callers can
     /// log what actually changed.
     /// Cancel a non-terminal execution without touching the task status.
@@ -88,7 +93,23 @@ impl WorkDb {
         } else {
             false
         };
-        // Demote the task only if it is still `active`.
+        // Demote the task only if it is still `active` AND this execution
+        // is still the work item's CURRENT (latest) execution.
+        //
+        // Defect 4 — superseded-stop must be a no-op for row status.
+        // After a false-positive stale-reconcile cancel, the row gets
+        // redispatched to a NEW execution while the OLD one's process may
+        // still be alive. An operator (or a teardown path) then stops the
+        // OLD execution. Unconditionally demoting the row to `todo` here
+        // yanks the actively-working REPLACEMENT worker's row out from
+        // under it: its eventual Stop never reconciles (pr_url stays null,
+        // the card sits in backlog at risk of a THIRD dispatch). Key the
+        // row's lifecycle to its current execution: the "latest execution"
+        // subquery is the row's implicit current-execution pointer, and a
+        // redispatch INSERT moves that pointer atomically by virtue of a
+        // newer created_at. A stop targeting a superseded execution finds
+        // the subquery no longer equal to `execution_id` and leaves the
+        // row (and the live replacement) untouched.
         let task_demoted = {
             let affected = tx.execute(
                 "UPDATE tasks
@@ -97,8 +118,14 @@ impl WorkDb {
                      updated_at         = ?2
                  WHERE id              = ?1
                    AND status          = 'active'
-                   AND deleted_at      IS NULL",
-                params![execution.work_item_id, now],
+                   AND deleted_at      IS NULL
+                   AND ?3 = (
+                       SELECT id FROM work_executions
+                       WHERE work_item_id = ?1
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )",
+                params![execution.work_item_id, now, execution_id],
             )?;
             affected > 0
         };

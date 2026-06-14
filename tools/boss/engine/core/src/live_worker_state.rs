@@ -361,6 +361,20 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.spawned_at.insert(slot_id, epoch_secs);
     }
+
+    /// Override `last_event_at` for `slot_id` to an arbitrary ISO-8601
+    /// string. Test seam for reproducing a *recycled-slot* live state —
+    /// a slot whose `run_id` was replaced for the current execution but
+    /// whose `last_event_at` still carries a prior run's timestamp. Only
+    /// available in tests; production stamps this wall-clock in
+    /// `apply_event`.
+    #[cfg(test)]
+    pub fn set_last_event_at_for_test(&self, slot_id: u8, last_event_at: impl Into<String>) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if let Some(state) = guard.by_slot.get_mut(&slot_id) {
+            state.last_event_at = Some(last_event_at.into());
+        }
+    }
 }
 
 /// True iff `activity` indicates the worker is no longer attached
