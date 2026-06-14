@@ -10,6 +10,7 @@
 //! the one-time developer setup instructions.
 
 pub mod contents;
+pub mod gh_runner;
 pub mod pr_url;
 pub mod spawn;
 
