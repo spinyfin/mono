@@ -22,7 +22,7 @@ use super::{
 };
 
 mod cwasm_cache;
-pub use cwasm_cache::ComponentAotCache;
+pub use cwasm_cache::{ComponentAotCache, cache_file_name, precompile_into_cache_dir};
 
 /// Base wall-clock budget for component-v1 checks (5 seconds). Used as the
 /// fixed component of the proportional timeout formula when no explicit

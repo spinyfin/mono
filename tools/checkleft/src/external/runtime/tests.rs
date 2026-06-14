@@ -12,9 +12,8 @@ use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
 use super::{
-    BASE_COMPONENT_TIMEOUT_MS, DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor,
-    HOST_CEILING_TIMEOUT_MS, HostState, MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine,
-    is_interrupt_error, resolve_component_limits,
+    BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
+    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine, is_interrupt_error, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -672,6 +671,50 @@ fn memory_cap_trip_via_resource_limiter() {
     assert_eq!(result, -1, "memory.grow must return -1 when the cap is exceeded");
 }
 
+// --- Build-time .cwasm fixture parity ---
+
+/// Guard the build-time precompile fix: under `bazel test`, the precompiled
+/// `.cwasm` fixture directory MUST contain an entry whose filename is the
+/// canonical cache key for the bundled `rust/giant-structs` component. If that
+/// fixture is missing (e.g. a cache-key axis drifted — wasmtime version, engine
+/// config, host target, or the hashing itself), the heavy tests would silently
+/// cold-miss and JIT-compile the component at runtime, re-opening the 60 s
+/// `checkleft_lib_test` timeout. We want that to fail loudly here instead.
+///
+/// No-ops outside Bazel (`cargo test`), where no fixture is staged.
+#[test]
+fn precompiled_cwasm_fixture_is_keyed_for_giant_structs() {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
+        cache_file_name,
+    };
+
+    let Some(dir) = crate::external::test_support::precompiled_cwasm_dir() else {
+        return; // not under `bazel test`; nothing staged.
+    };
+
+    let package = BundledExternalCheckPackageProvider
+        .resolve(&ExternalCheckImplementationRef::Bundled(
+            "rust/giant-structs".to_owned(),
+        ))
+        .expect("resolve")
+        .expect("bundled package must exist");
+    let ExternalCheckPackageImplementation::Component(component) = package.implementation else {
+        panic!("rust/giant-structs must be a component package");
+    };
+    let bytes = component.artifact_bytes.expect("bundled component carries its bytes");
+
+    let expected = cache_file_name(bytes);
+    let fixture = dir.join(&expected);
+    assert!(
+        fixture.exists(),
+        "precompiled .cwasm fixture `{expected}` is missing from {} — the giant-structs tests \
+         would JIT-compile at runtime (a cache-key axis drifted). Rebuild \
+         //tools/checkleft:precompiled_cwasm / check CHECKLEFT_WASMTIME_VERSION + ENGINE_CONFIG_KEY.",
+        dir.display(),
+    );
+}
+
 // --- T10: rust-giant-structs-use-builder end-to-end test ---
 //
 // This is the acceptance proof for the CM-wasm project: the check is authored
@@ -718,7 +761,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
         .expect("bundled package must exist");
 
     // Run through the full component-v1 host with modified-only sandbox (the default).
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
     let result = executor
         .execute(
             &package,
@@ -782,7 +825,7 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
         .expect("resolve")
         .expect("bundled package must exist");
 
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
     let result = executor
         .execute(
             &package,
@@ -840,7 +883,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
         .expect("resolve")
         .expect("bundled package must exist");
 
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
     let result = executor
         .execute(
             &package,

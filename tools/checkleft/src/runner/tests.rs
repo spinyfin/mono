@@ -729,11 +729,14 @@ pub struct ServerState {
 "#;
 
 async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
-    use crate::external::{BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor};
+    use crate::external::BundledExternalCheckPackageProvider;
+    use crate::external::test_support::executor_with_precompiled_cache;
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry).expect("register built-ins");
     // Use the full external stack so bundled component checks resolve and execute.
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    // Pointed at the build-time precompiled .cwasm fixture so the giant-structs
+    // component deserializes instead of JIT-compiling at runtime.
+    let executor = executor_with_precompiled_cache(temp.path());
     let runner = Runner::with_external(
         Arc::new(registry),
         Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
