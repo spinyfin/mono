@@ -526,7 +526,7 @@ struct ContentView: View {
                     let choresUnblocked = model.unblockedChoreCount
                     let choresBlocked = model.blockedChoreCount
                     WorkSidebarFilterRow(
-                        title: "No Project (Chores)",
+                        title: "No Project",
                         subtitle: nil,
                         systemImage: "tray",
                         isSelected: model.filterToChoresOnly,

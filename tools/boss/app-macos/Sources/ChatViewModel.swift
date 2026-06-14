@@ -113,8 +113,9 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedProjectFilterIDs: Set<String> = [] {
         didSet { invalidateWorkCache() }
     }
-    /// When true, the board shows only chores (project-less tasks and their
-    /// revisions). Mutually exclusive with `selectedProjectFilterIDs`.
+    /// When true, the board shows all project-less work items (chores,
+    /// investigation tasks, etc.) and their revisions. Mutually exclusive
+    /// with `selectedProjectFilterIDs`.
     @Published var filterToChoresOnly: Bool = false {
         didSet { invalidateWorkCache() }
     }
@@ -595,7 +596,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     var projectFilterDescription: String {
-        if filterToChoresOnly { return "Chores only" }
+        if filterToChoresOnly { return "No Project" }
         let visibleSelected = visibleSelectedProjectFilterIDs
         switch visibleSelected.count {
         case 0:
@@ -692,6 +693,7 @@ final class ChatViewModel: ObservableObject {
         var items: [WorkTask] = []
         if filterToChoresOnly {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
+            items.append(contentsOf: (productLevelTasksByProductID[productID] ?? []).sorted(by: taskSort))
             items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
         } else {
             let projectFilter = visibleSelectedProjectFilterIDs
@@ -2487,14 +2489,17 @@ final class ChatViewModel: ObservableObject {
 
     var unblockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        return (choresByProductID[productID] ?? []).filter { $0.status == "todo" }.count
+        let chores = (choresByProductID[productID] ?? []).filter { $0.status == "todo" }
+        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter { $0.status == "todo" }
+        return chores.count + projectlessTasks.count
     }
 
     var blockedChoreCount: Int {
         guard let productID = currentSelectedProductID else { return 0 }
-        return (choresByProductID[productID] ?? []).filter {
-            $0.status == "blocked" && $0.blockedReason == "dependency"
-        }.count
+        let isBlocked: (WorkTask) -> Bool = { $0.status == "blocked" && $0.blockedReason == "dependency" }
+        let chores = (choresByProductID[productID] ?? []).filter(isBlocked)
+        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isBlocked)
+        return chores.count + projectlessTasks.count
     }
 
     /// Repo-chip mode for the kanban under the currently selected
