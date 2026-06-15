@@ -61,7 +61,7 @@ final class ChatViewModel: ObservableObject {
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render
     /// "Blocked by <prereq title>" on gated cards.
-    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:]
+    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:] { didSet { rebuildPrereqCache() } }
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
@@ -2762,15 +2762,17 @@ final class ChatViewModel: ObservableObject {
     private var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
     private var cachedAmbiguousRepoNames: Set<String>?
+    // Prereq caches; rebuilt by rebuildPrereqCache() on data changes, read O(1) per card.
+    var gatingPrereqsByTaskID: [String: [WorkDependencyRow]] = [:]
+    var dependencyPrereqsByTaskID: [String: [WorkDependencyRow]] = [:]
 
     func invalidateWorkCache() {
         cachedVisibleItems = nil
         cachedItemsByColumn.removeAll(keepingCapacity: true)
         cachedSectionsByColumn.removeAll(keepingCapacity: true)
         cachedAmbiguousRepoNames = nil
+        rebuildPrereqCache()
     }
-
-
 
     /// Inline drag-refusal banner shown next to the source card when a
     /// drag from Blocked → Doing is rejected because the row still has

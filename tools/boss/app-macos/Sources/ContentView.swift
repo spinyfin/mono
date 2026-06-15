@@ -1566,20 +1566,26 @@ private struct WorkBoardCardItem: View {
             return liveState?.liveStatus
         }()
 
+        // Read precomputed prereq caches — O(1) per card instead of
+        // scanning all dependency edges and tasks on every render pass.
+        let cachedGating = model.gatingPrereqsByTaskID[task.id] ?? []
         let blockedBy: String? = {
             if task.status == "blocked" {
-                return model.blockedByLabel(for: task)
+                let names = cachedGating.filter { $0.kind != .unknown }.map(\.title)
+                return names.isEmpty ? nil : names.joined(separator: ", ")
             }
             if task.blockedReason == "dependency" {
-                let rows = model.dependencyPrereqs(for: task.id)
+                let rows = model.dependencyPrereqsByTaskID[task.id] ?? []
                 guard !rows.isEmpty else { return nil }
                 return rows.map(\.title).joined(separator: ", ")
             }
             return nil
         }()
 
-        let gatingPrereqs = model.gatingPrereqs(for: task.id)
-        let isAutoBlocked = model.isAutoBlocked(task)
+        let gatingPrereqs = cachedGating
+        let isAutoBlocked = task.status == "blocked"
+            && task.lastStatusActor == "engine"
+            && !cachedGating.isEmpty
         let dragRefusal: String? = (model.dragRefusalNotice?.taskID == task.id)
             ? model.dragRefusalNotice?.message
             : nil
@@ -3195,7 +3201,7 @@ struct WorkDependenciesSection: View {
     let taskID: String
 
     var body: some View {
-        let prereqs = model.dependencyPrereqs(for: taskID)
+        let prereqs = model.dependencyPrereqsByTaskID[taskID] ?? []
         let dependents = model.dependencyDependents(for: taskID)
 
         if prereqs.isEmpty && dependents.isEmpty {
