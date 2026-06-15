@@ -82,7 +82,7 @@ The CI flow's `ci_remediations` row follows the same ephemerality rule as `confl
 - New values on `tasks.blocked_reason`: **`'ci_failure'`** (auto-fix flow is still trying) and **`'ci_failure_exhausted'`** (budget exhausted; engine has given up). The two-value split avoids re-decoding "is the engine still trying?" from a per-PR counter at every kanban render. The kanban inspector resolves both to user-visible labels: `ci failing` and `ci failing (exhausted)`.
 - New side table for composing multiple simultaneous blocked signals: **`task_blocked_signals`** (Q2). Scalar `tasks.blocked_reason` and `tasks.blocked_attempt_id` remain as the denormalised "primary reason" cache for the UI.
 - New columns on `tasks`: **`ci_attempt_budget`** (per-PR override, NULL = use product default) and **`ci_attempts_used`** (counter, default 0). The product-level default lives in **`products.ci_attempt_budget`** (default 3).
-- The CLI surface verbs for CI are **`boss engine ci list`** / **`boss engine ci show <id>`** / **`boss engine ci retry <id>`** (resets the counter for the PR + re-fires) / **`boss engine ci abandon <id>`**. Parallel to `boss engine conflicts ...`. The unified `boss engine attempts ...` grows a third kind, `ci`.
+- The CLI surface verbs for CI are **`boss engine ci list`** / **`boss engine ci show <id>`** / **`boss engine ci retry <id>`** (resets the counter for the PR + re-fires) / **`boss engine ci abandon <id>`**. Parallel to `boss engine conflicts ...`. The unified `boss engine attempts ...` grows a third kind, `ci`. The worker-facing markers (`classify` / `mark-failed` / `mark-retriggered` / the validated `mark-noop`) are catalogued in Q4's "Worker → engine markers (CI)"; `mark-noop`'s validation gate is DQ5's "Agent-driven validated-green retire".
 - The provider abstraction is **`CiLogReader`** (Rust trait), with concrete impls **`BuildkiteLogReader`** and **`GithubActionsLogReader`**. Q4 ("CI provider abstraction" subsection).
 
 ---
@@ -855,6 +855,8 @@ For the full log: `bk job log <provider_job_id>` (Buildkite) or `gh run view --l
 
 Apply in order:
 
+0. **CI already green (nothing to fix)** → before assuming there is work, re-check the PR's *current* required checks (`gh pr checks <pr>` / `gh pr view <pr>`). The failure may have cleared on its own — a flaky check settled, `main` moved, or a stale failure was re-detected. If every required check is now passing, do **not** invent a fix: declare it with `boss engine ci mark-noop <attempt-id> --observed-sha <current-head-sha> --reason already-green`. The engine validates the claim against live CI before honoring it (DQ5 "Agent-driven validated-green retire"); an honored verdict retires the attempt and unblocks the parent — you are done, stop. A rejection (CI still red/pending, or the head moved and is not green) exits non-zero with the live status, so continue triage below.
+
 1. **Infra markers** in the log → classify `flaky_or_infra`:
    `Connection refused`, `i/o timeout`, `pull access denied`, `manifest unknown`,
    `agent lost`, `agent timeout`, `node lost contact`,
@@ -964,8 +966,9 @@ New CLI verbs the CI worker uses:
 - `boss engine ci classify <attempt-id> --as tractable|flaky_or_infra|unfixable [--reason <r>]`
 - `boss engine ci mark-failed <attempt-id> --reason <r>` (parallel to `boss engine conflicts mark-failed`)
 - `boss engine ci mark-retriggered <attempt-id>` (records that the re-run was successfully enqueued)
+- `boss engine ci mark-noop <attempt-id> [--observed-sha <sha>] [--reason <r>]` — the **validated** "there is no CI to fix; it is already green" terminal signal. Unlike the markers above, this is **not** a fire-and-forget UPDATE the completion path reads later: the engine re-probes live CI synchronously and the worker gets an immediate honored/rejected receipt (see DQ5 "Agent-driven validated-green retire" for the gate). The worker uses it instead of inventing a fix when the failure has already cleared on its own.
 
-These map to UPDATEs on `ci_remediations`. The engine knows to expect them via the bound `attempt_id`; the completion path uses their presence/absence to decide the terminal status when the worker exits.
+The first three map to UPDATEs on `ci_remediations`. The engine knows to expect them via the bound `attempt_id`; the completion path uses their presence/absence to decide the terminal status when the worker exits. `mark-noop` is the exception — it is gated on a live re-probe and returns its verdict in-band rather than being reconciled at Stop (DQ5).
 
 ### CI provider abstraction
 
@@ -1024,6 +1027,27 @@ Explicitly *not* abstracted in v1: re-running a workflow vs re-running a single 
 After the worker pushes, GitHub re-evaluates the PR. On the next merge-poller sweep, the probe returns `state=OPEN, mergeable=MERGEABLE, mergeStateStatus=CLEAN`. That's the retire signal.
 
 (Possible transient: `mergeable=UNKNOWN` immediately after the push while GitHub recomputes. As in Q1, treat `UNKNOWN` as not-yet-resolved — wait for definitive `MERGEABLE`.)
+
+### Agent-driven validated-green retire (`ci mark-noop`)
+
+The retire signal above is **engine-detected**: the poller observes green on its own cadence. There is a second, **agent-driven** way an attempt retires — for the case where the worker was dispatched to fix a failure that is *no longer there* (a flaky check settled, `main` moved, or a stale failure was re-detected on an unchanged head). Without a sanctioned escape the worker is badgered to fix something impossible; with one, it can authoritatively close the loop. The hard constraint (operator's requirement): the signal must be **validated** — the engine must never take the worker's word that CI is green.
+
+The verb is `boss engine ci mark-noop <attempt-id> [--observed-sha <sha>] [--reason <r>]`, and it is a synchronous request/response (not a Stop-boundary marker): the worker gets an immediate honored/rejected receipt so it knows whether to stop or keep working.
+
+**The validation gate.** On the signal the engine, in the `MarkCiRemediationNoop` handler:
+
+1. Resolves the attempt (forged id → `WorkError`; already-`succeeded` → idempotent honored echo; any other terminal status → rejected with guidance).
+2. Rejects a `merge_queue_rebounce` attempt outright — its failure lives on the synthetic merge commit, which head-branch CI cannot vouch for; validating it off a green head-branch probe would be exactly the bypass the operator forbade.
+3. **Independently re-probes LIVE CI** for the PR via `CommandMergeProbe` — the same `gh pr view … statusCheckRollup` source of truth `ci_watch` and the merge-poller use. Never a cached status, never the worker's assertion. A probe error → reject (cannot verify ⇒ do not honor).
+4. Classifies the probe with `classify_noop_validation`, which reuses the merge-poller's `OpenPrCiStatus::Clean` notion of green (every required check `SUCCESS`/`NEUTRAL`/`SKIPPED`, rollup terminal). This is the **exact same predicate** `on_ci_resolved` clears on, so the validated-green decision and the engine-detected retire share one notion of "CI status for the head SHA".
+
+**Keyed to the live head SHA.** The verdict is always derived from the probe's *current* `head_ref_oid`, never the SHA the worker happened to observe. `--observed-sha` is advisory: if the head advanced since the worker looked, the claim is re-validated against the new commit (honored only if the new head is green; the CLI notes the re-validation). There is no path that honors a stale commit.
+
+**Honored** (`NoopValidation::Green`, or a `Merged` PR — branch protection means it could not have landed red, so the loop is moot): `mark_ci_remediation_validated_green` runs one transaction that (a) flips the `pending`/`running` attempt to terminal `succeeded`, stamping the validated `head_sha_after` and a `validated_green` audit discriminator, (b) clears the parent's `blocked: ci_failure` / `ci_failure_exhausted` back to `in_review` (and clears any in-flight signal for the in_review-with-revision model), and (c) resets `ci_attempts_used` for a fresh budget on the next cycle. Making the attempt **terminal** is what stops the stranded-rescue re-dispatch (its query requires `status='pending'`) — i.e. it is the validated terminal, not a generic re-dispatch throttle, that ends the badgering.
+
+**Rejected** (`NoopValidation::Rejected`: required checks still failing, still in-flight/pending, PR closed-unmerged, or the probe failed): the row is left untouched and actionable, the CLI exits non-zero with `CI not green on <sha>: <status>`, and the rejected claim is logged. The worker cannot escape a real or pending failure.
+
+This is complementary to the watcher-idempotency fix (T1743), which stops the engine from *falsely re-detecting* a failure on an unchanged SHA; both share the one `OpenPrCiStatus` notion of green. Where T1743 keeps a green PR from being re-flagged, this lets a worker authoritatively retire an attempt when the failure it was sent to fix is genuinely gone.
 
 ### What "retire" means
 

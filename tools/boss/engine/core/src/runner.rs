@@ -2106,6 +2106,26 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         out.push_str(&bk_cmds);
     }
 
+    if !is_rebounce {
+        out.push_str("### If CI is already green (nothing to fix)\n\n");
+        out.push_str(&format!(
+            "Before assuming there is work to do, check the **current** state of the PR's required \
+             checks (`gh pr checks {pr}` / `gh pr view {pr}`). If they are **already passing** — the \
+             failure cleared on its own (a flaky check settled, `main` moved, or a stale failure was \
+             re-detected) — you do NOT have to invent a fix. Declare it; the engine VALIDATES your \
+             claim against live CI before retiring the attempt:\n\n\
+             ```\n\
+             boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+             ```\n\n\
+             The engine independently re-probes live CI for the PR's current head SHA. If every \
+             required check is verified green, the attempt is retired and the parent unblocks — you are \
+             **done, stop**. If CI is still red or pending, the command **fails** (non-zero exit) with \
+             the live status and the attempt stays open: the failure is real, so continue below.\n\n",
+            pr = attempt.pr_url,
+            attempt = attempt.id,
+        ));
+    }
+
     if attempt.attempt_kind == "retrigger" {
         out.push_str("### Action: retrigger the failing build\n\n");
         out.push_str(
@@ -2291,6 +2311,36 @@ fn compose_ci_remediation_prompt(
         ),
     }
     prompt.push('\n');
+
+    // If the failure already cleared, the worker can declare a
+    // validated noop rather than retriggering a build that is no longer
+    // red. The engine re-probes live CI before honoring it.
+    //
+    // Gated `!is_rebounce` to match the sibling revision-fragment brief
+    // (`compose_ci_remediation_fragment`): a merge_queue_rebounce
+    // failure lives on the synthetic merge commit, so the PR's
+    // head-branch checks always read green — surfacing `mark-noop` to a
+    // rebounce worker would invite a claim the engine is guaranteed to
+    // reject (`handle_mark_ci_remediation_noop` refuses rebounce
+    // attempts before it even probes). Rebounce rows normally deliver
+    // via a revision rather than this bespoke prompt, but the
+    // stranded-rescue path can re-dispatch one here, so guard it.
+    let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
+    if !is_rebounce {
+        prompt.push_str("### If CI is already green (nothing to fix)\n\n");
+        prompt.push_str(&format!(
+            "Check the **current** required checks first (`gh pr checks {pr}`). If they are already \
+             passing, declare it instead of retriggering — the engine validates the claim against live \
+             CI before retiring the attempt:\n\n\
+             ```\n\
+             boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+             ```\n\n\
+             Verified green → attempt retired, parent unblocked, you are done. Still red/pending → the \
+             command fails (non-zero) and the attempt stays open; fall through to the retrigger playbook.\n\n",
+            pr = attempt.pr_url,
+            attempt = attempt.id,
+        ));
+    }
 
     // §Q4 retrigger playbook: every failure is unambiguous infra,
     // no log read needed, no code change.
@@ -3595,6 +3645,81 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
             "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    /// A bespoke `ci_remediation`-kind execution routes to
+    /// `compose_ci_remediation_prompt` (the retrigger playbook) instead
+    /// of the revision directive.
+    fn ci_remediation_execution(pr_url: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_cir_01")
+            .work_item_id("task-cir-1")
+            .kind(ExecutionKind::CiRemediation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .pr_url(pr_url)
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    #[test]
+    fn ci_remediation_prompt_offers_mark_noop_for_non_rebounce() {
+        // A bespoke (retrigger / stranded-rescue) ci_remediation worker
+        // should be told it can declare a validated noop if the failure
+        // already cleared — the engine re-probes live CI before honoring
+        // it. `sample_ci_attempt` has `failure_kind: None`.
+        let attempt = sample_ci_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&ci_remediation_execution(&attempt.pr_url))
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .ci_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("### If CI is already green (nothing to fix)"),
+            "non-rebounce ci_remediation prompt must offer the validated mark-noop escape:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("boss engine ci mark-noop --attempt-id"),
+            "non-rebounce ci_remediation prompt must include the mark-noop verb:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
+        // A merge_queue_rebounce failure lives on the synthetic merge
+        // commit, so the PR's head-branch checks always read green. The
+        // engine REJECTS a rebounce noop outright
+        // (`handle_mark_ci_remediation_noop`), so the brief must NOT
+        // surface it — mirroring the `!is_rebounce` gate in the sibling
+        // `compose_ci_remediation_fragment`. (A rebounce normally
+        // delivers via a revision; the stranded-rescue path can still
+        // re-dispatch one through this bespoke prompt.)
+        let mut attempt = sample_ci_attempt();
+        attempt.failure_kind = Some("merge_queue_rebounce".into());
+        attempt.before_commit_sha = Some("mergesha999".into());
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&ci_remediation_execution(&attempt.pr_url))
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .ci_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains("mark-noop"),
+            "rebounce ci_remediation prompt must NOT surface mark-noop (engine rejects it):\n{prompt}",
+        );
+        // Sanity: we still produced the bespoke ci_remediation prompt.
+        assert!(
+            prompt.contains("CI remediation: PR #"),
+            "expected the bespoke ci_remediation prompt to be generated:\n{prompt}",
         );
     }
 

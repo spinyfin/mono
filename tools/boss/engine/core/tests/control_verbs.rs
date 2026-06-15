@@ -1436,6 +1436,155 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     Ok(())
 }
 
+/// `MarkCiRemediationNoop` is the *validated* terminal signal, but its
+/// pre-probe guards are deterministic without `gh`: a forged id errors,
+/// a terminal row is rejected, an already-succeeded row echoes a HONORED
+/// receipt, and a merge-queue rebounce is rejected outright (its failure
+/// lives on a synthetic merge commit, not the PR head, so head-branch CI
+/// can't validate it). These exercise the full request → dispatch →
+/// handler → response wire without reaching the live-CI probe.
+#[tokio::test]
+async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })?;
+    let chore = work_db.create_chore(CreateChoreInput {
+        product_id: product.id.clone(),
+        name: "C".to_owned(),
+        description: None,
+        autostart: false,
+        priority: None,
+        created_via: None,
+        repo_remote_url: None,
+        effort_level: None,
+        model_override: None,
+        force_duplicate: false,
+        driver: None,
+    })?;
+    let pr = "https://github.com/foo/bar/pull/77";
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+
+    let seed = |head_sha: &str, failure_kind: &str, before: Option<String>| {
+        work_db
+            .insert_ci_remediation(boss_engine::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr.to_owned(),
+                pr_number: 77,
+                head_branch: "feature".to_owned(),
+                head_sha_at_trigger: head_sha.to_owned(),
+                attempt_kind: "fix".to_owned(),
+                consumes_budget: 1,
+                failed_checks: "[]".to_owned(),
+                failure_kind: failure_kind.to_owned(),
+                before_commit_sha: before,
+            })
+            .map(|opt| opt.expect("insert should succeed on a fresh row"))
+    };
+
+    // (a) already-succeeded → echoed as a HONORED receipt.
+    let succeeded = seed("sha-a", "pr_branch_ci", None)?;
+    work_db
+        .mark_ci_remediation_succeeded(&succeeded.id, Some("sha-a-green"))?
+        .expect("flip to succeeded");
+    // (b) merge-queue rebounce, still pending → rejected outright.
+    let rebounce = seed("sha-b", "merge_queue_rebounce", Some("synthetic-merge-sha".to_owned()))?;
+    // (c) terminal failed → rejected as already terminal.
+    let failed = seed("sha-c", "pr_branch_ci", None)?;
+    work_db
+        .mark_ci_remediation_failed(&failed.id, "unfixable")?
+        .expect("flip to failed");
+
+    drop(work_db);
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // (a) already-succeeded → honored echo carrying the recorded SHA.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationNoop {
+            attempt_id: succeeded.id.clone(),
+            observed_sha: Some("sha-a-green".to_owned()),
+            reason: Some("already-green".to_owned()),
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationNoopValidated {
+            attempt, validated_sha, ..
+        } => {
+            assert_eq!(attempt.id, succeeded.id);
+            assert_eq!(attempt.status, "succeeded");
+            assert_eq!(validated_sha.as_deref(), Some("sha-a-green"));
+        }
+        other => return Err(anyhow!("expected NoopValidated echo, got: {other:?}")),
+    }
+
+    // (b) rebounce → rejected, and the engine never probes head-branch CI.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationNoop {
+            attempt_id: rebounce.id.clone(),
+            observed_sha: None,
+            reason: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::CiRemediationNoopRejected { attempt_id, status, .. } => {
+            assert_eq!(attempt_id, rebounce.id);
+            assert!(
+                status.contains("merge_queue_rebounce"),
+                "rebounce rejection should explain why: {status}"
+            );
+        }
+        other => return Err(anyhow!("expected NoopRejected for rebounce, got: {other:?}")),
+    }
+
+    // (c) terminal failed → WorkError naming "already terminal".
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationNoop {
+            attempt_id: failed.id.clone(),
+            observed_sha: None,
+            reason: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("already terminal"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for terminal attempt, got: {other:?}")),
+    }
+
+    // (d) unknown id → WorkError naming the bogus id.
+    let response = client
+        .send_request(&FrontendRequest::MarkCiRemediationNoop {
+            attempt_id: "cir_does_not_exist".to_owned(),
+            observed_sha: None,
+            reason: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("cir_does_not_exist"), "got: {message}");
+        }
+        other => return Err(anyhow!("expected WorkError for unknown id, got: {other:?}")),
+    }
+
+    Ok(())
+}
+
 /// Phase 5 #13 happy paths for the read-only `list` and `show` verbs:
 /// seed two attempts under one product, query the freshest-first list,
 /// then fetch one by id.

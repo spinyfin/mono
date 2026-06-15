@@ -1497,6 +1497,99 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Honor a *validated-green* "no CI to fix" signal atomically.
+    ///
+    /// Called only after the engine has independently re-probed live
+    /// CI and verified every required check passing on the PR's current
+    /// head SHA (the `boss engine ci mark-noop` validation gate). Two
+    /// effects in one transaction:
+    ///
+    /// 1. Flip a non-terminal (`pending`/`running`) attempt to the
+    ///    terminal `succeeded` status, stamping the validated
+    ///    `head_sha_after` and a `validated_green` audit discriminator
+    ///    in `failure_reason`. Making the row terminal is what stops
+    ///    the stranded-rescue re-dispatch (its query requires
+    ///    `status='pending'`).
+    /// 2. Transition the parent OUT of the remediation loop: clear
+    ///    `blocked: ci_failure` / `ci_failure_exhausted` back to
+    ///    `in_review`, clear any active in-flight CI signal (the shared
+    ///    in_review-with-revision model, where the parent's status
+    ///    never moved to `blocked`), and reset `ci_attempts_used` so
+    ///    the next failure gets a fresh budget (design §Q3).
+    ///
+    /// The task / signal UPDATEs mirror
+    /// [`Self::clear_chore_blocked_ci_failure`] and
+    /// [`Self::clear_ci_failure_signal_only`]; they are inlined here so
+    /// the parent's retire is atomic with the attempt's status flip
+    /// rather than three separate connections that could tear on a
+    /// crash. Idempotent: a row already terminal returns `Ok(None)` and
+    /// writes nothing (the caller echoes the existing receipt).
+    pub fn mark_ci_remediation_validated_green(
+        &self,
+        attempt_id: &str,
+        head_sha: Option<&str>,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status         = 'succeeded',
+                    head_sha_after = COALESCE(?2, head_sha_after),
+                    failure_reason = COALESCE(failure_reason, 'validated_green'),
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, head_sha, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?
+            .with_context(|| format!("unknown ci_remediation after validated-green retire: {attempt_id}"))?;
+        let work_item_id = updated.work_item_id.clone();
+        let pr_url = updated.pr_url.clone();
+        // Parent transition out of the loop (mirrors
+        // `clear_chore_blocked_ci_failure`): only fires when the parent
+        // is actually `blocked: ci_failure[_exhausted]` on this PR.
+        tx.execute(
+            "UPDATE tasks
+                SET status             = 'in_review',
+                    blocked_reason     = NULL,
+                    blocked_attempt_id = NULL,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        // Clear any active CI blocked signal (covers both the blocked
+        // model above and the in_review-with-revision model where the
+        // status never moved). Mirrors `clear_ci_failure_signal_only`.
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered')
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        // A completed cycle resets the per-PR attempt counter.
+        tx.execute(
+            "UPDATE tasks
+                SET ci_attempts_used = 0
+              WHERE id = ?1
+                AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// Flip a `ci_remediations` attempt to `running` and stamp the
     /// coordinator-owned spawn metadata (lease, workspace, worker
     /// pane). Mirrors [`Self::mark_conflict_resolution_running`].

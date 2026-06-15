@@ -923,6 +923,34 @@ pub enum FrontendRequest {
         reason: String,
     },
 
+    /// Worker → engine, *validated* terminal signal: "there is no CI
+    /// to fix — the PR's required checks are already green." The CLI
+    /// surface is `boss engine ci mark-noop --attempt-id <cir_…>
+    /// [--observed-sha <sha>] [--reason <r>]`. Unlike the other
+    /// `Mark*` verbs, the engine does NOT take the worker's word for
+    /// it: it independently re-probes LIVE CI for the PR's CURRENT
+    /// head SHA (the same `gh pr view … statusCheckRollup` source the
+    /// merge-poller uses) and only honors the claim when every
+    /// required check is verified passing on that exact SHA. On a
+    /// verified-green probe it retires the attempt and unblocks the
+    /// parent ([`FrontendEvent::CiRemediationNoopValidated`]); on a
+    /// red/pending probe (or a SHA that moved) it rejects and keeps
+    /// the row actionable ([`FrontendEvent::CiRemediationNoopRejected`]),
+    /// so a worker cannot escape a real failure.
+    ///
+    /// `observed_sha` is the head SHA the worker saw when it decided
+    /// CI was green; it is advisory. The verdict is always re-derived
+    /// from the live head SHA, so a claim about a stale commit is
+    /// re-validated against the new head, never honored blindly.
+    /// `reason` is a free-form note (defaults to `already_green`).
+    MarkCiRemediationNoop {
+        attempt_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Worker → engine marker (Phase 9 #30): record that the worker
     /// re-triggered the failing build via the per-provider CLI
     /// (`bk build retry` / `gh run rerun --failed`). `new_id` is the
@@ -1870,6 +1898,39 @@ pub enum FrontendEvent {
         attempt: CiRemediation,
         budget_refunded: bool,
     },
+    /// HONORED response to [`FrontendRequest::MarkCiRemediationNoop`]:
+    /// the engine independently re-probed live CI and verified every
+    /// required check passing on `validated_sha` (the PR's current
+    /// head SHA at probe time). The attempt has been flipped to
+    /// `succeeded` and the parent unblocked out of the remediation
+    /// loop. `observed_sha` echoes what the worker reported, so the
+    /// CLI can note when the head advanced and the engine re-validated
+    /// against the new SHA.
+    CiRemediationNoopValidated {
+        attempt: CiRemediation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validated_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_sha: Option<String>,
+    },
+    /// REJECTED response to [`FrontendRequest::MarkCiRemediationNoop`]:
+    /// the engine re-probed live CI and did NOT find it green on the
+    /// PR's current head SHA (`live_sha`). `status` is a human-readable
+    /// description of what the probe actually saw (failing checks,
+    /// still-pending, PR closed). The attempt row is untouched and
+    /// stays actionable — the worker has not escaped the failure. The
+    /// CLI surfaces this as a non-zero exit so the receipt is an
+    /// honest pass/fail.
+    CiRemediationNoopRejected {
+        attempt_id: String,
+        work_item_id: String,
+        pr_url: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_sha: Option<String>,
+    },
     /// Response to [`FrontendRequest::ListConflictResolutions`]: the
     /// filtered set of rows, ordered freshest-first.
     ConflictResolutionsList {
@@ -2481,290 +2542,7 @@ pub enum TopicEventPayload {
 mod editorial_controls_tests;
 
 #[cfg(test)]
-mod feature_flags_wire_tests {
-    use super::*;
-    use crate::health_wire::{EngineHealthIssue, EngineHealthReport};
-    use crate::metrics_wire::MetricLiveEntry;
-
-    #[test]
-    fn list_feature_flags_request_round_trips() {
-        let original = FrontendRequest::ListFeatureFlags;
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("list_feature_flags"));
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, FrontendRequest::ListFeatureFlags));
-    }
-
-    #[test]
-    fn set_feature_flag_request_round_trips() {
-        let original = FrontendRequest::SetFeatureFlag {
-            name: "detect_pr_cold_fallback".into(),
-            enabled: false,
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("set_feature_flag"));
-        assert!(json.contains("detect_pr_cold_fallback"));
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendRequest::SetFeatureFlag { name, enabled } => {
-                assert_eq!(name, "detect_pr_cold_fallback");
-                assert!(!enabled);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feature_flags_list_event_round_trips() {
-        let snap = FeatureFlagSnapshot {
-            name: "detect_pr_cold_fallback".into(),
-            description: "test description".into(),
-            category: "completion".into(),
-            default_enabled: true,
-            enabled: false,
-        };
-        let original = FrontendEvent::FeatureFlagsList {
-            flags: vec![snap.clone()],
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("feature_flags_list"));
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::FeatureFlagsList { flags } => {
-                assert_eq!(flags, vec![snap]);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feature_flag_set_event_round_trips() {
-        let original = FrontendEvent::FeatureFlagSet {
-            name: "detect_pr_cold_fallback".into(),
-            enabled: true,
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("feature_flag_set"));
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::FeatureFlagSet { name, enabled } => {
-                assert_eq!(name, "detect_pr_cold_fallback");
-                assert!(enabled);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_list_live_request_round_trips() {
-        let original = FrontendRequest::MetricsListLive;
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_list_live"), "serialized: {json}");
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, FrontendRequest::MetricsListLive));
-    }
-
-    #[test]
-    fn metrics_list_live_result_event_round_trips() {
-        let entries = vec![
-            MetricLiveEntry {
-                name: "a.counter".into(),
-                description: "a counter".into(),
-                kind: "counter".into(),
-                value: 7,
-                timestamp_ms: 1_700_000_000_000,
-                stale: false,
-            },
-            MetricLiveEntry {
-                name: "b.gauge".into(),
-                description: "a gauge".into(),
-                kind: "gauge".into(),
-                value: -3,
-                timestamp_ms: 1_700_000_001_000,
-                stale: true,
-            },
-        ];
-        let original = FrontendEvent::MetricsListLiveResult {
-            entries: entries.clone(),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_list_live_result"), "serialized: {json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::MetricsListLiveResult {
-                entries: parsed_entries,
-            } => {
-                assert_eq!(parsed_entries.len(), 2);
-                assert_eq!(parsed_entries[0].name, "a.counter");
-                assert_eq!(parsed_entries[0].value, 7);
-                assert!(!parsed_entries[0].stale);
-                assert_eq!(parsed_entries[1].name, "b.gauge");
-                assert_eq!(parsed_entries[1].value, -3);
-                assert!(parsed_entries[1].stale);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_show_live_request_round_trips() {
-        let original = FrontendRequest::MetricsShowLive {
-            name: "pr_url_capture.primary_path.hit".into(),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_show_live"), "serialized: {json}");
-        assert!(json.contains("pr_url_capture.primary_path.hit"), "serialized: {json}");
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendRequest::MetricsShowLive { name } => {
-                assert_eq!(name, "pr_url_capture.primary_path.hit");
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_reset_request_round_trips_with_name() {
-        let original = FrontendRequest::MetricsReset {
-            name: Some("pr_url_capture.primary_path.hit".into()),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_reset"), "serialized: {json}");
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendRequest::MetricsReset { name } => {
-                assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_reset_request_round_trips_with_all() {
-        let original = FrontendRequest::MetricsReset { name: None };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_reset"), "serialized: {json}");
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendRequest::MetricsReset { name } => assert!(name.is_none()),
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_show_live_result_event_round_trips() {
-        let entry = MetricLiveEntry {
-            name: "pr_url_capture.primary_path.hit".into(),
-            description: "test desc".into(),
-            kind: "counter".into(),
-            value: 42,
-            timestamp_ms: 1_700_000_000_000,
-            stale: false,
-        };
-        let original = FrontendEvent::MetricsShowLiveResult {
-            entry: Some(entry.clone()),
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_show_live_result"), "serialized: {json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::MetricsShowLiveResult { entry: Some(e) } => {
-                assert_eq!(e, entry);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn metrics_reset_done_event_round_trips() {
-        let original = FrontendEvent::MetricsResetDone {
-            name: Some("pr_url_capture.primary_path.hit".into()),
-            counters_reset: 1,
-            gauges_reset: 0,
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("metrics_reset_done"), "serialized: {json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::MetricsResetDone {
-                name,
-                counters_reset,
-                gauges_reset,
-            } => {
-                assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
-                assert_eq!(counters_reset, 1);
-                assert_eq!(gauges_reset, 0);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_engine_health_request_round_trips() {
-        let original = FrontendRequest::GetEngineHealth;
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("get_engine_health"), "serialized: {json}");
-        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, FrontendRequest::GetEngineHealth));
-    }
-
-    #[test]
-    fn engine_health_result_event_round_trips_healthy() {
-        let original = FrontendEvent::EngineHealthResult {
-            report: EngineHealthReport {
-                anthropic_api_key_present: true,
-                dispatch_paused: false,
-                issues: Vec::new(),
-            },
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("engine_health_result"), "serialized: {json}");
-        assert!(json.contains("\"anthropic_api_key_present\":true"), "{json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::EngineHealthResult { report } => {
-                assert!(report.anthropic_api_key_present);
-                assert!(report.issues.is_empty());
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn engine_health_result_event_round_trips_with_issue() {
-        // The macOS app's banner / settings warning binds to the
-        // structured `kind` and `severity`, not the freeform `title`
-        // or `body`. Pin all four so a refactor that drops the
-        // wire-level distinction between kinds gets caught here.
-        let issue = EngineHealthIssue {
-            kind: "missing_anthropic_api_key".into(),
-            severity: "warning".into(),
-            title: "ANTHROPIC_API_KEY is not set".into(),
-            body: "Summarization is disabled. Set ANTHROPIC_API_KEY in \
-                   the engine's environment and restart Boss to enable \
-                   live worker summaries."
-                .into(),
-        };
-        let original = FrontendEvent::EngineHealthResult {
-            report: EngineHealthReport {
-                anthropic_api_key_present: false,
-                dispatch_paused: false,
-                issues: vec![issue.clone()],
-            },
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("\"kind\":\"missing_anthropic_api_key\""), "{json}");
-        assert!(json.contains("\"severity\":\"warning\""), "{json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::EngineHealthResult { report } => {
-                assert!(!report.anthropic_api_key_present);
-                assert_eq!(report.issues, vec![issue]);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-}
+mod feature_flags_wire_tests;
 
 #[cfg(test)]
 mod sorted_request_variants_test {

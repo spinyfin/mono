@@ -2400,6 +2400,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
                 ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
             }
+            r @ FrontendRequest::MarkCiRemediationNoop { .. } => {
+                ci_remediation::handle_mark_ci_remediation_noop(ctx, r).await
+            }
             r @ FrontendRequest::MarkCiRemediationRetriggered { .. } => {
                 ci_remediation::handle_mark_ci_remediation_retriggered(ctx, r).await
             }

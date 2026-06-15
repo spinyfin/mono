@@ -256,6 +256,256 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
     }
 }
 
+pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::MarkCiRemediationNoop {
+        attempt_id,
+        observed_sha,
+        reason,
+    } = req
+    else {
+        unreachable!()
+    };
+    {
+        // The validated "there is no CI to fix" terminal signal. Unlike
+        // the sibling `Mark*` verbs, the engine does NOT take the
+        // worker's word for it: it independently re-probes LIVE CI for
+        // the PR's CURRENT head SHA and only honors a verified-green
+        // claim. A red/pending probe (or a head that moved) is rejected
+        // with a receipt, leaving the row actionable so the worker
+        // cannot escape a real failure.
+
+        // 1. Resolve the attempt. A forged id simply has no row.
+        let attempt = match work_db.get_ci_remediation(&attempt_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
+                    },
+                );
+                return;
+            }
+            Err(err) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+
+        // 2. Idempotency: an attempt already retired green echoes a
+        //    HONORED receipt — the loop is already closed (e.g. the
+        //    merge-poller's `on_ci_resolved` beat us to it, or this is a
+        //    duplicate call).
+        if attempt.status == "succeeded" {
+            let validated_sha = attempt.head_sha_after.clone();
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::CiRemediationNoopValidated {
+                    attempt,
+                    validated_sha,
+                    observed_sha,
+                },
+            );
+            return;
+        }
+        // A terminal-but-not-succeeded attempt is not the worker's live,
+        // actionable attempt. Reject with guidance rather than silently
+        // touching an unrelated row.
+        if attempt.status != "pending" && attempt.status != "running" {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!(
+                        "ci_remediation attempt {attempt_id:?} is already terminal ({status}); nothing to validate. \
+                         If CI is still failing on a fresh attempt, use `boss engine ci retry`.",
+                        status = attempt.status,
+                    ),
+                },
+            );
+            return;
+        }
+
+        // 3. A merge-queue rebounce failure is NOT validated by the PR's
+        //    head-branch CI (which is always green for a rebounce — the
+        //    failure was on the synthetic merge commit). Honoring a noop
+        //    off a green head-branch probe would be exactly the bypass
+        //    the operator forbade. Reject; keep the row actionable.
+        if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                work_item_id = %attempt.work_item_id,
+                "mark_ci_remediation_noop: rejected — rebounce attempt not validatable via head-branch CI",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::CiRemediationNoopRejected {
+                    attempt_id: attempt.id.clone(),
+                    work_item_id: attempt.work_item_id.clone(),
+                    pr_url: attempt.pr_url.clone(),
+                    status: "merge_queue_rebounce attempts cannot be validated via head-branch CI: the failure is \
+                             on the synthetic merge commit, not the PR head. Fix the rebounce and re-enqueue, or use \
+                             `boss engine ci mark-failed`."
+                        .to_owned(),
+                    live_sha: None,
+                    observed_sha,
+                },
+            );
+            return;
+        }
+
+        // 4. THE VALIDATION GATE. Independently re-probe LIVE CI for the
+        //    PR's CURRENT head SHA — the same `gh pr view …
+        //    statusCheckRollup` source the merge-poller uses. We never
+        //    trust the worker's assertion or a cached status. A probe
+        //    failure means we cannot verify → reject (do not honor).
+        let probe = match crate::merge_poller::CommandMergeProbe::new()
+            .probe(&attempt.pr_url)
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    pr_url = %attempt.pr_url,
+                    ?err,
+                    "mark_ci_remediation_noop: rejected — live CI probe failed; cannot verify green",
+                );
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::CiRemediationNoopRejected {
+                        attempt_id: attempt.id.clone(),
+                        work_item_id: attempt.work_item_id.clone(),
+                        pr_url: attempt.pr_url.clone(),
+                        status: format!("could not verify CI status (live probe failed): {err}"),
+                        live_sha: None,
+                        observed_sha,
+                    },
+                );
+                return;
+            }
+        };
+
+        match crate::ci_watch::classify_noop_validation(&probe) {
+            crate::ci_watch::NoopValidation::Green { head_sha } => {
+                match work_db.mark_ci_remediation_validated_green(&attempt.id, head_sha.as_deref()) {
+                    Ok(Some(succeeded)) => {
+                        tracing::info!(
+                            attempt_id = %succeeded.id,
+                            work_item_id = %succeeded.work_item_id,
+                            pr_url = %succeeded.pr_url,
+                            validated_sha = ?head_sha,
+                            observed_sha = ?observed_sha,
+                            reason = %reason.as_deref().unwrap_or("already_green"),
+                            "mark_ci_remediation_noop: VALIDATED GREEN — attempt retired, parent unblocked",
+                        );
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &succeeded.product_id,
+                                FrontendEvent::CiRemediationSucceeded {
+                                    product_id: succeeded.product_id.clone(),
+                                    work_item_id: succeeded.work_item_id.clone(),
+                                    attempt_id: succeeded.id.clone(),
+                                    pr_url: succeeded.pr_url.clone(),
+                                },
+                            )
+                            .await;
+                        server_state
+                            .publisher
+                            .publish_work_item_changed(
+                                &succeeded.product_id,
+                                &succeeded.work_item_id,
+                                "ci_validated_green_noop",
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::CiRemediationNoopValidated {
+                                attempt: succeeded,
+                                validated_sha: head_sha,
+                                observed_sha,
+                            },
+                        );
+                    }
+                    // Raced to terminal between the lookup and the write
+                    // (another path retired it). Re-fetch and echo so the
+                    // receipt stays honest.
+                    Ok(None) => match work_db.get_ci_remediation(&attempt.id) {
+                        Ok(Some(current)) => {
+                            let validated_sha = current.head_sha_after.clone();
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::CiRemediationNoopValidated {
+                                    attempt: current,
+                                    validated_sha,
+                                    observed_sha,
+                                },
+                            );
+                        }
+                        _ => send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("ci_remediation attempt {:?} vanished mid-retire", attempt.id),
+                            },
+                        ),
+                    },
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            crate::ci_watch::NoopValidation::Rejected { head_sha, status } => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    work_item_id = %attempt.work_item_id,
+                    pr_url = %attempt.pr_url,
+                    live_sha = ?head_sha,
+                    observed_sha = ?observed_sha,
+                    %status,
+                    "mark_ci_remediation_noop: REJECTED — CI not verified green; row stays actionable",
+                );
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::CiRemediationNoopRejected {
+                        attempt_id: attempt.id.clone(),
+                        work_item_id: attempt.work_item_id.clone(),
+                        pr_url: attempt.pr_url.clone(),
+                        status,
+                        live_sha: head_sha,
+                        observed_sha,
+                    },
+                );
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_list_ci_remediations(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
