@@ -167,6 +167,29 @@ extension ChatViewModel {
         return frontier
     }
 
+    /// Rebuild the gating/dependency prereq caches from current edge and
+    /// task/project data. Called synchronously from `invalidateWorkCache()`
+    /// and `dependenciesByProductID.didSet` so the caches are always current
+    /// before the next SwiftUI render pass. O(total edges) per call.
+    func rebuildPrereqCache() {
+        var gating: [String: [WorkDependencyRow]] = [:]
+        var prereqs: [String: [WorkDependencyRow]] = [:]
+        for edges in dependenciesByProductID.values {
+            // Group block-edges by dependentID in one pass over this product's edges.
+            var byDependent: [String: [WorkItemDependency]] = [:]
+            for edge in edges where edge.relation == "blocks" {
+                byDependent[edge.dependentID, default: []].append(edge)
+            }
+            for (taskID, taskEdges) in byDependent {
+                let rows = taskEdges.map { workDependencyRow(forID: $0.prerequisiteID) }
+                prereqs[taskID] = rows
+                gating[taskID] = rows.filter { !isWorkItemSatisfied($0.id) }
+            }
+        }
+        dependencyPrereqsByTaskID = prereqs
+        gatingPrereqsByTaskID = gating
+    }
+
     private func workDependencyRow(forID id: String) -> WorkDependencyRow {
         if id.hasPrefix("proj_") {
             if let project = project(withID: id) {
