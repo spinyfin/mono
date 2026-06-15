@@ -468,8 +468,17 @@ impl WorkDb {
             )
             .optional()?
             .flatten();
-        // Only write (and count as changed) when the CI, review, or merge-queue
-        // state differs from what's already stored. `COALESCE(col, '')` treats
+        // Always stamp the poll timestamp so operators can observe that sweeps
+        // are running even when CI/review/merge-queue state is unchanged (e.g. a
+        // PR that stays CONFLICTING for an extended period). Without this,
+        // pr_state_polled_at freezes the moment the state stabilises, making it
+        // impossible to distinguish a frozen poller from an actively-polling one.
+        conn.execute(
+            "UPDATE tasks SET pr_state_polled_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        // Only write state columns (and count as changed) when CI, review, or
+        // merge-queue state differs from what's already stored.  COALESCE treats
         // NULL as distinct from any non-empty string, so the first probe after
         // migration always fires the event.
         let changed = conn.execute(
@@ -478,20 +487,18 @@ impl WorkDb {
                  review_required_state  = ?3,
                  ci_required_detail     = ?4,
                  review_required_detail = ?5,
-                 pr_state_polled_at     = ?6,
-                 merge_queue_state      = ?7
+                 merge_queue_state      = ?6
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
-                    OR COALESCE(merge_queue_state, '') != COALESCE(?7, ''))",
+                    OR COALESCE(merge_queue_state, '') != COALESCE(?6, ''))",
             params![
                 work_item_id,
                 ci_required_state,
                 review_required_state,
                 ci_required_detail,
                 review_required_detail,
-                now,
                 merge_queue_state,
             ],
         )?;

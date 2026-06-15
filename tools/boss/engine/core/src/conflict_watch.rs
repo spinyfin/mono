@@ -153,16 +153,80 @@ pub async fn on_conflict_detected(
                     // through to the reconciliation path in the re-arm branch.
                 }
                 Ok(false) | Err(_) => {
-                    // Parent is in_review (or human-moved): idempotent probe.
-                    // Re-arm the signal so maybe_clear_blocked continues to fire
-                    // when the PR becomes clean, then return false (no net change).
-                    let _ = work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id);
-                    tracing::debug!(
-                        work_item_id = %candidate.work_item_id,
-                        attempt_id = %active_crz.id,
-                        "conflict_watch: active revision in flight; idempotent probe no-op",
-                    );
-                    return false;
+                    // Parent is in_review (or human-moved).  Before treating
+                    // this as an idempotent no-op, check whether the active crz
+                    // is stale.  A crz is stale when either:
+                    //   (a) the probe head SHA has moved since the crz was
+                    //       created — the revision pushed a commit but didn't
+                    //       resolve the conflict, then its exec was abandoned
+                    //       by the orphan sweep (not NudgeBreakerParked, so
+                    //       finalize_conflict_resolution_attempt never ran),
+                    //       leaving the crz `pending` with `revision_task_id`
+                    //       set against an old head; or
+                    //   (b) the linked revision task is in a terminal status
+                    //       (in_review/done/cancelled) but the crz was never
+                    //       finalised — same orphan-sweep abandonment scenario
+                    //       where the head SHA happened not to change.
+                    // In either case, abandon the stale crz and fall through to
+                    // spawn a fresh resolution against the current head.
+                    // Mirrors ci_watch's stale-head supersede logic.
+                    let current_head_sha = probe.head_ref_oid.as_deref();
+                    let head_sha_stale = match current_head_sha {
+                        Some(current) => active_crz
+                            .head_sha_before
+                            .as_deref()
+                            .map(|s| s != current)
+                            .unwrap_or(false),
+                        None => false, // can't compare — conservative: don't supersede
+                    };
+                    let revision_dead = active_crz
+                        .revision_task_id
+                        .as_deref()
+                        .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
+                        .unwrap_or(false);
+                    if head_sha_stale || revision_dead {
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            attempt_id = %active_crz.id,
+                            stale_sha = ?active_crz.head_sha_before,
+                            current_sha = ?current_head_sha,
+                            revision_task_id = ?active_crz.revision_task_id,
+                            head_sha_stale,
+                            revision_dead,
+                            "conflict_watch: active crz is stale; superseding revision and re-detecting",
+                        );
+                        // Reset the stale crz in place: clear revision_task_id
+                        // (and update head_sha_before if head moved) so the
+                        // UNIQUE-collision fallback in insert_conflict_resolution
+                        // picks up this row and dispatches a fresh revision.
+                        // We do NOT abandon the row: abandoning + re-inserting
+                        // would fail the UNIQUE (work_item_id, base_sha_at_trigger)
+                        // key when the base SHA hasn't changed, silently leaving
+                        // no active crz and no new revision spawned.
+                        let new_head = if head_sha_stale { current_head_sha } else { None };
+                        if let Err(err) = work_db.reset_conflict_resolution_for_supersede(&active_crz.id, new_head) {
+                            tracing::warn!(
+                                work_item_id = %candidate.work_item_id,
+                                attempt_id = %active_crz.id,
+                                ?err,
+                                "conflict_watch: failed to reset stale crz; falling through anyway",
+                            );
+                        }
+                        // Fall through to the main code path: mark_chore_blocked
+                        // → insert_conflict_resolution UNIQUE collision → active
+                        // crz lookup returns the reset row → spawn fresh revision.
+                    } else {
+                        // Same head SHA and revision is still live — idempotent
+                        // no-op: re-arm the signal so maybe_clear_blocked fires
+                        // when the PR becomes clean, then return false.
+                        let _ = work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id);
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            attempt_id = %active_crz.id,
+                            "conflict_watch: active revision in flight; idempotent probe no-op",
+                        );
+                        return false;
+                    }
                 }
             }
         }
@@ -2328,6 +2392,222 @@ mod tests {
             "churn cap exhausted: parent must be blocked"
         );
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    }
+
+    // Helper: build a probe with an explicit head SHA (all other fields match
+    // the default `probe()` helper).
+    fn probe_with_head(pr_url: &str, state: PrLifecycleState, head_sha: &str) -> PrLifecycleProbe {
+        PrLifecycleProbe {
+            head_ref_oid: Some(head_sha.to_owned()),
+            ..probe(pr_url, state)
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_head_sha_supersedes_pending_crz() {
+        // Regression test for T1795 / T1764.
+        //
+        // Scenario: a crz is spawned for head SHA A.  The revision pushes a
+        // commit (head moves to B) but doesn't resolve the conflict; then
+        // the exec is abandoned by the orphan sweep (NudgeBreakerParked was
+        // never the stop outcome), leaving the crz `pending` with
+        // `revision_task_id` set and `head_sha_before = A`.
+        //
+        // On the next sweep the probe reports head SHA B.  conflict_watch
+        // must detect the mismatch, abandon the stale crz, and spawn a
+        // fresh resolution against B rather than returning false (no-op).
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/40";
+        let (product, chore) = make_in_review(&db, "C-stale-sha", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // First detection: probe reports head SHA "head-A".  crz spawned, revision
+        // created, parent stays in_review.
+        let first = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+        )
+        .await;
+        assert!(first, "first detection must return true");
+
+        let original_crz = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .expect("crz must exist after first detection");
+        assert_eq!(original_crz.head_sha_before.as_deref(), Some("head-A"));
+        let original_id = original_crz.id.clone();
+
+        // Simulate: revision pushed (head moves to "head-B"), exec abandoned.
+        // We leave the crz as `pending` with `revision_task_id` set (the orphan
+        // sweep does not call finalize_conflict_resolution_attempt).
+
+        // Second sweep: probe reports head SHA "head-B" (head moved).
+        // This must abandon the stale crz and spawn a fresh one.
+        let second = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-B"),
+        )
+        .await;
+        assert!(second, "second probe with new head SHA must re-detect (return true)");
+
+        // The original crz row is reused (reset in place): same ID, updated
+        // head_sha_before, new revision_task_id for the fresh revision.
+        // We do NOT get a second row because the UNIQUE (work_item_id,
+        // base_sha_at_trigger) constraint prevents re-insertion at the same
+        // base SHA; the reset-in-place approach reuses the existing row.
+        let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+        assert_eq!(all.len(), 1, "same crz row is reset in place; no second row created");
+        let crz = &all[0];
+        assert_eq!(crz.id, original_id, "same crz row");
+        assert_eq!(
+            crz.head_sha_before.as_deref(),
+            Some("head-B"),
+            "head_sha_before updated to current head"
+        );
+        assert!(
+            crz.revision_task_id.is_some(),
+            "fresh revision must be stamped on the reset crz"
+        );
+
+        // Parent stays in_review (fresh revision spawned).
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, TaskStatus::InReview);
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_revision_supersedes_pending_crz_even_without_head_move() {
+        // Regression test for the terminal-revision case.
+        //
+        // Scenario: a crz is spawned for head SHA A.  The revision completes
+        // (task moves to in_review) but the execution was abandoned before
+        // NudgeBreakerParked fired, so finalize_conflict_resolution_attempt
+        // was never called and the crz stays `pending` with `revision_task_id`
+        // set.  The head SHA did NOT change.
+        //
+        // On the next sweep, conflict_watch must detect that the linked
+        // revision task is terminal, abandon the stale crz ("revision_terminal"),
+        // and spawn a fresh resolution.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/41";
+        let (product, chore) = make_in_review(&db, "C-stale-terminal", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // First detection: crz spawned, revision created.
+        let first = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(first, "first detection must return true");
+
+        let original_crz = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .expect("crz must exist after first detection");
+        let original_id = original_crz.id.clone();
+        let revision_id = original_crz.revision_task_id.clone().expect("revision must be spawned");
+
+        // Simulate: revision task completed (e.g. moved to in_review) but the
+        // crz was never finalised (exec abandoned outside NudgeBreakerParked).
+        db.update_work_item(
+            &revision_id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Second sweep: same head SHA — but revision is terminal.
+        // Must abandon stale crz and spawn fresh resolution.
+        let second = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(
+            second,
+            "second probe with terminal revision must re-detect (return true)"
+        );
+
+        // The original crz row is reset in place (revision_task_id cleared,
+        // status stays pending), then reused to spawn a fresh revision.
+        let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+        assert_eq!(all.len(), 1, "same crz row is reset in place; no second row created");
+        let crz = &all[0];
+        assert_eq!(crz.id, original_id, "same crz row");
+        assert!(
+            crz.revision_task_id.is_some(),
+            "fresh revision must be stamped on the reset crz"
+        );
+        // revision_task_id must be different from the original stale revision.
+        assert_ne!(
+            crz.revision_task_id.as_deref(),
+            Some(revision_id.as_str()),
+            "fresh revision must be a new task, not the old stale one",
+        );
+
+        // Parent stays in_review (fresh revision spawned).
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, TaskStatus::InReview);
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_revision_same_head_sha_remains_no_op() {
+        // Idempotency guard: if the crz's head SHA matches the current probe
+        // and the revision task is still live, the pre-flight must NOT supersede.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/42";
+        let (product, chore) = make_in_review(&db, "C-noop-live", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // First detection: crz + revision spawned.
+        let first = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(first);
+
+        // Second probe: same head SHA ("head456"), revision still live (todo/active).
+        let second = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(!second, "same head + live revision must remain a no-op (false)");
+
+        // Only the original crz exists — no supersede.
+        let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "no second crz must be created when revision is still live"
+        );
+        assert_eq!(all[0].status, "pending");
     }
 
     #[tokio::test]

@@ -388,6 +388,45 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Supersede a stale `conflict_resolutions` row in place, clearing the
+    /// stale `revision_task_id` so the UNIQUE-collision fallback in
+    /// `on_conflict_detected` can pick up the same row and dispatch a fresh
+    /// revision.
+    ///
+    /// Call this when the active crz's linked revision is stale (head SHA
+    /// moved or revision task reached a terminal status) but the base SHA
+    /// hasn't changed — `INSERT OR IGNORE` would silently skip a fresh row
+    /// with the same `(work_item_id, base_sha_at_trigger)` key. Resetting
+    /// the existing row avoids that constraint while preserving the audit
+    /// entry (same `id`, same `created_at`, updated `head_sha_before`).
+    ///
+    /// `new_head_sha_before`: pass the current probe head SHA when the head
+    /// moved; `None` leaves `head_sha_before` unchanged (terminal-revision
+    /// case where head didn't change).
+    pub fn reset_conflict_resolution_for_supersede(
+        &self,
+        attempt_id: &str,
+        new_head_sha_before: Option<&str>,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+             SET revision_task_id = NULL,
+                 head_sha_before  = COALESCE(?2, head_sha_before)
+             WHERE id = ?1
+               AND status IN ('pending', 'running')",
+            params![attempt_id, new_head_sha_before],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Read-only list of `conflict_resolutions` rows for the Phase 5
     /// `boss engine conflicts list` CLI. Filters are AND-ed; an empty
     /// `status` slice means "any status." Rows come back freshest first
