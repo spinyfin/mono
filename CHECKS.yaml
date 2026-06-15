@@ -7,7 +7,7 @@ checks:
   - id: docs-link-integrity
 
   - id: no-generated-artifacts
-    check: forbidden-paths
+    check: file/forbidden-path
     config:
       rules:
         - remediation: "Generated build output must not be committed. Remove the artifact from the change."

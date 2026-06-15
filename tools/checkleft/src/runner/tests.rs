@@ -629,10 +629,10 @@ async fn runner_reports_invalid_builtin_config_on_checks_file() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "forbidden-paths"
+id = "api-breaking-surface"
 
 [checks.config]
-rules = "not-a-list"
+trigger_globs = "not-a-list"
 "#,
     )
     .expect("write config");
@@ -656,7 +656,7 @@ rules = "not-a-list"
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].check_id, "forbidden-paths");
+    assert_eq!(results[0].check_id, "api-breaking-surface");
     assert_eq!(
         results[0].findings[0].location.as_ref().map(|location| &location.path),
         Some(&Path::new("CHECKS.toml").to_path_buf())
@@ -664,7 +664,7 @@ rules = "not-a-list"
     assert!(
         results[0].findings[0]
             .message
-            .contains("invalid forbidden-paths check config")
+            .contains("invalid api-breaking-surface config")
     );
     assert!(!results[0].findings[0].message.contains("check execution failed"));
 }

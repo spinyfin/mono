@@ -128,6 +128,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
     // CARGO_MANIFEST_DIR for bindgen!.
     BundledCheckDef {
         check_names: &[
+            "file/forbidden-path",
             "file/size",
             "file/ifchange",
             "rust/giant-structs",

@@ -44,6 +44,7 @@ use checkleft_check_sdk::export_checks;
 // source crate emits a `__CHECKLEFT_ENTRY_<fn>` static; `export_checks!` derives
 // that name from the function ident it is given and references it via `super::`.
 // The `rust/giant-structs` stale-exclusion audit hooks are plain functions.
+use checkleft_file_forbidden_path::__CHECKLEFT_ENTRY_forbidden_path_check;
 use checkleft_file_ifchange::__CHECKLEFT_ENTRY_file_ifchange_check;
 use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
 use checkleft_rust_giant_structs_create::{
@@ -55,6 +56,7 @@ use checkleft_rust_giant_structs_use_builder::{
 };
 
 export_checks!(
+    forbidden_path_check,
     file_size_check,
     file_ifchange_check,
     giant_structs_check,
