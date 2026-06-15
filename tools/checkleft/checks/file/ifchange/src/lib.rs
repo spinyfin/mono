@@ -1,9 +1,7 @@
 //! Checkleft check: require linked files or blocks to change together.
 //!
-//! This is the Component Model wasm port of the former built-in
-//! `ifchange-thenchange` check, registered under the canonical id `file/ifchange`.
-//! It runs inside the checkleft wasm host and reads files via the WASI filesystem
-//! sandbox.
+//! Registered under the canonical id `file/ifchange`. Runs inside the checkleft
+//! wasm host and reads files via the WASI filesystem sandbox.
 //!
 //! ## What the check detects
 //!
@@ -11,8 +9,7 @@
 //! and the region between the markers is modified, the check requires the named target
 //! file (or labeled block within it) to also be modified in the same change.
 //!
-//! This check achieves full parity with the former native implementation, including
-//! enforcement on deleted files and removed-marker scenarios, via base-revision
+//! Enforcement covers deleted files and removed-marker scenarios via base-revision
 //! content supplied through the [`ChangeSet::base_files`] field in the check input.
 //!
 //! ## Supported comment styles

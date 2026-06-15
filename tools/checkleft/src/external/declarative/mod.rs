@@ -8,12 +8,11 @@
 //! invocations → apply declared transforms → emit [`Finding`]s.
 //!
 //! This runtime is the single "framework runs declared invocations + transforms"
-//! path. It **subsumes the former `exec-v1` tier**: an `exec` check (a custom
-//! binary that emits checkleft findings JSON directly) is just an invocation with
-//! the `passthrough` transform. buildifier is the other forcing example: file
-//! selection, binary resolution, ordered invocations with explicit exit-code
-//! semantics, and a JSON→Finding projection — but no real computation, so it
-//! collapses to pure declaration.
+//! path. A custom binary that emits checkleft findings JSON directly is modelled
+//! as a declarative invocation with the `passthrough` transform. buildifier is
+//! the other representative example: file selection, binary resolution, ordered
+//! invocations with explicit exit-code semantics, and a JSON→Finding projection —
+//! but no guest computation, so it collapses to pure declaration.
 //!
 //! # Transform strategies
 //!

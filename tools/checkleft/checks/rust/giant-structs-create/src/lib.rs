@@ -2,9 +2,7 @@
 //! `max_fields` explicit named fields without a functional-update spread, and
 //! should use a builder instead.
 //!
-//! This is the Component Model wasm port of the former native
-//! `rust-giant-struct-instantiation-use-builder` check, registered under the
-//! canonical id `rust/giant-structs-create`. It is the construction-site
+//! Registered under the canonical id `rust/giant-structs-create`. Construction-site
 //! counterpart of `rust/giant-structs` (which flags struct DEFINITIONS).
 //!
 //! ## What the check detects

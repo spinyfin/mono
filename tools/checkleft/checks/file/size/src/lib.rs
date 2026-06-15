@@ -1,7 +1,6 @@
 //! Checkleft check: flag files exceeding a configured line-count limit.
 //!
-//! This is the Component Model wasm port of the former built-in `file-size` check,
-//! registered under the canonical id `file/size`. It runs inside the checkleft
+//! Registered under the canonical id `file/size`. Runs inside the checkleft
 //! wasm host and reads files via the WASI filesystem sandbox.
 //!
 //! ## What the check detects

@@ -34,8 +34,7 @@ def _toml_string(value):
 def _render_declarative_passthrough_manifest(check_id, executable_path, args):
     # A repo-local check binary is modelled as a single declarative invocation with
     # the `passthrough` transform: the binary emits a checkleft findings document
-    # (`{"findings":[…]}`) on stdout, which the framework returns unchanged. This is
-    # the unified replacement for the former `exec-v1` runtime.
+    # (`{"findings":[…]}`) on stdout, which the framework returns unchanged.
     arg_entries = [_toml_string(arg) for arg in args] + [_toml_string("{{files}}")]
     lines = [
         "id = {}".format(_toml_string(check_id)),

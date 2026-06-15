@@ -1,8 +1,7 @@
 //! Checkleft check: flag changed files whose paths match forbidden glob patterns.
 //!
-//! This is the Component Model wasm port of the former built-in `forbidden-paths`
-//! check, registered under the canonical id `file/forbidden-path`. It runs inside
-//! the checkleft wasm host and receives changeset data via the WIT contract.
+//! Registered under the canonical id `file/forbidden-path`. Runs inside the
+//! checkleft wasm host and receives changeset data via the WIT contract.
 //!
 //! ## What the check detects
 //!
