@@ -16,6 +16,12 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 /// case (writes are tiny) but cheap when uncontended.
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// SQL fragment for the set of task kinds that behave like chores: they own
+/// their own PR and follow the active → in_review → done lifecycle. Used in
+/// every `kind IN (...)` filter that drives the merge-poller and blocking
+/// sweeps so a new kind only needs to be added here to be wired in everywhere.
+pub(crate) const CHORE_LIKE_KINDS_SQL: &str = "'chore', 'project_task', 'design', 'investigation', 'followup'";
+
 /// Sliding window for the merge-conflict churn-guard heuristic
 /// (`merge-conflict-handling-in-review.md` Q6 / Phase 6 #16): the
 /// 4th `conflict_resolutions` row for a given work item inside one
