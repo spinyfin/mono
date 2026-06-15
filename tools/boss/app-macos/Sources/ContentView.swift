@@ -2780,9 +2780,10 @@ struct WorkCardPopoverView: View {
                 }
                 metadataPRRow(prURL: task.prURL)
                 if task.kind == "followup" {
-                    var originParts: [String] = []
-                    if let sid = task.originTaskShortId { originParts.append("T\(sid)") }
-                    if let pn = task.originPrNumber { originParts.append("PR #\(pn)") }
+                    let originParts = [
+                        task.originTaskShortId.map { "T\($0)" },
+                        task.originPrNumber.map { "PR #\($0)" }
+                    ].compactMap { $0 }
                     if !originParts.isEmpty {
                         metadataRow("Origin", value: originParts.joined(separator: " / "))
                     }
