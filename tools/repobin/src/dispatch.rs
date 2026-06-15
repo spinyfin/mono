@@ -94,15 +94,18 @@ fn plan_from_target<B: BazelAdapter>(
     let executable_path = bazel.resolve_executable(repo_root, target)?;
 
     if let Some(root) = cache_root {
-        let source_files = match bazel.resolve_source_files(repo_root, target) {
-            Ok(files) => files,
-            Err(error) => {
-                trace(format_args!("dispatch-cache source query failed: {error}"));
-                Vec::new()
+        match bazel.resolve_source_files(repo_root, target) {
+            Ok(source_files) => {
+                if let Err(error) = dispatch_cache::record_in(root, repo_root, target, &executable_path, &source_files)
+                {
+                    trace(format_args!("dispatch-cache record failed: {error}"));
+                }
             }
-        };
-        if let Err(error) = dispatch_cache::record_in(root, repo_root, target, &executable_path, &source_files) {
-            trace(format_args!("dispatch-cache record failed: {error}"));
+            Err(error) => {
+                trace(format_args!(
+                    "dispatch-cache source query failed, skipping cache record: {error}"
+                ));
+            }
         }
     }
 

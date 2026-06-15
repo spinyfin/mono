@@ -402,7 +402,7 @@ fn parses_forbidden_paths_rules_from_yaml() {
         r#"
 checks:
   - id: no-generated-artifacts
-    check: forbidden-paths
+    check: file/forbidden-path
     config:
       rules:
         - remediation: "Remove the artifact."
@@ -422,7 +422,7 @@ checks:
         .expect("resolve checks");
 
     let check = checks.get("no-generated-artifacts").expect("check present");
-    assert_eq!(check.check, "forbidden-paths");
+    assert_eq!(check.check, "file/forbidden-path");
     let rules = check
         .config
         .as_table()

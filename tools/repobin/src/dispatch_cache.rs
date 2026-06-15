@@ -11,7 +11,11 @@ use crate::app::RepobinError;
 // v3: witnesses are validated by content sha256, not mtime alone. Bumping the
 // version makes every v2 (mtime-only) entry a cache miss so we never trust a
 // pre-content-hash record.
-const CACHE_VERSION: u32 = 3;
+// v4: empty witness lists are now treated as a cache miss; skip recording when
+// source query fails. Bump so any stale v3 entries with incomplete witness
+// coverage (e.g. transitive dep changes not reflected in direct-source witnesses)
+// are forced to rebuild.
+const CACHE_VERSION: u32 = 4;
 const CACHE_SUBDIR: &str = "dispatch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +61,12 @@ pub fn lookup_in(cache_root: &Path, repo_root: &Path, target: &str) -> Option<Pa
     let executable = PathBuf::from(&cache.executable_path);
     let actual_binary_mtime = mtime_ns(&executable)?;
     if actual_binary_mtime < cache.binary_mtime_ns {
+        return None;
+    }
+
+    // An empty witness list means we have no evidence about which source files
+    // back this binary. Treat it as a miss rather than assuming it's current.
+    if cache.build_witnesses.is_empty() {
         return None;
     }
 

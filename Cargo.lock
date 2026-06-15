@@ -634,6 +634,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-file-forbidden-path"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "globset",
+ "serde",
+]
+
+[[package]]
 name = "checkleft-file-ifchange"
 version = "0.1.0"
 dependencies = [
@@ -669,6 +678,7 @@ name = "checkleft-preinstalled-bundle"
 version = "0.1.0"
 dependencies = [
  "checkleft-check-sdk",
+ "checkleft-file-forbidden-path",
  "checkleft-file-ifchange",
  "checkleft-file-size",
  "checkleft-rust-giant-structs",
