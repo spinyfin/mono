@@ -131,7 +131,7 @@ pub fn heartbeat_interval() -> Duration {
 }
 
 /// Counts from one heartbeat pass; logged at `info` when activity occurs.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
 pub struct HeartbeatSweepOutcome {
     /// Leases successfully refreshed this pass via the live-registry sweep.
     pub heartbeated: usize,
@@ -191,7 +191,14 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
 ) -> HeartbeatSweepOutcome {
-    run_one_pass_impl(work_db, live_states, cube_client, dispatch_events, HEARTBEAT_CUBE_TIMEOUT).await
+    run_one_pass_impl(
+        work_db,
+        live_states,
+        cube_client,
+        dispatch_events,
+        HEARTBEAT_CUBE_TIMEOUT,
+    )
+    .await
 }
 
 /// Internal implementation that accepts a configurable per-call timeout
@@ -448,15 +455,20 @@ pub async fn reheartbeat_live_runs(
 ) -> usize {
     let mut heartbeated = 0usize;
     for execution in in_flight {
-        if !matches!(report.verdicts.get(&execution.id).copied(), Some(RunReconcileVerdict::Live)) {
+        if !matches!(
+            report.verdicts.get(&execution.id).copied(),
+            Some(RunReconcileVerdict::Live)
+        ) {
             continue;
         }
         let Some(lease_id) = execution.cube_lease_id.as_deref() else {
             continue;
         };
-        let result =
-            tokio::time::timeout(HEARTBEAT_CUBE_TIMEOUT, cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)))
-                .await;
+        let result = tokio::time::timeout(
+            HEARTBEAT_CUBE_TIMEOUT,
+            cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)),
+        )
+        .await;
         match result {
             Ok(Ok(())) => {
                 heartbeated += 1;
@@ -552,10 +564,7 @@ mod tests {
             unimplemented!()
         }
         async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
-            self.heartbeats
-                .lock()
-                .unwrap()
-                .push((lease_id.to_owned(), ttl_seconds));
+            self.heartbeats.lock().unwrap().push((lease_id.to_owned(), ttl_seconds));
             if self.fail.load(Ordering::SeqCst) {
                 return Err(anyhow!("simulated cube heartbeat failure"));
             }
@@ -598,14 +607,9 @@ mod tests {
     }
 
     fn create_named_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
-        db.create_chore(
-            CreateChoreInput::builder()
-                .product_id(product_id)
-                .name(name)
-                .build(),
-        )
-        .unwrap()
-        .id
+        db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
+            .unwrap()
+            .id
     }
 
     /// Create a `ready` execution for `work_item_id`.
@@ -618,8 +622,15 @@ mod tests {
     /// Create a `running` execution that has recorded `lease_id`.
     fn running_execution_with_lease(db: &WorkDb, work_item_id: &str, lease_id: &str) -> String {
         let execution_id = ready_execution(db, work_item_id);
-        db.start_execution_run(&execution_id, "agent-1", "repo", lease_id, "mono-agent-001", "/tmp/mono-agent-001")
-            .unwrap();
+        db.start_execution_run(
+            &execution_id,
+            "agent-1",
+            "repo",
+            lease_id,
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
         execution_id
     }
 
@@ -907,7 +918,11 @@ mod tests {
         assert_eq!(outcome.heartbeated, 1, "the non-hung slot must succeed");
 
         let completed = cube.completed.lock().unwrap().clone();
-        assert_eq!(completed, vec!["lease-fast".to_owned()], "only the fast lease completes");
+        assert_eq!(
+            completed,
+            vec!["lease-fast".to_owned()],
+            "only the fast lease completes"
+        );
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1, "one timeout error event");
@@ -933,13 +948,13 @@ mod tests {
         let sink = RecordingDispatchEventSink::new();
         let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, HEARTBEAT_CUBE_TIMEOUT).await;
 
-        assert_eq!(outcome.db_fallback_heartbeated, 1, "DB-fallback must cover unregistered execution");
+        assert_eq!(
+            outcome.db_fallback_heartbeated, 1,
+            "DB-fallback must cover unregistered execution"
+        );
         assert_eq!(outcome.heartbeated, 0);
         assert_eq!(outcome.failed, 0);
-        assert_eq!(
-            cube.calls(),
-            vec![("lease-orphan".to_owned(), Some(LEASE_TTL_SECS))],
-        );
+        assert_eq!(cube.calls(), vec![("lease-orphan".to_owned(), Some(LEASE_TTL_SECS))],);
         let _ = execution_id; // used to set up DB row
     }
 }
