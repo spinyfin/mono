@@ -1746,10 +1746,8 @@ final class ChatViewModel: ObservableObject {
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
-    /// Invoked when the engine pushes `engine_pool_config` on session
-    /// registration. Allows `ContentView` to forward the pool sizes to
-    /// `WorkersWorkspaceModel` so its slot ranges mirror the engine, and
-    /// to update the Boss pane's coordinator model via `BossPaneModel`.
+    /// Invoked when the engine pushes `engine_pool_config`: forwards pool sizes to
+    /// `WorkersWorkspaceModel` and coordinator model to `BossPaneModel`.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
 
