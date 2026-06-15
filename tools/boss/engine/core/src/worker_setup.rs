@@ -225,6 +225,54 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          `$EDITOR` — commands that fall through to one fail. Fix by\n\
          re-running with `-m`.\n\
          \n\
+         ## jj-native operation: mental model and recovery\n\
+         \n\
+         This repo uses jj. Operate natively in jj terms — do NOT reach for raw\n\
+         git against the shared object store.\n\
+         \n\
+         **Forbidden:** `GIT_DIR=.jj/repo/store/git git ...` and `gh pr checkout`\n\
+         against the colocated store — these bypass jj's op-log and are how\n\
+         recoverable jj states turn into corruption. Use `jj git fetch`,\n\
+         `jj git push -b <name>`, and `jj new '<bookmark>@origin'` instead.\n\
+         \n\
+         **Conflicts are first-class in jj.** Conflicts are stored inside commits\n\
+         and propagate through rebase. A conflicted commit is NOT an emergency:\n\
+         keep working and resolve when ready. `jj status` and `jj diff` work\n\
+         normally on a conflicted working copy.\n\
+         \n\
+         **Divergent change-ids (`xxxxxxxx??`) are not corruption.** When jj shows\n\
+         a change-id with `??`, it means the same change-id resolves to more than\n\
+         one commit. This is jj surfacing a divergence for you to resolve: pick\n\
+         one and `jj abandon` the others. Do NOT panic-reset to remote.\n\
+         \n\
+         **Recover via the op-log, not git tricks.** jj almost never loses work:\n\
+         \n\
+         ```sh\n\
+         jj op log               # find the operation that caused the problem\n\
+         jj op undo              # step back one operation\n\
+         jj op restore <op-id>   # restore to a specific operation\n\
+         ```\n\
+         \n\
+         Do NOT reset-to-remote-and-replay-a-patch — that throws away jj's history\n\
+         and is fragile.\n\
+         \n\
+         **Rewriting is safe and normal.** `jj rebase`, `jj squash`, and `jj describe`\n\
+         produce new commit-ids with stable change-ids and are recorded in the\n\
+         op-log. Do not reach for git seatbelts (merge-to-avoid-rewrite,\n\
+         force-push fear) when jj's rewrite is the cleaner path.\n\
+         \n\
+         **Merge-conflict resolution:**\n\
+         \n\
+         ```sh\n\
+         jj rebase -d main@origin  # rebase onto latest main; conflicts materialize here\n\
+         # resolve conflicts in the working copy\n\
+         jj describe -m \"...\"     # set the commit message\n\
+         ```\n\
+         \n\
+         **Adding work to an existing PR:** when operator feedback adds new work,\n\
+         prefer creating a NEW commit (append) rather than amending — it is\n\
+         generally cleaner and easier to review.\n\
+         \n\
          ## Creating a PR from a jj workspace\n\
          \n\
          Cube workspaces are secondary jj workspaces. There is no `.git/`\n\
