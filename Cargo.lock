@@ -634,6 +634,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-file-ifchange"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "tempfile",
+]
+
+[[package]]
 name = "checkleft-file-size"
 version = "0.1.0"
 dependencies = [
@@ -661,6 +669,7 @@ name = "checkleft-preinstalled-bundle"
 version = "0.1.0"
 dependencies = [
  "checkleft-check-sdk",
+ "checkleft-file-ifchange",
  "checkleft-file-size",
  "checkleft-rust-giant-structs",
  "checkleft-rust-giant-structs-create",
