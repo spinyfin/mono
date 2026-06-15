@@ -377,17 +377,27 @@ final class GhosttyRuntime: @unchecked Sendable {
         location _: ghostty_clipboard_e,
         state: UnsafeMutableRawPointer?
     ) -> Bool {
-        guard let host = hostView(from: userdata), let surface = host.surface else {
-            return false
-        }
-        guard let text = NSPasteboard.general.string(forType: .string) else {
-            return false
-        }
+        // libghostty invokes surface clipboard callbacks on the main thread, so
+        // the host view's main-actor-isolated `surface` can be read under
+        // `assumeIsolated`. The raw pointers are not Sendable, so cross the
+        // isolation boundary as bit patterns and rebuild them inside.
+        let userdataBits = UInt(bitPattern: userdata)
+        let stateBits = UInt(bitPattern: state)
+        return MainActor.assumeIsolated {
+            guard let host = hostView(from: UnsafeMutableRawPointer(bitPattern: userdataBits)),
+                  let surface = host.surface else {
+                return false
+            }
+            guard let text = NSPasteboard.general.string(forType: .string) else {
+                return false
+            }
 
-        text.withCString { ptr in
-            ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
+            let state = UnsafeMutableRawPointer(bitPattern: stateBits)
+            text.withCString { ptr in
+                ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
+            }
+            return true
         }
-        return true
     }
 
     fileprivate static func writeClipboard(

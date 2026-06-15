@@ -1833,13 +1833,7 @@ private struct WorkFilterBanner: View {
             Image(systemName: "line.3.horizontal.decrease.circle.fill")
                 .foregroundStyle(Color.accentColor)
                 .font(.callout)
-            (
-                Text("Filtered view — showing matches for ")
-                    .foregroundStyle(.secondary)
-                    + Text("“\(query)”")
-                    .foregroundStyle(.primary)
-                    .fontWeight(.semibold)
-            )
+            Text("\(Text("Filtered view — showing matches for ").foregroundStyle(.secondary))\(Text("“\(query)”").foregroundStyle(.primary).fontWeight(.semibold))")
             .font(.callout)
             .lineLimit(1)
             .truncationMode(.middle)
@@ -5165,7 +5159,7 @@ private struct UpdateBadgeToolbarButton: View {
                 Image(systemName: "arrow.down.circle.fill")
                     .foregroundStyle(Color.accentColor)
             }
-            .help("Update available: Boss \(update.version)")
+            .help("Update available: Boss \(update.version.description)")
             .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
                 UpdateBadgePopover(update: update, updateModel: updateModel) {
                     isPopoverPresented = false
@@ -5197,7 +5191,7 @@ private struct UpdateBadgePopover: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Update Available")
                         .font(.headline)
-                    Text("Boss \(update.version)")
+                    Text("Boss \(update.version.description)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
