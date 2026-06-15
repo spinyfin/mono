@@ -817,19 +817,17 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
 }
 
 // NOTE: the modified-only scope behavior (a file NOT in the changeset is never
-// read even when it contains a violation) is no longer round-tripped through the
-// real component here. Its mechanism is proven structurally — the sandbox simply
+// read even when it contains a violation) is not round-tripped through the real
+// component here. Its mechanism is proven structurally — the sandbox simply
 // excludes out-of-scope files — by
 // `sandbox_is_populated_only_with_changeset_files_for_modified_only_scope` above,
 // and the check's own detection logic is covered by the native unit tests in the
-// giant-structs check crate. Keeping a full wasm execution just to re-observe
-// "no finding" was redundant matrix coverage on the slow layer.
+// giant-structs check crate. A full wasm execution just to re-observe "no finding"
+// would be redundant matrix coverage on the slow layer.
 
 /// Regression test: the check must complete without crashing when given a large
-/// Rust file (~3100 lines). Previously, an instruction-counting fuel limit was
-/// exhausted on the first syn parse of a large file and produced a generic
-/// "run-check call failed" trap with no file attribution. Fuel has since been
-/// removed; epoch-only timeout is the safety net.
+/// Rust file (~3100 lines). Epoch-based timeout is the safety net; this test
+/// confirms large files parse cleanly without triggering it.
 #[test]
 fn bundled_giant_structs_check_handles_large_rs_file() {
     use crate::external::{

@@ -3,9 +3,9 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 # The file/size check logic as an ordinary rlib. It is linked (together with the
 # other preinstalled checks) into the single multiplexed Component Model
-# component built by //tools/checkleft/preinstalled-bundle. This crate no longer
-# builds its own component: a separate component per check duplicated the entire
-# wasm runtime baseline (std/alloc/SDK/wit-bindgen/serde) once per check.
+# component built by //tools/checkleft/preinstalled-bundle. Building as an rlib
+# lets the shared wasm runtime baseline (std/alloc/SDK/wit-bindgen/serde) be
+# deduped across all checks inside one component.
 rust_library(
     name = "file_size_check",
     srcs = ["src/lib.rs"],

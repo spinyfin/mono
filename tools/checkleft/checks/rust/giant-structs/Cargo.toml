@@ -7,7 +7,7 @@ description = "checkleft check (rust/giant-structs): flag Rust structs with too 
 # An ordinary rlib. The component ABI is wired once in the aggregating
 # `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
 # the single multiplexed preinstalled component. No `wit-bindgen` dependency is
-# needed here because this crate no longer calls `export_checks!`.
+# needed here: `export_checks!` is called by the aggregating bundle, not here.
 #
 # The lib name is set explicitly so cargo matches the Bazel `crate_name`
 # (`checkleft_rust_giant_structs_use_builder`); the aggregator imports the check

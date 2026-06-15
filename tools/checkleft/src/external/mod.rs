@@ -11,7 +11,7 @@ use crate::path::validate_relative_path;
 /// `component` manifest mode selects this runtime.
 pub const EXTERNAL_CHECK_COMPONENT_RUNTIME_V1: &str = "component-v1";
 /// Runtime tag for the `declarative` tier (config-only, framework-owned
-/// invocation + declarative transforms). Subsumes the former `exec-v1` tier.
+/// invocation + declarative transforms).
 pub const EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1: &str = "declarative-v1";
 pub const EXTERNAL_CHECK_API_V1: &str = "v1";
 pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
@@ -114,8 +114,8 @@ pub enum ExternalCheckPackageImplementation {
     /// capability-scoped file access and resource limits.
     Component(ExternalCheckComponentPackage),
     /// The `declarative` tier: framework-owned invocations + declarative
-    /// transforms. Subsumes the former `exec` tier (via the `passthrough`
-    /// transform).
+    /// transforms. Custom binaries that emit findings JSON directly use the
+    /// `passthrough` transform.
     Declarative(ExternalCheckDeclarativePackage),
 }
 

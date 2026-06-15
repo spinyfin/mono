@@ -3,21 +3,18 @@
 //!
 //! # Why a bundle
 //!
-//! Each preinstalled check used to be its own `cdylib` compiled to its own
-//! component and `include_bytes!`'d into the binary. Every component statically
-//! linked its OWN copy of the wasm `std`/`core`/`alloc` runtime, the
-//! `checkleft-check-sdk`, the `wit-bindgen` glue, and `serde`/`serde_json`, so
-//! the embedded size grew by a full shared baseline with every new check (and
-//! heavy deps like `syn` were duplicated across checks that use them).
+//! A separate component per check would statically link its OWN copy of the wasm
+//! `std`/`core`/`alloc` runtime, `checkleft-check-sdk`, `wit-bindgen` glue, and
+//! `serde`/`serde_json`, growing the embedded binary size by a full shared baseline
+//! with every new check (heavy deps like `syn` would be duplicated across checks).
 //!
 //! This crate is a single `cdylib` that depends on each check's source crate as
 //! an rlib and calls [`export_checks!`] exactly once. Rust's LTO / dead-code
-//! elimination then dedups the shared baseline and shared deps across all checks
-//! inside ONE component. The SDK already supports multiple checks per component:
+//! elimination deduplicates the shared baseline and shared deps across all checks
+//! inside ONE component. The SDK supports multiple checks per component:
 //! the generated `list-checks` / `run-check` exports dispatch by check name, and
-//! the host (`tools/checkleft/src/external/runtime.rs`) already drives them that
-//! way — so this is purely a packaging change. Check ids, messages, severities,
-//! and behavior are unchanged.
+//! the host (`tools/checkleft/src/external/runtime.rs`) drives them that way.
+//! Check ids, messages, severities, and behavior are unaffected by the bundling.
 //!
 //! # Per-invocation isolation
 //!

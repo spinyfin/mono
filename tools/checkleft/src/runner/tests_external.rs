@@ -1,6 +1,6 @@
-/// Build a resolved `declarative` external package (the runtime the former
-/// `exec` tier folded into) for routing/policy tests. The mock executor returns
-/// canned results, so the invocation body is never actually run.
+/// Build a resolved `declarative` external package for routing/policy tests.
+/// The mock executor returns canned results, so the invocation body is never
+/// actually run.
 fn declarative_package(check_id: &str) -> ExternalCheckPackage {
     let manifest = r#"
 id = "CHECK_ID"
