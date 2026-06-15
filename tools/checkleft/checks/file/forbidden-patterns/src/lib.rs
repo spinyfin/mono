@@ -50,9 +50,12 @@
 //! ### Glob coordinates
 //!
 //! `include_globs` and `exclude_globs` (alias `exclude_files`) are matched
-//! against repo-root-relative paths. The host resolves any CHECKS-file-relative
-//! framework globs to repo-relative coordinates before they reach this check, so
-//! matching here is a plain repo-relative glob test.
+//! against repo-root-relative paths. The host rewrites top-level
+//! `exclude_files`/`exclude_globs` keys in the config table but does NOT recurse
+//! into the `rules[]` array, so all rule-level globs reach this check verbatim.
+//! They are matched repo-root-relative with no `config_dir` prefix applied.
+//! Authors writing a repo-local (subdirectory) `CHECKS` file must express
+//! rule-level globs as repo-root-relative paths, not config-dir-relative paths.
 
 use checkleft_check_sdk::{ChangeKind, CheckInput, Finding, Severity, check};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -114,7 +117,16 @@ impl CompiledRule {
     severity = error
 )]
 pub fn forbidden_patterns_check(input: CheckInput) -> Vec<Finding> {
-    let cfg: Config = input.config().unwrap_or_default();
+    // Fail loudly on a malformed config: silently falling back to an empty rule
+    // list would let forbidden content slip through undetected.  A well-formed
+    // absent/empty config parses successfully (all Config fields have serde
+    // defaults), so this only panics for genuinely invalid JSON or wrong types.
+    let cfg: Config = input
+        .config()
+        .unwrap_or_else(|err| panic!("invalid file/forbidden-patterns config: {err}"));
+    if cfg.rules.is_empty() {
+        panic!("file/forbidden-patterns config must contain at least one rule");
+    }
     let rules = compile_rules(&cfg);
 
     let mut findings = Vec::new();
@@ -256,7 +268,11 @@ mod tests {
 
     /// Run the check against a file written into a temp dir, with the given config.
     fn run(path: &str, kind: ChangeKind, contents: &str, config_json: &str) -> Vec<Finding> {
-        let _guard = CWD_LOCK.lock().unwrap();
+        // Recover from a poisoned lock: a #[should_panic] test panics while
+        // holding the lock, which poisons it.  The CWD is restored by the
+        // panicking test's cleanup or left in an indeterminate state, but
+        // subsequent tests must still be able to acquire the guard.
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let old_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -350,10 +366,33 @@ mod tests {
         assert!(forbidden_patterns_check(input).is_empty());
     }
 
+    /// Call the check with config only — no file on disk needed because the
+    /// panic occurs before any file I/O (during config parsing or rule
+    /// validation).  Bypasses the CWD-mutating `run()` helper so that these
+    /// `#[should_panic]` tests cannot poison CWD_LOCK for sibling tests.
+    fn check_with_config(config_json: &str) {
+        let input = CheckInput::__from_parts(make_changeset("a.ts", ChangeKind::Modified), config_json.to_owned());
+        forbidden_patterns_check(input);
+    }
+
     #[test]
-    fn empty_rules_produce_no_findings() {
-        let findings = run("a.ts", ChangeKind::Modified, "fetch(url(\n", "{}");
-        assert!(findings.is_empty());
+    #[should_panic(expected = "must contain at least one rule")]
+    fn empty_rules_panic() {
+        check_with_config("{}");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid file/forbidden-patterns config")]
+    fn malformed_config_panics() {
+        // A rule missing the required `pattern` field is a config error; the
+        // check must fail loudly rather than silently enforcing nothing.
+        check_with_config(r#"{"rules": [{"message": "m"}]}"#);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid file/forbidden-patterns config")]
+    fn invalid_json_config_panics() {
+        check_with_config("not json at all");
     }
 
     #[test]
