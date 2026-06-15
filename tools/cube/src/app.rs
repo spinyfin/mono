@@ -197,12 +197,6 @@ const JJ_NO_REMOTE_BOOKMARK_SIGNATURE: &str = "no such remote bookmark";
 /// during the on-lease fast-forward without bricking the lease.
 const JJ_REVISION_DOESNT_EXIST_SIGNATURE: &str = "doesn't exist";
 
-/// Stable substring jj prints when `jj bookmark set` is asked to move a
-/// bookmark backwards (target is an ancestor of the current position) or
-/// sideways (neither is an ancestor of the other) without `--allow-backwards`.
-/// Used by the PR-resume path to detect a diverged local `pr/<n>` bookmark
-/// and force-reset it to the GitHub head rather than aborting the lease.
-
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -5022,11 +5016,6 @@ fn run_jj_network(
         }
     }
 }
-
-/// Run a non-`jj` network subprocess (e.g. `gh`, `git ls-remote`) with the
-/// network timeout and the same bounded retry policy as [`run_jj_network`].
-/// Unlike [`run_jj`] there is no jj-specific recovery to layer on, so this
-/// goes straight through [`CommandRunner::run_with_timeout`].
 
 /// Run a `jj` command against a workspace, transparently recovering
 /// from a stale working copy, op-log divergence, or a missing jj repo
@@ -14373,28 +14362,6 @@ steps:
                     args: args_owned,
                     status: Some(1),
                     stderr: format!("Error: Revision `{target}` doesn't exist"),
-                }),
-                creates_dir: None,
-            }
-        }
-
-        /// Build an expectation that simulates `jj bookmark set` failing
-        /// because the target is an ancestor of (or unrelated to) the current
-        /// bookmark position and `--allow-backwards` was not passed. Matches
-        fn bookmark_backwards_or_sideways(cwd: PathBuf, args: &[&str], bookmark_name: &str) -> Self {
-            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-            Self {
-                cwd,
-                program: "jj".to_string(),
-                args: args_owned.clone(),
-                result: Err(CubeError::CommandFailed {
-                    program: "jj".to_string(),
-                    args: args_owned,
-                    status: Some(1),
-                    stderr: format!(
-                        "Error: Refusing to move bookmark backwards or sideways: {bookmark_name}\n\
-                         Hint: Use --allow-backwards to allow it."
-                    ),
                 }),
                 creates_dir: None,
             }
