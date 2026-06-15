@@ -1,0 +1,16 @@
+[package]
+name = "checkleft-file-ifchange"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (file/ifchange): require linked files or blocks to change together (LINT.IfChange / LINT.ThenChange markers)"
+
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component. No `wit-bindgen` dependency is
+# needed here because this crate does not call `export_checks!`.
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

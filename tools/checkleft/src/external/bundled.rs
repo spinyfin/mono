@@ -127,7 +127,12 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
     // that separation keeps checkleft_lib in "source mode" and preserves
     // CARGO_MANIFEST_DIR for bindgen!.
     BundledCheckDef {
-        check_names: &["file/size", "rust/giant-structs", "rust/giant-structs-create"],
+        check_names: &[
+            "file/size",
+            "file/ifchange",
+            "rust/giant-structs",
+            "rust/giant-structs-create",
+        ],
         kind: BundledCheckDefKind::Component {
             bytes: checkleft_preinstalled_wasm_bundle::WASM,
         },
@@ -266,6 +271,7 @@ mod tests {
         };
 
         let file_size = resolve_component("file/size");
+        let file_ifchange = resolve_component("file/ifchange");
         let giant_structs = resolve_component("rust/giant-structs");
 
         // Same underlying component bytes (pointer-identical static + equal sha).
@@ -274,12 +280,19 @@ mod tests {
             giant_structs.artifact_bytes.map(<[u8]>::as_ptr),
             "preinstalled wasm checks must point at the same consolidated component",
         );
+        assert_eq!(
+            file_size.artifact_bytes.map(<[u8]>::as_ptr),
+            file_ifchange.artifact_bytes.map(<[u8]>::as_ptr),
+            "file/ifchange must point at the same consolidated component",
+        );
         assert_eq!(file_size.artifact_sha256, giant_structs.artifact_sha256);
+        assert_eq!(file_size.artifact_sha256, file_ifchange.artifact_sha256);
         assert!(!file_size.artifact_sha256.is_empty(), "sha256 must be computed");
 
         // ...but each names its own check so the host dispatches correctly via
         // the component's list-checks / run-check exports.
         assert_eq!(file_size.check_name, "file/size");
+        assert_eq!(file_ifchange.check_name, "file/ifchange");
         assert_eq!(giant_structs.check_name, "rust/giant-structs");
     }
 
