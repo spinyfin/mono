@@ -156,9 +156,9 @@ checks:
 
 ```yaml
 checks:
-  - id: frontend-no-legacy-api
-    check: frontend-no-legacy-api
-    implementation: generated:frontend-no-legacy-api
+  - id: no-internal-deps
+    check: no-internal-deps
+    implementation: generated:no-internal-deps
 ```
 
 Generated implementations are resolved through the configured generated index,
