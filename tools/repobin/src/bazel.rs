@@ -208,9 +208,16 @@ impl BazelAdapter for RealBazel {
     }
 
     fn resolve_source_files(&self, repo_root: &Path, target: &str) -> Result<Vec<PathBuf>, RepobinError> {
-        // Query only workspace-local source files (labels starting with //) to avoid
-        // enumerating thousands of third-party crate files from external repositories.
-        let query = format!("filter('^//', kind('source file', deps({target})))");
+        // Witness the full workspace-local build-input closure so the dispatch
+        // cache invalidates whenever anything bazel keys on changes:
+        //   - `kind('source file', deps(...))` — first-party sources, and
+        //   - `buildfiles(deps(...))` — the BUILD.bazel / *.bzl files that define
+        //     those targets, so a registration change made purely in a dependency
+        //     package's BUILD.bazel (e.g. adding a check crate to a bundle's deps)
+        //     is still caught.
+        // `filter('^//', ...)` keeps it workspace-local, avoiding the thousands of
+        // third-party crate files under external repositories (`@repo//...`).
+        let query = format!("filter('^//', kind('source file', deps({target})) + buildfiles(deps({target})))");
         let output = Command::new("bazel")
             .args(extra_bazel_startup_flags())
             .arg("query")
