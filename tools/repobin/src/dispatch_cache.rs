@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::app::RepobinError;
 
-const CACHE_VERSION: u32 = 2;
+// v3: witnesses are validated by content sha256, not mtime alone. Bumping the
+// version makes every v2 (mtime-only) entry a cache miss so we never trust a
+// pre-content-hash record.
+const CACHE_VERSION: u32 = 3;
 const CACHE_SUBDIR: &str = "dispatch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +28,15 @@ struct CacheFile {
 struct BuildWitness {
     path: String,
     mtime_ns: u128,
+    /// Lowercase hex sha256 of the witness file's contents at record time.
+    ///
+    /// mtime alone is not a sound proxy for content: a branch checkout or
+    /// artifact restore can rewrite a file's bytes while leaving its mtime
+    /// unchanged (or set it to a value that coincidentally matches). Trusting
+    /// mtime then serves a binary built from a *different* source tree — e.g.
+    /// another concurrently-built PR's checkleft check set. The content hash
+    /// makes a cache hit impossible across any source change.
+    content_sha256: String,
 }
 
 pub fn lookup_in(cache_root: &Path, repo_root: &Path, target: &str) -> Option<PathBuf> {
@@ -50,8 +62,18 @@ pub fn lookup_in(cache_root: &Path, repo_root: &Path, target: &str) -> Option<Pa
 
     for witness in &cache.build_witnesses {
         let witness_path = Path::new(&witness.path);
-        let actual = mtime_ns(witness_path)?;
-        if actual != witness.mtime_ns {
+        // mtime is a cheap first filter: if it advanced, the file definitely
+        // changed and we can miss without hashing.
+        let actual_mtime = mtime_ns(witness_path)?;
+        if actual_mtime != witness.mtime_ns {
+            return None;
+        }
+        // mtime matched — but that does not prove the bytes are unchanged. A
+        // mtime-preserving checkout/restore could have swapped in a different
+        // PR's sources. Confirm by content so a hit can never cross a source
+        // (e.g. check-set / registration) change.
+        let actual_sha = file_sha256(witness_path)?;
+        if actual_sha != witness.content_sha256 {
             return None;
         }
     }
@@ -106,26 +128,39 @@ fn build_witnesses_for(repo_root: &Path, target: &str, source_files: &[PathBuf])
     if let Some(package_dir) = package_dir_for(target) {
         let dir = repo_root.join(package_dir);
         for candidate in ["BUILD.bazel", "BUILD"] {
-            let path = dir.join(candidate);
-            if let Some(mtime_ns) = mtime_ns(&path) {
-                out.push(BuildWitness {
-                    path: path.to_string_lossy().into_owned(),
-                    mtime_ns,
-                });
+            if let Some(witness) = witness_for(&dir.join(candidate)) {
+                out.push(witness);
             }
         }
     }
 
     for path in source_files {
-        if let Some(mtime_ns) = mtime_ns(path) {
-            out.push(BuildWitness {
-                path: path.to_string_lossy().into_owned(),
-                mtime_ns,
-            });
+        if let Some(witness) = witness_for(path) {
+            out.push(witness);
         }
     }
 
     out
+}
+
+/// Snapshot a witness file's mtime and content hash. Returns `None` if the file
+/// is missing or unreadable, in which case it is simply not witnessed (a missing
+/// witness at lookup time is a miss, which is the safe direction).
+fn witness_for(path: &Path) -> Option<BuildWitness> {
+    let mtime_ns = mtime_ns(path)?;
+    let content_sha256 = file_sha256(path)?;
+    Some(BuildWitness {
+        path: path.to_string_lossy().into_owned(),
+        mtime_ns,
+        content_sha256,
+    })
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn package_dir_for(target: &str) -> Option<String> {
@@ -336,6 +371,46 @@ mod tests {
     }
 
     #[test]
+    fn content_change_with_preserved_mtime_invalidates() {
+        // Regression for the checkleft CI-correctness bug: a checkout/restore
+        // rewrote a witnessed source file's *bytes* while leaving its mtime
+        // unchanged. The old mtime-only check false-hit and served a binary
+        // built from another PR's check set. Content hashing must catch it.
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/checkleft:checkleft";
+        let exe = repo_root.join("bazel-bin/tools/checkleft/checkleft");
+        let build = repo_root.join("tools/checkleft/BUILD.bazel");
+        let src = repo_root.join("tools/checkleft/preinstalled-bundle/src/lib.rs");
+
+        touch(&exe, "binary-from-pr-A");
+        touch(&build, "rust_binary(...)");
+        touch(&src, "export_checks!(forbidden_paths_check);");
+
+        record_in(&cache_root, &repo_root, target, &exe, std::slice::from_ref(&src)).expect("record");
+        assert!(lookup_in(&cache_root, &repo_root, target).is_some());
+
+        // Swap in a different check set, then forcibly restore the original
+        // mtime to simulate the mtime-preserving checkout that triggered the bug.
+        let recorded_mtime = fs::metadata(&src).unwrap().modified().unwrap();
+        fs::write(&src, "export_checks!(file_forbidden_path_check);").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(recorded_mtime)
+            .unwrap();
+        // mtime is back to the recorded value; only the content differs.
+        assert_eq!(fs::metadata(&src).unwrap().modified().unwrap(), recorded_mtime);
+
+        assert!(
+            lookup_in(&cache_root, &repo_root, target).is_none(),
+            "content change must invalidate even when the witness mtime is preserved"
+        );
+    }
+
+    #[test]
     fn corrupt_cache_falls_through() {
         let temp = TempDir::new().unwrap();
         let cache_root = temp.path().join("cache");
@@ -370,6 +445,7 @@ mod tests {
             build_witnesses: vec![BuildWitness {
                 path: "/nope".into(),
                 mtime_ns: 0,
+                content_sha256: String::new(),
             }],
         };
         fs::write(&entry, serde_json::to_vec(&bad).unwrap()).unwrap();
