@@ -1091,6 +1091,111 @@ fn standard_claude_md_is_unchanged_by_reviewer_branch() {
 }
 
 #[test]
+fn claude_md_forbids_raw_git_against_store() {
+    // Workers must be explicitly told not to use GIT_DIR=.jj/repo/store/git
+    // or gh pr checkout against the colocated store — this is how recoverable
+    // jj states turned into corruption in the incident that prompted this guidance.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("GIT_DIR=.jj/repo/store/git"),
+        "CLAUDE.md must call out the forbidden GIT_DIR form explicitly",
+    );
+    assert!(
+        rendered.contains("op-log"),
+        "CLAUDE.md must explain that bypassing jj bypasses the op-log",
+    );
+    assert!(
+        rendered.contains("jj git fetch"),
+        "CLAUDE.md must name the correct jj alternative",
+    );
+}
+
+#[test]
+fn claude_md_explains_conflicts_are_first_class() {
+    // Agents treated conflicted commits as an emergency halt (git mental model).
+    // The prompt must correct this: conflicts are first-class in jj and do not
+    // require a panic-reset.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("Conflicts are first-class"),
+        "CLAUDE.md must state that conflicts are first-class in jj",
+    );
+    assert!(
+        rendered.contains("NOT an emergency"),
+        "CLAUDE.md must clarify that a conflicted commit is not an emergency",
+    );
+}
+
+#[test]
+fn claude_md_explains_divergent_change_ids() {
+    // Agents panic-reset on divergent change-ids (the `??` indicator).
+    // The prompt must explain what it means and give the correct resolution.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("??"),
+        "CLAUDE.md must show the divergent change-id indicator",
+    );
+    assert!(
+        rendered.contains("jj abandon"),
+        "CLAUDE.md must mention jj abandon as the way to resolve divergence",
+    );
+    assert!(
+        rendered.contains("not corruption"),
+        "CLAUDE.md must state that divergent change-ids are not corruption",
+    );
+}
+
+#[test]
+fn claude_md_explains_op_log_recovery() {
+    // Agents used git reset+replay instead of the op-log when things went wrong.
+    // The prompt must teach op-log recovery.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("jj op log"),
+        "CLAUDE.md must show jj op log as the first recovery step",
+    );
+    assert!(rendered.contains("jj op undo"), "CLAUDE.md must show jj op undo",);
+    assert!(rendered.contains("jj op restore"), "CLAUDE.md must show jj op restore",);
+    assert!(
+        rendered.contains("reset-to-remote-and-replay-a-patch"),
+        "CLAUDE.md must explicitly forbid the git-style reset+replay escape hatch",
+    );
+}
+
+#[test]
+fn claude_md_explains_jj_rebase_for_conflict_resolution() {
+    // The idiomatic merge-conflict resolution flow in jj is
+    // `jj rebase -d main@origin` — agents should use this, not git-style
+    // merge commits or manual cherry-picks.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("jj rebase -d main@origin"),
+        "CLAUDE.md must show the idiomatic jj rebase conflict-resolution command",
+    );
+}
+
+#[test]
+fn claude_md_explains_rewriting_is_safe_in_jj() {
+    // Agents reached for merge-to-avoid-rewrite (a git habit). In jj,
+    // rebase/squash/amend are the intended workflow.
+    let input = sample_input();
+    let rendered = render_claude_md(&input);
+    assert!(
+        rendered.contains("Rewriting is safe"),
+        "CLAUDE.md must state that rewriting is safe and normal in jj",
+    );
+    assert!(
+        rendered.contains("op-log"),
+        "CLAUDE.md must mention that rewrites are recorded in the op-log",
+    );
+}
+
+#[test]
 fn heal_hook_command_replaces_shim_path() {
     let old_cmd = "BOSS_EVENTS_SOCKET='/tmp/events.sock' BOSS_LEASE_ID='lease-1' \
                    BOSS_RUN_ID='run-1' BOSS_WORKSPACE='/tmp/ws' \
