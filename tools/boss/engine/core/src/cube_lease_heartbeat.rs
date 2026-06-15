@@ -55,13 +55,34 @@
 //! The periodic sweep keys off the in-memory live-worker registry,
 //! which is *empty* immediately after an engine restart (it is rebuilt
 //! as workers re-send hook events). To stop a long-running worker from
-//! being stranded in that gap, [`reheartbeat_live_runs`] runs once at
-//! startup: it re-heartbeats the leases the startup probe
-//! ([`crate::run_reconcile::probe_in_flight_runs`]) classified `Live`,
-//! giving each re-adopted worker a fresh full TTL immediately. By the
-//! time that window elapses the worker's next hook has re-registered it
-//! in the live registry and the periodic sweep has taken over.
+//! being stranded in that gap, two complementary mechanisms work together:
+//!
+//! 1. [`reheartbeat_live_runs`] runs once at startup and pushes every
+//!    `Live`-verdict lease forward by a full TTL immediately.
+//! 2. Every subsequent pass of [`run_one_pass`] also scans the DB for
+//!    non-terminal executions with a recorded lease that are *not yet
+//!    present* in the in-memory registry (the "DB-fallback sweep"). This
+//!    covers quiet workers (e.g. a long `bazel build`) that emit no hook
+//!    events for many minutes — they receive a continuous stream of
+//!    heartbeats until they re-register via a hook or their execution
+//!    reaches a terminal state in the DB.
+//!
+//! ## Relationship with `HeartbeatGuard` (coordinator.rs)
+//!
+//! `coordinator.rs` also contains a `HeartbeatGuard` that was added for
+//! the same 2026-05-12 incident. For in-process / blocking runners
+//! (e.g. test fakes where `spawn_worker` blocks until the run
+//! completes), the guard fires correctly throughout the run. For the
+//! production *pane-spawn* path, `spawn_worker` returns immediately
+//! after handing the pane off, and the guard is dropped right after —
+//! which means it almost never fires a single beat for a pane worker.
+//! That is the accurate root-cause framing: the guard existed but was
+//! dropped before it could cover the pane worker's lifetime. This
+//! module's periodic sweep is the complementary fix that covers the
+//! pane-worker gap. Both mechanisms are intentionally left in place:
+//! the guard covers blocking runners; this sweep covers pane workers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,6 +110,14 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 /// is a 6× margin.
 pub const LEASE_TTL_SECS: u64 = 1800;
 
+/// Per-call timeout for a single `cube workspace heartbeat` subprocess
+/// invocation. Mirrors [`crate::coordinator::CUBE_LEASE_TIMEOUT`]: the
+/// same cube-hang failure mode that prompted timeouts on lease/repo-ensure
+/// calls applies here. Without a bound, one hung heartbeat call would
+/// stall the entire pass and leave every other live worker un-heartbeated
+/// until the subprocess eventually returned (or never did).
+pub const HEARTBEAT_CUBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Read the heartbeat interval from [`HEARTBEAT_INTERVAL_SECS_ENV`],
 /// falling back to [`DEFAULT_HEARTBEAT_INTERVAL`]. A zero or unparseable
 /// value falls back to the default (a zero interval would busy-loop).
@@ -104,13 +133,19 @@ pub fn heartbeat_interval() -> Duration {
 /// Counts from one heartbeat pass; logged at `info` when activity occurs.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HeartbeatSweepOutcome {
-    /// Leases successfully refreshed this pass.
+    /// Leases successfully refreshed this pass via the live-registry sweep.
     pub heartbeated: usize,
-    /// Heartbeat calls that errored (lease gone, cube unreachable).
+    /// Leases successfully refreshed via the DB-fallback sweep (in-flight
+    /// executions not yet present in the live-worker registry, covering the
+    /// post-restart gap until each worker re-registers via hook events).
+    pub db_fallback_heartbeated: usize,
+    /// Heartbeat calls that errored (lease gone, cube unreachable) or timed
+    /// out (cube subprocess hung).
     pub failed: usize,
     /// Live slots whose PID was gone — left to expire on purpose.
     pub dead_pid_skipped: usize,
-    /// Live slots whose `shell_pid` is not yet reported (≤ 0).
+    /// Live slots whose `shell_pid` is not yet reported (≤ 0), and remote
+    /// workers whose shell_pid is permanently 0 (they have no local pid).
     pub no_pid_skipped: usize,
     /// Live slots whose execution has not recorded a `cube_lease_id` yet.
     pub no_lease_skipped: usize,
@@ -120,7 +155,7 @@ pub struct HeartbeatSweepOutcome {
 
 impl HeartbeatSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.heartbeated > 0 || self.failed > 0
+        self.heartbeated > 0 || self.db_fallback_heartbeated > 0 || self.failed > 0
     }
 }
 
@@ -156,14 +191,32 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
 ) -> HeartbeatSweepOutcome {
+    run_one_pass_impl(work_db, live_states, cube_client, dispatch_events, HEARTBEAT_CUBE_TIMEOUT).await
+}
+
+/// Internal implementation that accepts a configurable per-call timeout
+/// (exposed so tests can inject a short timeout without waiting 30 s).
+async fn run_one_pass_impl(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    cube_client: &dyn CubeClient,
+    dispatch_events: &dyn DispatchEventSink,
+    heartbeat_timeout: Duration,
+) -> HeartbeatSweepOutcome {
     let mut outcome = HeartbeatSweepOutcome::default();
+    let mut registered_run_ids: HashSet<String> = HashSet::new();
 
     for state in live_states.snapshot() {
         // Slot hasn't reported a shell pid yet — we can't probe liveness,
         // and the lease was just created with a full TTL, so there is no
         // urgency. The next pass picks it up once the app reports the pid.
+        //
+        // Remote workers (shell_pid = 0 by design, since they have no local
+        // pid and their leases live on a remote cube) also land here
+        // permanently — they are out of scope for this local sweep.
         if state.shell_pid <= 0 {
             outcome.no_pid_skipped += 1;
+            registered_run_ids.insert(state.run_id.clone());
             continue;
         }
 
@@ -171,10 +224,13 @@ pub async fn run_one_pass(
         // release; there is nothing to keep alive.
         if is_terminal_activity(state.activity) {
             outcome.terminal_skipped += 1;
+            registered_run_ids.insert(state.run_id.clone());
             continue;
         }
 
         let execution_id = &state.run_id;
+        registered_run_ids.insert(execution_id.clone());
+
         let execution = match work_db.get_execution(execution_id) {
             Ok(execution) => execution,
             Err(err) => {
@@ -220,43 +276,74 @@ pub async fn run_one_pass(
         // extend a live one reclaims a working copy out from under an active
         // worker (the incident this whole module fixes).
 
-        match cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)).await {
-            Ok(()) => {
-                outcome.heartbeated += 1;
-                tracing::debug!(
+        heartbeat_one(
+            cube_client,
+            dispatch_events,
+            execution_id,
+            lease_id,
+            &execution.work_item_id,
+            execution.cube_workspace_id.as_deref().unwrap_or(""),
+            heartbeat_timeout,
+            &mut outcome.heartbeated,
+            &mut outcome.failed,
+        )
+        .await;
+    }
+
+    // DB-fallback sweep: heartbeat in-flight executions not yet present in
+    // the live-worker registry. This covers the post-restart gap: the
+    // registry is empty until each worker re-registers via hook events, so
+    // a quiet worker (e.g. a long bazel build emitting no hooks) would get
+    // only the one-shot startup beat and then go un-heartbeated. By scanning
+    // the DB every pass we continuously cover such workers until they
+    // re-register or their execution reaches a terminal state.
+    match work_db.list_in_flight_executions() {
+        Ok(in_flight) => {
+            for execution in in_flight {
+                if registered_run_ids.contains(&execution.id) {
+                    continue; // already handled by the registry sweep above
+                }
+                let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+                    continue;
+                };
+                let execution_id = &execution.id;
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                heartbeat_one(
+                    cube_client,
+                    dispatch_events,
                     execution_id,
                     lease_id,
-                    ttl_secs = LEASE_TTL_SECS,
-                    "cube-lease heartbeat: refreshed lease",
-                );
+                    &execution.work_item_id,
+                    execution.cube_workspace_id.as_deref().unwrap_or(""),
+                    heartbeat_timeout,
+                    &mut succeeded,
+                    &mut failed,
+                )
+                .await;
+                if succeeded > 0 {
+                    outcome.db_fallback_heartbeated += 1;
+                    tracing::debug!(
+                        execution_id,
+                        lease_id,
+                        "cube-lease heartbeat: DB-fallback beat (not yet in live registry)",
+                    );
+                }
+                outcome.failed += failed;
             }
-            Err(err) => {
-                outcome.failed += 1;
-                tracing::warn!(
-                    execution_id,
-                    lease_id,
-                    error = %format!("{err:#}"),
-                    "cube-lease heartbeat: failed to refresh lease (cube may have reclaimed it; the worker's workspace is at risk)",
-                );
-                dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id.as_str())
-                            .with_work_item(&execution.work_item_id)
-                            .with_cube_lease(lease_id)
-                            .with_error(&err)
-                            .with_details(serde_json::json!({
-                                "ttl_secs": LEASE_TTL_SECS,
-                                "cube_workspace_id": execution.cube_workspace_id,
-                            })),
-                    )
-                    .await;
-            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "cube-lease heartbeat: failed to query in-flight executions for DB-fallback sweep",
+            );
         }
     }
 
     if outcome.has_activity() {
         tracing::info!(
             heartbeated = outcome.heartbeated,
+            db_fallback_heartbeated = outcome.db_fallback_heartbeated,
             failed = outcome.failed,
             dead_pid_skipped = outcome.dead_pid_skipped,
             no_lease_skipped = outcome.no_lease_skipped,
@@ -265,6 +352,81 @@ pub async fn run_one_pass(
     }
 
     outcome
+}
+
+/// Execute one `cube workspace heartbeat` call with a timeout. Increments
+/// either `*succeeded` or `*failed` and emits a dispatch error event on
+/// failure or timeout.
+async fn heartbeat_one(
+    cube_client: &dyn CubeClient,
+    dispatch_events: &dyn DispatchEventSink,
+    execution_id: &str,
+    lease_id: &str,
+    work_item_id: &str,
+    cube_workspace_id: &str,
+    timeout: Duration,
+    succeeded: &mut usize,
+    failed: &mut usize,
+) {
+    let result = tokio::time::timeout(timeout, cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
+    match result {
+        Ok(Ok(())) => {
+            *succeeded += 1;
+            tracing::debug!(
+                execution_id,
+                lease_id,
+                ttl_secs = LEASE_TTL_SECS,
+                "cube-lease heartbeat: refreshed lease",
+            );
+        }
+        Ok(Err(err)) => {
+            *failed += 1;
+            tracing::warn!(
+                execution_id,
+                lease_id,
+                error = %format!("{err:#}"),
+                "cube-lease heartbeat: failed to refresh lease (cube may have reclaimed it; the worker's workspace is at risk)",
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
+                        .with_work_item(work_item_id)
+                        .with_cube_lease(lease_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "ttl_secs": LEASE_TTL_SECS,
+                            "cube_workspace_id": cube_workspace_id,
+                        })),
+                )
+                .await;
+        }
+        Err(_elapsed) => {
+            *failed += 1;
+            let err = anyhow::anyhow!(
+                "cube workspace heartbeat timed out after {}s (cube subprocess may be hung)",
+                timeout.as_secs()
+            );
+            tracing::warn!(
+                execution_id,
+                lease_id,
+                timeout_secs = timeout.as_secs(),
+                "cube-lease heartbeat: heartbeat call timed out; treating as failure so other leases continue",
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
+                        .with_work_item(work_item_id)
+                        .with_cube_lease(lease_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "ttl_secs": LEASE_TTL_SECS,
+                            "cube_workspace_id": cube_workspace_id,
+                            "timed_out": true,
+                        })),
+                )
+                .await;
+        }
+    }
 }
 
 /// Re-heartbeat, once at engine startup, the cube lease of every
@@ -292,8 +454,11 @@ pub async fn reheartbeat_live_runs(
         let Some(lease_id) = execution.cube_lease_id.as_deref() else {
             continue;
         };
-        match cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)).await {
-            Ok(()) => {
+        let result =
+            tokio::time::timeout(HEARTBEAT_CUBE_TIMEOUT, cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)))
+                .await;
+        match result {
+            Ok(Ok(())) => {
                 heartbeated += 1;
                 tracing::info!(
                     execution_id = %execution.id,
@@ -302,12 +467,20 @@ pub async fn reheartbeat_live_runs(
                     "cube-lease heartbeat: re-adopted live lease at startup",
                 );
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     lease_id,
                     error = %format!("{err:#}"),
                     "cube-lease heartbeat: failed to re-adopt live lease at startup (best-effort)",
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    timeout_secs = HEARTBEAT_CUBE_TIMEOUT.as_secs(),
+                    "cube-lease heartbeat: startup re-adoption timed out (cube subprocess may be hung); skipping this lease",
                 );
             }
         }
@@ -421,10 +594,14 @@ mod tests {
     }
 
     fn create_chore(db: &WorkDb, product_id: &str) -> String {
+        create_named_chore(db, product_id, "test chore")
+    }
+
+    fn create_named_chore(db: &WorkDb, product_id: &str, name: &str) -> String {
         db.create_chore(
             CreateChoreInput::builder()
                 .product_id(product_id)
-                .name("test chore")
+                .name(name)
                 .build(),
         )
         .unwrap()
@@ -645,5 +822,124 @@ mod tests {
     fn heartbeat_interval_default_and_override() {
         // Default when unset / unparseable / zero.
         assert_eq!(heartbeat_interval(), DEFAULT_HEARTBEAT_INTERVAL);
+    }
+
+    // ─── SlowCube: hangs on "lease-slow", succeeds on everything else ─────────
+
+    /// A cube stub whose `heartbeat_lease` never returns for a designated
+    /// "hung" lease id, simulating a stuck cube subprocess. All other leases
+    /// complete immediately.
+    #[derive(Default)]
+    struct SlowCube {
+        completed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CubeClient for SlowCube {
+        async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
+            unimplemented!()
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: Option<u64>,
+        ) -> Result<CubeWorkspaceLease> {
+            unimplemented!()
+        }
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn release_workspace(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
+            unimplemented!()
+        }
+        async fn heartbeat_lease(&self, lease_id: &str, _ttl: Option<u64>) -> Result<()> {
+            if lease_id == "lease-slow" {
+                // Never returns — simulates a hung cube subprocess.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            self.completed.lock().unwrap().push(lease_id.to_owned());
+            Ok(())
+        }
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            Ok(vec![])
+        }
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A hung heartbeat for one slot must NOT block heartbeating of the
+    /// remaining slots. The timed-out slot increments `failed`; the other
+    /// slot is heartbeated successfully.
+    #[tokio::test]
+    async fn hung_heartbeat_does_not_block_other_slots() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+
+        // Two live executions: one with the hung lease, one normal.
+        let wi_slow = create_named_chore(&db, &product_id, "slow chore");
+        let exec_slow = running_execution_with_lease(&db, &wi_slow, "lease-slow");
+
+        let wi_fast = create_named_chore(&db, &product_id, "fast chore");
+        let exec_fast = running_execution_with_lease(&db, &wi_fast, "lease-fast");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &exec_slow, std::process::id() as i32);
+        register_slot(&live_states, 2, &exec_fast, std::process::id() as i32);
+
+        let cube = SlowCube::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        // Use a short timeout so the test does not wait 30 s.
+        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, Duration::from_millis(50)).await;
+
+        assert_eq!(outcome.failed, 1, "the hung slot must count as failed");
+        assert_eq!(outcome.heartbeated, 1, "the non-hung slot must succeed");
+
+        let completed = cube.completed.lock().unwrap().clone();
+        assert_eq!(completed, vec!["lease-fast".to_owned()], "only the fast lease completes");
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1, "one timeout error event");
+        assert_eq!(events[0].stage, "cube_lease_heartbeat");
+        assert_eq!(events[0].outcome, "error");
+        assert_eq!(events[0].cube_lease_id.as_deref(), Some("lease-slow"));
+    }
+
+    /// In-flight executions not yet in the live registry (post-restart gap)
+    /// are heartbeated via the DB-fallback sweep, so quiet workers with no
+    /// hook events continue receiving beats after an engine restart.
+    #[tokio::test]
+    async fn db_fallback_heartbeats_unregistered_in_flight_executions() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-orphan");
+
+        // Registry is empty (simulates post-restart state before worker re-hooks).
+        let live_states = LiveWorkerStateRegistry::new();
+
+        let cube = RecordingCube::default();
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, HEARTBEAT_CUBE_TIMEOUT).await;
+
+        assert_eq!(outcome.db_fallback_heartbeated, 1, "DB-fallback must cover unregistered execution");
+        assert_eq!(outcome.heartbeated, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            cube.calls(),
+            vec![("lease-orphan".to_owned(), Some(LEASE_TTL_SECS))],
+        );
+        let _ = execution_id; // used to set up DB row
     }
 }
