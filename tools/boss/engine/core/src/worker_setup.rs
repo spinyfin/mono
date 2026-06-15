@@ -260,23 +260,23 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          jj git push -b my-feature   # no --allow-new needed for subsequent pushes\n\
          ```\n\
          \n\
-         ### The `origin` remote is a LOCAL MIRROR, not GitHub\n\
+         ### `origin` is the real GitHub upstream (shared object store)\n\
          \n\
-         A cube workspace has **two** git remotes: a local on-disk mirror\n\
-         (typically named `origin`) and the real GitHub upstream (typically\n\
-         named `github`). This is the opposite of the usual convention. A\n\
-         raw `jj git push` / `git push origin` / `git fetch origin` can hit\n\
-         the local mirror and update a ref that **never reaches GitHub** —\n\
-         the PR head stays stale and CI never re-runs, even though the push\n\
-         looked successful.\n\
+         Every cube workspace is a **secondary jj workspace** that SHARES one\n\
+         object store with its siblings — there is no per-workspace clone. That\n\
+         store has a single `origin` remote pointing at the real GitHub\n\
+         upstream, so `jj git push -b my-feature` reaches GitHub directly.\n\
          \n\
          - Prefer `cube pr ensure` for all pushes: it pushes to the\n\
-           github.com remote by URL (not by name) and verifies the result\n\
-           against GitHub, so it cannot be fooled by the mirror.\n\
-         - **NEVER confirm a push with `git ls-remote origin` or by checking\n\
-           the same remote you pushed to** — that is circular and confirms\n\
-           the local mirror, not GitHub. Confirm by reading GitHub's head sha\n\
-           and asserting it equals your local commit:\n\
+           github.com remote by URL and verifies the result against GitHub, and\n\
+           — because the workspace has no top-level `.git` — it resolves\n\
+           `-R <owner/repo>` for `gh` so PR creation Just Works.\n\
+         - Because the store is shared, a `jj git fetch` in ANY workspace\n\
+           advances the remote-tracking bookmarks (e.g. `main@origin`) seen by\n\
+           ALL of them. Don't be alarmed if refs move without you fetching.\n\
+         - A solid belt-and-suspenders check that a push actually landed is to\n\
+           compare your local commit against GitHub's head sha (do not infer\n\
+           success from the push command's own output alone):\n\
          \n\
          ```sh\n\
          # local commit you intended to ship\n\

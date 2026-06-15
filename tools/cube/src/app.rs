@@ -839,94 +839,6 @@ fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path, default_
     Ok(())
 }
 
-/// After cloning a workspace from a local source mirror, add the real GitHub
-/// upstream as a `github` remote, fetch from it, and track the repo's
-/// integration branch on that remote. This ensures that `jj new <main>` and
-/// the on-lease fast-forward both branch from the current GitHub head rather
-/// than the stale local-mirror snapshot.
-///
-/// The `github` remote name is conventional: `parse_github_remote` recognises
-/// it when scanning `jj git remote list`, so `cube pr ensure` and the
-/// fast-forward step automatically resolve it as the real upstream.
-fn add_github_remote_and_track(
-    runner: &dyn CommandRunner,
-    workspace_path: &Path,
-    origin_url: &str,
-    main_branch: &str,
-) -> Result<()> {
-    runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "git".to_string(),
-            "remote".to_string(),
-            "add".to_string(),
-            "github".to_string(),
-            origin_url.to_string(),
-        ],
-    })?;
-
-    runner.run_with_timeout(
-        &CommandInvocation {
-            cwd: workspace_path.to_path_buf(),
-            program: "jj".to_string(),
-            args: vec![
-                "git".to_string(),
-                "fetch".to_string(),
-                "--remote".to_string(),
-                "github".to_string(),
-            ],
-        },
-        network_cmd_timeout(),
-    )?;
-
-    // Track the integration branch on the github remote so that local `<main>`
-    // follows GitHub rather than the stale local mirror. A missing `<main>@github`
-    // after fetch means the remote is empty or misconfigured; convert that into an
-    // explicit SetupStepFailed so provisioning fails loudly rather than silently
-    // leaving an untracked integration branch.
-    let result = runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "bookmark".to_string(),
-            "track".to_string(),
-            format!("{main_branch}@github"),
-        ],
-    });
-    match result {
-        Ok(_) => {}
-        Err(err) if is_no_such_remote_bookmark(&err) => {
-            return Err(CubeError::SetupStepFailed {
-                step: "add_github_remote_and_track".to_string(),
-                error: format!(
-                    "fresh clone at `{}` has no `{main_branch}` on the github remote after fetch; \
-                     cube cannot track the integration branch on the real upstream",
-                    workspace_path.display()
-                ),
-            });
-        }
-        Err(err) => return Err(err),
-    }
-
-    // Untrack the mirror's integration branch so local `<main>` follows only
-    // the real GitHub upstream. Without this, local `<main>` tracks BOTH
-    // `<main>@origin` (stale mirror) and `<main>@github`, and a mid-session
-    // `jj git fetch` can leave `<main>` in a conflicted/divergent state —
-    // the same failure class this fix exists to prevent.
-    runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "bookmark".to_string(),
-            "untrack".to_string(),
-            format!("{main_branch}@origin"),
-        ],
-    })?;
-
-    Ok(())
-}
-
 /// Returns `true` when the error is `jj bookmark track`'s "no such
 /// remote bookmark" diagnostic — meaning the named `<branch>@origin`
 /// does not exist in this freshly-cloned repo. Distinct from "jj is
@@ -3048,69 +2960,98 @@ fn auto_create_workspace(
         source: e,
     })?;
 
-    // Clone into a staging directory and only publish it under its final name
-    // once it is fully populated, via an atomic rename. A clone interrupted
-    // mid-flight then leaves only the dotted staging dir — which
-    // `discover_workspaces` ignores (it doesn't match the workspace prefix) —
-    // so a partially-populated tree can never be observed as a pool entry and
-    // become a "broken-empty" husk (issue #845 part 2a). The repo lock is held
-    // across the whole lease, so the staging name can't race a concurrent
-    // create for this repo; clear any leftover from a prior interrupted run.
+    // The canonical repo is the single shared object store every pool workspace
+    // attaches to via `jj workspace add` — the cube design (R4) chose the
+    // shared-store/worktree model and explicitly REJECTED "fresh clone per
+    // task". `cube repo ensure` materialises it at `repo_record.source`: a
+    // colocated jj repo whose `origin` is the real GitHub upstream and which
+    // carries a local `main` bookmark. Without it there is nothing to attach to,
+    // so surface a clear, actionable error instead of silently regressing to an
+    // independent clone.
+    let canonical = repo_record.source.as_ref().ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "cannot grow the workspace pool for repo `{}`: it has no canonical source repo to \
+             attach to. Run `cube repo ensure` first so cube materialises the shared object store \
+             (default `~/.local/share/cube/repos/{}`); pool workspaces are `jj workspace add` \
+             attachments to it, not independent clones.",
+            repo_record.repo, repo_record.repo
+        ))
+    })?;
+    if !canonical.join(".jj").is_dir() {
+        return Err(CubeError::InvalidArgument(format!(
+            "canonical source repo for `{}` at `{}` has no `.jj/` store — it was never \
+             materialised or has been removed. Run `cube repo ensure` to (re)create the shared \
+             store before leasing.",
+            repo_record.repo,
+            canonical.display()
+        )));
+    }
+
+    // Attach under a dotted staging name first, then publish it under its final
+    // name with an atomic rename. A create interrupted mid-flight leaves only the
+    // dotted staging dir — which `discover_workspaces` ignores (it doesn't match
+    // the workspace prefix) — so a partially-populated tree can never be observed
+    // as a pool entry and become a "broken-empty" husk (issue #845 part 2a). The
+    // rename is safe across `jj workspace add`: jj resolves a workspace from the
+    // `.jj/` it finds relative to cwd, not from any path recorded in the store, so
+    // moving the directory after the attach is transparent. The repo lock is held
+    // across the whole lease, so the staging name can't race a concurrent create.
     let staging_path = repo_record.workspace_root.join(format!(".incoming-{workspace_id}"));
     if staging_path.exists() {
+        // A leftover staging dir means a prior create was interrupted after
+        // `jj workspace add` registered this workspace in the SHARED canonical
+        // store but before the publish rename. Unlike an independent clone, the
+        // attach mutated that shared store, so the dangling registration must be
+        // forgotten or the re-add below collides with "workspace already exists".
+        // Best-effort: tolerate "no such workspace" when there is nothing to forget.
+        let _ = runner.run(&CommandInvocation {
+            cwd: repo_record.workspace_root.clone(),
+            program: "jj".to_string(),
+            args: vec![
+                "-R".to_string(),
+                canonical.display().to_string(),
+                "workspace".to_string(),
+                "forget".to_string(),
+                workspace_id.clone(),
+            ],
+        });
         fs::remove_dir_all(&staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
             path: staging_path.clone(),
             source,
         })?;
     }
 
-    let clone_from_source = matches!(&repo_record.source, Some(source) if source.exists());
-    let clone_source = if clone_from_source {
-        repo_record
-            .source
-            .as_ref()
-            .expect("clone_from_source guarantees Some")
-            .display()
-            .to_string()
-    } else {
-        repo_record.origin.clone()
-    };
-
-    // Bound the clone so a wedged remote can't hang provisioning forever.
-    // NOTE: this clone still runs under the per-repo lock (the new workspace
-    // id is allocated here and the staging name must not race a concurrent
-    // create). The timeout caps the worst case; moving the clone fully out of
-    // the lock requires reserving the id first — tracked as a follow-up.
+    // `jj workspace add` attaches a new working copy that SHARES the canonical
+    // store: the new `.jj/repo` is a file POINTER to `<canonical>/.jj/repo`, not a
+    // full history copy (the whole point — see incident: independent clones were
+    // tens of GB each). `--name <workspace_id>` pins the store-side workspace name
+    // to the pool id regardless of the staging basename, so the publish rename
+    // needs no fix-up. This is a local operation; the timeout is only a backstop.
     runner.run_with_timeout(
         &CommandInvocation {
             cwd: repo_record.workspace_root.clone(),
             program: "jj".to_string(),
             args: vec![
-                "git".to_string(),
-                "clone".to_string(),
-                "--colocate".to_string(),
-                clone_source,
+                "-R".to_string(),
+                canonical.display().to_string(),
+                "workspace".to_string(),
+                "add".to_string(),
+                "--name".to_string(),
+                workspace_id.clone(),
                 staging_path.display().to_string(),
             ],
         },
         network_cmd_timeout(),
     )?;
 
-    if clone_from_source {
-        // Cloned from a local mirror: `origin` now points to the stale on-disk
-        // source rather than GitHub. Add the real upstream as the `github` remote
-        // and track the integration branch there so workers always branch from the
-        // current GitHub head, not the mirror snapshot.
-        add_github_remote_and_track(runner, &staging_path, &repo_record.origin, &repo_record.main_branch)?;
-    } else {
-        // Cloned directly from GitHub: `origin` IS the upstream — track the
-        // integration branch on it as usual.
-        track_remote_bookmarks(runner, &staging_path, Some(repo_record.main_branch.as_str()))?;
-    }
+    // No per-workspace remote/bookmark setup is needed: the shared store already
+    // carries `origin` = the real GitHub upstream and a local `main` bookmark, both
+    // established once by `materialize_repo_source_if_missing` at ensure time. Every
+    // attached workspace sees them, so the lease's later `jj new main` resolves.
 
     // Publish atomically. Staging and final live under the same workspace_root
     // (one filesystem), so the rename is atomic and the final path appears
-    // only when the checkout is complete.
+    // only when the attach is complete.
     fs::rename(&staging_path, &workspace_path).map_err(|source| CubeError::WorkspaceDirCreate {
         path: workspace_path.clone(),
         source,
@@ -3691,24 +3632,37 @@ fn upsert_managed_exclude(existing: &str, block: &str) -> String {
     }
 }
 
-/// Ensure the colocated workspace's local git exclude file carries the
-/// cube-managed Boss-infra ignore block, so jj never auto-snapshots those
-/// infra files into the worker's working-copy commit (and thus its PR) —
-/// defense-in-depth for issue #1174.
+/// Keep Boss/host infra files out of the worker's jj snapshot (and thus its
+/// PR) — defense-in-depth for issue #1174. The mechanism depends on the
+/// workspace layout, because jj sources its ignore patterns differently:
 ///
-/// `.git/info/exclude` is the right home: it lives under `.git/` (never
-/// committed, never shipped in a PR), is local to this one workspace, and
-/// jj honors it for git-backed/colocated repos exactly like a tracked
-/// `.gitignore`. Best-effort by design — a workspace without a colocated
-/// `.git/` directory, or an unreadable/unwritable exclude file, is left
-/// untouched rather than failing the lease.
+/// * **Colocated** (the canonical source repo, or any legacy colocated
+///   workspace): write the cube-managed block to `.git/info/exclude`. That file
+///   lives under `.git/` (never committed, never shipped in a PR) and jj honors
+///   it for git-backed repos exactly like a tracked `.gitignore`. This carries
+///   both `.boss/` and the `/logs/<id>.log` host-tooling drop.
+///
+/// * **Non-colocated** (the shared-store pool workspaces created by
+///   `jj workspace add`): there is NO per-workspace `.git/`, and jj does NOT
+///   read the shared backing store's `info/exclude` for a workspace working
+///   copy — the only ignore source jj honors there is a `.gitignore` in the
+///   working tree. Writing the engine's scratch dir off via a self-ignoring
+///   `.boss/.gitignore` keeps it (and the guard file itself) out of the
+///   snapshot without polluting the PR; see [`ensure_boss_dir_self_ignored`].
+///
+/// Best-effort throughout — an unwritable guard is logged and skipped rather
+/// than failing the lease.
 fn ensure_boss_infra_excluded(workspace_path: &Path, workspace_id: &str) {
     let git_dir = workspace_path.join(".git");
-    if !git_dir.is_dir() {
-        // Non-colocated layout: no `info/exclude` jj would read. The guard
-        // is defense-in-depth, so skip silently rather than warn.
-        return;
+    if git_dir.is_dir() {
+        ensure_boss_infra_excluded_colocated(&git_dir, workspace_id);
+    } else {
+        ensure_boss_dir_self_ignored(workspace_path);
     }
+}
+
+/// Colocated path: rewrite the cube-managed block inside `<git_dir>/info/exclude`.
+fn ensure_boss_infra_excluded_colocated(git_dir: &Path, workspace_id: &str) {
     let info_dir = git_dir.join("info");
     if let Err(e) = fs::create_dir_all(&info_dir) {
         eprintln!(
@@ -3737,6 +3691,45 @@ fn ensure_boss_infra_excluded(workspace_path: &Path, workspace_id: &str) {
         eprintln!(
             "warning: cube could not write {} for the Boss-infra exclude guard: {e}",
             exclude_path.display()
+        );
+    }
+}
+
+/// Single `*` pattern that ignores every path in its own directory — including
+/// the `.gitignore` carrying it — so the guard file never appears as a change.
+const BOSS_DIR_SELF_IGNORE: &str = "*\n";
+
+/// Non-colocated path: make jj ignore the engine's `.boss/` scratch dir (where
+/// the remote runner drops `worker.log`, `settings.json`, `initial-input.txt`,
+/// …) via a self-ignoring `.boss/.gitignore`. jj honors working-tree
+/// `.gitignore` files in every workspace layout, and the `*` pattern ignores
+/// the whole dir plus the guard file itself, so nothing leaks into the worker's
+/// snapshot or PR. `.boss/` is purely Boss/host infra and never a repo
+/// deliverable, so writing into it can't collide with versioned content.
+///
+/// (The colocated path's `/logs/<id>.log` anchor is intentionally not mirrored
+/// here: re-homing it for a non-colocated workspace would mean writing a
+/// `.gitignore` into a `logs/` directory a repo may legitimately track, risking
+/// PR pollution. The `.boss/` dir is the only Boss-owned infra location and is
+/// covered cleanly above.)
+fn ensure_boss_dir_self_ignored(workspace_path: &Path) {
+    let boss_dir = workspace_path.join(".boss");
+    if let Err(e) = fs::create_dir_all(&boss_dir) {
+        eprintln!(
+            "warning: cube could not create {} for the Boss-infra ignore guard: {e}",
+            boss_dir.display()
+        );
+        return;
+    }
+    let gitignore = boss_dir.join(".gitignore");
+    // Idempotent: skip the write when the guard is already in place.
+    if matches!(fs::read_to_string(&gitignore), Ok(body) if body == BOSS_DIR_SELF_IGNORE) {
+        return;
+    }
+    if let Err(e) = fs::write(&gitignore, BOSS_DIR_SELF_IGNORE) {
+        eprintln!(
+            "warning: cube could not write {} for the Boss-infra ignore guard: {e}",
+            gitignore.display()
         );
     }
 }
@@ -4024,12 +4017,16 @@ fn reset_workspace_guarded(
 }
 
 /// Detect the name of the remote that represents the real GitHub upstream for
-/// a workspace. In workspaces provisioned from a local source mirror, the clone
-/// sets `origin` to the local path and cube adds the real GitHub upstream as
-/// `github`. `parse_github_remote` identifies this by URL (github.com host).
-/// Falls back to `"origin"` when the remote list cannot be resolved or no
-/// github.com remote is found (direct-GitHub-clone workspaces where `origin`
-/// IS the upstream).
+/// a workspace, resolved by URL via `parse_github_remote` (github.com host).
+///
+/// In the shared-store model every pool workspace attaches (via
+/// `jj workspace add`) to the canonical repo, whose sole remote `origin` IS the
+/// real GitHub upstream — so this resolves to `"origin"`. The github.com lookup
+/// (rather than a hard-coded `"origin"`) is retained as defense for two cases:
+/// a canonical repo whose upstream happens to be named differently, and any
+/// lingering pre-reprovision workspace cloned from a local mirror that still
+/// carries a separate `github` remote. Falls back to `"origin"` when the remote
+/// list cannot be resolved or no github.com remote is found.
 fn detect_upstream_tracking_remote(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -6599,21 +6596,7 @@ mod tests {
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6646,21 +6629,19 @@ mod tests {
         runner.assert_exhausted();
     }
 
-    /// Regression for spinyfin/mono#696. A fresh `jj git clone` only
-    /// populates `<branch>@origin` (remote) bookmarks; there is no
-    /// local `main`/`master` for `jj new <main>` to resolve. The lease
-    /// must promote those remote bookmarks to local tracking right
-    /// after cloning. The expectation here pins the two specific
-    /// `jj bookmark track <name>@origin` calls (one for `main`, one
-    /// for `master`) between clone and reset — exercising the
-    /// `--main-branch master` shape where `main@origin` doesn't exist
-    /// in the remote and the per-branch error must be swallowed.
-    /// `workspace_lease_tracks_main_origin_after_fresh_clone` covers
-    /// the reverse `--main-branch main` shape.
+    /// Auto-create for a repo whose default branch is `master`: the new
+    /// shared-store workspace is attached via `jj workspace add` (no per-
+    /// workspace clone or bookmark tracking), and the reset fast-forwards and
+    /// branches through `master`/`master@origin`, proving the non-`main`
+    /// default flows through provisioning + reset correctly.
     #[test]
-    fn workspace_lease_tracks_master_origin_after_fresh_clone() {
+    fn workspace_lease_auto_creates_master_default_repo() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
+        // Canonical shared store for the `legacy` repo (what `repo ensure`
+        // would have materialised), with its `.jj/` store present.
+        let source = workspace_root.parent().unwrap().join("source").join("legacy");
+        std::fs::create_dir_all(source.join(".jj")).expect("seed canonical source .jj");
 
         {
             use crate::metadata::RepoRecord;
@@ -6673,7 +6654,7 @@ mod tests {
                     main_branch: "master".to_string(),
                     workspace_root: workspace_root.clone(),
                     workspace_prefix: "legacy-agent-".to_string(),
-                    source: None,
+                    source: Some(source.clone()),
                     clone_command: None,
                 })
                 .expect("seed repo");
@@ -6682,21 +6663,7 @@ mod tests {
         let new_path = workspace_root.join("legacy-agent-001");
         let staging = workspace_root.join(".incoming-legacy-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/legacy.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "main@origin"]),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "master@origin"], ""),
+            ExpectedCommand::workspace_add(workspace_root.clone(), &source, "legacy-agent-001", &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6725,7 +6692,7 @@ mod tests {
             "lease",
             "legacy",
             "--task",
-            "fresh-clone master default",
+            "master-default auto-create",
         ]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
@@ -6734,37 +6701,39 @@ mod tests {
         runner.assert_exhausted();
     }
 
-    /// Counterpart to `workspace_lease_tracks_master_origin_after_fresh_clone`:
-    /// the same two-call sequence (`bookmark track main@origin`,
-    /// `bookmark track master@origin`) but for a repo whose default
-    /// branch is `main`. Pins that `master@origin` not existing in the
-    /// remote is swallowed, not propagated. This is the common case in
-    /// modern repos.
+    /// A create interrupted after `jj workspace add` registered the workspace
+    /// in the SHARED canonical store but before the publish rename leaves a
+    /// leftover `.incoming-<id>` dir. The next lease must forget the dangling
+    /// registration (best-effort) and clear the dir before re-attaching, rather
+    /// than colliding with jj's "workspace already exists".
     #[test]
-    fn workspace_lease_tracks_main_origin_after_fresh_clone() {
+    fn workspace_lease_auto_create_recovers_from_interrupted_staging() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-
         seed_mono_repo(&workspace_root, &database_path);
+        let source = mono_source_path(&workspace_root);
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
+        // Leftover from the interrupted prior create.
+        std::fs::create_dir_all(staging.join(".jj")).expect("leftover staging");
+
         let runner = FakeRunner::new(vec![
+            // The dangling store registration is forgotten first (here it
+            // exists and the forget succeeds; a missing one is tolerated).
             ExpectedCommand::ok(
                 workspace_root.clone(),
                 "jj",
                 &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
+                    "-R",
+                    &source.display().to_string(),
+                    "workspace",
+                    "forget",
+                    "mono-agent-001",
                 ],
                 "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ),
+            ExpectedCommand::workspace_add(workspace_root.clone(), &source, "mono-agent-001", &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6787,14 +6756,7 @@ mod tests {
             ),
         ]);
 
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "fresh-clone main default",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "recover staging"]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
         assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
@@ -6802,18 +6764,14 @@ mod tests {
         runner.assert_exhausted();
     }
 
-    /// Pins that cube does NOT promote remote bookmarks other than
-    /// `main`/`master` after a fresh clone. Real repos accumulate
-    /// long-lived `feature/*`, `release/*`, and
-    /// `gh-readonly-queue/*` remote refs; tracking all of them
-    /// pollutes the local bookmark namespace and slows
-    /// `jj log` / `jj bookmark list` in every leased workspace. The
-    /// FakeRunner's strict call-sequence match enforces this: any
-    /// stray `bookmark track <other>@origin` invocation would fail
-    /// the assertion. If cube ever regresses to `glob:*@origin` (or
-    /// to tracking individual non-default branches), this test fails.
+    /// In the shared-store model the canonical repo already carries the local
+    /// `main`/`master` bookmarks, so auto-create must NOT re-track any bookmark
+    /// per workspace — it only attaches and resets. The FakeRunner's strict
+    /// call sequence enforces it: a stray `bookmark track …` between the
+    /// `workspace add` and the reset would crash with "unexpected command". If
+    /// cube ever regresses to per-workspace tracking, this test fails.
     #[test]
-    fn workspace_lease_does_not_track_non_default_origin_bookmarks() {
+    fn workspace_lease_auto_create_does_not_track_bookmarks_in_shared_store() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
 
@@ -6821,27 +6779,8 @@ mod tests {
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
-        // Pretend the remote has many extra bookmarks (feature/foo,
-        // release/1.0, gh-readonly-queue/main/...). The test enforces
-        // its expectation negatively: only `main@origin` and
-        // `master@origin` may be tracked. Any other `bookmark track`
-        // call would crash FakeRunner with "unexpected command".
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6870,61 +6809,44 @@ mod tests {
             "lease",
             "mono",
             "--task",
-            "no extra bookmark tracking",
+            "no per-workspace bookmark tracking",
         ]);
         run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
         runner.assert_exhausted();
     }
 
-    /// If a freshly-cloned repo has neither `main@origin` nor
-    /// `master@origin`, cube cannot promote any default branch to
-    /// local tracking. Lease must hard-fail with a setup-step error
-    /// rather than silently proceeding into `jj new <missing>` later
-    /// (which would surface as a confusing unrelated jj error).
+    /// If the canonical repo materialised by `cube repo ensure` has neither
+    /// `main@origin` nor `master@origin`, ensure must hard-fail with a
+    /// setup-step error rather than leaving an untrackable shared store the
+    /// lease would later stumble on. (Bookmark promotion moved from the
+    /// per-workspace clone to the one-time canonical-repo materialize when
+    /// pool workspaces became shared-store `jj workspace add` attachments.)
     #[test]
-    fn workspace_lease_errors_when_no_default_origin_bookmark_exists() {
+    fn repo_ensure_errors_when_no_default_origin_bookmark_exists() {
         let (tempdir, database_path) = with_database_path();
-        let workspace_root = tempdir.path().join("workspaces");
-
-        {
-            use crate::metadata::RepoRecord;
-            use crate::store::Store;
-            let store = Store::open_at(&database_path).expect("store");
-            store
-                .upsert_repo(&RepoRecord {
-                    repo: "weird".to_string(),
-                    origin: "git@github.com:spinyfin/weird.git".to_string(),
-                    main_branch: "main".to_string(),
-                    workspace_root: workspace_root.clone(),
-                    workspace_prefix: "weird-agent-".to_string(),
-                    source: None,
-                    clone_command: None,
-                })
-                .expect("seed repo");
-        }
-
-        let staging = workspace_root.join(".incoming-weird-agent-001");
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("weird");
+        let origin = "git@github.com:spinyfin/weird.git";
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "main"),
             ExpectedCommand::ok(
-                workspace_root.clone(),
+                defaults.repo_root.clone(),
                 "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/weird.git",
-                    &staging.display().to_string(),
-                ],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "main@origin"]),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::no_such_remote_bookmark(source_path.clone(), "jj", &["bookmark", "track", "main@origin"]),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
         ]);
 
-        let lease = Cli::parse_from(["cube", "workspace", "lease", "weird", "--task", "no default branch"]);
-        let err = run_with_dependencies(lease, Some(&database_path), &runner)
-            .expect_err("lease should fail when neither default branch is present");
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let err = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+            .expect_err("ensure should fail when neither default branch is present");
         match err {
             CubeError::SetupStepFailed { step, error } => {
                 assert_eq!(step, "track_remote_bookmarks");
@@ -6938,35 +6860,29 @@ mod tests {
         runner.assert_exhausted();
     }
 
-    /// If `jj bookmark track main@origin` fails with anything other
-    /// than "no such remote bookmark" (e.g. jj is broken, network
-    /// failure mid-clone), cube must propagate the error rather than
-    /// swallowing it. Pins the precision of the error-tolerance
-    /// classifier: only the bookmark-doesn't-exist case is benign.
+    /// If `jj bookmark track main@origin` fails with anything other than "no
+    /// such remote bookmark" (e.g. jj is broken, network failure mid-clone)
+    /// while materialising the canonical repo, `cube repo ensure` must
+    /// propagate the error rather than swallowing it. Pins the precision of the
+    /// error-tolerance classifier: only the bookmark-doesn't-exist case is
+    /// benign.
     #[test]
-    fn workspace_lease_propagates_unrelated_track_failure() {
+    fn repo_ensure_propagates_unrelated_track_failure() {
         let (tempdir, database_path) = with_database_path();
-        let workspace_root = tempdir.path().join("workspaces");
-
-        seed_mono_repo(&workspace_root, &database_path);
-
-        let staging = workspace_root.join(".incoming-mono-agent-001");
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+        let origin = "git@github.com:spinyfin/mono.git";
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "main"),
             ExpectedCommand::ok(
-                workspace_root.clone(),
+                defaults.repo_root.clone(),
                 "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
-            .creating_dir(staging.clone()),
+            .creating_dir(source_path.clone()),
             ExpectedCommand {
-                cwd: staging.clone(),
+                cwd: source_path.clone(),
                 program: "jj".to_string(),
                 args: vec!["bookmark".to_string(), "track".to_string(), "main@origin".to_string()],
                 result: Err(CubeError::CommandFailed {
@@ -6979,16 +6895,9 @@ mod tests {
             },
         ]);
 
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "track failure propagates",
-        ]);
-        let err = run_with_dependencies(lease, Some(&database_path), &runner)
-            .expect_err("lease should propagate non-NoSuchRemoteBookmark failures");
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let err = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+            .expect_err("ensure should propagate non-NoSuchRemoteBookmark failures");
         match err {
             CubeError::CommandFailed { program, stderr, .. } => {
                 assert_eq!(program, "jj");
@@ -7049,21 +6958,7 @@ mod tests {
         let new_path = workspace_root.join("mono-agent-008");
         let staging = workspace_root.join(".incoming-mono-agent-008");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -8289,21 +8184,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(path_003.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(path_007.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -9510,21 +9391,7 @@ mod tests {
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -10338,7 +10205,19 @@ mod tests {
         FakeRunner::new(commands)
     }
 
+    /// Deterministic canonical-source path for a seeded repo, derived from the
+    /// test's `workspace_root` so auto-create tests can reference the
+    /// `jj workspace add -R <source>` argument without threading extra state.
+    fn mono_source_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+        workspace_root.parent().unwrap().join("source").join("mono")
+    }
+
     fn seed_mono_repo(workspace_root: &std::path::Path, database_path: &std::path::Path) {
+        // The shared-store model requires a materialised canonical repo for the
+        // pool to attach to; `repo ensure` always creates one. Mirror that here so
+        // auto-create exercises `jj workspace add` against a present `.jj/` store.
+        let source = mono_source_path(workspace_root);
+        std::fs::create_dir_all(source.join(".jj")).expect("seed canonical source .jj");
         let store = crate::store::Store::open_at(database_path).expect("store");
         store
             .upsert_repo(&crate::metadata::RepoRecord {
@@ -10347,7 +10226,7 @@ mod tests {
                 main_branch: "main".to_string(),
                 workspace_root: workspace_root.to_path_buf(),
                 workspace_prefix: "mono-agent-".to_string(),
-                source: None,
+                source: Some(source),
                 clone_command: None,
             })
             .expect("seed repo");
@@ -11861,21 +11740,7 @@ steps:
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -11958,21 +11823,7 @@ steps:
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -12031,21 +11882,7 @@ steps:
         let staging = workspace_root.join(".incoming-mono-agent-004");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -12468,21 +12305,7 @@ steps:
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    "git@github.com:spinyfin/mono.git",
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -12934,6 +12757,47 @@ steps:
         fn creating_dir(mut self, path: PathBuf) -> Self {
             self.creates_dir = Some(path);
             self
+        }
+
+        /// Build an expectation for the shared-store auto-create's
+        /// `jj -R <source> workspace add --name <id> <staging>` invocation, run
+        /// in `workspace_root` and materialising the dotted staging dir. Replaces
+        /// the old independent-clone provisioning sequence.
+        fn workspace_add(
+            workspace_root: PathBuf,
+            source: &std::path::Path,
+            workspace_id: &str,
+            staging: &std::path::Path,
+        ) -> Self {
+            Self::ok(
+                workspace_root,
+                "jj",
+                &[
+                    "-R",
+                    &source.display().to_string(),
+                    "workspace",
+                    "add",
+                    "--name",
+                    workspace_id,
+                    &staging.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(staging.to_path_buf())
+        }
+
+        /// Convenience for the many `mono` auto-create tests: derives the
+        /// canonical source (via [`mono_source_path`]) and the workspace id (from
+        /// the `.incoming-<id>` staging basename) so callers pass only the two
+        /// vars every such test already has in scope.
+        fn workspace_add_mono(workspace_root: &std::path::Path, staging: &std::path::Path) -> Self {
+            let source = mono_source_path(workspace_root);
+            let workspace_id = staging
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(".incoming-"))
+                .expect("staging dir must be named .incoming-<workspace-id>");
+            Self::workspace_add(workspace_root.to_path_buf(), &source, workspace_id, staging)
         }
 
         /// Build an expectation for the `git ls-remote --symref <origin> HEAD`
@@ -14483,7 +14347,7 @@ steps:
     }
 
     #[test]
-    fn ensure_boss_infra_excluded_skips_when_not_colocated() {
+    fn ensure_boss_infra_excluded_writes_self_ignoring_boss_gitignore_when_not_colocated() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let workspace = tempdir.path().join("mono-agent-004");
         // Secondary jj workspace: `.jj` but no colocated `.git` directory.
@@ -14491,7 +14355,17 @@ steps:
 
         ensure_boss_infra_excluded(&workspace, "mono-agent-004");
 
+        // No `.git/info/exclude` is created (there is no `.git` to hold it).
         assert!(!workspace.join(".git").exists());
+        // Instead, a self-ignoring `.boss/.gitignore` keeps the engine's scratch
+        // dir — and the guard file itself — out of the worker's jj snapshot.
+        let gitignore = std::fs::read_to_string(workspace.join(".boss/.gitignore")).expect("boss gitignore written");
+        assert_eq!(gitignore, "*\n");
+
+        // Idempotent: a second call leaves the same bytes.
+        ensure_boss_infra_excluded(&workspace, "mono-agent-004");
+        let again = std::fs::read_to_string(workspace.join(".boss/.gitignore")).unwrap();
+        assert_eq!(again, "*\n");
     }
 
     // ── unhealthy GC tests ────────────────────────────────────────────────────
@@ -14810,89 +14684,141 @@ steps:
         assert_eq!(result.payload["forced"], true);
     }
 
-    /// When cube auto-creates a workspace from a local source mirror, it must
-    /// add the real GitHub remote and track `main@github` so that subsequent
-    /// resets see the current GitHub head, not the stale local mirror.
+    /// Part-1 integration test — the test gap that let the bad clone-based
+    /// provisioning ship (PR #126 passed because the FakeRunner only *simulated*
+    /// `jj git clone`). This drives the REAL `auto_create_workspace` against a
+    /// real throwaway colocated jj repo with a real `jj`/`git`, and asserts the
+    /// new workspace SHARES the canonical object store rather than being an
+    /// independent clone. A FakeRunner can prove only that cube *issued* a
+    /// command; only a real `jj workspace add` proves the store is shared.
     #[test]
-    fn workspace_auto_creates_source_pool_workspace_adds_github_remote() {
-        let (tempdir, database_path) = with_database_path();
-        let workspace_root = tempdir.path().join("workspaces");
-        let source_dir = tempdir.path().join("source").join("mono");
-        std::fs::create_dir_all(&source_dir).expect("source dir");
+    fn auto_create_workspace_attaches_real_shared_store() {
+        use crate::command_runner::RealCommandRunner;
 
-        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
-        let ensure_defaults = RepoEnsureDefaults {
-            repo_root: source_dir.parent().unwrap().to_path_buf(),
-            workspace_root: workspace_root.clone(),
+        // Requires real jj + git; skip in sandboxes that lack them rather than
+        // failing (mirrors the other real-subprocess tests in this crate).
+        if which::which("jj").is_err() || which::which("git").is_err() {
+            eprintln!("skipping auto_create_workspace_attaches_real_shared_store: jj or git not on PATH");
+            return;
+        }
+
+        let tempdir = TempDir::new().unwrap();
+        let canonical = tempdir.path().join("canonical");
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        // Build a real colocated canonical repo with a `main` branch and some
+        // history — what `materialize_repo_source_if_missing` produces at
+        // `repo ensure` time.
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&canonical)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
-        run_with_context(
-            ensure,
-            Some(&database_path),
-            &FakeRunner::default(),
-            Some(&ensure_defaults),
-            None,
-        )
-        .expect("repo");
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "cube-test@example.com"]);
+        git(&["config", "user.name", "cube-test"]);
+        std::fs::write(canonical.join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
 
-        let new_path = workspace_root.join("mono-agent-001");
-        let staging = workspace_root.join(".incoming-mono-agent-001");
-        let runner = FakeRunner::new(vec![
-            // Clone from local source mirror (not GitHub).
-            ExpectedCommand::ok(
-                workspace_root.clone(),
+        let runner = RealCommandRunner;
+        // Colocate jj over the git repo; this imports `main` as a local bookmark,
+        // exactly like cube's canonical-repo materialize.
+        runner
+            .run(&RealCommandRunner::invocation(
+                &canonical,
                 "jj",
-                &[
-                    "git",
-                    "clone",
-                    "--colocate",
-                    &source_dir.display().to_string(),
-                    &staging.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(staging.clone()),
-            // Add the real GitHub remote.
-            ExpectedCommand::ok(
-                staging.clone(),
-                "jj",
-                &["git", "remote", "add", "github", "git@github.com:spinyfin/mono.git"],
-                "",
-            ),
-            // Fetch from GitHub.
-            ExpectedCommand::ok(staging.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
-            // Track main on the github remote.
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@github"], ""),
-            // Untrack main@origin so local main only follows the real GitHub upstream.
-            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "untrack", "main@origin"], ""),
-            // Reset sequence uses main@github for the fast-forward.
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(
-                new_path.clone(),
-                "jj",
-                &["git", "remote", "list"],
-                "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n",
-            ),
-            ExpectedCommand::ok(
-                new_path.clone(),
-                "jj",
-                &["bookmark", "set", "main", "-r", "main@github", "--allow-backwards"],
-                "",
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
-            ExpectedCommand::ok(
-                new_path.clone(),
-                "jj",
-                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
-                "abc1234",
-            ),
-        ]);
+                &["git", "init", "--colocate"],
+            ))
+            .expect("jj git init --colocate on canonical");
 
-        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "source-pool test"]);
-        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+        let workspace_root = tempdir.path().join("workspaces");
+        let repo_record = crate::metadata::RepoRecord {
+            repo: "mono".to_string(),
+            origin: "git@github.com:spinyfin/mono.git".to_string(),
+            main_branch: "main".to_string(),
+            workspace_root: workspace_root.clone(),
+            workspace_prefix: "mono-agent-".to_string(),
+            source: Some(canonical.clone()),
+            clone_command: None,
+        };
 
-        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
-        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
-        runner.assert_exhausted();
+        let candidate = super::auto_create_workspace(&runner, &repo_record, &[]).expect("auto-create");
+        assert_eq!(candidate.workspace_id, "mono-agent-001");
+        let ws = candidate.workspace_path.clone();
+
+        // 1. `.jj/repo` is a FILE pointer into the canonical store, not its own
+        //    directory — this is what makes it a shared-store attachment rather
+        //    than an independent clone (the whole point of the fix).
+        let repo_marker = ws.join(".jj").join("repo");
+        assert!(
+            repo_marker.is_file(),
+            ".jj/repo must be a file pointer for a shared-store workspace; a directory means an independent clone"
+        );
+        let target = std::fs::read_to_string(&repo_marker).unwrap();
+        assert!(
+            target.contains("canonical"),
+            "the .jj/repo pointer must reference the canonical store, got: {target}"
+        );
+
+        // 2. No independent `.git` of its own (non-colocated secondary workspace).
+        assert!(
+            !ws.join(".git").exists(),
+            "a shared-store workspace must not carry its own .git"
+        );
+
+        // 3. The canonical repo lists the new workspace by name.
+        let list = runner
+            .run(&RealCommandRunner::invocation(&canonical, "jj", &["workspace", "list"]))
+            .expect("jj workspace list");
+        assert!(
+            list.contains("mono-agent-001"),
+            "canonical `jj workspace list` must include the attached workspace: {list}"
+        );
+
+        // 4. Disk footprint is working-copy-sized, not a full history copy: the
+        //    workspace's own `.jj` is materially smaller than the canonical store.
+        fn dir_size(p: &std::path::Path) -> u64 {
+            let mut total = 0;
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for entry in rd.flatten() {
+                    let Ok(md) = entry.metadata() else { continue };
+                    if md.is_dir() {
+                        total += dir_size(&entry.path());
+                    } else {
+                        total += md.len();
+                    }
+                }
+            }
+            total
+        }
+        let ws_jj = dir_size(&ws.join(".jj"));
+        let canon_jj = dir_size(&canonical.join(".jj"));
+        assert!(
+            ws_jj < canon_jj,
+            "workspace .jj ({ws_jj} bytes) must be smaller than the shared canonical store ({canon_jj} bytes); a full clone would be comparable"
+        );
+
+        // 5. The shared store is usable from the workspace: the canonical
+        //    `main` history resolves there (proves the attach, not just files).
+        let log = runner
+            .run(&RealCommandRunner::invocation(
+                &ws,
+                "jj",
+                &["log", "--no-graph", "-r", "main", "-T", "description.first_line()"],
+            ))
+            .expect("jj log -r main in workspace");
+        assert!(
+            log.contains("initial"),
+            "workspace must see the canonical history via the shared store: {log}"
+        );
     }
 
     /// When leasing an existing workspace whose repo has a local source mirror,
