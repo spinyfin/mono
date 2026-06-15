@@ -1,33 +1,118 @@
-//! Checkleft check: require linked files or blocks to change together.
+//! Checkleft check: require a companion change when a coupled surface changes.
 //!
-//! Registered under the canonical id `file/ifchange`. Runs inside the checkleft
-//! wasm host and reads files via the WASI filesystem sandbox.
+//! This is the Component Model wasm check `file/require-companion-change`. It is
+//! the generalization of the former `ifchange-thenchange` built-in (ported to
+//! wasm as `file/ifchange`) and the former native `api-breaking-surface` check.
+//! Both expressed the same rule — *"when region/surface X changes, companion Y
+//! must also change"* — through two different coupling-declaration mechanisms;
+//! this check supports both at once.
 //!
-//! ## What the check detects
+//! ## Two ways to declare a coupling
 //!
-//! When a file contains `// LINT.IfChange` ... `// LINT.ThenChange(<target>)` markers,
-//! and the region between the markers is modified, the check requires the named target
-//! file (or labeled block within it) to also be modified in the same change.
+//! 1. **In-source markers** (`LINT.IfChange` / `LINT.ThenChange`). Code-declared
+//!    coupling between specific regions/files. Always active — no config needed.
+//!    This is the former `ifchange-thenchange` / `file/ifchange` behavior, at
+//!    full parity (including enforcement on deleted files and removed-marker
+//!    scenarios via base-revision content supplied through
+//!    [`ChangeSet::base_file_content`]).
 //!
-//! Enforcement covers deleted files and removed-marker scenarios via base-revision
-//! content supplied through the [`ChangeSet::base_files`] field in the check input.
+//! 2. **Config globs** (`trigger_globs` / `required_globs`). Policy-declared
+//!    coupling scoped by path globs: if any changed file matches a coupling's
+//!    `trigger_globs` but no changed file matches its `required_globs`, every
+//!    trigger file is flagged. This is the former `api-breaking-surface`
+//!    behavior, now a config of this generic check.
 //!
-//! ## Supported comment styles
+//! The two mechanisms are independent and additive: a single instance can rely
+//! on markers, on glob couplings, or on both.
+//!
+//! ## Deprecated aliases
+//!
+//! For a migration window this check is also exported under its two historical
+//! ids — `file/ifchange` and `api-breaking-surface` — which dispatch to the same
+//! implementation. New configuration should reference `file/require-companion-change`.
+//!
+//! ## Supported comment styles (markers)
 //!
 //! The `LINT.IfChange` / `LINT.ThenChange` directives are recognized when preceded
 //! by any of: `//`, `#`, `--`, `;`, `/*`, `*`, `<!--` (and `*/` / `-->` suffixes
 //! are stripped). This covers most common source languages.
 //!
-//! ## Configuration
+//! ## Configuration (JSON-encoded, passed via `config-json`)
 //!
-//! This check has no configuration surface; all parameters are intrinsic to the
-//! LINT markers in the source files.
+//! ```json
+//! {
+//!   "trigger_globs": ["backend/blob/src/v3/**"],
+//!   "required_globs": ["docs/backend.md", "docs/product-specs/**"],
+//!   "message": "Potential backend API surface change without docs update.",
+//!   "remediation": "Update docs/backend.md or a relevant product spec in this PR."
+//! }
+//! ```
+//!
+//! The flat `trigger_globs` / `required_globs` form declares a single coupling.
+//! For multiple couplings in one instance, use the `couplings` array, each entry
+//! carrying its own `trigger_globs` / `required_globs` / `message` / `remediation`.
+//! With no config, only the in-source marker mechanism is active.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use checkleft_check_sdk::{
     ChangeKind, ChangeSet, ChangedFile, CheckInput, DiffHunk, Finding, Location, Severity, check,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::Deserialize;
+
+// ── Check entry points ─────────────────────────────────────────────────────────
+//
+// One shared implementation, exported under the canonical id plus two deprecated
+// aliases so existing `file/ifchange` and `api-breaking-surface` configs keep
+// resolving during the migration window. The host dispatches by name; each entry
+// carries its own descriptor (severity/access-scope), so all three behave
+// identically.
+
+/// Canonical check: require a companion change when a coupled surface changes.
+#[check(
+    name = "file/require-companion-change",
+    description = "requires a companion change (marked region/file or glob-matched surface) to change together",
+    severity = error,
+    access_scope = whole_repo
+)]
+pub fn file_require_companion_change_check(input: CheckInput) -> Vec<Finding> {
+    run(&input)
+}
+
+/// Deprecated alias of `file/require-companion-change` (marker-only history).
+#[check(
+    name = "file/ifchange",
+    description = "deprecated alias of file/require-companion-change (LINT.IfChange / LINT.ThenChange markers)",
+    severity = error,
+    access_scope = whole_repo
+)]
+pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
+    run(&input)
+}
+
+/// Deprecated alias of `file/require-companion-change` (glob-coupling history).
+#[check(
+    name = "api-breaking-surface",
+    description = "deprecated alias of file/require-companion-change (trigger_globs / required_globs)",
+    severity = error,
+    access_scope = whole_repo
+)]
+pub fn api_breaking_surface_check(input: CheckInput) -> Vec<Finding> {
+    run(&input)
+}
+
+/// Shared implementation behind every exported entry point. Runs both coupling
+/// mechanisms and concatenates their findings.
+fn run(input: &CheckInput) -> Vec<Finding> {
+    let mut findings = marker_findings(&input.changeset);
+    findings.extend(glob_findings(input));
+    findings
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Mechanism 1 — in-source LINT.IfChange / LINT.ThenChange markers
+// ══════════════════════════════════════════════════════════════════════════════
 
 // ── Parsing types ────────────────────────────────────────────────────────────
 
@@ -57,20 +142,13 @@ enum ThenChangeTarget {
     Block { path: String, label: String },
 }
 
-// ── Main check ───────────────────────────────────────────────────────────────
+// ── Marker-mode driver ─────────────────────────────────────────────────────────
 
-#[check(
-    name = "file/ifchange",
-    description = "requires linked files or blocks to change together",
-    severity = error,
-    access_scope = whole_repo
-)]
-pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
-    let analyses: Vec<FileAnalysis> = input
-        .changeset
+fn marker_findings(changeset: &ChangeSet) -> Vec<Finding> {
+    let analyses: Vec<FileAnalysis> = changeset
         .changed_files
         .iter()
-        .map(|f| analyze_file(f, &input.changeset))
+        .map(|f| analyze_file(f, changeset))
         .collect();
 
     let mut findings = Vec::new();
@@ -91,7 +169,7 @@ pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
                 continue;
             }
 
-            let status = target_status(block, &input.changeset, &analyses);
+            let status = target_status(block, changeset, &analyses);
             match status {
                 TargetStatus::Satisfied => continue,
                 TargetStatus::MissingFile => findings.push(broken_target_finding(
@@ -155,24 +233,18 @@ fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalys
         };
     }
 
+    // A file that cannot be read as UTF-8 text (e.g. a binary asset) cannot carry
+    // LINT markers, so skip it rather than emitting an error. This keeps
+    // glob-coupling-only configs — which still run marker analysis over every
+    // changed file — from flagging binary or unreadable changes, preserving the
+    // former api-breaking-surface behavior of never reading file contents.
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) => {
-            let finding = Finding {
-                severity: Severity::Error,
-                message: format!("failed to read `{path}` for ifchange analysis: {e}"),
-                location: Some(Location {
-                    path: path.clone(),
-                    line: None,
-                    column: None,
-                }),
-                remediations: vec![],
-                suggested_fix: None,
-            };
+        Err(_) => {
             return FileAnalysis {
                 path,
                 touched_blocks: vec![],
-                parse_findings: vec![finding],
+                parse_findings: vec![],
             };
         }
     };
@@ -527,6 +599,167 @@ fn validate_path(path_text: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Mechanism 2 — config glob couplings (former api-breaking-surface)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Top-level configuration. The flat `trigger_globs` / `required_globs` fields
+/// declare a single coupling (compatible with the former `api-breaking-surface`
+/// config); `couplings` declares any number of additional couplings.
+#[derive(Debug, Deserialize, Default)]
+struct CompanionConfig {
+    #[serde(default)]
+    trigger_globs: Vec<String>,
+    #[serde(default)]
+    required_globs: Vec<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    remediation: Option<String>,
+    #[serde(default)]
+    couplings: Vec<Coupling>,
+}
+
+/// One glob-based coupling: a trigger surface and the companion it requires.
+#[derive(Debug, Deserialize, Default)]
+struct Coupling {
+    #[serde(default)]
+    trigger_globs: Vec<String>,
+    #[serde(default)]
+    required_globs: Vec<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    remediation: Option<String>,
+}
+
+impl CompanionConfig {
+    /// Flatten the top-level coupling (if any) plus the explicit `couplings` list.
+    fn into_couplings(self) -> Vec<Coupling> {
+        let mut out = Vec::new();
+        if !self.trigger_globs.is_empty() || !self.required_globs.is_empty() {
+            out.push(Coupling {
+                trigger_globs: self.trigger_globs,
+                required_globs: self.required_globs,
+                message: self.message,
+                remediation: self.remediation,
+            });
+        }
+        out.extend(self.couplings);
+        out
+    }
+}
+
+fn glob_findings(input: &CheckInput) -> Vec<Finding> {
+    // Absent or unparseable config means "marker mode only" — the marker
+    // mechanism never needs config, so a config error here must not abort it.
+    let cfg: CompanionConfig = match input.config() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    cfg.into_couplings()
+        .iter()
+        .flat_map(|coupling| evaluate_coupling(coupling, &input.changeset))
+        .collect()
+}
+
+fn evaluate_coupling(coupling: &Coupling, changeset: &ChangeSet) -> Vec<Finding> {
+    // A coupling with no triggers can never fire.
+    if coupling.trigger_globs.is_empty() {
+        return vec![];
+    }
+    // Misconfiguration: a trigger with no required companion can never be
+    // satisfied. The former native check hard-errored here; the wasm check
+    // surfaces it as an error finding (it cannot abort the whole run).
+    if coupling.required_globs.is_empty() {
+        return vec![config_error_finding(
+            "`required_globs` must be set when `trigger_globs` is set",
+        )];
+    }
+
+    let trigger = match compile_globs(&coupling.trigger_globs) {
+        Ok(g) => g,
+        Err(msg) => return vec![config_error_finding(&format!("invalid `trigger_globs`: {msg}"))],
+    };
+    let required = match compile_globs(&coupling.required_globs) {
+        Ok(g) => g,
+        Err(msg) => return vec![config_error_finding(&format!("invalid `required_globs`: {msg}"))],
+    };
+
+    let mut trigger_files = Vec::new();
+    let mut required_updated = false;
+    for changed_file in &changeset.changed_files {
+        // Deleted files neither satisfy nor trigger the requirement, matching the
+        // former api-breaking-surface behavior.
+        if changed_file.kind == ChangeKind::Deleted {
+            continue;
+        }
+        if required.is_match(&changed_file.path) {
+            required_updated = true;
+        }
+        if trigger.is_match(&changed_file.path) {
+            trigger_files.push(changed_file.path.clone());
+        }
+    }
+
+    if trigger_files.is_empty() || required_updated {
+        return vec![];
+    }
+
+    let message = coupling.message.clone().unwrap_or_else(default_companion_message);
+    let remediation = coupling
+        .remediation
+        .clone()
+        .unwrap_or_else(default_companion_remediation);
+
+    trigger_files
+        .into_iter()
+        .map(|path| Finding {
+            severity: Severity::Error,
+            message: message.clone(),
+            location: Some(Location {
+                path,
+                line: None,
+                column: None,
+            }),
+            remediations: vec![remediation.clone()],
+            suggested_fix: None,
+        })
+        .collect()
+}
+
+fn compile_globs(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|e| format!("`{pattern}`: {e}"))?;
+        builder.add(glob);
+    }
+    builder.build().map_err(|e| format!("{e}"))
+}
+
+fn config_error_finding(detail: &str) -> Finding {
+    Finding {
+        severity: Severity::Error,
+        message: format!("require-companion-change config error: {detail}"),
+        location: None,
+        remediations: vec!["Fix the check configuration in the CHECKS file.".to_owned()],
+        suggested_fix: None,
+    }
+}
+
+fn default_companion_message() -> String {
+    "a file matching `trigger_globs` changed, but no companion file matching `required_globs` was updated in the \
+     same change"
+        .to_owned()
+}
+
+fn default_companion_remediation() -> String {
+    "Update a companion file matching the configured `required_globs` in the same change, or bypass the check with a \
+     documented reason."
+        .to_owned()
+}
+
 // NOTE: this crate is an rlib, NOT a standalone wasm component. The component
 // ABI (`export_checks!` → `list-checks`/`run-check`) is wired ONCE in the
 // aggregating `checkleft-preinstalled-bundle` crate, which links this check
@@ -603,8 +836,17 @@ mod tests {
 
     fn run_check(changeset: ChangeSet) -> Vec<Finding> {
         let input = CheckInput::__from_parts(changeset, "{}".to_owned());
-        file_ifchange_check(input)
+        file_require_companion_change_check(input)
     }
+
+    fn run_with_config(changeset: ChangeSet, config_json: &str) -> Vec<Finding> {
+        let input = CheckInput::__from_parts(changeset, config_json.to_owned());
+        file_require_companion_change_check(input)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Marker-mode tests (parity with the former ifchange-thenchange / file/ifchange)
+    // ══════════════════════════════════════════════════════════════════════════
 
     // ── File-target tests ─────────────────────────────────────────────────────
 
@@ -1364,5 +1606,204 @@ mod tests {
     fn zero_len_hunk_beyond_block() {
         // An insertion at line 5 does not touch range [1,3].
         assert!(!hunk_touches_range(5, 0, 1, 3));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Glob-coupling tests (parity with the former api-breaking-surface)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn glob_flags_trigger_change_without_required_update() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#,
+        );
+        assert_eq!(findings.len(), 1, "expected 1 finding; got {findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(
+            findings[0].location.as_ref().map(|l| l.path.as_str()),
+            Some("backend/blob/src/v3/auth.rs")
+        );
+    }
+
+    #[test]
+    fn glob_passes_when_required_file_is_updated() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(
+            vec![
+                ("backend/blob/src/v3/auth.rs", ChangeKind::Modified),
+                ("docs/backend.md", ChangeKind::Modified),
+            ],
+            vec![],
+        );
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#,
+        );
+        assert!(
+            findings.is_empty(),
+            "required companion updated — no finding; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn glob_ignores_changes_outside_trigger_globs() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v2/fencer.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/app.rs", "backend/blob/src/v2/mod.rs"], "required_globs": ["docs/backend.md"]}"#,
+        );
+        assert!(findings.is_empty(), "no trigger matched — no finding; got {findings:?}");
+    }
+
+    #[test]
+    fn glob_custom_message_and_remediation_are_used() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"], "message": "API surface changed", "remediation": "update docs/backend.md"}"#,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "API surface changed");
+        assert_eq!(findings[0].remediations, vec!["update docs/backend.md".to_owned()]);
+    }
+
+    #[test]
+    fn glob_deleted_trigger_file_does_not_fire() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Deleted)], vec![]);
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#,
+        );
+        assert!(findings.is_empty(), "deleted trigger must not fire; got {findings:?}");
+    }
+
+    #[test]
+    fn glob_multiple_couplings_evaluated_independently() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        // First coupling fires (backend changed, no docs); second does not (no frontend change).
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(
+            cs,
+            r#"{
+                "couplings": [
+                    {"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]},
+                    {"trigger_globs": ["frontend/**"], "required_globs": ["docs/frontend.md"]}
+                ]
+            }"#,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the first coupling should fire; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn glob_config_with_trigger_but_no_required_reports_config_error() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(cs, r#"{"trigger_globs": ["backend/blob/src/v3/**"]}"#);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].message.contains("config error"),
+            "message: {}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("required_globs"),
+            "message: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn no_config_means_marker_mode_only() {
+        // With empty config and no markers, there are no findings (and no config error).
+        let _guard = CWD_LOCK.lock().unwrap();
+        let cs = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let findings = run_with_config(cs, "{}");
+        assert!(
+            findings.is_empty(),
+            "no markers + no globs → no findings; got {findings:?}"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Combined + alias behavior
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn marker_and_glob_findings_both_emitted() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // Marker coupling that is unsatisfied (target b.txt not changed).
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "unchanged\n").unwrap();
+        fs::create_dir_all(dir.path().join("backend/blob/src/v3")).unwrap();
+        fs::write(dir.path().join("backend/blob/src/v3/auth.rs"), "fn f() {}\n").unwrap();
+
+        // a.txt's block touched (marker fires) AND a v3 backend file changed with
+        // no docs companion (glob fires).
+        let cs = make_changeset(
+            vec![
+                ("a.txt", ChangeKind::Modified),
+                ("backend/blob/src/v3/auth.rs", ChangeKind::Modified),
+            ],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let findings = run_with_config(
+            cs,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#,
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            findings.len(),
+            2,
+            "expected one marker + one glob finding; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn aliases_dispatch_to_same_implementation() {
+        // file/ifchange alias runs the marker mechanism.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "unchanged\n").unwrap();
+        let cs = make_changeset(
+            vec![("a.txt", ChangeKind::Modified)],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let ifchange_findings = file_ifchange_check(CheckInput::__from_parts(cs, "{}".to_owned()));
+        assert_eq!(ifchange_findings.len(), 1, "file/ifchange alias must run marker mode");
+
+        // api-breaking-surface alias runs the glob mechanism.
+        let cs2 = make_changeset(vec![("backend/blob/src/v3/auth.rs", ChangeKind::Modified)], vec![]);
+        let abs_findings = api_breaking_surface_check(CheckInput::__from_parts(
+            cs2,
+            r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#.to_owned(),
+        ));
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(abs_findings.len(), 1, "api-breaking-surface alias must run glob mode");
     }
 }
