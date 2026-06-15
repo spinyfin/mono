@@ -7033,6 +7033,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 })
             }
         }
@@ -7346,6 +7348,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 })
             }
         }
@@ -8967,6 +8971,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 labels: Vec::new(),
                 review: crate::merge_poller::PrReviewState::Unknown,
                 in_merge_queue: false,
+                raw_mergeable: String::new(),
+                raw_merge_state_status: String::new(),
             })
         }
     }
@@ -9586,6 +9592,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 })
             }
         }
@@ -9699,6 +9707,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     labels: Vec::new(),
                     review: crate::merge_poller::PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 })
             }
         }
@@ -9964,6 +9974,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             labels: Vec::new(),
             review: crate::merge_poller::PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
