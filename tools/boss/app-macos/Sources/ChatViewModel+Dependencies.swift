@@ -83,6 +83,15 @@ extension ChatViewModel {
 
     // MARK: - Dependency badge hover / frontier highlight
 
+    /// The parent task ID when the currently selected card is a revision.
+    /// Drives the green-border highlight on the parent card so clicking a
+    /// revision lights up the task it amends — the inverse of the "In
+    /// revision" badge hover which highlights child revisions.
+    var selectedRevisionParentID: String? {
+        guard let task = selectedTask, task.kind == "revision" else { return nil }
+        return task.parentTaskId
+    }
+
     /// Called when the pointer enters or leaves a Dependency badge on a
     /// kanban card. On enter, computes the actionable prerequisite
     /// frontier — the set of reachable, unblocked, open prerequisites —

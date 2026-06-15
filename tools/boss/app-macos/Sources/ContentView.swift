@@ -972,11 +972,12 @@ struct ContentView: View {
         let highlightID = model.revealHighlightID
         let frontierIDs = model.depFrontierHighlightIDs
         let revisionIDs = model.revisionHighlightIDs
+        let selectedRevisionParentID = model.selectedRevisionParentID
         VStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
                 let isRevealed = highlightID == task.id
-                let isFrontierHighlighted = frontierIDs.contains(task.id) || revisionIDs.contains(task.id)
+                let isFrontierHighlighted = frontierIDs.contains(task.id) || revisionIDs.contains(task.id) || selectedRevisionParentID == task.id
                 WorkBoardCardItem(
                     task: task,
                     projectName: model.cardProjectBadge(for: task),
