@@ -165,6 +165,13 @@ pub enum CubeError {
 /// `tools/jj/` — the wording has been stable across releases.
 const JJ_STALE_SIGNATURE: &str = "working copy is stale";
 
+/// Alternate stale signature emitted by newer jj versions when the op-log
+/// entry for the working copy cannot be read at all (distinct from "the copy
+/// IS stale" phrasing). Also fixed by `jj workspace update-stale`.
+/// Seen in the wild as: "Could not read working copy's operation. Hint: Run
+/// jj workspace update-stale to recover."
+const JJ_STALE_OP_SIGNATURE: &str = "could not read working copy's operation";
+
 /// Stable substring jj prints when the repo was loaded at an operation
 /// that is a sibling of the working copy's operation (op-log divergence).
 /// Both the stale-working-copy and op-log-diverged cases are fixed by
@@ -1200,7 +1207,30 @@ fn run_workspace(
                     continue;
                 }
 
-                let outcome = check_workspace_health(runner, database_path, &ws.workspace_path)?;
+                // Any error from check_workspace_health skips this workspace
+                // rather than hard-failing the lease. The pool is not fixed —
+                // cube provisions a fresh workspace when none are usable.
+                let outcome = match check_workspace_health(runner, database_path, &ws.workspace_path) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        health_checks.push(json!({
+                            "workspace_id": ws_id,
+                            "health": "error",
+                            "skipped": true,
+                            "reason": "health_check_error",
+                            "error": err_str,
+                        }));
+                        audit!(
+                            database_path,
+                            "workspace.health_check_error",
+                            repo = repo,
+                            workspace_id = ws_id,
+                            error = err_str,
+                        );
+                        continue;
+                    }
+                };
                 match outcome {
                     WorkspaceHealthOutcome::Clean => {
                         let was_stale_dirty = matches!(
@@ -1229,6 +1259,116 @@ fn run_workspace(
                         }
                         clean_candidate = Some(ws_id.clone());
                         break;
+                    }
+                    WorkspaceHealthOutcome::StaleWorkingCopy(recovery_kind) => {
+                        // Run `jj workspace update-stale` to recover the working
+                        // copy, then retry the health check. If recovery or the
+                        // retry fails, skip this workspace; never hard-fail the
+                        // lease over one bad workspace.
+                        let update_stale_inv = CommandInvocation {
+                            cwd: ws.workspace_path.clone(),
+                            program: "jj".to_string(),
+                            args: vec!["workspace".to_string(), "update-stale".to_string()],
+                        };
+                        match runner.run(&update_stale_inv) {
+                            Ok(_) => {
+                                audit!(
+                                    database_path,
+                                    recovery_kind,
+                                    workspace_path = ws.workspace_path.display().to_string(),
+                                    repo = repo,
+                                    workspace_id = ws_id,
+                                );
+                                match check_workspace_health(runner, database_path, &ws.workspace_path) {
+                                    Ok(WorkspaceHealthOutcome::Clean) => {
+                                        let was_stale_dirty = matches!(
+                                            ws.health_status,
+                                            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+                                        );
+                                        health_checks.push(json!({
+                                            "workspace_id": ws_id,
+                                            "health": "stale_recovered_clean",
+                                            "skipped": false,
+                                            "was_stale_dirty": was_stale_dirty,
+                                        }));
+                                        if was_stale_dirty {
+                                            store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Clean)?;
+                                            audit!(
+                                                database_path,
+                                                "workspace.health_reconciled",
+                                                repo = repo,
+                                                workspace_id = ws_id,
+                                                prior_health =
+                                                    ws.health_status.map(|h| h.as_str()).unwrap_or("unknown"),
+                                                new_health = "clean",
+                                            );
+                                        }
+                                        clean_candidate = Some(ws_id.clone());
+                                        break;
+                                    }
+                                    Ok(other) => {
+                                        let reason = match &other {
+                                            WorkspaceHealthOutcome::DirtyWorkingCopy => "dirty_after_stale_recovery",
+                                            WorkspaceHealthOutcome::ConflictedBookmarks(_) => {
+                                                "conflicted_after_stale_recovery"
+                                            }
+                                            WorkspaceHealthOutcome::StaleWorkingCopy(_) => "still_stale_after_recovery",
+                                            WorkspaceHealthOutcome::BrokenEmpty => "broken_empty_after_stale_recovery",
+                                            WorkspaceHealthOutcome::Clean => unreachable!(),
+                                        };
+                                        health_checks.push(json!({
+                                            "workspace_id": ws_id,
+                                            "health": "stale",
+                                            "skipped": true,
+                                            "reason": reason,
+                                        }));
+                                        audit!(
+                                            database_path,
+                                            "workspace.health_check_skipped",
+                                            repo = repo,
+                                            workspace_id = ws_id,
+                                            reason = reason,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        health_checks.push(json!({
+                                            "workspace_id": ws_id,
+                                            "health": "stale",
+                                            "skipped": true,
+                                            "reason": "health_check_failed_after_stale_recovery",
+                                            "error": err_str,
+                                        }));
+                                        audit!(
+                                            database_path,
+                                            "workspace.health_check_skipped",
+                                            repo = repo,
+                                            workspace_id = ws_id,
+                                            reason = "health_check_failed_after_stale_recovery",
+                                            error = err_str,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                health_checks.push(json!({
+                                    "workspace_id": ws_id,
+                                    "health": "stale",
+                                    "skipped": true,
+                                    "reason": "stale_recovery_failed",
+                                    "error": err_str,
+                                }));
+                                audit!(
+                                    database_path,
+                                    "workspace.health_check_skipped",
+                                    repo = repo,
+                                    workspace_id = ws_id,
+                                    reason = "stale_recovery_failed",
+                                    error = err_str,
+                                );
+                            }
+                        }
                     }
                     WorkspaceHealthOutcome::ConflictedBookmarks(ref bookmarks) => {
                         health_checks.push(json!({
@@ -3505,12 +3645,12 @@ fn gc_collect_closed_pr_bookmarks(
 fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
     // Skip if a pass completed recently (the main 24h throttle).
     let last_completed = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)?;
-    if last_completed.map_or(false, |t| (now_epoch_s - t) < AUTO_GC_INTERVAL_SECS) {
+    if last_completed.is_some_and(|t| (now_epoch_s - t) < AUTO_GC_INTERVAL_SECS) {
         return Ok(());
     }
     // Skip if a pass is already in progress (started within the stuck timeout).
     let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
-    if last_started.map_or(false, |t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
+    if last_started.is_some_and(|t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
         return Ok(());
     }
     store.set_pool_metadata_i(POOL_GC_STARTED_AT_KEY, now_epoch_s)?;
@@ -4315,12 +4455,28 @@ enum WorkspaceHealthOutcome {
     /// The directory was likely wiped externally. Requires manual re-clone or
     /// force-release. Not safe to auto-repair without the source.
     BrokenEmpty,
+    /// `jj status` returned a stale-working-copy error (the op-log entry for
+    /// the working copy could not be read). Auto-recoverable: the lease handler
+    /// runs `jj workspace update-stale` and retries the health check. If the
+    /// retry comes back clean the workspace is used; if recovery fails the
+    /// workspace is skipped and a fresh one is provisioned instead.
+    ///
+    /// The inner string is the audit event name to emit on successful recovery
+    /// (e.g. `"workspace.stale_recovered"` or `"workspace.op_diverged_recovered"`).
+    StaleWorkingCopy(&'static str),
 }
 
 /// Check the health of a free workspace by running `jj status`. Returns
 /// [`WorkspaceHealthOutcome`] so the lease handler can decide whether to
-/// skip, repair, or immediately use the workspace. Does not modify the
-/// workspace.
+/// skip, repair, or immediately use the workspace.
+///
+/// This function does NOT transparently recover from stale working copies.
+/// When `jj status` exits non-zero with a stale-op signature it returns
+/// [`WorkspaceHealthOutcome::StaleWorkingCopy`] so the lease handler can
+/// explicitly drive recovery with `jj workspace update-stale` and retry.
+/// Colocate-init (a `.git`-only workspace missing its `.jj` overlay) IS
+/// performed inline here, since it is a structural fix that must happen
+/// before any further jj operations can succeed.
 fn check_workspace_health(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -4334,15 +4490,48 @@ fn check_workspace_health(
         return Ok(WorkspaceHealthOutcome::BrokenEmpty);
     }
 
-    let output = run_jj(
-        runner,
-        database_path,
-        &CommandInvocation {
-            cwd: workspace_path.to_path_buf(),
-            program: "jj".to_string(),
-            args: vec!["status".to_string(), "--no-pager".to_string()],
-        },
-    )?;
+    let status_invocation = CommandInvocation {
+        cwd: workspace_path.to_path_buf(),
+        program: "jj".to_string(),
+        args: vec!["status".to_string(), "--no-pager".to_string()],
+    };
+
+    // Run jj status directly (not via run_jj) so we can intercept the
+    // stale-working-copy error before run_jj would transparently recover it.
+    // This makes StaleWorkingCopy a first-class outcome the lease handler can
+    // audit and drive, rather than a transparent retry inside run_jj.
+    let output = match runner.run_with_timeout(&status_invocation, network_cmd_timeout()) {
+        Ok(out) => out,
+        Err(err) => {
+            // Stale working copy: surface as StaleWorkingCopy so the lease
+            // handler decides whether to run update-stale and retry.
+            if let Some(recovery_kind) = jj_update_stale_recovery_kind(&err) {
+                return Ok(WorkspaceHealthOutcome::StaleWorkingCopy(recovery_kind));
+            }
+            // Colocate-init: workspace has .git but no .jj overlay. Fix it
+            // in-place and retry jj status. If colocate-init fails, propagate
+            // the original error so the lease loop can skip this workspace.
+            if jj_needs_colocate_init(&err, workspace_path) {
+                let init = RealCommandRunner::invocation(workspace_path, "jj", &["git", "init", "--colocate"]);
+                if runner.run(&init).is_err() {
+                    return Err(err);
+                }
+                audit!(
+                    database_path,
+                    "workspace.jj_colocate_initialised",
+                    workspace_path = workspace_path.display().to_string(),
+                    program = status_invocation.program,
+                    args = status_invocation.args,
+                );
+                match runner.run_with_timeout(&status_invocation, network_cmd_timeout()) {
+                    Ok(out) => out,
+                    Err(_) => return Err(err),
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    };
 
     // "Working copy changes:" appears when jj has file-level changes staged
     // or present in the working copy. Its absence means the working copy
@@ -4768,7 +4957,7 @@ fn jj_update_stale_recovery_kind(err: &CubeError) -> Option<&'static str> {
         return None;
     }
     let lower = stderr.to_lowercase();
-    if lower.contains(JJ_STALE_SIGNATURE) {
+    if lower.contains(JJ_STALE_SIGNATURE) || lower.contains(JJ_STALE_OP_SIGNATURE) {
         return Some("workspace.stale_recovered");
     }
     if lower.contains(JJ_OP_DIVERGED_SIGNATURE) {
@@ -5237,6 +5426,19 @@ fn reconcile_free_workspace_health(
                     prior_health,
                     new_health: None,
                     skip_reason: Some("broken_empty".to_string()),
+                });
+            }
+            WorkspaceHealthOutcome::StaleWorkingCopy(_) => {
+                // The reconcile pass doesn't attempt stale recovery — that's
+                // a lease-time operation. Report as skipped so the operator
+                // can run `jj workspace update-stale` manually or wait for
+                // the lease path to auto-recover it.
+                report.skipped.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: None,
+                    skip_reason: Some("stale_working_copy".to_string()),
                 });
             }
         }
@@ -12523,7 +12725,10 @@ steps:
     }
 
     #[test]
-    fn workspace_lease_surfaces_op_diverged_recovery_failure() {
+    fn workspace_lease_skips_op_diverged_unrecoverable_and_provisions_new() {
+        // When jj status reports op-log divergence AND jj workspace update-stale
+        // fails, the poisoned workspace must be SKIPPED — not hard-failed —
+        // and the lease must succeed by provisioning a fresh workspace.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
@@ -12531,11 +12736,15 @@ steps:
 
         seed_mono_repo(&workspace_root, &database_path);
 
-        // `jj status` reports op-log divergence; `jj workspace update-stale`
-        // itself fails. The lease must surface a StaleRecoveryFailed error
-        // with the original error preserved.
+        // After the poisoned workspace is skipped, the pool has only that one
+        // entry, so the next ID is mono-agent-005.
+        let new_path = workspace_root.join("mono-agent-005");
+        let staging = workspace_root.join(".incoming-mono-agent-005");
+
         let runner = FakeRunner::new(vec![
+            // Health check: jj status → op-diverged
             ExpectedCommand::op_diverged(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            // Recovery attempt: update-stale fails
             ExpectedCommand {
                 cwd: workspace_path.clone(),
                 program: "jj".to_string(),
@@ -12548,29 +12757,232 @@ steps:
                 }),
                 creates_dir: None,
             },
+            // Fallback: auto-provision a fresh workspace and reset it.
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "fresh5678",
+            ),
         ]);
 
-        let error = run_with_dependencies(
+        let result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "op-diverged fail"]),
             Some(&database_path),
             &runner,
         )
-        .expect_err("lease should fail when op-diverged recovery itself fails");
+        .expect("lease must succeed even when one workspace's stale recovery fails");
         runner.assert_exhausted();
 
-        match error {
-            CubeError::StaleRecoveryFailed {
-                workspace_path: path,
-                cause,
-            } => {
-                assert_eq!(path, workspace_path);
-                assert!(
-                    cause.contains("update-stale"),
-                    "cause should mention update-stale: {cause}"
-                );
-            }
-            other => panic!("expected StaleRecoveryFailed, got {other:?}"),
-        }
+        // The lease landed on the freshly provisioned workspace, not the poisoned one.
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+        assert_eq!(result.payload["workspace"]["head_commit"], "fresh5678");
+
+        // The skipped workspace is recorded in health_check output.
+        let hc = result.payload["health_check"].as_array().expect("health_check array");
+        assert!(
+            hc.iter()
+                .any(|e| e["workspace_id"] == "mono-agent-004" && e["skipped"] == true),
+            "mono-agent-004 must be marked skipped: {hc:?}",
+        );
+    }
+
+    #[test]
+    fn workspace_lease_health_check_stale_op_signature_recovered_and_leased() {
+        // Regression test for T1812: jj prints "Could not read working copy's
+        // operation." (JJ_STALE_OP_SIGNATURE) instead of the older "working
+        // copy is stale" text. The pre-lease health check must detect this
+        // as StaleWorkingCopy, run jj workspace update-stale, and lease the
+        // workspace after the retry succeeds — not hard-fail the dispatch.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let runner = FakeRunner::new(vec![
+            // Health check: jj status exits non-zero with the alternate stale signature.
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "jj".to_string(),
+                args: vec!["status".to_string(), "--no-pager".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec!["status".to_string(), "--no-pager".to_string()],
+                    status: Some(1),
+                    stderr: "Error: Could not read working copy's operation. \
+                             Hint: Run jj workspace update-stale to recover."
+                        .to_string(),
+                }),
+                creates_dir: None,
+            },
+            // Recovery: update-stale succeeds.
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["workspace", "update-stale"],
+                "Working copy now at: abc1234",
+            ),
+            // Retry health check: clean.
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
+            // Normal lease reset proceeds.
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stale-op demo"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease must succeed after stale-op recovery");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+
+        // Recovery is observable in the audit log.
+        let audit_dir = database_path.parent().unwrap().join("audit");
+        let logs = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).expect("audit log"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            logs.contains("\"event\":\"workspace.stale_recovered\""),
+            "expected stale_recovered audit event, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_health_check_stale_status_unrecoverable_falls_through_to_new_workspace() {
+        // Regression test for T1812: when jj status returns the stale signature
+        // and jj workspace update-stale itself fails, the poisoned workspace must
+        // be skipped (not hard-fail the lease) and a fresh workspace provisioned.
+        // This must hold regardless of fallback_policy.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        // After the poisoned workspace is skipped the pool has one entry, so
+        // next_workspace_id picks mono-agent-005.
+        let new_path = workspace_root.join("mono-agent-005");
+        let staging = workspace_root.join(".incoming-mono-agent-005");
+
+        let runner = FakeRunner::new(vec![
+            // Health check: jj status returns the stale-op alternate signature.
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "jj".to_string(),
+                args: vec!["status".to_string(), "--no-pager".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec!["status".to_string(), "--no-pager".to_string()],
+                    status: Some(1),
+                    stderr: "Error: Could not read working copy's operation. \
+                             Hint: Run jj workspace update-stale to recover."
+                        .to_string(),
+                }),
+                creates_dir: None,
+            },
+            // Recovery attempt: update-stale fails.
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "jj".to_string(),
+                args: vec!["workspace".to_string(), "update-stale".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec!["workspace".to_string(), "update-stale".to_string()],
+                    status: Some(1),
+                    stderr: "Error: workspace operation failed".to_string(),
+                }),
+                creates_dir: None,
+            },
+            // Fallback: auto-provision a fresh workspace and reset it.
+            ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "fresh5678",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stale-op-unrecoverable"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease must succeed by provisioning a new workspace when stale recovery fails");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+        assert_eq!(result.payload["workspace"]["head_commit"], "fresh5678");
+
+        // The poisoned workspace is recorded as skipped.
+        let hc = result.payload["health_check"].as_array().expect("health_check array");
+        assert!(
+            hc.iter()
+                .any(|e| e["workspace_id"] == "mono-agent-004" && e["skipped"] == true),
+            "mono-agent-004 must be marked skipped: {hc:?}",
+        );
     }
 
     #[test]
