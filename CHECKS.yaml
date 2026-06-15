@@ -57,7 +57,7 @@ checks:
 
   - id: lint/bazel
     policy:
-      severity: warning
+      severity: error
 
   - id: rust-test-rule-coverage
     policy:
