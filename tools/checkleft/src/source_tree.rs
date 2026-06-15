@@ -154,7 +154,21 @@ impl SourceTree for LocalSourceTree {
         let glob_set = glob_builder.build().context("failed to build glob set")?;
 
         let mut matches = Vec::new();
-        for entry in WalkDir::new(&self.root).follow_links(false) {
+        for entry in WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                // Never descend into VCS internal directories — their contents
+                // are not check inputs and can disappear mid-walk (e.g.
+                // .jj/working_copy/working_copy.lock).
+                if e.file_type().is_dir() {
+                    let name = e.file_name();
+                    name != ".jj" && name != ".git"
+                } else {
+                    true
+                }
+            })
+        {
             let entry =
                 entry.with_context(|| format!("failed to walk source tree rooted at {}", self.root.display()))?;
 
@@ -249,6 +263,55 @@ mod tests {
                 Path::new("src/lib.rs").to_path_buf(),
                 Path::new("src/nested/mod.rs").to_path_buf()
             ]
+        );
+    }
+
+    #[test]
+    fn glob_excludes_jj_directory() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join(".jj/working_copy")).expect("create .jj dirs");
+        fs::write(temp.path().join(".jj/working_copy/working_copy.lock"), b"lock").expect("write lock");
+        fs::write(temp.path().join(".jj/store"), b"store data").expect("write store");
+        fs::create_dir_all(temp.path().join("src")).expect("create src dir");
+        fs::write(temp.path().join("src/lib.rs"), b"fn f() {}").expect("write source");
+
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let matches = tree.glob("**").expect("glob all");
+
+        for p in &matches {
+            assert!(
+                !p.starts_with(".jj"),
+                ".jj internal must not appear in glob results: {}",
+                p.display()
+            );
+        }
+        assert!(
+            matches.contains(&Path::new("src/lib.rs").to_path_buf()),
+            "source file must appear in glob results"
+        );
+    }
+
+    #[test]
+    fn glob_excludes_git_directory() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join(".git/refs/heads")).expect("create .git dirs");
+        fs::write(temp.path().join(".git/HEAD"), b"ref: refs/heads/main").expect("write HEAD");
+        fs::write(temp.path().join(".git/config"), b"[core]").expect("write config");
+        fs::write(temp.path().join("README.md"), b"readme").expect("write readme");
+
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let matches = tree.glob("**").expect("glob all");
+
+        for p in &matches {
+            assert!(
+                !p.starts_with(".git"),
+                ".git internal must not appear in glob results: {}",
+                p.display()
+            );
+        }
+        assert!(
+            matches.contains(&Path::new("README.md").to_path_buf()),
+            "non-VCS file must appear in glob results"
         );
     }
 
