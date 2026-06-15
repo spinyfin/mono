@@ -4,9 +4,15 @@
 //! [`GhRunner`] is a trait so callers can inject a fake implementation in
 //! tests without spawning real processes. [`CommandGhRunner`] is the
 //! production implementation.
+//!
+//! This module also exports the lower-level [`gh_output`] and [`run_gh`]
+//! primitives used by call sites that need raw subprocess output or a
+//! simple `Result<String>` with conventional error messages.
 
+use std::process::Output;
 use std::process::Stdio;
 
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
@@ -80,6 +86,50 @@ pub trait GhRunner: Send + Sync {
     ) -> std::result::Result<GhResponse, GhRunnerError>;
 }
 
+// ── Low-level spawn primitives ────────────────────────────────────────────────
+
+/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop envelope
+/// (stdin null, stdout+stderr piped, `kill_on_drop(true)`) and return its
+/// raw [`Output`].
+///
+/// This is the shared spawn primitive: it deliberately performs no
+/// exit-code or stderr handling so each call site keeps its own tailored
+/// logic on top. The returned `io::Result` is the spawn result — callers
+/// apply their own context (`.with_context(...)`, `.ok()?`, `.map_err(...)`).
+pub async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
+    Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
+/// Spawn `gh` via [`gh_output`] and return the trimmed stdout on success.
+/// `display` is a human-readable rendering of the command and is reused in
+/// both the spawn-failure context and the non-zero-exit error message
+/// (which also carries the captured stderr).
+///
+/// This is the happy-path convenience for sites that want a
+/// `Result<String>` with the conventional "spawn failed" / "command
+/// failed: <stderr>" error shape. Sites that need different exit-code
+/// handling (graceful degradation, JSON parsing) call [`gh_output`]
+/// directly.
+pub async fn run_gh(args: &[&str], display: &str) -> Result<String> {
+    let output = gh_output(args)
+        .await
+        .with_context(|| format!("failed to spawn `{display}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{display}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 // ── CommandGhRunner (production) ──────────────────────────────────────────────
 
 /// Production [`GhRunner`] that spawns the `gh` CLI binary.
@@ -110,7 +160,7 @@ fn gh_status_error(output: &std::process::Output) -> GhRunnerError {
 /// return its captured [`Output`](std::process::Output) once the exit status is
 /// verified. Spawn failures map to transient errors; non-zero exits map via
 /// [`gh_status_error`].
-async fn run_gh(args: &[String], token: Option<&str>) -> std::result::Result<std::process::Output, GhRunnerError> {
+async fn execute_gh(args: &[String], token: Option<&str>) -> std::result::Result<std::process::Output, GhRunnerError> {
     let mut cmd = Command::new("gh");
     if let Some(t) = token {
         cmd.env("GH_TOKEN", t);
@@ -149,14 +199,14 @@ impl GhRunner for CommandGhRunner {
             args.push("-F".to_owned());
             args.push(format!("{k}={v}"));
         }
-        let output = run_gh(&args, token).await?;
+        let output = execute_gh(&args, token).await?;
 
         serde_json::from_slice(&output.stdout)
             .map_err(|e| GhRunnerError::transient(format!("failed to parse graphql response: {e}")))
     }
 
     async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
-        let output = run_gh(&["api".to_owned(), path.to_owned()], token).await?;
+        let output = execute_gh(&["api".to_owned(), path.to_owned()], token).await?;
 
         let body = serde_json::from_slice(&output.stdout)
             .map_err(|e| GhRunnerError::transient(format!("failed to parse REST response: {e}")))?;
@@ -174,7 +224,7 @@ impl GhRunner for CommandGhRunner {
             args.push("-f".to_owned());
             args.push(format!("{k}={v}"));
         }
-        let output = run_gh(&args, token).await?;
+        let output = execute_gh(&args, token).await?;
 
         let body = serde_json::from_slice(&output.stdout)
             .map_err(|e| GhRunnerError::transient(format!("failed to parse PATCH response: {e}")))?;
