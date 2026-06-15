@@ -1935,16 +1935,60 @@ must not be asked to open one",
                 };
                 (AUTOMATION_OUTCOME_SKIPPED, None, Some(reason))
             }
-            TriageDecision::NoDecision => (
-                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
-                None,
-                Some(triage_no_decision_detail(&transcript)),
-            ),
-            TriageDecision::Ambiguous(n) => (
-                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
-                None,
-                Some(format!("triage emitted {n} decision markers; expected exactly one")),
-            ),
+            TriageDecision::NoDecision | TriageDecision::Ambiguous(_) => {
+                // Build the base detail for the no-marker case (used when
+                // recovery fails or is inapplicable).
+                let base_detail = match &decision {
+                    TriageDecision::NoDecision => triage_no_decision_detail(&transcript),
+                    TriageDecision::Ambiguous(n) => {
+                        format!("triage emitted {n} decision markers; expected exactly one")
+                    }
+                    _ => unreachable!(),
+                };
+                // Recovery path: if the worker ran `boss task create --automation`
+                // but forgot to emit the decision marker (or emitted it in a turn
+                // the Stop hook raced past), the open-task record is the ground
+                // truth. Treat the most recently created open task as the
+                // produced outcome rather than recording `failed_will_retry`.
+                //
+                // Without this, every retry creates another task until the
+                // open-task cap fills, then loops as `failed_will_retry` forever
+                // — the exact "Fix compilation warnings: at limit 3/3" wedge in
+                // the field evidence.
+                match self.work_db.find_most_recent_open_task_for_automation(&automation_id) {
+                    Ok(Some(task)) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            automation_id = %automation_id,
+                            recovered_task_id = %task.id,
+                            base_detail,
+                            "triage run ended without a valid decision marker but \
+                             found an open task produced by this automation; \
+                             recording as produced_task (marker-recovery path \
+                             prevents duplicate tasks on retry)",
+                        );
+                        (
+                            AUTOMATION_OUTCOME_PRODUCED_TASK,
+                            Some(task.id),
+                            Some(format!(
+                                "produced_task (marker-recovery): task was created \
+                                 but decision marker was missing — {base_detail}"
+                            )),
+                        )
+                    }
+                    Ok(None) => (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail)),
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            automation_id = %automation_id,
+                            ?err,
+                            "triage recovery: DB query for open tasks failed; \
+                             recording as failed_will_retry",
+                        );
+                        (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail))
+                    }
+                }
+            }
         };
 
         match self.work_db.finalize_automation_triage_run(

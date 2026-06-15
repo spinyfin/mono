@@ -87,6 +87,22 @@ the line:\n\n\
   ```\n  automation: task T42\n  ```\n\n\
 - **If there is nothing appropriate to do right now**, end your final message with:\n\n\
   ```\n  automation: skip — <one-line reason>\n  ```\n\n\
+## Single-shot mandate — no sub-agents, no deferral\n\n\
+This run is **single-shot**: the investigation AND the decision marker must both \
+happen within this session. The session ends the moment you stop responding.\n\n\
+- **Do NOT use the `Agent` tool.** Spawning a sub-agent provides no resume \
+mechanism — the session will hang waiting for a result that never returns.\n\
+- **Do NOT end any turn with deferred intent** such as \"I'll create the task \
+next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
+If you state an intent like \"Let me create the task\", you must follow through \
+immediately in that same turn — do not stop before you do.\n\
+- **Do NOT wait for any external process or event.** All investigation must \
+happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
+`WebSearch`). Finish the investigation before you make your decision.\n\
+- **If you create a task** with `boss task create --automation`, emit the \
+`automation: task <id>` marker **in the same response**, immediately after the \
+tool call returns with the task id. Do not stop between the tool call and the \
+marker.\n\n\
 ## Hard guardrails\n\n\
 - **Do NOT do the work yourself.** Do not edit files, do not commit, do not open a \
 PR. A separate worker executes the task you create. Your only deliverable is the \
@@ -146,6 +162,20 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          Zero markers, or more than one, is treated as an inconclusive run and\n\
          retried — it is NOT a skip. Concluding \"nothing to do\" is a `skip`,\n\
          never a silent end.\n\
+         \n\
+         ## Single-shot mandate — no sub-agents, no deferral\n\
+         \n\
+         This run is **single-shot**: investigation AND the decision marker must\n\
+         both happen within this session. The session ends the moment you stop.\n\
+         \n\
+         - **Do NOT use the `Agent` tool.** Sub-agents provide no resume\n\
+           mechanism — spawning one will hang the session indefinitely.\n\
+         - **Do NOT defer to a later turn.** If you say \"I'll create the task\n\
+           next\" or \"Let me wait for the agent\", you must complete that action\n\
+           immediately in the same turn — the session will NOT give you another.\n\
+         - **If you run `boss task create --automation`**, emit the\n\
+           `automation: task <id>` marker in the **same response**, right after\n\
+           the tool call returns the task id. Do not stop between the two.\n\
          \n\
          ## Do NOT do the work (tool calls for these are denied)\n\
          \n\
@@ -449,6 +479,67 @@ mod tests {
         );
         // States the no-PR posture explicitly.
         assert!(md.contains("no pull-request deliverable") || md.contains("NO pull-request deliverable"));
+    }
+
+    #[test]
+    fn triage_claude_md_forbids_sub_agents_and_deferral() {
+        let md = render_triage_claude_md("lease_xyz");
+        // Must explicitly name the Agent tool and explain why it is forbidden
+        // (the hang mode: no resume mechanism once a sub-agent is spawned).
+        assert!(
+            md.contains("Agent"),
+            "triage CLAUDE.md must mention the Agent tool to tell the worker not to use it",
+        );
+        // Must warn against deferring intent to a later turn.
+        assert!(
+            md.contains("defer") || md.contains("deferral") || md.contains("later turn"),
+            "triage CLAUDE.md must warn against deferring intent to a later turn",
+        );
+        // Must tell the worker to emit the marker in the same response as the
+        // task-create tool call.
+        assert!(
+            md.contains("same response") || md.contains("same turn"),
+            "triage CLAUDE.md must instruct the worker to emit the marker in the same response as the tool call",
+        );
+    }
+
+    #[test]
+    fn preamble_forbids_sub_agents_and_deferral() {
+        let automation = Automation::builder()
+            .id("auto_abc")
+            .short_id(1i64)
+            .product_id("prod_1")
+            .name("clippy sweep")
+            .trigger(boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * *".to_owned(),
+                timezone: "UTC".to_owned(),
+            })
+            .standing_instruction("fix any clippy warnings")
+            .created_at("2026-01-01")
+            .updated_at("2026-01-01")
+            .build();
+        let preamble = render_triage_preamble(&automation, "My Product");
+        // Must explicitly name the Agent tool and explain the hang risk.
+        assert!(
+            preamble.contains("Agent"),
+            "preamble must name the Agent tool to tell the worker not to use it",
+        );
+        // Must name the failure mode (sub-agent hang) so the worker understands why.
+        assert!(
+            preamble.contains("sub-agent") || preamble.contains("sub agent"),
+            "preamble must mention sub-agents",
+        );
+        // Must require the marker to be emitted in the same response as the task
+        // creation — the premature-end failure mode in the field evidence.
+        assert!(
+            preamble.contains("same response") || preamble.contains("same turn"),
+            "preamble must instruct the worker to emit the marker in the same response as the tool call",
+        );
+        // Must warn against deferred intent.
+        assert!(
+            preamble.to_lowercase().contains("defer") || preamble.contains("later turn"),
+            "preamble must warn against deferring intent to a later turn",
+        );
     }
 
     #[test]
