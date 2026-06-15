@@ -142,14 +142,14 @@ fn claude_md_mentions_workspace_and_lease() {
 }
 
 #[test]
-fn claude_md_warns_origin_is_a_local_mirror() {
-    // Workers must be told that in a cube workspace `origin` is a local
-    // mirror, not GitHub, and that pushes must be confirmed against
-    // GitHub's head sha — never against the remote they pushed to.
+fn claude_md_explains_origin_is_the_real_github_upstream() {
+    // Workers must be told that in a (shared-store) cube workspace `origin`
+    // IS the real GitHub upstream, that `jj git push` reaches GitHub, and
+    // that a push can be confirmed against GitHub's head sha.
     let input = sample_input();
     let rendered = render_claude_md(&input);
-    assert!(rendered.contains("LOCAL MIRROR"));
-    assert!(rendered.contains("ls-remote"));
+    assert!(rendered.contains("real GitHub upstream"));
+    assert!(rendered.contains("SHARES one"));
     assert!(rendered.contains(".head.sha") || rendered.contains(".commit.sha"));
 }
 
@@ -1087,7 +1087,7 @@ fn standard_claude_md_is_unchanged_by_reviewer_branch() {
     let rendered = render_claude_md(&input);
     assert!(rendered.contains("Pull requests are the deliverable"));
     assert!(rendered.contains("cube pr ensure"));
-    assert!(rendered.contains("LOCAL MIRROR"));
+    assert!(rendered.contains("real GitHub upstream"));
 }
 
 #[test]
