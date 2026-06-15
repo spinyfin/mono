@@ -1,11 +1,8 @@
 //! Checkleft check: flag Rust structs with more named fields than `max_fields`
 //! (default 5, meaning 6+) that do not carry the required builder derive.
 //!
-//! This is the Component Model wasm port of the built-in
-//! `rust/giant-structs` check. It is authored on the guest SDK so
-//! it runs inside the checkleft wasm host (T3-T6), reads files via the WASI
-//! filesystem sandbox (T4), and is the acceptance proof for the CM-wasm project
-//! (T10).
+//! Registered under the canonical id `rust/giant-structs`. Runs inside the
+//! checkleft wasm host and reads files via the WASI filesystem sandbox.
 //!
 //! ## What the check detects
 //!
