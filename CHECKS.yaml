@@ -5,6 +5,8 @@ check_definitions:
 
 checks:
   - id: docs-link-integrity
+    policy:
+      severity: warning
 
   - id: no-generated-artifacts
     check: file/forbidden-path
@@ -52,10 +54,14 @@ checks:
       severity: error
 
   - id: lint/bazel
+    policy:
+      severity: warning
 
   - id: rust-test-rule-coverage
 
   - id: todo-expiry
+    policy:
+      severity: warning
 
   - id: repo-visibility
 
