@@ -2902,7 +2902,16 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
-            .invoke_lease(repo, task, prefer, allow_dirty, resume_pr, CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
+            .invoke_lease(
+                repo,
+                task,
+                prefer,
+                allow_dirty,
+                resume_pr,
+                CUBE_LEASE_TIMEOUT,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
@@ -2988,7 +2997,16 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, false, resume_pr, CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
+            .invoke_lease(
+                repo,
+                task,
+                None,
+                false,
+                resume_pr,
+                CUBE_LEASE_TIMEOUT,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
@@ -4207,8 +4225,7 @@ mod tests {
         }
 
         fn with_workspace_id_queue(self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
-            *self.workspace_id_queue.try_lock().expect("uncontended") =
-                ids.into_iter().map(|s| s.into()).collect();
+            *self.workspace_id_queue.try_lock().expect("uncontended") = ids.into_iter().map(|s| s.into()).collect();
             self
         }
 
@@ -9578,10 +9595,7 @@ mod tests {
 
         // First lease returns the occupied workspace; subsequent calls
         // return the free one (simulating cube respecting --exclude).
-        let cube = Arc::new(
-            FakeCubeClient::default()
-                .with_workspace_id_queue(["mono-agent-037", "mono-agent-014"]),
-        );
+        let cube = Arc::new(FakeCubeClient::default().with_workspace_id_queue(["mono-agent-037", "mono-agent-014"]));
 
         // Wire the live-worker registry: exec-live is Working and alive
         // (pid = current test process → probe_pid sees it as alive).
@@ -9602,12 +9616,8 @@ mod tests {
             ..FakeExecutionRunner::default()
         });
 
-        let mut coordinator_inner = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coordinator_inner =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         coordinator_inner.set_live_worker_states(live_states);
         // Zero-delay retry so the test doesn't sleep.
         let coordinator = Arc::new(coordinator_inner.with_pre_start_retry_delays(vec![Duration::ZERO]));
@@ -9615,12 +9625,7 @@ mod tests {
         coordinator.kick();
 
         // Wait for the anti-livelock task execution to reach Running.
-        let our_execution_id = db
-            .list_executions(Some(&chore.id))
-            .unwrap()
-            .pop()
-            .unwrap()
-            .id;
+        let our_execution_id = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap().id;
 
         wait_for_execution_status(db.as_ref(), &our_execution_id, ExecutionStatus::Running).await;
 

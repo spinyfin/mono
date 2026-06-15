@@ -187,7 +187,14 @@ impl HostAdapter for LocalHostAdapter {
         exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
         self.cube_client
-            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr, exclude_workspace_ids)
+            .lease_workspace(
+                repo_id,
+                task,
+                prefer_workspace_id,
+                allow_dirty,
+                resume_pr,
+                exclude_workspace_ids,
+            )
             .await
     }
 
