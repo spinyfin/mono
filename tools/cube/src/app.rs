@@ -5620,6 +5620,22 @@ mod tests {
                 orig_cube_bin,
             }
         }
+
+        // Sets CUBE_CHECKLEFT_BIN to a nonexistent path so resolve_checkleft_bin
+        // returns None (gate is a no-op) without modifying PATH. Use in tests that
+        // call ensure_pr / run_with_dependencies but don't want to test the gate
+        // itself. Always hold ENV_MUTEX before calling this.
+        fn with_gate_disabled() -> Self {
+            let orig_path = std::env::var_os("PATH");
+            let orig_cube_bin = std::env::var_os("CUBE_CHECKLEFT_BIN");
+            unsafe {
+                std::env::set_var("CUBE_CHECKLEFT_BIN", "");
+            }
+            CheckleftEnvGuard {
+                orig_path,
+                orig_cube_bin,
+            }
+        }
     }
 
     impl Drop for CheckleftEnvGuard {
@@ -5629,8 +5645,11 @@ mod tests {
                     Some(v) => std::env::set_var("PATH", v),
                     None => std::env::remove_var("PATH"),
                 }
-                if let Some(v) = &self.orig_cube_bin {
-                    std::env::set_var("CUBE_CHECKLEFT_BIN", v);
+                // Restore CUBE_CHECKLEFT_BIN to its original state, including
+                // removing it if it was absent before (e.g. after with_gate_disabled).
+                match &self.orig_cube_bin {
+                    Some(v) => std::env::set_var("CUBE_CHECKLEFT_BIN", v),
+                    None => std::env::remove_var("CUBE_CHECKLEFT_BIN"),
                 }
             }
         }
@@ -14167,6 +14186,8 @@ steps:
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
         runner.assert_exhausted();
 
@@ -14234,6 +14255,8 @@ steps:
             "--title",
             "Existing PR",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
         runner.assert_exhausted();
 
@@ -14356,6 +14379,8 @@ steps:
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let err = run_with_dependencies(cli, None, &runner)
             .expect_err("ensure_pr should fail when push did not reach GitHub");
         runner.assert_exhausted();
@@ -14468,6 +14493,8 @@ steps:
             "--title",
             "My Feature",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr create+bookmark");
         runner.assert_exhausted();
 
@@ -14600,6 +14627,8 @@ steps:
             "--title",
             "My Feature",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let err = run_with_dependencies(cli, None, &runner).expect_err("ensure_pr should fail on >1 open PRs");
         runner.assert_exhausted();
         let msg = err.to_string();
