@@ -64,6 +64,17 @@ pub struct FileDiff {
     pub hunks: Vec<DiffHunk>,
 }
 
+/// Base-revision content of a single file.
+///
+/// Provided for files that were deleted or modified in the current changeset
+/// when a base revision is available. Absent for added files and when running
+/// in `--all` mode. Use [`ChangeSet::base_file_content`] to look up by path.
+#[derive(Debug, Clone)]
+pub struct BaseFile {
+    pub path: String,
+    pub content: String,
+}
+
 /// The set of changes under review.
 #[derive(Debug, Clone)]
 pub struct ChangeSet {
@@ -73,6 +84,21 @@ pub struct ChangeSet {
     pub pr_description: Option<String>,
     pub change_id: Option<String>,
     pub repository: Option<String>,
+    /// Base-revision content for deleted and modified files.
+    ///
+    /// Empty when no base revision is available (e.g. `--all` mode). Checks
+    /// should handle the absent case by skipping base-revision enforcement.
+    pub base_files: Vec<BaseFile>,
+}
+
+impl ChangeSet {
+    /// Return the base-revision content for `path`, or `None` when not available.
+    pub fn base_file_content(&self, path: &str) -> Option<&str> {
+        self.base_files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.content.as_str())
+    }
 }
 
 /// All input a check receives for one invocation.
@@ -285,6 +311,7 @@ mod tests {
                 pr_description: None,
                 change_id: None,
                 repository: None,
+                base_files: vec![],
             },
             config_json: "{}".to_owned(),
         }

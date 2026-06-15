@@ -690,7 +690,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
 
-    let input = lower_check_input(changeset, config, config_dir)?;
+    let input = lower_check_input(changeset, source_tree, config, config_dir)?;
     let file_list = format_file_list(changeset);
     let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input)).map_err(|err| {
         if is_interrupt_error(&err) {
@@ -893,7 +893,23 @@ fn lower_file_diff(path: &Path, diff: &FileDiff) -> wit_types::FileDiff {
     }
 }
 
-fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
+fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_types::ChangeSet {
+    let base_files: Vec<wit_types::BaseFile> = changeset
+        .changed_files
+        .iter()
+        .filter(|f| matches!(f.kind, ChangeKind::Deleted | ChangeKind::Modified))
+        .filter_map(|f| {
+            source_tree
+                .read_file_versioned(&f.path, crate::input::TreeVersion::Base)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|content| wit_types::BaseFile {
+                    path: f.path.to_string_lossy().into_owned(),
+                    content,
+                })
+        })
+        .collect();
+
     wit_types::ChangeSet {
         changed_files: changeset.changed_files.iter().map(lower_changed_file).collect(),
         file_diffs: changeset
@@ -905,10 +921,16 @@ fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
         pr_description: changeset.pr_description.clone(),
         change_id: changeset.change_id.clone(),
         repository: changeset.repository.clone(),
+        base_files,
     }
 }
 
-fn lower_check_input(changeset: &ChangeSet, config: &toml::Value, config_dir: &Path) -> Result<wit_types::CheckInput> {
+fn lower_check_input(
+    changeset: &ChangeSet,
+    source_tree: &dyn SourceTree,
+    config: &toml::Value,
+    config_dir: &Path,
+) -> Result<wit_types::CheckInput> {
     // The guest operates purely in repo-root-relative coordinates and never sees
     // the CHECKS file's directory. `exclude_files`/`exclude_globs` patterns are
     // authored relative to that directory, so the host rewrites them to
@@ -918,7 +940,7 @@ fn lower_check_input(changeset: &ChangeSet, config: &toml::Value, config_dir: &P
     let config_json =
         serde_json::to_string(&scoped_config).context("failed to serialize config to JSON for component input")?;
     Ok(wit_types::CheckInput {
-        changeset: lower_changeset(changeset),
+        changeset: lower_changeset(changeset, source_tree),
         config_json,
     })
 }

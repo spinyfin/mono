@@ -7,16 +7,40 @@ use crate::external::{
     EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
     ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
-use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
+use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree, TreeVersion};
 use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::source_tree::LocalSourceTree;
 
 use super::{
     BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
     MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_struct_exclusions, build_wasmtime_engine, is_interrupt_error,
-    lower_check_input, resolve_component_limits,
+    lower_changeset, lower_check_input, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
+
+struct NoopSourceTree;
+
+impl SourceTree for NoopSourceTree {
+    fn read_file(&self, _path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NoopSourceTree: no files available")
+    }
+
+    fn read_file_versioned(&self, _path: &std::path::Path, _version: TreeVersion) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NoopSourceTree: no files available")
+    }
+
+    fn exists(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+
+    fn list_dir(&self, _path: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        Ok(vec![])
+    }
+
+    fn glob(&self, _pattern: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        Ok(vec![])
+    }
+}
 
 // --- component-v1 error-path tests ---
 
@@ -144,7 +168,7 @@ fn lower_changeset_maps_fields_to_wit_types() {
         },
     );
 
-    let wit_cs = super::lower_changeset(&changeset);
+    let wit_cs = lower_changeset(&changeset, &NoopSourceTree);
     assert_eq!(wit_cs.changed_files.len(), 2);
     assert_eq!(wit_cs.changed_files[0].path, "src/foo.rs");
     assert!(matches!(
@@ -1129,7 +1153,8 @@ fn lower_check_input_scopes_exclude_files_to_config_dir() {
         exclude_files = ["*.rs"]
     });
 
-    let input = lower_check_input(&changeset, &config, std::path::Path::new("sub/dir")).expect("lower_check_input");
+    let input = lower_check_input(&changeset, &NoopSourceTree, &config, std::path::Path::new("sub/dir"))
+        .expect("lower_check_input");
 
     let parsed: serde_json::Value = serde_json::from_str(&input.config_json).expect("parse config_json");
     let exclude_files: Vec<&str> = parsed["exclude_files"]

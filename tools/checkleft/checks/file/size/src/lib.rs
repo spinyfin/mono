@@ -166,6 +166,7 @@ mod tests {
             pr_description: None,
             change_id: None,
             repository: None,
+            base_files: vec![],
         }
     }
 

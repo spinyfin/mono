@@ -546,6 +546,10 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     pr_description: cs.pr_description,
                     change_id: cs.change_id,
                     repository: cs.repository,
+                    base_files: cs.base_files.into_iter().map(|bf| ::checkleft_check_sdk::BaseFile {
+                        path: bf.path,
+                        content: bf.content,
+                    }).collect(),
                 }
             }
 

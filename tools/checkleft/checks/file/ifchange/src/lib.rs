@@ -11,6 +11,10 @@
 //! and the region between the markers is modified, the check requires the named target
 //! file (or labeled block within it) to also be modified in the same change.
 //!
+//! This check achieves full parity with the former native implementation, including
+//! enforcement on deleted files and removed-marker scenarios, via base-revision
+//! content supplied through the [`ChangeSet::base_files`] field in the check input.
+//!
 //! ## Supported comment styles
 //!
 //! The `LINT.IfChange` / `LINT.ThenChange` directives are recognized when preceded
@@ -21,25 +25,6 @@
 //!
 //! This check has no configuration surface; all parameters are intrinsic to the
 //! LINT markers in the source files.
-//!
-//! ## Known limitation: base-revision enforcement is not available
-//!
-//! The WASM sandbox exposes only the *current* file tree; it cannot read the
-//! base revision of a changed file. This creates two enforcement gaps relative
-//! to the former native implementation:
-//!
-//! 1. **Deleted files** — if a file containing `LINT.IfChange` markers is
-//!    deleted as part of a change, the check cannot inspect the old content and
-//!    will not flag missing target updates for the deleted file's blocks.
-//!
-//! 2. **Removed markers on existing files** — if a change edits the guarded
-//!    region in a still-present file *and simultaneously removes* its
-//!    `LINT.IfChange`/`LINT.ThenChange` markers, the check sees neither the
-//!    block nor the edit in the current tree and reports nothing. The former
-//!    native implementation (which read the base revision) would have caught
-//!    this as a contract-removal violation.
-//!
-//! All other cases (modified files, new files, renamed files) are fully enforced.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -145,10 +130,30 @@ struct FileAnalysis {
 fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalysis {
     let path = changed_file.path.clone();
 
+    // Gap 1: deleted files — read the base revision to find IfChange blocks.
+    // All blocks in a deleted file are considered "touched" (the whole file is gone).
     if changed_file.kind == ChangeKind::Deleted {
+        let Some(base_content) = changeset.base_file_content(&path) else {
+            // No base content available (e.g. no base revision configured).
+            return FileAnalysis {
+                path,
+                touched_blocks: vec![],
+                parse_findings: vec![],
+            };
+        };
+        let parsed = match parse_ifchange_file(&path, base_content) {
+            Ok(p) => p,
+            Err(_) => {
+                return FileAnalysis {
+                    path,
+                    touched_blocks: vec![],
+                    parse_findings: vec![],
+                };
+            }
+        };
         return FileAnalysis {
             path,
-            touched_blocks: vec![],
+            touched_blocks: parsed.blocks,
             parse_findings: vec![],
         };
     }
@@ -199,9 +204,9 @@ fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalys
 
     let diff = changeset.file_diffs.iter().find(|d| d.path == path);
 
-    let touched_blocks = parsed
+    let mut touched_blocks: Vec<IfChangeBlock> = parsed
         .blocks
-        .into_iter()
+        .iter()
         .filter(|block| {
             diff.is_some_and(|d| {
                 d.hunks
@@ -209,7 +214,33 @@ fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalys
                     .any(|hunk| hunk_touches_range_new(hunk, block.ifchange_line, block.thenchange_line))
             })
         })
+        .cloned()
         .collect();
+
+    // Gap 2: removed markers on modified files — check if any IfChange block
+    // present in the base revision was removed from the current file while the
+    // guarded region was touched (using OLD diff coordinates).
+    if changed_file.kind == ChangeKind::Modified
+        && let Some(base_content) = changeset.base_file_content(&path)
+        && let Ok(base_parsed) = parse_ifchange_file(&path, base_content)
+    {
+        for base_block in &base_parsed.blocks {
+            let still_present = parsed
+                .blocks
+                .iter()
+                .any(|b| b.source_label == base_block.source_label && targets_match(&b.target, &base_block.target));
+            if !still_present {
+                let was_touched = diff.is_some_and(|d| {
+                    d.hunks
+                        .iter()
+                        .any(|hunk| hunk_touches_range_old(hunk, base_block.ifchange_line, base_block.thenchange_line))
+                });
+                if was_touched {
+                    touched_blocks.push(base_block.clone());
+                }
+            }
+        }
+    }
 
     FileAnalysis {
         path,
@@ -231,16 +262,34 @@ enum TargetStatus {
 fn target_status(block: &IfChangeBlock, changeset: &ChangeSet, analyses: &[FileAnalysis]) -> TargetStatus {
     match &block.target {
         ThenChangeTarget::File { path } => {
+            // A target that was itself changed (even deleted) satisfies the constraint.
+            if file_changed(changeset, path) {
+                return TargetStatus::Satisfied;
+            }
             if !std::path::Path::new(path).exists() {
                 return TargetStatus::MissingFile;
             }
-            if file_changed(changeset, path) {
-                TargetStatus::Satisfied
-            } else {
-                TargetStatus::NotChanged
-            }
+            TargetStatus::NotChanged
         }
         ThenChangeTarget::Block { path, label } => {
+            // A target file that was changed (even deleted) satisfies the constraint
+            // at the file level; we skip the block-existence check for deleted targets.
+            if file_changed(changeset, path) {
+                // File was changed — check if the specific block was touched.
+                let Some(target_analysis) = analyses.iter().find(|a| a.path == *path) else {
+                    // File changed but no analysis (e.g. it was deleted) — satisfied.
+                    return TargetStatus::Satisfied;
+                };
+                if target_analysis
+                    .touched_blocks
+                    .iter()
+                    .any(|b| b.source_label.as_deref() == Some(label))
+                {
+                    return TargetStatus::Satisfied;
+                }
+                // File changed but the specific block was not touched.
+                return TargetStatus::NotChanged;
+            }
             if !std::path::Path::new(path).exists() {
                 return TargetStatus::MissingFile;
             }
@@ -278,10 +327,26 @@ fn file_changed(changeset: &ChangeSet, target_path: &str) -> bool {
         .any(|f| f.path == target_path || f.old_path.as_deref().is_some_and(|op| op == target_path))
 }
 
+// ── Target matching ───────────────────────────────────────────────────────────
+
+fn targets_match(a: &ThenChangeTarget, b: &ThenChangeTarget) -> bool {
+    match (a, b) {
+        (ThenChangeTarget::File { path: pa }, ThenChangeTarget::File { path: pb }) => pa == pb,
+        (ThenChangeTarget::Block { path: pa, label: la }, ThenChangeTarget::Block { path: pb, label: lb }) => {
+            pa == pb && la == lb
+        }
+        _ => false,
+    }
+}
+
 // ── Hunk / range overlap ──────────────────────────────────────────────────────
 
 fn hunk_touches_range_new(hunk: &DiffHunk, range_start: usize, range_end: usize) -> bool {
     hunk_touches_range(hunk.new_start as usize, hunk.new_lines as usize, range_start, range_end)
+}
+
+fn hunk_touches_range_old(hunk: &DiffHunk, range_start: usize, range_end: usize) -> bool {
+    hunk_touches_range(hunk.old_start as usize, hunk.old_lines as usize, range_start, range_end)
 }
 
 fn hunk_touches_range(start: usize, len: usize, range_start: usize, range_end: usize) -> bool {
@@ -488,6 +553,15 @@ mod tests {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     fn make_changeset(changed_files: Vec<(&str, ChangeKind)>, diffs: Vec<(&str, Vec<DiffHunk>)>) -> ChangeSet {
+        make_changeset_with_base(changed_files, diffs, vec![])
+    }
+
+    fn make_changeset_with_base(
+        changed_files: Vec<(&str, ChangeKind)>,
+        diffs: Vec<(&str, Vec<DiffHunk>)>,
+        base_files: Vec<(&str, &str)>,
+    ) -> ChangeSet {
+        use checkleft_check_sdk::BaseFile;
         ChangeSet {
             changed_files: changed_files
                 .into_iter()
@@ -508,6 +582,13 @@ mod tests {
             pr_description: None,
             change_id: None,
             repository: None,
+            base_files: base_files
+                .into_iter()
+                .map(|(path, content)| BaseFile {
+                    path: path.to_owned(),
+                    content: content.to_owned(),
+                })
+                .collect(),
         }
     }
 
@@ -657,9 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn deleted_files_are_skipped_without_findings() {
-        // A deleted file cannot be read, so its IfChange blocks are not enforced.
-        // This is the documented WASM limitation (no base-version access).
+    fn deleted_file_with_no_base_content_produces_no_findings() {
+        // Without base content in the changeset, a deleted file is skipped.
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let old_cwd = std::env::current_dir().unwrap();
@@ -667,7 +747,7 @@ mod tests {
 
         fs::write(dir.path().join("b.txt"), "something\n").unwrap();
 
-        // a.txt is deleted (not on disk), b.txt is not in changeset.
+        // a.txt is deleted (not on disk), no base_files provided.
         let cs = make_changeset(
             vec![("a.txt", ChangeKind::Deleted)],
             vec![("a.txt", vec![hunk_new(1, 3)])],
@@ -677,8 +757,202 @@ mod tests {
         std::env::set_current_dir(old_cwd).unwrap();
         assert!(
             findings.is_empty(),
-            "deleted file must produce no findings; got {findings:?}"
+            "deleted file with no base content must produce no findings; got {findings:?}"
         );
+    }
+
+    #[test]
+    fn deleted_file_with_ifchange_markers_is_flagged() {
+        // When base content is available for a deleted file and it contained
+        // LINT.IfChange blocks, the check flags missing target updates.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // b.txt still exists (target of a.txt's block) but was not changed.
+        fs::write(dir.path().join("b.txt"), "something\n").unwrap();
+
+        let base_a_txt = "// LINT.IfChange\ncontent here\n// LINT.ThenChange(b.txt)\n";
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Deleted)],
+            vec![("a.txt", vec![hunk_new(1, 3)])],
+            vec![("a.txt", base_a_txt)],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(findings.len(), 1, "expected 1 finding; got {findings:?}");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].message.contains("b.txt"),
+            "message: {}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("not updated in the same change"),
+            "message: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn deleted_file_with_ifchange_markers_passes_when_target_also_changed() {
+        // If the target file was also changed, the constraint is satisfied.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // b.txt also changed in the same changeset.
+        fs::write(dir.path().join("b.txt"), "updated content\n").unwrap();
+
+        let base_a_txt = "// LINT.IfChange\ncontent here\n// LINT.ThenChange(b.txt)\n";
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Deleted), ("b.txt", ChangeKind::Modified)],
+            vec![("a.txt", vec![hunk_new(1, 3)]), ("b.txt", vec![hunk_new(1, 1)])],
+            vec![("a.txt", base_a_txt)],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert!(
+            findings.is_empty(),
+            "target was changed — no finding expected; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn removed_markers_on_modified_file_is_flagged() {
+        // Gap 2: a change edits the guarded region AND removes its LINT markers.
+        // The check must detect this via base-revision content and OLD hunk coords.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // Current version of a.txt has no markers (they were removed).
+        fs::write(dir.path().join("a.txt"), "changed content\n").unwrap();
+        // b.txt exists but was not changed.
+        fs::write(dir.path().join("b.txt"), "something\n").unwrap();
+
+        // Base version had markers at lines 1-3, content at line 2.
+        let base_a_txt = "// LINT.IfChange\ncontent here\n// LINT.ThenChange(b.txt)\n";
+
+        // Hunk removes old lines 1-3 and replaces with 1 new line.
+        // old_start=1, old_lines=3 → touches block [1, 3] in OLD coords.
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Modified)],
+            vec![(
+                "a.txt",
+                vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 3,
+                    new_start: 1,
+                    new_lines: 1,
+                    added_lines: 1,
+                    removed_lines: 3,
+                }],
+            )],
+            vec![("a.txt", base_a_txt)],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected 1 finding for removed markers; got {findings:?}"
+        );
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].message.contains("b.txt"),
+            "message: {}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("not updated in the same change"),
+            "message: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn removed_markers_passes_when_target_also_changed() {
+        // If markers are removed AND the target was updated, no finding.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // Current version of a.txt has no markers.
+        fs::write(dir.path().join("a.txt"), "changed content\n").unwrap();
+        // b.txt was also changed.
+        fs::write(dir.path().join("b.txt"), "updated\n").unwrap();
+
+        let base_a_txt = "// LINT.IfChange\ncontent here\n// LINT.ThenChange(b.txt)\n";
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Modified), ("b.txt", ChangeKind::Modified)],
+            vec![
+                (
+                    "a.txt",
+                    vec![DiffHunk {
+                        old_start: 1,
+                        old_lines: 3,
+                        new_start: 1,
+                        new_lines: 1,
+                        added_lines: 1,
+                        removed_lines: 3,
+                    }],
+                ),
+                ("b.txt", vec![hunk_new(1, 1)]),
+            ],
+            vec![("a.txt", base_a_txt)],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert!(
+            findings.is_empty(),
+            "target was changed — no finding expected; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn markers_still_present_in_modified_file_not_double_flagged() {
+        // If markers are present in both base and current, they should only be
+        // checked via the new-coord path; the base check must not add duplicates.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // Same markers in base and current.
+        let content = "// LINT.IfChange\ncontent changed\n// LINT.ThenChange(b.txt)\n";
+        fs::write(dir.path().join("a.txt"), content).unwrap();
+        fs::write(dir.path().join("b.txt"), "something\n").unwrap();
+
+        let base_a_txt = "// LINT.IfChange\ncontent old\n// LINT.ThenChange(b.txt)\n";
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Modified)],
+            vec![(
+                "a.txt",
+                vec![DiffHunk {
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 1,
+                    added_lines: 1,
+                    removed_lines: 1,
+                }],
+            )],
+            vec![("a.txt", base_a_txt)],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        // Should get exactly one finding (from the new-coord path), not two.
+        assert_eq!(findings.len(), 1, "must not double-flag; got {findings:?}");
     }
 
     // ── Block-target tests ────────────────────────────────────────────────────

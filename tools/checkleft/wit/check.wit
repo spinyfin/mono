@@ -75,6 +75,23 @@ interface types {
         hunks: list<diff-hunk>,
     }
 
+    /// The base-revision content of a single file.
+    ///
+    /// Provided for files that were deleted or modified in the current changeset,
+    /// when a base revision is available (e.g. a diff-based run against a VCS).
+    /// Absent for added files (no prior revision) and when running in `--all`
+    /// (whole-tree) mode where there is no meaningful base.
+    ///
+    /// Checks can use this to inspect what a file contained before the change —
+    /// for example, to enforce contracts on deleted files or to detect when
+    /// a guarded region's markers are removed while their content changes.
+    record base-file {
+        /// Repo-relative path, matching the corresponding `changed-file.path`.
+        path: string,
+        /// UTF-8 content of the file at the base revision.
+        content: string,
+    }
+
     /// The set of changes under review: modified files, diffs, and metadata.
     /// Mirrors `input::ChangeSet`.
     record change-set {
@@ -84,6 +101,12 @@ interface types {
         pr-description: option<string>,
         change-id: option<string>,
         repository: option<string>,
+        /// Base-revision content for deleted and modified files.
+        ///
+        /// Empty when no base revision is available (e.g. `--all` mode, unit
+        /// tests that do not configure a VCS base). Checks that need old content
+        /// should handle the absent case gracefully.
+        base-files: list<base-file>,
     }
 
     /// All input a check receives for one invocation.
