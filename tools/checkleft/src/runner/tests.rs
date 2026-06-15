@@ -631,10 +631,10 @@ async fn runner_reports_invalid_builtin_config_on_checks_file() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "api-breaking-surface"
+id = "forbidden-imports-deps"
 
 [checks.config]
-trigger_globs = "not-a-list"
+rules = "not-a-list"
 "#,
     )
     .expect("write config");
@@ -658,7 +658,7 @@ trigger_globs = "not-a-list"
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].check_id, "api-breaking-surface");
+    assert_eq!(results[0].check_id, "forbidden-imports-deps");
     assert_eq!(
         results[0].findings[0].location.as_ref().map(|location| &location.path),
         Some(&Path::new("CHECKS.toml").to_path_buf())
@@ -666,7 +666,7 @@ trigger_globs = "not-a-list"
     assert!(
         results[0].findings[0]
             .message
-            .contains("invalid api-breaking-surface config")
+            .contains("invalid forbidden-imports-deps config")
     );
     assert!(!results[0].findings[0].message.contains("check execution failed"));
 }
