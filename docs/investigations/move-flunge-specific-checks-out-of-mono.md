@@ -155,6 +155,95 @@ This answers the brief's "does a coherent generalization exist?" with: **yes, it
 
 **No — and they should not be forced to.** They are structurally different (a per-line content/regex scan vs. a changed-path-set companion requirement). They do not collapse into one generic check, and inventing a meta-check to host both would itself violate the "don't build an over-generic engine" guidance. They share a common _strategy_ (approach (a)), realized two ways: one folds into an existing generic check and disappears; the other is already generic and just needs a neutral name.
 
+### 3.4 Could `api-breaking-surface` be modeled as a use of `ifchange-thenchange`?
+
+The surface similarity is real: both `api-breaking-surface` and `ifchange-thenchange` express "if A changed, B must also change." The question is whether the former could be expressed as a usage of the latter — folding it into the `ifchange-thenchange` check rather than a renamed standalone.
+
+**Verdict: not feasible as a substitution.** The two checks implement the same _intent_ but via fundamentally different coupling mechanisms:
+
+| Dimension | `api-breaking-surface` / `require-companion-change` | `ifchange-thenchange` |
+|---|---|---|
+| How triggers are declared | Config-driven glob patterns in `CHECKS.yaml` | Inline `LINT.IfChange` annotations in each source file |
+| Trigger granularity | Any change to any file matching `trigger_globs` | Change to a specific marked region within an annotated file |
+| Coverage of new files | Automatic — new files matching the glob are covered | Manual — each new file must be individually annotated |
+| Policy location | One `CHECKS.yaml` entry | Spread across every trigger file's source |
+
+Translating flunge's `api-breaking-surface` policy ("whenever ANY file in `backend/blob/src/v3/**` changes, `docs/backend.md` must also change") to `ifchange-thenchange` would require:
+
+1. Annotating every existing trigger file with `LINT.IfChange ... LINT.ThenChange(docs/backend.md)` — touching the source of each policy-relevant file.
+2. Annotating every _future_ file added under the glob — this is the fatal gap. A glob pattern covers files not yet written; inline annotations cannot.
+3. Scattering policy intent across many source files rather than capturing it in one config entry.
+
+Additionally, `ifchange-thenchange` fires on region-level changes (a marked block must change), while `api-breaking-surface` fires on any file-level change to a trigger path. A trivial comment edit inside a `LINT.IfChange` block satisfies the contract in one direction; a pure whitespace change outside any marked block does not. `api-breaking-surface` makes no such distinction — any diff to a trigger file fires the check. These semantics differ in ways that matter for the "docs must accompany API change" use case.
+
+**Conclusion:** `ifchange-thenchange` and `require-companion-change` (the renamed `api-breaking-surface`) are **complementary primitives, not substitutes**:
+
+- `ifchange-thenchange` = _code-declared_ coupling, declared at the source region, best for co-evolution contracts between specific code blocks that a developer explicitly marks as coupled (e.g., a version constant and a changelog file).
+- `require-companion-change` = _policy-declared_ coupling, declared in config, best for organizational rules like "API-surface changes must include a docs update" where the scope is defined by path globs that cover files not yet written.
+
+The distinction maps directly onto where the coupling contract lives: in the code (opt-in per block) vs. in policy (applied to all matching paths by config). Both are useful; neither replaces the other.
+
+### 3.5 `forbidden-imports-deps`: is "forbidden regexp patterns" the right framing?
+
+The observation is correct: `forbidden-imports-deps` is, mechanistically, a **generic line-by-line regex scanner scoped to path globs**. Its name encodes a use case (import/dependency enforcement) rather than its mechanism. The question is whether this framing is appropriate or whether the check should be reconceived and possibly renamed.
+
+**What the implementation actually is** (`forbidden_imports_deps.rs`): the check takes a `rules:` list, each with an arbitrary `pattern` regex, `message`, `include_globs`, and `exclude_files`. It reads each changed file's content, scans every line for a regex match, and emits a finding per match. It has no knowledge of import syntax, module systems, or dependency graphs — it matches any regex in any text file.
+
+**The name encodes a use case, not the mechanism.** Flunge's existing `forbidden-imports-deps` usage (`pattern: "\\bfetch\\(url\\("`) already demonstrates the stretch: `fetch(url(` is a call site, not an import statement or a declared dependency. The name arguably mislabels this usage.
+
+**Is the "super generic" framing OK?** Yes — provided the check is clearly distinguished from the language-aware `code-patterns` check:
+
+- `code-patterns`: AST-level, language-aware (currently Java, via tree-sitter), for patterns requiring semantic disambiguation (e.g., `Future#get()` vs `Future#get(long, TimeUnit)`, or call-site typing).
+- `forbidden-imports-deps` / "forbidden patterns": text-level, language-agnostic, for patterns detectable by simple regex per line.
+
+These are complementary and cover different complexity tiers. A generic line-regex check is a legitimately useful built-in; the issue is only whether its name communicates its scope. The current name is import-biased enough that a user wanting to check non-import patterns might overlook it in favour of writing a new one-off check — exactly the proliferation pattern the design principle discourages.
+
+**Recommendation on the framing question:** the "forbidden regexp patterns" framing is the honest description of what the check does, and naming it `forbidden-patterns` (or similar) would make that clear and reduce the risk of users writing narrow one-offs when this check already covers them. However, renaming is not a prerequisite for the migration in §3.1 — the import-scan use case is squarely within what the name implies. If the rename of `api-breaking-surface` (§3.2) proceeds as a sweep, renaming `forbidden-imports-deps` → `forbidden-patterns` at the same time is a natural companion move. If not, the current name is tolerable.
+
+### 3.6 `forbidden-imports-deps`: one check instance per policy vs. nested policy list
+
+The current `forbidden-imports-deps` config model nests multiple rules inside one check instance:
+
+```yaml
+- id: no-legacy-api
+  check: forbidden-imports-deps
+  config:
+    rules:
+      - pattern: '...'   # sub-rule 1
+        message: '...'
+      - pattern: '...'   # sub-rule 2
+        message: '...'
+```
+
+The alternative is one check instance per policy, where each rule gets its own `id:`:
+
+```yaml
+- id: no-legacy-api-fencingtracker
+  check: forbidden-imports-deps
+  config:
+    rules:
+      - pattern: '...'
+        message: '...'
+
+- id: no-legacy-api-usafencing
+  check: forbidden-imports-deps
+  config:
+    rules:
+      - pattern: '...'
+        message: '...'
+```
+
+**Does checkleft follow a pattern here?** Yes. Each `- id:` entry in `CHECKS.yaml` is checkleft's **policy unit**: findings carry the policy `id:`, bypasses are keyed to it, severity is set at this level. Looking at mono's own CHECKS.yaml, `no-generated-artifacts` uses `check: forbidden-paths` with multiple glob patterns in one `rules:` list because those patterns are all sub-clauses of one logical policy ("no build artifacts committed") — grouping them is correct. If the patterns represented distinct prohibitions with different owners, different bypass semantics, or different remediation contexts, they should be separate instances.
+
+**Feasibility: fully feasible.** The `forbidden-imports-deps` check already supports both patterns — there is no structural impediment to either approach. The question is a **policy modeling decision, not a check design constraint**:
+
+- Group rules that are sub-clauses of the **same prohibition** (e.g., multiple deprecated module names under one "no legacy API" policy — what matters to a bypass reviewer is the logical prohibition, not which specific module path was imported).
+- Split rules that represent **distinct policies** that could be owned, bypassed, or sunset independently (e.g., "no legacy API imports" and "no direct fetch calls" are different prohibitions with different rationales and different remediation steps — they should have separate `id:` entries even if both run via `forbidden-imports-deps`).
+
+For flunge's `frontend-no-legacy-api` rewrite specifically: both deprecated modules (`api/fencingtracker`, `api/usafencing`) are sub-clauses of one "no imports from deprecated frontend API modules" policy. One `- id:` with a two-alternation regex (or two rules under one instance) is appropriate. If flunge later added a prohibition on `api/directdb` for an unrelated reason with a different remediation, that would warrant its own `- id:` instance pointing at the same `check: forbidden-imports-deps`.
+
+**On whether this follows checkleft's patterns:** yes. The `check:` field names the mechanism; the `id:` field names the policy. The one-instance-per-policy principle is already implicit in how checkleft assigns findings and bypasses. The nested `rules:` list is a convenience for grouping sub-clauses, not a place to bundle unrelated policies.
+
 ---
 
 ## 4. Approach (b): custom WASI/Component-Model check authored from flunge
