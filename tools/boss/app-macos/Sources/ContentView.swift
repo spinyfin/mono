@@ -2779,6 +2779,14 @@ struct WorkCardPopoverView: View {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
                 metadataPRRow(prURL: task.prURL)
+                if task.kind == "followup" {
+                    var originParts: [String] = []
+                    if let sid = task.originTaskShortId { originParts.append("T\(sid)") }
+                    if let pn = task.originPrNumber { originParts.append("PR #\(pn)") }
+                    if !originParts.isEmpty {
+                        metadataRow("Origin", value: originParts.joined(separator: " / "))
+                    }
+                }
                 sourceChipRow
                 if task.sourceAutomationId != nil {
                     automationRow
