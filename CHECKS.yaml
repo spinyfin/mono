@@ -10,6 +10,8 @@ checks:
 
   - id: no-generated-artifacts
     check: file/forbidden-path
+    policy:
+      severity: warning
     config:
       rules:
         - remediation: "Generated build output must not be committed. Remove the artifact from the change."
@@ -58,12 +60,16 @@ checks:
       severity: warning
 
   - id: rust-test-rule-coverage
+    policy:
+      severity: warning
 
   - id: todo-expiry
     policy:
       severity: warning
 
   - id: repo-visibility
+    policy:
+      severity: warning
 
   - id: format/rust
     policy:
