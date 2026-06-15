@@ -143,11 +143,7 @@ pub(super) async fn handle_list_feature_flags(ctx: Dispatch, req: FrontendReques
     };
     {
         let flags = feature_flags_snapshot_to_wire(&server_state);
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::FeatureFlagsList { flags },
-        );
+        send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
     }
 }
 
@@ -167,9 +163,7 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
                 // Warn the operator when a flag is enabled but its
                 // backing capability is absent from this build.
                 if enabled {
-                    if let Some(spec) =
-                        crate::feature_flags::REGISTRY.iter().find(|s| s.name == name)
-                    {
+                    if let Some(spec) = crate::feature_flags::REGISTRY.iter().find(|s| s.name == name) {
                         if let Some(cap_id) = spec.capability_id {
                             if !server_state.capability_registry.is_present(cap_id) {
                                 tracing::warn!(
@@ -213,23 +207,15 @@ pub(super) async fn handle_register_capabilities(ctx: Dispatch, req: FrontendReq
     let FrontendRequest::RegisterCapabilities { capability_ids } = req else {
         unreachable!()
     };
-    server_state
-        .capability_registry
-        .replace_all(capability_ids.into_iter());
+    server_state.capability_registry.replace_all(capability_ids.into_iter());
     let flags = feature_flags_snapshot_to_wire(&server_state);
-    send_response(
-        &sink,
-        &request_id,
-        FrontendEvent::FeatureFlagsList { flags },
-    );
+    send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
 }
 
 /// Build the wire-protocol flag list from the live store + capability
 /// registry. Extracted so both `ListFeatureFlags` and
 /// `RegisterCapabilities` share the same mapping code.
-fn feature_flags_snapshot_to_wire(
-    server_state: &ServerState,
-) -> Vec<boss_protocol::FeatureFlagSnapshot> {
+fn feature_flags_snapshot_to_wire(server_state: &ServerState) -> Vec<boss_protocol::FeatureFlagSnapshot> {
     server_state
         .feature_flags
         .snapshot_all(Some(&server_state.capability_registry))

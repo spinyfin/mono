@@ -127,8 +127,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "toolbar_search_standard",
-        description:
-            "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
+        description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
              of the custom WorkSearchToolbarItem. Requires the macOS app to be built with \
              standard-search support (capability: toolbar_search_standard). DEFAULT OFF — \
              flip ON to validate the standard search path; the capability-present badge in the \
@@ -142,7 +141,8 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
 /// Snapshot of one flag's current state for the wire / debug pane.
 /// Mirrors the protocol type one-for-one so the engine can return the
 /// in-memory state without copying field-by-field at the call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct FeatureFlagSnapshot {
     pub name: String,
     pub description: String,
@@ -343,7 +343,6 @@ impl FeatureFlagsStore {
                     enabled,
                     capability_present,
                 }
-
             })
             .collect()
     }
@@ -585,7 +584,10 @@ mod tests {
         let reg = CapabilityRegistry::new();
         reg.register("old_feature");
         reg.replace_all(["new_feature".to_owned(), "another".to_owned()]);
-        assert!(!reg.is_present("old_feature"), "replace_all should remove prior entries");
+        assert!(
+            !reg.is_present("old_feature"),
+            "replace_all should remove prior entries"
+        );
         assert!(reg.is_present("new_feature"));
         assert!(reg.is_present("another"));
     }

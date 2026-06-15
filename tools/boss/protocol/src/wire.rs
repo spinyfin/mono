@@ -2466,7 +2466,8 @@ pub enum FrontendEvent {
 /// Mirrors `boss_engine::feature_flags::FeatureFlagSnapshot` so the
 /// engine can ship its in-memory snapshot over the wire without
 /// translating field-by-field at the call site.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct FeatureFlagSnapshot {
     /// Stable flag identifier (lowercase snake_case). Also the key
     /// the consumer passes to `is_enabled`.
