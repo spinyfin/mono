@@ -640,6 +640,10 @@ pub async fn serve(
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        // Reap via the same `release_worker_pane` teardown as `bossctl
+        // agents stop` so a reconcile-cancel kills the worker's process
+        // tree before its slot/lease is freed.
+        server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );

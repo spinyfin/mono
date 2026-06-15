@@ -246,6 +246,21 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
     }
 }
 
+#[async_trait]
+impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
+    /// Route the stale-worker reconcile through the exact teardown
+    /// `bossctl agents stop` performs: `release_worker_pane` tears down
+    /// the libghostty pane, fires the `reap_worker_process_tree`
+    /// SIGTERM/SIGKILL ladder at the worker's process group, releases the
+    /// pool slot, and drops the live-state entry. This is what was
+    /// missing — the sweep used to free the pool slot without ever
+    /// killing the `claude` process, so a redispatch could re-lease the
+    /// still-occupied workspace.
+    async fn reap_worker(&self, execution_id: &str) {
+        let _ = ServerState::release_worker_pane(self, execution_id).await;
+    }
+}
+
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
 /// ServerState owns the completion handler, which owns the releaser,
@@ -364,6 +379,8 @@ impl Drop for PidFileGuard {
     }
 }
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct ServerState {
     work_db: Arc<WorkDb>,
     execution_coordinator: Arc<ExecutionCoordinator>,
@@ -952,6 +969,11 @@ impl ServerState {
         let cfg_for_provider = cfg.clone();
         let provider_events_socket = crate::runner::engine_events_socket_path();
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
+        // Create the live per-slot worker registry up front so the
+        // coordinator's lease-time occupancy guard (defect 3) and
+        // ServerState share the SAME registry instance.
+        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
+        let live_worker_states_for_coordinator = live_worker_states.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -962,6 +984,7 @@ impl ServerState {
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
+            execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an
@@ -1000,7 +1023,7 @@ impl ServerState {
                 dispatch_event_root: dispatch_event_root_for_state,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
-                live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
+                live_worker_states,
                 live_status_manager: Arc::new(LiveStatusManager::new()),
                 dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(metrics_for_dispatcher)),
                 transcript_path_cache: Arc::new(crate::live_status_loop::TranscriptPathCache::new()),

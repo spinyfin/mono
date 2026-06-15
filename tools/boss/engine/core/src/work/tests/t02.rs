@@ -1557,6 +1557,116 @@ fn cancel_running_execution_demotes_active_task() {
     assert!(!demoted2, "second call: task already out of active");
 }
 
+/// Defect 4 (regression test): stopping a SUPERSEDED execution must be a
+/// no-op for the row's status. After a false-positive stale-reconcile
+/// cancel the row is redispatched to a new execution; stopping the OLD
+/// execution (e.g. operator cleanup of the already-cancelled worker) must
+/// NOT drag the row back to `todo` — that would strand the live
+/// replacement's eventual Stop (pr_url never bound, card at risk of a
+/// third dispatch). The row's lifecycle is keyed to its CURRENT (latest)
+/// execution; only stopping that one demotes the row.
+#[test]
+fn stopping_superseded_execution_does_not_demote_row() {
+    let path = temp_db_path("cancel-superseded-exec");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Redispatched chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The original (superseded) execution and its live replacement (the
+    // redispatch). The replacement, created second, is the row's current
+    // execution.
+    let exec_old = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let exec_new = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        db.latest_execution_for_work_item(&chore.id).unwrap().unwrap().id,
+        exec_new.id,
+        "the redispatch must be the row's current execution",
+    );
+
+    // Stop the SUPERSEDED execution: it cancels, but the row must stay
+    // `active` for the live replacement.
+    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&exec_old.id).unwrap();
+    assert!(cancelled, "the superseded execution is non-terminal, so it cancels");
+    assert!(!demoted, "stopping a superseded execution must NOT demote the row");
+    assert_eq!(
+        db.get_execution(&exec_old.id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    let task = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore"),
+    };
+    assert_eq!(
+        task.status,
+        TaskStatus::Active,
+        "row must remain active so the live replacement's Stop can still reconcile",
+    );
+    assert_eq!(
+        db.get_execution(&exec_new.id).unwrap().status,
+        ExecutionStatus::Running,
+        "the live replacement execution must be untouched",
+    );
+
+    // Control: stopping the CURRENT execution DOES demote — the guard is
+    // correctly keyed to the row's current execution, not a blanket skip.
+    let (cancelled2, demoted2) = db.cancel_running_execution_and_demote_task(&exec_new.id).unwrap();
+    assert!(cancelled2, "the current execution cancels");
+    assert!(demoted2, "stopping the current execution still demotes the row");
+    let task2 = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore"),
+    };
+    assert_eq!(task2.status, TaskStatus::Todo);
+}
+
 /// Steady-state on-free rescan: an `active` chore whose only
 /// execution is terminal (worker died, cube lease errored, …)
 /// gets a fresh `ready` row so the next `kick()` can land it on

@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind, TaskStatus};
+use boss_protocol::{
+    ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus, WorkerActivity,
+};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -867,6 +869,39 @@ impl RevisionSource for AtomicU64 {
     }
 }
 
+/// Lease-time occupancy guard (defect 3). Given the workspace cube just
+/// handed us and a snapshot of the engine's live worker registry, return
+/// the `run_id`/execution-id of a **tracked, live** worker that already
+/// occupies that workspace — `Some` means we must NOT lease it.
+///
+/// A workspace is considered occupied iff some live-state entry, other
+/// than the execution being dispatched, is (a) not in a terminal activity
+/// (the slot is still held), (b) backed by a still-alive OS process
+/// (`pid_alive`), and (c) recorded against the same `cube_workspace_id`
+/// (resolved from the DB via `workspace_id_of_execution`). Cube's own
+/// lease bookkeeping should already make this impossible; the guard is
+/// the belt-and-suspenders that downgrades the duplicate-dispatch /
+/// shared-workspace incident from data-interleaving to a refused lease.
+///
+/// Pure (all I/O is injected) so the decision is unit-testable without a
+/// running engine. A dead-pid occupant (the worker genuinely gone, which
+/// is the normal orphan-resume case) returns `None` — the workspace is
+/// re-leasable; only a *live* occupant blocks.
+pub(crate) fn occupying_live_worker(
+    leased_workspace_id: &str,
+    self_execution_id: &str,
+    live: &[LiveWorkerState],
+    workspace_id_of_execution: impl Fn(&str) -> Option<String>,
+    pid_alive: impl Fn(i32) -> bool,
+) -> Option<String> {
+    live.iter()
+        .filter(|s| s.run_id != self_execution_id)
+        .filter(|s| !matches!(s.activity, WorkerActivity::Terminated | WorkerActivity::Errored))
+        .filter(|s| s.shell_pid > 0 && pid_alive(s.shell_pid))
+        .find(|s| workspace_id_of_execution(&s.run_id).as_deref() == Some(leased_workspace_id))
+        .map(|s| s.run_id.clone())
+}
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionCoordinator {
@@ -944,6 +979,14 @@ pub struct ExecutionCoordinator {
     /// Epoch seconds when dispatch was last paused. Zero means "not paused".
     /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
     dispatch_paused_since_epoch_s: AtomicU64,
+    /// Live per-slot worker registry, used by the lease-time occupancy
+    /// guard to refuse leasing a workspace that is still the cwd of a
+    /// tracked, live worker process (defect 3 — belt-and-suspenders
+    /// against the duplicate-dispatch shared-workspace incident). `None`
+    /// in tests that don't wire it; production installs it via
+    /// [`Self::set_live_worker_states`]. When absent the guard fails open
+    /// (the historical no-check behaviour).
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
 }
 
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
@@ -1023,6 +1066,7 @@ impl ExecutionCoordinator {
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
+            live_worker_states: None,
         }
     }
 
@@ -1139,6 +1183,15 @@ impl ExecutionCoordinator {
     /// never panic.
     pub fn set_metrics(&mut self, metrics: Arc<Registry>) {
         self.metrics = metrics;
+    }
+
+    /// Wire the engine's live per-slot worker registry so the dispatch
+    /// loop can run the lease-time occupancy guard (defect 3). `app.rs`
+    /// calls this once with the shared registry; tests that want to
+    /// exercise the guard install a registry, and those that don't leave
+    /// it unset (the guard then fails open, preserving legacy behaviour).
+    pub fn set_live_worker_states(&mut self, live: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) {
+        self.live_worker_states = Some(live);
     }
 
     /// Override the pre-start retry delay schedule. Pass an empty vec
@@ -2098,6 +2151,84 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+
+        // Lease-time occupancy guard (defect 3). Cube should never hand us
+        // a workspace that is still the cwd of a live worker — but the
+        // duplicate-dispatch incident proved it can when an upstream bug
+        // frees a lease while the worker's process is still alive. Before
+        // we commit this run to the workspace, refuse (and loudly log) if
+        // the engine's own live-worker registry still tracks a live
+        // process there. A refused lease retries via the normal pre-start
+        // backoff; an interleaved working copy silently corrupts two
+        // workers' edits. Only runs when the registry is wired
+        // (production); fails open otherwise. The probe is keyed by
+        // run_id/execution_id, so it never trips on our own (not-yet-
+        // spawned) execution.
+        if let Some(live_states) = self.live_worker_states.as_ref() {
+            let snapshot = live_states.snapshot();
+            let occupant = occupying_live_worker(
+                &lease.workspace_id,
+                &execution.id,
+                &snapshot,
+                |eid| self.work_db.get_execution(eid).ok().and_then(|e| e.cube_workspace_id),
+                |pid| {
+                    !matches!(
+                        crate::dead_pid_sweep::probe_pid(pid),
+                        crate::dead_pid_sweep::PidStatus::Dead
+                    )
+                },
+            );
+            if let Some(occupant_run_id) = occupant {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    workspace_path = %lease.workspace_path.display(),
+                    occupied_by = %occupant_run_id,
+                    "REFUSING lease: cube returned a workspace still occupied by a live tracked worker \
+                     — refusing rather than interleaving two workers in one working copy (defect 3)",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "reason": "workspace_occupied_by_live_worker",
+                                "occupied_by_execution_id": occupant_run_id,
+                                "workspace_path": lease.workspace_path.display().to_string(),
+                            })),
+                    )
+                    .await;
+                // Hand the workspace straight back so it isn't stranded.
+                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                    tracing::error!(
+                        ?release_err,
+                        lease_id = %lease.lease_id,
+                        "failed to release workspace after refusing an occupied lease",
+                    );
+                }
+                let err = anyhow!(
+                    "leased workspace {} is occupied by live worker {}",
+                    lease.workspace_id,
+                    occupant_run_id
+                );
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    "cube_workspace_occupied",
+                    "Cube leased a workspace occupied by a live worker",
+                    &err,
+                )?;
+                return Err(err);
+            }
+        }
         {
             let mut lease_args = vec![
                 "--json",
@@ -3779,10 +3910,74 @@ mod tests {
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
         CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, ExecutionPublisher,
         FrontendEvent, Host, HostAdapter, HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
-        MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, pick_worst_failing_check,
+        MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, occupying_live_worker, pick_worst_failing_check,
         pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
     };
     use boss_protocol::ExecutionStatus;
+
+    /// Lease-time occupancy guard (defect 3, regression test c). The
+    /// pure decision: a workspace is "occupied" only by a tracked worker
+    /// with a *live* process and non-terminal activity on that workspace;
+    /// a dead-pid occupant (the orphan-resume case) is re-leasable, and
+    /// the dispatching execution never blocks itself.
+    #[test]
+    fn occupying_live_worker_blocks_only_a_live_tracked_occupant() {
+        use boss_protocol::{LiveWorkerState, WorkerActivity};
+
+        // exec-live: alive process; exec-dead: process gone. Both are
+        // recorded against the SAME workspace cube just handed us.
+        let mut live = LiveWorkerState::new_spawning(1, "exec-live", "opus", 4242, None);
+        live.activity = WorkerActivity::Working;
+        let mut dead = LiveWorkerState::new_spawning(2, "exec-dead", "opus", 5151, None);
+        dead.activity = WorkerActivity::Working;
+
+        let workspace_of = |eid: &str| match eid {
+            "exec-live" | "exec-dead" | "exec-new" => Some("mono-agent-021".to_owned()),
+            _ => None,
+        };
+        let pid_alive = |pid: i32| pid == 4242; // only exec-live is alive
+
+        // A redispatch CANNOT lease a workspace occupied by a live process.
+        assert_eq!(
+            occupying_live_worker("mono-agent-021", "exec-new", &[live.clone()], workspace_of, pid_alive),
+            Some("exec-live".to_owned()),
+            "a live occupant must block the lease",
+        );
+
+        // A dead-pid occupant does NOT block — the workspace is genuinely
+        // free (normal orphan-resume).
+        assert_eq!(
+            occupying_live_worker("mono-agent-021", "exec-new", &[dead], workspace_of, pid_alive),
+            None,
+            "a dead occupant must not block the lease",
+        );
+
+        // The dispatching execution never blocks itself.
+        let mut myself = LiveWorkerState::new_spawning(3, "exec-new", "opus", 4242, None);
+        myself.activity = WorkerActivity::Working;
+        assert_eq!(
+            occupying_live_worker("mono-agent-021", "exec-new", &[myself], workspace_of, pid_alive),
+            None,
+            "the dispatching execution must never block itself",
+        );
+
+        // A terminal-activity occupant has released its slot — not occupying.
+        let mut terminated = LiveWorkerState::new_spawning(4, "exec-live", "opus", 4242, None);
+        terminated.activity = WorkerActivity::Terminated;
+        assert_eq!(
+            occupying_live_worker("mono-agent-021", "exec-new", &[terminated], workspace_of, pid_alive),
+            None,
+            "a terminated worker no longer occupies its workspace",
+        );
+
+        // Occupancy is workspace-scoped: a live worker on a DIFFERENT
+        // workspace doesn't block this lease.
+        assert_eq!(
+            occupying_live_worker("mono-agent-099", "exec-new", &[live], workspace_of, pid_alive),
+            None,
+            "occupancy must be scoped to the leased workspace",
+        );
+    }
 
     #[test]
     fn pick_worst_failing_check_prefers_failure() {
