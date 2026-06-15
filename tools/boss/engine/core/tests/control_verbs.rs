@@ -1467,6 +1467,7 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
         effort_level: None,
         model_override: None,
         force_duplicate: false,
+        driver: None,
     })?;
     let pr = "https://github.com/foo/bar/pull/77";
     work_db.update_work_item(
