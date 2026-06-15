@@ -84,9 +84,19 @@ pub fn create_sandbox(
 
     let mut allowed_paths = Vec::with_capacity(allowlist.len());
     for path in &allowlist {
-        populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree)
-            .with_context(|| format!("failed to populate sandbox file {}", path.display()))?;
-        allowed_paths.push(path.clone());
+        match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree) {
+            Ok(()) => {
+                allowed_paths.push(path.clone());
+            }
+            Err(e) if source_file_not_found(&e) => {
+                // File vanished between enumeration and population (e.g. a
+                // transient lock file or a concurrent workspace write). Skip it
+                // rather than aborting the whole sandbox build.
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to populate sandbox file {}", path.display()));
+            }
+        }
     }
 
     Ok(SandboxResult {
@@ -151,6 +161,16 @@ fn resolve_allowlist(changeset: &ChangeSet, scope: &AccessScope, source_tree: &d
     // Sort all scopes for deterministic, consistent output.
     paths.sort();
     Ok(paths)
+}
+
+/// Returns true when `err` (or any cause in its chain) is an I/O "not found"
+/// error — i.e. the source file disappeared between enumeration and the link/read.
+fn source_file_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn populate_sandbox_file(
@@ -570,6 +590,119 @@ mod tests {
             result.allowed_paths,
             vec![PathBuf::from("a.rs"), PathBuf::from("m.rs"), PathBuf::from("z.rs"),],
             "allowed_paths must be sorted regardless of changeset order"
+        );
+    }
+
+    // --- VCS internals exclusion ---
+
+    #[test]
+    fn whole_repo_excludes_jj_internals() {
+        let (dir, tree) = disk_source_tree(&[
+            ("src/lib.rs", b"pub fn f() {}"),
+            (".jj/working_copy/working_copy.lock", b"lock"),
+            (".jj/store/git/config", b"[core]"),
+        ]);
+
+        let cs = ChangeSet::new(vec![]);
+        let result =
+            create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(dir.path())).expect("create sandbox");
+
+        for p in &result.allowed_paths {
+            assert!(
+                !p.starts_with(".jj"),
+                ".jj internal must not appear in sandbox: {}",
+                p.display()
+            );
+        }
+        assert!(
+            result.root.path().join("src/lib.rs").exists(),
+            "non-VCS file must still appear in sandbox"
+        );
+    }
+
+    #[test]
+    fn whole_repo_excludes_git_internals() {
+        let (dir, tree) = disk_source_tree(&[
+            ("README.md", b"readme"),
+            (".git/config", b"[core]"),
+            (".git/HEAD", b"ref: refs/heads/main"),
+        ]);
+
+        let cs = ChangeSet::new(vec![]);
+        let result =
+            create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(dir.path())).expect("create sandbox");
+
+        for p in &result.allowed_paths {
+            assert!(
+                !p.starts_with(".git"),
+                ".git internal must not appear in sandbox: {}",
+                p.display()
+            );
+        }
+        assert!(
+            result.root.path().join("README.md").exists(),
+            "non-VCS file must still appear in sandbox"
+        );
+    }
+
+    // --- Mid-population ENOENT tolerance ---
+
+    /// A SourceTree wrapper that simulates a file vanishing between enumeration
+    /// and population: `exists` and `glob` advertise the file, but `read_file`
+    /// returns NotFound for it.
+    struct VanishingSourceTree {
+        inner: MapSourceTree,
+        vanished: PathBuf,
+    }
+
+    impl SourceTree for VanishingSourceTree {
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+            if path == self.vanished {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+            }
+            self.inner.read_file(path)
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+            self.inner.list_dir(path)
+        }
+
+        fn glob(&self, pattern: &str) -> Result<Vec<PathBuf>> {
+            self.inner.glob(pattern)
+        }
+    }
+
+    #[test]
+    fn vanished_file_does_not_abort_sandbox_population() {
+        let tree = VanishingSourceTree {
+            inner: MapSourceTree::new(&[("src/stable.rs", b"fn stable() {}"), ("src/volatile.rs", b"fn v() {}")]),
+            vanished: PathBuf::from("src/volatile.rs"),
+        };
+        let ceiling = tempdir().unwrap();
+
+        let cs = ChangeSet::new(vec![]);
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("sandbox must succeed even when a file vanishes");
+
+        assert!(
+            result.root.path().join("src/stable.rs").exists(),
+            "stable file must be in sandbox"
+        );
+        assert!(
+            !result.root.path().join("src/volatile.rs").exists(),
+            "vanished file must be absent"
+        );
+        assert!(
+            result.allowed_paths.contains(&PathBuf::from("src/stable.rs")),
+            "stable file must appear in allowed_paths"
+        );
+        assert!(
+            !result.allowed_paths.contains(&PathBuf::from("src/volatile.rs")),
+            "vanished file must not appear in allowed_paths"
         );
     }
 
