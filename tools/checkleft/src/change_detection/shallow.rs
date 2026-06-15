@@ -38,7 +38,18 @@ pub const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
 /// git repo via the `.git` directory at the workspace root and then run
 /// `jj git import` to sync jj's op log after deepening.
 pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<bool> {
-    let git_root = resolve_git_root(root, kind)?;
+    // For non-colocated jj workspaces there is no `.git` at the workspace
+    // root. Git operations cannot be run from there, so we can neither check
+    // depth nor deepen history. Local dev workspaces always have full history,
+    // so fail-open: return Ok(true) and let the caller proceed.
+    let git_root = match resolve_git_root(root, kind) {
+        Ok(root) => root,
+        Err(_) if kind == VcsKind::Jujutsu => {
+            info!("non-colocated jj workspace — no .git at root; assuming full history");
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
 
     // For PR and push-to-branch scenarios, always refresh the remote tracking
     // ref before checking depth. Buildkite agents reuse checkout directories
