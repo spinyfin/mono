@@ -457,9 +457,10 @@ impl WorkDb {
         review_required_detail: Option<&str>,
         merge_queue_state: Option<&str>,
     ) -> Result<PrPollStateOutcome> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
         let now = now_string();
-        let prior_ci_state: Option<String> = conn
+        let prior_ci_state: Option<String> = tx
             .query_row(
                 "SELECT ci_required_state FROM tasks
                  WHERE id = ?1 AND deleted_at IS NULL",
@@ -473,7 +474,7 @@ impl WorkDb {
         // PR that stays CONFLICTING for an extended period). Without this,
         // pr_state_polled_at freezes the moment the state stabilises, making it
         // impossible to distinguish a frozen poller from an actively-polling one.
-        conn.execute(
+        tx.execute(
             "UPDATE tasks SET pr_state_polled_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
@@ -481,7 +482,7 @@ impl WorkDb {
         // merge-queue state differs from what's already stored.  COALESCE treats
         // NULL as distinct from any non-empty string, so the first probe after
         // migration always fires the event.
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE tasks
              SET ci_required_state      = ?2,
                  review_required_state  = ?3,
@@ -502,6 +503,7 @@ impl WorkDb {
                 merge_queue_state,
             ],
         )?;
+        tx.commit()?;
         Ok(PrPollStateOutcome {
             changed: changed > 0,
             prior_ci_state,

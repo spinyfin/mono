@@ -185,6 +185,20 @@ pub async fn on_conflict_detected(
                         .map(|rid| !work_db.is_conflict_resolution_revision_live(rid).unwrap_or(true))
                         .unwrap_or(false);
                     if head_sha_stale || revision_dead {
+                        // base_sha_changed is true when the PR's base (main) has
+                        // also advanced since this crz was created — the realistic
+                        // path for crz rows that sat pending for hours (T1764).
+                        // In that case the stale row's UNIQUE key
+                        // (work_item_id, base_sha_at_trigger) differs from the
+                        // fresh row's, so a plain abandon is safe.
+                        // When base SHA is unchanged (same-base head-move or
+                        // terminal-revision), we must also nullify
+                        // base_sha_at_trigger on the abandoned row so the INSERT
+                        // below can create a fresh row at the same key and the
+                        // churn guard can count this supersede, matching
+                        // ci_watch's abandon path.
+                        let base_sha_changed = head_sha_stale
+                            && probe.base_ref_oid.as_deref() != active_crz.base_sha_at_trigger.as_deref();
                         tracing::info!(
                             work_item_id = %candidate.work_item_id,
                             attempt_id = %active_crz.id,
@@ -193,28 +207,40 @@ pub async fn on_conflict_detected(
                             revision_task_id = ?active_crz.revision_task_id,
                             head_sha_stale,
                             revision_dead,
-                            "conflict_watch: active crz is stale; superseding revision and re-detecting",
+                            base_sha_changed,
+                            "conflict_watch: active crz is stale; superseding and re-detecting",
                         );
-                        // Reset the stale crz in place: clear revision_task_id
-                        // (and update head_sha_before if head moved) so the
-                        // UNIQUE-collision fallback in insert_conflict_resolution
-                        // picks up this row and dispatches a fresh revision.
-                        // We do NOT abandon the row: abandoning + re-inserting
-                        // would fail the UNIQUE (work_item_id, base_sha_at_trigger)
-                        // key when the base SHA hasn't changed, silently leaving
-                        // no active crz and no new revision spawned.
-                        let new_head = if head_sha_stale { current_head_sha } else { None };
-                        if let Err(err) = work_db.reset_conflict_resolution_for_supersede(&active_crz.id, new_head) {
-                            tracing::warn!(
-                                work_item_id = %candidate.work_item_id,
-                                attempt_id = %active_crz.id,
-                                ?err,
-                                "conflict_watch: failed to reset stale crz; falling through anyway",
-                            );
+                        if base_sha_changed {
+                            // Base SHA advanced: plain abandon suffices; the
+                            // INSERT below uses a new (work_item_id, base_sha)
+                            // key and will not collide.
+                            if let Err(err) =
+                                work_db.mark_conflict_resolution_abandoned(&active_crz.id, "superseded_stale_head")
+                            {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    attempt_id = %active_crz.id,
+                                    ?err,
+                                    "conflict_watch: failed to abandon stale crz (base changed); falling through anyway",
+                                );
+                            }
+                        } else {
+                            // Same base SHA: abandon AND nullify base_sha_at_trigger
+                            // to free the UNIQUE slot so the INSERT can proceed and
+                            // the churn guard counts this supersede.
+                            if let Err(err) = work_db
+                                .abandon_conflict_resolution_for_supersede(&active_crz.id, "superseded_stale_head")
+                            {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    attempt_id = %active_crz.id,
+                                    ?err,
+                                    "conflict_watch: failed to abandon stale crz (same base); falling through anyway",
+                                );
+                            }
                         }
-                        // Fall through to the main code path: mark_chore_blocked
-                        // → insert_conflict_resolution UNIQUE collision → active
-                        // crz lookup returns the reset row → spawn fresh revision.
+                        // Fall through: mark_chore_blocked → insert_conflict_resolution
+                        // creates a new row → spawn fresh revision.
                     } else {
                         // Same head SHA and revision is still live — idempotent
                         // no-op: re-arm the signal so maybe_clear_blocked fires
@@ -2403,6 +2429,20 @@ mod tests {
         }
     }
 
+    // Helper: build a probe with an explicit head SHA and base SHA.
+    fn probe_with_head_and_base(
+        pr_url: &str,
+        state: PrLifecycleState,
+        head_sha: &str,
+        base_sha: &str,
+    ) -> PrLifecycleProbe {
+        PrLifecycleProbe {
+            head_ref_oid: Some(head_sha.to_owned()),
+            base_ref_oid: Some(base_sha.to_owned()),
+            ..probe(pr_url, state)
+        }
+    }
+
     #[tokio::test]
     async fn stale_head_sha_supersedes_pending_crz() {
         // Regression test for T1795 / T1764.
@@ -2457,23 +2497,28 @@ mod tests {
         .await;
         assert!(second, "second probe with new head SHA must re-detect (return true)");
 
-        // The original crz row is reused (reset in place): same ID, updated
-        // head_sha_before, new revision_task_id for the fresh revision.
-        // We do NOT get a second row because the UNIQUE (work_item_id,
-        // base_sha_at_trigger) constraint prevents re-insertion at the same
-        // base SHA; the reset-in-place approach reuses the existing row.
+        // Same base SHA (both probes use the default "abc123"): the stale crz
+        // is abandoned (base_sha_at_trigger nullified) and a fresh row is
+        // inserted with the current head SHA.  Two rows in total:
+        // one abandoned (the original) and one pending (the fresh one).
         let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
-        assert_eq!(all.len(), 1, "same crz row is reset in place; no second row created");
-        let crz = &all[0];
-        assert_eq!(crz.id, original_id, "same crz row");
+        assert_eq!(all.len(), 2, "stale crz abandoned, fresh crz created");
+        let abandoned = all
+            .iter()
+            .find(|r| r.id == original_id)
+            .expect("original crz must still exist");
+        assert_eq!(abandoned.status, "abandoned", "original crz must be abandoned");
+        assert_eq!(abandoned.failure_reason.as_deref(), Some("superseded_stale_head"));
+        let fresh = all.iter().find(|r| r.id != original_id).expect("fresh crz must exist");
+        assert_eq!(fresh.status, "pending", "fresh crz must be pending");
         assert_eq!(
-            crz.head_sha_before.as_deref(),
+            fresh.head_sha_before.as_deref(),
             Some("head-B"),
-            "head_sha_before updated to current head"
+            "fresh crz carries the current head SHA"
         );
         assert!(
-            crz.revision_task_id.is_some(),
-            "fresh revision must be stamped on the reset crz"
+            fresh.revision_task_id.is_some(),
+            "fresh revision must be stamped on the new crz"
         );
 
         // Parent stays in_review (fresh revision spawned).
@@ -2545,24 +2590,144 @@ mod tests {
             "second probe with terminal revision must re-detect (return true)"
         );
 
-        // The original crz row is reset in place (revision_task_id cleared,
-        // status stays pending), then reused to spawn a fresh revision.
+        // Same base SHA, terminal revision (head didn't move): the stale crz is
+        // abandoned (base_sha_at_trigger nullified) and a fresh row inserted.
+        // Two rows total: one abandoned (original) and one pending (fresh).
         let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
-        assert_eq!(all.len(), 1, "same crz row is reset in place; no second row created");
-        let crz = &all[0];
-        assert_eq!(crz.id, original_id, "same crz row");
+        assert_eq!(all.len(), 2, "stale crz abandoned, fresh crz created");
+        let abandoned = all
+            .iter()
+            .find(|r| r.id == original_id)
+            .expect("original crz must still exist");
+        assert_eq!(abandoned.status, "abandoned", "original crz must be abandoned");
+        assert_eq!(abandoned.failure_reason.as_deref(), Some("superseded_stale_head"));
+        let fresh = all.iter().find(|r| r.id != original_id).expect("fresh crz must exist");
+        assert_eq!(fresh.status, "pending", "fresh crz must be pending");
         assert!(
-            crz.revision_task_id.is_some(),
-            "fresh revision must be stamped on the reset crz"
+            fresh.revision_task_id.is_some(),
+            "fresh revision must be stamped on the new crz"
         );
         // revision_task_id must be different from the original stale revision.
         assert_ne!(
-            crz.revision_task_id.as_deref(),
+            fresh.revision_task_id.as_deref(),
             Some(revision_id.as_str()),
             "fresh revision must be a new task, not the old stale one",
         );
 
         // Parent stays in_review (fresh revision spawned).
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, TaskStatus::InReview);
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
+        // Regression test for the real incident path (T1764: crz pending ~11h).
+        //
+        // Scenario: a crz is spawned for head SHA "head-A" / base SHA "base-1".
+        // Over the next ~11 h main advances to "base-2" AND the PR author pushes
+        // a new commit ("head-B") without resolving the conflict.  The exec is
+        // abandoned by the orphan sweep, leaving the crz `pending` with
+        // `revision_task_id` set.
+        //
+        // On the next sweep the probe reports head="head-B", base="base-2".
+        // conflict_watch must:
+        //   1. Detect that both head AND base moved.
+        //   2. Abandon the stale crz (NOT leave it dangling as `pending`).
+        //   3. Spawn a fresh crz+revision against the current (head-B, base-2).
+        //   4. Exactly one active crz remaining; the stale row is terminal.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/43";
+        let (product, chore) = make_in_review(&db, "C-base-advance", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // First detection: probe reports head="head-A", base="base-1".
+        let first = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head_and_base(
+                pr,
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+                "head-A",
+                "base-1",
+            ),
+        )
+        .await;
+        assert!(first, "first detection must return true");
+
+        let original_crz = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .expect("crz must exist after first detection");
+        assert_eq!(original_crz.head_sha_before.as_deref(), Some("head-A"));
+        assert_eq!(original_crz.base_sha_at_trigger.as_deref(), Some("base-1"));
+        let original_id = original_crz.id.clone();
+
+        // Simulate: revision pushed (head moves to "head-B"), exec abandoned;
+        // meanwhile main advanced to "base-2".  The crz stays `pending` with
+        // `revision_task_id` set — finalize_conflict_resolution_attempt was
+        // never called by the orphan sweep.
+
+        // Second sweep: both head AND base moved.
+        // Must abandon the stale crz and spawn a fresh one.
+        let second = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe_with_head_and_base(
+                pr,
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+                "head-B",
+                "base-2",
+            ),
+        )
+        .await;
+        assert!(
+            second,
+            "second probe with new head+base SHA must re-detect (return true)"
+        );
+
+        // Stale row abandoned; fresh row inserted with the new (work_item_id, base-2) key.
+        // Exactly two rows: one terminal (the old one) and one pending (the new one).
+        let all = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "stale crz abandoned, fresh crz inserted with new base SHA"
+        );
+
+        let abandoned = all
+            .iter()
+            .find(|r| r.id == original_id)
+            .expect("original crz must still exist");
+        assert_eq!(
+            abandoned.status, "abandoned",
+            "original crz must be abandoned, not left pending"
+        );
+        assert_eq!(abandoned.failure_reason.as_deref(), Some("superseded_stale_head"));
+        // base_sha_at_trigger is untouched on a base-changed abandon (the row is
+        // purely terminal; its key slot is not reused).
+        assert_eq!(abandoned.base_sha_at_trigger.as_deref(), Some("base-1"));
+
+        let fresh = all.iter().find(|r| r.id != original_id).expect("fresh crz must exist");
+        assert_eq!(fresh.status, "pending", "fresh crz must be pending");
+        assert_eq!(
+            fresh.base_sha_at_trigger.as_deref(),
+            Some("base-2"),
+            "fresh crz uses the new base SHA"
+        );
+        assert_eq!(
+            fresh.head_sha_before.as_deref(),
+            Some("head-B"),
+            "fresh crz uses the new head SHA"
+        );
+        assert!(fresh.revision_task_id.is_some(), "fresh revision must be spawned");
+
+        // Parent stays in_review (fresh revision in flight).
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
