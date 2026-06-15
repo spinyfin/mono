@@ -317,19 +317,13 @@ pub trait AgentDriver: Send + Sync {
     /// + tool-use stream the engine decodes into [`WorkerEvent`]s. For the
     /// Claude driver this is the `hooks` block routing every hook event to the
     /// `boss-event` shim; the spawn flow merges it into the worker settings.
-    fn progress_observation_wiring(
-        &self,
-        config: &ProgressObservationConfig,
-    ) -> ProgressObservationWiring;
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring;
 
     /// Decode one raw event-source payload into a typed [`WorkerEvent`] that
     /// drives the (driver-agnostic) activity machine. For the Claude driver
     /// the raw payload is a hook JSON object; this delegates to
     /// [`boss_protocol::normalize_hook_event`].
-    fn normalize_progress_event(
-        &self,
-        raw: &serde_json::Value,
-    ) -> Result<WorkerEvent, NormalizeError>;
+    fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
     // ── PromptComposition capability ────────────────────────────────────────
 

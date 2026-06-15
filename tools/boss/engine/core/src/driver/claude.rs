@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use boss_protocol::{NormalizeError, WorkerEvent, normalize_hook_event};
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ProgressFidelity,
-    ProgressObservationConfig, ProgressObservationWiring, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ProgressFidelity, ProgressObservationConfig,
+    ProgressObservationWiring, WorkerErrorClass,
 };
 
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
@@ -127,10 +127,7 @@ impl AgentDriver for ClaudeDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(
-        &self,
-        config: &ProgressObservationConfig,
-    ) -> ProgressObservationWiring {
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring {
         // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
         // is load-bearing: without it the shim can't splice `_boss_run_id` and
         // the engine drops the event, pinning the worker at `Spawning`.
@@ -164,18 +161,12 @@ impl AgentDriver for ClaudeDriver {
 
         let mut hooks = serde_json::Map::new();
         for event in CLAUDE_HOOK_EVENTS {
-            hooks.insert(
-                (*event).to_owned(),
-                serde_json::json!([forward_hook.clone()]),
-            );
+            hooks.insert((*event).to_owned(), serde_json::json!([forward_hook.clone()]));
         }
         ProgressObservationWiring { hooks }
     }
 
-    fn normalize_progress_event(
-        &self,
-        raw: &serde_json::Value,
-    ) -> Result<WorkerEvent, NormalizeError> {
+    fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
         normalize_hook_event(raw)
     }
 
@@ -229,15 +220,11 @@ mod tests {
 
     fn sample_config() -> ProgressObservationConfig {
         ProgressObservationConfig {
-            events_socket_path: PathBuf::from(
-                "/Users/x/Library/Application Support/Boss/events.sock",
-            ),
+            events_socket_path: PathBuf::from("/Users/x/Library/Application Support/Boss/events.sock"),
             lease_id: "lease-uuid-abc".into(),
             run_id: "run-sample".into(),
             workspace_path: PathBuf::from("/ws/mono-agent-007"),
-            forwarder_binary: PathBuf::from(
-                "/Users/x/Library/Application Support/Boss/bin/boss-event",
-            ),
+            forwarder_binary: PathBuf::from("/Users/x/Library/Application Support/Boss/bin/boss-event"),
         }
     }
 
@@ -269,9 +256,7 @@ mod tests {
     #[test]
     fn observation_wiring_threads_socket_lease_run_and_workspace_into_command() {
         let wiring = ClaudeDriver.progress_observation_wiring(&sample_config());
-        let command = wiring.hooks["Stop"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
+        let command = wiring.hooks["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         // Single-quote escaping must survive the space in "Application Support".
         assert!(command.contains("BOSS_EVENTS_SOCKET='/Users/x/Library/Application Support/Boss/events.sock'"));
         assert!(command.contains("BOSS_LEASE_ID='lease-uuid-abc'"));
