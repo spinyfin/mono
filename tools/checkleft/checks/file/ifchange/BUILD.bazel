@@ -1,16 +1,16 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# The file/require-companion-change check logic as an ordinary rlib. It is linked
+# The file/ifchange check logic as an ordinary rlib. It is linked
 # (together with the other preinstalled checks) into the single multiplexed
 # Component Model component built by //tools/checkleft/preinstalled-bundle. This
 # crate does not build its own component: a separate component per check
 # duplicated the entire wasm runtime baseline (std/alloc/SDK/wit-bindgen/serde)
 # once per check.
 rust_library(
-    name = "require_companion_change_check",
+    name = "ifchange_check",
     srcs = ["src/lib.rs"],
-    crate_name = "checkleft_file_require_companion_change",
+    crate_name = "checkleft_file_ifchange",
     edition = "2024",
     proc_macro_deps = [
         "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
@@ -24,9 +24,9 @@ rust_library(
 
 # Unit tests for the check logic compiled natively.
 rust_test(
-    name = "require_companion_change_check_test",
+    name = "ifchange_check_test",
     size = "small",
-    crate = ":require_companion_change_check",
+    crate = ":ifchange_check",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

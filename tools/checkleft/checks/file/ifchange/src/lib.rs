@@ -1,20 +1,19 @@
 //! Checkleft check: require a companion change when a coupled surface changes.
 //!
-//! This is the Component Model wasm check `file/require-companion-change`. It is
-//! the generalization of the former `ifchange-thenchange` built-in (ported to
-//! wasm as `file/ifchange`) and the former native `api-breaking-surface` check.
-//! Both expressed the same rule — *"when region/surface X changes, companion Y
-//! must also change"* — through two different coupling-declaration mechanisms;
-//! this check supports both at once.
+//! This is the Component Model wasm check `file/ifchange`. It is
+//! the generalization of the former `ifchange-thenchange` built-in and the
+//! former native `api-breaking-surface` check. Both expressed the same rule —
+//! *"when region/surface X changes, companion Y must also change"* — through
+//! two different coupling-declaration mechanisms; this check supports both at
+//! once.
 //!
 //! ## Two ways to declare a coupling
 //!
 //! 1. **In-source markers** (`LINT.IfChange` / `LINT.ThenChange`). Code-declared
 //!    coupling between specific regions/files. Always active — no config needed.
-//!    This is the former `ifchange-thenchange` / `file/ifchange` behavior, at
-//!    full parity (including enforcement on deleted files and removed-marker
-//!    scenarios via base-revision content supplied through
-//!    [`ChangeSet::base_file_content`]).
+//!    This is the former `ifchange-thenchange` behavior, at full parity
+//!    (including enforcement on deleted files and removed-marker scenarios via
+//!    base-revision content supplied through [`ChangeSet::base_file_content`]).
 //!
 //! 2. **Config globs** (`trigger_globs` / `required_globs`). Policy-declared
 //!    coupling scoped by path globs: if any changed file matches a coupling's
@@ -27,9 +26,9 @@
 //!
 //! ## Deprecated aliases
 //!
-//! For a migration window this check is also exported under its two historical
-//! ids — `file/ifchange` and `api-breaking-surface` — which dispatch to the same
-//! implementation. New configuration should reference `file/require-companion-change`.
+//! For a migration window this check is also exported under its historical id
+//! `api-breaking-surface`, which dispatches to the same implementation.
+//! New configuration should reference `file/ifchange`.
 //!
 //! ## Supported comment styles (markers)
 //!
@@ -63,7 +62,7 @@ use serde::Deserialize;
 
 // ── Check entry points ─────────────────────────────────────────────────────────
 //
-// The canonical check runs both mechanisms. Each deprecated alias runs only its
+// The canonical check runs both mechanisms. The deprecated alias runs only its
 // historical mechanism so that existing configs are not accidentally extended
 // (e.g. `api-breaking-surface` must not start enforcing LINT markers that the
 // deleted native check never enforced) and to avoid double-reporting when a repo
@@ -71,34 +70,21 @@ use serde::Deserialize;
 
 /// Canonical check: require a companion change when a coupled surface changes.
 #[check(
-    name = "file/require-companion-change",
+    name = "file/ifchange",
     description = "requires a companion change (marked region/file or glob-matched surface) to change together",
     severity = error,
     access_scope = whole_repo
 )]
-pub fn file_require_companion_change_check(input: CheckInput) -> Vec<Finding> {
+pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
     run(&input)
 }
 
-/// Deprecated alias of `file/require-companion-change` (marker-only history).
-/// Runs only the LINT.IfChange/LINT.ThenChange marker mechanism — not glob
-/// coupling — to faithfully reproduce the original `file/ifchange` behavior.
-#[check(
-    name = "file/ifchange",
-    description = "deprecated alias of file/require-companion-change (LINT.IfChange / LINT.ThenChange markers)",
-    severity = error,
-    access_scope = whole_repo
-)]
-pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
-    marker_findings(&input.changeset)
-}
-
-/// Deprecated alias of `file/require-companion-change` (glob-coupling history).
+/// Deprecated alias of `file/ifchange` (glob-coupling history).
 /// Runs only the trigger_globs/required_globs mechanism — not LINT markers —
 /// to faithfully reproduce the original `api-breaking-surface` behavior.
 #[check(
     name = "api-breaking-surface",
-    description = "deprecated alias of file/require-companion-change (trigger_globs / required_globs)",
+    description = "deprecated alias of file/ifchange (trigger_globs / required_globs)",
     severity = error,
     access_scope = whole_repo
 )]
@@ -753,7 +739,7 @@ fn compile_globs(patterns: &[String]) -> Result<GlobSet, String> {
 fn config_error_finding(detail: &str) -> Finding {
     Finding {
         severity: Severity::Error,
-        message: format!("require-companion-change config error: {detail}"),
+        message: format!("ifchange config error: {detail}"),
         location: None,
         remediations: vec!["Fix the check configuration in the CHECKS file.".to_owned()],
         suggested_fix: None,
@@ -848,16 +834,16 @@ mod tests {
 
     fn run_check(changeset: ChangeSet) -> Vec<Finding> {
         let input = CheckInput::__from_parts(changeset, "{}".to_owned());
-        file_require_companion_change_check(input)
+        file_ifchange_check(input)
     }
 
     fn run_with_config(changeset: ChangeSet, config_json: &str) -> Vec<Finding> {
         let input = CheckInput::__from_parts(changeset, config_json.to_owned());
-        file_require_companion_change_check(input)
+        file_ifchange_check(input)
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Marker-mode tests (parity with the former ifchange-thenchange / file/ifchange)
+    // Marker-mode tests (parity with the former ifchange-thenchange built-in)
     // ══════════════════════════════════════════════════════════════════════════
 
     // ── File-target tests ─────────────────────────────────────────────────────

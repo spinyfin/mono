@@ -130,11 +130,10 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         check_names: &[
             "file/forbidden-path",
             "file/size",
-            "file/require-companion-change",
-            // Deprecated aliases of file/require-companion-change, kept for the
-            // migration window. All dispatch to the same multiplexed component;
-            // the guest exports a descriptor for each name.
             "file/ifchange",
+            // Deprecated alias of file/ifchange, kept for the migration window.
+            // Dispatches to the same multiplexed component; the guest exports a
+            // descriptor for each name.
             "api-breaking-surface",
             "rust/giant-structs",
             "rust/giant-structs-create",
@@ -277,7 +276,6 @@ mod tests {
         };
 
         let file_size = resolve_component("file/size");
-        let companion = resolve_component("file/require-companion-change");
         let file_ifchange = resolve_component("file/ifchange");
         let api_breaking = resolve_component("api-breaking-surface");
         let giant_structs = resolve_component("rust/giant-structs");
@@ -289,7 +287,6 @@ mod tests {
             "preinstalled wasm checks must point at the same consolidated component",
         );
         for (name, comp) in [
-            ("file/require-companion-change", &companion),
             ("file/ifchange", &file_ifchange),
             ("api-breaking-surface", &api_breaking),
         ] {
@@ -306,7 +303,6 @@ mod tests {
         // ...but each names its own check so the host dispatches correctly via
         // the component's list-checks / run-check exports.
         assert_eq!(file_size.check_name, "file/size");
-        assert_eq!(companion.check_name, "file/require-companion-change");
         assert_eq!(file_ifchange.check_name, "file/ifchange");
         assert_eq!(api_breaking.check_name, "api-breaking-surface");
         assert_eq!(giant_structs.check_name, "rust/giant-structs");
