@@ -300,30 +300,16 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 
-## `frontend-no-legacy-api`
+## `file/ifchange`
 
 Purpose:
 
-- Prevents frontend imports from deprecated module suffixes.
+- Enforces `LINT.IfChange` / `LINT.ThenChange` contracts so linked files or
+  linked blocks change together.
 
 Config keys:
 
-- `legacy_modules` (required array of module suffixes)
-- `severity` (optional `error|warning|info`, default `error`)
-- `remediation` (optional string)
-
-## `file/require-companion-change`
-
-Purpose:
-
-- Requires a companion change when a coupled surface changes — *"when region/surface
-  X changes, companion Y must also change."* Supersedes and unifies the former
-  `ifchange-thenchange` / `file/ifchange` check and the former `api-breaking-surface`
-  check, which expressed the same rule through two different mechanisms.
-
-Two ways to declare a coupling (independent and additive — use either or both):
-
-**1. In-source markers** (code-declared, always active, no config):
+## `frontend-no-legacy-api`
 
 ```text
 LINT.IfChange

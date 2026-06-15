@@ -301,7 +301,6 @@ mod tests {
             assert_eq!(file_size.artifact_sha256, comp.artifact_sha256);
         }
         assert_eq!(file_size.artifact_sha256, giant_structs.artifact_sha256);
-
         assert!(!file_size.artifact_sha256.is_empty(), "sha256 must be computed");
 
         // ...but each names its own check so the host dispatches correctly via
