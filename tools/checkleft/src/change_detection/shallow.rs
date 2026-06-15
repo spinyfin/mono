@@ -41,6 +41,10 @@ pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &S
     // Secondary jj workspaces have no colocated .git at their root. These are
     // local development environments, not CI shallow clones, so there is no
     // shallow history to deepen. Skip the check and report history as available.
+    // Invariant: secondary jj workspaces always share a non-shallow primary
+    // store (cube workspaces are full clones), so skipping the depth check
+    // here is safe — if this assumption ever breaks (shallow primary store),
+    // this early return must be removed.
     if kind == VcsKind::Jujutsu && !root.join(".git").exists() {
         info!("secondary jj workspace (no colocated .git) — skipping shallow history check");
         return Ok(true);

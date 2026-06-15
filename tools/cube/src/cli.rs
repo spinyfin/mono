@@ -979,7 +979,12 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "reconcile"]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Reconcile { repo, workspace, dry_run },
+                command:
+                    WorkspaceCommand::Reconcile {
+                        repo,
+                        workspace,
+                        dry_run,
+                    },
             } => {
                 assert!(repo.is_none());
                 assert!(workspace.is_none());
@@ -1003,7 +1008,12 @@ mod tests {
         ]);
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Reconcile { repo, workspace, dry_run },
+                command:
+                    WorkspaceCommand::Reconcile {
+                        repo,
+                        workspace,
+                        dry_run,
+                    },
             } => {
                 assert_eq!(repo.as_deref(), Some("mono"));
                 assert_eq!(workspace.as_deref(), Some("mono-agent-008"));

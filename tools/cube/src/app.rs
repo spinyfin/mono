@@ -1143,10 +1143,7 @@ fn run_workspace(
             // All free candidates: effective-free first (preferred), then
             // stale-unhealthy. This combined list is used for the ordered_ids
             // below so --prefer can reference either category.
-            let all_free: Vec<&WorkspaceRecord> = effective_free
-                .iter()
-                .chain(stale_unhealthy.iter())
-                .collect();
+            let all_free: Vec<&WorkspaceRecord> = effective_free.iter().chain(stale_unhealthy.iter()).collect();
 
             // Ordering: try the --prefer workspace first; effective-free before
             // stale-dirty so we skip the stale-dirty jj-status cost when a clean
@@ -1201,16 +1198,20 @@ fn run_workspace(
                 let outcome = check_workspace_health(runner, database_path, &ws.workspace_path)?;
                 match outcome {
                     WorkspaceHealthOutcome::Clean => {
+                        let was_stale_dirty = matches!(
+                            ws.health_status,
+                            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+                        );
                         health_checks.push(json!({
                             "workspace_id": ws_id,
                             "health": "clean",
                             "skipped": false,
-                            "was_stale_dirty": ws.health_status.is_some(),
+                            "was_stale_dirty": was_stale_dirty,
                         }));
                         // If the workspace was previously marked unhealthy in the
                         // DB (stale dirty/conflicted), update the DB so
                         // subsequent `list` and GC passes see the correct state.
-                        if ws.health_status.is_some() {
+                        if was_stale_dirty {
                             store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Clean)?;
                             audit!(
                                 database_path,
@@ -5129,7 +5130,11 @@ fn reconcile_free_workspace_health(
     let mut report = ReconcileHealthReport::default();
 
     for record in candidates {
-        let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown").to_string();
+        let prior_health = record
+            .health_status
+            .map(|h| h.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
         if !workspace_path_exists(&record) {
             report.skipped.push(ReconcileHealthEntry {
@@ -7801,7 +7806,10 @@ mod tests {
         // The workspace is now leased; claim clears health_status to NULL.
         assert_eq!(ws.state, crate::metadata::WorkspaceState::Leased);
         assert!(ws.health_status.is_none(), "health_status should be NULL after claim");
-        assert!(ws.unhealthy_since_epoch_s.is_none(), "unhealthy_since should be cleared");
+        assert!(
+            ws.unhealthy_since_epoch_s.is_none(),
+            "unhealthy_since should be cleared"
+        );
     }
 
     #[test]
@@ -7852,7 +7860,12 @@ mod tests {
 
         let runner = FakeRunner::new(vec![
             // 1. effective-free 005 checked first → truly dirty → skip
-            ExpectedCommand::ok(eff_free_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(
+                eff_free_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                jj_status_dirty(),
+            ),
             // 2. stale-dirty 007 checked second → clean on disk → promote and use
             ExpectedCommand::ok(stale_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(stale_path.clone(), "jj", &["git", "fetch"], ""),
@@ -7947,7 +7960,10 @@ mod tests {
         let store = Store::open_at(&database_path).unwrap();
         let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
         assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Clean));
-        assert!(ws.unhealthy_since_epoch_s.is_none(), "unhealthy_since must be cleared after promotion");
+        assert!(
+            ws.unhealthy_since_epoch_s.is_none(),
+            "unhealthy_since must be cleared after promotion"
+        );
     }
 
     #[test]
