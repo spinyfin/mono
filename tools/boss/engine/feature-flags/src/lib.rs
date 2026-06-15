@@ -143,6 +143,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              opt in; set to false to kill immediately if it misbehaves.",
         category: "notifications",
         default_enabled: false,
+        capability_id: None,
     },
     FeatureFlagSpec {
         name: "notification_dedup_taxonomy",
@@ -150,6 +151,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              in the dedup comparison set. Requires notification_dedup. Off by default.",
         category: "notifications",
         default_enabled: false,
+        capability_id: None,
     },
     FeatureFlagSpec {
         name: "notification_dedup_sensibility",
@@ -157,6 +159,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              and suppress on High confidence. Requires notification_dedup. Off by default.",
         category: "notifications",
         default_enabled: false,
+        capability_id: None,
     },
 ];
 
