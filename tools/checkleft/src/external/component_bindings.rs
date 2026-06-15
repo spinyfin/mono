@@ -5,9 +5,9 @@
 // (`CheckPre` / `Check`) that the host uses to call `list-checks` and
 // `run-check` on a loaded component.
 //
-// In production code (T3 onward) these bindings are used by the component
-// executor. For T1 their presence here acts as a compile-time proof that the
-// WIT is syntactically valid and generates coherent Rust types.
+// In production code these bindings are used by the component executor. Their
+// presence here also acts as a compile-time proof that the WIT is syntactically
+// valid and generates coherent Rust types.
 wasmtime::component::bindgen!({
     world: "check",
     path: "wit/check.wit",

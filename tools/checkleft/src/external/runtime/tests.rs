@@ -740,12 +740,8 @@ fn precompiled_cwasm_fixture_is_keyed_for_giant_structs() {
     );
 }
 
-// --- T10: rust-giant-structs-use-builder end-to-end test ---
-//
-// This is the acceptance proof for the CM-wasm project: the check is authored
-// on the guest SDK, built end-to-end under bazel via the rust_wasm_component
-// rule (T9), bundled via the BundledExternalCheckPackageProvider (T8), and run
-// through the full component-v1 host (T3-T6) with a modified-only sandbox.
+// End-to-end test: the bundled rust/giant-structs check, run through the full
+// component-v1 host with a modified-only sandbox.
 
 #[test]
 fn bundled_giant_structs_check_finds_violation_in_rs_file() {
