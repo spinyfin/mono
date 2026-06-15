@@ -575,8 +575,8 @@ R docs/old.md => docs/new.md
     #[test]
     fn parses_jj_diff_summary_copy_simple_form() {
         // Copy where old and new share no prefix — jj emits C old => new.
-        let parsed = parse_jj_diff_summary("C old/file.rs => new/file.rs\n")
-            .expect("parse jj diff summary with simple C line");
+        let parsed =
+            parse_jj_diff_summary("C old/file.rs => new/file.rs\n").expect("parse jj diff summary with simple C line");
 
         assert_eq!(parsed.changed_files.len(), 1);
         let f = &parsed.changed_files[0];
@@ -588,38 +588,31 @@ R docs/old.md => docs/new.md
     #[test]
     fn parses_jj_diff_summary_copy_does_not_delete_source() {
         // A copy must NOT produce a Deleted entry for the source path.
-        let parsed = parse_jj_diff_summary(
-            "A src/kept.rs\nC src/{old => new}/lib.rs\n",
-        )
-        .expect("parse jj diff summary copy without deleted source");
+        let parsed = parse_jj_diff_summary("A src/kept.rs\nC src/{old => new}/lib.rs\n")
+            .expect("parse jj diff summary copy without deleted source");
 
         let deleted: Vec<_> = parsed
             .changed_files
             .iter()
             .filter(|f| f.kind == ChangeKind::Deleted)
             .collect();
-        assert!(deleted.is_empty(), "copy must not mark the source as deleted: {deleted:?}");
+        assert!(
+            deleted.is_empty(),
+            "copy must not mark the source as deleted: {deleted:?}"
+        );
         assert_eq!(parsed.changed_files.len(), 2);
     }
 
     #[test]
     fn parses_jj_diff_summary_rename_with_brace_expansion() {
-        let parsed = parse_jj_diff_summary(
-            "R tools/checks/{old-check => new-check}/BUILD.bazel\n",
-        )
-        .expect("parse jj diff summary rename with brace expansion");
+        let parsed = parse_jj_diff_summary("R tools/checks/{old-check => new-check}/BUILD.bazel\n")
+            .expect("parse jj diff summary rename with brace expansion");
 
         assert_eq!(parsed.changed_files.len(), 1);
         let f = &parsed.changed_files[0];
         assert_eq!(f.kind, ChangeKind::Renamed);
-        assert_eq!(
-            f.path,
-            PathBuf::from("tools/checks/new-check/BUILD.bazel")
-        );
-        assert_eq!(
-            f.old_path,
-            Some(PathBuf::from("tools/checks/old-check/BUILD.bazel"))
-        );
+        assert_eq!(f.path, PathBuf::from("tools/checks/new-check/BUILD.bazel"));
+        assert_eq!(f.old_path, Some(PathBuf::from("tools/checks/old-check/BUILD.bazel")));
     }
 
     #[test]
@@ -632,8 +625,8 @@ R docs/old.md => docs/new.md
     #[test]
     fn brace_expansion_handles_filename_fragment() {
         // Brace notation can appear in the middle of a filename (not just a directory).
-        let (old, new) = try_expand_brace_notation("src/file_{old => new}.rs")
-            .expect("brace expansion in filename fragment");
+        let (old, new) =
+            try_expand_brace_notation("src/file_{old => new}.rs").expect("brace expansion in filename fragment");
         assert_eq!(old, PathBuf::from("src/file_old.rs"));
         assert_eq!(new, PathBuf::from("src/file_new.rs"));
     }
@@ -641,8 +634,8 @@ R docs/old.md => docs/new.md
     #[test]
     fn brace_expansion_handles_no_shared_prefix() {
         // Brace at the very start with no prefix.
-        let (old, new) = try_expand_brace_notation("{old-dir => new-dir}/file.rs")
-            .expect("brace expansion at path start");
+        let (old, new) =
+            try_expand_brace_notation("{old-dir => new-dir}/file.rs").expect("brace expansion at path start");
         assert_eq!(old, PathBuf::from("old-dir/file.rs"));
         assert_eq!(new, PathBuf::from("new-dir/file.rs"));
     }
