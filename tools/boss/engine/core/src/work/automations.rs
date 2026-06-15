@@ -261,6 +261,44 @@ impl WorkDb {
         Ok(count)
     }
 
+    /// Find the most recently created open task for an automation, or `None` if
+    /// none exist. "Open" = any non-terminal status (`todo`, `ready`, `active`,
+    /// `in_review`, `blocked`). Ordered by `created_at DESC` so the newest task
+    /// is returned when multiple open tasks exist (possible when
+    /// `open_task_limit > 1`).
+    ///
+    /// Used by the triage finalizer's marker-recovery path: when a triage run
+    /// ends without a decision marker but DID create a task (the worker ran
+    /// `boss task create --automation` then stopped before emitting the marker),
+    /// the finalizer calls this to record `produced_task` instead of
+    /// `failed_will_retry`, preventing the retry loop from over-producing
+    /// duplicate tasks until the open-task cap is full.
+    pub fn find_most_recent_open_task_for_automation(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<boss_protocol::Task>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
+                    source_automation_id
+               FROM tasks
+              WHERE source_automation_id = ?1
+                AND status IN ('todo', 'ready', 'active', 'in_review', 'blocked')
+                AND deleted_at IS NULL
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1",
+            [automation_id],
+            map_task_with_source_automation_id,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// List `automation_runs` rows for an automation, newest first.
     pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<boss_protocol::AutomationRun>> {
         let conn = self.connect()?;

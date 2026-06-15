@@ -711,3 +711,119 @@ fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
         .unwrap()
     );
 }
+
+// ── find_most_recent_open_task_for_automation ────────────────────────────────
+
+/// Returns None when the automation has no tasks at all.
+#[test]
+fn find_most_recent_open_task_returns_none_when_no_tasks() {
+    let db = WorkDb::open(temp_db_path("auto-find-none")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 3);
+    assert!(
+        db.find_most_recent_open_task_for_automation(&automation.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Returns the single open task when exactly one exists.
+#[test]
+fn find_most_recent_open_task_returns_open_task() {
+    let db = WorkDb::open(temp_db_path("auto-find-one")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 2);
+
+    let task = db.create_automation_task(&automation.id, "fix clippy", None).unwrap();
+
+    let found = db
+        .find_most_recent_open_task_for_automation(&automation.id)
+        .unwrap()
+        .expect("must return the one open task");
+    assert_eq!(found.id, task.id);
+    assert_eq!(found.source_automation_id.as_deref(), Some(automation.id.as_str()));
+}
+
+/// Returns None when all tasks are in terminal states.
+#[test]
+fn find_most_recent_open_task_ignores_done_tasks() {
+    let db = WorkDb::open(temp_db_path("auto-find-done")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 2);
+
+    let task = db.create_automation_task(&automation.id, "already done", None).unwrap();
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        db.find_most_recent_open_task_for_automation(&automation.id)
+            .unwrap()
+            .is_none(),
+        "a completed task must not be returned"
+    );
+}
+
+/// When multiple open tasks exist (e.g. after `open_task_limit > 1` or after
+/// a retry created duplicates before the cap was full), the most recently
+/// created task is returned.
+#[test]
+fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open() {
+    let db = WorkDb::open(temp_db_path("auto-find-recent")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 3);
+
+    let t1 = db.create_automation_task(&automation.id, "task one", None).unwrap();
+    let t2 = db.create_automation_task(&automation.id, "task two", None).unwrap();
+
+    // t2 was created after t1 — must be returned.
+    let found = db
+        .find_most_recent_open_task_for_automation(&automation.id)
+        .unwrap()
+        .expect("must return the newest open task");
+    assert_eq!(
+        found.id, t2.id,
+        "must return the most recently created open task (t2), not t1={} t2={}",
+        t1.id, t2.id
+    );
+
+    // Mark t2 done — now t1 must be returned.
+    db.update_work_item(
+        &t2.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let found2 = db
+        .find_most_recent_open_task_for_automation(&automation.id)
+        .unwrap()
+        .expect("t1 still open");
+    assert_eq!(found2.id, t1.id);
+}
+
+/// Does not surface a soft-deleted task.
+#[test]
+fn find_most_recent_open_task_ignores_deleted_tasks() {
+    let db = WorkDb::open(temp_db_path("auto-find-deleted")).unwrap();
+    let product = make_product(&db);
+    let automation = make_automation(&db, &product.id, 2);
+
+    let task = db
+        .create_automation_task(&automation.id, "to be deleted", None)
+        .unwrap();
+    db.delete_work_item(&task.id).unwrap();
+
+    assert!(
+        db.find_most_recent_open_task_for_automation(&automation.id)
+            .unwrap()
+            .is_none(),
+        "soft-deleted task must not be returned"
+    );
+}
