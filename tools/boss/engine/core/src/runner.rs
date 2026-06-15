@@ -2106,6 +2106,26 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         out.push_str(&bk_cmds);
     }
 
+    if !is_rebounce {
+        out.push_str("### If CI is already green (nothing to fix)\n\n");
+        out.push_str(&format!(
+            "Before assuming there is work to do, check the **current** state of the PR's required \
+             checks (`gh pr checks {pr}` / `gh pr view {pr}`). If they are **already passing** — the \
+             failure cleared on its own (a flaky check settled, `main` moved, or a stale failure was \
+             re-detected) — you do NOT have to invent a fix. Declare it; the engine VALIDATES your \
+             claim against live CI before retiring the attempt:\n\n\
+             ```\n\
+             boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+             ```\n\n\
+             The engine independently re-probes live CI for the PR's current head SHA. If every \
+             required check is verified green, the attempt is retired and the parent unblocks — you are \
+             **done, stop**. If CI is still red or pending, the command **fails** (non-zero exit) with \
+             the live status and the attempt stays open: the failure is real, so continue below.\n\n",
+            pr = attempt.pr_url,
+            attempt = attempt.id,
+        ));
+    }
+
     if attempt.attempt_kind == "retrigger" {
         out.push_str("### Action: retrigger the failing build\n\n");
         out.push_str(
@@ -2291,6 +2311,23 @@ fn compose_ci_remediation_prompt(
         ),
     }
     prompt.push('\n');
+
+    // If the failure already cleared, the worker can declare a
+    // validated noop rather than retriggering a build that is no longer
+    // red. The engine re-probes live CI before honoring it.
+    prompt.push_str("### If CI is already green (nothing to fix)\n\n");
+    prompt.push_str(&format!(
+        "Check the **current** required checks first (`gh pr checks {pr}`). If they are already \
+         passing, declare it instead of retriggering — the engine validates the claim against live \
+         CI before retiring the attempt:\n\n\
+         ```\n\
+         boss engine ci mark-noop --attempt-id {attempt} --observed-sha <current-head-sha> --reason already-green\n\
+         ```\n\n\
+         Verified green → attempt retired, parent unblocked, you are done. Still red/pending → the \
+         command fails (non-zero) and the attempt stays open; fall through to the retrigger playbook.\n\n",
+        pr = attempt.pr_url,
+        attempt = attempt.id,
+    ));
 
     // §Q4 retrigger playbook: every failure is unambiguous infra,
     // no log read needed, no code change.

@@ -2544,6 +2544,128 @@ fn ci_failure_block_mark_clear_rearm_lifecycle() {
     assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
 }
 
+/// The validated-green "no CI to fix" retire
+/// (`mark_ci_remediation_validated_green`) is the DB half of the
+/// `boss engine ci mark-noop` gate. It atomically flips the attempt to
+/// `succeeded` (stamping the validated head SHA + a `validated_green`
+/// audit discriminator), unblocks the parent out of the CI-failure
+/// loop, clears the signal, and resets the per-PR attempt counter.
+/// Idempotent on a terminal row.
+#[test]
+fn validated_green_noop_retires_attempt_and_unblocks_parent() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "ci-validated-green");
+    let pr = "https://github.com/spinyfin/mono/pull/950";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    let attempt = db
+        .insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 950,
+            head_branch: "feature-x".into(),
+            head_sha_at_trigger: "sha-old".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("insert");
+
+    // The badgering state: parent blocked: ci_failure, counter bumped,
+    // attempt still pending.
+    db.mark_chore_blocked_ci_failure(&chore, pr, None)
+        .unwrap()
+        .expect("block");
+    db.increment_ci_attempts_used(&chore).unwrap();
+    assert_eq!(task_of(&db, &chore).status, TaskStatus::Blocked);
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+
+    // Validated-green retire keyed to the CURRENT (advanced) head SHA.
+    let retired = db
+        .mark_ci_remediation_validated_green(&attempt.id, Some("sha-new-green"))
+        .unwrap()
+        .expect("validated-green flip");
+    assert_eq!(retired.status, "succeeded");
+    assert_eq!(retired.head_sha_after.as_deref(), Some("sha-new-green"));
+    assert_eq!(
+        retired.failure_reason.as_deref(),
+        Some("validated_green"),
+        "the audit discriminator marks this as a validated-green retire",
+    );
+
+    // Parent left the loop: in_review, no block, no active signal, fresh budget.
+    let t = task_of(&db, &chore);
+    assert_eq!(t.status, TaskStatus::InReview);
+    assert!(t.blocked_reason.is_none());
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "the validated-green retire clears the active ci_failure signal",
+    );
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        0,
+        "a completed cycle resets the per-PR attempt counter",
+    );
+
+    // Idempotent: the row is terminal now, so a repeat is a no-op.
+    assert!(
+        db.mark_ci_remediation_validated_green(&attempt.id, Some("sha-new-green"))
+            .unwrap()
+            .is_none(),
+        "a second validated-green call on a terminal row writes nothing",
+    );
+}
+
+/// The validated-green retire also handles the in_review-with-revision
+/// model, where the parent's status never moved to `blocked` — only the
+/// in-flight `ci_failure` signal is armed. The retire must clear that
+/// signal so the merge-poller's clear path does not re-fire.
+#[test]
+fn validated_green_noop_clears_in_flight_signal_without_blocked_status() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "ci-validated-green-inflight");
+    let pr = "https://github.com/spinyfin/mono/pull/951";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    let attempt = db
+        .insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 951,
+            head_branch: "feature-y".into(),
+            head_sha_at_trigger: "sha-old".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("insert");
+
+    // in_review-with-revision: the signal is armed but the status stays
+    // in_review (the parent was never flipped to blocked).
+    db.record_ci_failure_in_flight(&chore, &attempt.id).unwrap();
+    assert_eq!(task_of(&db, &chore).status, TaskStatus::InReview);
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
+
+    db.mark_ci_remediation_validated_green(&attempt.id, Some("sha-green"))
+        .unwrap()
+        .expect("validated-green flip");
+
+    assert_eq!(task_of(&db, &chore).status, TaskStatus::InReview);
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "the retire clears the in-flight signal even though status never blocked",
+    );
+}
+
 /// Merge-conflict counterpart of the CI-failure lifecycle test, exercising
 /// `clear_chore_blocked_merge_conflict` and
 /// `rearm_blocked_merge_conflict_signal` (both live, previously untested):

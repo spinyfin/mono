@@ -949,6 +949,16 @@ enum EngineCiCommand {
     /// `consumes_budget = 0` and decrements `tasks.ci_attempts_used`
     /// to refund the detection-side bump.
     MarkSucceededViaRebase(EngineCiMarkSucceededViaRebaseArgs),
+    /// Declare "there is no CI to fix — the PR's required checks are
+    /// already green." The engine does NOT take your word for it: it
+    /// independently re-probes LIVE CI for the PR's current head SHA
+    /// and only honors the claim when every required check is verified
+    /// passing on that exact SHA. Verified green → the attempt is
+    /// retired and the parent unblocks (exit 0). Still red / pending /
+    /// SHA moved → REJECTED (non-zero exit, clear receipt) and the row
+    /// stays actionable. Use this instead of being badgered to "fix" a
+    /// failure that no longer exists.
+    MarkNoop(EngineCiMarkNoopArgs),
     /// Per-PR / per-product CI attempt budget management.
     Budget {
         #[command(subcommand)]
@@ -1191,6 +1201,24 @@ struct EngineCiMarkSucceededViaRebaseArgs {
     /// Attempt id from the `ci_remediations` table.
     #[arg(long = "attempt-id")]
     attempt_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiMarkNoopArgs {
+    /// Attempt id from the `ci_remediations` table (`cir_…`). The
+    /// current attempt id is part of the worker's spawn prompt.
+    #[arg(long = "attempt-id")]
+    attempt_id: String,
+    /// The head SHA you observed to be green when you decided there was
+    /// nothing to fix. Advisory: the engine always re-validates against
+    /// the PR's CURRENT head SHA, so if the head advanced the claim is
+    /// re-checked against the new commit (never honored on a stale one).
+    #[arg(long = "observed-sha")]
+    observed_sha: Option<String>,
+    /// Free-form note recorded with the decision. Defaults to
+    /// `already_green`.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -5257,6 +5285,58 @@ async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunContext) -> Re
                     Err(CliError::application(message))
                 }
                 other => Err(unexpected_event("ci mark-succeeded-via-rebase", &other)),
+            }
+        }
+        EngineCiCommand::MarkNoop(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::MarkCiRemediationNoop {
+                    attempt_id: args.attempt_id.clone(),
+                    observed_sha: args.observed_sha.clone(),
+                    reason: args.reason.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationNoopValidated {
+                    attempt,
+                    validated_sha,
+                    observed_sha,
+                } => print_entity(
+                    ctx,
+                    &serde_json::json!({
+                        "attempt": attempt,
+                        "validated_sha": validated_sha,
+                        "observed_sha": observed_sha,
+                    }),
+                    || {
+                        if !ctx.quiet {
+                            let sha = validated_sha.as_deref().unwrap_or("<unknown>");
+                            println!(
+                                "ci_remediation {} validated green on {} — attempt retired, parent unblocked.",
+                                attempt.id, sha,
+                            );
+                            if let (Some(obs), Some(live)) = (observed_sha.as_deref(), validated_sha.as_deref())
+                                && obs != live
+                            {
+                                println!(
+                                    "(head advanced since you observed {obs}; re-validated against current head {live}.)"
+                                );
+                            }
+                        }
+                    },
+                ),
+                // A rejection is a real pass/fail receipt: the claim was
+                // NOT honored, so exit non-zero with the live status so
+                // the worker knows it must keep working.
+                FrontendEvent::CiRemediationNoopRejected { status, live_sha, .. } => {
+                    let sha = live_sha.as_deref().unwrap_or("current head");
+                    Err(CliError::application(format!("CI not green on {sha}: {status}")))
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci mark-noop", &other)),
             }
         }
         EngineCiCommand::List(args) => {

@@ -44,7 +44,9 @@ use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::ExecutionPublisher;
-use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
+use crate::merge_poller::{
+    OpenPrCiStatus, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out,
+};
 use crate::work::{
     CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
     StrandedCiRemediationAttempt, WorkDb,
@@ -1604,6 +1606,75 @@ pub async fn on_ci_resolved(
         "ci_watch: CI back at clean; retire path ran",
     );
     true
+}
+
+/// Verdict of validating an agent's "no CI to fix — it's already
+/// green" claim against a LIVE probe of the PR's current head SHA.
+/// This is the decision half of the `boss engine ci mark-noop`
+/// validation gate; the engine handler runs the (impure) probe, then
+/// calls this to decide whether to honor or reject.
+///
+/// The verdict is always derived from the probe's CURRENT head SHA
+/// (`PrLifecycleProbe::head_ref_oid`) and CURRENT CI rollup — never a
+/// cached status and never the SHA the worker happened to observe. So
+/// if the head advanced since the worker looked, the claim is
+/// re-validated against the new head: green-now → honored, anything
+/// else → rejected. There is no path that honors a stale commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoopValidation {
+    /// Every required check is verified passing on `head_sha`. Honor
+    /// the claim: retire the attempt and unblock the parent.
+    Green { head_sha: Option<String> },
+    /// CI is not green on the current head SHA (still failing, still
+    /// pending/in-flight, or the PR is no longer an open mergeable
+    /// candidate). Reject the claim and keep the row actionable.
+    /// `status` is a human-readable description of what the live probe
+    /// saw, for the rejection receipt.
+    Rejected { head_sha: Option<String>, status: String },
+}
+
+/// Decide whether to honor a "no CI to fix" claim from a LIVE probe of
+/// the PR. Pure so the validation rule is unit-testable without `gh`.
+///
+/// "Green" reuses the merge-poller's [`OpenPrCiStatus::Clean`] notion
+/// — every required check is `SUCCESS`/`NEUTRAL`/`SKIPPED` and the
+/// rollup is terminal (no still-running checks). This is the exact
+/// same predicate `on_ci_resolved` clears on, so the validated-green
+/// decision and the ci_watch retire path share one notion of "CI
+/// status for the head SHA". A `Merged` PR is treated as green-and-
+/// moot (branch protection means it could not have merged red); a
+/// closed-unmerged PR is rejected (it is the human's problem, not a
+/// validated-green escape).
+pub fn classify_noop_validation(probe: &PrLifecycleProbe) -> NoopValidation {
+    let head_sha = probe.head_ref_oid.clone();
+    match &probe.state {
+        PrLifecycleState::Open(open) => match &open.ci {
+            OpenPrCiStatus::Clean => NoopValidation::Green { head_sha },
+            OpenPrCiStatus::Failing { failures } => {
+                let names = failures.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ");
+                let detail = if names.is_empty() {
+                    "required checks still failing".to_owned()
+                } else {
+                    format!("required checks still failing: {names}")
+                };
+                NoopValidation::Rejected {
+                    head_sha,
+                    status: detail,
+                }
+            }
+            OpenPrCiStatus::InFlight => NoopValidation::Rejected {
+                head_sha,
+                status: "required checks have not finished yet (still pending/in-flight)".to_owned(),
+            },
+        },
+        // The PR merged — branch protection means CI was green to land.
+        // The remediation loop is moot; honoring retires it cleanly.
+        PrLifecycleState::Merged => NoopValidation::Green { head_sha },
+        PrLifecycleState::ClosedUnmerged => NoopValidation::Rejected {
+            head_sha,
+            status: "PR is closed and unmerged — not a validated-green state".to_owned(),
+        },
+    }
 }
 
 fn encode_failed_checks(failures: &[RequiredCheckFailure]) -> String {
