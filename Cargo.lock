@@ -638,7 +638,6 @@ name = "checkleft-file-ifchange"
 version = "0.1.0"
 dependencies = [
  "checkleft-check-sdk",
- "serde",
  "tempfile",
 ]
 

@@ -323,7 +323,7 @@ Config keys:
 - `severity` (optional `error|warning|info`, default `error`)
 - `remediation` (optional string)
 
-## `ifchange-thenchange`
+## `file/ifchange`
 
 Purpose:
 

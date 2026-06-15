@@ -22,14 +22,24 @@
 //! This check has no configuration surface; all parameters are intrinsic to the
 //! LINT markers in the source files.
 //!
-//! ## Known limitation
+//! ## Known limitation: base-revision enforcement is not available
 //!
-//! The WASM sandbox exposes only the *current* file tree. If a file that contains
-//! `LINT.IfChange` markers is **deleted** as part of a change, the check cannot
-//! inspect the old content and will not flag missing target updates for the deleted
-//! file's blocks. This is a behaviour gap relative to the former native
-//! implementation, which could read the base version of deleted files. All other
-//! cases (modified files, new files, renamed files) are fully enforced.
+//! The WASM sandbox exposes only the *current* file tree; it cannot read the
+//! base revision of a changed file. This creates two enforcement gaps relative
+//! to the former native implementation:
+//!
+//! 1. **Deleted files** — if a file containing `LINT.IfChange` markers is
+//!    deleted as part of a change, the check cannot inspect the old content and
+//!    will not flag missing target updates for the deleted file's blocks.
+//!
+//! 2. **Removed markers on existing files** — if a change edits the guarded
+//!    region in a still-present file *and simultaneously removes* its
+//!    `LINT.IfChange`/`LINT.ThenChange` markers, the check sees neither the
+//!    block nor the edit in the current tree and reports nothing. The former
+//!    native implementation (which read the base revision) would have caught
+//!    this as a contract-removal violation.
+//!
+//! All other cases (modified files, new files, renamed files) are fully enforced.
 
 use std::collections::{BTreeMap, BTreeSet};
 

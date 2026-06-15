@@ -10,7 +10,6 @@ description = "checkleft check (file/ifchange): require linked files or blocks t
 # needed here because this crate does not call `export_checks!`.
 [dependencies]
 checkleft-check-sdk = { path = "../../../sdk" }
-serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
