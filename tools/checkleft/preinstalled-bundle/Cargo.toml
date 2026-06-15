@@ -16,4 +16,5 @@ crate-type = ["cdylib"]
 checkleft-check-sdk = { path = "../sdk" }
 checkleft-file-size = { path = "../checks/file/size" }
 checkleft-rust-giant-structs = { path = "../checks/rust/giant-structs" }
+checkleft-rust-giant-structs-create = { path = "../checks/rust/giant-structs-create" }
 wit-bindgen = "0.51"

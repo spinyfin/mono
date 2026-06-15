@@ -1,0 +1,22 @@
+[package]
+name = "checkleft-rust-giant-structs-create"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (rust/giant-structs-create): flag Rust struct instantiations with too many explicit fields that should use a builder"
+
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component.
+[lib]
+name = "checkleft_rust_giant_structs_create"
+
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+checkleft-rust-giant-structs-common = { path = "../giant-structs-common" }
+globset = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+syn = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

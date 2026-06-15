@@ -45,6 +45,10 @@ use checkleft_check_sdk::export_checks;
 // that name from the function ident it is given and references it via `super::`.
 // The `rust/giant-structs` stale-exclusion audit hooks are plain functions.
 use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
+use checkleft_rust_giant_structs_create::{
+    __CHECKLEFT_ENTRY_giant_structs_create_check, giant_structs_create_declared_exclusions,
+    giant_structs_create_evaluate_exclusion,
+};
 use checkleft_rust_giant_structs_use_builder::{
     __CHECKLEFT_ENTRY_giant_structs_check, giant_structs_declared_exclusions, giant_structs_evaluate_exclusion,
 };
@@ -56,5 +60,11 @@ export_checks!(
         "rust/giant-structs",
         giant_structs_declared_exclusions,
         giant_structs_evaluate_exclusion
+    ),
+    giant_structs_create_check,
+    exclusion_audit(
+        "rust/giant-structs-create",
+        giant_structs_create_declared_exclusions,
+        giant_structs_create_evaluate_exclusion
     ),
 );

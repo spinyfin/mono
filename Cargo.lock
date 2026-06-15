@@ -662,6 +662,7 @@ dependencies = [
  "checkleft-check-sdk",
  "checkleft-file-size",
  "checkleft-rust-giant-structs",
+ "checkleft-rust-giant-structs-create",
  "wit-bindgen 0.51.0",
 ]
 
@@ -670,6 +671,26 @@ name = "checkleft-rust-giant-structs"
 version = "0.1.0"
 dependencies = [
  "checkleft-check-sdk",
+ "serde",
+ "serde_json",
+ "syn",
+ "tempfile",
+]
+
+[[package]]
+name = "checkleft-rust-giant-structs-common"
+version = "0.1.0"
+dependencies = [
+ "syn",
+]
+
+[[package]]
+name = "checkleft-rust-giant-structs-create"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "checkleft-rust-giant-structs-common",
+ "globset",
  "serde",
  "serde_json",
  "syn",
