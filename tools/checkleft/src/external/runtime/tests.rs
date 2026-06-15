@@ -1130,3 +1130,48 @@ fn file_size_exclude_files_is_scoped_to_the_config_subtree() {
         "only the file outside the config subtree should be flagged"
     );
 }
+
+/// An `exclude_structs` entry in a CHECKS config suppresses a
+/// `rust/giant-structs-create` finding: the host's `struct_name_from_finding`
+/// helper parses the create-check message format (`struct \`Name\` is constructed
+/// with …`) correctly, so the named struct is filtered out.
+#[test]
+fn giant_structs_create_exclude_structs_suppresses_finding() {
+    // A 6-field struct literal — triggers rust/giant-structs-create at default threshold.
+    const CREATE_VIOLATION: &str = r#"fn make() -> Giant {
+    Giant { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }
+}
+"#;
+
+    let temp = tempdir().expect("temp dir");
+    write_file(temp.path(), "src.rs", CREATE_VIOLATION);
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    // A simple name exclusion: suppresses the `Giant` struct in the whole subtree.
+    let config = toml::Value::Table(toml::toml! {
+        exclude_structs = ["Giant"]
+    });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let result = executor
+        .execute(
+            &bundled_package("rust/giant-structs-create"),
+            &changeset,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+        )
+        .expect("execute");
+
+    assert!(
+        result.findings.is_empty(),
+        "exclude_structs = [\"Giant\"] must suppress the create finding; got: {:?}",
+        result.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}

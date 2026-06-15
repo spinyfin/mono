@@ -23,6 +23,7 @@ rust_shared_library(
     deps = [
         "//tools/checkleft/checks/file/size:file_size_check",
         "//tools/checkleft/checks/rust/giant-structs:rust_giant_structs_use_builder",
+        "//tools/checkleft/checks/rust/giant-structs-create:rust_giant_structs_create",
         "//tools/checkleft/sdk:checkleft_check_sdk",
     ] + all_crate_deps(normal = True),
 )

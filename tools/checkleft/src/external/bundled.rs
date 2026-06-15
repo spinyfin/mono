@@ -127,7 +127,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
     // that separation keeps checkleft_lib in "source mode" and preserves
     // CARGO_MANIFEST_DIR for bindgen!.
     BundledCheckDef {
-        check_names: &["file/size", "rust/giant-structs"],
+        check_names: &["file/size", "rust/giant-structs", "rust/giant-structs-create"],
         kind: BundledCheckDefKind::Component {
             bytes: checkleft_preinstalled_wasm_bundle::WASM,
         },

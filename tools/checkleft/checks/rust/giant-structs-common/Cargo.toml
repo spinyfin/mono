@@ -1,0 +1,11 @@
+[package]
+name = "checkleft-rust-giant-structs-common"
+version = "0.1.0"
+edition.workspace = true
+description = "Shared AST helpers for the rust/giant-structs and rust/giant-structs-create checkleft checks"
+
+[lib]
+name = "checkleft_rust_giant_structs_common"
+
+[dependencies]
+syn = { workspace = true }
