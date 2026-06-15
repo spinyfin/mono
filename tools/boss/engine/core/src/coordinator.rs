@@ -10148,6 +10148,369 @@ mod tests {
         );
     }
 
+    /// Redundant-spawn guard emits `host_selected:error` with `reason=redundant_spawn`
+    /// when a live execution already exists for the same work item. The execution is
+    /// marked abandoned (not left ready), and the stall watchdog must not fire because
+    /// the terminal `host_selected:error` event closes the stage immediately.
+    #[tokio::test]
+    async fn redundant_spawn_guard_emits_terminal_host_selected_error() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Redundant-spawn chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+
+        // Simulate the race: a first execution is already live (running).
+        let _live_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // A second, redundant `ready` execution arrives (the one under test).
+        let redundant_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&redundant_exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&redundant_exec, &worker_id).await;
+        assert!(result.is_err(), "redundant spawn must be rejected: {result:?}");
+
+        // Dispatch timeline: must carry a terminal host_selected:error with the right reason.
+        let events = recording.events_for(&redundant_exec.id).await;
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .unwrap_or_else(|| panic!("expected host_selected event; got {events:#?}"));
+        assert_eq!(
+            host_selected.outcome, "error",
+            "redundant_spawn must surface as host_selected:error; got {host_selected:?}",
+        );
+        assert_eq!(
+            host_selected.details.get("reason").and_then(|v| v.as_str()),
+            Some("redundant_spawn"),
+            "host_selected:error must name redundant_spawn reason; got {:?}",
+            host_selected.details,
+        );
+        assert!(
+            crate::dispatch_reader::is_terminal_event(host_selected),
+            "host_selected:error must be terminal so the stall watchdog never fires",
+        );
+
+        // No stage_stalled must appear — the terminal event closes the stage immediately.
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            !stages.contains(&"stage_stalled"),
+            "redundant_spawn must not produce a stage_stalled event; got {stages:?}",
+        );
+
+        // Post-condition: the redundant execution is abandoned, not left in a live state.
+        let after = db.get_execution(&redundant_exec.id).unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::Abandoned,
+            "redundant execution must be marked abandoned; got {:?}",
+            after.status,
+        );
+
+        // No cube workspace was touched.
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased for a redundant spawn",
+        );
+    }
+
+    /// Chain-serialized backstop guard emits `host_selected:error` with
+    /// `reason=chain_serialized_backstop` when a live execution exists on a
+    /// different work item in the same revision chain. This guard is the backstop
+    /// for `force_dispatch` (the auto-dispatcher pre-filters at the worker-claim
+    /// stage). The deferred execution must stay `ready` so it can be re-dispatched
+    /// once the live sibling reaps; it must NOT be abandoned. The stall watchdog
+    /// must not fire because the terminal event closes the stage immediately.
+    #[tokio::test]
+    async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1849";
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            // Revision hanging off the chain root (same PR, different work item).
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_backstop', product_id, 'revision', 'Resolve conflicts backstop', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live implementation resume on the chain root (blocks the revision).
+        let _root_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // Ready conflict-resolution revision execution targeting the same PR.
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_backstop")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        // Use force_dispatch to hit the schedule_execution backstop (the auto-dispatcher
+        // pre-filters this case before claiming a worker, so force_dispatch is the path
+        // that actually reaches this guard in production).
+        let result = coordinator.force_dispatch(&revision_exec.id).await;
+        assert!(
+            result.is_err(),
+            "chain-serialized revision must be deferred: {result:?}",
+        );
+
+        // Dispatch timeline: must carry a terminal host_selected:error with the right reason.
+        let events = recording.events_for(&revision_exec.id).await;
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .unwrap_or_else(|| panic!("expected host_selected event; got {events:#?}"));
+        assert_eq!(
+            host_selected.outcome, "error",
+            "chain_serialized_backstop must surface as host_selected:error; got {host_selected:?}",
+        );
+        assert_eq!(
+            host_selected.details.get("reason").and_then(|v| v.as_str()),
+            Some("chain_serialized_backstop"),
+            "host_selected:error must name chain_serialized_backstop reason; got {:?}",
+            host_selected.details,
+        );
+        assert!(
+            crate::dispatch_reader::is_terminal_event(host_selected),
+            "host_selected:error must be terminal so the stall watchdog never fires",
+        );
+
+        // No stage_stalled — the terminal event closes the stage immediately.
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            !stages.contains(&"stage_stalled"),
+            "chain_serialized_backstop must not produce stage_stalled; got {stages:?}",
+        );
+
+        // Post-condition: deferred, NOT abandoned — execution stays ready for re-dispatch.
+        let after = db.get_execution(&revision_exec.id).unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::Ready,
+            "chain-serialized execution must stay ready (deferred, not abandoned); got {:?}",
+            after.status,
+        );
+
+        // No cube workspace was touched.
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased while serialized behind a live chain sibling",
+        );
+    }
+
+    /// Gating-prereqs guard emits `host_selected:error` with
+    /// `reason=gating_prereqs_blocked` when the work item has an unmet
+    /// prerequisite at dispatch time. The execution must be downgraded to
+    /// `waiting_dependency` (not abandoned) so it can be re-promoted when the
+    /// gate clears. The stall watchdog must not fire because the terminal event
+    /// closes the stage immediately.
+    #[tokio::test]
+    async fn gating_prereqs_guard_emits_terminal_host_selected_error() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        // prereq: a chore that has not yet completed.
+        let prereq = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Prereq (still active)")
+                    .build(),
+            )
+            .unwrap();
+
+        // dependent: the gated chore.
+        let dep = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Gated chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+
+        // Wire the blocks edge: dep requires prereq to be done first.
+        db.add_dependency(AddDependencyInput {
+            dependent: dep.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Simulate the timing race: a `ready` execution created before the dep edge committed.
+        let gated_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(dep.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&gated_exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&gated_exec, &worker_id).await;
+        assert!(result.is_err(), "gated execution must be refused: {result:?}");
+
+        // Dispatch timeline: must carry a terminal host_selected:error with the right reason.
+        let events = recording.events_for(&gated_exec.id).await;
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .unwrap_or_else(|| panic!("expected host_selected event; got {events:#?}"));
+        assert_eq!(
+            host_selected.outcome, "error",
+            "gating_prereqs_blocked must surface as host_selected:error; got {host_selected:?}",
+        );
+        assert_eq!(
+            host_selected.details.get("reason").and_then(|v| v.as_str()),
+            Some("gating_prereqs_blocked"),
+            "host_selected:error must name gating_prereqs_blocked reason; got {:?}",
+            host_selected.details,
+        );
+        assert!(
+            crate::dispatch_reader::is_terminal_event(host_selected),
+            "host_selected:error must be terminal so the stall watchdog never fires",
+        );
+
+        // No stage_stalled — the terminal event closes the stage immediately.
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            !stages.contains(&"stage_stalled"),
+            "gating_prereqs_blocked must not produce stage_stalled; got {stages:?}",
+        );
+
+        // Post-condition: downgraded to waiting_dependency (not abandoned) so it can
+        // be re-promoted when the prerequisite clears.
+        let after = db.get_execution(&gated_exec.id).unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::WaitingDependency,
+            "gated execution must be downgraded to waiting_dependency; got {:?}",
+            after.status,
+        );
+
+        // No cube workspace was touched.
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased for a gated execution",
+        );
+    }
+
     /// Occupancy-guard livelock regression (T1769). When cube keeps handing
     /// back the same occupied workspace, the engine must exclude it on the
     /// next lease call and land on a different free workspace.
