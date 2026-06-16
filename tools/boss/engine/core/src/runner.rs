@@ -998,6 +998,8 @@ pub(crate) async fn compose_worker_spawn(
                 }
                 None => crate::pr_review::ReviewScope::Code,
             };
+            let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
+                .unwrap_or_else(|_| "<owner/repo>".to_owned());
             crate::pr_review::render_reviewer_initial_prompt(
                 task_name,
                 task_description,
@@ -1005,6 +1007,7 @@ pub(crate) async fn compose_worker_spawn(
                 &crate::structured_output::default_path_string(&execution.id),
                 scope,
                 pr_review_context.as_ref(),
+                &reviewer_repo_slug,
             )
         }
     } else {
@@ -1792,6 +1795,12 @@ fn compose_revision_directive(
     out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. Do NOT create a `boss/exec_*` bookmark.\n");
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
     out.push_str(&format!("- What this revision should change: {description}\n"));
+    out.push_str(&format!(
+        "\n**`gh` requires `--repo` in this workspace:** This repo is `{repo_slug}`. \
+         `gh` cannot auto-detect the repo in a jj workspace (there is no `.git` \
+         directory at the root — only `.jj/`). Pass `--repo {repo_slug}` on every \
+         `gh` command: `gh pr view`, `gh pr checks`, `gh pr diff`, `gh api`, etc.\n"
+    ));
     // Issue #804: revision chores (T30–T34 on PR #250) were the worst
     // offenders for pushing red code. Apply the pre-push build gate when
     // the workspace is a Bazel workspace. Conflict-resolution revisions
