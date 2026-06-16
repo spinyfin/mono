@@ -26,9 +26,9 @@
 //!
 //! ## Multi-target `LINT.ThenChange`
 //!
-//! A single `LINT.ThenChange` can list multiple comma-separated targets using
-//! Google's ifchange/thenchange syntax. Every listed target must be updated
-//! in the same change when the guarded region changes:
+//! A single `LINT.ThenChange` can list multiple comma-separated targets.
+//! Every listed target must be updated in the same change when the guarded
+//! region changes:
 //!
 //! ```text
 //! LINT.ThenChange(fileA, fileB)
