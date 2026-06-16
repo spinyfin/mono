@@ -28,6 +28,12 @@ pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 /// advances. See the OAuth device-flow design (§3 state machine, §4 RPC).
 pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
 
+/// Global topic carrying engine-health pushes
+/// ([`FrontendEvent::EngineHealthResult`]). The engine fans every
+/// health-state change (dispatch pause/resume, API key changes, etc.)
+/// out on this topic so subscribed frontends update without polling.
+pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }
@@ -1110,6 +1116,17 @@ pub enum FrontendRequest {
     /// Only the registered app session may call this.
     RegisterBossSession {
         shell_pid: i32,
+    },
+
+    /// App reports the capability IDs compiled into this build. The
+    /// engine updates its in-memory capability registry so the flag
+    /// system can detect when a flag is enabled but its backing
+    /// capability is absent. Sent once per session immediately after
+    /// [`Self::RegisterAppSession`] is acknowledged. Replies with
+    /// [`FrontendEvent::FeatureFlagsList`] so the flag pane
+    /// immediately reflects accurate `capability_present` state.
+    RegisterCapabilities {
+        capability_ids: Vec<String>,
     },
 
     /// App notifies the engine that a review terminal window has closed
@@ -2455,7 +2472,8 @@ pub enum FrontendEvent {
 /// Mirrors `boss_engine::feature_flags::FeatureFlagSnapshot` so the
 /// engine can ship its in-memory snapshot over the wire without
 /// translating field-by-field at the call site.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct FeatureFlagSnapshot {
     /// Stable flag identifier (lowercase snake_case). Also the key
     /// the consumer passes to `is_enabled`.
@@ -2473,6 +2491,13 @@ pub struct FeatureFlagSnapshot {
     /// Current effective value — what `is_enabled(name)` returns
     /// right now. Equals `default_enabled` when no override exists.
     pub enabled: bool,
+    /// Whether the capability backing this flag is present in the
+    /// current running build. `None` when the flag has no backing
+    /// capability (kill-switch pattern). `Some(false)` when the flag
+    /// is enabled but its implementation is absent from this build —
+    /// the debug pane shows a warning badge in this state.
+    #[serde(default)]
+    pub capability_present: Option<bool>,
 }
 
 /// Snapshot of one per-installation setting's static metadata + current

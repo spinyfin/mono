@@ -1,4 +1,3 @@
-mod api_breaking_surface;
 mod bazel;
 mod code_patterns;
 mod forbidden_imports_deps;
@@ -16,7 +15,6 @@ use anyhow::Result;
 use crate::check::CheckRegistry;
 
 pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
-    registry.register(api_breaking_surface::ApiBreakingSurfaceCheck)?;
     registry.register(bazel::BazelPoliciesCheck)?;
     registry.register(bazel::BazelrcPoliciesCheck)?;
     registry.register(bazel::BazelversionPoliciesCheck)?;
