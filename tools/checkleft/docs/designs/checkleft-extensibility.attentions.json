@@ -1,0 +1,47 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What should the default governance posture be when a repo adopts a central config pointer?",
+    "choices": [
+      "merge — local config may override central policy (backwards-compatible; central control is opt-in via `strict`) [recommended]",
+      "strict — central pointer is authoritative; no local policy override for governed checks (safer org-wide, but a breaking change for existing consumers)",
+      "allowlisted-local-override — strict, except an explicit declared allowlist of locally-overridable checks/fields"
+    ],
+    "anchor": "governance-dial"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should the Shadow gate decision (run-but-don't-enforce; surface findings as info/record-only) be in scope for v1? It is the highest-value state for fleet ramp but adds an enforcement/observation split to the runner plus a new output field.",
+    "anchor": "check-gating-checkgate"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When the experiment/gating service is unreachable (e.g. CI offline), how should a CheckGate behave?",
+    "choices": [
+      "Fail to config-default — gate yields the statically configured enabled/severity; run proceeds deterministically [recommended]",
+      "Fail-closed — treat affected checks as Disabled",
+      "Fail-open — treat affected checks as Enabled (enforce)"
+    ],
+    "anchor": "check-gating-checkgate"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What trust posture should declarative (host-binary-executing) checks from a non-first-party bundle have?",
+    "choices": [
+      "Off by default; explicit per-bundle opt-in, invocations constrained to the bundle's declared `needs` [recommended]",
+      "Allowed but constrained to an explicit allowlist of permitted binaries per repo",
+      "Forbidden entirely for third-party bundles (only first-party bundled declarative checks run)"
+    ],
+    "anchor": "declarative-checks-from-external-bundles"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which transport should the shared versioned-pointer substrate use for v1?",
+    "choices": [
+      "HTTPS + sha256 — reuses existing reqwest fetch + retry/backoff and the .cwasm-cache patterns [recommended]",
+      "Git-repo-ref — resolve a git ref to a commit and fetch a path",
+      "OCI/registry — content-addressable distribution (new infra)"
+    ],
+    "anchor": "transport-and-locator-model"
+  }
+]
