@@ -67,6 +67,7 @@ indicatif = "0.17.11"
 jsonwebtoken = "10.4.0"
 keyring = "3.6.3"
 rand = "0.8"
+rayon = "1.10"
 rsa = "0.9"
 regex = "1.11.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
