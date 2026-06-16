@@ -380,6 +380,13 @@ async fn dispatch_run(
     let mut results = runner.run_changeset(&changeset).await?;
     let elapsed = run_started_at.elapsed();
     sort_results_for_output(&mut results);
+    let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
+    info!(
+        elapsed_ms = elapsed.as_millis(),
+        checks_ran = results.len(),
+        total_findings,
+        "run complete"
+    );
 
     match format {
         OutputFormat::Human => print_human_results(&results, elapsed),
