@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -92,6 +93,18 @@ impl Store {
         }
 
         let connection = Connection::open(path).map_err(CubeError::Storage)?;
+        // Wait up to 5 s when another connection holds the write lock instead
+        // of immediately returning SQLITE_BUSY (default busy timeout is 0 ms).
+        // This hardens the real lease path against transient contention from
+        // the background GC thread that opens a second connection during lease.
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(CubeError::Storage)?;
+        // WAL mode lets readers and the background GC writer proceed concurrently;
+        // only concurrent writers need to serialize (serialised by busy_timeout).
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(CubeError::Storage)?;
         let store = Self { connection };
         store.migrate()?;
         Ok(store)
@@ -346,6 +359,10 @@ impl Store {
         transaction.commit().map_err(CubeError::Storage)
     }
 
+    // All parameters are required, distinct fields for a single atomic DB
+    // claim; collapsing them into a struct would just move the names one
+    // level up without reducing call-site complexity.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_workspace(
         &mut self,
         repo: &str,
@@ -559,6 +576,10 @@ impl Store {
     /// currently free (e.g., already leased or doesn't exist). Unlike
     /// `claim_workspace`, there is no fallback — the named workspace must be
     /// free or the call returns `None`.
+    // All parameters are required, distinct fields for a single atomic DB
+    // claim; collapsing them into a struct would just move the names one
+    // level up without reducing call-site complexity.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_specific_workspace(
         &mut self,
         repo: &str,
