@@ -4,10 +4,10 @@ This page documents the built-in check implementations currently registered in t
 
 ## `api-breaking-surface` (deprecated alias)
 
-Deprecated alias of [`file/require-companion-change`](#filerequire-companion-change). It
+Deprecated alias of [`file/ifchange`](#fileifchange). It
 dispatches to the same implementation with the same `trigger_globs` / `required_globs` /
 `message` / `remediation` config. New configuration should reference
-`file/require-companion-change`; this alias is kept for one migration window.
+`file/ifchange`; this alias is kept for one migration window.
 
 ## `bazel-policies`
 
@@ -304,12 +304,10 @@ Notes:
 
 Purpose:
 
-- Enforces `LINT.IfChange` / `LINT.ThenChange` contracts so linked files or
-  linked blocks change together.
+- Enforces `LINT.IfChange` / `LINT.ThenChange` contracts so linked files or linked blocks change together.
+- Requires companion changes when a glob-matched surface changes (policy-declared couplings).
 
-Config keys:
-
-## `frontend-no-legacy-api`
+**1. In-source markers** (code-declared):
 
 ```text
 LINT.IfChange
@@ -330,7 +328,7 @@ LINT.ThenChange(path:label)
 
 ```yaml
 - id: api-surface-docs           # local policy label (drives findings/bypass/severity)
-  check: file/require-companion-change
+  check: file/ifchange
   config:
     trigger_globs: ["backend/blob/src/v3/**"]
     required_globs: ["docs/backend.md", "docs/product-specs/**"]
@@ -356,8 +354,7 @@ Notes:
 - Severity defaults to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass` (see
   [Bypass mechanism](bypass.md)).
-- Deprecated aliases `file/ifchange` and `api-breaking-surface` dispatch to this same
-  check during the migration window.
+- Deprecated alias `api-breaking-surface` dispatches to this same check during the migration window.
 
 ## `rust-test-rule-coverage`
 
