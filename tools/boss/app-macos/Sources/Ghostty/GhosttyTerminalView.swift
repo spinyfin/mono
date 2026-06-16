@@ -605,11 +605,81 @@ final class GhosttyTerminalHostView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_RIGHT)
+        NSMenu.popUpContextMenu(buildContextMenu(), with: event, for: self)
     }
 
     override func rightMouseUp(with event: NSEvent) {
-        sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_RIGHT)
+        // Right-click shows a context menu; mouse events are not forwarded to the surface.
+    }
+
+    private func buildContextMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let hasSelection = surface.map { ghostty_surface_has_selection($0) } ?? false
+        let hasClipboard = NSPasteboard.general.string(forType: .string) != nil
+
+        let copyItem = NSMenuItem(
+            title: "Copy",
+            action: #selector(contextMenuCopy(_:)),
+            keyEquivalent: ""
+        )
+        copyItem.target = self
+        copyItem.isEnabled = hasSelection
+        menu.addItem(copyItem)
+
+        let pasteItem = NSMenuItem(
+            title: "Paste",
+            action: #selector(contextMenuPaste(_:)),
+            keyEquivalent: ""
+        )
+        pasteItem.target = self
+        pasteItem.isEnabled = hasClipboard
+        menu.addItem(pasteItem)
+
+        menu.addItem(.separator())
+
+        let selectAllItem = NSMenuItem(
+            title: "Select All",
+            action: #selector(contextMenuSelectAll(_:)),
+            keyEquivalent: ""
+        )
+        selectAllItem.target = self
+        selectAllItem.isEnabled = surface != nil
+        menu.addItem(selectAllItem)
+
+        return menu
+    }
+
+    @objc private func contextMenuCopy(_ sender: Any?) {
+        guard let surface else { return }
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let textPtr = text.text else { return }
+        let string = String(cString: textPtr)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+    }
+
+    @objc private func contextMenuPaste(_ sender: Any?) {
+        guard let surface else { return }
+        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        text.withCString { ptr in
+            ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
+        }
+    }
+
+    @objc private func contextMenuSelectAll(_ sender: Any?) {
+        guard let surface else { return }
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.action = GHOSTTY_ACTION_PRESS
+        keyEvent.mods = GHOSTTY_MODS_SUPER
+        keyEvent.consumed_mods = GHOSTTY_MODS_SUPER
+        keyEvent.keycode = 0x00  // kVK_ANSI_A
+        keyEvent.text = nil
+        keyEvent.composing = false
+        keyEvent.unshifted_codepoint = 0x61  // 'a'
+        _ = ghostty_surface_key(surface, keyEvent)
     }
 
     override func otherMouseDown(with event: NSEvent) {
