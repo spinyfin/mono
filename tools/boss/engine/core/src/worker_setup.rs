@@ -164,8 +164,7 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
         "\n## PR creation mode\n\
          \n\
          Default PR creation mode: pass `--draft` to `cube pr create`\n\
-         (or `gh pr create`) unless the chore description explicitly says\n\
-         to create a non-draft PR.\n"
+         unless the chore description explicitly says to create a non-draft PR.\n"
     } else {
         ""
     };
@@ -351,6 +350,13 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
 /// revision workers and adds additional blocks (`cube pr create`, `cube pr
 /// ensure`) with revision-specific messaging.
+///
+/// Known limitation: the guard inspects only the top-level program token of
+/// each delimiter-split group. Invocations that wrap the blocked command in
+/// another program (`sh -c 'jj git push ...'`, `bash -lc '...'`, `xargs git
+/// push`, etc.) will not match and are approved. Workers are not adversarial
+/// and this edge case is covered by the checkleft gate and deny rules as
+/// defense-in-depth, so the limitation is acceptable.
 const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
     "python3 -c \"\n",
     "import json,os,sys,re,shlex\n",

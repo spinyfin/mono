@@ -1294,6 +1294,41 @@ fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
     }
 }
 
+/// Design and investigation workers are also `WorkerKind::Standard` and must
+/// carry the PR redirect guard. The original root cause (T686) was a DESIGN
+/// worker's prelude diverging from chore/task preludes — pin that cross-prelude
+/// invariant here so future drift is caught immediately.
+#[test]
+fn design_and_investigation_workers_carry_pr_redirect_guard() {
+    for execution_kind in ["project_design", "investigation_implementation"] {
+        let mut input = sample_input();
+        input.execution_kind = execution_kind.into();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let pre = parsed["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{execution_kind}: PreToolUse must be an array"));
+        // Must carry the PR redirect guard: the Bash-matcher hook whose
+        // command inspects `jj git push` and `cube pr create` (but not
+        // `ensure`, which is the revision-only guard).
+        let has_pr_redirect_guard = pre.iter().any(|e| {
+            let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
+            cmd.contains("jj git push") && cmd.contains("cube pr create") && !cmd.contains("ensure")
+        });
+        assert!(
+            has_pr_redirect_guard,
+            "{execution_kind} worker must carry the PR redirect guard: {pre:?}",
+        );
+        // Must NOT carry the revision-specific guard (which blocks `cube pr ensure`).
+        let has_revision_guard = pre
+            .iter()
+            .any(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("ensure"));
+        assert!(
+            !has_revision_guard,
+            "{execution_kind} worker must not carry the revision-specific guard: {pre:?}",
+        );
+    }
+}
+
 /// Every worker session — regardless of kind — must carry a PreToolUse
 /// guard that blocks *launching Boss itself*: the macOS app, its bundled
 /// engine, or an app-macos test that can spawn the real app. `bazel build`

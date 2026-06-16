@@ -4517,8 +4517,10 @@ pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 /// will simply push and open one, but a worker that's blocked has an
 /// out to explain itself rather than churning.
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
-If the work is complete, push your branch and open the PR with `gh pr create`. \
-If you're blocked, explain what you need.";
+If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
+branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
+for this branch, push any new commits with `cube pr update --branch <bookmark>` instead — \
+do not open a duplicate. If you're blocked, explain what you need.";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot
