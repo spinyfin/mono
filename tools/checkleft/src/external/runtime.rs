@@ -518,9 +518,19 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
             return Ok(vec![]);
         };
+        if !self.ticker.is_alive() {
+            anyhow::bail!(
+                "epoch ticker thread has died; cannot enforce execution timeout for \
+                 declared-exclusions in check `{check_name}` (`{}`)",
+                package.id
+            );
+        }
+        // Use the manifest timeout (or proportional default with n_files=0) so
+        // the audit call is bounded by the same policy as the run-check phase.
+        let (timeout_ticks, _) = resolve_component_limits(component.limits.as_ref(), 0);
         let wasm_component = self.load_component_for_audit(package, component)?;
-        let raw =
-            call_declared_exclusions(&self.engine, &wasm_component, check_name, config_json).with_context(|| {
+        let raw = call_declared_exclusions(&self.engine, &wasm_component, check_name, config_json, timeout_ticks)
+            .with_context(|| {
                 format!(
                     "`declared-exclusions` failed for check `{check_name}` in `{}`",
                     package.id
@@ -549,6 +559,16 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         let ExternalCheckPackageImplementation::Component(component) = &package.implementation else {
             return Ok(ExclusionStatus::Unknown);
         };
+        if !self.ticker.is_alive() {
+            anyhow::bail!(
+                "epoch ticker thread has died; cannot enforce execution timeout for \
+                 evaluate-exclusion in check `{check_name}` (`{}`)",
+                package.id
+            );
+        }
+        // Use the manifest timeout (or proportional default with n_files=0) so
+        // the audit call is bounded by the same policy as the run-check phase.
+        let (timeout_ticks, _) = resolve_component_limits(component.limits.as_ref(), 0);
         let wasm_component = self.load_component_for_audit(package, component)?;
         let wit_excl = wit_types::DeclaredExclusion {
             entry: exclusion.entry.clone(),
@@ -565,6 +585,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
             config_json,
             wit_excl,
             file_content,
+            timeout_ticks,
         )
         .with_context(|| {
             format!(
@@ -672,6 +693,7 @@ fn resolve_access_scope(
     run: &ComponentRun<'_>,
     wit_scope: Option<&wit_types::AccessScope>,
     max_memory_bytes: usize,
+    timeout_ticks: u64,
 ) -> Result<AccessScope> {
     // Handle the static scopes first — no component call needed.
     if let Some(static_scope) = lift_access_scope(wit_scope) {
@@ -697,9 +719,12 @@ fn resolve_access_scope(
         )
     })?;
     let mut store = Store::new(engine, host_state);
-    // No epoch deadline on the declare call — it is lightweight and bounded
-    // (reads only the changeset files, which are already in mem).
-    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    // Apply the same wall-clock budget as run-check: the declare call runs with
+    // real filesystem preopens (changeset sandbox), so an untrusted component can
+    // loop here just as easily as in run-check. Unlike the list-checks Phase-1
+    // call (no preopens, purely static metadata, EPOCH_DEADLINE_NEVER is safe),
+    // this call must be bounded.
+    store.set_epoch_deadline(timeout_ticks);
 
     let instance = wasmtime(linker.instantiate(&mut store, run.component)).with_context(|| {
         format!(
@@ -721,11 +746,21 @@ fn resolve_access_scope(
 
     let declared =
         wasmtime(bindings.call_declare_required_files(&mut store, run.check_name, &wit_changeset, &config_json))
-            .with_context(|| {
-                format!(
-                    "declare-required-files failed for check `{}` in component `{}`",
-                    run.check_name, run.package.id
-                )
+            .map_err(|err| {
+                if is_interrupt_error(&err) {
+                    anyhow::anyhow!(
+                        "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
+                         during declare-required-files",
+                        run.check_name,
+                        run.package.id,
+                        timeout_ticks,
+                    )
+                } else {
+                    err.context(format!(
+                        "declare-required-files failed for check `{}` in component `{}`",
+                        run.check_name, run.package.id
+                    ))
+                }
             })?;
 
     // temp_sandbox kept alive through the call above; drop explicitly for clarity.
@@ -794,6 +829,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         &run,
         descriptor.access_scope.as_ref(),
         max_memory_bytes,
+        timeout_ticks,
     )
     .with_context(|| format!("failed to resolve access scope for check `{}`", run.package.id))?;
 
@@ -949,16 +985,29 @@ fn call_declared_exclusions(
     component: &Component,
     check_name: &str,
     config_json: &str,
+    timeout_ticks: u64,
 ) -> Result<Vec<wit_types::DeclaredExclusion>> {
     let linker = build_component_v1_linker(engine)?;
     let mut store = Store::new(engine, HostState::with_empty_wasi());
-    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    // No filesystem preopens here, but a malicious or buggy component can still
+    // busy-loop. Apply the same wall-clock bound as run-check so the audit path
+    // cannot stall the host indefinitely.
+    store.set_epoch_deadline(timeout_ticks);
     let instance = wasmtime(linker.instantiate(&mut store, component))
         .context("failed to instantiate component for declared-exclusions")?;
     let bindings =
         wasmtime(WitCheck::new(&mut store, &instance)).context("failed to bind component for declared-exclusions")?;
-    wasmtime(bindings.call_declared_exclusions(&mut store, check_name, config_json))
-        .context("call_declared_exclusions failed")
+    wasmtime(bindings.call_declared_exclusions(&mut store, check_name, config_json)).map_err(|err| {
+        if is_interrupt_error(&err) {
+            anyhow::anyhow!(
+                "check `{}` exceeded its {} ms wall-clock limit during declared-exclusions",
+                check_name,
+                timeout_ticks,
+            )
+        } else {
+            err.context("call_declared_exclusions failed")
+        }
+    })
 }
 
 fn call_evaluate_exclusion(
@@ -968,16 +1017,31 @@ fn call_evaluate_exclusion(
     config_json: &str,
     exclusion: wit_types::DeclaredExclusion,
     file_content: Option<&str>,
+    timeout_ticks: u64,
 ) -> Result<wit_types::ExclusionStatus> {
     let linker = build_component_v1_linker(engine)?;
     let mut store = Store::new(engine, HostState::with_empty_wasi());
-    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    // No filesystem preopens here, but a malicious or buggy component can still
+    // busy-loop. Apply the same wall-clock bound as run-check so the audit path
+    // cannot stall the host indefinitely.
+    store.set_epoch_deadline(timeout_ticks);
     let instance = wasmtime(linker.instantiate(&mut store, component))
         .context("failed to instantiate component for evaluate-exclusion")?;
     let bindings =
         wasmtime(WitCheck::new(&mut store, &instance)).context("failed to bind component for evaluate-exclusion")?;
-    wasmtime(bindings.call_evaluate_exclusion(&mut store, check_name, config_json, &exclusion, file_content))
-        .context("call_evaluate_exclusion failed")
+    wasmtime(bindings.call_evaluate_exclusion(&mut store, check_name, config_json, &exclusion, file_content)).map_err(
+        |err| {
+            if is_interrupt_error(&err) {
+                anyhow::anyhow!(
+                    "check `{}` exceeded its {} ms wall-clock limit during evaluate-exclusion",
+                    check_name,
+                    timeout_ticks,
+                )
+            } else {
+                err.context("call_evaluate_exclusion failed")
+            }
+        },
+    )
 }
 
 fn lift_exclusion_status(s: wit_types::ExclusionStatus) -> ExclusionStatus {

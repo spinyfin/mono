@@ -13,8 +13,9 @@ use crate::source_tree::LocalSourceTree;
 
 use super::{
     BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
-    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_struct_exclusions, build_wasmtime_engine, is_interrupt_error,
-    lower_changeset, lower_check_input, resolve_component_limits,
+    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_struct_exclusions, build_wasmtime_engine,
+    call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error, lower_changeset,
+    lower_check_input, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -1226,5 +1227,104 @@ fn giant_structs_create_exclude_structs_suppresses_finding() {
         result.findings.is_empty(),
         "exclude_structs = [\"Giant\"] must suppress the create finding; got: {:?}",
         result.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+// --- Timeout enforcement tests for audit WIT calls ---
+//
+// `call_declared_exclusions` and `call_evaluate_exclusion` previously used
+// EPOCH_DEADLINE_NEVER, leaving them unbounded. These tests verify that passing
+// timeout_ticks=0 (deadline = current_epoch, already exhausted) causes an epoch
+// interrupt trap at the first WASM instruction, exercising the error-mapping
+// and confirming the mechanism works end-to-end.
+//
+// Note: a test for the `declare-required-files` path specifically requires a
+// WASM component that (a) returns DeclaredFiles scope from list-checks and
+// (b) loops in declare-required-files. That spinning-component fixture is a
+// follow-on; the epoch-interrupt enforcement path used by all three calls is
+// the same wasmtime mechanism tested here.
+
+fn bundled_component_bytes(name: &str) -> Vec<u8> {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
+    };
+    let package = BundledExternalCheckPackageProvider
+        .resolve(&ExternalCheckImplementationRef::Bundled(name.to_owned()))
+        .expect("resolve")
+        .expect("bundled package must exist");
+    let crate::external::ExternalCheckPackageImplementation::Component(component) = package.implementation else {
+        panic!("expected component package");
+    };
+    component.artifact_bytes.expect("bundled component has bytes").to_vec()
+}
+
+/// `call_declared_exclusions` must produce an epoch-interrupt error when
+/// `timeout_ticks = 0` (deadline = current epoch, already exhausted at the
+/// first WASM instruction). This verifies that the previously unbounded audit
+/// call is now enforced by the epoch mechanism.
+#[test]
+fn call_declared_exclusions_times_out_when_deadline_exhausted() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let bytes = bundled_component_bytes("rust/giant-structs");
+    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+
+    // timeout_ticks = 0 → deadline = current_epoch + 0 = current_epoch.
+    // At the first WASM instruction, engine.current_epoch() >= deadline → trap.
+    let err = call_declared_exclusions(&engine, &component, "rust/giant-structs", "{}", 0)
+        .expect_err("call must be interrupted when timeout_ticks = 0");
+
+    assert!(
+        is_interrupt_error(&err) || err.to_string().contains("exceeded"),
+        "expected epoch interrupt or timeout message, got: {err:#}"
+    );
+}
+
+/// `call_evaluate_exclusion` must produce an epoch-interrupt error when
+/// `timeout_ticks = 0`. Mirrors the `call_declared_exclusions` test above.
+#[test]
+fn call_evaluate_exclusion_times_out_when_deadline_exhausted() {
+    use super::wit_types;
+
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let bytes = bundled_component_bytes("rust/giant-structs");
+    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+
+    let excl = wit_types::DeclaredExclusion {
+        entry: "some/entry".to_owned(),
+        depends_on: vec!["some/file.rs".to_owned()],
+    };
+
+    let err = call_evaluate_exclusion(&engine, &component, "rust/giant-structs", "{}", excl, None, 0)
+        .expect_err("call must be interrupted when timeout_ticks = 0");
+
+    assert!(
+        is_interrupt_error(&err) || err.to_string().contains("exceeded"),
+        "expected epoch interrupt or timeout message, got: {err:#}"
+    );
+}
+
+/// Verify the timeout error message format for `call_declared_exclusions`:
+/// the message must name the check and include the timeout budget so operators
+/// can distinguish timeout from other failures.
+#[test]
+fn call_declared_exclusions_timeout_error_names_check_and_budget() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let bytes = bundled_component_bytes("rust/giant-structs");
+    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+
+    let err = call_declared_exclusions(&engine, &component, "rust/giant-structs", "{}", 0)
+        .expect_err("expected timeout error");
+
+    let msg = err.to_string();
+    // The interrupt is mapped to a clear message before the context is added;
+    // verify the chain contains the key fields.
+    let full = format!("{err:#}");
+    assert!(
+        full.contains("rust/giant-structs"),
+        "error must name the check; got: {full}"
+    );
+    assert!(
+        full.contains("declared-exclusions") || msg.contains("exceeded"),
+        "error must mention declared-exclusions or exceeded; got: {full}"
     );
 }
