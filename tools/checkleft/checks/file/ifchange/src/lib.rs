@@ -391,7 +391,9 @@ fn targets_match(a: &ThenChangeTarget, b: &ThenChangeTarget) -> bool {
 }
 
 fn targets_list_match(a: &[ThenChangeTarget], b: &[ThenChangeTarget]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(ta, tb)| targets_match(ta, tb))
+    // Order-insensitive: reordering targets in an existing ThenChange is not
+    // treated as marker removal.
+    a.len() == b.len() && a.iter().all(|ta| b.iter().any(|tb| targets_match(ta, tb)))
 }
 
 // ── Hunk / range overlap ──────────────────────────────────────────────────────
