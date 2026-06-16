@@ -191,6 +191,12 @@ interface types {
         /// given repo-root-relative globs. The host intersects the expanded
         /// set with a ceiling before populating the sandbox.
         globs(list<string>),
+        /// The check declares its exact required files per-changeset at
+        /// runtime. The host calls `declare-required-files` before building
+        /// the sandbox. The sandbox contains the changeset files plus the
+        /// paths returned by that call (paths that do not exist are skipped).
+        /// No globs — every path must be a concrete repo-relative file path.
+        declared-files,
     }
 
     /// Self-description returned by `list-checks`.
@@ -250,7 +256,7 @@ interface types {
 /// guests read files with `std::fs` and see only the files the host allows.
 /// No checkleft-specific file import exists in this world.
 world check {
-    use types.{check-input, finding, check-descriptor, check-error, declared-exclusion, exclusion-status};
+    use types.{change-set, check-input, finding, check-descriptor, check-error, declared-exclusion, exclusion-status};
 
     /// Return a descriptor for every check exported by this component.
     /// Called once by the host after instantiation.
@@ -261,6 +267,24 @@ world check {
         name: string,
         input: check-input,
     ) -> result<list<finding>, check-error>;
+
+    /// Declare the exact set of additional files required by the named check
+    /// for the given changeset invocation.
+    ///
+    /// Only called when the check descriptor returns `access-scope = declared-files`.
+    /// The host builds a temporary sandbox containing only the changeset files,
+    /// calls this export, then constructs the real sandbox from the changeset
+    /// files plus the returned paths. Paths that do not exist in the source tree
+    /// are silently skipped. Paths must be concrete repo-relative file paths
+    /// (no globs, no directory names).
+    ///
+    /// Returns an empty list when no additional files beyond the changeset are
+    /// needed.
+    export declare-required-files: func(
+        name: string,
+        changeset: change-set,
+        config-json: string,
+    ) -> list<string>;
 
     /// Return all exclusion entries declared by the named check that are eligible
     /// for stale-exclusion auditing. The host calls this once per check instance

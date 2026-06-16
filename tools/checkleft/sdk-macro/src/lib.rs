@@ -42,6 +42,7 @@ enum AccessScopeArg {
     ModifiedOnly,
     WholeRepo,
     Globs(Vec<String>),
+    DeclaredFiles,
 }
 
 impl Parse for CheckArgs {
@@ -115,6 +116,7 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
     match ident.to_string().as_str() {
         "modified_only" => Ok(AccessScopeArg::ModifiedOnly),
         "whole_repo" => Ok(AccessScopeArg::WholeRepo),
+        "declared_files" => Ok(AccessScopeArg::DeclaredFiles),
         "globs" => {
             let content;
             syn::parenthesized!(content in input);
@@ -134,7 +136,9 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
         }
         other => Err(syn::Error::new(
             ident.span(),
-            format!("unknown access_scope `{other}`: expected `modified_only`, `whole_repo`, or `globs([...])`"),
+            format!(
+                "unknown access_scope `{other}`: expected `modified_only`, `whole_repo`, `declared_files`, or `globs([...])`"
+            ),
         )),
     }
 }
@@ -145,8 +149,10 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
 /// - `name = "..."` (required): The check name used for dispatch.
 /// - `description = "..."` (optional): Human-readable description; defaults to name.
 /// - `severity = warning|error|info` (optional): Default severity (default: `warning`).
-/// - `access_scope = modified_only|whole_repo|globs([...])` (optional): File-access
-///   scope (default: `modified_only`).
+/// - `access_scope = modified_only|whole_repo|declared_files|globs([...])` (optional):
+///   File-access scope (default: `modified_only`). Use `declared_files` together with a
+///   `required_files(name, fn)` entry in `export_checks!` to declare per-changeset file
+///   sets without requesting whole-repo access.
 ///
 /// After annotating all check functions, call `export_checks!(fn_name, ...)` once at
 /// the crate root to wire up the component exports.
@@ -178,6 +184,9 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
         AccessScopeArg::ModifiedOnly => quote! { ::core::option::Option::None },
         AccessScopeArg::WholeRepo => quote! {
             ::core::option::Option::Some(::checkleft_check_sdk::AccessScope::WholeRepo)
+        },
+        AccessScopeArg::DeclaredFiles => quote! {
+            ::core::option::Option::Some(::checkleft_check_sdk::AccessScope::DeclaredFiles)
         },
         AccessScopeArg::Globs(patterns) => {
             let pats: Vec<_> = patterns.iter().collect();
@@ -249,6 +258,11 @@ enum ExportChecksItem {
         declared_fn: Ident,
         eval_fn: Ident,
     },
+    /// Per-changeset required-files hook for a check using `declared_files` scope.
+    RequiredFiles {
+        check_name: LitStr,
+        required_files_fn: Ident,
+    },
 }
 
 impl Parse for ExportChecksItem {
@@ -270,6 +284,20 @@ impl Parse for ExportChecksItem {
                 check_name,
                 declared_fn,
                 eval_fn,
+            })
+        } else if ident == "required_files" {
+            let content;
+            syn::parenthesized!(content in input);
+            let check_name: LitStr = content.parse()?;
+            content.parse::<Token![,]>()?;
+            let required_files_fn: Ident = content.parse()?;
+            // Allow optional trailing comma inside parens.
+            if content.peek(Token![,]) {
+                content.parse::<Token![,]>()?;
+            }
+            Ok(ExportChecksItem::RequiredFiles {
+                check_name,
+                required_files_fn,
             })
         } else {
             Ok(ExportChecksItem::Check(ident))
@@ -321,9 +349,10 @@ pub fn export_checks(input: TokenStream) -> TokenStream {
 }
 
 fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
-    // Separate check functions from exclusion audit registrations.
+    // Separate check functions from exclusion audit and required_files registrations.
     let mut check_fns: Vec<&Ident> = Vec::new();
     let mut exclusion_audits: Vec<(&LitStr, &Ident, &Ident)> = Vec::new();
+    let mut required_files_hooks: Vec<(&LitStr, &Ident)> = Vec::new();
     for item in &input.items {
         match item {
             ExportChecksItem::Check(id) => check_fns.push(id),
@@ -333,6 +362,12 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                 eval_fn,
             } => {
                 exclusion_audits.push((check_name, declared_fn, eval_fn));
+            }
+            ExportChecksItem::RequiredFiles {
+                check_name,
+                required_files_fn,
+            } => {
+                required_files_hooks.push((check_name, required_files_fn));
             }
         }
     }
@@ -400,6 +435,19 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
+    // declare_required_files: dispatch arms from required_files(...) items
+    let req_files_arms: Vec<TokenStream2> = required_files_hooks
+        .iter()
+        .map(|(check_name, required_files_fn)| {
+            quote! {
+                #check_name => {
+                    let sdk_changeset = from_wit_changeset(changeset);
+                    return super::#required_files_fn(&sdk_changeset, &config_json);
+                }
+            }
+        })
+        .collect();
+
     // Generate exclusion-audit method bodies. When there are no audit registrations the
     // parameters are prefixed with `_` to suppress unused-variable warnings.
     let exclusion_methods = if exclusion_audits.is_empty() {
@@ -445,6 +493,33 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     _ => {}
                 }
                 W::ExclusionStatus::Unknown
+            }
+        }
+    };
+
+    // Generate the declare_required_files method body.
+    let required_files_method = if required_files_hooks.is_empty() {
+        quote! {
+            fn declare_required_files(
+                _name: ::std::string::String,
+                _changeset: W::ChangeSet,
+                _config_json: ::std::string::String,
+            ) -> ::std::vec::Vec<::std::string::String> {
+                ::std::vec::Vec::new()
+            }
+        }
+    } else {
+        quote! {
+            fn declare_required_files(
+                name: ::std::string::String,
+                changeset: W::ChangeSet,
+                config_json: ::std::string::String,
+            ) -> ::std::vec::Vec<::std::string::String> {
+                match name.as_str() {
+                    #( #req_files_arms )*
+                    _ => {}
+                }
+                ::std::vec::Vec::new()
             }
         }
     };
@@ -523,6 +598,8 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         _ => ::core::result::Result::Err(W::CheckError::UnknownCheck(name)),
                     }
                 }
+
+                #required_files_method
 
                 #exclusion_methods
             }
@@ -617,6 +694,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     access_scope: d.access_scope.map(|s| match s {
                         ::checkleft_check_sdk::AccessScope::ModifiedOnly => W::AccessScope::ModifiedOnly,
                         ::checkleft_check_sdk::AccessScope::WholeRepo => W::AccessScope::WholeRepo,
+                        ::checkleft_check_sdk::AccessScope::DeclaredFiles => W::AccessScope::DeclaredFiles,
                         ::checkleft_check_sdk::AccessScope::Globs(patterns) => W::AccessScope::Globs(patterns),
                     }),
                 }
