@@ -270,6 +270,11 @@ pub enum AccessScope {
     WholeRepo,
     /// Modified files plus files matched by the given repo-root-relative globs.
     Globs(Vec<String>),
+    /// The exact required files are declared per-changeset via
+    /// `declare_required_files`. The host calls that function before building the
+    /// sandbox; the sandbox contains the changeset files plus the returned paths.
+    /// No globs — paths must be concrete repo-relative file paths.
+    DeclaredFiles,
 }
 
 /// Self-description returned by `list-checks`.

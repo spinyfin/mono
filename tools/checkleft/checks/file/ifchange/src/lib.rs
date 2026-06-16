@@ -75,10 +75,53 @@ use serde::Deserialize;
     name = "file/ifchange",
     description = "requires a companion change (marked region/file or glob-matched surface) to change together",
     severity = error,
-    access_scope = whole_repo
+    access_scope = declared_files
 )]
 pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
     run(&input)
+}
+
+/// Declare the set of additional files needed by `file/ifchange` beyond the
+/// changeset itself: all ThenChange target paths extracted from the current and
+/// base-revision content of every changed file.
+///
+/// Called by the engine before building the sandbox (via `declare-required-files`).
+/// The engine adds these paths to the sandbox so `file_ifchange_check` can check
+/// whether target files exist and read their content to verify labeled blocks.
+pub fn file_ifchange_declare_required_files(changeset: &ChangeSet, _config_json: &str) -> Vec<String> {
+    let mut required: BTreeSet<String> = BTreeSet::new();
+
+    for changed_file in &changeset.changed_files {
+        // Parse the current file content (non-deleted files are in the sandbox).
+        if changed_file.kind != ChangeKind::Deleted
+            && let Ok(content) = std::fs::read_to_string(&changed_file.path)
+            && let Ok(parsed) = parse_ifchange_file(&changed_file.path, &content)
+        {
+            collect_target_paths(&parsed, &mut required);
+        }
+
+        // Also scan the base-revision content (in-band, no filesystem needed) to
+        // capture targets from removed markers (Gap 1 & Gap 2).
+        if let Some(base_content) = changeset.base_file_content(&changed_file.path)
+            && let Ok(parsed) = parse_ifchange_file(&changed_file.path, base_content)
+        {
+            collect_target_paths(&parsed, &mut required);
+        }
+    }
+
+    required.into_iter().collect()
+}
+
+fn collect_target_paths(parsed: &IfChangeFile, out: &mut BTreeSet<String>) {
+    for block in &parsed.blocks {
+        for target in &block.targets {
+            let path = match target {
+                ThenChangeTarget::File { path } => path.clone(),
+                ThenChangeTarget::Block { path, .. } => path.clone(),
+            };
+            out.insert(path);
+        }
+    }
 }
 
 /// Runs both coupling mechanisms and concatenates their findings.
@@ -2092,5 +2135,143 @@ mod tests {
             "message: {}",
             findings[0].message
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // declare_required_files tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn make_simple_changeset(path: &str, kind: ChangeKind) -> ChangeSet {
+        make_changeset(vec![(path, kind)], vec![])
+    }
+
+    #[test]
+    fn declare_required_files_returns_thenchange_targets_from_current_file() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt)\n",
+        )
+        .unwrap();
+
+        let cs = make_simple_changeset("a.txt", ChangeKind::Modified);
+        let required = file_ifchange_declare_required_files(&cs, "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(required, vec!["b.txt".to_owned()]);
+    }
+
+    #[test]
+    fn declare_required_files_multi_target_returns_all_targets() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt, c.txt)\n",
+        )
+        .unwrap();
+
+        let cs = make_simple_changeset("a.txt", ChangeKind::Modified);
+        let mut required = file_ifchange_declare_required_files(&cs, "{}");
+        required.sort();
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(required, vec!["b.txt".to_owned(), "c.txt".to_owned()]);
+    }
+
+    #[test]
+    fn declare_required_files_extracts_targets_from_base_content() {
+        // For a deleted file, targets come from base_files (no disk read).
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let base_content = "// LINT.IfChange\ncontent\n// LINT.ThenChange(target.txt)\n";
+        let cs = make_changeset_with_base(
+            vec![("a.txt", ChangeKind::Deleted)],
+            vec![],
+            vec![("a.txt", base_content)],
+        );
+        let required = file_ifchange_declare_required_files(&cs, "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(required, vec!["target.txt".to_owned()]);
+    }
+
+    #[test]
+    fn declare_required_files_deduplicates_across_multiple_files() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        // Both a.txt and b.txt point to the same target.
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(shared.txt)\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(shared.txt)\n",
+        )
+        .unwrap();
+
+        let cs = make_changeset(
+            vec![("a.txt", ChangeKind::Modified), ("b.txt", ChangeKind::Modified)],
+            vec![],
+        );
+        let required = file_ifchange_declare_required_files(&cs, "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            required,
+            vec!["shared.txt".to_owned()],
+            "duplicate target must appear only once"
+        );
+    }
+
+    #[test]
+    fn declare_required_files_empty_when_no_markers() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(dir.path().join("plain.txt"), "no markers here\n").unwrap();
+
+        let cs = make_simple_changeset("plain.txt", ChangeKind::Modified);
+        let required = file_ifchange_declare_required_files(&cs, "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert!(required.is_empty(), "no markers → no required files; got {required:?}");
+    }
+
+    #[test]
+    fn declare_required_files_extracts_block_target_path() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(backend/schema.rs:version)\n",
+        )
+        .unwrap();
+
+        let cs = make_simple_changeset("a.txt", ChangeKind::Modified);
+        let required = file_ifchange_declare_required_files(&cs, "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(required, vec!["backend/schema.rs".to_owned()]);
     }
 }

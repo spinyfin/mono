@@ -83,6 +83,11 @@ pub enum AccessScope {
     WholeRepo,
     /// Union of the declared glob patterns (repo-root-relative) plus all changeset files.
     Globs(Vec<String>),
+    /// Exactly the listed paths plus all changeset files. No globs; each entry
+    /// must be a concrete repo-relative file path. Paths absent from the source
+    /// tree are silently skipped. Produced by the engine after calling
+    /// `declare-required-files` on a check that declares `declared-files` scope.
+    ExplicitFiles(Vec<PathBuf>),
 }
 
 /// The on-disk path of the repository root, used as the source location for
@@ -147,6 +152,7 @@ pub fn create_sandbox(
         AccessScope::ModifiedOnly => "modified-only",
         AccessScope::WholeRepo => "whole-repo",
         AccessScope::Globs(_) => "globs",
+        AccessScope::ExplicitFiles(_) => "declared-files",
     };
     let allowlist = resolve_allowlist(changeset, &scope, source_tree)?;
     debug!(scope = scope_str, files = allowlist.len(), "populating sandbox");
@@ -259,6 +265,30 @@ fn resolve_allowlist(changeset: &ChangeSet, scope: &AccessScope, source_tree: &d
                     if seen.insert(p.clone()) {
                         paths.push(p);
                     }
+                }
+            }
+
+            paths
+        }
+
+        AccessScope::ExplicitFiles(extra) => {
+            let mut seen: HashSet<PathBuf> = HashSet::new();
+            let mut paths: Vec<PathBuf> = Vec::new();
+
+            // Changeset paths are always included.
+            for file in &changeset.changed_files {
+                validate_relative_path(&file.path)
+                    .with_context(|| format!("invalid path in changeset: {}", file.path.display()))?;
+                if source_tree.exists(&file.path) && seen.insert(file.path.clone()) {
+                    paths.push(file.path.clone());
+                }
+            }
+
+            // Plus every explicitly declared path that exists in the source tree.
+            for p in extra {
+                validate_relative_path(p).with_context(|| format!("invalid explicit path: {}", p.display()))?;
+                if source_tree.exists(p) && seen.insert(p.clone()) {
+                    paths.push(p.clone());
                 }
             }
 
@@ -579,6 +609,106 @@ mod tests {
         .expect("create sandbox");
 
         assert_eq!(result.allowed_paths.len(), 1);
+    }
+
+    // --- ExplicitFiles scope ---
+
+    #[test]
+    fn explicit_files_includes_changeset_and_declared_paths() {
+        let tree = MapSourceTree::new(&[
+            ("src/lib.rs", b"fn lib() {}"),
+            ("src/main.rs", b"fn main() {}"),
+            ("docs/api.md", b"# API"),
+            ("other.txt", b"other"),
+        ]);
+        let cs = changeset(&["src/lib.rs"]);
+        let ceiling = tempdir().unwrap();
+        let explicit = vec![PathBuf::from("docs/api.md"), PathBuf::from("other.txt")];
+        let result = create_sandbox(
+            &cs,
+            AccessScope::ExplicitFiles(explicit),
+            &tree,
+            &HostCeiling::new(ceiling.path()),
+        )
+        .expect("create sandbox");
+
+        assert!(
+            result.root.path().join("src/lib.rs").exists(),
+            "changeset file must be in sandbox"
+        );
+        assert!(
+            result.root.path().join("docs/api.md").exists(),
+            "declared file must be in sandbox"
+        );
+        assert!(
+            result.root.path().join("other.txt").exists(),
+            "declared file must be in sandbox"
+        );
+        assert!(
+            !result.root.path().join("src/main.rs").exists(),
+            "undeclared file must not be in sandbox"
+        );
+        assert_eq!(result.allowed_paths.len(), 3);
+    }
+
+    #[test]
+    fn explicit_files_skips_paths_not_in_source_tree() {
+        let tree = MapSourceTree::new(&[("src/lib.rs", b"fn lib() {}")]);
+        let cs = changeset(&["src/lib.rs"]);
+        let ceiling = tempdir().unwrap();
+        let explicit = vec![PathBuf::from("nonexistent.rs")];
+        let result = create_sandbox(
+            &cs,
+            AccessScope::ExplicitFiles(explicit),
+            &tree,
+            &HostCeiling::new(ceiling.path()),
+        )
+        .expect("create sandbox");
+
+        assert_eq!(
+            result.allowed_paths,
+            vec![PathBuf::from("src/lib.rs")],
+            "non-existent explicit path must be skipped"
+        );
+    }
+
+    #[test]
+    fn explicit_files_no_duplicates_when_declared_path_is_also_in_changeset() {
+        let tree = MapSourceTree::new(&[("src/lib.rs", b"fn lib() {}")]);
+        let cs = changeset(&["src/lib.rs"]);
+        let ceiling = tempdir().unwrap();
+        // Declaring the changeset file again must not duplicate it.
+        let explicit = vec![PathBuf::from("src/lib.rs")];
+        let result = create_sandbox(
+            &cs,
+            AccessScope::ExplicitFiles(explicit),
+            &tree,
+            &HostCeiling::new(ceiling.path()),
+        )
+        .expect("create sandbox");
+
+        assert_eq!(
+            result.allowed_paths.len(),
+            1,
+            "no duplicate even when explicit path overlaps changeset"
+        );
+    }
+
+    #[test]
+    fn explicit_files_empty_declared_list_behaves_like_modified_only() {
+        let tree = MapSourceTree::new(&[("src/lib.rs", b"fn lib() {}"), ("other.rs", b"fn other() {}")]);
+        let cs = changeset(&["src/lib.rs"]);
+        let ceiling = tempdir().unwrap();
+        let result = create_sandbox(
+            &cs,
+            AccessScope::ExplicitFiles(vec![]),
+            &tree,
+            &HostCeiling::new(ceiling.path()),
+        )
+        .expect("create sandbox");
+
+        assert_eq!(result.allowed_paths, vec![PathBuf::from("src/lib.rs")]);
+        assert!(!result.root.path().join("other.rs").exists());
     }
 
     // --- Traversal-escape rejection ---

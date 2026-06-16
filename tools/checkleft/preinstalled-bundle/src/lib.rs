@@ -42,7 +42,7 @@ use checkleft_check_sdk::export_checks;
 // that name from the function ident it is given and references it via `super::`.
 // The `rust/giant-structs` stale-exclusion audit hooks are plain functions.
 use checkleft_file_forbidden_path::__CHECKLEFT_ENTRY_forbidden_path_check;
-use checkleft_file_ifchange::__CHECKLEFT_ENTRY_file_ifchange_check;
+use checkleft_file_ifchange::{__CHECKLEFT_ENTRY_file_ifchange_check, file_ifchange_declare_required_files};
 use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
 use checkleft_md_link_integrity::__CHECKLEFT_ENTRY_md_link_integrity_check;
 use checkleft_rust_giant_structs_create::{
@@ -57,6 +57,7 @@ export_checks!(
     forbidden_path_check,
     file_size_check,
     file_ifchange_check,
+    required_files("file/ifchange", file_ifchange_declare_required_files),
     md_link_integrity_check,
     giant_structs_check,
     exclusion_audit(
