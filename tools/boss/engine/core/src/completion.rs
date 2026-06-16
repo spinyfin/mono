@@ -4591,8 +4591,8 @@ fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -
 pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
     format!(
         "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
-commits, push them to the existing PR's branch (`jj git push -b <bookmark>`). If your changes \
-are already pushed or there is nothing left to do, say so — explain your status instead of \
+commits, push them to the existing PR's branch with `cube pr update --branch <bookmark>`. If your \
+changes are already pushed or there is nothing left to do, say so — explain your status instead of \
 re-running."
     )
 }
@@ -4600,7 +4600,7 @@ re-running."
 /// Probe text dispatched when a PR exists but the worker has local
 /// commits that haven't been pushed yet — the PR is stale.
 pub const PROBE_STALE_PR: &str = "A PR exists for this branch, but your local commits \
-are ahead of the PR's head. Push the new commits (`jj git push -b <bookmark>`) \
+are ahead of the PR's head. Push the new commits with `cube pr update --branch <bookmark>` \
 so the PR reflects your latest work, or explain why the local commits should not \
 be pushed.";
 
