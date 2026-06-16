@@ -141,13 +141,22 @@ impl Runner {
                     );
 
                     join_set.spawn(async move {
+                        let check_start = std::time::Instant::now();
                         check
                             .run(&run_changeset, source_tree.as_ref())
                             .await
                             .map(|mut result| {
+                                let elapsed_ms = check_start.elapsed().as_millis();
                                 // Report findings under the configured instance id.
                                 result.check_id = configured_check_id.clone();
-                                apply_policy_to_result(result, &run_policy, &run_changeset)
+                                let result = apply_policy_to_result(result, &run_policy, &run_changeset);
+                                info!(
+                                    check_id = %configured_check_id,
+                                    elapsed_ms,
+                                    findings = result.findings.len(),
+                                    "built-in check complete"
+                                );
+                                result
                             })
                             .map_err(|err| (configured_check_id, source_path, err))
                     });
@@ -203,6 +212,7 @@ impl Runner {
                         let check_id_clone = configured_check_id.clone();
                         let source_path_clone = source_path.clone();
                         tokio::task::spawn_blocking(move || {
+                            let check_start = std::time::Instant::now();
                             external_executor
                                 .execute(
                                     &package,
@@ -213,8 +223,16 @@ impl Runner {
                                     run_policy.severity_override,
                                 )
                                 .map(|mut result| {
+                                    let elapsed_ms = check_start.elapsed().as_millis();
                                     result.check_id = configured_check_id.clone();
-                                    apply_policy_to_result(result, &run_policy, &run_changeset)
+                                    let result = apply_policy_to_result(result, &run_policy, &run_changeset);
+                                    info!(
+                                        check_id = %configured_check_id,
+                                        elapsed_ms,
+                                        findings = result.findings.len(),
+                                        "external check complete"
+                                    );
+                                    result
                                 })
                                 .map_err(|err| (configured_check_id, source_path, err))
                         })

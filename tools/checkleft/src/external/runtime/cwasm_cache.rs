@@ -142,15 +142,20 @@ impl ComponentAotCache {
 
         if cache_path.exists() {
             match self.try_load_cached(engine, &cache_path) {
-                Ok(component) => return Ok(component),
+                Ok(component) => {
+                    tracing::debug!(package_id, "component loaded from .cwasm cache (cache hit)");
+                    return Ok(component);
+                }
                 Err(_) => {
                     // Corrupt or stale entry from a previous crash / partial write.
                     // Remove it and fall through to a fresh precompile.
+                    tracing::debug!(package_id, "corrupt .cwasm cache entry removed; recompiling");
                     let _ = fs::remove_file(&cache_path);
                 }
             }
         }
 
+        tracing::debug!(package_id, "compiling component (cache miss)");
         self.compile_and_cache(engine, package_id, component_bytes, &cache_path)
     }
 

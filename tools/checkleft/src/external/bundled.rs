@@ -175,6 +175,11 @@ fn resolve_from_defs(defs: &[BundledCheckDef], name: &str) -> Result<Option<Exte
         if !def.check_names.contains(&name) {
             continue;
         }
+        let kind = match &def.kind {
+            BundledCheckDefKind::Declarative { .. } => "declarative",
+            BundledCheckDefKind::Component { .. } => "component",
+        };
+        tracing::debug!(name, kind, "resolved bundled check definition");
         return Ok(Some(match &def.kind {
             BundledCheckDefKind::Declarative { extension, contents } => {
                 parse_external_check_manifest(contents, extension)
@@ -185,6 +190,7 @@ fn resolve_from_defs(defs: &[BundledCheckDef], name: &str) -> Result<Option<Exte
             }
         }));
     }
+    tracing::debug!(name, "no bundled definition found for name");
     Ok(None)
 }
 

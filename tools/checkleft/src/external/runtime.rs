@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -382,6 +383,7 @@ impl DefaultExternalCheckExecutor {
                 package.id
             );
         }
+        let load_start = Instant::now();
         let component_bytes = if let Some(bytes) = component.artifact_bytes {
             bytes.to_vec()
         } else {
@@ -404,11 +406,34 @@ impl DefaultExternalCheckExecutor {
 
         let wasm_component =
             self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)?;
+        tracing::debug!(
+            check_id = %package.id,
+            elapsed_ms = load_start.elapsed().as_millis(),
+            "component loaded"
+        );
 
         // Phase 1: discover the check's declared access scope via list-checks.
         // This instantiation uses an empty WASI context (no preopens); only the
         // static descriptor is needed, no filesystem access.
+        let scope_start = Instant::now();
         let access_scope = discover_access_scope(&self.engine, &wasm_component, package, &component.check_name)?;
+        let scope_str = match &access_scope {
+            AccessScope::ModifiedOnly => "modified-only",
+            AccessScope::WholeRepo => "whole-repo",
+            AccessScope::Globs(_) => "globs",
+        };
+        tracing::debug!(
+            check_id = %package.id,
+            scope = scope_str,
+            elapsed_ms = scope_start.elapsed().as_millis(),
+            "access scope discovered via list-checks"
+        );
+        tracing::info!(
+            check_id = %package.id,
+            scope = scope_str,
+            file_count = changeset.changed_files.len(),
+            "acquiring sandbox for component check"
+        );
 
         // Acquire the sandbox. WholeRepo checks share a single sandbox that is
         // built at most once per executor lifetime — avoids materializing the
@@ -425,6 +450,7 @@ impl DefaultExternalCheckExecutor {
         };
 
         // Phase 2: run the check with the capability-scoped sandbox preopened.
+        let run_start = Instant::now();
         let result = run_component_check(
             &self.engine,
             sandbox.root.path(),
@@ -439,6 +465,12 @@ impl DefaultExternalCheckExecutor {
                 config_dir,
             },
         )?;
+        tracing::debug!(
+            check_id = %package.id,
+            elapsed_ms = run_start.elapsed().as_millis(),
+            findings = result.findings.len(),
+            "component run-check complete"
+        );
 
         // Release this task's reference. For per-check sandboxes this triggers
         // cleanup immediately; for the shared whole-repo sandbox the executor's

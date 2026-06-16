@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
+use tracing::debug;
 use walkdir::WalkDir;
 
 use crate::input::{SourceTree, TreeVersion};
@@ -153,7 +155,9 @@ impl SourceTree for LocalSourceTree {
         glob_builder.add(Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?);
         let glob_set = glob_builder.build().context("failed to build glob set")?;
 
+        let walk_start = Instant::now();
         let mut matches = Vec::new();
+        let mut skipped_symlinks = 0usize;
         for entry in WalkDir::new(&self.root)
             .follow_links(false)
             .into_iter()
@@ -184,9 +188,13 @@ impl SourceTree for LocalSourceTree {
             // not appear in a whole-repo scan.
             if entry.file_type().is_symlink() {
                 let Ok(resolved) = entry.path().canonicalize() else {
+                    debug!(path = %entry.path().display(), reason = "unresolvable symlink", "skipped glob entry");
+                    skipped_symlinks += 1;
                     continue;
                 };
                 if !resolved.starts_with(&self.root) || resolved.is_dir() {
+                    debug!(path = %entry.path().display(), reason = "symlink escapes tree or is dir", "skipped glob entry");
+                    skipped_symlinks += 1;
                     continue;
                 }
             }
@@ -198,6 +206,13 @@ impl SourceTree for LocalSourceTree {
         }
 
         matches.sort();
+        debug!(
+            pattern,
+            matched = matches.len(),
+            skipped_symlinks,
+            elapsed_ms = walk_start.elapsed().as_millis(),
+            "glob walk complete"
+        );
         Ok(matches)
     }
 }

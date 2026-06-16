@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+use tracing::{debug, info};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -141,7 +143,13 @@ pub fn create_sandbox(
     source_tree: &dyn SourceTree,
     ceiling: &HostCeiling,
 ) -> Result<SandboxResult> {
+    let scope_str = match &scope {
+        AccessScope::ModifiedOnly => "modified-only",
+        AccessScope::WholeRepo => "whole-repo",
+        AccessScope::Globs(_) => "globs",
+    };
     let allowlist = resolve_allowlist(changeset, &scope, source_tree)?;
+    debug!(scope = scope_str, files = allowlist.len(), "populating sandbox");
 
     let base = sandbox_base_dir();
     if let Some(ref dir) = base {
@@ -162,11 +170,12 @@ pub fn create_sandbox(
     //    directory are safe (the OS serializes the mkdir).
     //  - allowed_paths is re-sorted after collection so output is deterministic
     //    regardless of completion order.
-    let results: Vec<Result<Option<PathBuf>>> = allowlist
+    let populate_start = Instant::now();
+    let results: Vec<Result<Option<(PathBuf, bool)>>> = allowlist
         .par_iter()
         .map(
             |path| match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree) {
-                Ok(()) => Ok(Some(path.clone())),
+                Ok(hardlinked) => Ok(Some((path.clone(), hardlinked))),
                 Err(e) if source_file_not_found(&e) => Ok(None),
                 Err(e) => Err(e).with_context(|| format!("failed to populate sandbox file {}", path.display())),
             },
@@ -174,13 +183,29 @@ pub fn create_sandbox(
         .collect();
 
     let mut allowed_paths = Vec::with_capacity(allowlist.len());
+    let mut hardlink_count = 0usize;
+    let mut copy_count = 0usize;
     for result in results {
-        if let Some(path) = result? {
+        if let Some((path, hardlinked)) = result? {
             allowed_paths.push(path);
+            if hardlinked {
+                hardlink_count += 1;
+            } else {
+                copy_count += 1;
+            }
         }
     }
     // Re-sort: parallel completion order is non-deterministic.
     allowed_paths.sort();
+
+    info!(
+        scope = scope_str,
+        files = allowed_paths.len(),
+        hardlinks = hardlink_count,
+        copies = copy_count,
+        elapsed_ms = populate_start.elapsed().as_millis(),
+        "sandbox populated"
+    );
 
     Ok(SandboxResult {
         root: sandbox_root,
@@ -256,12 +281,16 @@ fn source_file_not_found(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Populate one file into the sandbox. Returns `true` when the file was placed
+/// via a hardlink (zero-copy, fast path) or `false` when it was materialised
+/// from the SourceTree (copy path). Returns `Err` on any I/O failure other than
+/// ENOENT (handled by the caller as a benign mid-walk disappearance).
 fn populate_sandbox_file(
     sandbox_root: &Path,
     relative_path: &Path,
     ceiling: &Path,
     source_tree: &dyn SourceTree,
-) -> Result<()> {
+) -> Result<bool> {
     let dest = sandbox_root.join(relative_path);
 
     if let Some(parent) = dest.parent() {
@@ -280,7 +309,8 @@ fn populate_sandbox_file(
         .unwrap_or(false);
 
     if !source_is_symlink && fs::hard_link(&source, &dest).is_ok() {
-        return Ok(());
+        debug!(path = %relative_path.display(), method = "hardlink", "populated sandbox file");
+        return Ok(true);
     }
 
     // Fall back to materializing from the SourceTree. This handles virtual or
@@ -295,8 +325,9 @@ fn populate_sandbox_file(
         .read_file(relative_path)
         .with_context(|| format!("failed to read source file {}", relative_path.display()))?;
     fs::write(&dest, &content).with_context(|| format!("failed to write sandbox file {}", dest.display()))?;
+    debug!(path = %relative_path.display(), method = "copy", "populated sandbox file");
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
