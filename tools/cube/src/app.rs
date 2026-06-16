@@ -12034,8 +12034,8 @@ steps:
             "abc1234",
             vec![ExpectedCommand::ok(
                 workspace_path.clone(),
-                "pnpm",
-                &["install", "--frozen-lockfile"],
+                "sh",
+                &["-c", "pnpm install --frozen-lockfile"],
                 "",
             )],
         );
@@ -12121,7 +12121,12 @@ steps:
         let lease_runner = lease_runner_with_setup(
             &workspace_path,
             "abc1234",
-            vec![ExpectedCommand::ok(workspace_path.clone(), "pnpm", &["install"], "")],
+            vec![ExpectedCommand::ok(
+                workspace_path.clone(),
+                "sh",
+                &["-c", "pnpm install"],
+                "",
+            )],
         );
         run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
@@ -12137,8 +12142,8 @@ steps:
 
         let setup_runner = FakeRunner::new(vec![ExpectedCommand::ok(
             workspace_path.clone(),
-            "pnpm",
-            &["install"],
+            "sh",
+            &["-c", "pnpm install"],
             "",
         )]);
         let setup_result = run_with_dependencies(
@@ -12182,8 +12187,8 @@ steps:
             "abc1234",
             vec![ExpectedCommand::ok(
                 workspace_path.clone(),
-                "./decode-secrets.sh",
-                &[],
+                "sh",
+                &["-c", "./decode-secrets.sh"],
                 "",
             )],
         );
@@ -12267,11 +12272,11 @@ steps:
 
         let failing = ExpectedCommand {
             cwd: workspace_path.clone(),
-            program: "pnpm".to_string(),
-            args: vec!["install".to_string()],
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "pnpm install".to_string()],
             result: Err(CubeError::CommandFailed {
-                program: "pnpm".to_string(),
-                args: vec!["install".to_string()],
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "pnpm install".to_string()],
                 status: Some(1),
                 stderr: "boom".to_string(),
             }),

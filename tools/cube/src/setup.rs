@@ -290,21 +290,12 @@ fn invoke_step(
     step: &SetupStep,
     extra_env: &[(String, String)],
 ) -> Result<(), CubeError> {
-    let parts = shlex::split(&step.command).ok_or_else(|| {
-        CubeError::InvalidArgument(format!(
-            "setup step `{}` has an unparseable command: {}",
-            step.id, step.command
-        ))
-    })?;
-    let mut iter = parts.into_iter();
-    let program = iter
-        .next()
-        .ok_or_else(|| CubeError::InvalidArgument(format!("setup step `{}` resolved to an empty command", step.id)))?;
-    let args: Vec<String> = iter.collect();
+    // Run setup commands through a shell so that env var references like
+    // $CUBE_BASE_REPO are expanded by the shell before the program executes.
     runner.run(&CommandInvocation {
         cwd: workspace_path.to_path_buf(),
-        program,
-        args,
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), step.command.clone()],
         env: extra_env.to_vec(),
     })?;
     Ok(())
@@ -511,7 +502,7 @@ steps:
 
     use super::run_setup_engine;
     use crate::app::CubeError;
-    use crate::command_runner::{CommandInvocation, CommandRunner};
+    use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
     use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
     use crate::store::Store;
     use std::cell::RefCell;
@@ -638,5 +629,40 @@ steps:
             Some(source_dir.display().to_string()).as_deref()
         );
         assert!(env.contains_key("CUBE_WORKSPACE"));
+    }
+
+    #[test]
+    fn setup_engine_expands_cube_base_repo_in_command() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create a source directory with a file that should be copied.
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("config.toml"), b"secret").unwrap();
+
+        let store = make_store_with_repo(&tmp, Some(&source_dir));
+        let ws = workspace_record(&tmp);
+
+        // Command references $CUBE_BASE_REPO — must be expanded by the shell.
+        let config: SetupConfig = serde_yaml::from_str(
+            r#"version: 1
+steps:
+  - id: copy-config
+    command: 'cp "$CUBE_BASE_REPO/config.toml" config.toml'
+    run_when: always
+"#,
+        )
+        .unwrap();
+
+        let runner = RealCommandRunner;
+        run_setup_engine(&store, &runner, &ws, &config, 0).unwrap();
+
+        // Assert the file was actually copied, proving $CUBE_BASE_REPO expanded.
+        let dest = ws.workspace_path.join("config.toml");
+        assert!(
+            dest.exists(),
+            "config.toml should have been copied from $CUBE_BASE_REPO"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"secret");
     }
 }
