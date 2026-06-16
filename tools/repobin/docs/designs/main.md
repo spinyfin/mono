@@ -505,6 +505,101 @@ The smallest viable implementation is:
 This should stay intentionally small. The design is good if it replaces
 repo-local one-off wrappers, not if it grows into a second build system.
 
+## Pinned Tools (Build From Source At A Version Tag)
+
+The core model builds a tool from whatever is checked out (HEAD). Some consumers
+instead need a *specific released version* of a tool that lives in another repo
+— for example a repo that runs `checkleft` (released as `checkleft-v*` tags in
+`spinyfin/mono`) and wants to control exactly which release it runs, the way
+flunge historically did with a hand-rolled install plus a `bin/checkleft.lock`.
+
+Repobin folds that into one mechanism: a *pinned tool*.
+
+### Configuration
+
+A pinned tool is declared in the consuming repo's checked-in `REPOBIN.toml`
+under a separate `[pins]` table, so the pin travels with the repo and is
+reviewed like any other source change:
+
+```toml
+version = 1
+
+[tools.app]
+target = "//app:app"            # local: built at the current checkout's HEAD
+
+[pins.checkleft]
+repo = "git@github.com:spinyfin/mono.git"
+tag  = "checkleft-v0.1.0-alpha.5"
+```
+
+`[tools]` and `[pins]` are disjoint namespaces (a name may be one or the other,
+not both). A pin carries `repo` + `tag` but **not** a Bazel target: the target
+is read from the pinned checkout's own `REPOBIN.toml`, so it is never duplicated
+in the consumer and renaming it upstream needs no consumer change. Unpinned
+local tools keep building at HEAD exactly as before — pins are purely additive.
+
+### Source Acquisition: Git Tag → Commit
+
+The open question was how to obtain an external tool's source at a tag. The
+options were a git tag in the upstream repo, a crates.io source version, or a
+release artifact. We use the **git tag**, because:
+
+- it is how the canonical consumer (`checkleft`) already releases — a
+  `checkleft-v*` tag points at the release commit that patches the version into
+  `Cargo.toml`, so building the Bazel target at that commit reproduces exactly
+  the released binary;
+- it keeps repobin's "Bazel owns the build" model intact — there is no separate
+  artifact format to download, verify, or platform-match (consistent with the
+  Non-Goals above);
+- it is deterministic: a tag resolves to exactly one commit.
+
+Resolution and build:
+
+1. `git ls-remote <repo> refs/tags/<tag> refs/tags/<tag>^{}` resolves the tag to
+   a commit without cloning. The peeled `^{}` line is preferred so annotated
+   tags yield the underlying commit, not the tag object.
+2. The repo is full-cloned into a per-SHA cache slot
+   (`<cache>/repos/<slug>-<hash>/pins/<sha>/checkout`) and the commit is checked
+   out. Per-SHA slots let multiple pinned versions of one repo coexist and keep
+   the dispatch cache (keyed on checkout path) from ever serving one tag's
+   binary for another.
+3. The target is read from the checkout's `REPOBIN.toml` and built via the
+   normal `bazel build` + executable-resolution path.
+
+### Reproducibility: `REPOBIN.lock`
+
+To make the resolved version deterministic and verifiable — the role
+`bin/checkleft.lock` played — repobin records each pin's resolved commit in a
+`REPOBIN.lock` next to `REPOBIN.toml`:
+
+```toml
+version = 1
+
+[tools.checkleft]
+repo = "git@github.com:spinyfin/mono.git"
+tag = "checkleft-v0.1.0-alpha.5"
+resolved = "4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d"
+```
+
+Resolution is **lock-first**: if the lock already records the tool at the
+configured repo + tag, that commit is authoritative and repobin builds it
+without contacting the remote (offline, fully deterministic). The lock is
+(re)written only on first use or when the tag in `REPOBIN.toml` changes — so
+steady-state invocations do not mutate the working tree. The lock should be
+committed so CI and teammates build the identical commit. `repobin list` and
+`repobin doctor` surface each pin's tag and resolved commit.
+
+A missing tag is a hard, clearly-worded error (naming tool, repo, and tag).
+There is deliberately no silent fall-back to HEAD: a pin that cannot be honored
+must fail loudly rather than run an unexpected version.
+
+### Trust Note
+
+Pinning narrows *which* version runs but does not change the trust model: a
+pinned build still executes the upstream repo's Bazel-defined behavior at the
+pinned commit. As with the rest of repobin, this is convenient execution of
+repo-owned tools, not sandboxing or artifact verification.
+
 ## Follow-Up Extensions
 
 Useful follow-ups after the core design works:

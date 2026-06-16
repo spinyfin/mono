@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::app::RepobinError;
 use crate::bazel::BazelAdapter;
 use crate::cache::cache_root_from_env;
-use crate::config::{RepoConfig, load_repo_config};
+use crate::config::RepoConfig;
 use crate::dispatch_cache;
 
 const TRACE_ENV: &str = "REPOBIN_TRACE";
@@ -20,16 +20,6 @@ pub struct DispatchPlan {
     pub executable_path: PathBuf,
     pub original_cwd: PathBuf,
     pub forwarded_args: Vec<OsString>,
-}
-
-pub fn prepare_dispatch<B: BazelAdapter>(
-    bazel: &B,
-    cwd: &Path,
-    tool_name: &str,
-    forwarded_args: &[OsString],
-) -> Result<DispatchPlan, RepobinError> {
-    let repo_config = load_repo_config(cwd)?;
-    prepare_dispatch_from_repo_config(bazel, repo_config, cwd, tool_name, forwarded_args)
 }
 
 pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
@@ -60,7 +50,7 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
     )
 }
 
-fn plan_from_target<B: BazelAdapter>(
+pub(crate) fn plan_from_target<B: BazelAdapter>(
     bazel: &B,
     cache_root: Option<&Path>,
     repo_root: &Path,
@@ -193,6 +183,7 @@ mod tests {
                         target: "//tools/boss/cli:boss".to_string(),
                     },
                 )]),
+                pins: BTreeMap::new(),
             },
         }
     }

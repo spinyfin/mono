@@ -11,8 +11,10 @@ use crate::cache::{EnsureOutcome, RepoCache, cache_root_from_env};
 use crate::cli::{Cli, Command as CliCommand};
 use crate::config::{CONFIG_FILE_NAME, load_repo_config};
 use crate::defaults::{DEFAULTS_FILE_NAME, load_defaults_at, load_defaults_for_exe};
-use crate::dispatch::{DispatchPlan, prepare_dispatch, prepare_dispatch_from_repo_config};
+use crate::dispatch::{DispatchPlan, prepare_dispatch_from_repo_config};
 use crate::install::{InstallReport, current_home_dir, install, resolve_bin_dir};
+use crate::lock::{load_lock, lock_path};
+use crate::pin::prepare_pinned_plan;
 
 const REPOBIN_BINARY_NAME: &str = "repobin";
 
@@ -179,6 +181,42 @@ pub enum RepobinError {
         sha: String,
         defaults_path: PathBuf,
     },
+    #[error("tag `{tag}` for pinned tool `{tool}` was not found in `{repo}`")]
+    TagNotFound { tool: String, repo: String, tag: String },
+    #[error(
+        "pinned tool `{tool}` ({repo} @ {tag}) is not declared in the upstream `{}` — the pinned checkout must declare a bazel target for it",
+        config_path.display()
+    )]
+    PinnedToolNotInUpstream {
+        tool: String,
+        repo: String,
+        tag: String,
+        config_path: PathBuf,
+    },
+    #[error("failed to read lock file `{}`", path.display())]
+    ReadLock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse lock file `{}`", path.display())]
+    ParseLock {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("failed to serialize lock file `{}`", path.display())]
+    SerializeLock {
+        path: PathBuf,
+        #[source]
+        source: toml::ser::Error,
+    },
+    #[error("failed to write lock file `{}`", path.display())]
+    WriteLock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to exec `{}`", path.display())]
     ExecTool {
         path: PathBuf,
@@ -201,13 +239,12 @@ impl RepobinError {
             | Self::ParseDefaults { .. }
             | Self::UnsupportedDefaultsVersion { .. }
             | Self::InvalidDefaults(_)
+            | Self::TagNotFound { .. }
+            | Self::PinnedToolNotInUpstream { .. }
+            | Self::ParseLock { .. }
             | Self::MissingHomeDirectory => ExitCode::from(2),
             _ => ExitCode::FAILURE,
         }
-    }
-
-    fn allows_default_fallback(&self) -> bool {
-        matches!(self, Self::ConfigNotFound { .. } | Self::ToolNotConfigured { .. })
     }
 }
 
@@ -266,6 +303,25 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
                 println!("  {name} -> {}", tool.target);
             }
 
+            if !repo_config.config.pins.is_empty() {
+                let lock_file = lock_path(&repo_config.repo_root);
+                let lock = load_lock(&lock_file)?;
+                println!("Pinned tools:");
+                for (name, pin) in &repo_config.config.pins {
+                    let resolved = lock
+                        .as_ref()
+                        .and_then(|l| l.tools.get(name))
+                        .filter(|entry| entry.repo == pin.repo && entry.tag == pin.tag)
+                        .map(|entry| entry.resolved.as_str())
+                        .unwrap_or("unresolved");
+                    println!("  {name} -> {} @ {} (resolved {resolved})", pin.repo, pin.tag);
+                }
+                match &lock {
+                    Some(_) => println!("Lock: {}", lock_file.display()),
+                    None => println!("Lock: {} (not yet written)", lock_file.display()),
+                }
+            }
+
             let defaults_file = bin_dir.join(DEFAULTS_FILE_NAME);
             match load_defaults_at(&defaults_file)? {
                 Some(loaded) if !loaded.config.tools.is_empty() => {
@@ -295,6 +351,9 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
             let repo_config = load_repo_config(cwd)?;
             for (name, tool) in &repo_config.config.tools {
                 println!("{name} -> {}", tool.target);
+            }
+            for (name, pin) in &repo_config.config.pins {
+                println!("{name} -> {} @ {} (pinned)", pin.repo, pin.tag);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -336,20 +395,59 @@ fn dispatch_tool(
     forwarded_args: &[OsString],
 ) -> Result<(), RepobinError> {
     let bazel = RealBazel::new(env::var_os("REPOBIN_VERBOSE").is_some());
-    let local_err = match prepare_dispatch(&bazel, cwd, tool_name, forwarded_args) {
-        Ok(plan) => return exec_dispatch(plan),
-        Err(error) => error,
-    };
 
-    if !local_err.allows_default_fallback() {
-        return Err(local_err);
+    // Resolution order: a tool declared in the nearest REPOBIN.toml wins
+    // (local `[tools]` target built at HEAD, or a `[pins]` entry built from
+    // source at its tag); otherwise fall back to default mode (repobin.yaml
+    // next to the installed binary).
+    match load_repo_config(cwd) {
+        Ok(repo_config) => {
+            if repo_config.config.tools.contains_key(tool_name) {
+                let plan = prepare_dispatch_from_repo_config(&bazel, repo_config, cwd, tool_name, forwarded_args)?;
+                return exec_dispatch(plan);
+            }
+            if let Some(pin) = repo_config.config.pins.get(tool_name) {
+                let cache_root = cache_root_from_env()?;
+                let lock_file = lock_path(&repo_config.repo_root);
+                let plan = prepare_pinned_plan(
+                    &bazel,
+                    &cache_root,
+                    &lock_file,
+                    tool_name,
+                    pin,
+                    cwd,
+                    forwarded_args,
+                    repobin_verbose(),
+                )?;
+                return exec_dispatch(plan);
+            }
+            // Configured repo, but this tool is not in it — try default mode.
+            let local_err = RepobinError::ToolNotConfigured {
+                tool: tool_name.to_string(),
+                config_path: repo_config.config_path.clone(),
+            };
+            dispatch_via_default_mode(&bazel, current_executable, cwd, tool_name, forwarded_args, local_err)
+        }
+        Err(local_err @ RepobinError::ConfigNotFound { .. }) => {
+            dispatch_via_default_mode(&bazel, current_executable, cwd, tool_name, forwarded_args, local_err)
+        }
+        // Parse / validation errors are real misconfiguration — surface them.
+        Err(other) => Err(other),
     }
+}
 
-    let plan = match prepare_default_plan(&bazel, current_executable, cwd, tool_name, forwarded_args)? {
-        Some(plan) => plan,
-        None => return Err(local_err),
-    };
-    exec_dispatch(plan)
+fn dispatch_via_default_mode(
+    bazel: &RealBazel,
+    current_executable: &Path,
+    cwd: &Path,
+    tool_name: &str,
+    forwarded_args: &[OsString],
+    local_err: RepobinError,
+) -> Result<(), RepobinError> {
+    match prepare_default_plan(bazel, current_executable, cwd, tool_name, forwarded_args)? {
+        Some(plan) => exec_dispatch(plan),
+        None => Err(local_err),
+    }
 }
 
 fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
@@ -404,7 +502,7 @@ fn repobin_verbose() -> bool {
     env::var_os("REPOBIN_VERBOSE").is_some()
 }
 
-fn args_request_json(args: &[OsString]) -> bool {
+pub(crate) fn args_request_json(args: &[OsString]) -> bool {
     args.iter().any(|arg| arg == "--json")
 }
 
