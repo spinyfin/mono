@@ -541,6 +541,13 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          `Read`, `jj log`, `jj show`, `jj diff`, `gh pr view`, `gh pr diff`,\n\
          `gh pr list`, and similar read-only operations.\n\
          \n\
+         ## `gh` requires `--repo` in this workspace\n\
+         \n\
+         `gh` cannot auto-detect the repo in a jj workspace (there is no `.git`\n\
+         directory at the root — only `.jj/`). Your initial task prompt states\n\
+         the concrete repo slug. Pass `--repo <owner/repo>` on every `gh`\n\
+         command: `gh pr view`, `gh pr diff`, `gh pr checks`, `gh api`, etc.\n\
+         \n\
          ## Your workspace\n\
          \n\
          - Workspace path: `{workspace_path}`\n\
@@ -615,6 +622,7 @@ pub fn render_reviewer_initial_prompt(
     output_path: &str,
     scope: ReviewScope,
     ctx: Option<&PrReviewContext>,
+    repo_slug: &str,
 ) -> String {
     let rubric = render_rubric_section(&scope);
 
@@ -665,7 +673,7 @@ pub fn render_reviewer_initial_prompt(
          below — no need to fetch it separately.\n"
             .to_owned()
     } else {
-        format!("2. Get the diff for the annotated view: `gh pr diff {pr_ref}`\n")
+        format!("2. Get the diff for the annotated view: `gh pr diff {pr_ref} --repo {repo_slug}`\n")
     };
     let embedded_diff_section = match embedded_diff {
         Some(diff) => format!(
@@ -695,6 +703,13 @@ pub fn render_reviewer_initial_prompt(
          finding. Posting to GitHub is prohibited — your feedback stays inside \
          Boss as an internal revision.\n\
          \n\
+         ## `gh` requires `--repo` in this workspace\n\
+         \n\
+         This repo is `{repo_slug}`. `gh` cannot auto-detect the repo in a jj \
+         workspace (there is no `.git` directory at the root — only `.jj/`). \
+         Pass `--repo {repo_slug}` on every `gh` command: `gh pr view`, \
+         `gh pr diff`, `gh pr checks`, `gh api`, etc.\n\
+         \n\
          ## PR under review\n\
          \n\
          **Task:** {task_name}\n\
@@ -709,7 +724,7 @@ pub fn render_reviewer_initial_prompt(
          1. Your workspace is already checked out to the PR head — read \
             changed files directly with `Read`, `cat`, `grep`, etc.\n\
          {diff_step}\
-         3. Get the PR description: `gh pr view {pr_ref}`\n\
+         3. Get the PR description: `gh pr view {pr_ref} --repo {repo_slug}`\n\
          4. Read changed files and surrounding context using `Read`, `cat`, \
             `grep`, `jj show`, etc. — no writes to repo files.\n\
          5. Produce the `ReviewResult` JSON (schema below) and deliver it as \
@@ -802,6 +817,7 @@ pub fn render_reviewer_initial_prompt(
         embedded_diff_section = embedded_diff_section,
         schema_head_sha = schema_head_sha,
         rubric = rubric,
+        repo_slug = repo_slug,
     )
 }
 
@@ -935,6 +951,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
+            "org/repo",
         );
         assert!(prompt.contains("https://github.com/org/repo/pull/99"));
         assert!(prompt.contains("Fix the auth bug"));
@@ -945,6 +962,8 @@ mod tests {
         assert!(prompt.contains("regression_check"));
         assert!(prompt.contains("read-only"));
         assert!(prompt.contains("gh pr diff"));
+        assert!(prompt.contains("--repo org/repo"), "prompt must include --repo flag");
+        assert!(prompt.contains("org/repo"), "prompt must state the repo slug");
     }
 
     #[test]
@@ -956,6 +975,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
+            "org/repo",
         );
         assert!(
             prompt.contains("already checked out to the PR head"),
@@ -987,14 +1007,15 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
+            "org/repo",
         );
         assert!(prompt.contains("base000"), "prompt must include base SHA");
         assert!(prompt.contains("head999"), "prompt must include head SHA");
         assert!(prompt.contains("src/main.rs"), "prompt must list changed files");
         assert!(prompt.contains("tests/test.rs"), "prompt must list changed files");
         assert!(
-            prompt.contains("gh pr diff 99"),
-            "prompt must use PR number in diff command"
+            prompt.contains("gh pr diff 99 --repo org/repo"),
+            "prompt must use PR number and --repo in diff command"
         );
         assert!(
             prompt.contains("already checked out to the PR head"),
@@ -1026,6 +1047,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
+            "org/repo",
         );
         assert!(
             !prompt.contains("gh pr diff 42"),
@@ -1061,10 +1083,11 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
+            "org/repo",
         );
         assert!(
-            prompt.contains("gh pr diff 42"),
-            "prompt must instruct reviewer to call gh pr diff when no diff is embedded"
+            prompt.contains("gh pr diff 42 --repo org/repo"),
+            "prompt must instruct reviewer to call gh pr diff with --repo when no diff is embedded"
         );
         assert!(
             !prompt.contains("Embedded diff"),
@@ -1081,6 +1104,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
+            "org/repo",
         );
         assert!(prompt.contains("code PR"));
         assert!(prompt.contains("Docs-only fallback"));
@@ -1101,6 +1125,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::DocsOnly,
             None,
+            "org/repo",
         );
         assert!(prompt.contains("docs-only PR"));
         assert!(prompt.contains("light rubric"));
@@ -1120,6 +1145,7 @@ mod tests {
             "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
+            "org/repo",
         );
         assert!(prompt.contains("fast, high-signal"));
         assert!(prompt.contains("scrutiny budget"));
@@ -1134,6 +1160,7 @@ mod tests {
             "/var/tmp/boss-worker-output/exec_abc_1.json",
             ReviewScope::Code,
             None,
+            "org/repo",
         );
         // The artifact path is embedded verbatim as the primary output target.
         assert!(
