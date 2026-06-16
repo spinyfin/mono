@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use tempfile::TempDir;
 
 use crate::input::{ChangeSet, SourceTree};
@@ -148,22 +149,38 @@ pub fn create_sandbox(
     }
     let sandbox_root = make_sandbox_dir(base.as_deref())?;
 
+    // Populate files in parallel. Each file's hardlink/copy is independent, so
+    // rayon's work-stealing pool (bounded by the hardware thread count) gives
+    // near-linear speedup on whole-repo scopes with thousands of files.
+    //
+    // Correctness invariants preserved under parallelism:
+    //  - Path-containment checks run inside populate_sandbox_file per file;
+    //    any containment failure propagates as Err and aborts the whole build.
+    //  - ENOENT (file vanished between enumeration and link/read) is skipped,
+    //    not an error — same as the sequential version.
+    //  - create_dir_all is idempotent; concurrent calls for the same parent
+    //    directory are safe (the OS serializes the mkdir).
+    //  - allowed_paths is re-sorted after collection so output is deterministic
+    //    regardless of completion order.
+    let results: Vec<Result<Option<PathBuf>>> = allowlist
+        .par_iter()
+        .map(
+            |path| match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree) {
+                Ok(()) => Ok(Some(path.clone())),
+                Err(e) if source_file_not_found(&e) => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("failed to populate sandbox file {}", path.display())),
+            },
+        )
+        .collect();
+
     let mut allowed_paths = Vec::with_capacity(allowlist.len());
-    for path in &allowlist {
-        match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree) {
-            Ok(()) => {
-                allowed_paths.push(path.clone());
-            }
-            Err(e) if source_file_not_found(&e) => {
-                // File vanished between enumeration and population (e.g. a
-                // transient lock file or a concurrent workspace write). Skip it
-                // rather than aborting the whole sandbox build.
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to populate sandbox file {}", path.display()));
-            }
+    for result in results {
+        if let Some(path) = result? {
+            allowed_paths.push(path);
         }
     }
+    // Re-sort: parallel completion order is non-deterministic.
+    allowed_paths.sort();
 
     Ok(SandboxResult {
         root: sandbox_root,
