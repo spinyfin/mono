@@ -40,7 +40,9 @@ struct Config {
 #[check(
     name = "rust/giant-structs",
     description = "flags Rust structs with more than the configured number of named fields that lack a builder derive",
-    severity = error
+    severity = error,
+    declared_exclusions = giant_structs_declared_exclusions,
+    evaluate_exclusion = giant_structs_evaluate_exclusion
 )]
 pub fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();

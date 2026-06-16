@@ -36,39 +36,11 @@
 
 use checkleft_check_sdk::export_checks;
 
-// Bring each preinstalled check's generated component-ABI entry into this crate's
-// root so the single `export_checks!` below can register it. `#[check]` in each
-// source crate emits a `__CHECKLEFT_ENTRY_<fn>` static; `export_checks!` derives
-// that name from the function ident it is given and references it via `super::`.
-// The `rust/giant-structs` stale-exclusion audit hooks are plain functions.
-use checkleft_file_forbidden_path::__CHECKLEFT_ENTRY_forbidden_path_check;
-use checkleft_file_ifchange::{__CHECKLEFT_ENTRY_file_ifchange_check, file_ifchange_declare_required_files};
-use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
-use checkleft_md_link_integrity::__CHECKLEFT_ENTRY_md_link_integrity_check;
-use checkleft_rust_giant_structs_create::{
-    __CHECKLEFT_ENTRY_giant_structs_create_check, giant_structs_create_declared_exclusions,
-    giant_structs_create_evaluate_exclusion,
-};
-use checkleft_rust_giant_structs_use_builder::{
-    __CHECKLEFT_ENTRY_giant_structs_check, giant_structs_declared_exclusions, giant_structs_evaluate_exclusion,
-};
-
 export_checks!(
-    forbidden_path_check,
-    file_size_check,
-    file_ifchange_check,
-    required_files("file/ifchange", file_ifchange_declare_required_files),
-    md_link_integrity_check,
-    giant_structs_check,
-    exclusion_audit(
-        "rust/giant-structs",
-        giant_structs_declared_exclusions,
-        giant_structs_evaluate_exclusion
-    ),
-    giant_structs_create_check,
-    exclusion_audit(
-        "rust/giant-structs-create",
-        giant_structs_create_declared_exclusions,
-        giant_structs_create_evaluate_exclusion
-    ),
+    checkleft_file_forbidden_path::forbidden_path_check,
+    checkleft_file_size::file_size_check,
+    checkleft_file_ifchange::file_ifchange_check,
+    checkleft_md_link_integrity::md_link_integrity_check,
+    checkleft_rust_giant_structs_use_builder::giant_structs_check,
+    checkleft_rust_giant_structs_create::giant_structs_create_check,
 );

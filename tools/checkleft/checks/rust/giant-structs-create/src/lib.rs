@@ -60,7 +60,9 @@ struct Config {
 #[check(
     name = "rust/giant-structs-create",
     description = "flags call sites that construct a struct with more than the configured number of explicit named fields instead of a builder",
-    severity = error
+    severity = error,
+    declared_exclusions = giant_structs_create_declared_exclusions,
+    evaluate_exclusion = giant_structs_create_evaluate_exclusion
 )]
 pub fn giant_structs_create_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();

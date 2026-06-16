@@ -7,7 +7,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Expr, ExprArray, ExprLit, Ident, ItemFn, Lit, LitStr, Token,
+    Expr, ExprArray, ExprLit, Ident, ItemFn, Lit, LitStr, Path, Token,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -26,6 +26,12 @@ struct CheckArgs {
     description: Option<String>,
     severity: SeverityArg,
     access_scope: AccessScopeArg,
+    /// Optional function to call for `declared_exclusions` dispatch.
+    declared_exclusions: Option<Ident>,
+    /// Optional function to call for `evaluate_exclusion` dispatch.
+    evaluate_exclusion: Option<Ident>,
+    /// Optional function to call for `declare_required_files` dispatch.
+    required_files: Option<Ident>,
 }
 
 #[derive(Default)]
@@ -51,6 +57,9 @@ impl Parse for CheckArgs {
         let mut description: Option<String> = None;
         let mut severity = SeverityArg::Warning;
         let mut access_scope = AccessScopeArg::ModifiedOnly;
+        let mut declared_exclusions: Option<Ident> = None;
+        let mut evaluate_exclusion: Option<Ident> = None;
+        let mut required_files: Option<Ident> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -82,6 +91,18 @@ impl Parse for CheckArgs {
                 "access_scope" => {
                     access_scope = parse_access_scope(input)?;
                 }
+                "declared_exclusions" => {
+                    let ident: Ident = input.parse()?;
+                    declared_exclusions = Some(ident);
+                }
+                "evaluate_exclusion" => {
+                    let ident: Ident = input.parse()?;
+                    evaluate_exclusion = Some(ident);
+                }
+                "required_files" => {
+                    let ident: Ident = input.parse()?;
+                    required_files = Some(ident);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -107,6 +128,9 @@ impl Parse for CheckArgs {
             description,
             severity,
             access_scope,
+            declared_exclusions,
+            evaluate_exclusion,
+            required_files,
         })
     }
 }
@@ -150,11 +174,19 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
 /// - `description = "..."` (optional): Human-readable description; defaults to name.
 /// - `severity = warning|error|info` (optional): Default severity (default: `warning`).
 /// - `access_scope = modified_only|whole_repo|declared_files|globs([...])` (optional):
-///   File-access scope (default: `modified_only`). Use `declared_files` together with a
-///   `required_files(name, fn)` entry in `export_checks!` to declare per-changeset file
-///   sets without requesting whole-repo access.
+///   File-access scope (default: `modified_only`). Use `declared_files` together with
+///   `required_files = fn` to declare per-changeset file sets without requesting whole-repo
+///   access.
+/// - `declared_exclusions = fn` (optional): Function to call for stale-exclusion auditing.
+///   The function must have the signature `fn(&str) -> Vec<DeclaredExclusion>`.
+/// - `evaluate_exclusion = fn` (optional): Function to evaluate whether a declared
+///   exclusion is still load-bearing.
+///   The function must have the signature `fn(&str, &DeclaredExclusion, Option<&str>) -> ExclusionStatus`.
+/// - `required_files = fn` (optional): Function to declare the extra files needed by the
+///   check beyond the changeset. Use with `access_scope = declared_files`.
+///   The function must have the signature `fn(&ChangeSet, &str) -> Vec<String>`.
 ///
-/// After annotating all check functions, call `export_checks!(fn_name, ...)` once at
+/// After annotating all check functions, call `export_checks!(path::to::fn, ...)` once at
 /// the crate root to wire up the component exports.
 #[proc_macro_attribute]
 pub fn check(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -200,6 +232,51 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
         }
     };
 
+    // Optional declared_exclusions trait method impl.
+    let declared_exclusions_impl = if let Some(hook_fn) = &args.declared_exclusions {
+        quote! {
+            fn declared_exclusions(
+                &self,
+                config_json: &str,
+            ) -> ::std::vec::Vec<::checkleft_check_sdk::DeclaredExclusion> {
+                #hook_fn(config_json)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // Optional evaluate_exclusion trait method impl.
+    let evaluate_exclusion_impl = if let Some(hook_fn) = &args.evaluate_exclusion {
+        quote! {
+            fn evaluate_exclusion(
+                &self,
+                config_json: &str,
+                excl: &::checkleft_check_sdk::DeclaredExclusion,
+                file_content: ::core::option::Option<&str>,
+            ) -> ::checkleft_check_sdk::ExclusionStatus {
+                #hook_fn(config_json, excl, file_content)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // Optional declare_required_files trait method impl.
+    let required_files_impl = if let Some(hook_fn) = &args.required_files {
+        quote! {
+            fn declare_required_files(
+                &self,
+                changeset: &::checkleft_check_sdk::ChangeSet,
+                config_json: &str,
+            ) -> ::std::vec::Vec<::std::string::String> {
+                #hook_fn(changeset, config_json)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #func
 
@@ -230,11 +307,15 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             ) -> ::std::vec::Vec<::checkleft_check_sdk::Finding> {
                 #fn_ident(input)
             }
+
+            #declared_exclusions_impl
+            #evaluate_exclusion_impl
+            #required_files_impl
         }
 
         // `pub` so both the same-crate `export_checks!` (via `super::`) and an
-        // out-of-crate aggregating bundle (via `use <check_crate>::...`) can
-        // reference it. See the `pub struct` note above.
+        // out-of-crate aggregating bundle (via `crate_name::__CHECKLEFT_ENTRY_fn`)
+        // can reference it. See the `pub struct` note above.
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         pub static #entry_static: #entry_struct = #entry_struct;
@@ -248,60 +329,16 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
 // export_checks! function-like macro
 // ---------------------------------------------------------------------------
 
-/// One item in the `export_checks!(...)` argument list.
-enum ExportChecksItem {
-    /// A `#[check]`-annotated function to export.
-    Check(Ident),
-    /// Stale-exclusion audit hooks for a named check.
-    ExclusionAudit {
-        check_name: LitStr,
-        declared_fn: Ident,
-        eval_fn: Ident,
-    },
-    /// Per-changeset required-files hook for a check using `declared_files` scope.
-    RequiredFiles {
-        check_name: LitStr,
-        required_files_fn: Ident,
-    },
+/// One item in the `export_checks!(...)` argument list: a path to a
+/// `#[check]`-annotated function.
+struct ExportChecksItem {
+    path: Path,
 }
 
 impl Parse for ExportChecksItem {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let ident: Ident = input.parse()?;
-        if ident == "exclusion_audit" {
-            let content;
-            syn::parenthesized!(content in input);
-            let check_name: LitStr = content.parse()?;
-            content.parse::<Token![,]>()?;
-            let declared_fn: Ident = content.parse()?;
-            content.parse::<Token![,]>()?;
-            let eval_fn: Ident = content.parse()?;
-            // Allow optional trailing comma inside parens.
-            if content.peek(Token![,]) {
-                content.parse::<Token![,]>()?;
-            }
-            Ok(ExportChecksItem::ExclusionAudit {
-                check_name,
-                declared_fn,
-                eval_fn,
-            })
-        } else if ident == "required_files" {
-            let content;
-            syn::parenthesized!(content in input);
-            let check_name: LitStr = content.parse()?;
-            content.parse::<Token![,]>()?;
-            let required_files_fn: Ident = content.parse()?;
-            // Allow optional trailing comma inside parens.
-            if content.peek(Token![,]) {
-                content.parse::<Token![,]>()?;
-            }
-            Ok(ExportChecksItem::RequiredFiles {
-                check_name,
-                required_files_fn,
-            })
-        } else {
-            Ok(ExportChecksItem::Check(ident))
-        }
+        let path: Path = input.parse()?;
+        Ok(ExportChecksItem { path })
     }
 }
 
@@ -324,15 +361,30 @@ impl Parse for ExportChecksInput {
 
 /// Wire up the wasm component exports for all `#[check]`-annotated functions.
 ///
-/// Call this macro exactly once at the crate root listing every function
-/// decorated with `#[check]`:
+/// Call this macro exactly once at the crate root, listing every check function
+/// you want to export. Each argument is a path to a `#[check]`-annotated function:
 ///
+/// **Same-crate (single-check component):**
 /// ```rust,ignore
-/// export_checks!(my_check, another_check);
+/// export_checks!(my_check);
+/// ```
+///
+/// **Cross-crate bundle (multiple checks from different crates):**
+/// ```rust,ignore
+/// export_checks!(
+///     some_check_crate::my_check,
+///     another_check_crate::other_check,
+/// );
 /// ```
 ///
 /// The macro generates `list-checks` and `run-check` wasm component exports
-/// so the guest crate compiles as a valid checkleft check component.
+/// so the crate compiles as a valid checkleft check component.
+///
+/// Stale-exclusion audit hooks and required-files hooks are picked up
+/// automatically from the `#[check]` annotation on each function (via
+/// `declared_exclusions = fn`, `evaluate_exclusion = fn`, and
+/// `required_files = fn` arguments). No separate `exclusion_audit(...)` or
+/// `required_files(...)` entries are needed in `export_checks!`.
 ///
 /// # Requirements
 ///
@@ -348,54 +400,51 @@ pub fn export_checks(input: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
-    // Separate check functions from exclusion audit and required_files registrations.
-    let mut check_fns: Vec<&Ident> = Vec::new();
-    let mut exclusion_audits: Vec<(&LitStr, &Ident, &Ident)> = Vec::new();
-    let mut required_files_hooks: Vec<(&LitStr, &Ident)> = Vec::new();
-    for item in &input.items {
-        match item {
-            ExportChecksItem::Check(id) => check_fns.push(id),
-            ExportChecksItem::ExclusionAudit {
-                check_name,
-                declared_fn,
-                eval_fn,
-            } => {
-                exclusion_audits.push((check_name, declared_fn, eval_fn));
-            }
-            ExportChecksItem::RequiredFiles {
-                check_name,
-                required_files_fn,
-            } => {
-                required_files_hooks.push((check_name, required_files_fn));
-            }
-        }
-    }
+/// Build the token stream that references the `__CHECKLEFT_ENTRY_<fn>` static
+/// for a given check function path.
+///
+/// - For a single-ident path (`my_check`): produces `super::__CHECKLEFT_ENTRY_my_check`
+///   so the reference works inside the generated inner module.
+/// - For a multi-segment path (`some_crate::my_check`): produces
+///   `some_crate::__CHECKLEFT_ENTRY_my_check`, referencing the exported static
+///   directly from the check crate.
+fn entry_static_ref(path: &Path) -> syn::Path {
+    let fn_ident = &path.segments.last().unwrap().ident;
+    let entry_ident = format_ident!("__CHECKLEFT_ENTRY_{}", fn_ident);
 
-    let entry_statics: Vec<proc_macro2::Ident> = check_fns
-        .iter()
-        .map(|id| format_ident!("__CHECKLEFT_ENTRY_{}", id))
-        .collect();
+    if path.segments.len() == 1 {
+        // Same-crate: reference via super (we're inside __checkleft_exports module)
+        syn::parse_quote!(super::#entry_ident)
+    } else {
+        // Cross-crate: replace the last path segment with the entry static ident
+        let mut entry_path = path.clone();
+        entry_path.segments.last_mut().unwrap().ident = entry_ident;
+        entry_path
+    }
+}
+
+fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
+    let entry_paths: Vec<syn::Path> = input.items.iter().map(|item| entry_static_ref(&item.path)).collect();
 
     let wit = WIT_CONTENT;
 
     // list_checks: collect descriptors from all entries
-    let list_checks_body: Vec<TokenStream2> = entry_statics
+    let list_checks_body: Vec<TokenStream2> = entry_paths
         .iter()
-        .map(|stat| {
+        .map(|entry| {
             quote! {
-                to_wit_descriptor(super::#stat.descriptor()),
+                to_wit_descriptor(#entry.descriptor()),
             }
         })
         .collect();
 
-    // run_check: dispatch arms
-    let dispatch_arms: Vec<TokenStream2> = entry_statics
+    // run_check: match-arm dispatch
+    let dispatch_arms: Vec<TokenStream2> = entry_paths
         .iter()
-        .map(|stat| {
+        .map(|entry| {
             quote! {
-                n if n == super::#stat.name() => {
-                    let sdk_findings = super::#stat.run(sdk_input);
+                n if n == #entry.name() => {
+                    let sdk_findings = #entry.run(sdk_input);
                     ::core::result::Result::Ok(
                         sdk_findings.into_iter().map(to_wit_finding).collect()
                     )
@@ -404,13 +453,13 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
-    // declared_exclusions: dispatch arms from exclusion_audit(...) items
-    let decl_excl_arms: Vec<TokenStream2> = exclusion_audits
+    // declared_exclusions: if-chain dispatch (hooks travel with the check entry)
+    let decl_excl_arms: Vec<TokenStream2> = entry_paths
         .iter()
-        .map(|(check_name, declared_fn, _eval_fn)| {
+        .map(|entry| {
             quote! {
-                #check_name => {
-                    return super::#declared_fn(&config_json)
+                if name.as_str() == #entry.name() {
+                    return #entry.declared_exclusions(&config_json)
                         .into_iter()
                         .map(to_wit_declared_exclusion)
                         .collect();
@@ -419,13 +468,13 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
-    // evaluate_exclusion: dispatch arms from exclusion_audit(...) items
-    let eval_excl_arms: Vec<TokenStream2> = exclusion_audits
+    // evaluate_exclusion: if-chain dispatch
+    let eval_excl_arms: Vec<TokenStream2> = entry_paths
         .iter()
-        .map(|(check_name, _declared_fn, eval_fn)| {
+        .map(|entry| {
             quote! {
-                #check_name => {
-                    return to_wit_exclusion_status(super::#eval_fn(
+                if name.as_str() == #entry.name() {
+                    return to_wit_exclusion_status(#entry.evaluate_exclusion(
                         &config_json,
                         &sdk_excl,
                         file_content.as_deref(),
@@ -435,123 +484,20 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
-    // declare_required_files: dispatch arms from required_files(...) items
-    let req_files_arms: Vec<TokenStream2> = required_files_hooks
+    // declare_required_files: if-chain dispatch
+    // Each arm consumes `changeset` only when the name matches; Rust's
+    // flow-sensitive borrow checker accepts this because each arm returns.
+    let req_files_arms: Vec<TokenStream2> = entry_paths
         .iter()
-        .map(|(check_name, required_files_fn)| {
+        .map(|entry| {
             quote! {
-                #check_name => {
+                if name.as_str() == #entry.name() {
                     let sdk_changeset = from_wit_changeset(changeset);
-                    return super::#required_files_fn(&sdk_changeset, &config_json);
+                    return #entry.declare_required_files(&sdk_changeset, &config_json);
                 }
             }
         })
         .collect();
-
-    // Generate exclusion-audit method bodies. When there are no audit registrations the
-    // parameters are prefixed with `_` to suppress unused-variable warnings.
-    let exclusion_methods = if exclusion_audits.is_empty() {
-        quote! {
-            fn declared_exclusions(
-                _name: ::std::string::String,
-                _config_json: ::std::string::String,
-            ) -> ::std::vec::Vec<W::DeclaredExclusion> {
-                ::std::vec::Vec::new()
-            }
-
-            fn evaluate_exclusion(
-                _name: ::std::string::String,
-                _config_json: ::std::string::String,
-                _exclusion: W::DeclaredExclusion,
-                _file_content: ::core::option::Option<::std::string::String>,
-            ) -> W::ExclusionStatus {
-                W::ExclusionStatus::Unknown
-            }
-        }
-    } else {
-        quote! {
-            fn declared_exclusions(
-                name: ::std::string::String,
-                config_json: ::std::string::String,
-            ) -> ::std::vec::Vec<W::DeclaredExclusion> {
-                match name.as_str() {
-                    #( #decl_excl_arms )*
-                    _ => {}
-                }
-                ::std::vec::Vec::new()
-            }
-
-            fn evaluate_exclusion(
-                name: ::std::string::String,
-                config_json: ::std::string::String,
-                exclusion: W::DeclaredExclusion,
-                file_content: ::core::option::Option<::std::string::String>,
-            ) -> W::ExclusionStatus {
-                let sdk_excl = from_wit_declared_exclusion(exclusion);
-                match name.as_str() {
-                    #( #eval_excl_arms )*
-                    _ => {}
-                }
-                W::ExclusionStatus::Unknown
-            }
-        }
-    };
-
-    // Generate the declare_required_files method body.
-    let required_files_method = if required_files_hooks.is_empty() {
-        quote! {
-            fn declare_required_files(
-                _name: ::std::string::String,
-                _changeset: W::ChangeSet,
-                _config_json: ::std::string::String,
-            ) -> ::std::vec::Vec<::std::string::String> {
-                ::std::vec::Vec::new()
-            }
-        }
-    } else {
-        quote! {
-            fn declare_required_files(
-                name: ::std::string::String,
-                changeset: W::ChangeSet,
-                config_json: ::std::string::String,
-            ) -> ::std::vec::Vec<::std::string::String> {
-                match name.as_str() {
-                    #( #req_files_arms )*
-                    _ => {}
-                }
-                ::std::vec::Vec::new()
-            }
-        }
-    };
-
-    // Only generate the conversion helpers for exclusion types when needed.
-    let exclusion_conversions = if exclusion_audits.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            fn to_wit_declared_exclusion(e: ::checkleft_check_sdk::DeclaredExclusion) -> W::DeclaredExclusion {
-                W::DeclaredExclusion {
-                    entry: e.entry,
-                    depends_on: e.depends_on,
-                }
-            }
-
-            fn from_wit_declared_exclusion(e: W::DeclaredExclusion) -> ::checkleft_check_sdk::DeclaredExclusion {
-                ::checkleft_check_sdk::DeclaredExclusion {
-                    entry: e.entry,
-                    depends_on: e.depends_on,
-                }
-            }
-
-            fn to_wit_exclusion_status(s: ::checkleft_check_sdk::ExclusionStatus) -> W::ExclusionStatus {
-                match s {
-                    ::checkleft_check_sdk::ExclusionStatus::LoadBearing => W::ExclusionStatus::LoadBearing,
-                    ::checkleft_check_sdk::ExclusionStatus::Stale(reason) => W::ExclusionStatus::Stale(reason),
-                    ::checkleft_check_sdk::ExclusionStatus::Unknown => W::ExclusionStatus::Unknown,
-                }
-            }
-        }
-    };
 
     Ok(quote! {
         // The module is private; the wasm exports it generates are still
@@ -573,7 +519,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
             use checkleft::check::types as W;
 
             // Bring the CheckEntry trait into scope so we can call .name(),
-            // .descriptor(), and .run() on the entry statics from the parent.
+            // .descriptor(), .run(), .declared_exclusions(), etc. on entry statics.
             use ::checkleft_check_sdk::__private::CheckEntry as _;
 
             struct __CheckleftComponent;
@@ -599,9 +545,33 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     }
                 }
 
-                #required_files_method
+                fn declare_required_files(
+                    name: ::std::string::String,
+                    changeset: W::ChangeSet,
+                    config_json: ::std::string::String,
+                ) -> ::std::vec::Vec<::std::string::String> {
+                    #( #req_files_arms )*
+                    ::std::vec::Vec::new()
+                }
 
-                #exclusion_methods
+                fn declared_exclusions(
+                    name: ::std::string::String,
+                    config_json: ::std::string::String,
+                ) -> ::std::vec::Vec<W::DeclaredExclusion> {
+                    #( #decl_excl_arms )*
+                    ::std::vec::Vec::new()
+                }
+
+                fn evaluate_exclusion(
+                    name: ::std::string::String,
+                    config_json: ::std::string::String,
+                    exclusion: W::DeclaredExclusion,
+                    file_content: ::core::option::Option<::std::string::String>,
+                ) -> W::ExclusionStatus {
+                    let sdk_excl = from_wit_declared_exclusion(exclusion);
+                    #( #eval_excl_arms )*
+                    W::ExclusionStatus::Unknown
+                }
             }
 
             export!(__CheckleftComponent);
@@ -700,7 +670,27 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                 }
             }
 
-            #exclusion_conversions
+            fn to_wit_declared_exclusion(e: ::checkleft_check_sdk::DeclaredExclusion) -> W::DeclaredExclusion {
+                W::DeclaredExclusion {
+                    entry: e.entry,
+                    depends_on: e.depends_on,
+                }
+            }
+
+            fn from_wit_declared_exclusion(e: W::DeclaredExclusion) -> ::checkleft_check_sdk::DeclaredExclusion {
+                ::checkleft_check_sdk::DeclaredExclusion {
+                    entry: e.entry,
+                    depends_on: e.depends_on,
+                }
+            }
+
+            fn to_wit_exclusion_status(s: ::checkleft_check_sdk::ExclusionStatus) -> W::ExclusionStatus {
+                match s {
+                    ::checkleft_check_sdk::ExclusionStatus::LoadBearing => W::ExclusionStatus::LoadBearing,
+                    ::checkleft_check_sdk::ExclusionStatus::Stale(reason) => W::ExclusionStatus::Stale(reason),
+                    ::checkleft_check_sdk::ExclusionStatus::Unknown => W::ExclusionStatus::Unknown,
+                }
+            }
         }
     })
 }

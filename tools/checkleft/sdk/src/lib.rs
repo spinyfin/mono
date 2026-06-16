@@ -4,7 +4,7 @@
 //! `#[check]`, and call `export_checks!` once at the crate root. The SDK
 //! generates the component ABI boilerplate so authors never touch WIT bindings.
 //!
-//! # Quick start
+//! # Quick start (single-check crate)
 //!
 //! ```rust,ignore
 //! use checkleft_check_sdk::{check, export_checks, CheckInput, Finding};
@@ -18,6 +18,22 @@
 //! }
 //!
 //! export_checks!(my_check);
+//! ```
+//!
+//! # Multi-check bundle (aggregating crate)
+//!
+//! When packaging multiple checks into one component, pass fully-qualified paths
+//! instead of bare idents. Each check's stale-exclusion audit and required-files
+//! hooks are picked up automatically from the `#[check]` annotation — no manual
+//! `use` imports for generated statics, no repeated `exclusion_audit(...)` entries.
+//!
+//! ```rust,ignore
+//! use checkleft_check_sdk::export_checks;
+//!
+//! export_checks!(
+//!     my_check_crate::some_check,
+//!     another_check_crate::other_check,
+//! );
 //! ```
 //!
 //! The check crate's `Cargo.toml` must also include `wit-bindgen = "0.51"` as a
@@ -298,6 +314,36 @@ pub mod __private {
         fn name(&self) -> &'static str;
         fn descriptor(&self) -> crate::CheckDescriptor;
         fn run(&self, input: crate::CheckInput) -> Vec<crate::Finding>;
+
+        /// Return the auditable exclusion entries for this check.
+        ///
+        /// Populated when the `#[check]` attribute is annotated with
+        /// `declared_exclusions = fn_name`. Defaults to an empty vec.
+        fn declared_exclusions(&self, _config_json: &str) -> Vec<crate::DeclaredExclusion> {
+            vec![]
+        }
+
+        /// Evaluate whether a previously-declared exclusion is still load-bearing.
+        ///
+        /// Populated when the `#[check]` attribute is annotated with
+        /// `evaluate_exclusion = fn_name`. Defaults to `Unknown`.
+        fn evaluate_exclusion(
+            &self,
+            _config_json: &str,
+            _excl: &crate::DeclaredExclusion,
+            _file_content: Option<&str>,
+        ) -> crate::ExclusionStatus {
+            crate::ExclusionStatus::Unknown
+        }
+
+        /// Declare the set of additional files needed by this check beyond the
+        /// modified-files sandbox.
+        ///
+        /// Populated when the `#[check]` attribute is annotated with
+        /// `required_files = fn_name`. Defaults to an empty vec.
+        fn declare_required_files(&self, _changeset: &crate::ChangeSet, _config_json: &str) -> Vec<String> {
+            vec![]
+        }
     }
 }
 
