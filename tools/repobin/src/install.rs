@@ -66,6 +66,10 @@ pub fn install(
     };
 
     let mut symlink_names: BTreeSet<String> = repo_config.config.tools.keys().cloned().collect();
+    // Pinned tools get a symlink too (so e.g. `checkleft` becomes a command),
+    // but they are NOT written to repobin.yaml defaults: a pin is self-contained
+    // (its own repo + tag), not a default-mode entry tied to this repo's origin.
+    symlink_names.extend(repo_config.config.pins.keys().cloned());
     symlink_names.extend(updated_defaults.tools.keys().cloned());
     let mut installed_tools = Vec::with_capacity(symlink_names.len());
     for tool_name in &symlink_names {
@@ -228,7 +232,7 @@ mod tests {
 
     use crate::config::{Config, RepoConfig, ToolConfig};
 
-    use super::{current_home_dir, install, resolve_bin_dir};
+    use super::{current_home_dir, install, merge_defaults, resolve_bin_dir};
 
     fn sample_repo_config(root: &std::path::Path) -> RepoConfig {
         RepoConfig {
@@ -250,6 +254,7 @@ mod tests {
                         },
                     ),
                 ]),
+                pins: std::collections::BTreeMap::new(),
             },
         }
     }
@@ -349,6 +354,67 @@ mod tests {
         assert!(report.installed_tools.contains(&"leftover".to_string()));
         assert_eq!(
             std::fs::read_link(bin_dir.join("leftover")).expect("leftover symlink"),
+            Path::new("repobin")
+        );
+    }
+
+    #[test]
+    fn merge_defaults_excludes_pins() {
+        use crate::config::PinConfig;
+        use crate::defaults::DefaultsConfig;
+
+        let temp = TempDir::new().expect("tempdir");
+        let mut repo = sample_repo_config(temp.path());
+        repo.config.pins.insert(
+            "checkleft".to_string(),
+            PinConfig {
+                repo: "git@github.com:spinyfin/mono.git".to_string(),
+                tag: "checkleft-v0.1.0-alpha.5".to_string(),
+            },
+        );
+
+        let merged = merge_defaults(&DefaultsConfig::empty(), &repo, "git@github.com:spinyfin/consumer.git");
+        assert!(merged.tools.contains_key("boss"));
+        assert!(merged.tools.contains_key("cube"));
+        assert!(
+            !merged.tools.contains_key("checkleft"),
+            "pinned tools must not be written to default-mode entries"
+        );
+    }
+
+    #[test]
+    fn install_symlinks_pinned_tools() {
+        use crate::config::PinConfig;
+
+        let temp = TempDir::new().expect("tempdir");
+        let mut repo = sample_repo_config(temp.path());
+        repo.config.pins.insert(
+            "checkleft".to_string(),
+            PinConfig {
+                repo: "git@github.com:spinyfin/mono.git".to_string(),
+                tag: "checkleft-v0.1.0-alpha.5".to_string(),
+            },
+        );
+
+        let source_binary = temp.path().join("repobin-source");
+        fs::write(&source_binary, b"#!/bin/sh\nexit 0\n").expect("write source binary");
+        fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755)).expect("chmod source binary");
+
+        let bin_dir = temp.path().join("bin");
+        let report = install(
+            &source_binary,
+            &repo,
+            &bin_dir,
+            Some(OsString::from("/usr/bin").as_os_str()),
+            Some(OsString::from("/bin/zsh").as_os_str()),
+            Some(Path::new("/Users/test")),
+            false,
+        )
+        .expect("install");
+
+        assert!(report.installed_tools.contains(&"checkleft".to_string()));
+        assert_eq!(
+            std::fs::read_link(bin_dir.join("checkleft")).expect("checkleft symlink"),
             Path::new("repobin")
         );
     }

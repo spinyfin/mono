@@ -7,6 +7,8 @@ mod defaults;
 mod dispatch;
 mod dispatch_cache;
 mod install;
+mod lock;
+mod pin;
 mod shell;
 
 pub use app::{RepobinError, run_from_env};

@@ -49,6 +49,14 @@ impl RepoCache {
         self.dir.join("pinned").join("checkout")
     }
 
+    /// Checkout slot for a tag-pinned tool, keyed by the resolved commit SHA so
+    /// multiple pinned versions of the same repo (different tags) coexist
+    /// without thrashing a single slot, and so the dispatch cache — which keys
+    /// on the checkout path — never serves one tag's binary for another.
+    pub fn commit_checkout_dir(&self, sha: &str) -> PathBuf {
+        self.dir.join("pins").join(sha).join("checkout")
+    }
+
     pub fn lock(self) -> Result<RepoCacheLock, RepobinError> {
         fs::create_dir_all(&self.dir).map_err(|source| RepobinError::CreateCacheDir {
             path: self.dir.clone(),
@@ -189,6 +197,54 @@ impl RepoCacheLock {
         Ok(EnsureOutcome::Pinned { head })
     }
 
+    /// Ensure a full checkout of `sha` exists in its per-SHA slot. The SHA is
+    /// expected to be a resolved tag commit (see [`resolve_tag`]); if it is not
+    /// reachable in the remote, returns [`RepobinError::PinnedShaUnreachable`].
+    pub fn ensure_at_commit(
+        &self,
+        sha: &str,
+        tool_name: &str,
+        lock_path: &Path,
+    ) -> Result<EnsureOutcome, RepobinError> {
+        let checkout = self.cache.commit_checkout_dir(sha);
+
+        // Reuse the existing checkout if it is already at the requested SHA.
+        if checkout.join(".git").is_dir() {
+            if let Ok(current) = read_head(&checkout)
+                && sha_matches(&current, sha)
+            {
+                return Ok(EnsureOutcome::Pinned { head: current });
+            }
+            fs::remove_dir_all(&checkout).map_err(|source| RepobinError::WriteCacheMetadata {
+                path: checkout.clone(),
+                source,
+            })?;
+        }
+
+        if let Some(parent) = checkout.parent() {
+            fs::create_dir_all(parent).map_err(|source| RepobinError::CreateCacheDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        // Full clone so any reachable commit (the tag's target) is available.
+        self.clone_full(&checkout)?;
+
+        if !sha_reachable(&checkout, sha) {
+            let _ = fs::remove_dir_all(&checkout);
+            return Err(RepobinError::PinnedShaUnreachable {
+                tool: tool_name.to_string(),
+                sha: sha.to_string(),
+                defaults_path: lock_path.to_path_buf(),
+            });
+        }
+
+        checkout_sha(&checkout, sha)?;
+        let head = read_head(&checkout)?;
+        Ok(EnsureOutcome::Pinned { head })
+    }
+
     fn clone_full(&self, checkout: &Path) -> Result<(), RepobinError> {
         let output = Command::new("git")
             .arg("clone")
@@ -320,6 +376,60 @@ fn ls_remote_head(checkout: &Path) -> Result<String, RepobinError> {
             status: None,
         })?;
     Ok(sha)
+}
+
+/// Resolve a version tag in `repo_url` to its commit SHA via `git ls-remote`,
+/// without cloning. For annotated tags the peeled commit (`<tag>^{}`) is
+/// preferred over the tag-object SHA so the result is always a commit. Returns
+/// [`RepobinError::TagNotFound`] if the remote has no such tag.
+///
+/// This is the deterministic source-acquisition step for pinned tools: a tag
+/// resolves to exactly one commit, which the per-SHA checkout then builds.
+pub fn resolve_tag(tool_name: &str, repo_url: &str, tag: &str) -> Result<String, RepobinError> {
+    let direct = format!("refs/tags/{tag}");
+    let peeled = format!("refs/tags/{tag}^{{}}");
+    let output = Command::new("git")
+        .arg("ls-remote")
+        .arg(repo_url)
+        .arg(&direct)
+        .arg(&peeled)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| RepobinError::SpawnGit {
+            action: "ls-remote".to_string(),
+            source,
+        })?;
+    forward_to_stderr(&output.stderr);
+    if !output.status.success() {
+        return Err(RepobinError::GitFailed {
+            action: format!("ls-remote {repo_url} {direct}"),
+            status: output.status.code(),
+        });
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut direct_sha = None;
+    let mut peeled_sha = None;
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let sha = fields.next().unwrap_or("");
+        let refname = fields.next().unwrap_or("");
+        if sha.is_empty() {
+            continue;
+        }
+        if refname == peeled {
+            peeled_sha = Some(sha.to_string());
+        } else if refname == direct {
+            direct_sha = Some(sha.to_string());
+        }
+    }
+
+    peeled_sha.or(direct_sha).ok_or_else(|| RepobinError::TagNotFound {
+        tool: tool_name.to_string(),
+        repo: repo_url.to_string(),
+        tag: tag.to_string(),
+    })
 }
 
 fn fetch_and_reset(checkout: &Path) -> Result<(), RepobinError> {
@@ -733,6 +843,102 @@ mod tests {
             "head checkout should still be sha[2]={}, got {head_sha_final}",
             shas[2]
         );
+    }
+
+    fn push_tag(remote: &std::path::Path, tag: &str, sha: &str, annotated: bool) {
+        use std::process::Command;
+
+        let temp = TempDir::new().unwrap();
+        let work = temp.path().join("tagwork");
+        Command::new("git")
+            .args(["clone"])
+            .arg(remote)
+            .arg(&work)
+            .output()
+            .unwrap();
+        if annotated {
+            Command::new("git")
+                .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+                .args(["tag", "-a", tag, "-m", "release", sha])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+        } else {
+            Command::new("git")
+                .args(["tag", tag, sha])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+        }
+        Command::new("git")
+            .args(["push", "origin", &format!("refs/tags/{tag}")])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        // Keep `temp` alive until the push completes.
+        drop(temp);
+    }
+
+    #[test]
+    fn resolve_tag_returns_commit_for_lightweight_tag() {
+        let temp = TempDir::new().unwrap();
+        let (remote, shas) = make_remote_with_commits(&temp);
+        push_tag(&remote, "checkleft-v1", &shas[1], false);
+
+        let url = format!("file://{}", remote.display());
+        let resolved = super::resolve_tag("checkleft", &url, "checkleft-v1").expect("resolve");
+        assert_eq!(resolved, shas[1], "lightweight tag should resolve to its commit");
+    }
+
+    #[test]
+    fn resolve_tag_returns_peeled_commit_for_annotated_tag() {
+        let temp = TempDir::new().unwrap();
+        let (remote, shas) = make_remote_with_commits(&temp);
+        push_tag(&remote, "checkleft-v2", &shas[2], true);
+
+        let url = format!("file://{}", remote.display());
+        let resolved = super::resolve_tag("checkleft", &url, "checkleft-v2").expect("resolve");
+        assert_eq!(
+            resolved, shas[2],
+            "annotated tag must resolve to the peeled commit, not the tag object"
+        );
+    }
+
+    #[test]
+    fn resolve_tag_missing_tag_errors_clearly() {
+        let temp = TempDir::new().unwrap();
+        let (remote, _) = make_remote_with_commits(&temp);
+        let url = format!("file://{}", remote.display());
+        let err = super::resolve_tag("checkleft", &url, "checkleft-v-nope").expect_err("missing tag");
+        match err {
+            crate::app::RepobinError::TagNotFound { tool, tag, .. } => {
+                assert_eq!(tool, "checkleft");
+                assert_eq!(tag, "checkleft-v-nope");
+            }
+            other => panic!("expected TagNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_at_commit_checks_out_resolved_sha_in_per_sha_slot() {
+        let temp = TempDir::new().unwrap();
+        let (remote, shas) = make_remote_with_commits(&temp);
+        let cache_root = temp.path().join("cache");
+        let url = format!("file://{}", remote.display());
+        let cache = RepoCache::for_url(&cache_root, &url);
+
+        let lock = cache.lock().unwrap();
+        let outcome = lock
+            .ensure_at_commit(&shas[0], "checkleft", std::path::Path::new("REPOBIN.lock"))
+            .unwrap();
+        assert!(matches!(outcome, EnsureOutcome::Pinned { .. }));
+
+        let checkout = lock.cache().commit_checkout_dir(&shas[0]);
+        let head = super::read_head(&checkout).unwrap();
+        assert!(super::sha_matches(&head, &shas[0]), "expected {}, got {head}", shas[0]);
+        // Slot is keyed by SHA, distinct from the floating-HEAD checkout.
+        assert_ne!(checkout, lock.cache().checkout);
+        assert!(checkout.to_string_lossy().contains(&shas[0]));
     }
 
     #[test]
