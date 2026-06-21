@@ -1530,27 +1530,50 @@ fn prettier_manifest_parses_correctly() {
 
 #[test]
 fn prettier_applies_to_covers_js_ts_and_friends() {
+    // Behavioral test: compile the same globset select_files builds and verify
+    // representative files match (including tsx/mjs which exercise brace
+    // alternation) and that non-prettier file types do not.
+    use globset::{Glob, GlobSetBuilder};
+
     let package = parse_prettier_package();
-    for glob in [
-        "**/*.js",
-        "**/*.jsx",
-        "**/*.ts",
-        "**/*.tsx",
-        "**/*.json",
-        "**/*.css",
-        "**/*.scss",
-        "**/*.less",
-        "**/*.html",
-        "**/*.md",
-        "**/*.yaml",
-        "**/*.yml",
-        "**/*.graphql",
-        "**/*.vue",
+    let mut builder = GlobSetBuilder::new();
+    for pattern in &package.applies_to {
+        builder.add(Glob::new(pattern).unwrap_or_else(|e| panic!("invalid applies_to glob `{pattern}`: {e}")));
+    }
+    let globset = builder.build().expect("applies_to globset must build");
+
+    for path in [
+        "a.js",
+        "b.tsx",
+        "c.mjs",
+        "d.css",
+        "e.json",
+        "f.md",
+        "g.yaml",
+        "h.jsx",
+        "i.ts",
+        "j.cjs",
+        "k.mts",
+        "l.cts",
+        "m.scss",
+        "n.less",
+        "o.html",
+        "p.vue",
+        "q.markdown",
+        "r.yml",
+        "s.graphql",
+        "t.gql",
     ] {
         assert!(
-            package.applies_to.iter().any(|g| g == glob),
-            "applies_to should include `{glob}`; got: {:?}",
-            package.applies_to
+            globset.is_match(path),
+            "`{path}` should be matched by prettier's applies_to"
+        );
+    }
+
+    for path in ["x.rs", "y.png"] {
+        assert!(
+            !globset.is_match(path),
+            "`{path}` should NOT be matched by prettier's applies_to"
         );
     }
 }
