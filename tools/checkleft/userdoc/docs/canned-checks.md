@@ -249,6 +249,44 @@ Notes:
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
+## `format/biome`
+
+Purpose:
+
+- Flags changed files that are not [Biome](https://biomejs.dev)-formatted. [Biome](https://biomejs.dev) is a single fast Rust tool covering both formatting and linting — a quick alternative to Prettier. The formatter applies to the file types Biome formats: `*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`, `*.json`, `*.jsonc`, `*.css`, `*.graphql`, `*.gql`. (Biome 2.5.0 does not format HTML or Markdown, so those are not included.)
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `biome format --files-ignore-unknown=true --reporter=json <files>` over the changed files in one batch invocation (Biome is fast and accepts the whole set at once) and emits one finding per file that needs reformatting. The invocation runs in format-CHECK mode — it never writes files.
+- Biome discovers the **repo's own** `biome.json` / `biome.jsonc` relative to the repo root (invocations run with cwd = repo root). With no config, Biome uses its built-in defaults; checkleft imposes no formatting options of its own.
+- `--files-ignore-unknown=true` skips any file Biome has no formatter for instead of erroring (the analogue of Prettier's `--ignore-unknown`).
+
+Tool provisioning and version pinning:
+
+- By default Biome is provisioned via `npx --yes @biomejs/biome@<version>`, pinned to **2.5.0**. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain. `format/biome` and `lint/biome` share the same pinned `@biomejs/biome` binding.
+- Pinning also stabilises the JSON reporter: Biome warns that the json reporter is unstable **across** releases, which the version pin neutralises for the pinned 2.5.0 shape.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: format/biome
+    policy:
+      severity: error
+    config:
+      needs:
+        biome:
+          npm:
+            version: "2.6.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to a `biome` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- Each finding's remediation is ``Run `<biome invocation> format --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
+- Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
 ## `lint/js`
 
 Purpose:
@@ -313,6 +351,46 @@ checks:
       severity: warning
 ```
 
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
+## `lint/biome`
+
+Purpose:
+
+- Flags [Biome](https://biomejs.dev) lint violations in changed JS/TS source files (`*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`). Biome is a single fast Rust tool covering both linting and formatting — a quick alternative to ESLint.
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `biome lint --files-ignore-unknown=true --reporter=json <files>` over the changed files in one batch invocation and converts the JSON diagnostics to findings (file path, 1-based line/column, rule category, severity, and message). The invocation runs in lint-CHECK mode — it never writes fixes.
+- Biome's per-diagnostic severity is preserved: `error`/`fatal` map to a checkleft `error` finding, `warning` to `warning`, and `information`/`hint` to `info`. Each finding's message is prefixed with the rule category (e.g. `lint/suspicious/noDoubleEquals: Using == may be unsafe ...`).
+
+Config — none required:
+
+- **Unlike `lint/js`, `lint/biome` requires no config key.** Biome is zero-config by design: it ships a built-in `recommended` rule set and auto-discovers the repo's own `biome.json` / `biome.jsonc` (invocations run with cwd = repo root) to refine it. With no `biome.json` present, it lints with Biome's recommended defaults; with one present, it is picked up automatically. (ESLint 9+ has no built-in defaults and so forces `lint/js` to make `config_file` mandatory — Biome does not.)
+
+Tool provisioning and version pinning:
+
+- By default Biome is provisioned via `npx --yes @biomejs/biome@<version>`, pinned to **2.5.0**. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain. `lint/biome` and `format/biome` share the same pinned `@biomejs/biome` binding.
+- Pinning also stabilises the JSON reporter: Biome warns that the json reporter is unstable **across** releases, which the version pin neutralises for the pinned 2.5.0 shape.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: lint/biome
+    config:
+      needs:
+        biome:
+          npm:
+            version: "2.6.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to a `biome` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.biome.bazel: "<label>"`, or at an explicit path with `needs.biome.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- Biome is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
+- Each finding's remediation is to fix the violation or suppress it with a justified `// biome-ignore lint: <reason>` comment.
+- Biome's per-finding severity is preserved end-to-end, so no policy configuration is needed to get the error/warning/info distinction. To make all findings non-blocking, set `policy.severity: warning`, which overrides every finding's severity regardless of what Biome reported.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
 ## `md/link-integrity`

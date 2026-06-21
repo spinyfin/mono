@@ -17,9 +17,11 @@ rust_library(
     # inside bazel's sandbox during proc-macro / macro expansion.
     compile_data = [
         "checks/format/bazel.yaml",
+        "checks/format/biome.yaml",
         "checks/format/prettier.yaml",
         "checks/format/rust.yaml",
         "checks/lint/bazel.yaml",
+        "checks/lint/biome.yaml",
         "checks/lint/js.yaml",
         "checks/lint/rust.yaml",
         "//tools/checkleft/wit:check.wit",
@@ -124,9 +126,11 @@ rust_test(
     # compile time in component_bindings.rs. All are embedded/read at compile time.
     compile_data = [
         "checks/format/bazel.yaml",
+        "checks/format/biome.yaml",
         "checks/format/prettier.yaml",
         "checks/format/rust.yaml",
         "checks/lint/bazel.yaml",
+        "checks/lint/biome.yaml",
         "checks/lint/js.yaml",
         "checks/lint/rust.yaml",
         "tests/fixtures/buildifier/malformed.bzl.fixture",

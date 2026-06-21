@@ -1,0 +1,95 @@
+id: lint/biome
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions Biome via
+#     `npx --yes @biomejs/biome@<version>`, pinned here to 2.5.0. The version is
+#     part of the package spec, so npx fetches and runs exactly that release
+#     regardless of any globally-installed copy — a reproducible tool without a
+#     parallel Bazel JS toolchain (mono has no rules_js/node Bazel integration
+#     today; Node arrives on PATH via the CI bootstrap). lint/biome and
+#     format/biome share the SAME pinned `@biomejs/biome` binding. Re-pin per-repo
+#     via CHECKS config:
+#
+#       checks:
+#         - id: lint/biome
+#           config:
+#             needs:
+#               biome:
+#                 npm:
+#                   version: "2.6.0"
+#
+#   - fallback: when `npx` is not on PATH, the framework uses `biome` from PATH
+#     and warns loudly on stderr so you know the pinned toolchain was skipped.
+#
+# Config — Biome is zero-config by design: it ships a built-in `recommended`
+# rule set and auto-discovers the repo's own `biome.json` / `biome.jsonc`
+# (invocations run with cwd = repo root) to refine it. UNLIKE lint/js (ESLint 9+
+# has no built-in defaults and REQUIRES an explicit flat config, so lint/js makes
+# `config_file` mandatory), lint/biome needs NO config key: with no biome.json it
+# lints with Biome's recommended defaults; with one present it is picked up
+# automatically. Re-point config explicitly per repo via `--config-path` only if
+# you need a non-default location — not required here.
+needs:
+  biome:
+    default:
+      npm:
+        package: "@biomejs/biome"
+        version: "2.5.0"
+    fallback:
+      path: "biome"
+
+invocations:
+  - id: lint
+    run: biome
+    mode: batch
+    args:
+      - "lint"
+      # Skip files Biome cannot lint instead of erroring (defensive: applies_to is
+      # the JS/TS set Biome lints, but an override could widen it).
+      - "--files-ignore-unknown=true"
+      # Machine-readable JSON on stdout so the json transform can parse diagnostics.
+      # The pinned 2.5.0 reporter shape is stable for this version.
+      - "--reporter=json"
+      - "{{files}}"
+    # Biome lint exit codes:
+    #   0 = no error-level diagnostics (clean, OR warning/info-only) — run the
+    #       transform so warning/info findings are still surfaced; an empty
+    #       diagnostics array yields zero findings.
+    #   1 = at least one error-level diagnostic — run the transform.
+    #   anything else (crash, signal) = error, so it never masquerades as clean.
+    exit:
+      "0": findings
+      "1": findings
+      default: error
+    transform:
+      kind: json
+      # Biome's json reporter emits {"diagnostics":[{severity, message, category,
+      # location:{path, start:{line,column}, end:{...}}}]}. Flatten to one row per
+      # diagnostic, hoisting the file path and 1-based line/column (confirmed
+      # 1-based against Biome 2.5.0). Map Biome's severity strings to checkleft's
+      # error/warning/info, and prefix the message with the rule category
+      # (e.g. `lint/suspicious/noDoubleEquals`). Guard against a path-less
+      # diagnostic so a project-level message never renders a null path/line.
+      select: >-
+        .diagnostics[] | select(.location.path != null) |
+        {path: .location.path,
+         line: .location.start.line,
+         column: .location.start.column,
+         sev: (if .severity == "error" then "error"
+               elif .severity == "fatal" then "error"
+               elif .severity == "warning" then "warning"
+               else "info" end),
+         msg: ((.category // "lint") + ": " + .message)}
+      finding:
+        path: "{{item.path}}"
+        line: "{{item.line}}"
+        column: "{{item.column}}"
+        message: "{{item.msg}}"
+        severity: "{{item.sev}}"
+        remediations:
+          - "Fix the Biome lint violation, or suppress it with a justified `// biome-ignore lint: <reason>` comment."

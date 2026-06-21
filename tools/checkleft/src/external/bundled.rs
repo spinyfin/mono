@@ -111,6 +111,14 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         limits: None,
     },
     BundledCheckDef {
+        check_names: &["format/biome"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/format/biome.yaml"),
+        },
+        limits: None,
+    },
+    BundledCheckDef {
         check_names: &["lint/rust"],
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",
@@ -131,6 +139,14 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",
             contents: include_str!("../../checks/lint/js.yaml"),
+        },
+        limits: None,
+    },
+    BundledCheckDef {
+        check_names: &["lint/biome"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/lint/biome.yaml"),
         },
         limits: None,
     },
