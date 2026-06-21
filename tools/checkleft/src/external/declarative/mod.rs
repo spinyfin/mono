@@ -39,6 +39,9 @@ pub mod transform;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_lint_js;
+
 /// Hermetic end-to-end parity test against a real (runfiles-staged) buildifier.
 #[cfg(test)]
 mod parity_e2e;
@@ -498,6 +501,13 @@ fn validate_args_for_mode(id: &str, mode: InvocationMode, args: &[String]) -> Re
 
 /// Reject args that contain `{{...}}` tokens the framework doesn't recognise.
 /// Unrecognised tokens would silently pass through unexpanded to the tool.
+///
+/// Recognized refs:
+/// - `{{files}}` / `{{file}}` — the matched file set (batch/per-file mode)
+/// - `{{repo_root}}` — absolute path to the repository root
+/// - `{{config.KEY}}` — a top-level string value from the check's per-repo config
+///   block (e.g. `config_file: "eslint.config.js"` in CHECKS.yaml). Missing keys
+///   produce a clear runtime error at invocation time.
 fn validate_arg_template_refs(id: &str, args: &[String]) -> Result<()> {
     for arg in args {
         let mut rest = arg.as_str();
@@ -509,9 +519,18 @@ fn validate_arg_template_refs(id: &str, args: &[String]) -> Result<()> {
             let inner = &after[..close];
             match inner {
                 "files" | "file" | "repo_root" => {}
+                other if other.starts_with("config.") => {
+                    let key = &other["config.".len()..];
+                    if key.is_empty() || key.contains('.') {
+                        bail!(
+                            "invocation `{id}` arg contains invalid config ref `{{{{{other}}}}}` \
+                             — key must be a single non-empty identifier (no dots)"
+                        );
+                    }
+                }
                 other => bail!(
                     "invocation `{id}` arg contains unknown template ref `{{{{{other}}}}}` \
-                     (recognized in args: `{{{{files}}}}`, `{{{{file}}}}`, `{{{{repo_root}}}}`)"
+                     (recognized in args: `{{{{files}}}}`, `{{{{file}}}}`, `{{{{repo_root}}}}`, `{{{{config.KEY}}}}`)"
                 ),
             }
             rest = &after[close + 2..];
@@ -629,12 +648,22 @@ fn validate_finding(id: &str, raw: RawFinding) -> Result<transform::FindingTempl
     let parse = |field: &str, value: String| -> Result<Template> {
         Template::parse(&value).map_err(|err| anyhow::anyhow!("invocation `{id}` finding.{field} is invalid: {err}"))
     };
+    // `severity` may be a fixed string ("error"/"warning") OR a template
+    // expression like `"{{item.sev}}"` that resolves to a severity string per row.
+    // Detect template usage by presence of `{{`.
+    let severity = match raw.severity.as_deref() {
+        Some(s) if s.contains("{{") => {
+            let tmpl = parse("severity", s.to_owned())?;
+            transform::SeverityTemplate::Dynamic(tmpl)
+        }
+        other => transform::SeverityTemplate::Fixed(Severity::parse_with_default(other, Severity::Warning)),
+    };
     Ok(transform::FindingTemplate {
         path: parse("path", raw.path)?,
         line: raw.line.map(|line| parse("line", line)).transpose()?,
         column: raw.column.map(|column| parse("column", column)).transpose()?,
         message: parse("message", raw.message)?,
-        severity: Severity::parse_with_default(raw.severity.as_deref(), Severity::Warning),
+        severity,
         remediations: raw
             .remediations
             .into_iter()
