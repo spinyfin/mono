@@ -221,17 +221,21 @@ pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<S
 /// The reverse (cascade-on-prereq-regression) deliberately does NOT
 /// call this — see the comment on
 /// [`cascade_dependents_after_prereq_status_change`].
-pub(crate) fn maybe_engine_block_dependent(conn: &Connection, dependent_id: &str, now_epoch: &str) -> Result<()> {
+pub(crate) fn maybe_engine_block_dependent(
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+) -> Result<Option<WorkExecution>> {
     let gating = deps::gating_prereqs_for(conn, dependent_id)?;
     if gating.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let current_status = deps::lookup_work_item_status(conn, dependent_id)?;
     let Some(current) = current_status else {
-        return Ok(());
+        return Ok(None);
     };
     if matches!(current.as_str(), "blocked" | "done" | "archived") {
-        return Ok(());
+        return Ok(None);
     }
     write_engine_status(conn, dependent_id, "blocked", now_epoch)?;
     // Stamp blocked_reason so the user-override path in
@@ -244,8 +248,96 @@ pub(crate) fn maybe_engine_block_dependent(conn: &Connection, dependent_id: &str
              WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
             [dependent_id],
         )?;
+        // Invariant: a `blocked` work item must never have a live
+        // execution. If a worker is actively running this dependent —
+        // i.e. a `blocks` edge just landed on an already-`active`
+        // task — cancel that execution in the *same transaction* as
+        // the status flip so the DB can never expose the "blocked but
+        // executing" state the operator caught. The caller releases
+        // the worker's pane + cube lease out-of-band (async side
+        // effects that cannot live inside a DB transaction);
+        // returning the cancelled row tells it which execution to
+        // reap. Projects (`proj_…`) have no executions, so this only
+        // applies to tasks.
+        return cancel_live_execution_for_block_in_tx(conn, dependent_id, now_epoch);
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Cancel the live (`running` / `waiting_human`) execution attached to
+/// `work_item_id` as part of an engine block, returning the cancelled
+/// row (or `None` when no worker was attached).
+///
+/// Unlike [`WorkDb::cancel_execution`], this deliberately does NOT
+/// reset the task to `todo`: the caller has just set it to `blocked`
+/// and that status must stick. It only marks the execution `cancelled`
+/// and stamps `finished_at`. Releasing the pane / cube lease is the
+/// caller's job (it needs the engine app's completion handler, which
+/// the DB layer can't reach).
+fn cancel_live_execution_for_block_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    now_epoch: &str,
+) -> Result<Option<WorkExecution>> {
+    let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE work_executions
+         SET status = 'cancelled',
+             finished_at = ?2
+         WHERE id = ?1",
+        params![live.id, now_epoch],
+    )?;
+    let updated = query_execution(conn, &live.id)?
+        .with_context(|| format!("execution vanished after block-cancel: {}", live.id))?;
+    tracing::info!(
+        work_item_id,
+        execution_id = %live.id,
+        "engine: cancelled live execution because its dependent transitioned to blocked",
+    );
+    Ok(Some(updated))
+}
+
+/// Declare a single `relation` edge from `dependent_id` to
+/// `prerequisite_id` **inside an existing transaction**, applying the
+/// same validation [`WorkDb::add_dependency`] does (same-product, no
+/// self-edge, no cycle) plus the engine auto-block. Returns the new
+/// edge and any execution that had to be cancelled because the new
+/// gate pushed an actively-running dependent into `blocked`.
+///
+/// Shared by the public `add_dependency` method and the create-time
+/// `--depends-on` path (`insert_task_in_tx` / `insert_chore_in_tx`),
+/// so a dependency declared atomically at create time gates dispatch
+/// identically to one added afterwards.
+pub(crate) fn add_dependency_edge_in_tx(
+    conn: &Connection,
+    dependent_id: &str,
+    prerequisite_id: &str,
+    relation: &str,
+    now_epoch: &str,
+) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
+    if dependent_id == prerequisite_id {
+        bail!("a work item cannot depend on itself: {dependent_id}");
+    }
+    // Both ids must resolve and live in the same product. Cross-
+    // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
+    let dependent_product = product_id_for_work_item(conn, dependent_id)?;
+    let prerequisite_product = product_id_for_work_item(conn, prerequisite_id)?;
+    if dependent_product != prerequisite_product {
+        bail!(
+            "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
+        );
+    }
+    if deps::would_create_cycle(conn, dependent_id, prerequisite_id)? {
+        bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
+    }
+    let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
+        deps::insert_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
+    // Auto-block (Q4): if the new edge introduces a gating prereq, flip
+    // the dependent to `blocked` and (defect #2) reap any live worker.
+    let reaped = maybe_engine_block_dependent(conn, dependent_id, now_epoch)?;
+    Ok((edge, reaped))
 }
 
 /// Flip a dependent off `blocked` if (a) its current status is

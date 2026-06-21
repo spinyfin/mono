@@ -727,6 +727,25 @@ impl WorkDb {
     /// column accepts any TEXT value at the schema level so future
     /// relation types can ship without a re-migration.
     pub fn add_dependency(&self, input: AddDependencyInput) -> Result<WorkItemDependency> {
+        self.add_dependency_with_worker_reconcile(input).map(|(edge, _)| edge)
+    }
+
+    /// Like [`Self::add_dependency`], but also returns the live
+    /// execution (if any) that was cancelled because the new edge
+    /// pushed an actively-running dependent into `blocked`.
+    ///
+    /// The DB transition is atomic: when this returns `Some(execution)`,
+    /// the dependent is already `blocked` and the execution is already
+    /// `cancelled` in the database. The caller (engine app handler)
+    /// MUST still release the worker's pane and cube workspace lease via
+    /// `CompletionHandler::force_release` — those are async side effects
+    /// that cannot live inside the DB transaction. The plain
+    /// `add_dependency` wrapper discards this and is only safe where no
+    /// live worker can be attached (tests, edges added to parked rows).
+    pub fn add_dependency_with_worker_reconcile(
+        &self,
+        input: AddDependencyInput,
+    ) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
         let relation = input
             .relation
             .as_deref()
@@ -741,35 +760,13 @@ impl WorkDb {
         if dependent_id.is_empty() || prerequisite_id.is_empty() {
             bail!("dependent and prerequisite ids are required");
         }
-        if dependent_id == prerequisite_id {
-            bail!("a work item cannot depend on itself: {dependent_id}");
-        }
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        // Both ids must resolve and live in the same product. Cross-
-        // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
-        let dependent_product = product_id_for_work_item(&tx, dependent_id)?;
-        let prerequisite_product = product_id_for_work_item(&tx, prerequisite_id)?;
-        if dependent_product != prerequisite_product {
-            bail!(
-                "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
-            );
-        }
-        if deps::would_create_cycle(&tx, dependent_id, prerequisite_id)? {
-            bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
-        }
         let now = now_string();
-        let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
-            deps::insert_edge(&tx, dependent_id, prerequisite_id, relation, &now)?;
-        // Auto-block (Q4): if the dependent isn't already `blocked`
-        // and the new edge introduces a gating prereq, the engine
-        // flips it to `blocked` and stamps `last_status_actor =
-        // 'engine'` so the eventual auto-unblock knows the engine
-        // owns this transition.
-        maybe_engine_block_dependent(&tx, dependent_id, &now)?;
+        let (edge, reaped) = add_dependency_edge_in_tx(&tx, dependent_id, prerequisite_id, relation, &now)?;
         tx.commit()?;
-        Ok(edge)
+        Ok((edge, reaped))
     }
 
     /// Drop the named edge if it exists. No-op success when the edge

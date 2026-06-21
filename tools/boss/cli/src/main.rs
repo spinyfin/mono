@@ -1745,6 +1745,16 @@ struct TaskCreateArgs {
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
 
+    /// Gate this task on one or more prerequisites, declared atomically
+    /// with creation. Repeatable (or comma-separated). Each value is a
+    /// work-item selector (`T42`, a canonical `task_…` id) in the same
+    /// product; the task is created `blocked` and is never dispatched
+    /// until every prerequisite is satisfied. Unlike a follow-up `task
+    /// depend add`, this leaves no window where the task could autostart
+    /// before its gate exists.
+    #[arg(long = "depends-on", value_delimiter = ',')]
+    depends_on: Vec<String>,
+
     /// Mark this task as produced by an automation's triage phase. Accepts
     /// an automation selector — a canonical `auto_…` id (resolves on its
     /// own) or an `A<n>` short id (requires `--product`). The engine stamps
@@ -1865,6 +1875,14 @@ struct ChoreCreateArgs {
     /// the full description.
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
+
+    /// Gate this chore on one or more prerequisites, declared atomically
+    /// with creation. See `boss task create --depends-on` for the full
+    /// description — the chore is created `blocked` and never dispatches
+    /// until every prerequisite is satisfied, closing the
+    /// create→`depend add` race.
+    #[arg(long = "depends-on", value_delimiter = ',')]
+    depends_on: Vec<String>,
 }
 
 /// Args for `boss task create-investigation`.
@@ -3362,6 +3380,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             let model_override = normalize_non_empty(args.model);
             let driver = normalize_non_empty(args.driver);
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
+            let depends_on = resolve_depends_on(&mut client, ctx, &args.depends_on, &product.id).await?;
             let task = create_task(
                 &mut client,
                 CreateTaskInput::builder()
@@ -3370,6 +3389,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
@@ -3475,6 +3495,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let model_override = normalize_non_empty(args.model);
             let driver = normalize_non_empty(args.driver);
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
+            let depends_on = resolve_depends_on(&mut client, ctx, &args.depends_on, &product.id).await?;
             let chore = create_chore(
                 &mut client,
                 CreateChoreInput::builder()
@@ -3482,6 +3503,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
@@ -6717,7 +6739,8 @@ async fn run_unlink_external(client: &mut BossClient, ctx: &RunContext, args: Ta
 /// `project_id` (tasks only) are optional per-item overrides of the
 /// top-level CLI defaults. Unknown fields are rejected so a typo
 /// doesn't silently drop data on the floor.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 struct BulkCreateItem {
     name: String,
@@ -6731,6 +6754,13 @@ struct BulkCreateItem {
     /// vocabulary as the `--priority` flag.
     #[serde(default)]
     priority: Option<String>,
+    /// Per-item prerequisites, declared atomically with creation (see
+    /// `--depends-on`). Each entry is a selector for an *already
+    /// existing* work item in the same product; intra-batch references
+    /// (one item depending on another created in the same call) are not
+    /// supported — create the prerequisites first. Omitted → no gate.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 fn read_bulk_input(from_file: &str) -> Result<Vec<BulkCreateItem>, CliError> {
@@ -6808,6 +6838,9 @@ async fn run_task_create_many(
                 }
             },
         };
+        let depends_on = resolve_depends_on(client, ctx, &item.depends_on, &product.id)
+            .await
+            .map_err(|err| CliError::usage(format!("item {index}: {err}")))?;
         inputs.push(
             CreateTaskInput::builder()
                 .product_id(product.id.clone())
@@ -6815,6 +6848,7 @@ async fn run_task_create_many(
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
                 .build(),
@@ -6854,12 +6888,16 @@ async fn run_chore_create_many(
                 "item {index}: chores do not have a project — remove `project_id`"
             )));
         }
+        let depends_on = resolve_depends_on(client, ctx, &item.depends_on, &product.id)
+            .await
+            .map_err(|err| CliError::usage(format!("item {index}: {err}")))?;
         inputs.push(
             CreateChoreInput::builder()
                 .product_id(product.id.clone())
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
                 .build(),
@@ -7455,6 +7493,29 @@ fn work_item_primary_id(item: &WorkItem) -> &str {
 /// cross-product `boss/42`, or primary `task_…` id) to a primary engine
 /// id. If the selector is already a primary id or an opaque slug, it is
 /// returned unchanged so the engine can reject it with its own error.
+/// Resolve a list of `--depends-on` selectors to canonical work-item
+/// ids for the create-time dependency channel. Each selector resolves
+/// within `product` (so bare `T<n>` short ids work), matching how
+/// `depend add` resolves its endpoints. The resolved canonical ids
+/// travel in `CreateTaskInput::depends_on` / `CreateChoreInput::depends_on`
+/// and become `blocks` edges in the same transaction as the row insert.
+async fn resolve_depends_on(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    selectors: &[String],
+    product: &str,
+) -> Result<Vec<String>, CliError> {
+    let mut resolved = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        let trimmed = selector.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        resolved.push(resolve_selector_to_primary_id(client, ctx, trimmed, Some(product.to_owned())).await?);
+    }
+    Ok(resolved)
+}
+
 async fn resolve_selector_to_primary_id(
     client: &mut BossClient,
     ctx: &RunContext,
@@ -9105,6 +9166,54 @@ mod tests {
                 assert!(matches!(args.target, MoveTarget::Blocked));
             }
             _ => panic!("expected task move command"),
+        }
+    }
+
+    /// `--depends-on` is repeatable and comma-splittable on `task create`,
+    /// carrying the create-time prerequisite selectors that the engine
+    /// turns into atomic `blocks` edges.
+    #[test]
+    fn parses_task_create_depends_on() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "create",
+            "--name",
+            "Dependent",
+            "--depends-on",
+            "T1908",
+            "--depends-on",
+            "task_abc,task_def",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Create(args),
+            } => {
+                assert_eq!(args.depends_on, vec!["T1908", "task_abc", "task_def"]);
+            }
+            _ => panic!("expected task create command"),
+        }
+    }
+
+    /// Same flag on `chore create`.
+    #[test]
+    fn parses_chore_create_depends_on() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "create",
+            "--name",
+            "Dependent",
+            "--depends-on",
+            "T1908",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Create(args),
+            } => {
+                assert_eq!(args.depends_on, vec!["T1908"]);
+            }
+            _ => panic!("expected chore create command"),
         }
     }
 
