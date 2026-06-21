@@ -123,17 +123,29 @@ impl JsonTransform {
     }
 }
 
+/// The severity field of a [`FindingTemplate`]: either a fixed value known at
+/// parse time, or a template that is rendered per row and parsed as a severity
+/// string. The latter supports checks like `lint/js` where ESLint's JSON output
+/// carries the per-finding severity (2 = error, 1 = warning) so both levels
+/// can come from a single invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeverityTemplate {
+    Fixed(Severity),
+    Dynamic(Template),
+}
+
 /// A declared finding map. Each field is a [`Template`] (literal text + refs);
-/// `severity` is a literal. `line`/`column` are optional, so a finding may be
-/// line-less — the buildifier format pass emits exactly that (the file isn't
-/// clean, but there is no single offending line).
+/// `severity` is either a fixed literal or a template rendered per row.
+/// `line`/`column` are optional, so a finding may be line-less — the buildifier
+/// format pass emits exactly that (the file isn't clean, but there is no single
+/// offending line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingTemplate {
     pub path: Template,
     pub line: Option<Template>,
     pub column: Option<Template>,
     pub message: Template,
-    pub severity: Severity,
+    pub severity: SeverityTemplate,
     pub remediations: Vec<Template>,
 }
 
@@ -143,13 +155,20 @@ impl FindingTemplate {
         let line = self.render_number(self.line.as_ref(), "line", item, context)?;
         let column = self.render_number(self.column.as_ref(), "column", item, context)?;
         let message = self.message.render(item, context)?;
+        let severity = match &self.severity {
+            SeverityTemplate::Fixed(sev) => *sev,
+            SeverityTemplate::Dynamic(tmpl) => {
+                let rendered = tmpl.render(item, context)?;
+                Severity::parse_with_default(Some(&rendered), Severity::Warning)
+            }
+        };
         let remediations = self
             .remediations
             .iter()
             .map(|remediation| remediation.render(item, context))
             .collect::<Result<Vec<_>>>()?;
         Ok(Finding {
-            severity: self.severity,
+            severity,
             message,
             location: Some(Location { path, line, column }),
             remediations,

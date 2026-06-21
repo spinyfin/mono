@@ -1,0 +1,92 @@
+id: lint/js
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions ESLint via `npx --yes eslint@<version>`,
+#     pinned here to 10.5.0. The version is part of the package spec, so npx fetches
+#     and runs exactly that release regardless of any globally-installed copy — a
+#     reproducible tool without a parallel Bazel JS toolchain (mono has no
+#     rules_js/node Bazel integration today; Node arrives on PATH via the CI
+#     bootstrap). Re-pin per-repo via CHECKS config:
+#
+#       checks:
+#         - id: lint/js
+#           config:
+#             needs:
+#               eslint:
+#                 npm:
+#                   version: "10.6.0"
+#
+#   - fallback: when `npx` is not on PATH, the framework uses `eslint` from PATH
+#     and warns loudly on stderr so you know the pinned toolchain was skipped.
+#
+# Required config key — `config_file` MUST be set in each check instance's config
+# block. There is no auto-discovery default: `--no-config-lookup` prevents ESLint
+# from discovering any config file from the filesystem, so only the path you
+# provide via `config_file` is used. Example:
+#
+#   checks:
+#     - id: lint/js
+#       config:
+#         config_file: "eslint.config.js"
+#
+# If `config_file` is not set, the invocation fails with a clear runtime error
+# rather than silently linting with a discovered or default config.
+needs:
+  eslint:
+    default:
+      npm:
+        package: "eslint"
+        version: "10.5.0"
+    fallback:
+      path: "eslint"
+
+invocations:
+  - id: lint
+    run: eslint
+    mode: batch
+    args:
+      # Disable config auto-discovery so only the user-specified config is used.
+      # Without this, ESLint 9+ would still look for eslint.config.js in the
+      # repo root alongside the explicitly-specified --config file.
+      - "--no-config-lookup"
+      # config_file is REQUIRED in the check's config block. Missing it produces
+      # a clear runtime error: "required config key `config_file` is not set".
+      - "--config"
+      - "{{config.config_file}}"
+      # Emit machine-readable JSON so the json transform can parse findings.
+      - "--format"
+      - "json"
+      - "{{files}}"
+    # ESLint 9+/10.x exit codes:
+    #   0 = linting successful, no errors (may have warnings); findings = transform
+    #       runs and selects severity-1 warnings if present
+    #   1 = linting successful, at least one error; findings = transform runs
+    #   2 = configuration problem or internal ESLint error; surface as check error
+    exit:
+      "0": findings
+      "1": findings
+      default: error
+    transform:
+      kind: json
+      # ESLint JSON is an array of {filePath, messages:[{ruleId,severity,line,column,message}]}.
+      # Flatten to one row per message, hoisting filePath and converting the
+      # severity integer (2=error, 1=warning) to the string the finding template needs.
+      # ruleId is null for parse/config errors, so msg falls back to message alone.
+      select: >-
+        .[] | .filePath as $path | .messages[] | select(.severity > 0) |
+        {path: $path, line: .line, column: .column,
+         sev: (if .severity == 2 then "error" else "warning" end),
+         msg: (if .ruleId then (.ruleId + ": " + .message) else .message end)}
+      finding:
+        path: "{{item.path}}"
+        line: "{{item.line}}"
+        column: "{{item.column}}"
+        message: "{{item.msg}}"
+        severity: "{{item.sev}}"
+        remediations:
+          - "Fix the ESLint violation, or suppress with a justified `// eslint-disable-next-line` comment."

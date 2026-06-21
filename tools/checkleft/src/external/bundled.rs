@@ -126,6 +126,14 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         },
         limits: None,
     },
+    BundledCheckDef {
+        check_names: &["lint/js"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/lint/js.yaml"),
+        },
+        limits: None,
+    },
     // All preinstalled wasm checks ship in ONE multiplexed Component Model
     // component. Resolving any of these names yields a package carrying the same
     // aggregate bytes; the host dispatches to the right check by name via the

@@ -76,6 +76,12 @@ pub fn run_declarative_check(
         BTreeMap::new()
     };
 
+    // Extract top-level string values from the config blob for {{config.KEY}}
+    // expansion in invocation args. Framework-level keys (needs, applies_to) are
+    // consumed by the binary resolver and apply-to override; remaining string
+    // values are user-defined parameters (e.g. config_file for lint/js).
+    let config_values = extract_config_string_values(config);
+
     let mut findings = Vec::new();
     for invocation in &package.invocations {
         findings.extend(run_invocation(
@@ -84,6 +90,7 @@ pub fn run_declarative_check(
             invocation,
             &files,
             effective_severity,
+            &config_values,
         )?);
     }
 
@@ -181,9 +188,10 @@ fn run_invocation(
     invocation: &Invocation,
     files: &[String],
     effective_severity: Option<Severity>,
+    config_values: &BTreeMap<String, String>,
 ) -> Result<Vec<Finding>> {
     let mut findings = match &invocation.kind {
-        InvocationKind::Tool(tool) => run_tool_invocation(repo_root, binaries, invocation, tool, files)?,
+        InvocationKind::Tool(tool) => run_tool_invocation(repo_root, binaries, invocation, tool, files, config_values)?,
         InvocationKind::BazelAspect(aspect) => {
             run_bazel_aspect_invocation(repo_root, invocation, aspect, files, effective_severity)?
         }
@@ -202,12 +210,13 @@ fn run_tool_invocation(
     invocation: &Invocation,
     tool: &ToolInvocation,
     files: &[String],
+    config_values: &BTreeMap<String, String>,
 ) -> Result<Vec<Finding>> {
     let binary = binaries
         .get(&tool.run)
         .ok_or_else(|| anyhow::anyhow!("invocation `{}` binary `{}` was not resolved", invocation.id, tool.run))?;
 
-    // Resolved prefix args (e.g. `npx --yes prettier@3.8.4`) precede the
+    // Resolved prefix args (e.g. `npx --yes eslint@10.5.0`) precede the
     // invocation's own templated args.
     let with_prefix = |args: Vec<String>| -> Vec<String> {
         let mut all = binary.prefix_args.clone();
@@ -239,7 +248,7 @@ fn run_tool_invocation(
             let chunks = split_files_into_chunks(fixed_cost, files);
             let mut findings = Vec::new();
             for chunk in chunks {
-                let args = with_prefix(expand_batch_args(repo_root, &tool.args, chunk));
+                let args = with_prefix(expand_batch_args(repo_root, &tool.args, chunk, config_values)?);
                 let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
                 findings.extend(classify_and_project(
                     invocation,
@@ -256,7 +265,7 @@ fn run_tool_invocation(
             // See module-level doc for the batch vs per_file asymmetry.
             let mut findings = Vec::new();
             for file in files {
-                let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file));
+                let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file, config_values)?);
                 let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
                 match invocation.exit.classify(output.exit_code) {
                     ExitOutcome::Ok => {}
@@ -543,25 +552,89 @@ pub(crate) fn split_files_into_chunks(fixed_cost: usize, files: &[String]) -> Ve
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.
 /// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
-fn expand_batch_args(repo_root: &Path, args: &[String], files: &[String]) -> Vec<String> {
+/// `{{config.KEY}}` is substituted with the value of KEY from the config blob.
+fn expand_batch_args(
+    repo_root: &Path,
+    args: &[String],
+    files: &[String],
+    config_values: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
     let repo_root_str = repo_root.to_string_lossy();
     let mut expanded = Vec::with_capacity(args.len() + files.len());
     for arg in args {
         if arg == "{{files}}" {
             expanded.extend(files.iter().cloned());
         } else {
-            expanded.push(arg.replace("{{repo_root}}", &repo_root_str));
+            expanded.push(expand_config_refs(
+                &arg.replace("{{repo_root}}", &repo_root_str),
+                config_values,
+            )?);
         }
     }
-    expanded
+    Ok(expanded)
 }
 
 /// In per-file mode `{{file}}` is substituted in place within each arg.
 /// `{{repo_root}}` anywhere in an arg is substituted with the absolute repo root path.
-fn expand_per_file_args(repo_root: &Path, args: &[String], file: &str) -> Vec<String> {
+/// `{{config.KEY}}` is substituted with the value of KEY from the config blob.
+fn expand_per_file_args(
+    repo_root: &Path,
+    args: &[String],
+    file: &str,
+    config_values: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
     let repo_root_str = repo_root.to_string_lossy();
     args.iter()
-        .map(|arg| arg.replace("{{file}}", file).replace("{{repo_root}}", &repo_root_str))
+        .map(|arg| {
+            expand_config_refs(
+                &arg.replace("{{file}}", file).replace("{{repo_root}}", &repo_root_str),
+                config_values,
+            )
+        })
+        .collect()
+}
+
+/// Substitute `{{config.KEY}}` refs in a single arg string. Each ref is replaced
+/// with the corresponding string value from `config_values`. Missing keys produce
+/// a clear error directing the operator to add the key to their CHECKS config.
+fn expand_config_refs(arg: &str, config_values: &BTreeMap<String, String>) -> Result<String> {
+    const CONFIG_PREFIX: &str = "{{config.";
+    const CLOSE: &str = "}}";
+    if !arg.contains(CONFIG_PREFIX) {
+        return Ok(arg.to_owned());
+    }
+    let mut result = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(open) = rest.find(CONFIG_PREFIX) {
+        result.push_str(&rest[..open]);
+        let after = &rest[open + CONFIG_PREFIX.len()..];
+        let close = after
+            .find(CLOSE)
+            .ok_or_else(|| anyhow::anyhow!("unterminated `{{{{config.` in arg `{arg}`"))?;
+        let key = &after[..close];
+        let value = config_values.get(key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "required config key `{key}` is not set — \
+                 add `{key}: <value>` to this check's `config:` block in CHECKS.yaml"
+            )
+        })?;
+        result.push_str(value);
+        rest = &after[close + CLOSE.len()..];
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
+/// Extract top-level string values from a TOML config blob for `{{config.KEY}}`
+/// arg expansion. Only immediate string leaves at the table root are included;
+/// nested tables (e.g. `needs.*`, `applies_to`) are framework-level and skipped.
+fn extract_config_string_values(config: &toml::Value) -> BTreeMap<String, String> {
+    let Some(table) = config.as_table() else {
+        return BTreeMap::new();
+    };
+    table
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
         .collect()
 }
 

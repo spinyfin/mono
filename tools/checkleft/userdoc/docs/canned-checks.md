@@ -249,6 +249,64 @@ Notes:
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
+## `lint/js`
+
+Purpose:
+
+- Flags ESLint violations in changed JS/TS source files (`*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`).
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `eslint --no-config-lookup --config <config_file> --format json` over the changed files in one batch invocation and converts the JSON output to findings.
+- ESLint severity is preserved: severity 2 (error) maps to a checkleft `error` finding; severity 1 (warning) maps to a `warning` finding.
+- `--no-config-lookup` prevents ESLint from discovering any config file from the filesystem — only the path you specify via `config_file` is applied.
+
+Required config — `config_file`:
+
+- `config_file` **must** be set in the check's `config:` block. There is no default — omitting it produces a clear runtime error rather than accidentally linting with an auto-discovered or default config.
+
+Minimal CHECKS config:
+
+```yaml
+checks:
+  - id: lint/js
+    config:
+      config_file: "eslint.config.js"
+```
+
+Tool provisioning and version pinning:
+
+- By default ESLint is provisioned via `npx --yes eslint@<version>`, pinned to **10.5.0**. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: lint/js
+    config:
+      config_file: "eslint.config.js"
+      needs:
+        eslint:
+          npm:
+            version: "10.6.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to an `eslint` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.eslint.bazel: "<label>"`, or at an explicit path with `needs.eslint.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- ESLint is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
+- Each finding includes the rule ID (e.g. `no-unused-vars: 'x' is defined but never used.`). Parse errors without a rule ID appear as the raw ESLint message.
+- Findings default to the configured policy severity. To make warnings non-blocking while keeping errors blocking, configure two instances:
+
+```yaml
+checks:
+  - id: lint/js
+    config:
+      config_file: "eslint.config.js"
+```
+
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
 ## `md/link-integrity`
 
 Purpose:
