@@ -1106,6 +1106,19 @@ pub struct CreateChoreInput {
     #[builder(default)]
     pub force_duplicate: bool,
 
+    /// Canonical ids of work items this chore must wait on. Each id
+    /// becomes a `blocks` prerequisite edge declared **atomically with
+    /// the row insert**, so the chore is born `blocked` (and never
+    /// dispatched) while any prerequisite is unsatisfied. This closes
+    /// the create→`depend add` race: there is no window where the chore
+    /// autostarts before its gate exists. The caller (CLI) is
+    /// responsible for resolving selectors (`T42`) to canonical ids
+    /// before sending — mirrors [`AddDependencyInput`]. Cross-product
+    /// edges and cycles are rejected at insert time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub depends_on: Vec<String>,
+
     pub name: String,
     /// See `CreateTaskInput::created_via`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1435,6 +1448,12 @@ pub struct CreateTaskInput {
     #[serde(default)]
     #[builder(default)]
     pub force_duplicate: bool,
+
+    /// Canonical ids of work items this task must wait on. See
+    /// [`CreateChoreInput::depends_on`] — same atomic-gate semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub depends_on: Vec<String>,
 
     pub name: String,
     /// Surface that filed this task — `cli`, `bossctl`, `mac_app`,

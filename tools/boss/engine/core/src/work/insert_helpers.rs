@@ -159,7 +159,35 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
         params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id],
     )?;
 
+    apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
+}
+
+/// Declare each `--depends-on` prerequisite as a `blocks` edge in the
+/// SAME transaction as the freshly-inserted work item. This is the fix
+/// for the create→`depend add` race: by the time this transaction
+/// commits, the row is already `blocked` (if any prerequisite is
+/// unsatisfied), so the auto-dispatcher's reconcile sees the gate and
+/// parks the execution in `waiting_dependency` instead of dispatching a
+/// worker. `prerequisite_ids` are canonical work-item ids — the caller
+/// (CLI) resolves selectors like `T42` before sending. A freshly
+/// created row can't have a live worker, so the cancelled-execution
+/// channel of [`add_dependency_edge_in_tx`] is always empty here.
+pub(crate) fn apply_create_time_dependencies(
+    conn: &Connection,
+    dependent_id: &str,
+    prerequisite_ids: &[String],
+    now: &str,
+) -> Result<()> {
+    for prerequisite_id in prerequisite_ids {
+        let prerequisite_id = prerequisite_id.trim();
+        if prerequisite_id.is_empty() {
+            continue;
+        }
+        add_dependency_edge_in_tx(conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
+            .with_context(|| format!("declaring create-time dependency on `{prerequisite_id}`"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
@@ -192,6 +220,7 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
         params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, input.origin_task_short_id, input.origin_pr_number],
     )?;
 
+    apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
 }
 

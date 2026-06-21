@@ -20,13 +20,39 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        match work_db.add_dependency(input) {
-            Ok(edge) => {
-                // Edge changes don't move any work item's status
-                // in this PR (status mechanics arrive in the
-                // follow-up phase), but we still publish a
-                // work-invalidation so subscribers re-render the
-                // dependency surfaces (kanban badge, show view).
+        match work_db.add_dependency_with_worker_reconcile(input) {
+            Ok((edge, reaped)) => {
+                // Defect #2: adding this edge may have pushed an
+                // actively-running dependent into `blocked`. The DB
+                // transition already cancelled its execution row
+                // atomically; here we release the physical worker —
+                // tear down its libghostty pane and free its cube
+                // workspace lease — so a `blocked` task never leaves a
+                // live worker behind ("in backlog but executing").
+                // Mirrors the cancel-execution reaping path: pane slots
+                // are keyed by run_id, the lease by execution_id, so we
+                // release both. force_release is idempotent.
+                if let Some(execution) = reaped {
+                    tracing::warn!(
+                        dependent_id = %edge.dependent_id,
+                        prerequisite_id = %edge.prerequisite_id,
+                        execution_id = %execution.id,
+                        "add_dependency: dependent became blocked while a worker was running it — \
+                         cancelled the execution and releasing its pane + cube lease",
+                    );
+                    let active_runs = work_db.active_run_ids_for_execution(&execution.id).unwrap_or_default();
+                    let handler = server_state.completion_handler.clone();
+                    let exec_for_release = execution.id.clone();
+                    tokio::spawn(async move {
+                        for run_id in active_runs {
+                            handler.force_release(&run_id).await;
+                        }
+                        handler.force_release(&exec_for_release).await;
+                    });
+                }
+                // Publish a work-invalidation so subscribers re-render
+                // the dependency surfaces (kanban badge, show view) and
+                // the dependent's possibly-changed status.
                 let product_id = match work_db.get_work_item(&edge.dependent_id) {
                     Ok(item) => Some(work_item_product_id(&item)),
                     Err(_) => None,

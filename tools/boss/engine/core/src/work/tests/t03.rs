@@ -2340,3 +2340,217 @@ fn investigation_with_doc_pointer_exposes_resolved_doc_link_in_work_tree() {
         Some("docs/investigations/checkleft-lib-test-wasm-compile-timeout.md"),
     );
 }
+
+/// Defect #1 — atomic create-with-dependency. A chore created with
+/// `depends_on = [prereq]` must be born `blocked` and must never yield
+/// a `ready` execution while the prereq is unsatisfied. This closes the
+/// create→`depend add` race: before the fix the only way to gate a
+/// dependent was a separate `add_dependency` call that necessarily
+/// landed *after* the create, leaving a window where the dependent
+/// autostarted and dispatched.
+#[test]
+fn create_time_depends_on_gates_dispatch_atomically() {
+    let path = temp_db_path("create-depends-on");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    // Prerequisite — left in `todo` (unsatisfied).
+    let prereq = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Prereq: version-pin mechanism")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+
+    // Dependent declared WITH the gate at create time.
+    let dependent = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Dependent: reuse the mechanism")
+                .depends_on(vec![prereq.id.clone()])
+                .build(),
+        )
+        .unwrap();
+
+    // Born blocked, atomically — no window where it was dispatchable.
+    assert_eq!(
+        dependent.status,
+        TaskStatus::Blocked,
+        "dependent must be created `blocked` when a create-time prereq is unsatisfied",
+    );
+    assert_eq!(
+        dependent.blocked_reason.as_deref(),
+        Some("dependency"),
+        "create-time block must be attributed to the dependency",
+    );
+    // The edge actually exists (not a status-only block).
+    let prereqs = db.gating_prereqs_for(&dependent.id).unwrap();
+    assert_eq!(prereqs, vec![prereq.id.clone()], "the gating edge must be present");
+
+    // Reconcile must NOT produce a `ready` execution for the gated
+    // dependent — at most a non-dispatchable `waiting_dependency` row.
+    db.reconcile_product_executions(&product.id).unwrap();
+    for exec in db.list_executions(Some(&dependent.id)).unwrap() {
+        assert_ne!(
+            exec.status,
+            ExecutionStatus::Ready,
+            "a gated dependent must never have a `ready` execution (got {exec:?})",
+        );
+    }
+    assert!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .all(|e| e.work_item_id != dependent.id),
+        "the dependent must not appear in the dispatcher's ready pool while gated",
+    );
+
+    // Satisfy the prereq → the dependent unblocks and becomes dispatchable.
+    db.update_work_item(
+        &prereq.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.try_unblock_dependency_if_resolved(&dependent.id).unwrap();
+    let after = db.get_work_item(&dependent.id).unwrap();
+    let WorkItem::Chore(after_t) = after else {
+        panic!("expected chore")
+    };
+    assert_eq!(
+        after_t.status,
+        TaskStatus::Todo,
+        "dependent must unblock to `todo` once its create-time prereq is done",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Defect #2 — a `blocked` task must never keep a live worker. When a
+/// `blocks` edge lands on an actively-running dependent, the same
+/// transaction that flips it to `blocked` must also cancel the live
+/// execution (atomic DB invariant), and the engine must surface that
+/// execution so the app layer can release its pane + cube lease.
+#[test]
+fn blocking_a_running_dependent_cancels_its_execution() {
+    let path = temp_db_path("block-running-dependent");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let prereq = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Prereq")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let dependent = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Already running dependent")
+                .build(),
+        )
+        .unwrap();
+
+    // Drive the dependent into the Doing column with a live worker.
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(dependent.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "la-forge",
+        "mono",
+        "lease-1",
+        "mono-agent-006",
+        "/tmp/mono-agent-006",
+    )
+    .unwrap();
+    match db.get_work_item(&dependent.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore/task, got {other:?}"),
+    }
+    assert!(
+        db.get_live_execution_for_work_item(&dependent.id, "")
+            .unwrap()
+            .is_some(),
+        "precondition: the dependent has a live execution",
+    );
+
+    // The gating edge lands while the worker is running.
+    let (edge, reaped) = db
+        .add_dependency_with_worker_reconcile(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+    assert_eq!(edge.dependent_id, dependent.id);
+
+    // Invariant: blocked status AND no live execution, atomically.
+    match db.get_work_item(&dependent.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(
+            t.status,
+            TaskStatus::Blocked,
+            "dependent must be `blocked` after the edge lands",
+        ),
+        other => panic!("expected chore/task, got {other:?}"),
+    }
+    let reaped = reaped.expect("blocking a running dependent must report the cancelled execution");
+    assert_eq!(
+        reaped.id, execution.id,
+        "the reaped execution must be the one that was live"
+    );
+    assert_eq!(
+        reaped.status,
+        ExecutionStatus::Cancelled,
+        "the live execution must be cancelled in the same transaction as the block",
+    );
+    assert!(
+        reaped.finished_at.is_some(),
+        "the cancelled execution must be stamped finished"
+    );
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::Cancelled,
+        "the persisted execution row must be cancelled — no `blocked but executing` state",
+    );
+    assert!(
+        db.get_live_execution_for_work_item(&dependent.id, "")
+            .unwrap()
+            .is_none(),
+        "a blocked task must have no live execution",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
