@@ -296,13 +296,21 @@ Notes:
 
 - ESLint is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
 - Each finding includes the rule ID (e.g. `no-unused-vars: 'x' is defined but never used.`). Parse errors without a rule ID appear as the raw ESLint message.
-- Findings default to the configured policy severity. To make warnings non-blocking while keeping errors blocking, configure two instances:
+- ESLint's per-finding severity is preserved end-to-end: severity 2 (error) produces a checkleft `error` finding; severity 1 (warning) produces a `warning` finding. No policy configuration is needed to get this distinction.
+- To make all findings non-blocking (warnings), set `policy.severity: warning`. This overrides every finding's severity regardless of what ESLint reported. To keep errors blocking while making warnings non-blocking, configure two instances — one with no severity override (errors block, warnings are advisory) and one with `severity: warning` using a separate ESLint config that only enables warning-level rules:
 
 ```yaml
 checks:
-  - id: lint/js
+  - id: lint/js-errors
+    check: lint/js
     config:
       config_file: "eslint.config.js"
+  - id: lint/js-warnings
+    check: lint/js
+    config:
+      config_file: "eslint.config.warnings.js"
+    policy:
+      severity: warning
 ```
 
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
@@ -425,7 +433,7 @@ LINT.ThenChange(fileA:region, fileB)
 **2. Config globs** (policy-declared):
 
 ```yaml
-- id: api-surface-docs           # local policy label (drives findings/bypass/severity)
+- id: api-surface-docs # local policy label (drives findings/bypass/severity)
   check: file/ifchange
   config:
     trigger_globs: ["backend/blob/src/v3/**"]

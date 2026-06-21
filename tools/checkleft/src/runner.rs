@@ -48,6 +48,11 @@ struct EffectiveCheckPolicy {
     severity_override: Option<Severity>,
     allow_bypass: bool,
     bypass_name: String,
+    /// When true, `apply_policy_to_result` preserves per-finding severity set by
+    /// the transform instead of defaulting to Error. Set for declarative checks
+    /// that opt into dynamic severity via `SeverityTemplate::Dynamic`. An explicit
+    /// `severity_override` still takes precedence and flattens all findings.
+    preserve_finding_severity: bool,
 }
 
 impl EffectiveCheckPolicy {
@@ -623,21 +628,31 @@ impl Runner {
                     policy_fingerprint,
                 );
 
-                let entry = grouped_runs.entry(key).or_insert_with(|| ScheduledCheckRun {
-                    configured_check_id: check.id.clone(),
-                    source_path: check.source_path.clone(),
-                    execution: self.resolve_scheduled_execution(check),
-                    policy,
-                    config: check.config.clone(),
-                    changeset: ChangeSet {
-                        changed_files: Vec::new(),
-                        file_line_deltas: HashMap::new(),
-                        file_diffs: HashMap::new(),
-                        commit_description: changeset.commit_description.clone(),
-                        pr_description: changeset.pr_description.clone(),
-                        change_id: changeset.change_id.clone(),
-                        repository: changeset.repository.clone(),
-                    },
+                let entry = grouped_runs.entry(key).or_insert_with(|| {
+                    let execution = self.resolve_scheduled_execution(check);
+                    let mut effective_policy = policy;
+                    if let ScheduledExecution::ExternalResolved { package } = &execution
+                        && let ExternalCheckPackageImplementation::Declarative(d) = &package.implementation
+                        && d.invocations.iter().any(|inv| inv.transform.uses_dynamic_severity())
+                    {
+                        effective_policy.preserve_finding_severity = true;
+                    }
+                    ScheduledCheckRun {
+                        configured_check_id: check.id.clone(),
+                        source_path: check.source_path.clone(),
+                        execution,
+                        policy: effective_policy,
+                        config: check.config.clone(),
+                        changeset: ChangeSet {
+                            changed_files: Vec::new(),
+                            file_line_deltas: HashMap::new(),
+                            file_diffs: HashMap::new(),
+                            commit_description: changeset.commit_description.clone(),
+                            pr_description: changeset.pr_description.clone(),
+                            change_id: changeset.change_id.clone(),
+                            repository: changeset.repository.clone(),
+                        },
+                    }
                 });
 
                 let already_present = entry
@@ -686,6 +701,7 @@ impl Runner {
             severity_override,
             allow_bypass,
             bypass_name,
+            preserve_finding_severity: false,
         }
     }
 
@@ -853,11 +869,18 @@ fn apply_policy_to_result(
         }
     }
 
-    // Default to Error when no policy severity is specified. A check author who
-    // wants a non-blocking check must explicitly set `policy: severity: warning`.
-    let effective_severity = policy.severity_override.unwrap_or(Severity::Error);
-    for finding in &mut result.findings {
-        finding.severity = effective_severity;
+    // When the policy has an explicit severity override, apply it to all findings
+    // unconditionally. When no override is set, either preserve the transform-supplied
+    // per-finding severity (declarative checks that opt into SeverityTemplate::Dynamic)
+    // or default to Error (built-in and non-dynamic declarative checks).
+    if let Some(severity_override) = policy.severity_override {
+        for finding in &mut result.findings {
+            finding.severity = severity_override;
+        }
+    } else if !policy.preserve_finding_severity {
+        for finding in &mut result.findings {
+            finding.severity = Severity::Error;
+        }
     }
 
     result

@@ -46,6 +46,16 @@ pub enum Transform {
 }
 
 impl Transform {
+    /// Returns true when this transform contains a `SeverityTemplate::Dynamic`
+    /// finding — i.e., the transform itself controls per-finding severity and the
+    /// runner should not flatten it to a single default when no policy override is set.
+    pub fn uses_dynamic_severity(&self) -> bool {
+        match self {
+            Transform::Json(json) => matches!(json.finding.severity, SeverityTemplate::Dynamic(_)),
+            Transform::Passthrough | Transform::LineList(_) => false,
+        }
+    }
+
     /// Project an invocation's output into findings. `input_file` is the file the
     /// invocation ran on (per-file mode) or `None` (batch mode). `needs_invocations`
     /// maps binary names to their human-readable invocation strings for template

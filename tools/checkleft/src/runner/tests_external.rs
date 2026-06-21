@@ -695,3 +695,213 @@ id = "spelling-typos"
     assert!(check_map.contains_key("file-size"));
     assert!(check_map.contains_key("spelling-typos"));
 }
+
+/// Build a declarative package with a json transform that uses a dynamic
+/// severity template (`{{item.sev}}`). This exercises `preserve_finding_severity`.
+fn dynamic_severity_package(check_id: &str) -> ExternalCheckPackage {
+    let manifest = r#"
+id = "CHECK_ID"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.js"]
+
+[needs.eslint.default]
+path = "eslint"
+
+[[invocations]]
+id = "run"
+run = "eslint"
+mode = "batch"
+args = ["{{files}}"]
+exit = { "0" = "ok", "1" = "findings", default = "error" }
+
+[invocations.transform]
+kind = "json"
+select = ".[]"
+
+[invocations.transform.finding]
+path = "{{item.path}}"
+message = "{{item.msg}}"
+severity = "{{item.sev}}"
+"#
+    .replace("CHECK_ID", check_id);
+    parse_external_check_package_manifest(&manifest).expect("valid dynamic-severity declarative manifest")
+}
+
+#[tokio::test]
+async fn runner_preserves_dynamic_per_finding_severity_when_no_policy_override() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create dirs");
+    fs::write(temp.path().join("src/app.js"), "console.log('hi');\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "lint/js"
+check = "lint/js"
+implementation = "generated:lint/js"
+config.config_file = "eslint.config.js"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(dynamic_severity_package("lint/js")),
+    };
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "lint/js".to_owned(),
+            findings: vec![
+                Finding {
+                    severity: Severity::Error,
+                    message: "no-unused-vars: 'x' is defined but never used.".to_owned(),
+                    location: Some(Location {
+                        path: std::path::PathBuf::from("src/app.js"),
+                        line: Some(1),
+                        column: Some(1),
+                    }),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+                Finding {
+                    severity: Severity::Warning,
+                    message: "no-console: Unexpected console statement.".to_owned(),
+                    location: Some(Location {
+                        path: std::path::PathBuf::from("src/app.js"),
+                        line: Some(1),
+                        column: Some(1),
+                    }),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+            ],
+        }),
+        error_message: None,
+        seen_packages: Arc::clone(&seen_packages),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: std::path::Path::new("src/app.js").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    let findings = &results[0].findings;
+    assert_eq!(findings.len(), 2, "expected 2 findings; got: {findings:?}");
+
+    let errors: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Error).collect();
+    let warnings: Vec<_> = findings.iter().filter(|f| f.severity == Severity::Warning).collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected 1 error; severities: {:?}",
+        findings.iter().map(|f| f.severity).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected 1 warning; severities: {:?}",
+        findings.iter().map(|f| f.severity).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn runner_policy_severity_override_flattens_dynamic_severity_findings() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create dirs");
+    fs::write(temp.path().join("src/app.js"), "console.log('hi');\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "lint/js"
+check = "lint/js"
+implementation = "generated:lint/js"
+config.config_file = "eslint.config.js"
+
+[checks.policy]
+severity = "warning"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(dynamic_severity_package("lint/js")),
+    };
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "lint/js".to_owned(),
+            findings: vec![
+                Finding {
+                    severity: Severity::Error,
+                    message: "no-unused-vars: 'x' is defined but never used.".to_owned(),
+                    location: Some(Location {
+                        path: std::path::PathBuf::from("src/app.js"),
+                        line: Some(1),
+                        column: Some(1),
+                    }),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+                Finding {
+                    severity: Severity::Error,
+                    message: "no-console: Unexpected console statement.".to_owned(),
+                    location: Some(Location {
+                        path: std::path::PathBuf::from("src/app.js"),
+                        line: Some(1),
+                        column: Some(1),
+                    }),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+            ],
+        }),
+        error_message: None,
+        seen_packages: Arc::clone(&seen_packages),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: std::path::Path::new("src/app.js").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    let findings = &results[0].findings;
+    assert_eq!(findings.len(), 2, "expected 2 findings; got: {findings:?}");
+
+    for finding in findings {
+        assert_eq!(
+            finding.severity,
+            Severity::Warning,
+            "explicit policy severity=warning must flatten all findings; got: {:?}",
+            finding.severity
+        );
+    }
+}
