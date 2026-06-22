@@ -54,6 +54,9 @@ mod tests_format_oxc;
 #[cfg(test)]
 mod tests_lint_oxc;
 
+#[cfg(test)]
+mod tests_fix_block;
+
 /// Hermetic end-to-end parity test against a real (runfiles-staged) buildifier.
 #[cfg(test)]
 mod parity_e2e;
@@ -124,6 +127,10 @@ pub struct Invocation {
     pub kind: InvocationKind,
     pub exit: ExitSemantics,
     pub transform: transform::Transform,
+    /// Optional fix invocation for the `fix` subcommand. `None` means this
+    /// invocation has no declared fix — failing files are reported as "no fix
+    /// available". Only present on `tool`-kind invocations.
+    pub fix: Option<FixBlock>,
 }
 
 /// How an invocation produces tool output for its transform.
@@ -218,6 +225,65 @@ pub enum ExitOutcome {
     Error,
 }
 
+/// Exit-code → outcome mapping for a fix invocation. Reduced from [`ExitOutcome`]:
+/// a fix either succeeded (`Ok`) or failed (`Error`); "findings" is not a valid
+/// outcome (the fix either applied cleanly or it did not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixExitSemantics {
+    /// Per-code outcomes.
+    codes: BTreeMap<i32, FixExitOutcome>,
+    /// Fallback for any unlisted code.
+    default: FixExitOutcome,
+}
+
+impl FixExitSemantics {
+    /// Build the default fix exit semantics: `0 => ok`, everything else => `error`.
+    fn default_semantics() -> Self {
+        let mut codes = BTreeMap::new();
+        codes.insert(0, FixExitOutcome::Ok);
+        FixExitSemantics {
+            codes,
+            default: FixExitOutcome::Error,
+        }
+    }
+
+    /// Classify an exit code. A missing/None code (process killed by signal) is
+    /// treated as the default outcome.
+    pub fn classify(&self, code: Option<i32>) -> FixExitOutcome {
+        match code {
+            Some(code) => self.codes.get(&code).copied().unwrap_or(self.default),
+            None => self.default,
+        }
+    }
+}
+
+/// What an exit code means for a fix run. A fix has no "findings" outcome — it
+/// either applied successfully or it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixExitOutcome {
+    /// Fix applied (or nothing to do) — proceed to copy-back.
+    Ok,
+    /// Fix failed — abort; real tree is left untouched.
+    Error,
+}
+
+/// The optional fix invocation declared on a [`Invocation`]. When present, the
+/// `fix` subcommand (T4+) can use this to apply the check's fix automatically.
+/// Model only — no execution in this PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixBlock {
+    /// Which declared binary (key into [`ExternalCheckDeclarativePackage::needs`]).
+    /// Inherits from the parent invocation's `run` when absent in the manifest.
+    pub run: String,
+    /// Batch or per-file. Inherits from the parent invocation's `mode` when absent.
+    pub mode: InvocationMode,
+    /// Argument templates for the fix invocation (write/fix flags instead of
+    /// check/report flags). Must include `{{files}}` (batch) or `{{file}}` (per-file).
+    pub args: Vec<String>,
+    /// Exit-code semantics for the fix run. Defaults: `0 => ok`, else `error`.
+    pub exit: FixExitSemantics,
+}
+
 // ── raw manifest (TOML) → validated model ──────────────────────────────────────
 
 /// Raw declarative fields grouped for validation. The individual fields are
@@ -297,6 +363,30 @@ pub(super) struct RawInvocation {
     artifact_format: Option<String>,
     exit: BTreeMap<String, String>,
     transform: RawTransform,
+    /// Optional fix invocation. Only valid on `tool` invocations; rejected on
+    /// `bazel_aspect`. Absent means no fix is declared for this invocation.
+    #[serde(default)]
+    fix: Option<RawFixBlock>,
+}
+
+/// Raw fix block before validation. All fields are optional except `args`, which
+/// carries the write/fix flags (distinguishing it from the check invocation's args).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFixBlock {
+    /// Override the binary. Defaults to the parent invocation's `run`.
+    #[serde(default)]
+    run: Option<String>,
+    /// Override the mode. Defaults to the parent invocation's `mode`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// The fix invocation's argument templates (required — these are the write/fix
+    /// flags that distinguish this from the check invocation's args).
+    args: Vec<String>,
+    /// Exit-code → outcome map. Each value must be `ok` or `error` (not `findings`).
+    /// Defaults to `{ "0": ok, default: error }` when absent.
+    #[serde(default)]
+    exit: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,8 +511,9 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
     let id = non_empty("invocations[].id", raw.id)?;
     let exit = validate_exit(&id, raw.exit)?;
     let transform = validate_transform(&id, raw.transform)?;
+    let raw_fix = raw.fix;
 
-    let kind = match raw.kind.as_deref().unwrap_or("tool") {
+    let (kind, fix) = match raw.kind.as_deref().unwrap_or("tool") {
         "tool" => {
             for (field, set) in [
                 ("aspect", raw.aspect.is_some()),
@@ -450,13 +541,23 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
             };
             validate_args_for_mode(&id, mode, &raw.args)?;
             validate_arg_template_refs(&id, &raw.args)?;
-            InvocationKind::Tool(ToolInvocation {
-                run,
+            let tool_kind = InvocationKind::Tool(ToolInvocation {
+                run: run.clone(),
                 mode,
                 args: raw.args,
-            })
+            });
+            let fix = raw_fix
+                .map(|raw_fix| validate_fix_block(&id, needs, raw_fix, &run, mode))
+                .transpose()?;
+            (tool_kind, fix)
         }
         "bazel_aspect" => {
+            if raw_fix.is_some() {
+                bail!(
+                    "bazel_aspect invocation `{id}` must not declare a `fix` block \
+                     (bazel_aspect invocations have no auto-fix support in v1)"
+                );
+            }
             for (field, set) in [
                 ("run", raw.run.is_some()),
                 ("mode", raw.mode.is_some()),
@@ -481,12 +582,15 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
                     "bazel_aspect invocation `{id}` has invalid artifact_format `{other}` (expected `json` or `jsonl`)"
                 ),
             };
-            InvocationKind::BazelAspect(BazelAspectInvocation {
-                aspect,
-                output_groups: raw.output_groups,
-                build_flags: raw.build_flags,
-                artifact_format,
-            })
+            (
+                InvocationKind::BazelAspect(BazelAspectInvocation {
+                    aspect,
+                    output_groups: raw.output_groups,
+                    build_flags: raw.build_flags,
+                    artifact_format,
+                }),
+                None,
+            )
         }
         other => bail!("invocation `{id}` has unknown kind `{other}` (expected `tool` or `bazel_aspect`)"),
     };
@@ -496,7 +600,101 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
         kind,
         exit,
         transform,
+        fix,
     })
+}
+
+/// Validate a raw fix block, inheriting `run` and `mode` from the parent tool
+/// invocation when they are absent.
+fn validate_fix_block(
+    id: &str,
+    needs: &BTreeMap<String, BinaryRequirement>,
+    raw: RawFixBlock,
+    parent_run: &str,
+    parent_mode: InvocationMode,
+) -> Result<FixBlock> {
+    let run = match raw.run {
+        Some(r) => {
+            let r = non_empty(&format!("invocations[{id}].fix.run"), r)?;
+            if !needs.contains_key(&r) {
+                bail!(
+                    "invocation `{id}` fix block references unknown binary `{r}` \
+                     (not declared in `needs`)"
+                );
+            }
+            r
+        }
+        None => parent_run.to_owned(),
+    };
+
+    let mode = match raw.mode.as_deref() {
+        Some("batch") => InvocationMode::Batch,
+        Some("per_file") => InvocationMode::PerFile,
+        Some(other) => bail!(
+            "invocation `{id}` fix block has invalid mode `{other}` \
+             (expected `batch` or `per_file`)"
+        ),
+        None => parent_mode,
+    };
+
+    if raw.args.is_empty() {
+        bail!(
+            "invocation `{id}` fix block must declare a non-empty `args` list \
+             (the fix args must differ from the check args, e.g. `--write` instead of `--check`)"
+        );
+    }
+    validate_args_for_mode(id, mode, &raw.args).map_err(|e| anyhow::anyhow!("invocation `{id}` fix block: {e}"))?;
+    validate_arg_template_refs(id, &raw.args).map_err(|e| anyhow::anyhow!("invocation `{id}` fix block: {e}"))?;
+
+    let exit = match raw.exit {
+        Some(raw_exit) => validate_fix_exit(id, raw_exit)?,
+        None => FixExitSemantics::default_semantics(),
+    };
+
+    Ok(FixBlock {
+        run,
+        mode,
+        args: raw.args,
+        exit,
+    })
+}
+
+fn validate_fix_exit(id: &str, raw: BTreeMap<String, String>) -> Result<FixExitSemantics> {
+    let mut codes = BTreeMap::new();
+    let mut default = None;
+    for (key, value) in raw {
+        let outcome = parse_fix_outcome(id, &value)?;
+        if key == "default" {
+            default = Some(outcome);
+        } else {
+            let code: i32 = key.parse().map_err(|_| {
+                anyhow::anyhow!("invocation `{id}` fix exit key `{key}` is not an integer or `default`")
+            })?;
+            codes.insert(code, outcome);
+        }
+    }
+    let Some(default) = default else {
+        bail!(
+            "invocation `{id}` fix exit semantics must include a `default` outcome \
+             (so crashes surface as errors)"
+        );
+    };
+    Ok(FixExitSemantics { codes, default })
+}
+
+fn parse_fix_outcome(id: &str, raw: &str) -> Result<FixExitOutcome> {
+    match raw {
+        "ok" => Ok(FixExitOutcome::Ok),
+        "error" => Ok(FixExitOutcome::Error),
+        "findings" => bail!(
+            "invocation `{id}` fix exit outcome `findings` is not valid for a fix block \
+             (fix exit outcomes are `ok` or `error` only)"
+        ),
+        other => bail!(
+            "invocation `{id}` fix block has invalid exit outcome `{other}` \
+             (expected `ok` or `error`)"
+        ),
+    }
 }
 
 fn validate_args_for_mode(id: &str, mode: InvocationMode, args: &[String]) -> Result<()> {
