@@ -7,9 +7,9 @@ use checkleft::change_detection::environment::CiEnvironment;
 
 use super::{
     ColorLevel, ExternalProviderMode, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES, TRUNCATE_MAX_TOTAL_CHARS,
-    ci_from_env, github_auth_unavailable_warning, normalize_optional_description, parse_external_provider_mode,
-    parse_github_ref_pr_number, render_human_footer, render_human_results, resolve_github_token_from_sources,
-    should_show_progress, sort_results_for_output, truncate_tool_output,
+    ci_from_env, compute_fix_plan, github_auth_unavailable_warning, normalize_optional_description,
+    parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer, render_human_results,
+    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, truncate_tool_output,
 };
 
 #[test]
@@ -847,4 +847,141 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
         human.contains("truncated"),
         "human output must contain the truncation marker"
     );
+}
+
+fn make_finding(severity: Severity, path: &str) -> Finding {
+    Finding {
+        severity,
+        message: "test finding".to_owned(),
+        location: Some(Location {
+            path: PathBuf::from(path),
+            line: None,
+            column: None,
+        }),
+        remediations: vec![],
+        suggested_fix: None,
+    }
+}
+
+fn make_finding_no_location(severity: Severity) -> Finding {
+    Finding {
+        severity,
+        message: "no location".to_owned(),
+        location: None,
+        remediations: vec![],
+        suggested_fix: None,
+    }
+}
+
+#[test]
+fn compute_fix_plan_collects_error_and_warning_paths() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Warning, "src/lib.rs"),
+            make_finding(Severity::Info, "src/info.rs"),
+        ],
+    }];
+    let plan = compute_fix_plan(&results, &[]);
+    assert_eq!(plan.checks.len(), 1);
+    let check = &plan.checks[0];
+    assert_eq!(check.check_id, "format/rust");
+    assert_eq!(check.failing_files.len(), 2);
+    assert!(check.failing_files.contains(&PathBuf::from("src/main.rs")));
+    assert!(check.failing_files.contains(&PathBuf::from("src/lib.rs")));
+    assert!(!check.failing_files.contains(&PathBuf::from("src/info.rs")));
+}
+
+#[test]
+fn compute_fix_plan_deduplicates_paths() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Warning, "src/main.rs"),
+        ],
+    }];
+    let plan = compute_fix_plan(&results, &[]);
+    assert_eq!(plan.checks[0].failing_files.len(), 1);
+    assert_eq!(plan.checks[0].failing_files[0], PathBuf::from("src/main.rs"));
+}
+
+#[test]
+fn compute_fix_plan_skips_checks_with_only_info() {
+    let results = vec![CheckResult {
+        check_id: "some-check".to_owned(),
+        findings: vec![make_finding(Severity::Info, "src/main.rs")],
+    }];
+    let plan = compute_fix_plan(&results, &[]);
+    assert!(plan.checks.is_empty());
+}
+
+#[test]
+fn compute_fix_plan_skips_findings_without_location() {
+    let results = vec![CheckResult {
+        check_id: "some-check".to_owned(),
+        findings: vec![make_finding_no_location(Severity::Error)],
+    }];
+    let plan = compute_fix_plan(&results, &[]);
+    assert!(plan.checks.is_empty());
+}
+
+#[test]
+fn compute_fix_plan_filters_by_paths() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/foo.rs"),
+            make_finding(Severity::Error, "tests/bar.rs"),
+            make_finding(Severity::Error, "src/baz.rs"),
+        ],
+    }];
+    let paths = vec![PathBuf::from("src")];
+    let plan = compute_fix_plan(&results, &paths);
+    assert_eq!(plan.checks.len(), 1);
+    let files = &plan.checks[0].failing_files;
+    assert_eq!(files.len(), 2);
+    assert!(files.contains(&PathBuf::from("src/foo.rs")));
+    assert!(files.contains(&PathBuf::from("src/baz.rs")));
+    assert!(!files.contains(&PathBuf::from("tests/bar.rs")));
+}
+
+#[test]
+fn compute_fix_plan_paths_filter_empties_check() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_finding(Severity::Error, "tests/bar.rs")],
+    }];
+    let paths = vec![PathBuf::from("src")];
+    let plan = compute_fix_plan(&results, &paths);
+    assert!(
+        plan.checks.is_empty(),
+        "check with all files filtered out should not appear"
+    );
+}
+
+#[test]
+fn compute_fix_plan_multiple_checks() {
+    let results = vec![
+        CheckResult {
+            check_id: "format/rust".to_owned(),
+            findings: vec![make_finding(Severity::Error, "src/a.rs")],
+        },
+        CheckResult {
+            check_id: "format/oxc".to_owned(),
+            findings: vec![make_finding(Severity::Warning, "src/b.ts")],
+        },
+        CheckResult {
+            check_id: "lint/rust".to_owned(),
+            findings: vec![make_finding(Severity::Info, "src/c.rs")],
+        },
+    ];
+    let plan = compute_fix_plan(&results, &[]);
+    assert_eq!(plan.checks.len(), 2);
+    let ids: Vec<&str> = plan.checks.iter().map(|c| c.check_id.as_str()).collect();
+    assert!(ids.contains(&"format/rust"));
+    assert!(ids.contains(&"format/oxc"));
+    assert!(!ids.contains(&"lint/rust"));
 }
