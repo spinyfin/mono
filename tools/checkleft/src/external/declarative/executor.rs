@@ -158,7 +158,14 @@ pub(crate) fn eligible_file_count(
     changeset: &ChangeSet,
     config: &toml::Value,
 ) -> usize {
-    let applies_to_override = resolve::override_applies_to(config).transpose().ok().flatten();
+    // A malformed override causes run_declarative_check to fail; here we fall back to
+    // the full changeset size so the progress count is conservative and consistent with
+    // the "something went wrong" signal the runner will surface when the check runs.
+    let applies_to_override = match resolve::override_applies_to(config) {
+        Some(Ok(globs)) => Some(globs),
+        Some(Err(_)) => return changeset.changed_files.len(),
+        None => None,
+    };
     let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
     select_files(repo_root, changeset, applies_to, package.skip_symlinks)
         .map(|f| f.len())

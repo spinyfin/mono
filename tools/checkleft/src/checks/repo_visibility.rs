@@ -29,6 +29,14 @@ impl Check for RepoVisibilityCheck {
 
 #[async_trait]
 impl ConfiguredCheck for RepoVisibilityCheck {
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_build_file(&f.path))
+            .count()
+    }
+
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let mut findings = Vec::new();
 

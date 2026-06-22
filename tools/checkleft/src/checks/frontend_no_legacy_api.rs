@@ -28,6 +28,14 @@ impl Check for FrontendNoLegacyApiCheck {
 
 #[async_trait]
 impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_frontend_source_file(&f.path))
+            .count()
+    }
+
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         let import_re = Regex::new(r#"^\s*import\b[^;]*\bfrom\s*["']([^"']+)["']"#).expect("valid regex");
         let mut findings = Vec::new();

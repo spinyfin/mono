@@ -1193,3 +1193,86 @@ implementation = "generated:lint/js"
         "lint/js must register 1 (.ts file), got: {reg_map:?}"
     );
 }
+
+/// `repo-visibility` is a built-in check that skips non-BUILD files.
+/// Its `applicable_file_count()` must report only BUILD files, not the global
+/// changeset size, so the progress UI shows the accurate eligible count.
+#[tokio::test]
+async fn runner_registers_eligible_file_count_for_builtin_filtering_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    // Wire the built-in repo-visibility check; no `implementation` field needed.
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "repo-visibility"
+"#,
+    )
+    .expect("write config");
+
+    // Mixed changeset: 2 BUILD files + 3 non-BUILD files → 5 total, 2 applicable.
+    fs::create_dir_all(temp.path().join("src")).expect("create src dir");
+    fs::create_dir_all(temp.path().join("tools")).expect("create tools dir");
+    fs::write(temp.path().join("src/BUILD"), "").expect("write BUILD");
+    fs::write(temp.path().join("tools/BUILD.bazel"), "").expect("write BUILD.bazel");
+    fs::write(temp.path().join("src/main.rs"), "fn main() {}").expect("write rs");
+    fs::write(temp.path().join("README.md"), "# readme").expect("write md");
+    fs::write(temp.path().join("Makefile"), "all:").expect("write makefile");
+
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: Path::new("src/BUILD").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("tools/BUILD.bazel").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("src/main.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("README.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("Makefile").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register checks");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    let reporter = Arc::new(CapturingProgressReporter {
+        registered: Arc::clone(&registered),
+    });
+
+    runner
+        .run_changeset_with_progress(&changeset, reporter)
+        .await
+        .expect("run checks");
+
+    let registered = registered.lock().expect("lock registered").clone();
+    let reg_map: std::collections::HashMap<String, usize> = registered.into_iter().collect();
+
+    assert_eq!(
+        reg_map.get("repo-visibility").copied(),
+        Some(2),
+        "repo-visibility must register 2 (only BUILD files in changeset), got: {reg_map:?}"
+    );
+}
