@@ -13,4 +13,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [checks] running checks"
-CLICOLOR_FORCE=1 bin/checkleft run --show-progress=true
+# EXPERIMENT: --all scans the full repo so pre-existing violations surface as
+# failures in the progress UI — needed to test how the UI renders red ✗ entries.
+# Normal CI uses the default change-scoped run (no --all).
+CLICOLOR_FORCE=1 bin/checkleft run --all --show-progress=true
