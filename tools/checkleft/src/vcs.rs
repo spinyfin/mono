@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -120,6 +121,34 @@ impl Vcs {
         }?;
 
         Ok(parse_tracked_file_list(&output))
+    }
+
+    /// Return the set of repo-relative paths that have uncommitted modifications
+    /// in the working tree (staged or unstaged changes, plus untracked files for
+    /// Git; working-copy diff for Jujutsu). Used by `fix --allow_dirty=false` to
+    /// exclude in-flight edits from the fixable set.
+    pub fn dirty_paths(&self) -> Result<HashSet<PathBuf>> {
+        match self.kind {
+            VcsKind::Git => {
+                let output = run_command(&self.root, "git", &["status", "--porcelain"])?;
+                Ok(parse_git_status_porcelain_paths(&output))
+            }
+            VcsKind::Jujutsu => {
+                let output = run_command(&self.root, "jj", &["diff", "--summary"])?;
+                let changeset = parse_jj_diff_summary(&output)?;
+                Ok(changeset
+                    .changed_files
+                    .iter()
+                    .flat_map(|f| {
+                        let mut paths = vec![f.path.clone()];
+                        if let Some(old) = &f.old_path {
+                            paths.push(old.clone());
+                        }
+                        paths
+                    })
+                    .collect())
+            }
+        }
     }
 
     pub fn base_revision(&self, all: bool, base_ref: Option<&str>) -> Result<Option<BaseRevision>> {
@@ -486,6 +515,29 @@ pub fn parse_tracked_file_list(output: &str) -> ChangeSet {
     ChangeSet::new(changed_files)
 }
 
+/// Parse `git status --porcelain` (v1) output into a set of repo-relative paths
+/// that have working-tree modifications. Includes staged changes, unstaged
+/// changes, and untracked files. For renames (`R  old -> new`), both the old
+/// and new paths are included so that either can match a dirty check.
+pub fn parse_git_status_porcelain_paths(output: &str) -> HashSet<PathBuf> {
+    let mut paths = HashSet::new();
+    for line in output.lines() {
+        // Each line is "XY PATH" (3-char prefix: 2 status chars + space).
+        if line.len() < 3 {
+            continue;
+        }
+        let path_part = &line[3..];
+        // Renames/copies appear as "old -> new".
+        if let Some(arrow_pos) = path_part.find(" -> ") {
+            paths.insert(PathBuf::from(path_part[..arrow_pos].trim_end()));
+            paths.insert(PathBuf::from(&path_part[arrow_pos + 4..]));
+        } else {
+            paths.insert(PathBuf::from(path_part));
+        }
+    }
+    paths
+}
+
 fn parse_arrow_rename(input: &str) -> Result<(PathBuf, PathBuf)> {
     // Handle brace-expansion form: prefix/{old => new}/suffix
     // This is what jj emits when a path component (directory or filename part) changes.
@@ -581,8 +633,8 @@ mod tests {
     use crate::input::ChangeKind;
 
     use super::{
-        normalize_non_empty, parse_git_name_status, parse_jj_diff_summary, parse_repo_root_output,
-        parse_repo_slug_from_remote_url, parse_tracked_file_list, try_expand_brace_notation,
+        normalize_non_empty, parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary,
+        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list, try_expand_brace_notation,
     };
 
     #[test]
@@ -962,6 +1014,90 @@ R docs/old.md => docs/new.md
         assert!(
             descriptions.contains("BYPASS_FILE_SIZE="),
             "BYPASS_FILE_SIZE directive must be found in the range even when tip commit is empty; got: {descriptions:?}"
+        );
+    }
+
+    #[test]
+    fn git_status_porcelain_parses_modified_and_untracked() {
+        let output = " M src/lib.rs\nM  src/main.rs\n?? new_file.rs\n";
+        let paths = parse_git_status_porcelain_paths(output);
+        assert!(paths.contains(&PathBuf::from("src/lib.rs")));
+        assert!(paths.contains(&PathBuf::from("src/main.rs")));
+        assert!(paths.contains(&PathBuf::from("new_file.rs")));
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn git_status_porcelain_parses_rename() {
+        let output = "R  old/name.rs -> new/name.rs\n";
+        let paths = parse_git_status_porcelain_paths(output);
+        assert!(paths.contains(&PathBuf::from("old/name.rs")));
+        assert!(paths.contains(&PathBuf::from("new/name.rs")));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn git_status_porcelain_skips_short_lines() {
+        let output = "\nXY\n M src/lib.rs\n";
+        let paths = parse_git_status_porcelain_paths(output);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn git_status_porcelain_empty_output_yields_empty_set() {
+        let paths = parse_git_status_porcelain_paths("");
+        assert!(paths.is_empty());
+    }
+
+    /// Verify that `dirty_paths()` returns the working-tree modified files for
+    /// a real git repo with staged and unstaged changes.
+    #[test]
+    fn git_dirty_paths_detects_modified_files() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init", "-b", "main"]);
+        run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
+        run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+        // Initial commit.
+        fs::write(temp.path().join("committed.txt"), "original\n").expect("write");
+        run_git(temp.path(), &["add", "committed.txt"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        // Unstaged modification to an existing file.
+        fs::write(temp.path().join("committed.txt"), "modified\n").expect("write");
+
+        // New untracked file.
+        fs::write(temp.path().join("new.txt"), "untracked\n").expect("write");
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        let dirty = vcs.dirty_paths().expect("dirty_paths");
+
+        assert!(
+            dirty.contains(&PathBuf::from("committed.txt")),
+            "unstaged modified file must appear in dirty_paths; got: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&PathBuf::from("new.txt")),
+            "untracked file must appear in dirty_paths; got: {dirty:?}"
         );
     }
 }
