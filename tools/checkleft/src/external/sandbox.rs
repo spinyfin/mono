@@ -877,7 +877,23 @@ mod tests {
 
         // PreferHardlink shares the inode; ForceCopy must produce a distinct inode
         // so a write inside the sandbox cannot escape to the real file.
-        let (dir, tree) = disk_source_tree(&[("src/real.rs", b"fn real() {}")]);
+        //
+        // Create the source tree in the same location where sandbox_base_dir() will
+        // place the sandbox (XDG cache dir or system tmp fallback). In CI (Bazel),
+        // TEST_TMPDIR (used by tempfile::tempdir()) and HOME (used by
+        // directories::ProjectDirs) can reside on different filesystems. If source
+        // and sandbox end up on different devices, fs::hard_link fails with EXDEV
+        // and PreferHardlink silently copies, making the inode assertion spurious.
+        let source_parent = super::sandbox_base_dir().unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::Builder::new()
+            .prefix("checkleft-test-src")
+            .tempdir_in(&source_parent)
+            .expect("create source temp dir");
+        let src_file = dir.path().join("src/real.rs");
+        fs::create_dir_all(src_file.parent().unwrap()).expect("create dirs");
+        fs::write(&src_file, b"fn real() {}").expect("write source file");
+        let tree = crate::source_tree::LocalSourceTree::new(dir.path()).expect("create tree");
+
         let cs = changeset(&["src/real.rs"]);
         let real_ino = fs::metadata(dir.path().join("src/real.rs")).unwrap().ino();
 
