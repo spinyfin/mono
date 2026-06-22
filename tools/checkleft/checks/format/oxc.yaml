@@ -1,0 +1,95 @@
+id: format/oxc
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+# The file types oxfmt's formatter handles. Confirmed empirically against the
+# pinned oxfmt 0.55.0 by formatting a representative (and a complex) sample of
+# each type and re-checking for idempotency + correctness:
+#   JS/TS family   js jsx mjs cjs ts tsx mts cts   (oxc's original formatter)
+#   JSON family    json jsonc json5
+#   CSS family     css scss less
+#   markup/data    html vue md markdown mdx yaml yml toml graphql gql
+# Every one above round-trips: `oxfmt --write` then a re-check reports clean
+# (exit 0), and the output is correct on both trivial and complex inputs
+# (markdown tables/frontmatter/code-fences, yaml anchors/merge-keys/multiline,
+# html with embedded <script>, vue template+script). svelte and astro are
+# deliberately EXCLUDED: oxfmt 0.55.0 does not recognise them (it treats them as
+# unmatched and exits 2), so advertising them would be a lie.
+#
+# CAVEAT — oxfmt is early-stage (0.x, released roughly weekly). The version pin
+# below freezes the behaviour above to a known-good release; do not assume a
+# later release formats the same set the same way without re-verifying. Anything
+# that slips through an applies_to override that oxfmt cannot parse surfaces as a
+# per-file error finding (exit 2 → error), not a silent pass.
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,jsonc,json5,css,scss,less,html,vue,md,markdown,mdx,yaml,yml,toml,graphql,gql}"
+skip_symlinks: true
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions oxfmt via `npx --yes oxfmt@<version>`,
+#     pinned here to 0.55.0. The version is part of the package spec, so npx
+#     fetches and runs exactly that release regardless of any globally-installed
+#     copy — a reproducible tool without a parallel Bazel JS toolchain (mono has
+#     no rules_js/node Bazel integration today; Node arrives on PATH via the CI
+#     bootstrap). oxfmt is distributed as the standalone `oxfmt` npm package with
+#     an `oxfmt` binary. Re-pin per-repo via CHECKS config, setting only the
+#     version (the package is inherited from this default `npm` binding):
+#
+#       checks:
+#         - id: format/oxc
+#           config:
+#             needs:
+#               oxfmt:
+#                 npm:
+#                   version: "0.56.0"
+#
+#     NOTE: 0.55.0 is the latest stable at authoring time; an operator-confirmed
+#     pin is pending. Because oxfmt is pre-1.0 and ships ~weekly, treat the pin as
+#     load-bearing and re-verify the formatted-language set when bumping it.
+#
+#   - fallback: when `npx` is not on PATH (some local/non-CI environments), the
+#     framework uses `oxfmt` from PATH and warns loudly on stderr so you know the
+#     pinned toolchain was skipped. A repo that later adopts a hermetic Bazel JS
+#     toolchain can point `needs.oxfmt.bazel` at its oxfmt target via CHECKS
+#     config with no change to this definition.
+#   - oxfmt discovers the REPO's own config (.oxfmtrc.json / .oxfmtrc.jsonc, etc.)
+#     and .gitignore/.prettierignore relative to the repo root (invocations run
+#     with cwd = repo root). checkleft imposes no formatting options of its own;
+#     with no config oxfmt uses its built-in defaults.
+needs:
+  oxfmt:
+    default:
+      npm:
+        package: "oxfmt"
+        version: "0.55.0"
+    fallback:
+      path: "oxfmt"
+
+invocations:
+  - id: format
+    run: oxfmt
+    mode: per_file
+    args:
+      # --list-different: print the path of each file that is NOT already
+      # formatted (one per line) and exit 1; exit 0 when the file is formatted.
+      # This is CHECK mode — it never writes the file. The linelist transform
+      # turns each printed path into one file-level finding. (We use per_file so
+      # the remediation can name `{{input.file}}`, mirroring format/prettier.)
+      - "--list-different"
+      - "{{file}}"
+    # oxfmt 0.55.0 exit codes (cleaner than prettier, which conflates 1):
+    #   0 = already formatted (ok)
+    #   1 = needs formatting (path printed on stdout via --list-different)
+    #   2 = operational error, e.g. a parse/syntax error (message on stderr, no
+    #       stdout file list) — surfaced as a per-file error finding, not "clean".
+    # In per_file mode a `default → error` outcome is isolated to that one file
+    # and the loop continues, so one unparseable file never masks the rest.
+    exit:
+      "0": ok
+      "1": findings
+      default: error
+    transform:
+      kind: linelist
+      message: "file needs oxfmt formatting"
+      remediations:
+        - "Run `{{needs.oxfmt.invocation}} --write {{input.file}}` to auto-format."

@@ -287,6 +287,48 @@ Notes:
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
+## `format/oxc`
+
+Purpose:
+
+- Flags changed files that are not [oxfmt](https://oxc.rs)-formatted. oxfmt is the formatter from the [Oxc](https://oxc.rs) toolchain (the same project as oxlint) — a fast Rust formatter. The check applies to the file types oxfmt formats reliably at the pinned version: `*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`, `*.json`, `*.jsonc`, `*.json5`, `*.css`, `*.scss`, `*.less`, `*.html`, `*.vue`, `*.md`, `*.markdown`, `*.mdx`, `*.yaml`, `*.yml`, `*.toml`, `*.graphql`, `*.gql`.
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `oxfmt --list-different <file>` per changed file (CHECK mode — it never writes the file) and emits one finding per file that needs reformatting.
+- oxfmt discovers the **repo's own** configuration (`.oxfmtrc.json` / `.oxfmtrc.jsonc`, etc.) and `.gitignore` / `.prettierignore` relative to the repo root (invocations run with cwd = repo root). With no config, oxfmt uses its built-in defaults; checkleft imposes no formatting options of its own.
+
+Language scope — verified, not advertised:
+
+- oxfmt is early-stage (pre-1.0). Each language above was verified against the pinned release by formatting representative and complex samples (markdown with tables/frontmatter/code-fences, YAML with anchors/merge-keys/multiline, HTML with embedded `<script>`, Vue single-file components) and confirming the output is correct and idempotent (a second format pass reports clean). Languages oxfmt does **not** yet handle are deliberately excluded so the check never claims coverage it doesn't have: notably `.svelte` and `.astro` (the pinned oxfmt does not recognise them).
+- Because oxfmt is pre-1.0 and ships frequently, the version pin is load-bearing: re-verify the formatted-language set when bumping it.
+
+Tool provisioning and version pinning:
+
+- By default oxfmt is provisioned via `npx --yes oxfmt@<version>`, pinned to **0.55.0** (the latest stable at authoring time; an operator-confirmed pin is pending). oxfmt is distributed as the standalone `oxfmt` npm package with an `oxfmt` binary. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: format/oxc
+    policy:
+      severity: error
+    config:
+      needs:
+        oxfmt:
+          npm:
+            version: "0.56.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to an `oxfmt` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxfmt.bazel: "<label>"`, or at an explicit path with `needs.oxfmt.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- Each finding's remediation is ``Run `<oxfmt invocation> --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
+- A file oxfmt cannot parse exits with an operational error (exit 2) and is reported as a per-file **error** finding rather than masquerading as clean; other files in the changeset are unaffected.
+- Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
 ## `lint/js`
 
 Purpose:
@@ -391,6 +433,47 @@ Notes:
 - Biome is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
 - Each finding's remediation is to fix the violation or suppress it with a justified `// biome-ignore lint: <reason>` comment.
 - Biome's per-finding severity is preserved end-to-end, so no policy configuration is needed to get the error/warning/info distinction. To make all findings non-blocking, set `policy.severity: warning`, which overrides every finding's severity regardless of what Biome reported.
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
+## `lint/oxc`
+
+Purpose:
+
+- Flags [oxlint](https://oxc.rs) violations in changed JS/TS source files and framework single-file components (`*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`, `*.vue`, `*.svelte`, `*.astro`). oxlint is the linter from the [Oxc](https://oxc.rs) toolchain — an extremely fast Rust linter, a quick alternative to ESLint. For `.vue` / `.svelte` / `.astro` it lints the embedded `<script>` (confirmed against the pinned release). oxlint is JS/TS only — there is no markdown/CSS/YAML linting (that is the formatter's job; see [format/oxc](#formatoxc)).
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `oxlint --format=json --no-error-on-unmatched-pattern <files>` over the changed files in one batch invocation and converts the JSON diagnostics to findings (file path, 1-based line/column, rule code, severity, and message). The invocation runs in lint-CHECK mode — it never writes fixes.
+- oxlint's per-diagnostic severity is preserved: `error` maps to a checkleft `error` finding, `warning` to `warning`, and anything else to `info`. Each finding's message is prefixed with the rule code (e.g. `eslint(no-debugger): ...`); diagnostics without a rule code (such as parse errors) fall back to an `oxlint:` prefix.
+- `--no-error-on-unmatched-pattern` makes an all-ignored file set a no-op (clean exit) instead of a hard error — the analogue of Prettier's `--ignore-unknown`.
+
+Config — none required:
+
+- **Unlike `lint/js`, `lint/oxc` requires no config key.** oxlint is zero-config by design: it ships a built-in default rule set (the `correctness` category) and auto-discovers the repo's own `.oxlintrc.json` / nested configs (invocations run with cwd = repo root) to refine it. With no `.oxlintrc.json` present, it lints with oxlint's defaults; with one present, it is picked up automatically. (ESLint 9+ has no built-in defaults and so forces `lint/js` to make `config_file` mandatory — oxlint does not.)
+
+Tool provisioning and version pinning:
+
+- By default oxlint is provisioned via `npx --yes oxlint@<version>`, pinned to **1.70.0** (the latest stable at authoring time; an operator-confirmed pin is pending). oxlint is distributed as the standalone `oxlint` npm package with an `oxlint` binary. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain.
+- oxlint is 1.x/stable, so the JSON reporter shape used by the transform is reliable across patch releases.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: lint/oxc
+    config:
+      needs:
+        oxlint:
+          npm:
+            version: "1.71.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to an `oxlint` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.oxlint.bazel: "<label>"`, or at an explicit path with `needs.oxlint.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- oxlint is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
+- Each finding's remediation is to fix the violation or suppress it with a justified `// oxlint-disable-next-line <rule>` comment.
+- oxlint's per-finding severity is preserved end-to-end, so no policy configuration is needed to get the error/warning/info distinction. To make all findings non-blocking, set `policy.severity: warning`, which overrides every finding's severity regardless of what oxlint reported.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
 ## `md/link-integrity`
