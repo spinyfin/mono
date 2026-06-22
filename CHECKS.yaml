@@ -71,7 +71,7 @@ checks:
     policy:
       severity: warning
 
-  - id: format/prettier
+  - id: format/oxc
     policy:
       severity: error
 
@@ -83,8 +83,6 @@ checks:
     policy:
       severity: error
 
-  - id: lint/js
+  - id: lint/oxc
     policy:
       severity: error
-    config:
-      config_file: "eslint.config.js"
