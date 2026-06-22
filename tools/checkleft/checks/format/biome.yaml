@@ -1,0 +1,87 @@
+id: format/biome
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+# The file types Biome's formatter handles. Confirmed against Biome 2.5.0:
+# JS/TS family, JSON/JSONC, CSS, and GraphQL are formatted; HTML and Markdown
+# are NOT (Biome emits no format diagnostic for them), so they are excluded.
+# Anything that slips through (e.g. via an applies_to override) is skipped by
+# `--files-ignore-unknown=true` rather than erroring.
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,jsonc,css,graphql,gql}"
+skip_symlinks: true
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions Biome via
+#     `npx --yes @biomejs/biome@<version>`, pinned here to 2.5.0. The version is
+#     part of the package spec, so npx fetches and runs exactly that release
+#     regardless of any globally-installed copy — a reproducible tool without a
+#     parallel Bazel JS toolchain (mono has no rules_js/node Bazel integration
+#     today; Node arrives on PATH via the CI bootstrap). format/biome and
+#     lint/biome share the SAME pinned `@biomejs/biome` binding. Re-pin per-repo
+#     via CHECKS config, setting only the version (the package is inherited from
+#     this default `npm` binding):
+#
+#       checks:
+#         - id: format/biome
+#           config:
+#             needs:
+#               biome:
+#                 npm:
+#                   version: "2.6.0"
+#
+#   - fallback: when `npx` is not on PATH (some local/non-CI environments), the
+#     framework uses `biome` from PATH and warns loudly on stderr so you know the
+#     pinned toolchain was skipped. A repo that later adopts a hermetic Bazel JS
+#     toolchain can point `needs.biome.bazel` at its biome target via CHECKS
+#     config with no change to this definition.
+#   - Biome discovers the REPO's own `biome.json` / `biome.jsonc` relative to the
+#     repo root (invocations run with cwd = repo root). checkleft imposes no
+#     formatting options of its own; with no config Biome uses its built-in
+#     defaults.
+needs:
+  biome:
+    default:
+      npm:
+        package: "@biomejs/biome"
+        version: "2.5.0"
+    fallback:
+      path: "biome"
+
+invocations:
+  - id: format
+    run: biome
+    mode: batch
+    args:
+      - "format"
+      # Skip files Biome has no formatter for (e.g. an applies_to override that
+      # includes an unsupported type, or a stray file in the batch) instead of
+      # emitting a diagnostic — the analogue of prettier's --ignore-unknown.
+      - "--files-ignore-unknown=true"
+      # Machine-readable JSON on stdout so the json transform can parse the
+      # per-file format diagnostics. The pinned 2.5.0 reporter shape is stable
+      # for this version (Biome warns the json reporter is unstable ACROSS
+      # releases, which the version pin neutralises).
+      - "--reporter=json"
+      - "{{files}}"
+    # exit 0 = everything already formatted (ok); exit 1 = at least one file needs
+    # formatting OR an operational diagnostic (the json transform projects the
+    # diagnostics, yielding zero findings for an empty set); any other code (crash,
+    # signal) = error so it never masquerades as clean.
+    exit:
+      "0": ok
+      "1": findings
+      default: error
+    transform:
+      kind: json
+      # Biome's json reporter emits {"diagnostics":[{... "location":{"path": "<file>"} ...}]}.
+      # One diagnostic per unformatted file; project just the path (formatting is a
+      # whole-file property, so there is no single offending line). Guard against a
+      # rare path-less diagnostic so the template never renders a null path.
+      select: ".diagnostics[] | select(.location.path != null) | {path: .location.path}"
+      finding:
+        path: "{{item.path}}"
+        message: "file needs biome formatting"
+        severity: warning
+        remediations:
+          - "Run `{{needs.biome.invocation}} format --write {{item.path}}` to auto-format."
