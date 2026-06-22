@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -883,7 +884,7 @@ fn compute_fix_plan_collects_error_and_warning_paths() {
             make_finding(Severity::Info, "src/info.rs"),
         ],
     }];
-    let plan = compute_fix_plan(&results, &[]);
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert_eq!(plan.checks.len(), 1);
     let check = &plan.checks[0];
     assert_eq!(check.check_id, "format/rust");
@@ -903,7 +904,7 @@ fn compute_fix_plan_deduplicates_paths() {
             make_finding(Severity::Warning, "src/main.rs"),
         ],
     }];
-    let plan = compute_fix_plan(&results, &[]);
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert_eq!(plan.checks[0].failing_files.len(), 1);
     assert_eq!(plan.checks[0].failing_files[0], PathBuf::from("src/main.rs"));
 }
@@ -914,7 +915,7 @@ fn compute_fix_plan_skips_checks_with_only_info() {
         check_id: "some-check".to_owned(),
         findings: vec![make_finding(Severity::Info, "src/main.rs")],
     }];
-    let plan = compute_fix_plan(&results, &[]);
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert!(plan.checks.is_empty());
 }
 
@@ -924,7 +925,7 @@ fn compute_fix_plan_skips_findings_without_location() {
         check_id: "some-check".to_owned(),
         findings: vec![make_finding_no_location(Severity::Error)],
     }];
-    let plan = compute_fix_plan(&results, &[]);
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert!(plan.checks.is_empty());
 }
 
@@ -939,7 +940,7 @@ fn compute_fix_plan_filters_by_paths() {
         ],
     }];
     let paths = vec![PathBuf::from("src")];
-    let plan = compute_fix_plan(&results, &paths);
+    let plan = compute_fix_plan(&results, &paths, &HashSet::new());
     assert_eq!(plan.checks.len(), 1);
     let files = &plan.checks[0].failing_files;
     assert_eq!(files.len(), 2);
@@ -955,7 +956,7 @@ fn compute_fix_plan_paths_filter_empties_check() {
         findings: vec![make_finding(Severity::Error, "tests/bar.rs")],
     }];
     let paths = vec![PathBuf::from("src")];
-    let plan = compute_fix_plan(&results, &paths);
+    let plan = compute_fix_plan(&results, &paths, &HashSet::new());
     assert!(
         plan.checks.is_empty(),
         "check with all files filtered out should not appear"
@@ -978,10 +979,55 @@ fn compute_fix_plan_multiple_checks() {
             findings: vec![make_finding(Severity::Info, "src/c.rs")],
         },
     ];
-    let plan = compute_fix_plan(&results, &[]);
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert_eq!(plan.checks.len(), 2);
     let ids: Vec<&str> = plan.checks.iter().map(|c| c.check_id.as_str()).collect();
     assert!(ids.contains(&"format/rust"));
     assert!(ids.contains(&"format/oxc"));
     assert!(!ids.contains(&"lint/rust"));
+}
+
+#[test]
+fn compute_fix_plan_dirty_paths_partitions_into_dirty_skipped() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/clean.rs"),
+            make_finding(Severity::Error, "src/dirty.rs"),
+        ],
+    }];
+    let dirty: HashSet<PathBuf> = [PathBuf::from("src/dirty.rs")].into_iter().collect();
+    let plan = compute_fix_plan(&results, &[], &dirty);
+    assert_eq!(plan.checks.len(), 1);
+    let check = &plan.checks[0];
+    assert_eq!(check.failing_files, vec![PathBuf::from("src/clean.rs")]);
+    assert_eq!(check.dirty_skipped, vec![PathBuf::from("src/dirty.rs")]);
+}
+
+#[test]
+fn compute_fix_plan_all_dirty_check_still_appears_with_empty_failing_files() {
+    // When all failing files are dirty, the check entry still appears so the
+    // user can see what was skipped (rather than silently producing no output).
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_finding(Severity::Error, "src/dirty.rs")],
+    }];
+    let dirty: HashSet<PathBuf> = [PathBuf::from("src/dirty.rs")].into_iter().collect();
+    let plan = compute_fix_plan(&results, &[], &dirty);
+    assert_eq!(plan.checks.len(), 1);
+    let check = &plan.checks[0];
+    assert!(check.failing_files.is_empty());
+    assert_eq!(check.dirty_skipped, vec![PathBuf::from("src/dirty.rs")]);
+}
+
+#[test]
+fn compute_fix_plan_empty_dirty_set_does_not_filter() {
+    // An empty dirty_paths (allow_dirty=true default) never moves files to dirty_skipped.
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_finding(Severity::Error, "src/lib.rs")],
+    }];
+    let plan = compute_fix_plan(&results, &[], &HashSet::new());
+    assert_eq!(plan.checks[0].failing_files, vec![PathBuf::from("src/lib.rs")]);
+    assert!(plan.checks[0].dirty_skipped.is_empty());
 }

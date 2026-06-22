@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::stderr;
 use std::path::{Path, PathBuf};
@@ -511,6 +512,9 @@ struct FixCheckPlan {
     check_id: String,
     /// Failing files (deduplicated, sorted) that would be passed to the fixer.
     failing_files: Vec<PathBuf>,
+    /// Files excluded from fixing because they have uncommitted working-tree
+    /// changes and `--allow_dirty=false` was set.
+    dirty_skipped: Vec<PathBuf>,
 }
 
 /// Aggregated dry-run plan for `checkleft fix`: one entry per check with a
@@ -524,8 +528,10 @@ struct FixPlan {
 /// For each check, the failing-file set is the distinct `finding.location.path`
 /// values whose severity is `Error` or `Warning` (Info findings are advisory
 /// and are not fixed). If `paths` is non-empty the set is further intersected
-/// with files that start with any of the given paths.
-fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf]) -> FixPlan {
+/// with files that start with any of the given paths. Files in `dirty_paths`
+/// are partitioned into `dirty_skipped` instead of `failing_files`; pass an
+/// empty set when `--allow_dirty=true` (the default).
+fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf], dirty_paths: &HashSet<PathBuf>) -> FixPlan {
     use std::collections::BTreeSet;
 
     let mut checks = Vec::new();
@@ -541,7 +547,7 @@ fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf]) -> FixPlan {
             continue;
         }
 
-        let filtered: Vec<PathBuf> = if paths.is_empty() {
+        let path_filtered: Vec<PathBuf> = if paths.is_empty() {
             failing.into_iter().collect()
         } else {
             failing
@@ -550,18 +556,36 @@ fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf]) -> FixPlan {
                 .collect()
         };
 
-        if !filtered.is_empty() {
-            checks.push(FixCheckPlan {
-                check_id: result.check_id.clone(),
-                failing_files: filtered,
-            });
+        if path_filtered.is_empty() {
+            continue;
         }
+
+        let mut failing_files = Vec::new();
+        let mut dirty_skipped = Vec::new();
+        for file in path_filtered {
+            if dirty_paths.contains(&file) {
+                dirty_skipped.push(file);
+            } else {
+                failing_files.push(file);
+            }
+        }
+
+        if failing_files.is_empty() && dirty_skipped.is_empty() {
+            continue;
+        }
+
+        checks.push(FixCheckPlan {
+            check_id: result.check_id.clone(),
+            failing_files,
+            dirty_skipped,
+        });
     }
     FixPlan { checks }
 }
 
 fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
     let total_files: usize = plan.checks.iter().map(|c| c.failing_files.len()).sum();
+    let total_dirty_skipped: usize = plan.checks.iter().map(|c| c.dirty_skipped.len()).sum();
 
     if plan.checks.is_empty() {
         println!(
@@ -583,14 +607,23 @@ fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
         for file in &check_plan.failing_files {
             println!("    {}", file.display());
         }
+        for file in &check_plan.dirty_skipped {
+            println!("    {} (skipped: uncommitted changes)", file.display());
+        }
         println!();
     }
 
+    let dirty_note = if total_dirty_skipped > 0 {
+        format!(", {total_dirty_skipped} skipped (dirty)")
+    } else {
+        String::new()
+    };
     println!(
-        "{}: {} check(s) with failing files, {} total file(s) in {}s\n",
+        "{}: {} check(s) with failing files, {} total file(s){} in {}s\n",
         style.paint_bold("summary"),
         plan.checks.len(),
         total_files,
+        dirty_note,
         elapsed.as_secs()
     );
 }
@@ -603,6 +636,7 @@ fn print_fix_dry_plan_json(plan: &FixPlan) -> Result<()> {
             serde_json::json!({
                 "check_id": c.check_id,
                 "failing_files": c.failing_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "dirty_skipped": c.dirty_skipped.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -621,9 +655,9 @@ async fn dispatch_fix(
                 format,
                 show_progress,
             },
-        allow_dirty: _, // TODO(T6): subtract dirty files when false
-        verify: _,      // TODO(T8): re-run checks after applying fixes
-        max_passes: _,  // TODO(T7): multi-pass convergence
+        allow_dirty,
+        verify: _,     // TODO(T8): re-run checks after applying fixes
+        max_passes: _, // TODO(T7): multi-pass convergence
         paths,
     }: FixArgs,
     root: &Path,
@@ -677,7 +711,15 @@ async fn dispatch_fix(
         progress.finalize();
     }
 
-    let fix_plan = compute_fix_plan(&results, &paths);
+    // When --allow_dirty=false, subtract files with uncommitted working-tree
+    // changes from the fixable set so in-flight edits are never clobbered.
+    let dirty_paths: HashSet<PathBuf> = if allow_dirty {
+        HashSet::new()
+    } else {
+        vcs.dirty_paths().unwrap_or_default()
+    };
+
+    let fix_plan = compute_fix_plan(&results, &paths, &dirty_paths);
 
     match format {
         OutputFormat::Human => print_fix_dry_plan(&fix_plan, style, elapsed),
