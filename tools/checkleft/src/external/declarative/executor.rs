@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
@@ -49,6 +50,48 @@ pub fn run_declarative_check(
     changeset: &ChangeSet,
     config: &toml::Value,
     effective_severity: Option<Severity>,
+) -> Result<CheckResult> {
+    run_declarative_check_impl(
+        repo_root,
+        package_id,
+        package,
+        changeset,
+        config,
+        effective_severity,
+        None,
+    )
+}
+
+/// Like [`run_declarative_check`] but emits per-file/per-chunk progress ticks
+/// via `on_file_processed` (cumulative count of eligible files processed so far).
+pub(crate) fn run_declarative_check_with_progress(
+    repo_root: &Path,
+    package_id: &str,
+    package: &ExternalCheckDeclarativePackage,
+    changeset: &ChangeSet,
+    config: &toml::Value,
+    effective_severity: Option<Severity>,
+    on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+) -> Result<CheckResult> {
+    run_declarative_check_impl(
+        repo_root,
+        package_id,
+        package,
+        changeset,
+        config,
+        effective_severity,
+        Some(on_file_processed),
+    )
+}
+
+fn run_declarative_check_impl(
+    repo_root: &Path,
+    package_id: &str,
+    package: &ExternalCheckDeclarativePackage,
+    changeset: &ChangeSet,
+    config: &toml::Value,
+    effective_severity: Option<Severity>,
+    on_file_processed: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 ) -> Result<CheckResult> {
     // A per-repo `applies_to` override in the CHECKS.yaml config blob replaces the
     // definition's applies_to list entirely (same glob vocabulary, replace semantics).
@@ -91,6 +134,7 @@ pub fn run_declarative_check(
             &files,
             effective_severity,
             &config_values,
+            on_file_processed.as_deref(),
         )?);
     }
 
@@ -215,9 +259,18 @@ fn run_invocation(
     files: &[String],
     effective_severity: Option<Severity>,
     config_values: &BTreeMap<String, String>,
+    on_file_processed: Option<&(dyn Fn(usize) + Send + Sync)>,
 ) -> Result<Vec<Finding>> {
     let mut findings = match &invocation.kind {
-        InvocationKind::Tool(tool) => run_tool_invocation(repo_root, binaries, invocation, tool, files, config_values)?,
+        InvocationKind::Tool(tool) => run_tool_invocation(
+            repo_root,
+            binaries,
+            invocation,
+            tool,
+            files,
+            config_values,
+            on_file_processed,
+        )?,
         InvocationKind::BazelAspect(aspect) => {
             run_bazel_aspect_invocation(repo_root, invocation, aspect, files, effective_severity)?
         }
@@ -237,6 +290,7 @@ fn run_tool_invocation(
     tool: &ToolInvocation,
     files: &[String],
     config_values: &BTreeMap<String, String>,
+    on_file_processed: Option<&(dyn Fn(usize) + Send + Sync)>,
 ) -> Result<Vec<Finding>> {
     let binary = binaries
         .get(&tool.run)
@@ -273,6 +327,9 @@ fn run_tool_invocation(
                     .sum::<usize>();
             let chunks = split_files_into_chunks(fixed_cost, files);
             let mut findings = Vec::new();
+            // Cumulative file count for progress reporting. Each chunk is reported
+            // as a single tick (one batch invocation per chunk).
+            let mut processed = 0usize;
             for chunk in chunks {
                 let args = with_prefix(expand_batch_args(repo_root, &tool.args, chunk, config_values)?);
                 let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
@@ -282,6 +339,10 @@ fn run_tool_invocation(
                     None,
                     Some(&needs_invocations),
                 )?);
+                processed += chunk.len();
+                if let Some(cb) = on_file_processed {
+                    cb(processed);
+                }
             }
             Ok(findings)
         }
@@ -290,6 +351,7 @@ fn run_tool_invocation(
             // finding scoped to that file, and the loop continues to the next file.
             // See module-level doc for the batch vs per_file asymmetry.
             let mut findings = Vec::new();
+            let mut processed = 0usize;
             for file in files {
                 let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file, config_values)?);
                 let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
@@ -337,6 +399,10 @@ fn run_tool_invocation(
                             suggested_fix: None,
                         });
                     }
+                }
+                processed += 1;
+                if let Some(cb) = on_file_processed {
+                    cb(processed);
                 }
             }
             Ok(findings)

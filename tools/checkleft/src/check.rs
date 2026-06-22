@@ -13,6 +13,22 @@ use crate::output::CheckResult;
 pub trait ConfiguredCheck: Send + Sync {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult>;
 
+    /// Run the check, emitting incremental per-file progress ticks via
+    /// `on_file_processed`. The argument is the cumulative count of eligible
+    /// files processed so far. Call once per eligible file (i.e. files that
+    /// would be counted by [`Self::applicable_file_count`]).
+    ///
+    /// The default implementation calls [`Self::run`] and emits no per-file
+    /// ticks. Override in checks that iterate files to provide live progress.
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
+        self.run(changeset, tree).await
+    }
+
     /// Count the files in `changeset` that this check will actually process.
     ///
     /// The default returns the full changeset size, which is correct for checks that

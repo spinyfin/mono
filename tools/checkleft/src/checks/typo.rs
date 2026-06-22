@@ -77,7 +77,16 @@ struct ParsedTypoConfig {
 #[async_trait]
 impl ConfiguredCheck for ParsedTypoConfig {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        run_typo_check("typo", changeset, tree, &self.rules)
+        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
+    }
+
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
+        run_typo_check("typo", changeset, tree, &self.rules, &*on_file_processed)
     }
 }
 
@@ -86,9 +95,11 @@ fn run_typo_check(
     changeset: &ChangeSet,
     tree: &dyn SourceTree,
     rules: &[TypoRule],
+    on_file_processed: &dyn Fn(usize),
 ) -> Result<CheckResult> {
     let compiled_rules = compile_rules(rules)?;
     let mut findings = Vec::new();
+    let mut processed = 0usize;
 
     for changed_file in &changeset.changed_files {
         if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -96,9 +107,13 @@ fn run_typo_check(
         }
 
         let Ok(contents) = tree.read_file(&changed_file.path) else {
+            processed += 1;
+            on_file_processed(processed);
             continue;
         };
         let Ok(contents) = String::from_utf8(contents) else {
+            processed += 1;
+            on_file_processed(processed);
             continue;
         };
 
@@ -130,6 +145,8 @@ fn run_typo_check(
                 break;
             }
         }
+        processed += 1;
+        on_file_processed(processed);
     }
 
     Ok(CheckResult {
@@ -299,5 +316,67 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_with_progress_emits_one_tick_per_eligible_file_and_never_exceeds_total() {
+        use std::sync::{Arc, Mutex};
+
+        let temp = tempdir().expect("create temp dir");
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(temp.path().join(f), "no typos here\n").expect("write file");
+        }
+
+        let config = &toml::Value::Table(toml::toml! {
+            rules = [
+                { typo = "teh", canonical = "the", kind = "substring" },
+            ]
+        });
+        let check = TypoCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let configured = check.configure(config).expect("configure");
+
+        let changeset = ChangeSet::new(vec![
+            ChangedFile {
+                path: Path::new("a.txt").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: Path::new("b.txt").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: Path::new("c.txt").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]);
+
+        let total = configured.applicable_file_count(&changeset);
+        assert_eq!(total, 3);
+
+        let ticks: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let ticks_clone = Arc::clone(&ticks);
+        let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+            ticks_clone.lock().unwrap().push(n);
+        });
+
+        configured
+            .run_with_progress(&changeset, &tree, on_file_processed)
+            .await
+            .expect("run_with_progress must succeed");
+
+        let ticks = ticks.lock().unwrap().clone();
+        assert_eq!(
+            ticks,
+            vec![1, 2, 3],
+            "must emit one cumulative tick per file; got {ticks:?}"
+        );
+        assert!(
+            ticks.iter().all(|&n| n <= total),
+            "numerator must never exceed denominator ({total}); got {ticks:?}"
+        );
     }
 }

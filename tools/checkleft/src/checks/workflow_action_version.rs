@@ -31,7 +31,17 @@ impl Check for WorkflowActionVersionCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
+    }
+
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let mut findings = Vec::new();
+        let mut processed = 0usize;
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -42,9 +52,13 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
             }
 
             let Ok(contents) = tree.read_file(&changed_file.path) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
             let Ok(contents) = String::from_utf8(contents) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
 
@@ -64,6 +78,8 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                         ],
                         suggested_fix: None,
                     });
+                    processed += 1;
+                    on_file_processed(processed);
                     continue;
                 }
             };
@@ -88,6 +104,8 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                     suggested_fix: None,
                 });
             }
+            processed += 1;
+            on_file_processed(processed);
         }
 
         Ok(CheckResult {

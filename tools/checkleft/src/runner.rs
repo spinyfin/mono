@@ -176,7 +176,15 @@ impl Runner {
                     join_set.spawn(async move {
                         reporter.start(&configured_check_id);
                         let check_start = Instant::now();
-                        match check.run(&run_changeset, source_tree.as_ref()).await {
+                        let progress_reporter = Arc::clone(&reporter);
+                        let progress_check_id = configured_check_id.clone();
+                        let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+                            progress_reporter.record_progress(&progress_check_id, n);
+                        });
+                        match check
+                            .run_with_progress(&run_changeset, source_tree.as_ref(), on_file_processed)
+                            .await
+                        {
                             Ok(mut result) => {
                                 let elapsed = check_start.elapsed();
                                 // Report findings under the configured instance id.
@@ -259,13 +267,19 @@ impl Runner {
                         let task_reporter = Arc::clone(&reporter);
                         let outcome = tokio::task::spawn_blocking(move || {
                             let check_start = Instant::now();
-                            match external_executor.execute(
+                            let progress_reporter = Arc::clone(&task_reporter);
+                            let progress_check_id = configured_check_id.clone();
+                            let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+                                progress_reporter.record_progress(&progress_check_id, n);
+                            });
+                            match external_executor.execute_with_progress(
                                 &package,
                                 &run_changeset,
                                 source_tree.as_ref(),
                                 &run_config,
                                 &run_config_dir,
                                 run_policy.severity_override,
+                                on_file_processed,
                             ) {
                                 Ok(mut result) => {
                                     let elapsed = check_start.elapsed();

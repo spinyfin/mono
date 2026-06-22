@@ -37,7 +37,17 @@ impl Check for BazelPoliciesCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelPoliciesConfig {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
+    }
+
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let mut findings = Vec::new();
+        let mut processed = 0usize;
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -49,19 +59,27 @@ impl ConfiguredCheck for CompiledBazelPoliciesConfig {
             };
 
             let Ok(contents) = tree.read_file(&changed_file.path) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
             let Ok(contents) = std::str::from_utf8(&contents) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
 
             let Some(parsed) = parse_starlark_file(contents) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
 
             for rule in &self.rules {
                 findings.extend(rule.evaluate(&changed_file.path, file_kind, &parsed));
             }
+            processed += 1;
+            on_file_processed(processed);
         }
 
         Ok(CheckResult {
