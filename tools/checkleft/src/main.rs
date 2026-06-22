@@ -54,6 +54,27 @@ struct RunArgs {
     show_progress: Option<bool>,
 }
 
+/// Arguments for `checkleft fix`.
+#[derive(Debug, Args, Clone)]
+struct FixArgs {
+    #[command(flatten)]
+    run_args: RunArgs,
+    /// Allow fixing files that have uncommitted modifications in the working
+    /// tree. When false, dirty files are excluded from the fixable set.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value = "true", value_name = "BOOL")]
+    allow_dirty: bool,
+    /// Re-run checks after applying fixes and report any remaining failures.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value = "true", value_name = "BOOL")]
+    verify: bool,
+    /// Maximum fix passes (re-apply fixes until stable or the cap is hit). Default: 1.
+    #[arg(long)]
+    max_passes: Option<u32>,
+    /// Restrict fixing to files under these paths (further intersects the
+    /// failing-file set; absent means all failing files are candidates).
+    #[arg(value_name = "PATHS")]
+    paths: Vec<PathBuf>,
+}
+
 /// Explicit log-level override (higher precedence than -v count and RUST_LOG).
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LogLevel {
@@ -109,6 +130,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run(RunArgs),
+    /// Apply fixes to files that are failing checks. Reuses `run`'s discovery
+    /// machinery to find failing files, then applies each check's declared fix
+    /// mechanism. Currently prints a dry plan (no files written).
+    Fix(FixArgs),
     List {
         #[command(flatten)]
         config: ConfigArgs,
@@ -202,6 +227,7 @@ async fn run_cli() -> Result<ExitCode> {
     match command {
         None => dispatch_run(default_run_args, &root, &vcs, &env).await,
         Some(Commands::Run(args)) => dispatch_run(args, &root, &vcs, &env).await,
+        Some(Commands::Fix(args)) => dispatch_fix(args, &root, &vcs, &env).await,
         Some(Commands::List {
             config,
             all,
@@ -473,6 +499,194 @@ async fn dispatch_run(
     let has_error = results
         .iter()
         .any(|result| result.findings.iter().any(|f| f.severity == Severity::Error));
+    Ok(if has_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Per-check slice of a fix plan: which files the fix phase would process.
+struct FixCheckPlan {
+    check_id: String,
+    /// Failing files (deduplicated, sorted) that would be passed to the fixer.
+    failing_files: Vec<PathBuf>,
+}
+
+/// Aggregated dry-run plan for `checkleft fix`: one entry per check with a
+/// non-empty failing-file set after optional PATHS filtering.
+struct FixPlan {
+    checks: Vec<FixCheckPlan>,
+}
+
+/// Compute the fix plan from a completed run's results.
+///
+/// For each check, the failing-file set is the distinct `finding.location.path`
+/// values whose severity is `Error` or `Warning` (Info findings are advisory
+/// and are not fixed). If `paths` is non-empty the set is further intersected
+/// with files that start with any of the given paths.
+fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf]) -> FixPlan {
+    use std::collections::BTreeSet;
+
+    let mut checks = Vec::new();
+    for result in results {
+        let failing: BTreeSet<PathBuf> = result
+            .findings
+            .iter()
+            .filter(|f| matches!(f.severity, Severity::Error | Severity::Warning))
+            .filter_map(|f| f.location.as_ref().map(|l| l.path.clone()))
+            .collect();
+
+        if failing.is_empty() {
+            continue;
+        }
+
+        let filtered: Vec<PathBuf> = if paths.is_empty() {
+            failing.into_iter().collect()
+        } else {
+            failing
+                .into_iter()
+                .filter(|file| paths.iter().any(|p| file.starts_with(p)))
+                .collect()
+        };
+
+        if !filtered.is_empty() {
+            checks.push(FixCheckPlan {
+                check_id: result.check_id.clone(),
+                failing_files: filtered,
+            });
+        }
+    }
+    FixPlan { checks }
+}
+
+fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
+    let total_files: usize = plan.checks.iter().map(|c| c.failing_files.len()).sum();
+
+    if plan.checks.is_empty() {
+        println!(
+            "{}: no fixable files found ({} checks ran in {}s)\n",
+            style.paint_info("fix"),
+            0,
+            elapsed.as_secs()
+        );
+        return;
+    }
+
+    println!(
+        "{}: DRY RUN — showing failing-file sets (no files written)\n",
+        style.paint_info("fix")
+    );
+
+    for check_plan in &plan.checks {
+        println!("  {}:", style.paint_check_id(&check_plan.check_id));
+        for file in &check_plan.failing_files {
+            println!("    {}", file.display());
+        }
+        println!();
+    }
+
+    println!(
+        "{}: {} check(s) with failing files, {} total file(s) in {}s\n",
+        style.paint_bold("summary"),
+        plan.checks.len(),
+        total_files,
+        elapsed.as_secs()
+    );
+}
+
+fn print_fix_dry_plan_json(plan: &FixPlan) -> Result<()> {
+    let output: Vec<serde_json::Value> = plan
+        .checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "check_id": c.check_id,
+                "failing_files": c.failing_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+async fn dispatch_fix(
+    FixArgs {
+        run_args:
+            RunArgs {
+                config,
+                all,
+                base_ref,
+                default_branch,
+                format,
+                show_progress,
+            },
+        allow_dirty: _, // TODO(T6): subtract dirty files when false
+        verify: _,      // TODO(T8): re-run checks after applying fixes
+        max_passes: _,  // TODO(T7): multi-pass convergence
+        paths,
+    }: FixArgs,
+    root: &Path,
+    vcs: &Vcs,
+    env: &CiEnvironment,
+) -> Result<ExitCode> {
+    let overrides = ChangeOverrides {
+        all,
+        base_ref,
+        default_branch,
+    };
+    info!("resolving change plan for fix");
+    let plan = resolve_change_plan(env, vcs, &overrides)?;
+    info!("building runner for fix");
+    let runner = build_runner(
+        root,
+        vcs,
+        base_revision_from_plan(vcs, &plan),
+        config.external_checks_file,
+        config.external_checks_url,
+    )
+    .await?;
+    info!("resolving changeset for fix");
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
+    info!(
+        changed_files = changeset.changed_files.len(),
+        "resolved changeset for fix"
+    );
+
+    let style = OutputStyle::detect_for_stdout();
+    let progress_enabled = matches!(format, OutputFormat::Human)
+        && should_show_progress(
+            show_progress,
+            style.level,
+            std::io::stdout().is_terminal(),
+            stderr().is_terminal(),
+            detect_ci(),
+        );
+    let mut live = progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE));
+    let reporter: Arc<dyn ProgressReporter> = match &live {
+        Some(progress) => progress.reporter(make_render_findings(style)),
+        None => Arc::new(NoopProgressReporter),
+    };
+
+    let run_started_at = Instant::now();
+    let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
+    let elapsed = run_started_at.elapsed();
+    sort_results_for_output(&mut results);
+
+    if let Some(mut progress) = live.take() {
+        progress.finalize();
+    }
+
+    let fix_plan = compute_fix_plan(&results, &paths);
+
+    match format {
+        OutputFormat::Human => print_fix_dry_plan(&fix_plan, style, elapsed),
+        OutputFormat::Json => print_fix_dry_plan_json(&fix_plan)?,
+    }
+
+    let has_error = results
+        .iter()
+        .any(|r| r.findings.iter().any(|f| f.severity == Severity::Error));
     Ok(if has_error {
         ExitCode::from(1)
     } else {
