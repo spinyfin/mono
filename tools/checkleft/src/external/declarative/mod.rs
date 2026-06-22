@@ -58,6 +58,7 @@ mod tests_lint_oxc;
 #[cfg(test)]
 mod parity_e2e;
 
+pub(crate) use executor::eligible_file_count;
 pub use executor::run_declarative_check;
 
 use selector::Selector;

@@ -146,6 +146,32 @@ fn normalize_finding_paths(findings: &mut [Finding], repo_root: &Path) {
     }
 }
 
+/// Count the files in `changeset` that the declarative check will actually process
+/// after applying the `applies_to` glob filter and any per-repo config override.
+/// Falls back to the full changeset size on glob-build errors.
+///
+/// Mirrors the first step of [`run_declarative_check`] so the runner can seed the
+/// progress reporter with the correct per-check eligible count before execution.
+pub(crate) fn eligible_file_count(
+    repo_root: &Path,
+    package: &ExternalCheckDeclarativePackage,
+    changeset: &ChangeSet,
+    config: &toml::Value,
+) -> usize {
+    // A malformed override causes run_declarative_check to fail; here we fall back to
+    // the full changeset size so the progress count is conservative and consistent with
+    // the "something went wrong" signal the runner will surface when the check runs.
+    let applies_to_override = match resolve::override_applies_to(config) {
+        Some(Ok(globs)) => Some(globs),
+        Some(Err(_)) => return changeset.changed_files.len(),
+        None => None,
+    };
+    let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
+    select_files(repo_root, changeset, applies_to, package.skip_symlinks)
+        .map(|f| f.len())
+        .unwrap_or_else(|_| changeset.changed_files.len())
+}
+
 /// Select non-deleted changed files matching any `applies_to` glob, sorted for
 /// determinism. When `skip_symlinks` is true, paths that are symlinks (resolved
 /// against `repo_root`) are excluded without following the link.

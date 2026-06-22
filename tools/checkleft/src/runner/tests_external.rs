@@ -905,3 +905,374 @@ severity = "warning"
         );
     }
 }
+
+// ── eligible file count progress reporter tests ─────────────────────────────
+
+/// Records `(check_id, registered_total)` for every `register()` call.
+#[derive(Default)]
+struct CapturingProgressReporter {
+    registered: Arc<Mutex<Vec<(String, usize)>>>,
+}
+
+impl crate::progress::ProgressReporter for CapturingProgressReporter {
+    fn register(&self, check_id: &str, total_files: usize) {
+        self.registered
+            .lock()
+            .expect("lock registered")
+            .push((check_id.to_owned(), total_files));
+    }
+    fn start(&self, _check_id: &str) {}
+    fn record_progress(&self, _check_id: &str, _processed: usize) {}
+    fn finish(&self, _check_id: &str, _files_failed: usize, _elapsed: std::time::Duration) {}
+    fn stream_findings(&self, _result: &crate::output::CheckResult) {}
+}
+
+/// A test executor that implements `eligible_file_count` properly for declarative
+/// packages (using the actual glob filter) and returns empty results for `execute`.
+struct DeclarativeEligibleCountExecutor {
+    root: std::path::PathBuf,
+}
+
+impl ExternalCheckExecutor for DeclarativeEligibleCountExecutor {
+    fn execute(
+        &self,
+        package: &ExternalCheckPackage,
+        _changeset: &ChangeSet,
+        _source_tree: &dyn crate::input::SourceTree,
+        _config: &toml::Value,
+        _config_dir: &std::path::Path,
+        _effective_severity: Option<crate::output::Severity>,
+    ) -> anyhow::Result<crate::output::CheckResult> {
+        Ok(crate::output::CheckResult {
+            check_id: package.id.clone(),
+            findings: vec![],
+        })
+    }
+
+    fn eligible_file_count(
+        &self,
+        package: &ExternalCheckPackage,
+        changeset: &ChangeSet,
+        config: &toml::Value,
+    ) -> usize {
+        match &package.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => {
+                crate::external::declarative::eligible_file_count(&self.root, d, changeset, config)
+            }
+            _ => changeset.changed_files.len(),
+        }
+    }
+}
+
+fn rs_only_declarative_package(check_id: &str) -> ExternalCheckPackage {
+    let manifest = format!(
+        r#"
+id = "{check_id}"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[needs.tool.default]
+path = "rustfmt"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    );
+    parse_external_check_package_manifest(&manifest).expect("valid declarative manifest")
+}
+
+fn bazel_only_declarative_package(check_id: &str) -> ExternalCheckPackage {
+    let manifest = format!(
+        r#"
+id = "{check_id}"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/BUILD", "**/*.bzl", "**/BUILD.bazel"]
+
+[needs.tool.default]
+path = "buildifier"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    );
+    parse_external_check_package_manifest(&manifest).expect("valid declarative manifest")
+}
+
+fn js_only_declarative_package(check_id: &str) -> ExternalCheckPackage {
+    let manifest = format!(
+        r#"
+id = "{check_id}"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.js", "**/*.ts"]
+
+[needs.eslint.default]
+path = "eslint"
+
+[[invocations]]
+id = "run"
+run = "eslint"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    );
+    parse_external_check_package_manifest(&manifest).expect("valid declarative manifest")
+}
+
+/// Run `run_changeset_with_progress` with three declarative checks (rs-only,
+/// bazel-only, js-only) against a mixed-file changeset. Verifies that the
+/// progress reporter `register()` is called with the per-check eligible count
+/// (post-applies_to filtering), not the global file count.
+#[tokio::test]
+async fn runner_registers_eligible_file_count_per_declarative_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    // Write a CHECKS config that wires all three declarative checks.
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/rust"
+check = "format/rust"
+implementation = "generated:format/rust"
+
+[[checks]]
+id = "format/bazel"
+check = "format/bazel"
+implementation = "generated:format/bazel"
+
+[[checks]]
+id = "lint/js"
+check = "lint/js"
+implementation = "generated:lint/js"
+"#,
+    )
+    .expect("write config");
+
+    // Mixed changeset: 2 .rs, 2 bazel, 1 .ts, 3 other files → 8 total.
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: std::path::Path::new("src/main.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("src/lib.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("BUILD").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("tools/defs.bzl").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("src/app.ts").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("README.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("config.json").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::Path::new("Makefile").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    // Provider returns each package by check id.
+    let rust_pkg = rs_only_declarative_package("format/rust");
+    let bazel_pkg = bazel_only_declarative_package("format/bazel");
+    let js_pkg = js_only_declarative_package("lint/js");
+
+    // Provider resolves by check id (not implementation ref). The CHECKS.toml has
+    // `check = "format/rust"` / `implementation = "generated:format/rust"`, so the
+    // provider is asked for the generated ref — match by the id suffix.
+    struct ByCheckIdProvider {
+        rust: ExternalCheckPackage,
+        bazel: ExternalCheckPackage,
+        js: ExternalCheckPackage,
+    }
+    impl ExternalCheckPackageProvider for ByCheckIdProvider {
+        fn resolve(
+            &self,
+            impl_ref: &crate::external::ExternalCheckImplementationRef,
+        ) -> anyhow::Result<Option<ExternalCheckPackage>> {
+            let key = impl_ref.to_string();
+            if key.contains("format/rust") {
+                Ok(Some(self.rust.clone()))
+            } else if key.contains("format/bazel") {
+                Ok(Some(self.bazel.clone()))
+            } else if key.contains("lint/js") {
+                Ok(Some(self.js.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let provider = Arc::new(ByCheckIdProvider {
+        rust: rust_pkg,
+        bazel: bazel_pkg,
+        js: js_pkg,
+    });
+    let executor = Arc::new(DeclarativeEligibleCountExecutor {
+        root: temp.path().to_path_buf(),
+    });
+
+    let runner = Runner::with_external(
+        Arc::new(crate::check::CheckRegistry::new()),
+        Arc::new(crate::config::ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(crate::source_tree::LocalSourceTree::new(temp.path()).expect("tree")),
+        provider,
+        executor,
+    );
+
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    let reporter = Arc::new(CapturingProgressReporter {
+        registered: Arc::clone(&registered),
+    });
+
+    runner
+        .run_changeset_with_progress(&changeset, reporter)
+        .await
+        .expect("run checks");
+
+    let registered = registered.lock().expect("lock registered").clone();
+    let reg_map: std::collections::HashMap<String, usize> = registered.into_iter().collect();
+
+    assert_eq!(
+        reg_map.get("format/rust").copied(),
+        Some(2),
+        "format/rust must register 2 (only .rs files), got: {reg_map:?}"
+    );
+    assert_eq!(
+        reg_map.get("format/bazel").copied(),
+        Some(2),
+        "format/bazel must register 2 (BUILD + .bzl), got: {reg_map:?}"
+    );
+    assert_eq!(
+        reg_map.get("lint/js").copied(),
+        Some(1),
+        "lint/js must register 1 (.ts file), got: {reg_map:?}"
+    );
+}
+
+/// `repo-visibility` is a built-in check that skips non-BUILD files.
+/// Its `applicable_file_count()` must report only BUILD files, not the global
+/// changeset size, so the progress UI shows the accurate eligible count.
+#[tokio::test]
+async fn runner_registers_eligible_file_count_for_builtin_filtering_check() {
+    let temp = tempdir().expect("create temp dir");
+
+    // Wire the built-in repo-visibility check; no `implementation` field needed.
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "repo-visibility"
+"#,
+    )
+    .expect("write config");
+
+    // Mixed changeset: 2 BUILD files + 3 non-BUILD files → 5 total, 2 applicable.
+    fs::create_dir_all(temp.path().join("src")).expect("create src dir");
+    fs::create_dir_all(temp.path().join("tools")).expect("create tools dir");
+    fs::write(temp.path().join("src/BUILD"), "").expect("write BUILD");
+    fs::write(temp.path().join("tools/BUILD.bazel"), "").expect("write BUILD.bazel");
+    fs::write(temp.path().join("src/main.rs"), "fn main() {}").expect("write rs");
+    fs::write(temp.path().join("README.md"), "# readme").expect("write md");
+    fs::write(temp.path().join("Makefile"), "all:").expect("write makefile");
+
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: Path::new("src/BUILD").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("tools/BUILD.bazel").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("src/main.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("README.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("Makefile").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register checks");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    let reporter = Arc::new(CapturingProgressReporter {
+        registered: Arc::clone(&registered),
+    });
+
+    runner
+        .run_changeset_with_progress(&changeset, reporter)
+        .await
+        .expect("run checks");
+
+    let registered = registered.lock().expect("lock registered").clone();
+    let reg_map: std::collections::HashMap<String, usize> = registered.into_iter().collect();
+
+    assert_eq!(
+        reg_map.get("repo-visibility").copied(),
+        Some(2),
+        "repo-visibility must register 2 (only BUILD files in changeset), got: {reg_map:?}"
+    );
+}

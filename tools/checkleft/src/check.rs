@@ -13,6 +13,15 @@ use crate::output::CheckResult;
 pub trait ConfiguredCheck: Send + Sync {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult>;
 
+    /// Count the files in `changeset` that this check will actually process.
+    ///
+    /// The default returns the full changeset size, which is correct for checks that
+    /// iterate over every file. Override in checks that filter by extension or change
+    /// kind so the progress UI reports the accurate eligible count.
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset.changed_files.len()
+    }
+
     /// Exclusions this configured check honors that are eligible for stale-exclusion
     /// auditing (see [`crate::exclusion`]). Each carries the inputs it depends on;
     /// checkleft re-evaluates an exclusion only when one of those inputs changes in the
