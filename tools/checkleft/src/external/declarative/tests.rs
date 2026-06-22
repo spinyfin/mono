@@ -2619,3 +2619,104 @@ fn per_file_single_exit2_does_not_hide_other_files_findings() {
         result.findings
     );
 }
+
+// ── eligible_file_count ──────────────────────────────────────────────────────
+
+fn make_changeset(paths: &[&str]) -> ChangeSet {
+    ChangeSet::new(
+        paths
+            .iter()
+            .map(|p| ChangedFile {
+                path: Path::new(p).to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            })
+            .collect(),
+    )
+}
+
+fn declarative_package_with_applies_to(applies_to: &[&str]) -> ExternalCheckDeclarativePackage {
+    let applies_to_yaml = applies_to
+        .iter()
+        .map(|p| format!("  - \"{p}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let manifest = format!(
+        r#"id: test-check
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+{applies_to_yaml}
+needs:
+  tool:
+    default:
+      path: "check-tool"
+invocations:
+  - id: run
+    run: tool
+    mode: batch
+    args: ["{{{{files}}}}"]
+    exit:
+      "0": ok
+      default: error
+    transform:
+      kind: passthrough
+"#
+    );
+    let pkg = crate::external::parse_declarative_check_manifest(&manifest).expect("valid manifest");
+    match pkg.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        _ => panic!("expected declarative"),
+    }
+}
+
+#[test]
+fn eligible_file_count_filters_by_applies_to_glob() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pkg = declarative_package_with_applies_to(&["**/*.rs"]);
+    let changeset = make_changeset(&["a.rs", "b.rs", "c.ts", "BUILD", "d.rs"]);
+    let config = toml::Value::Table(toml::map::Map::new());
+
+    let count = super::executor::eligible_file_count(temp.path(), &pkg, &changeset, &config);
+    assert_eq!(count, 3, "only .rs files should be counted; got {count}");
+}
+
+#[test]
+fn eligible_file_count_multi_glob_union() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pkg = declarative_package_with_applies_to(&["**/BUILD", "**/*.bzl", "**/BUILD.bazel"]);
+    let changeset = make_changeset(&[
+        "src/main.rs",
+        "BUILD",
+        "tools/defs.bzl",
+        "package/BUILD.bazel",
+        "README.md",
+    ]);
+    let config = toml::Value::Table(toml::map::Map::new());
+
+    let count = super::executor::eligible_file_count(temp.path(), &pkg, &changeset, &config);
+    assert_eq!(count, 3, "BUILD + .bzl + BUILD.bazel only; got {count}");
+}
+
+#[test]
+fn eligible_file_count_all_files_check_returns_full_count() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pkg = declarative_package_with_applies_to(&["**/*"]);
+    let changeset = make_changeset(&["a.rs", "b.ts", "c.md", "BUILD"]);
+    let config = toml::Value::Table(toml::map::Map::new());
+
+    let count = super::executor::eligible_file_count(temp.path(), &pkg, &changeset, &config);
+    assert_eq!(count, 4, "all-files check must return the full count; got {count}");
+}
+
+#[test]
+fn eligible_file_count_no_matching_files_returns_zero() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pkg = declarative_package_with_applies_to(&["**/*.java"]);
+    let changeset = make_changeset(&["a.rs", "b.ts", "BUILD"]);
+    let config = toml::Value::Table(toml::map::Map::new());
+
+    let count = super::executor::eligible_file_count(temp.path(), &pkg, &changeset, &config);
+    assert_eq!(count, 0, "no .java files; got {count}");
+}

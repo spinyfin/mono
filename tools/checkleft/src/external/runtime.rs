@@ -211,6 +211,22 @@ pub trait ExternalCheckExecutor: Send + Sync {
         effective_severity: Option<Severity>,
     ) -> Result<CheckResult>;
 
+    /// Count the files in `changeset` that this check will actually process after
+    /// applicability filtering. Used to seed the progress reporter with the correct
+    /// per-check eligible count before execution begins.
+    ///
+    /// The default returns the full changeset size, which is correct for component
+    /// checks (they receive the entire changeset). Declarative checks override this
+    /// to apply their `applies_to` glob filter.
+    fn eligible_file_count(
+        &self,
+        _package: &ExternalCheckPackage,
+        changeset: &ChangeSet,
+        _config: &toml::Value,
+    ) -> usize {
+        changeset.changed_files.len()
+    }
+
     /// Return the declared exclusions for a component check. `config_dir` is the
     /// directory of the CHECKS file (repo-root-relative), used to resolve any
     /// config-file-relative paths in the returned `depends_on` lists.
@@ -505,6 +521,20 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                     effective_severity,
                 )
             }
+        }
+    }
+
+    fn eligible_file_count(
+        &self,
+        package: &ExternalCheckPackage,
+        changeset: &ChangeSet,
+        config: &toml::Value,
+    ) -> usize {
+        match &package.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => {
+                super::declarative::eligible_file_count(&self.root, d, changeset, config)
+            }
+            ExternalCheckPackageImplementation::Component(_) => changeset.changed_files.len(),
         }
     }
 

@@ -164,7 +164,7 @@ impl Runner {
                     let run_changeset = run.changeset;
                     let run_policy = run.policy;
                     let source_path = run.source_path;
-                    let file_count = run_changeset.changed_files.len();
+                    let file_count = check.applicable_file_count(&run_changeset);
                     info!(
                         check_id = %configured_check_id,
                         file_count,
@@ -236,7 +236,9 @@ impl Runner {
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new(""))
                         .to_path_buf();
-                    let file_count = run_changeset.changed_files.len();
+                    let file_count = self
+                        .external_executor
+                        .eligible_file_count(&package, &run_changeset, &run_config);
                     info!(
                         check_id = %configured_check_id,
                         package_id = %package.id,
