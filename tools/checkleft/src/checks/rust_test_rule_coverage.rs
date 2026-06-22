@@ -29,9 +29,22 @@ impl Check for RustTestRuleCoverageCheck {
 #[async_trait]
 impl ConfiguredCheck for RustTestRuleCoverageCheck {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
+    }
+
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let mut findings = Vec::new();
+        let mut processed = 0usize;
 
         for changed_file in &changeset.changed_files {
+            processed += 1;
+            on_file_processed(processed);
+
             if !matches!(changed_file.kind, ChangeKind::Added) {
                 continue;
             }

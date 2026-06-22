@@ -2720,3 +2720,176 @@ fn eligible_file_count_no_matching_files_returns_zero() {
     let count = super::executor::eligible_file_count(temp.path(), &pkg, &changeset, &config);
     assert_eq!(count, 0, "no .java files; got {count}");
 }
+
+// ── progress tick tests ──────────────────────────────────────────────────────
+
+/// Build a per_file declarative manifest whose tool just exits 0 (no findings).
+#[cfg(unix)]
+fn per_file_noop_package(tool_path: &std::path::Path) -> ExternalCheckDeclarativePackage {
+    let manifest = format!(
+        r#"
+id = "test/per-file-progress"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.ts"]
+
+[needs.tool.default]
+path = "{tool}"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "per_file"
+args = ["{{{{file}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "hit"
+"#,
+        tool = tool_path.display()
+    );
+    let pkg = crate::external::parse_external_check_package_manifest(&manifest).expect("valid manifest");
+    match pkg.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        _ => panic!("expected declarative"),
+    }
+}
+
+/// Build a batch declarative manifest whose tool just exits 0 (no findings).
+#[cfg(unix)]
+fn batch_noop_package(tool_path: &std::path::Path) -> ExternalCheckDeclarativePackage {
+    let manifest = format!(
+        r#"
+id = "test/batch-progress"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.ts"]
+
+[needs.tool.default]
+path = "{tool}"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "hit"
+"#,
+        tool = tool_path.display()
+    );
+    let pkg = crate::external::parse_external_check_package_manifest(&manifest).expect("valid manifest");
+    match pkg.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        _ => panic!("expected declarative"),
+    }
+}
+
+/// per_file check over N eligible files → processed count goes 0 → 1 → 2 → N.
+#[cfg(unix)]
+#[test]
+fn per_file_progress_emits_one_tick_per_file() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    let repo_root = tempfile::tempdir().expect("temp dir");
+
+    let script = repo_root.path().join("noop.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+
+    for f in ["a.ts", "b.ts", "c.ts"] {
+        std::fs::write(repo_root.path().join(f), "").expect("write file");
+    }
+
+    let package = per_file_noop_package(&script);
+    let changeset = make_changeset(&["a.ts", "b.ts", "c.ts"]);
+    let config = toml::Value::Table(Default::default());
+
+    let ticks: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let ticks_clone = Arc::clone(&ticks);
+    let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+        ticks_clone.lock().unwrap().push(n);
+    });
+
+    super::run_declarative_check_with_progress(
+        repo_root.path(),
+        "test/per-file-progress",
+        &package,
+        &changeset,
+        &config,
+        None,
+        on_file_processed,
+    )
+    .expect("check must succeed");
+
+    let ticks = ticks.lock().unwrap().clone();
+    assert_eq!(
+        ticks,
+        vec![1, 2, 3],
+        "per_file must emit one cumulative tick per file; got {ticks:?}"
+    );
+}
+
+/// batch check: all eligible files go into one chunk → one tick equal to N.
+#[cfg(unix)]
+#[test]
+fn batch_progress_emits_one_tick_per_chunk() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    let repo_root = tempfile::tempdir().expect("temp dir");
+
+    let script = repo_root.path().join("noop.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+
+    for f in ["a.ts", "b.ts", "c.ts"] {
+        std::fs::write(repo_root.path().join(f), "").expect("write file");
+    }
+
+    let package = batch_noop_package(&script);
+    let changeset = make_changeset(&["a.ts", "b.ts", "c.ts"]);
+    let config = toml::Value::Table(Default::default());
+
+    let ticks: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let ticks_clone = Arc::clone(&ticks);
+    let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+        ticks_clone.lock().unwrap().push(n);
+    });
+
+    super::run_declarative_check_with_progress(
+        repo_root.path(),
+        "test/batch-progress",
+        &package,
+        &changeset,
+        &config,
+        None,
+        on_file_processed,
+    )
+    .expect("check must succeed");
+
+    let ticks = ticks.lock().unwrap().clone();
+    // 3 short paths fit in one chunk, so one tick equal to 3 is emitted.
+    assert!(!ticks.is_empty(), "batch must emit at least one tick; got none");
+    assert_eq!(
+        *ticks.last().unwrap(),
+        3,
+        "final tick must equal total eligible files; got {ticks:?}"
+    );
+    // Numerator must never exceed denominator (3 eligible files).
+    assert!(
+        ticks.iter().all(|&n| n <= 3),
+        "numerator must never exceed denominator (3); got {ticks:?}"
+    );
+}

@@ -35,6 +35,15 @@ impl Check for BazelrcPoliciesCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelrcPoliciesConfig {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
+    }
+
+    async fn run_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
         let changed_paths: HashSet<PathBuf> = changeset
             .changed_files
             .iter()
@@ -43,6 +52,7 @@ impl ConfiguredCheck for CompiledBazelrcPoliciesConfig {
             .collect();
 
         let mut findings = Vec::new();
+        let mut processed = 0usize;
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
@@ -52,12 +62,16 @@ impl ConfiguredCheck for CompiledBazelrcPoliciesConfig {
             }
 
             let Ok(parsed) = parse_bazelrc_closure(&changed_file.path, tree) else {
+                processed += 1;
+                on_file_processed(processed);
                 continue;
             };
 
             for rule in &self.rules {
                 findings.extend(rule.evaluate(&changed_file.path, &parsed, &changed_paths));
             }
+            processed += 1;
+            on_file_processed(processed);
         }
 
         Ok(CheckResult {

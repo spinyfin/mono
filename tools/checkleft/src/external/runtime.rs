@@ -17,10 +17,11 @@ use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, Suggeste
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
+use super::declarative::{run_declarative_check, run_declarative_check_with_progress};
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, run_declarative_check,
+    ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
 
 mod cwasm_cache;
@@ -210,6 +211,25 @@ pub trait ExternalCheckExecutor: Send + Sync {
         config_dir: &Path,
         effective_severity: Option<Severity>,
     ) -> Result<CheckResult>;
+
+    /// Like [`Self::execute`] but accepts a progress callback that is called
+    /// with the cumulative count of files processed after each file (per-file
+    /// mode) or each chunk (batch mode). The default ignores the callback and
+    /// delegates to [`Self::execute`]; override in executors that run
+    /// declarative checks to provide live per-file/per-batch progress.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_progress(
+        &self,
+        package: &ExternalCheckPackage,
+        changeset: &ChangeSet,
+        source_tree: &dyn SourceTree,
+        config: &toml::Value,
+        config_dir: &Path,
+        effective_severity: Option<Severity>,
+        _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
+        self.execute(package, changeset, source_tree, config, config_dir, effective_severity)
+    }
 
     /// Count the files in `changeset` that this check will actually process after
     /// applicability filtering. Used to seed the progress reporter with the correct
@@ -519,6 +539,43 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                     changeset,
                     config,
                     effective_severity,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_progress(
+        &self,
+        package: &ExternalCheckPackage,
+        changeset: &ChangeSet,
+        source_tree: &dyn SourceTree,
+        config: &toml::Value,
+        config_dir: &Path,
+        effective_severity: Option<Severity>,
+        on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> Result<CheckResult> {
+        match &package.implementation {
+            ExternalCheckPackageImplementation::Component(component) => {
+                // Component checks are opaque wasm calls — no per-file granularity.
+                self.execute_component_check(package, component, changeset, source_tree, config, config_dir)
+            }
+            ExternalCheckPackageImplementation::Declarative(declarative) => {
+                if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
+                    bail!(
+                        "unsupported external runtime `{}` for declarative package `{}`",
+                        package.runtime,
+                        package.id
+                    );
+                }
+                run_declarative_check_with_progress(
+                    &self.root,
+                    &package.id,
+                    declarative,
+                    changeset,
+                    config,
+                    effective_severity,
+                    on_file_processed,
                 )
             }
         }
