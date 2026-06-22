@@ -1,0 +1,112 @@
+id: lint/oxc
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+# oxlint's scope: the JS/TS family plus the framework single-file-component
+# wrappers whose embedded <script> oxlint extracts and lints out of the box
+# (confirmed against the pinned oxlint 1.70.0 — a `debugger` inside the <script>
+# of .vue / .svelte / .astro is reported with no extra plugin flag). oxlint is a
+# JS/TS linter only: there is no markdown/css/yaml linting, so those are NOT in
+# scope (that is the formatter's job — see format/oxc).
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,astro}"
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions oxlint via `npx --yes oxlint@<version>`,
+#     pinned here to 1.70.0. The version is part of the package spec, so npx
+#     fetches and runs exactly that release regardless of any globally-installed
+#     copy — a reproducible tool without a parallel Bazel JS toolchain (mono has
+#     no rules_js/node Bazel integration today; Node arrives on PATH via the CI
+#     bootstrap). oxlint is distributed as the standalone `oxlint` npm package
+#     with an `oxlint` binary. Re-pin per-repo via CHECKS config, setting only the
+#     version (the package is inherited from this default `npm` binding):
+#
+#       checks:
+#         - id: lint/oxc
+#           config:
+#             needs:
+#               oxlint:
+#                 npm:
+#                   version: "1.71.0"
+#
+#     NOTE: 1.70.0 is the latest stable at authoring time; an operator-confirmed
+#     pin is pending. oxlint is 1.x/stable (unlike oxfmt), so the JSON reporter
+#     shape used by the transform below is reliable across patch releases.
+#
+#   - fallback: when `npx` is not on PATH, the framework uses `oxlint` from PATH
+#     and warns loudly on stderr so you know the pinned toolchain was skipped.
+#
+# Config — oxlint is zero-config by design (like lint/biome, UNLIKE lint/js):
+# it ships a built-in default rule set (the `correctness` category) and
+# auto-discovers the repo's own `.oxlintrc.json` / nested configs (invocations
+# run with cwd = repo root) to refine it. So lint/oxc needs NO config key: with
+# no `.oxlintrc.json` it lints with oxlint's defaults; with one present it is
+# picked up automatically. (ESLint 9+ has no built-in defaults and so forces
+# lint/js to make `config_file` mandatory — oxlint does not.)
+needs:
+  oxlint:
+    default:
+      npm:
+        package: "oxlint"
+        version: "1.70.0"
+    fallback:
+      path: "oxlint"
+
+invocations:
+  - id: lint
+    run: oxlint
+    mode: batch
+    args:
+      # Machine-readable JSON on stdout so the json transform can parse the
+      # diagnostics. oxlint's `json` format emits {"diagnostics":[...]} plus a
+      # trailing summary object the selector ignores.
+      - "--format=json"
+      # If every passed file is excluded by an ignore file/pattern, exit 0 with a
+      # clean (empty-diagnostics) JSON document instead of exit 1 with a
+      # non-JSON "No files found to lint" preamble that would break JSON parsing.
+      # The analogue of prettier's --ignore-unknown / biome's
+      # --files-ignore-unknown: an all-ignored set is a no-op, not an error.
+      - "--no-error-on-unmatched-pattern"
+      - "{{files}}"
+    # oxlint exit codes:
+    #   0 = no error-level diagnostics (clean, OR warning/info-only) — run the
+    #       transform so warning/info findings are still surfaced; an empty
+    #       diagnostics array yields zero findings.
+    #   1 = at least one error-level diagnostic — run the transform. (A genuine
+    #       operational error, e.g. an unparseable config, also exits 1 but
+    #       writes a non-JSON message to stdout, so the json transform fails to
+    #       parse and the error is surfaced rather than masked as clean.)
+    #   anything else (crash, signal) = error, so it never masquerades as clean.
+    exit:
+      "0": findings
+      "1": findings
+      default: error
+    transform:
+      kind: json
+      # oxlint's json reporter emits {"diagnostics":[{message, code, severity,
+      # filename, labels:[{span:{line,column}}], ...}]}. Project one finding per
+      # diagnostic, hoisting the filename and the PRIMARY label's 1-based
+      # line/column (the first label is the offending span; later labels are
+      # secondary "first defined here"-style notes, so we must NOT flatten them
+      # or one violation would yield multiple findings). Map oxlint's severity
+      # strings to checkleft's error/warning/info and prefix the message with the
+      # rule code (e.g. `eslint(no-debugger)`). Guards: parse errors carry no
+      # `code` (fall back to "oxlint"); a diagnostic without a labelled span
+      # falls back to line/column 1 so the template never renders a null number.
+      select: >-
+        .diagnostics[] | select(.filename != null) |
+        {path: .filename,
+         line: (((((.labels // [])[0]) // {}).span // {}).line // 1),
+         column: (((((.labels // [])[0]) // {}).span // {}).column // 1),
+         sev: (if .severity == "error" then "error"
+               elif .severity == "warning" then "warning"
+               else "info" end),
+         msg: ((.code // "oxlint") + ": " + .message)}
+      finding:
+        path: "{{item.path}}"
+        line: "{{item.line}}"
+        column: "{{item.column}}"
+        message: "{{item.msg}}"
+        severity: "{{item.sev}}"
+        remediations:
+          - "Fix the oxlint violation, or suppress it with a justified `// oxlint-disable-next-line <rule>` comment."

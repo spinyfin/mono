@@ -48,6 +48,12 @@ mod tests_format_biome;
 #[cfg(test)]
 mod tests_lint_biome;
 
+#[cfg(test)]
+mod tests_format_oxc;
+
+#[cfg(test)]
+mod tests_lint_oxc;
+
 /// Hermetic end-to-end parity test against a real (runfiles-staged) buildifier.
 #[cfg(test)]
 mod parity_e2e;
