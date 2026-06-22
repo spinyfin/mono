@@ -23,6 +23,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+// On Linux, use the POSIX close() function directly (without Rust IO Safety
+// wrappers) to close arbitrary fds between fork and exec.  Every Rust binary
+// on Linux implicitly links against glibc/musl which export close(), so no
+// crate dependency is needed.  This avoids the abort-on-EBADF behaviour of
+// Rust 2024's OwnedFd::drop while still reaching close() without libc crate.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -739,16 +750,41 @@ struct InvocationOutput {
 }
 
 fn spawn(repo_root: &Path, binary: &Path, args: &[String], invocation_id: &str) -> Result<InvocationOutput> {
-    let output = Command::new(binary)
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to spawn declarative invocation `{invocation_id}` binary `{}`",
-                binary.display()
-            )
-        })?;
+    let mut command = Command::new(binary);
+    command.args(args).current_dir(repo_root);
+
+    // On Linux, fork() inherits every open file descriptor from the parent.
+    // O_CLOEXEC fds are closed at exec time, but between fork and exec the
+    // child still holds them.  A concurrent thread writing a script file and
+    // then calling exec can hit ETXTBSY if another thread's fork-but-not-yet-
+    // exec'd child holds a write fd on that same file.
+    //
+    // Close all fds > 2 in the child right after fork so the window shrinks to
+    // zero.  We call the raw C close() (linked from glibc/musl; always present)
+    // rather than going through Rust's OwnedFd/File wrappers, which abort on
+    // EBADF in the 2024 edition.  A close() on a non-existent fd returns EBADF;
+    // we ignore that — it just means the fd wasn't open, which is fine.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: Runs between fork and exec in the child.  close() is
+        // async-signal-safe.  The raw extern "C" call bypasses Rust IO Safety.
+        unsafe {
+            command.pre_exec(|| {
+                for fd in 3..1024i32 {
+                    close(fd); // EBADF for non-existent fds — ignored
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let output = command.output().with_context(|| {
+        format!(
+            "failed to spawn declarative invocation `{invocation_id}` binary `{}`",
+            binary.display()
+        )
+    })?;
     Ok(InvocationOutput {
         stdout: output.stdout,
         stderr: output.stderr,
@@ -816,8 +852,11 @@ pub struct FixInvocationOutcome {
     /// exit. Empty in batch mode and when all per-file runs succeed.
     pub per_file_errors: Vec<(PathBuf, String)>,
     /// Invocation-level error: binary resolution failure, spawn error, batch
-    /// fixer error exit, sandbox staging failure, or copy-back I/O error.
-    /// When set, `applied` is always empty and the real tree is untouched.
+    /// fixer error exit, or sandbox staging failure. On copy-back I/O error,
+    /// this is also set — but `applied` may be non-empty in that case: those
+    /// files were already atomically written to the real working tree before
+    /// copy-back stopped. For all other error kinds, `applied` is empty and
+    /// the real tree is untouched.
     pub error: Option<anyhow::Error>,
 }
 
@@ -829,8 +868,8 @@ pub struct FixInvocationOutcome {
 /// the sandbox are copied back, via a same-directory temp + atomic rename.
 ///
 /// `fixable_files` are repo-relative paths; files absent from `source_tree` are
-/// silently dropped by staging. Only files that match the invocation's
-/// `applies_to` filter are staged and passed to the fixer.
+/// silently dropped by staging. Only files that match the package's `applies_to`
+/// globs (or the per-repo config override) are staged and passed to the fixer.
 ///
 /// Invocations without a `fix` block are silently skipped. `bazel_aspect`
 /// invocations likewise (they cannot declare a fix block by schema).
@@ -890,7 +929,7 @@ pub fn run_declarative_fix(
         };
         let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
 
-        // Intersect fixable_files with this invocation's applies_to globs.
+        // Intersect fixable_files with the package's applies_to globs (or the config override).
         let filtered = match filter_by_applies_to(fixable_files, applies_to) {
             Ok(f) => f,
             Err(err) => {
@@ -998,6 +1037,15 @@ pub fn run_declarative_fix(
 /// Run a batch fix invocation: one process over all staged files (chunked when
 /// necessary to stay under ARG_MAX). Any chunk error aborts the entire invocation
 /// — the sandbox is dropped without copy-back, leaving the real tree untouched.
+///
+/// # cwd and config-file discovery
+///
+/// The fixer runs with `cwd = sandbox_root`. Config-discovering tools (biome,
+/// prettier, eslint, rustfmt) walk up from cwd to find their config files, but
+/// only the fixable files — not repo-root config files — are staged. A formatter
+/// fix block will therefore run with DEFAULT config and may write mis-formatted
+/// bytes back to the real tree. Until fix blocks stage config files alongside
+/// fixable files, formatter fix args must pass `--config {{repo_root}}/...` explicitly.
 #[allow(clippy::too_many_arguments)]
 fn execute_fix_batch(
     sandbox_root: &Path,
@@ -1062,6 +1110,12 @@ fn execute_fix_batch(
 /// isolated per file (one file's error does not abort the others). After all
 /// per-file runs, only the files whose fixer succeeded AND whose content changed
 /// are copied back.
+///
+/// # cwd and config-file discovery
+///
+/// See the note on [`execute_fix_batch`]: the same cwd=sandbox/config-discovery
+/// concern applies here. Formatter fix args must pass config explicitly via
+/// `--config {{repo_root}}/...` until sandbox staging includes config files.
 #[allow(clippy::too_many_arguments)]
 fn execute_fix_per_file(
     sandbox_root: &Path,
@@ -1131,4 +1185,242 @@ fn filter_by_applies_to(files: &[PathBuf], applies_to: &[String]) -> Result<Vec<
     }
     let globset = builder.build().context("failed to build applies_to glob set")?;
     Ok(files.iter().filter(|p| globset.is_match(p)).cloned().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::{TempDir, tempdir};
+
+    use super::{execute_fix_batch, execute_fix_per_file};
+    use crate::external::declarative::FixBlock;
+    use crate::external::sandbox::HostCeiling;
+    use crate::fix::safety::WritableSandbox;
+    use crate::source_tree::LocalSourceTree;
+
+    fn paths(p: &[&str]) -> Vec<PathBuf> {
+        p.iter().map(PathBuf::from).collect()
+    }
+
+    fn disk_tree(entries: &[(&str, &[u8])]) -> (TempDir, LocalSourceTree) {
+        let dir = tempdir().expect("temp dir");
+        for (path, content) in entries {
+            let full = dir.path().join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("create dirs");
+            }
+            fs::write(&full, content).expect("write file");
+        }
+        let tree = LocalSourceTree::new(dir.path()).expect("create tree");
+        (dir, tree)
+    }
+
+    /// Parse a minimal manifest to obtain a [`FixBlock`] with standard exit
+    /// semantics (0 = ok, else = error) for the given `mode` and `args`.
+    fn make_fix_block(mode_str: &str, args: &[&str]) -> FixBlock {
+        use crate::external::{ExternalCheckPackageImplementation, parse_declarative_check_manifest};
+        let args_yaml = args
+            .iter()
+            .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The check invocation uses batch/{{files}} regardless; only the fix block's
+        // mode and args matter for our executor tests.
+        let yaml = format!(
+            r#"
+id: test/fix
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**"]
+needs:
+  bin:
+    default:
+      path: /bin/true
+invocations:
+  - id: inv
+    run: bin
+    mode: batch
+    args: ["{{{{files}}}}"]
+    exit:
+      "0": ok
+      default: error
+    transform:
+      kind: linelist
+      message: "x"
+    fix:
+      mode: {mode_str}
+      args: [{args_yaml}]
+"#
+        );
+        let pkg = parse_declarative_check_manifest(&yaml).expect("parse test fix manifest");
+        match pkg.implementation {
+            ExternalCheckPackageImplementation::Declarative(d) => {
+                d.invocations[0].fix.clone().expect("fix block present")
+            }
+            _ => panic!("expected declarative"),
+        }
+    }
+
+    /// Create an executable shell script at `dir/name` and return its path.
+    #[cfg(unix)]
+    fn make_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+        path
+    }
+
+    /// Per-file mode: when file A succeeds (with a change) and file B errors,
+    /// only A is copied back to the real tree; B stays at its original bytes.
+    #[cfg(unix)]
+    #[test]
+    fn per_file_ok_and_error_isolates() {
+        let (dir, tree) = disk_tree(&[("a.txt", b"before"), ("b.txt", b"before")]);
+        let scripts_dir = tempdir().expect("scripts dir");
+        // Rewrites the file to "FIXED" then exits 0 for a.txt, 1 for b.txt.
+        let script = make_script(
+            scripts_dir.path(),
+            "fixer.sh",
+            r#"printf 'FIXED' > "$1"
+case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
+        );
+
+        let ceiling = HostCeiling::new(dir.path());
+        let sandbox = WritableSandbox::stage(&paths(&["a.txt", "b.txt"]), &tree, &ceiling).expect("stage");
+        let staged: Vec<String> = sandbox
+            .staged_paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let fix = make_fix_block("per_file", &["{{file}}"]);
+
+        let outcome = execute_fix_per_file(
+            sandbox.root_path(),
+            dir.path(),
+            &script,
+            &[],
+            &fix,
+            &staged,
+            &BTreeMap::new(),
+            "inv",
+            &sandbox,
+        )
+        .expect("execute");
+
+        assert_eq!(
+            outcome.applied,
+            paths(&["a.txt"]),
+            "only the ok+changed file is copied back"
+        );
+        assert_eq!(outcome.per_file_errors.len(), 1, "b.txt should have a per-file error");
+        assert_eq!(outcome.per_file_errors[0].0, PathBuf::from("b.txt"));
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            fs::read(dir.path().join("a.txt")).unwrap(),
+            b"FIXED",
+            "a.txt updated in real tree"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("b.txt")).unwrap(),
+            b"before",
+            "b.txt unchanged in real tree"
+        );
+    }
+
+    /// Per-file mode: when the fixer modifies the sandbox copy but exits with
+    /// error, the change must be discarded and the real tree must be untouched.
+    #[cfg(unix)]
+    #[test]
+    fn per_file_changed_but_errored_discards_change() {
+        let (dir, tree) = disk_tree(&[("a.txt", b"before")]);
+        let scripts_dir = tempdir().expect("scripts dir");
+        // Always rewrites the file AND always exits 1.
+        let script = make_script(
+            scripts_dir.path(),
+            "fixer.sh",
+            r#"printf 'FIXED' > "$1"
+exit 1"#,
+        );
+
+        let ceiling = HostCeiling::new(dir.path());
+        let sandbox = WritableSandbox::stage(&paths(&["a.txt"]), &tree, &ceiling).expect("stage");
+        let staged: Vec<String> = sandbox
+            .staged_paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let fix = make_fix_block("per_file", &["{{file}}"]);
+
+        let outcome = execute_fix_per_file(
+            sandbox.root_path(),
+            dir.path(),
+            &script,
+            &[],
+            &fix,
+            &staged,
+            &BTreeMap::new(),
+            "inv",
+            &sandbox,
+        )
+        .expect("execute");
+
+        assert!(
+            outcome.applied.is_empty(),
+            "errored file must not be copied back even if sandbox changed"
+        );
+        assert_eq!(outcome.per_file_errors.len(), 1);
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            fs::read(dir.path().join("a.txt")).unwrap(),
+            b"before",
+            "real tree unchanged"
+        );
+    }
+
+    /// Batch mode: when the fixer exits with error, no copy-back occurs and the
+    /// real tree is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn batch_error_leaves_real_tree_untouched() {
+        let (dir, tree) = disk_tree(&[("a.txt", b"before")]);
+        let scripts_dir = tempdir().expect("scripts dir");
+        // Always exits 1 without touching any files.
+        let script = make_script(scripts_dir.path(), "fixer.sh", "exit 1");
+
+        let ceiling = HostCeiling::new(dir.path());
+        let sandbox = WritableSandbox::stage(&paths(&["a.txt"]), &tree, &ceiling).expect("stage");
+        let staged: Vec<String> = sandbox
+            .staged_paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let fix = make_fix_block("batch", &["{{files}}"]);
+
+        let outcome = execute_fix_batch(
+            sandbox.root_path(),
+            dir.path(),
+            &script,
+            &[],
+            &fix,
+            &staged,
+            &BTreeMap::new(),
+            "inv",
+            &sandbox,
+        )
+        .expect("execute returns Ok(outcome) with error field set");
+
+        assert!(outcome.applied.is_empty(), "no files must be applied on batch error");
+        assert!(outcome.per_file_errors.is_empty());
+        assert!(outcome.error.is_some(), "invocation-level error must be recorded");
+        assert_eq!(
+            fs::read(dir.path().join("a.txt")).unwrap(),
+            b"before",
+            "real tree untouched"
+        );
+    }
 }

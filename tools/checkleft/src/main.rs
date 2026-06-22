@@ -629,6 +629,17 @@ fn print_fix_results(
             }
             FixCheckOutcome::Executed(inv_outcomes) => {
                 for inv in inv_outcomes {
+                    // Print applied files and per-file errors unconditionally —
+                    // a partial copy-back I/O error leaves `applied` non-empty
+                    // (those files were already written) even when `error` is set.
+                    for file in &inv.applied {
+                        println!("    {} {}", style.paint_info("fixed"), file.display());
+                        total_applied += 1;
+                    }
+                    for (file, msg) in &inv.per_file_errors {
+                        println!("    {} {}: {msg}", style.paint_error("error"), file.display());
+                        total_errors += 1;
+                    }
                     if let Some(ref err) = inv.error {
                         println!(
                             "    {}: {}",
@@ -636,21 +647,11 @@ fn print_fix_results(
                             style.paint_message(&format!("[{}] {err:#}", inv.invocation_id))
                         );
                         total_errors += 1;
-                    } else {
-                        for file in &inv.applied {
-                            println!("    {} {}", style.paint_info("fixed"), file.display());
-                            total_applied += 1;
-                        }
-                        for (file, msg) in &inv.per_file_errors {
-                            println!("    {} {}: {msg}", style.paint_error("error"), file.display());
-                            total_errors += 1;
-                        }
-                        if inv.applied.is_empty() && inv.per_file_errors.is_empty() {
-                            println!(
-                                "    {}",
-                                style.paint_help_body("nothing to fix (already clean or no matching files)")
-                            );
-                        }
+                    } else if inv.applied.is_empty() && inv.per_file_errors.is_empty() {
+                        println!(
+                            "    {}",
+                            style.paint_help_body("nothing to fix (already clean or no matching files)")
+                        );
                     }
                 }
             }
