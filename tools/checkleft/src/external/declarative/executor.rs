@@ -24,16 +24,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// On Linux, use the POSIX close() function directly (without Rust IO Safety
-// wrappers) to close arbitrary fds between fork and exec.  Every Rust binary
-// on Linux implicitly links against glibc/musl which export close(), so no
-// crate dependency is needed.  This avoids the abort-on-EBADF behaviour of
-// Rust 2024's OwnedFd::drop while still reaching close() without libc crate.
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -752,33 +742,6 @@ struct InvocationOutput {
 fn spawn(repo_root: &Path, binary: &Path, args: &[String], invocation_id: &str) -> Result<InvocationOutput> {
     let mut command = Command::new(binary);
     command.args(args).current_dir(repo_root);
-
-    // On Linux, fork() inherits every open file descriptor from the parent.
-    // O_CLOEXEC fds are closed at exec time, but between fork and exec the
-    // child still holds them.  A concurrent thread writing a script file and
-    // then calling exec can hit ETXTBSY if another thread's fork-but-not-yet-
-    // exec'd child holds a write fd on that same file.
-    //
-    // Close all fds > 2 in the child right after fork so the window shrinks to
-    // zero.  We call the raw C close() (linked from glibc/musl; always present)
-    // rather than going through Rust's OwnedFd/File wrappers, which abort on
-    // EBADF in the 2024 edition.  A close() on a non-existent fd returns EBADF;
-    // we ignore that — it just means the fd wasn't open, which is fine.
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: Runs between fork and exec in the child.  close() is
-        // async-signal-safe.  The raw extern "C" call bypasses Rust IO Safety.
-        unsafe {
-            command.pre_exec(|| {
-                for fd in 3..1024i32 {
-                    close(fd); // EBADF for non-existent fds — ignored
-                }
-                Ok(())
-            });
-        }
-    }
-
     let output = command.output().with_context(|| {
         format!(
             "failed to spawn declarative invocation `{invocation_id}` binary `{}`",
@@ -1298,12 +1261,14 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let fix = make_fix_block("per_file", &["{{file}}"]);
+        // Run via interpreter so no thread holds a write fd to a file being execve'd.
+        let prefix = vec![script.to_string_lossy().into_owned()];
 
         let outcome = execute_fix_per_file(
             sandbox.root_path(),
             dir.path(),
-            &script,
-            &[],
+            Path::new("/bin/sh"),
+            &prefix,
             &fix,
             &staged,
             &BTreeMap::new(),
@@ -1355,12 +1320,13 @@ exit 1"#,
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let fix = make_fix_block("per_file", &["{{file}}"]);
+        let prefix = vec![script.to_string_lossy().into_owned()];
 
         let outcome = execute_fix_per_file(
             sandbox.root_path(),
             dir.path(),
-            &script,
-            &[],
+            Path::new("/bin/sh"),
+            &prefix,
             &fix,
             &staged,
             &BTreeMap::new(),
@@ -1400,12 +1366,13 @@ exit 1"#,
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let fix = make_fix_block("batch", &["{{files}}"]);
+        let prefix = vec![script.to_string_lossy().into_owned()];
 
         let outcome = execute_fix_batch(
             sandbox.root_path(),
             dir.path(),
-            &script,
-            &[],
+            Path::new("/bin/sh"),
+            &prefix,
             &fix,
             &staged,
             &BTreeMap::new(),
