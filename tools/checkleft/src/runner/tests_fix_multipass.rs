@@ -1,12 +1,20 @@
-// Regression test: checkleft fix --all must converge in a single invocation
+// Regression tests: checkleft fix --all must converge in a single invocation
 // when a formatter requires multiple passes. The root cause was that
-// run_declarative_fixes defaulted to max_passes=1, so a 2-pass formatter
-// would leave files in an intermediate state (the "still failing" bug).
-//
-// This test sets up a fixer script that takes two passes to reach the final
-// state, then verifies:
-//   - max_passes=1  → file stuck at intermediate (demonstrates the old bug)
-//   - max_passes=10 → file converges to fully fixed (demonstrates the fix)
+// dispatch_fix called run_declarative_fixes with max_passes.unwrap_or(1), so
+// a 2-pass formatter would leave files in an intermediate state (the "still
+// failing" bug). The fix changed the default to unwrap_or(DEFAULT_FIX_PASSES).
+
+/// Guard that DEFAULT_FIX_PASSES is large enough to converge a 2-pass
+/// formatter. Fails if the constant is reverted to 1.
+#[test]
+fn default_fix_passes_is_at_least_two() {
+    use super::DEFAULT_FIX_PASSES;
+    assert!(
+        DEFAULT_FIX_PASSES >= 2,
+        "DEFAULT_FIX_PASSES must be ≥ 2 so that a 2-pass formatter \
+         converges when --max-passes is omitted from dispatch_fix"
+    );
+}
 
 #[cfg(unix)]
 #[test]
@@ -106,7 +114,8 @@ exit 0\n",
     };
 
     // With max_passes=1 the fixer only runs once, leaving the file in the
-    // intermediate state (this is the behaviour that the bug report exposed).
+    // intermediate state (same behaviour as dispatch_fix had before the fix,
+    // when it called run_declarative_fixes with max_passes.unwrap_or(1)).
     build_runner()
         .run_declarative_fixes(&changeset, &fix_plan, temp.path(), 1, Arc::new(NoopProgressReporter))
         .expect("run fixes");

@@ -73,6 +73,12 @@ struct ScheduledRuns {
     diagnostics: Vec<CheckResult>,
 }
 
+/// The number of fix passes `dispatch_fix` applies when `--max-passes` is not
+/// supplied on the command line. Must be ≥ 2 so a formatter that requires two
+/// passes to reach a stable state converges in a single `checkleft fix --all`
+/// invocation.
+pub const DEFAULT_FIX_PASSES: u32 = 10;
+
 pub struct Runner {
     registry: Arc<CheckRegistry>,
     resolver: Arc<ConfigResolver>,

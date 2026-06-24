@@ -27,7 +27,7 @@ use checkleft::install::{
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::progress::render::TermRenderer;
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
-use checkleft::runner::Runner;
+use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -55,8 +55,6 @@ struct RunArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     show_progress: Option<bool>,
 }
-
-const DEFAULT_FIX_PASSES: u32 = 10;
 
 /// Arguments for `checkleft fix`.
 #[derive(Debug, Args, Clone)]
