@@ -173,6 +173,11 @@ pub struct BazelAspectInvocation {
     pub build_flags: Vec<String>,
     /// How each artifact file's contents are shaped before the transform.
     pub artifact_format: ArtifactFormat,
+    /// When true, the executor extends the initial target set with same-package
+    /// `rust_test` targets that directly depend on the found lib/binary targets.
+    /// This ensures `#[cfg(test)]` modules — compiled only by the test target —
+    /// are covered by the aspect. Default: false.
+    pub include_test_rdeps: bool,
 }
 
 /// The on-disk shape of an output-group artifact.
@@ -361,6 +366,9 @@ pub(super) struct RawInvocation {
     /// bazel_aspect: `json` (default) or `jsonl`.
     #[serde(default)]
     artifact_format: Option<String>,
+    /// bazel_aspect: also apply the aspect to same-package `rust_test` rdeps.
+    #[serde(default)]
+    include_test_rdeps: bool,
     exit: BTreeMap<String, String>,
     transform: RawTransform,
     /// Optional fix invocation. Only valid on `tool` invocations; rejected on
@@ -520,6 +528,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
                 ("output_groups", !raw.output_groups.is_empty()),
                 ("build_flags", !raw.build_flags.is_empty()),
                 ("artifact_format", raw.artifact_format.is_some()),
+                ("include_test_rdeps", raw.include_test_rdeps),
             ] {
                 if set {
                     bail!("tool invocation `{id}` must not set `{field}` (bazel_aspect-only field)");
@@ -588,6 +597,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
                     output_groups: raw.output_groups,
                     build_flags: raw.build_flags,
                     artifact_format,
+                    include_test_rdeps: raw.include_test_rdeps,
                 }),
                 None,
             )

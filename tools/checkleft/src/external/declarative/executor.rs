@@ -480,6 +480,37 @@ fn run_bazel_aspect_invocation(
         .filter(|line| line.starts_with("//") || line.starts_with('@'))
         .map(str::to_owned)
         .collect();
+
+    // 1b. Optionally extend with same-package rust_test targets that directly depend
+    //     on the found lib/binary targets. rust_test targets are compiled with
+    //     --cfg test, so the aspect on them covers #[cfg(test)] modules that are
+    //     invisible to the lib/binary compilation. Non-fatal: if no rust_test targets
+    //     exist in the package (or the query fails for another reason), proceed with
+    //     just the non-test targets.
+    if aspect.include_test_rdeps && !targets.is_empty() {
+        let targets_set = targets
+            .iter()
+            .map(|t| format!("'{}'", t.replace('\'', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let test_query = format!("kind(\"rust_test\", same_pkg_direct_rdeps(set({targets_set})))");
+        let test_query_args = vec![
+            "query".to_owned(),
+            "--keep_going".to_owned(),
+            "--output=label".to_owned(),
+            test_query,
+        ];
+        let test_query_output = spawn(repo_root, &bazel, &test_query_args, &invocation.id)?;
+        if matches!(test_query_output.exit_code, Some(0) | Some(3)) {
+            for line in String::from_utf8_lossy(&test_query_output.stdout).lines() {
+                let line = line.trim();
+                if line.starts_with("//") || line.starts_with('@') {
+                    targets.push(line.to_owned());
+                }
+            }
+        }
+    }
+
     targets.sort();
     targets.dedup();
     if targets.is_empty() {

@@ -1141,6 +1141,79 @@ fn clippy_manifest_parses_as_bazel_aspect() {
     assert_eq!(invocation.exit.classify(Some(1)), ExitOutcome::Error);
     // bazel_aspect packages need no binaries: bazel runs the tool.
     assert!(package.needs.is_empty());
+    // include_test_rdeps must be true: without it, #[cfg(test)] modules are not
+    // covered because the lib/binary targets don't compile with --cfg test.
+    assert!(
+        spec.include_test_rdeps,
+        "lint/rust must set include_test_rdeps: true to cover #[cfg(test)] modules"
+    );
+}
+
+#[test]
+fn bazel_aspect_include_test_rdeps_defaults_to_false() {
+    // A bazel_aspect invocation without include_test_rdeps must default to false,
+    // so the flag is opt-in and doesn't change behavior for other aspect checks.
+    let manifest = r#"
+id: test/aspect
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+invocations:
+  - id: check
+    kind: bazel_aspect
+    aspect: "@some//rule:defs.bzl%some_aspect"
+    output_groups: [results]
+    artifact_format: json
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: passthrough
+"#;
+    let package = parse_declarative_check_manifest(manifest).expect("manifest must parse");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => {
+            let spec = aspect(&d.invocations[0]);
+            assert!(
+                !spec.include_test_rdeps,
+                "include_test_rdeps must default to false; got {:?}",
+                spec.include_test_rdeps
+            );
+        }
+        other => panic!("expected declarative, got {other:?}"),
+    }
+}
+
+#[test]
+fn bazel_aspect_include_test_rdeps_rejected_on_tool_invocation() {
+    let manifest = r#"
+id: test/tool
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+needs:
+  mytool:
+    default:
+      path: /usr/bin/mytool
+invocations:
+  - id: run
+    run: mytool
+    mode: batch
+    args: ["{{files}}"]
+    include_test_rdeps: true
+    exit:
+      "0": ok
+      default: error
+    transform:
+      kind: passthrough
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(
+        err.to_string().contains("include_test_rdeps"),
+        "error should name the rejected field: {err:#}"
+    );
 }
 
 #[test]
