@@ -20,7 +20,7 @@ use checkleft::external::{
     FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
     NoopExternalCheckPackageProvider,
 };
-use checkleft::input::ChangeSet;
+use checkleft::input::{ChangeKind, ChangeSet, ChangedFile};
 use checkleft::install::{
     InstallOutcome, UninstallOutcome, install_pre_push_hook, pre_push_path, uninstall_pre_push_hook,
 };
@@ -593,23 +593,44 @@ enum FixCheckOutcome<'a> {
     NoFixAvailable,
 }
 
+/// Build a per-check map of files still failing after a re-verify pass.
+/// Only Error- and Warning-severity findings count; Info is advisory.
+fn still_failing_from_verify(verify_results: &[CheckResult]) -> std::collections::BTreeMap<String, Vec<PathBuf>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut map: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+    for r in verify_results {
+        for f in &r.findings {
+            if matches!(f.severity, Severity::Error | Severity::Warning)
+                && let Some(location) = &f.location
+            {
+                map.entry(r.check_id.clone()).or_default().insert(location.path.clone());
+            }
+        }
+    }
+    map.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
+}
+
 fn print_fix_results(
     plan: &FixPlan,
     outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
+    verify_results: Option<&[CheckResult]>,
     style: OutputStyle,
     elapsed: Duration,
 ) {
     if plan.checks.is_empty() {
         println!(
-            "{}: no failing files found ({} checks ran in {}s)\n",
+            "{}: no failing files found (in {}s)\n",
             style.paint_info("fix"),
-            0,
             elapsed.as_secs()
         );
         return;
     }
 
-    let mut total_applied = 0usize;
+    // Build a per-check map of files still failing after re-verify.
+    let still_failing = verify_results.map(still_failing_from_verify).unwrap_or_default();
+
+    let mut total_fixed = 0usize;
+    let mut total_still_failing = 0usize;
     let mut total_errors = 0usize;
     let mut total_no_fix = 0usize;
     let total_dirty_skipped: usize = plan.checks.iter().map(|c| c.dirty_skipped.len()).sum();
@@ -621,20 +642,35 @@ fn print_fix_results(
             _ => FixCheckOutcome::NoFixAvailable,
         };
 
+        let check_still_failing = still_failing.get(&check_plan.check_id);
+
         println!("  {}:", style.paint_check_id(&check_plan.check_id));
         match bucket {
             FixCheckOutcome::NoFixAvailable => {
                 println!("    {}", style.paint_help_body("no fix available"));
+                for file in &check_plan.failing_files {
+                    println!(
+                        "    {} {}",
+                        style.paint_help_body("  needs manual fix:"),
+                        file.display()
+                    );
+                }
                 total_no_fix += 1;
             }
             FixCheckOutcome::Executed(inv_outcomes) => {
                 for inv in inv_outcomes {
-                    // Print applied files and per-file errors unconditionally —
-                    // a partial copy-back I/O error leaves `applied` non-empty
-                    // (those files were already written) even when `error` is set.
+                    // Print applied files, split into "fixed" vs "still failing" based on verify.
                     for file in &inv.applied {
-                        println!("    {} {}", style.paint_info("fixed"), file.display());
-                        total_applied += 1;
+                        let still_fails = check_still_failing
+                            .map(|sf: &Vec<PathBuf>| sf.contains(file))
+                            .unwrap_or(false);
+                        if still_fails {
+                            println!("    {} {}", style.paint_warning("still failing"), file.display());
+                            total_still_failing += 1;
+                        } else {
+                            println!("    {} {}", style.paint_info("fixed"), file.display());
+                            total_fixed += 1;
+                        }
                     }
                     for (file, msg) in &inv.per_file_errors {
                         println!("    {} {}: {msg}", style.paint_error("error"), file.display());
@@ -654,6 +690,19 @@ fn print_fix_results(
                         );
                     }
                 }
+                // Files still failing for this check that appeared in verify but were
+                // not in any invocation's applied set (edge case: a different check
+                // on the same applied file that still fails).
+                if let Some(sf) = check_still_failing {
+                    let all_applied: std::collections::HashSet<&PathBuf> =
+                        inv_outcomes.iter().flat_map(|inv| inv.applied.iter()).collect();
+                    for file in sf {
+                        if !all_applied.contains(file) {
+                            println!("    {} {}", style.paint_warning("still failing"), file.display());
+                            total_still_failing += 1;
+                        }
+                    }
+                }
             }
         }
         for file in &check_plan.dirty_skipped {
@@ -662,18 +711,39 @@ fn print_fix_results(
         println!();
     }
 
+    // Report checks from verify that were not in the fix plan (e.g. a different check
+    // failing on a file that was fixed by another check).
+    for (check_id, files) in &still_failing {
+        if plan.checks.iter().any(|c| &c.check_id == check_id) {
+            continue; // already rendered above
+        }
+        println!("  {} (also failing after fix):", style.paint_check_id(check_id));
+        for file in files {
+            println!("    {} {}", style.paint_warning("still failing"), file.display());
+            total_still_failing += 1;
+        }
+        println!();
+    }
+
+    let verify_note = if verify_results.is_some() {
+        String::new() // verify ran; still_failing and fixed counts are accurate
+    } else {
+        " (--verify=false; post-fix state unknown)".to_owned()
+    };
     let dirty_note = if total_dirty_skipped > 0 {
         format!(", {total_dirty_skipped} skipped (dirty)")
     } else {
         String::new()
     };
     println!(
-        "{}: {} file(s) fixed, {} error(s), {} check(s) with no fix available{} (in {}s)\n",
+        "{}: {} file(s) fixed, {} still failing, {} error(s), {} check(s) with no fix available{}{} (in {}s)\n",
         style.paint_bold("summary"),
-        total_applied,
+        total_fixed,
+        total_still_failing,
         total_errors,
         total_no_fix,
         dirty_note,
+        verify_note,
         elapsed.as_secs()
     );
 }
@@ -681,8 +751,11 @@ fn print_fix_results(
 fn print_fix_results_json(
     plan: &FixPlan,
     outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
+    verify_results: Option<&[CheckResult]>,
 ) -> Result<()> {
-    let output: Vec<serde_json::Value> = plan
+    let still_failing = verify_results.map(still_failing_from_verify).unwrap_or_default();
+
+    let checks: Vec<serde_json::Value> = plan
         .checks
         .iter()
         .map(|c| {
@@ -705,16 +778,46 @@ fn print_fix_results_json(
                         .collect()
                 })
                 .unwrap_or_default();
+            let check_still_failing: Vec<String> = still_failing
+                .get(&c.check_id)
+                .map(|files| files.iter().map(|p| p.display().to_string()).collect())
+                .unwrap_or_default();
             serde_json::json!({
                 "check_id": c.check_id,
                 "failing_files": c.failing_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dirty_skipped": c.dirty_skipped.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "fix_status": status,
                 "invocations": invocations,
+                "still_failing_after_verify": check_still_failing,
             })
         })
         .collect();
-    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    // Checks from verify not in the original plan (e.g. a different check failing
+    // on a fixed file).
+    let extra: Vec<serde_json::Value> = still_failing
+        .iter()
+        .filter(|(check_id, _)| !plan.checks.iter().any(|c| &c.check_id == *check_id))
+        .map(|(check_id, files)| {
+            serde_json::json!({
+                "check_id": check_id,
+                "failing_files": [],
+                "dirty_skipped": [],
+                "fix_status": "no_fix_available",
+                "invocations": [],
+                "still_failing_after_verify": files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let mut output = checks;
+    output.extend(extra);
+
+    let wrapper = serde_json::json!({
+        "verify_ran": verify_results.is_some(),
+        "checks": output,
+    });
+    println!("{}", serde_json::to_string_pretty(&wrapper)?);
     Ok(())
 }
 
@@ -730,7 +833,7 @@ async fn dispatch_fix(
                 show_progress,
             },
         allow_dirty,
-        verify: _,     // TODO(T8): re-run checks after applying fixes
+        verify,
         max_passes: _, // TODO(T7): multi-pass convergence
         paths,
     }: FixArgs,
@@ -778,7 +881,6 @@ async fn dispatch_fix(
 
     let run_started_at = Instant::now();
     let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
-    let elapsed = run_started_at.elapsed();
     sort_results_for_output(&mut results);
 
     if let Some(mut progress) = live.take() {
@@ -806,15 +908,77 @@ async fn dispatch_fix(
     // produce empty outcome vecs (no fix available).
     let fix_outcomes = runner.run_declarative_fixes(&changeset, &fix_plan_map, root)?;
 
+    // Collect the files that were atomically copied back to the real working tree.
+    let applied_files: std::collections::BTreeSet<PathBuf> = fix_outcomes
+        .values()
+        .flat_map(|inv_outcomes| inv_outcomes.iter().flat_map(|inv| inv.applied.iter().cloned()))
+        .collect();
+
+    // Re-run checks over the applied files to detect any residual failures (§G).
+    // Skipped when --verify=false or nothing was applied (no copy-back occurred).
+    let verify_results: Option<Vec<CheckResult>> = if verify && !applied_files.is_empty() {
+        info!(
+            files = applied_files.len(),
+            "re-running checks over fixed files (--verify)"
+        );
+        let verify_changeset = ChangeSet::new(
+            applied_files
+                .iter()
+                .map(|path| ChangedFile {
+                    path: path.clone(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                })
+                .collect(),
+        );
+        let mut vr = runner
+            .run_changeset_with_progress(&verify_changeset, Arc::new(NoopProgressReporter))
+            .await?;
+        sort_results_for_output(&mut vr);
+        Some(vr)
+    } else {
+        None
+    };
+
+    let elapsed = run_started_at.elapsed();
+
     match format {
-        OutputFormat::Human => print_fix_results(&fix_plan, &fix_outcomes, style, elapsed),
-        OutputFormat::Json => print_fix_results_json(&fix_plan, &fix_outcomes)?,
+        OutputFormat::Human => print_fix_results(&fix_plan, &fix_outcomes, verify_results.as_deref(), style, elapsed),
+        OutputFormat::Json => print_fix_results_json(&fix_plan, &fix_outcomes, verify_results.as_deref())?,
     }
 
-    let has_error = results
-        .iter()
-        .any(|r| r.findings.iter().any(|f| f.severity == Severity::Error));
-    Ok(if has_error {
+    // Exit 0 when no Error-severity finding remains after fixing and re-verifying (§A).
+    // Fixer invocation errors count as operational Error findings regardless of verify mode.
+    let fix_has_error = fix_outcomes
+        .values()
+        .flat_map(|invs| invs.iter())
+        .any(|inv| inv.error.is_some() || !inv.per_file_errors.is_empty());
+
+    let findings_error = match verify_results.as_deref() {
+        Some(vr) => {
+            // Applied files still failing after re-verify.
+            let verify_error = vr
+                .iter()
+                .any(|r| r.findings.iter().any(|f| f.severity == Severity::Error));
+            // Original errors on files that were never applied (no fix available or fixer failed).
+            let unresolved_error = results.iter().any(|r| {
+                r.findings.iter().any(|f| {
+                    matches!(f.severity, Severity::Error)
+                        && f.location
+                            .as_ref()
+                            .map(|l| !applied_files.contains(&l.path))
+                            .unwrap_or(true)
+                })
+            });
+            verify_error || unresolved_error
+        }
+        // Without re-verify: use original run results directly.
+        None => results
+            .iter()
+            .any(|r| r.findings.iter().any(|f| f.severity == Severity::Error)),
+    };
+
+    Ok(if fix_has_error || findings_error {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

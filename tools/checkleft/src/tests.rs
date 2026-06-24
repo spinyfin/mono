@@ -10,7 +10,8 @@ use super::{
     ColorLevel, ExternalProviderMode, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES, TRUNCATE_MAX_TOTAL_CHARS,
     ci_from_env, compute_fix_plan, github_auth_unavailable_warning, normalize_optional_description,
     parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer, render_human_results,
-    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, truncate_tool_output,
+    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, still_failing_from_verify,
+    truncate_tool_output,
 };
 
 #[test]
@@ -1030,4 +1031,85 @@ fn compute_fix_plan_empty_dirty_set_does_not_filter() {
     let plan = compute_fix_plan(&results, &[], &HashSet::new());
     assert_eq!(plan.checks[0].failing_files, vec![PathBuf::from("src/lib.rs")]);
     assert!(plan.checks[0].dirty_skipped.is_empty());
+}
+
+// --- still_failing_from_verify tests (T8) ---
+
+#[test]
+fn still_failing_from_verify_empty_results() {
+    let map = still_failing_from_verify(&[]);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn still_failing_from_verify_collects_error_and_warning_paths() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Warning, "src/lib.rs"),
+            make_finding(Severity::Info, "src/info.rs"), // excluded
+        ],
+    }];
+    let map = still_failing_from_verify(&results);
+    assert_eq!(map.len(), 1);
+    let files = &map["format/rust"];
+    assert_eq!(files.len(), 2);
+    assert!(files.contains(&PathBuf::from("src/main.rs")));
+    assert!(files.contains(&PathBuf::from("src/lib.rs")));
+    assert!(!files.contains(&PathBuf::from("src/info.rs")));
+}
+
+#[test]
+fn still_failing_from_verify_skips_findings_with_no_location() {
+    let results = vec![CheckResult {
+        check_id: "some-check".to_owned(),
+        findings: vec![make_finding_no_location(Severity::Error)],
+    }];
+    let map = still_failing_from_verify(&results);
+    // No location → no path → nothing in the map.
+    assert!(map.is_empty());
+}
+
+#[test]
+fn still_failing_from_verify_deduplicates_paths_per_check() {
+    let results = vec![CheckResult {
+        check_id: "lint/oxc".to_owned(),
+        findings: vec![
+            make_finding(Severity::Error, "src/foo.ts"),
+            make_finding(Severity::Warning, "src/foo.ts"), // same file, different severity
+        ],
+    }];
+    let map = still_failing_from_verify(&results);
+    assert_eq!(map["lint/oxc"].len(), 1);
+    assert_eq!(map["lint/oxc"][0], PathBuf::from("src/foo.ts"));
+}
+
+#[test]
+fn still_failing_from_verify_groups_by_check_id() {
+    let results = vec![
+        CheckResult {
+            check_id: "format/rust".to_owned(),
+            findings: vec![make_finding(Severity::Error, "src/a.rs")],
+        },
+        CheckResult {
+            check_id: "lint/oxc".to_owned(),
+            findings: vec![make_finding(Severity::Error, "src/b.ts")],
+        },
+    ];
+    let map = still_failing_from_verify(&results);
+    assert_eq!(map.len(), 2);
+    assert_eq!(map["format/rust"], vec![PathBuf::from("src/a.rs")]);
+    assert_eq!(map["lint/oxc"], vec![PathBuf::from("src/b.ts")]);
+}
+
+#[test]
+fn still_failing_from_verify_info_only_check_excluded() {
+    // A check that only has Info findings after verify should not appear in the map.
+    let results = vec![CheckResult {
+        check_id: "some-check".to_owned(),
+        findings: vec![make_finding(Severity::Info, "src/foo.rs")],
+    }];
+    let map = still_failing_from_verify(&results);
+    assert!(map.is_empty());
 }
