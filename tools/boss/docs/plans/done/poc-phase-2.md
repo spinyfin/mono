@@ -101,6 +101,7 @@ Add an `agent_id` field to all messages, and add new message types for agent
 lifecycle:
 
 **New frontend → engine messages:**
+
 ```json
 {"type": "create_agent", "name": "Agent 1"}
 {"type": "list_agents"}
@@ -108,12 +109,14 @@ lifecycle:
 ```
 
 **Extended existing messages (add `agent_id`):**
+
 ```json
 {"type": "prompt", "agent_id": "agent-1", "text": "..."}
 {"type": "permission_response", "agent_id": "agent-1", "id": "perm-1", "granted": true}
 ```
 
 **New engine → frontend messages:**
+
 ```json
 {"type": "agent_created", "agent_id": "agent-1", "name": "Agent 1"}
 {"type": "agent_list", "agents": [{"agent_id": "agent-1", "name": "Agent 1"}]}
@@ -122,6 +125,7 @@ lifecycle:
 ```
 
 **Extended existing messages (add `agent_id`):**
+
 ```json
 {"type": "chunk", "agent_id": "agent-1", "text": "..."}
 {"type": "done", "agent_id": "agent-1", "stop_reason": "end_turn"}

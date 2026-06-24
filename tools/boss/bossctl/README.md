@@ -2,8 +2,8 @@
 
 `bossctl` is the Boss-only control CLI for the Boss V2 engine. It is the
 low-level admin and coordinator counterpart to the user-facing `boss`
-command: where `boss` manages the *work taxonomy* (products / projects /
-tasks / chores), `bossctl` owns the *control verbs* used to inspect and
+command: where `boss` manages the _work taxonomy_ (products / projects /
+tasks / chores), `bossctl` owns the _control verbs_ used to inspect and
 steer the running system — worker sessions, the dispatch pipeline,
 engine metrics, the remote-host registry, and diagnostic logs.
 
@@ -24,7 +24,7 @@ subcommands. Each verb resolves into one of two backends:
   engine's in-memory `LiveWorkerState` registry and its scheduling and
   dispatch machinery.
 - **Direct file/DB reads.** Diagnostic verbs that must work when the
-  engine is *wedged* (`metrics list`, `metrics show`, `hosts *`,
+  engine is _wedged_ (`metrics list`, `metrics show`, `hosts *`,
   `dispatch *`, `live-status debug`, `logs`) read the engine's `state.db`
   or its on-disk JSONL event/log streams directly, bypassing RPC. This
   is intentional: an operator needs to inspect a stuck engine, and the

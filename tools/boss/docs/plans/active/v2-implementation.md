@@ -32,19 +32,19 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 
 ## Status at a glance (audited 2026-05-06 against `main`)
 
-| Phase | Title                                          | Status                       |
-|-------|------------------------------------------------|------------------------------|
-| 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; CLI follow-ups (Product/Project delete+move) landed |
-| 2     | Multi-client subscriptions                     | 🟢 shipped — bounded outbound queue, same-topic coalescing, slow-client disconnect (PR #137) |
-| 3     | Kanban Work tab                                | 🟢 shipped                   |
-| 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers for those land in Phase 9 |
-| 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
-| 6     | libghostty embedding and worker spawn          | 🟢 named deliverables shipped — 6a–6g + 6f-1..8 all in main; PR #197 closed the BOSS_RUN_ID hook-correlation gap that the 6f-6 shell_pid TODO had left |
-| 7     | Boss session and bossctl                       | 🟢 mostly shipped — Boss pane, `bossctl` binary, two-trust-root auth, probe model, coordinator system prompt, worker env hygiene all in `main`; some `bossctl` verbs (`agents focus/send/launch/transcript`, `work cancel`, `workspace summary`) still print `not_implemented` |
-| 8     | Review and attention                           | 🟡 auto PR-detect on Stop landed (PR #184) — moves work item to `in_review` and finalises execution; poller for `waiting_review` / `waiting_merge`, Triage UI, and re-engagement still pending |
-| 9     | Resume and continuity                          | ❌ not started               |
-| 10    | Transcripts and hardening                      | ❌ schema columns only       |
-| 11    | Bazel `GhosttyKit` integration                 | ❌ not started — Phase 6f cutover already shipped without it, so the Bazel `.app` currently has no working Agents mode |
+| Phase | Title                                 | Status                                                                                                                                                                                                                                                                         |
+| ----- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1     | Engine and CLI foundations            | 🟢 named deliverables shipped; CLI follow-ups (Product/Project delete+move) landed                                                                                                                                                                                             |
+| 2     | Multi-client subscriptions            | 🟢 shipped — bounded outbound queue, same-topic coalescing, slow-client disconnect (PR #137)                                                                                                                                                                                   |
+| 3     | Kanban Work tab                       | 🟢 shipped                                                                                                                                                                                                                                                                     |
+| 4     | Execution layer + cube V2 prereqs     | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers for those land in Phase 9                                                                                                                                            |
+| 5     | ExecutionCoordinator                  | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum                                                                                     |
+| 6     | libghostty embedding and worker spawn | 🟢 named deliverables shipped — 6a–6g + 6f-1..8 all in main; PR #197 closed the BOSS_RUN_ID hook-correlation gap that the 6f-6 shell_pid TODO had left                                                                                                                         |
+| 7     | Boss session and bossctl              | 🟢 mostly shipped — Boss pane, `bossctl` binary, two-trust-root auth, probe model, coordinator system prompt, worker env hygiene all in `main`; some `bossctl` verbs (`agents focus/send/launch/transcript`, `work cancel`, `workspace summary`) still print `not_implemented` |
+| 8     | Review and attention                  | 🟡 auto PR-detect on Stop landed (PR #184) — moves work item to `in_review` and finalises execution; poller for `waiting_review` / `waiting_merge`, Triage UI, and re-engagement still pending                                                                                 |
+| 9     | Resume and continuity                 | ❌ not started                                                                                                                                                                                                                                                                 |
+| 10    | Transcripts and hardening             | ❌ schema columns only                                                                                                                                                                                                                                                         |
+| 11    | Bazel `GhosttyKit` integration        | ❌ not started — Phase 6f cutover already shipped without it, so the Bazel `.app` currently has no working Agents mode                                                                                                                                                         |
 
 Phase 6 is closed: 6f-7 wiring (PaneSpawnRunner as production
 `ExecutionRunner`) shipped in PR #171, the BOSS_RUN_ID hook
@@ -279,8 +279,8 @@ cube features Boss will hard-depend on.
   `release_workspace`, `workspace_status`, `heartbeat_lease`, and
   `force_release_lease` (`engine/src/coordinator.rs`). Status returns
   a typed `CubeWorkspaceStatus` struct (state + lease + holder + task
-  + lease epochs) so the Phase 9 reconcile can do a three-way compare
-  without reparsing JSON.
+  - lease epochs) so the Phase 9 reconcile can do a three-way compare
+    without reparsing JSON.
 
 **Pending.**
 
@@ -411,7 +411,7 @@ workers in libghostty panes, workers do work, events flow back.
   - 6f-4: protocol additions for the engine→app pane RPC —
     `RegisterAppSession`, `EngineRequest` event variant,
     `EngineResponse` request variant, `EngineToAppRequest /
-    Response / Error` enums in `boss-protocol` (PR #152).
+Response / Error` enums in `boss-protocol` (PR #152).
   - 6f-5: engine-side dispatch — `ServerState::send_to_app`,
     `register_app_session`, `deliver_app_response`, app-disconnect
     cleanup, `app_pid` trust check (PR #157).
@@ -514,7 +514,7 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   it (see worker env hygiene below).
 - **`bossctl` subcommand surface** declared in
   `bossctl/src/main.rs`: `agents {list, status, focus, send,
-  interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
+interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
   `work {start, cancel}`, `workspace summary`. Wired to engine
   RPCs:
   - `probe` → `FrontendRequest::ProbeRun`
@@ -615,7 +615,7 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   consumes the in-flight entry recorded by the previous Stop's
   successful `SendToPane`, reads the new transcript region, and
   publishes `FrontendEvent::ProbeReplied { run_id, probe_id,
-  text }` on the per-run [`probe_topic`]. Idempotent on
+text }` on the per-run [`probe_topic`]. Idempotent on
   duplicate Stops (the in-flight entry is taken on first emit).
   Coverage:
   `app::tests::dispatch_probe_reply_emits_probe_replied_after_followup_stop`,
@@ -657,7 +657,7 @@ R3, R5, R8.
   `engine/src/runner.rs:178`).
 - `tasks.pr_url` column on the work-taxonomy schema
   (`engine/src/work.rs:1020`); settable via `boss task update
-  --pr-url <url>` and via the app's task edit form
+--pr-url <url>` and via the app's task edit form
   (`app-macos/Sources/ContentView.swift:1112`, `:1119`).
 - PR URL is rendered as an openable hyperlink on kanban cards /
   card detail (`ContentView.swift:838-839, :914`; hyperlink
@@ -677,7 +677,7 @@ R3, R5, R8.
 **Pending.**
 
 - Engine: GitHub poller — every 60s, `gh pr view --json state,
-  mergedAt, statusCheckRollup, reviews, comments` for each
+mergedAt, statusCheckRollup, reviews, comments` for each
   execution in `waiting_review` / `waiting_merge`. The on-Stop
   detector is not yet supplemented by ongoing polling, so once
   the worker stops a PR's downstream state changes (review
@@ -838,12 +838,12 @@ mode at all. So Phase 11 is a hard prereq for 6f.
 
 - `tools/boss/app-macos/Package.swift` declares
   `.binaryTarget(name: "GhosttyKit", path:
-  "ThirdParty/GhosttyKit.xcframework")` (SwiftPM only).
+"ThirdParty/GhosttyKit.xcframework")` (SwiftPM only).
 - `tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` builds the
   xcframework via the upstream `ghostty-org/ghostty` repo at
   `origin/main` using `zig@0.15`.
 - `tools/boss/app-macos/BUILD.bazel`'s `srcs = glob(["Sources/
-  *.swift"])` is single-level and excludes `Sources/Ghostty/*.swift`.
+*.swift"])` is single-level and excludes `Sources/Ghostty/*.swift`.
 
 **Pending.**
 

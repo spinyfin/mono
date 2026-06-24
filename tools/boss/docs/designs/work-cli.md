@@ -115,7 +115,7 @@ Add:
 - `boss engine start`,
 - `boss engine stop`.
 
-Note: `--no-autostart` is a *separate* concern — it suppresses worker
+Note: `--no-autostart` is a _separate_ concern — it suppresses worker
 auto-dispatch for newly created work items (and the seed `design` task on
 `project create`), but still lets the CLI bring the engine up to service the
 request. The engine is the system of record, so it must always be reachable to
@@ -361,7 +361,7 @@ The board (kanban) names are the canonical CLI vocabulary. They are what `--stat
 - `review`
 - `done`
 
-The engine still *stores* the original strings, and they remain accepted as input aliases everywhere a status is parsed (`--status`, `--to`), so old scripts and stored data keep working:
+The engine still _stores_ the original strings, and they remain accepted as input aliases everywhere a status is parsed (`--status`, `--to`), so old scripts and stored data keep working:
 
 - `todo` ↔ `backlog`
 - `active` ↔ `doing`
@@ -613,4 +613,3 @@ Reasonable follow-ons after the first version:
   should use `id` initially.
 - Board-friendly verbs like `move --to review` should map onto canonical
   storage statuses.
-

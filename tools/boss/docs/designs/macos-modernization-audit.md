@@ -15,7 +15,7 @@ Source of truth: `tools/boss/app-macos/Package.swift:6` and
 (`platforms: [.macOS(.v15)]` / `minimum_os_version = "15.0"`). Swift
 tools version is `6.2`.
 
-After macOS 15, Apple switched to year-aligned naming, so the *next*
+After macOS 15, Apple switched to year-aligned naming, so the _next_
 major OS is **macOS 26 (Tahoe, fall 2025)** — there is no macOS 16
 or 17. This audit treats "raising the floor" as a binary choice
 between macOS 15 (where we are) and macOS 26 (the only later
@@ -38,9 +38,9 @@ create` invocation at the end of this document — see
 
 ### 1. Replace `onHover` + `NSCursor` push/pop on PR links with `.pointerStyle(.link)`
 
-* File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:1683-1689`
+- File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:1683-1689`
   (inside `PRURLLink.body`).
-* Current shape (7 lines, the closure plus the `.onHover` modifier):
+- Current shape (7 lines, the closure plus the `.onHover` modifier):
 
   ```swift
   .onHover { hovering in
@@ -52,39 +52,39 @@ create` invocation at the end of this document — see
   }
   ```
 
-* Proposed: one-line `.pointerStyle(.link)` modifier on the `Link`
+- Proposed: one-line `.pointerStyle(.link)` modifier on the `Link`
   (or removed entirely if the SwiftUI default for a `Link` already
   flips the pointer once `.buttonStyle(.plain)` is reconciled).
-* Minimum deployment target: macOS 15 (`pointerStyle` shipped in 15,
+- Minimum deployment target: macOS 15 (`pointerStyle` shipped in 15,
   same modifier the sidebar overlay uses today on line 180).
-* Expected line count after: 1 line (or 0).
-* Risk: very low. `.buttonStyle(.plain)` may need to be re-checked —
+- Expected line count after: 1 line (or 0).
+- Risk: very low. `.buttonStyle(.plain)` may need to be re-checked —
   it should not suppress `pointerStyle`, but PR #361's experience
   with the sidebar suggests verifying on the real app rather than
   trusting parity from the docs.
 
 ### 2. Replace `SidebarProductPicker` `NSPopUpButton` bridge with a SwiftUI `Picker`
 
-* File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:818-870`
+- File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:818-870`
   (`struct SidebarProductPicker: NSViewRepresentable` plus its
   `Coordinator`). Used by `ContentView.swift:226` (Work sidebar)
   and `DesignsView.swift:240` (Designs sidebar).
-* Current shape (53 lines): `NSViewRepresentable` over
+- Current shape (53 lines): `NSViewRepresentable` over
   `NSPopUpButton`, with a `Coordinator` that mirrors a `[String]` of
   product ids and translates `selectionDidChange(_:)` into a
   `Binding<String?>` write. Calls
   `setContentCompressionResistancePriority(.defaultLow, for: .horizontal)`
   so the popup shrinks in a narrow sidebar.
-* Proposed: thin SwiftUI `Picker(selection:)` with `.pickerStyle(.menu)`
+- Proposed: thin SwiftUI `Picker(selection:)` with `.pickerStyle(.menu)`
   and a `ForEach` over products, tagging each item by its `id`.
   Apply `.frame(maxWidth: .infinity)` (and likely `.controlSize(.small)`)
   to recover the shrink-on-narrow-sidebar behaviour the explicit
   AppKit compression-resistance call was providing.
-* Minimum deployment target: macOS 15 (the SwiftUI primitives are
+- Minimum deployment target: macOS 15 (the SwiftUI primitives are
   much older — macOS 11 — but the sidebar this lives in was already
   validated against macOS 15+ in PR #361).
-* Expected line count after: ~10 lines.
-* Risk: medium. The bridge predates the deployment-floor bump and
+- Expected line count after: ~10 lines.
+- Risk: medium. The bridge predates the deployment-floor bump and
   may have been retained because earlier SwiftUI `Picker(menu)`
   versions wouldn't shrink horizontally inside a `List` row. Both
   call sites (Work sidebar at 220-360 pt column width; Designs
@@ -95,30 +95,30 @@ create` invocation at the end of this document — see
 
 ### 3. Replace `MarkdownViewerWindowController` with a SwiftUI `WindowGroup` + `openWindow`
 
-* File / symbol: `tools/boss/app-macos/Sources/DesignsView.swift:474-509`
+- File / symbol: `tools/boss/app-macos/Sources/DesignsView.swift:474-509`
   (`final class MarkdownViewerWindowController`), called from
   `ContentView.swift:1435` in the "Read full description"
   affordance.
-* Current shape (~35 lines plus a 3-line caller): an
+- Current shape (~35 lines plus a 3-line caller): an
   `NSWindowDelegate`-backed singleton that builds an `NSWindow` +
   `NSHostingView(rootView: MarkdownViewerView)` for each
   invocation, holds the window in `openWindows: [NSWindow]`, and
   drops it on `windowWillClose`. `isReleasedWhenClosed = false` is
   the explicit lifetime control that a SwiftUI `WindowGroup`
   manages automatically.
-* Proposed: declare a `WindowGroup("Markdown Viewer", id:
-  "markdown-viewer", for: MarkdownViewerArgs.self)` (where
+- Proposed: declare a `WindowGroup("Markdown Viewer", id:
+"markdown-viewer", for: MarkdownViewerArgs.self)` (where
   `MarkdownViewerArgs` is a small `Codable` struct holding
   `{title, markdown}`); the caller switches to
   `@Environment(\.openWindow)` and dispatches
   `openWindow(id: "markdown-viewer", value: args)`. Multiple
   concurrent viewers come for free.
-* Minimum deployment target: macOS 14 (the
+- Minimum deployment target: macOS 14 (the
   `WindowGroup(_:id:for:)` overload that passes a value to the
   scene). Already covered by our macOS 15 floor.
-* Expected line count after: ~12 lines (scene declaration) + ~2 lines
+- Expected line count after: ~12 lines (scene declaration) + ~2 lines
   at the call site. Net reduction: ~21 lines.
-* Risk: medium. Depends on migrating `BossMacApp` to the SwiftUI
+- Risk: medium. Depends on migrating `BossMacApp` to the SwiftUI
   `App` lifecycle first (see #5) so the `Scene` can be declared.
   If `App` migration is deferred, the workaround is to keep the
   controller; the win only lands after the scene graph is in
@@ -126,18 +126,18 @@ create` invocation at the end of this document — see
 
 ### 4. Replace `DispatchEventsWindowController` with a SwiftUI `Window` + `openWindow`
 
-* File / symbol: `tools/boss/app-macos/Sources/DispatchEventsViewer.swift:797-893`
+- File / symbol: `tools/boss/app-macos/Sources/DispatchEventsViewer.swift:797-893`
   (`final class DispatchEventsWindowController`), wired to the
   Debug menu in `BossMacApp.swift:99-105` via the obj-c selector
   `toggleDispatchEventsViewer(_:)`.
-* Current shape (97 lines): `NSWindowDelegate`-backed singleton
+- Current shape (97 lines): `NSWindowDelegate`-backed singleton
   that builds a single `NSWindow` + `NSHostingView`, persists
   visibility (`UserDefaults` key `boss.dispatchEventsViewer.visible`)
   and frame (`boss.dispatchEventsViewer.frame`) through
   `windowWillClose` / `windowDidMove` / `windowDidResize`, and
   reopens on launch via `restoreIfNeeded()`.
-* Proposed: declare a `Window("Dispatch Events", id:
-  "dispatch-events")` (single instance, not a `WindowGroup`); use
+- Proposed: declare a `Window("Dispatch Events", id:
+"dispatch-events")` (single instance, not a `WindowGroup`); use
   `setFrameAutosaveName` equivalent via the scene's automatic
   frame persistence. Replace the explicit
   `UserDefaults`-backed visibility with `@SceneStorage` (or
@@ -147,12 +147,12 @@ create` invocation at the end of this document — see
   Toggle the window via
   `@Environment(\.openWindow)` from a `CommandMenu("Debug")`
   command, replacing the manual `installMainMenu` Debug entry.
-* Minimum deployment target: macOS 15 (single-instance `Window`
+- Minimum deployment target: macOS 15 (single-instance `Window`
   scene; SwiftUI `CommandMenu`; scene-level
   `defaultLaunchBehavior`).
-* Expected line count after: ~25-30 lines combined (scene + command).
+- Expected line count after: ~25-30 lines combined (scene + command).
   Net reduction: ~65-70 lines.
-* Risk: medium-high. Window-frame persistence needs side-by-side
+- Risk: medium-high. Window-frame persistence needs side-by-side
   validation that the SwiftUI autosave matches the
   `NSStringFromRect`/`NSRectFromString` round-trip the current
   controller does. Restore-on-launch behaviour (only reopens if
@@ -161,15 +161,15 @@ create` invocation at the end of this document — see
 
 ### 5. Replace `BossMacApp` `NSApplicationDelegate` shell with SwiftUI `App` lifecycle
 
-* File / symbol: `tools/boss/app-macos/Sources/BossMacApp.swift:1-111`
+- File / symbol: `tools/boss/app-macos/Sources/BossMacApp.swift:1-111`
   (entire file).
-* Current shape (111 lines): hand-rolled `@main` entry that calls
+- Current shape (111 lines): hand-rolled `@main` entry that calls
   `NSApplication.shared.run()`, installs a manual `NSMenu` for App
   / Edit / Debug menus, builds a single `NSWindow` hosting
   `ContentView` with `titleVisibility = .hidden`, `toolbarStyle =
-  .unified`, and `.fullSizeContentView`, then activates the app
+.unified`, and `.fullSizeContentView`, then activates the app
   and calls `DispatchEventsWindowController.shared.restoreIfNeeded()`.
-* Proposed: rewrite as `@main struct BossApp: App` with:
+- Proposed: rewrite as `@main struct BossApp: App` with:
   - one `WindowGroup` for the main window
     (`.windowToolbarStyle(.unified)`,
     `.windowResizability(.contentMinSize)`,
@@ -184,12 +184,12 @@ create` invocation at the end of this document — see
     "activate ignoring other apps" can be skipped on a fresh
     `App` launch, and `applicationShouldTerminateAfterLastWindowClosed`
     has a SwiftUI knob).
-* Minimum deployment target: macOS 15 (every primitive listed is
+- Minimum deployment target: macOS 15 (every primitive listed is
   available; the toolbar-style and toolbar-background-visibility
   knobs are the cleanest at macOS 15).
-* Expected line count after: ~35-45 lines. Net reduction: ~65-75
+- Expected line count after: ~35-45 lines. Net reduction: ~65-75
   lines.
-* Risk: high — this is the app entry point. Title-bar styling
+- Risk: high — this is the app entry point. Title-bar styling
   (`.fullSizeContentView`, hidden title, unified toolbar) must be
   visually pixel-equivalent so the Work sidebar's sidebar-material
   bleed (the comment at `ContentView.swift:189-197` explains this)
@@ -198,10 +198,10 @@ create` invocation at the end of this document — see
 
 ### 6. Replace `NativeWorkBoardScrollView` NSScrollView bridge with a SwiftUI `ScrollView`
 
-* File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:2074-2233`
+- File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:2074-2233`
   (`NativeWorkBoardScrollView` plus `WorkBoardScrollView`,
   `FlippedContentView`, `HorizontalOnlyClipView` helpers).
-* Current shape (~160 lines): `NSViewRepresentable` over
+- Current shape (~160 lines): `NSViewRepresentable` over
   `NSScrollView`, with:
   - a `WorkBoardScrollView` subclass exposing an `onLayout`
     callback on every `tile()` so the Coordinator can re-lay out
@@ -212,7 +212,7 @@ create` invocation at the end of this document — see
   - manual frame math for column placement (`columnWidth`,
     `spacing`, `horizontalPadding`) plus a `sync(columns:)` that
     diffs the hosting-view list against the SwiftUI column list.
-* Proposed:
+- Proposed:
   ```swift
   ScrollView(.horizontal, showsIndicators: true) {
       HStack(alignment: .top, spacing: workBoardColumnSpacing) {
@@ -228,13 +228,13 @@ create` invocation at the end of this document — see
   with each `workColumn(...)` already filling vertical space via
   the existing `.frame(maxHeight: .infinity, alignment: .topLeading)`
   modifier at `ContentView.swift:633`.
-* Minimum deployment target: macOS 15 — SwiftUI 14's horizontal
+- Minimum deployment target: macOS 15 — SwiftUI 14's horizontal
   `ScrollView` is the floor (`scrollClipDisabled` shipped in 14);
   we're already above that. Performance characteristics of nested
   `ScrollView` (per-column vertical lanes inside a single
   horizontal scroll) have improved materially on macOS 14+.
-* Expected line count after: ~10 lines. Net reduction: ~150 lines.
-* Risk: medium-high. The AppKit bridge is load-bearing for three
+- Expected line count after: ~10 lines. Net reduction: ~150 lines.
+- Risk: medium-high. The AppKit bridge is load-bearing for three
   reasons that need explicit verification:
   1. Vertical drift clamping (`HorizontalOnlyClipView` keeps
      `origin.y == 0`). SwiftUI horizontal-only `ScrollView`
@@ -259,19 +259,19 @@ create` invocation at the end of this document — see
 
 ### `ResizeDivider` (Boss/Picard pane divider)
 
-* File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:2236-2377`
+- File / symbol: `tools/boss/app-macos/Sources/ContentView.swift:2236-2377`
   (`ResizeDivider: NSViewRepresentable` + `ResizeDividerView:
-  NSView`). 142 lines.
-* Why it stays: PR #357 and PR #361 explicitly hold this divider's
+NSView`). 142 lines.
+- Why it stays: PR #357 and PR #361 explicitly hold this divider's
   drag behaviour and visible separator styling constant. The
   divider owns three things bundled together — cursor feedback,
   click-and-drag width adjustment, and the 1pt visible separator
   with hover/active tint — and the AppKit bridge is the only
   place that gets all three to compose inside the SwiftUI
   `overlay(alignment: .leading)` host.
-* macOS 15 brings `pointerStyle(.frameResize(...))` (used today in
+- macOS 15 brings `pointerStyle(.frameResize(...))` (used today in
   PR #361 for the sidebar overlay), which trivially replaces the
-  *cursor feedback* portion. It does **not** replace the drag math
+  _cursor feedback_ portion. It does **not** replace the drag math
   or the visible separator tinting. A future simplification might
   split this view into "SwiftUI separator + `pointerStyle` for
   cursor + minimal AppKit drag bridge", but that is a behavioural
@@ -280,8 +280,8 @@ create` invocation at the end of this document — see
 
 ### `GhosttyTerminalView` and friends
 
-* File / symbol: `tools/boss/app-macos/Sources/Ghostty/GhosttyTerminalView.swift:14-612`.
-* Why it stays: wraps the libghostty C API
+- File / symbol: `tools/boss/app-macos/Sources/Ghostty/GhosttyTerminalView.swift:14-612`.
+- Why it stays: wraps the libghostty C API
   (`ghostty_surface_new`, `ghostty_surface_key`, mouse event
   routing). There is no SwiftUI equivalent — this is a terminal,
   not a control. Out of scope.
@@ -311,10 +311,10 @@ matches that would justify a chore:
 
 Considered and discarded for this audit:
 
-* Liquid Glass redesign (`Toolbar(spacer:)`, refined
-  `.scrollEdgeEffect`, etc.) is a *visual* refresh, not a code
-  simplification. Adopting it would *grow* the diff, not shrink it.
-* Nothing in the audit above genuinely requires a macOS-26-only
+- Liquid Glass redesign (`Toolbar(spacer:)`, refined
+  `.scrollEdgeEffect`, etc.) is a _visual_ refresh, not a code
+  simplification. Adopting it would _grow_ the diff, not shrink it.
+- Nothing in the audit above genuinely requires a macOS-26-only
   modifier to land.
 
 Recommendation: keep the floor at macOS 15 until a concrete
@@ -323,15 +323,15 @@ our current floor.
 
 ## Aggregate
 
-| # | Floor | Net line delta (estimated) | Risk |
-|---|-------|---------------------------:|------|
-| 1 | 15    | -6  | low    |
-| 2 | 15    | -43 | medium |
-| 3 | 15    | -21 | medium (depends on #5) |
-| 4 | 15    | -67 | medium-high (depends on #5) |
-| 5 | 15    | -70 | high   |
-| 6 | 15    | -150 | medium-high |
-| **Total** | | **~-357** | |
+| #         | Floor | Net line delta (estimated) | Risk                        |
+| --------- | ----- | -------------------------: | --------------------------- |
+| 1         | 15    |                         -6 | low                         |
+| 2         | 15    |                        -43 | medium                      |
+| 3         | 15    |                        -21 | medium (depends on #5)      |
+| 4         | 15    |                        -67 | medium-high (depends on #5) |
+| 5         | 15    |                        -70 | high                        |
+| 6         | 15    |                       -150 | medium-high                 |
+| **Total** |       |                  **~-357** |                             |
 
 `ResizeDivider` (142 lines) is excluded from the total because it
 is not queued.

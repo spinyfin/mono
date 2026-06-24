@@ -15,10 +15,10 @@ the sanitised text and a list of `Finding`s describing each change), or `Block`
 (with findings the worker must fix by hand). Because it does no I/O and holds no
 global state, it is cheap to call on the engine's async threads.
 
-Two classes of rule apply on every call. *Rewrite* rules strip text that can be
+Two classes of rule apply on every call. _Rewrite_ rules strip text that can be
 removed automatically — Boss identifier shapes (`exec_…`, `proj_…`, `task_…`,
 `chg_…`, `boss/exec_…` branch names) and UUIDs that sit near the words "lease"
-or "cube" — collapsing leftover whitespace afterwards. *Block* rules flag
+or "cube" — collapsing leftover whitespace afterwards. _Block_ rules flag
 free-text phrases that leak internals ("Boss worker", "the engine", "PreToolUse",
 and similar) which a worker must rephrase rather than have machine-deleted. A set
 of baked-in patterns for both classes is always on; products can layer additional

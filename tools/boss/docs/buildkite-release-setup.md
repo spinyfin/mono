@@ -16,10 +16,10 @@ The `boss-release` step in `.buildkite/pipeline.yml` only fires when
 `BUILDKITE_SOURCE` is `schedule`, `ui`, or `api`. It does **not** fire on every
 merge to main. There are two normal trigger paths:
 
-| Trigger | When | Change-detection |
-|---|---|---|
-| Hourly cron schedule | Every hour at :00 | Skips if no Boss-affecting changes since last `boss-v*` tag |
-| `boss release` CLI (or BK UI/API) | On demand | Always releases (skips change-detection) |
+| Trigger                           | When              | Change-detection                                            |
+| --------------------------------- | ----------------- | ----------------------------------------------------------- |
+| Hourly cron schedule              | Every hour at :00 | Skips if no Boss-affecting changes since last `boss-v*` tag |
+| `boss release` CLI (or BK UI/API) | On demand         | Always releases (skips change-detection)                    |
 
 ---
 

@@ -15,7 +15,7 @@ emitting a `checkleft-<version>-source.tgz` tarball; the binary parses an
 optional `--output` path and drives the library. It depends only on third-party
 crates, none from the monorepo.
 
-The core responsibility is *manifest flattening*. Inside the monorepo,
+The core responsibility is _manifest flattening_. Inside the monorepo,
 `checkleft`'s `Cargo.toml` inherits its version, edition, and dependency
 versions from the workspace (`workspace = true` / `*.workspace = true`).
 Packaging rewrites that manifest into a fully resolved, standalone form:

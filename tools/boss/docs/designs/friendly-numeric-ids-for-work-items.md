@@ -49,7 +49,7 @@ The primary use cases are:
   refers to items by friendly id by default in chat, falling back
   to the primary id only when disambiguation requires it.
 - CLI surfaces (`boss task show`, `boss task list`, `boss chore
-  show`, `boss project show`, etc.) accept the friendly id as a
+show`, `boss project show`, etc.) accept the friendly id as a
   lookup key in addition to the primary id, and emit both the
   primary and the friendly id in JSON and human output.
 - Allocation is race-safe under concurrent creates from any surface
@@ -76,7 +76,7 @@ The primary use cases are:
   scaffolding.
 - **A separate human-readable slug or title shortener.** Tasks have
   a `name` already; if the user wants to refer to a task by name
-  they can. The friendly id is a *number*, not a slug or alias.
+  they can. The friendly id is a _number_, not a slug or alias.
 - **Search by friendly id beyond exact lookup.** No fuzzy match, no
   "did you mean #42?", no prefix completion in the CLI. If the user
   types `42` we look up `42`; if they type `42x` we error.
@@ -111,7 +111,7 @@ with Boss tasks unless prefixed). Format like `boss-T-42`.
   column the card lives in says it's a task; the product header says
   it's Boss). Repeating it in the id is noise.
 - Pronounceability suffers: "boss-tee-forty-two" is three tokens
-  where "forty-two" is one. The pronounceability *was* the point.
+  where "forty-two" is one. The pronounceability _was_ the point.
 - The user's stated end state is "a badge in the top-right of every
   card." A `boss-T-42` badge is wider than a card title sometimes;
   layout fights start.
@@ -119,7 +119,7 @@ with Boss tasks unless prefixed). Format like `boss-T-42`.
   primarily runs against Boss itself with occasional Flunge work),
   so the cross-product disambiguation that prefixes solve is
   solving a problem the user does not have.
-- We *would* still need the prefix scheme if cross-product chat
+- We _would_ still need the prefix scheme if cross-product chat
   became common — but we can add it later (Q1 below explains the
   graceful path) without invalidating the per-product numbers we
   hand out today.
@@ -135,11 +135,11 @@ forty-second; the millionth chore eventually gets `#1000000`.
 - Within a single product (the dominant case) it interleaves
   unrelated kinds: the user files three Boss tasks and a Flunge
   chore lands in the middle, and Boss's "task list" reads `#5, #6,
-  #8, #9` with #7 unaccounted-for in this product. Confusing.
+#8, #9` with #7 unaccounted-for in this product. Confusing.
 - Numbers grow faster than per-product sequences, so they get longer
   sooner. `#1234` is fine; `#123456` is not glanceable any more.
 - It conflates "what's the next number" with "what's the next number
-  *here*." The latter is the question the user actually asks ("how
+  _here_." The latter is the question the user actually asks ("how
   many tasks have we filed for Boss?"); the former is rarely useful.
 - The badge gets wider as numbers grow. Per-product sequences keep
   numbers small for years.
@@ -245,7 +245,7 @@ already tells the user which product it belongs to.
 The user's day-to-day vocabulary is "task #42" and "chore #43" and
 "project #44," and they want those three numbers distinct because
 they refer to three different rows. Per-product-per-kind would
-collide — there'd be a "task #42" *and* a "chore #42" and the
+collide — there'd be a "task #42" _and_ a "chore #42" and the
 coordinator would have to spell out the kind every time. Within a
 product, mixing kinds in one sequence is fine: the user's question
 is "where is row #42 on the board" and the answer is in exactly one
@@ -263,7 +263,7 @@ reads naturally inside a product's kanban.
 
 The coordinator says `Boss #42` (or `boss/#42` in machine output)
 when the chat involves more than one product in the same turn.
-This is a *display* convention applied by the coordinator and the
+This is a _display_ convention applied by the coordinator and the
 CLI's human formatter; it is not a separate id. The underlying
 column is still just `42`; the prefix is rendered. Q7 spells out
 the rule.
@@ -393,7 +393,7 @@ untouched.
 **Why not just `MAX(short_id) + 1` per insert:**
 
 That works only if every concurrent writer holds the same lock.
-SQLite *does* serialise writers, so in practice
+SQLite _does_ serialise writers, so in practice
 `MAX(short_id) + 1` would produce correct results — but it's
 implicit, fragile to future code paths that read without writing,
 and hard to reason about under any future move to Postgres. An
@@ -705,7 +705,7 @@ the principle that flags should mean exactly one thing.)
 
 **JSON output: always both fields, regardless of flag.**
 
-`--json` mode on every subcommand emits *both* `id` and
+`--json` mode on every subcommand emits _both_ `id` and
 `short_id` unconditionally. The hide-by-default behaviour applies
 only to human-readable text output; tools that pipe `--json`
 through `jq` already have to deal with the full record and
@@ -742,8 +742,8 @@ text says "id" (or `#999`), never "friendly id."
 
 **Consistency with the coordinator-referral rule (Q7).**
 
-Q7 instructs the coordinator to *prefer the friendly id when
-speaking to the user*, with the primary id quoted parenthetically
+Q7 instructs the coordinator to _prefer the friendly id when
+speaking to the user_, with the primary id quoted parenthetically
 on first mention in a session. The CLI's hide-by-default
 behaviour is the same pattern in a different surface: the
 friendly id is the user-facing handle, the primary id is
@@ -760,7 +760,7 @@ secondary colour, the `#` visible. No label, no caption,
 no qualifier — the badge is just `#42`.
 
 **No "friendly" anywhere the user reads.** From the user's
-perspective these are just *the* ids — the only ids they see
+perspective these are just _the_ ids — the only ids they see
 in the UI by default. The word "friendly" exists only in
 internal terminology (the schema column is `friendly_id` in
 some prose / `short_id` in code, the JSON field is `short_id`,
@@ -851,8 +851,8 @@ those don't apply.
 3. **Coordinator-side rule (CLAUDE.md addition):** a short
    paragraph in `.claude/CLAUDE.md` (the worker / coordinator
    instructions, already a checked-in file) instructing the
-   coordinator to *prefer the friendly id when speaking to the
-   user* and to fall back to the primary id only when:
+   coordinator to _prefer the friendly id when speaking to the
+   user_ and to fall back to the primary id only when:
    - the friendly id would be ambiguous across products in the
      same chat turn (use `Boss #42` / `Flunge #7` in that case);
    - the user explicitly asked for the primary id;
@@ -1021,7 +1021,7 @@ work can interleave once the schema lands.
 
 8. **(Optional follow-up) Filter / sort by `short_id`.**
    - `boss task list --sort short-id` and `--filter
-     short-id=<n..m>`. Cheap; ship if anyone asks.
+short-id=<n..m>`. Cheap; ship if anyone asks.
 
 The implementation chores get filed as `kind = 'chore'` rows
 against the Boss product once this design is approved. Each
@@ -1166,7 +1166,7 @@ order in which they ship is irrelevant.
 
 **R8 — Multi-user / multi-engine in the future.** A second engine
 process pointed at the same SQLite file would serialise writes
-correctly. A second engine process with its *own* SQLite file
+correctly. A second engine process with its _own_ SQLite file
 would have its own per-product counters, which is the expected
 behaviour. If we ever consolidate to a single shared DB across
 multiple engine instances, the allocator just keeps working
@@ -1199,4 +1199,3 @@ Not in v1. Boss has two products; the user calls them by slug
 ("boss", "flunge"). If Boss ever has dozens of products, we
 revisit. The cost of adding it later is one more column on one
 more table.
-

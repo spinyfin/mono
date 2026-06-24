@@ -10,8 +10,8 @@ slot. The cube pool was healthy (12+ free `mono` workspaces), so the failure
 was inside Boss's dispatch pipeline rather than at the cube boundary.
 
 Every observable surface the operator could read — kanban status, `bossctl
-agents list`, `bossctl workspace summary` — gave the *outcome state* but no
-signal about *which step in the pipeline failed*. Engine logs in
+agents list`, `bossctl workspace summary` — gave the _outcome state_ but no
+signal about _which step in the pipeline failed_. Engine logs in
 `/tmp/boss-engine.log` carried the necessary detail, but had to be tailed and
 grepped by hand and weren't attributable back to a specific `execution_id`
 without re-deriving state.
@@ -29,7 +29,7 @@ operator (or a coordinator session) can read them.
 
 - Engine-side decision-making off log content (no auto-retry, no escalation
   rules driven by parsed log lines). The stream is for humans and tooling.
-- Replacing `tracing` for general engine logging. This design adds a *parallel*
+- Replacing `tracing` for general engine logging. This design adds a _parallel_
   structured stream targeted at the dispatch pipeline; ad-hoc engine info /
   warn / error logging still goes through `tracing` to
   `/tmp/boss-engine.log`.
@@ -87,7 +87,7 @@ a per-execution stage-by-stage record — and we couldn't.
 A second writer alongside `tracing`, with a narrow, stable schema. The schema
 is a JSONL file — one event per line — keyed by `execution_id` and stage. This
 is the canonical persistence surface. `tracing` continues to log freely; the
-structured stream is never the *only* place a fact lives, but it *is* the only
+structured stream is never the _only_ place a fact lives, but it _is_ the only
 place an operator should need to read.
 
 **File layout** (under `~/Library/Application Support/Boss/`, the same root
@@ -147,17 +147,17 @@ query.
 
 `details` is the per-stage open object. Recommended payloads:
 
-| stage | recommended `details` keys |
-|---|---|
-| `request_recorded` | `priority`, `preferred_workspace_id`, `force`, `live_check_result` |
-| `ready_or_reused` | `existing_execution_id`, `existing_status`, `decision` ("inserted_ready" / "reused_live" / "abandoned_stale") |
-| `worker_claimed` | `pool_capacity`, `idle_count_before`, `affinity_match`, `forced` |
-| `cube_repo_ensured` | `repo_remote_url` |
-| `cube_workspace_leased` | `prefer_workspace_id_request`, `prefer_workspace_id_actual`, `affinity_hit` |
-| `cube_change_created` | `change_id`, `change_title` |
-| `run_started` | `auto_advance_status_to_active` |
-| `pane_spawned` | `app_session_registered`, `summary` |
-| `handshake_observed` | `first_hook_event`, `via` ("payload_run_id" / "ancestor_walk") |
+| stage                   | recommended `details` keys                                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `request_recorded`      | `priority`, `preferred_workspace_id`, `force`, `live_check_result`                                            |
+| `ready_or_reused`       | `existing_execution_id`, `existing_status`, `decision` ("inserted_ready" / "reused_live" / "abandoned_stale") |
+| `worker_claimed`        | `pool_capacity`, `idle_count_before`, `affinity_match`, `forced`                                              |
+| `cube_repo_ensured`     | `repo_remote_url`                                                                                             |
+| `cube_workspace_leased` | `prefer_workspace_id_request`, `prefer_workspace_id_actual`, `affinity_hit`                                   |
+| `cube_change_created`   | `change_id`, `change_title`                                                                                   |
+| `run_started`           | `auto_advance_status_to_active`                                                                               |
+| `pane_spawned`          | `app_session_registered`, `summary`                                                                           |
+| `handshake_observed`    | `first_hook_event`, `via` ("payload_run_id" / "ancestor_walk")                                                |
 
 `error_chain` is `format!("{err:#}")` split on `: `, so a `cube workspace
 lease` failure surfaces every layer of the anyhow chain (cube CLI stderr →
@@ -195,7 +195,7 @@ Stage emission points:
 - `ExecutionCoordinator::schedule_execution` → 4, 5, 6, 7 around each cube
   call and the `start_execution_run` boundary.
 - `start_worker` (`spawn_flow.rs`) → 8 on `SpawnWorkerPane` success/error.
-- `events_socket::handle_connection` → 9 on the *first* successfully
+- `events_socket::handle_connection` → 9 on the _first_ successfully
   correlated hook event per run id. The sink needs an internal "have we seen
   a handshake for run X yet" flag so subsequent hook events don't re-emit.
 
@@ -206,12 +206,12 @@ already tracks executions in flight; on a periodic tick (default 30s) the
 sink emits one `stage_stalled` event for every execution whose latest stage
 is older than a per-stage threshold:
 
-| stage | stall threshold |
-|---|---|
-| `request_recorded` → `worker_claimed` | 60s (pool exhaustion is the common case; threshold gates "real" stalls) |
-| `worker_claimed` → `cube_workspace_leased` | 30s |
-| `cube_workspace_leased` → `pane_spawned` | 30s |
-| `pane_spawned` → `handshake_observed` | 60s (worker shell + claude startup is slow) |
+| stage                                      | stall threshold                                                         |
+| ------------------------------------------ | ----------------------------------------------------------------------- |
+| `request_recorded` → `worker_claimed`      | 60s (pool exhaustion is the common case; threshold gates "real" stalls) |
+| `worker_claimed` → `cube_workspace_leased` | 30s                                                                     |
+| `cube_workspace_leased` → `pane_spawned`   | 30s                                                                     |
+| `pane_spawned` → `handshake_observed`      | 60s (worker shell + claude startup is slow)                             |
 
 These thresholds are conservative defaults; the operator changes them in the
 runtime config if the local machine is slow. A stalled stage is not an error —
@@ -267,15 +267,15 @@ a topic that just broadcasts each event line is a small later addition.
 ## What this replaces / augments
 
 - The current `tracing::warn!(pool_capacity, "worker pool exhausted; deferring
-  dispatch …")` becomes a structured `worker_claimed` skip event. The tracing
+dispatch …")` becomes a structured `worker_claimed` skip event. The tracing
   log stays for human readability; the structured event is what tooling reads.
 - The `tracing::warn!(ghost_active = ?orphans, …)` invariant log becomes a
   surfaced `bossctl dispatch ghost-active` query plus a `stage_stalled` for
   every offending execution.
 - The detailed `tracing::error!(execution_id, work_item_id, worker_id,
-  cube_repo_id, error = "{err:#}", "cube workspace lease failed; …")` line at
+cube_repo_id, error = "{err:#}", "cube workspace lease failed; …")` line at
   `coordinator.rs:752` is the model for how stage failures should already be
-  attributed. The structured stream just makes that the *contract* rather
+  attributed. The structured stream just makes that the _contract_ rather
   than a per-callsite convention.
 
 ## Implementation phases
@@ -288,7 +288,7 @@ Vertical slices, each independently mergeable.
   `RecordingSink` test double.
 - `DispatchEvent` struct + `Stage` enum in `engine/src/`.
 - File path resolver under the existing Boss state root.
-- Wire up exactly *one* stage end-to-end (stage 5: `cube_workspace_leased`,
+- Wire up exactly _one_ stage end-to-end (stage 5: `cube_workspace_leased`,
   ok + error) so the file writer has a real consumer and the schema is
   tested before fanning out.
 
@@ -361,7 +361,7 @@ Vertical slices, each independently mergeable.
   is the on-disk evidence of the dispatch half of that lifecycle, and the
   natural seed for the Phase F per-run transcript model.
 - [`worker-live-status`](worker-live-status.md) — `live_worker_states.activity`
-  / `live_status` are the *steady-state* worker observability surface. Once a
+  / `live_status` are the _steady-state_ worker observability surface. Once a
   run is past stage 9 (handshake observed), live-status takes over. This
   design owns the gap between "execution requested" and "first hook event
   observed."

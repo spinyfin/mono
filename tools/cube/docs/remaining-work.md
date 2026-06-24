@@ -65,7 +65,7 @@ directly.
   `cube workspace heartbeat --lease <id> [--ttl-seconds <n>]` extends
   the expiry, `cube workspace release --reason <text> --keep-dirty`
   records reasons and skips reset for crash forensics, `cube workspace
-  force-release` frees a stuck lease without running the workspace
+force-release` frees a stuck lease without running the workspace
   reset. Stale leases are reclaimed by `expire_stale_leases` at the
   start of every `lease`. New columns: `lease_expires_at_epoch_s`,
   `last_release_reason`.

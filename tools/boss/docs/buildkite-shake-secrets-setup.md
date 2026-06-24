@@ -23,10 +23,10 @@ credential-embedded release build distinct from the credential-free PR build).
 
 ## Secret names
 
-| Secret name | Description |
-|---|---|
-| `BOSS_SHAKE_APP_ID` | Numeric GitHub App ID (e.g. `12345`) |
-| `BOSS_SHAKE_INSTALLATION_ID` | Numeric installation ID for the `spinyfin/mono` installation |
+| Secret name                  | Description                                                        |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `BOSS_SHAKE_APP_ID`          | Numeric GitHub App ID (e.g. `12345`)                               |
+| `BOSS_SHAKE_INSTALLATION_ID` | Numeric installation ID for the `spinyfin/mono` installation       |
 | `BOSS_SHAKE_PRIVATE_KEY_PEM` | Full RSA private key PEM including `-----BEGIN`/`-----END` markers |
 
 These names are verbatim — copy them exactly into Buildkite.

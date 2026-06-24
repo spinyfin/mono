@@ -12,7 +12,7 @@ The current `sandbox-v1` wasm runtime is a hand-rolled CORE-wasm ABI. Authors wr
 This document audits `sandbox-v1`, then proposes re-architecting the wasm tier onto the Component Model so that:
 
 1. **Ergonomic typed authoring** — an author writes `fn check(input: CheckInput) -> Vec<Finding>` against real Rust structs. No pointers, no manual `memory.grow`/offset math. All marshalling is generated glue (`wit-bindgen` on the guest, `wasmtime::component::bindgen!` on the host).
-2. **Capability-scoped file access** — checks *can* read files, but the **host** decides and enforces exactly which paths each invocation may read. Deny-by-default, finer than whole-FS.
+2. **Capability-scoped file access** — checks _can_ read files, but the **host** decides and enforces exactly which paths each invocation may read. Deny-by-default, finer than whole-FS.
 
 The current `sandbox-v1` restrictions are not sacrosanct; a fresh-slate rewrite of the wasm tier is explicitly in scope and is what this design recommends.
 
@@ -32,7 +32,7 @@ The current `sandbox-v1` restrictions are not sacrosanct; a fresh-slate rewrite 
 - Multi-language guest authoring in v1. Rust-only is acceptable and aligns with the wit-bindgen/`cargo component` sweet spot (this preserves the T1371/PR 1372 decision). The WIT contract does not preclude other guest languages later, but no non-Rust SDK ships in v1.
 - Replacing or re-litigating the **declarative** (`declarative-v1`) tier. The declarative tier keeps owning the "run an arbitrary binary" use case (e.g. `buildifier`). This project only re-architects the **wasm** tier.
 - Network access from checks. Checks remain pure-compute plus host-mediated file reads. No host-imported network capability.
-- Write access to the working tree from checks. `SuggestedFix`/`FileEdit` data flows *out* as part of findings (already in the output schema); checks never mutate files directly.
+- Write access to the working tree from checks. `SuggestedFix`/`FileEdit` data flows _out_ as part of findings (already in the output schema); checks never mutate files directly.
 - A general OS-process sandbox for wasm guests. Wasm's own isolation plus the host capability boundary is the sandbox; we are not adding seccomp/Landlock/sandbox-exec around the host process for this tier.
 - Remote/registry distribution of components beyond what the existing external-URL provider path already does. Fetch/caching of remote components is called out as future work, not a v1 blocker.
 
@@ -44,7 +44,7 @@ Source: `tools/checkleft/src/external/runtime.rs`, `mod.rs`, `command_policy.rs`
 
 - **Two execution paths in one function.** `DefaultExternalCheckExecutor::execute_artifact` first tries a CORE-wasm module path (`execute_core_artifact`); on an `ArtifactMismatch` it falls back to a "component" path (`execute_component_artifact`).
 - **The core path is a hand-rolled ABI.** The module must export `memory` and `checkleft_run: (i32, i32) -> i64`. The host serializes `{changeset, config, capabilities}` to JSON, writes it into the guest's linear memory at offset 0 (growing memory by hand via `ensure_memory_capacity`), calls `checkleft_run(offset, len)`, and decodes the `i64` return as a packed `(offset << 32) | len` pointing at the output JSON, which it then reads back out of linear memory. The guest is responsible for allocating that output buffer and packing the pointer.
-- **The "component" path is not a real Component-Model interface.** It expects an export `run: (string) -> (string)` and passes the *same JSON string* both ways (`call_component_run`). It uses `wasmtime::component`, but there are **no WIT records** — no lifting/lowering of typed structs. It is the core ABI's manual JSON marshalling wearing a component costume.
+- **The "component" path is not a real Component-Model interface.** It expects an export `run: (string) -> (string)` and passes the _same JSON string_ both ways (`call_component_run`). It uses `wasmtime::component`, but there are **no WIT records** — no lifting/lowering of typed structs. It is the core ABI's manual JSON marshalling wearing a component costume.
 - **Limits.** Fuel only, fixed at `EXECUTION_FUEL_LIMIT = 10_000_000`, set per store. No epoch deadline, no wall-clock timeout, no configured memory cap, no per-check override.
 - **No AOT / no cache.** `Module::new` / `Component::new` recompile the artifact from bytes on **every** invocation. The `Engine` is reused, but compiled artifacts are not cached to disk (`.cwasm`) or in memory across runs.
 - **Capabilities are vestigial for wasm.** The manifest `capabilities.commands` list is intersected with a global ceiling (`cat`, `grep`, `sed`, `wc`) in `command_policy.rs` and serialized into the input JSON — but the guest is pure wasm with **no host imports**, so there is no way for a guest to actually run a command. The grant is plumbed but inert in this tier. (It is a leftover from when wasm and exec shared a path; the exec use case now lives in the declarative tier.)
@@ -53,14 +53,14 @@ Source: `tools/checkleft/src/external/runtime.rs`, `mod.rs`, `command_policy.rs`
 
 ### Gap list against the two hard requirements
 
-| Requirement | Current state | Gap |
-|---|---|---|
-| Ergonomic typed authoring | Guest hand-writes `checkleft_run(i32,i32)->i64`, allocates output buffer, packs pointer; or `run(string)->(string)` with manual JSON. | No typed records, no generated glue. Authors see pointers and linear memory. Fails the requirement. |
+| Requirement                   | Current state                                                                                                                                          | Gap                                                                                                                                                                                                                                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ergonomic typed authoring     | Guest hand-writes `checkleft_run(i32,i32)->i64`, allocates output buffer, packs pointer; or `run(string)->(string)` with manual JSON.                  | No typed records, no generated glue. Authors see pointers and linear memory. Fails the requirement.                                                                                                                                                                                                                   |
 | Capability-scoped file access | `execute()` receives `&dyn SourceTree` but ignores it (`_source_tree`). Guest gets `{changeset, config, capabilities}` JSON only. No host file import. | Checks cannot read files at all. This is almost certainly because `sandbox-v1` is bare core-wasm with **no WASI wired in** — there are no host imports for file I/O and no WASI preopen. The fix is to **adopt WASI** (specifically `wasm32-wasip2`), not to design a bespoke file-access ABI. Fails the requirement. |
-| Limits as policy | Fixed `consume_fuel` budget, no overrides, no timeout, no memory cap. | No epoch deadline, no configurable memory, no per-check/per-bundle knobs. |
-| Performance | Recompiles artifact every invocation; no `.cwasm` cache. | Wasted compile cost per run; the one thing wasm-in-process is supposed to win (cheap repeated invocation) is left on the table. |
-| Bundling/discovery | One artifact, one check. | No "one component, N checks" / `list-checks`. |
-| Capability surface clarity | `capabilities.commands` plumbed into wasm input but unusable by a pure guest. | Misleading dead surface that should be removed from the wasm tier. |
+| Limits as policy              | Fixed `consume_fuel` budget, no overrides, no timeout, no memory cap.                                                                                  | No epoch deadline, no configurable memory, no per-check/per-bundle knobs.                                                                                                                                                                                                                                             |
+| Performance                   | Recompiles artifact every invocation; no `.cwasm` cache.                                                                                               | Wasted compile cost per run; the one thing wasm-in-process is supposed to win (cheap repeated invocation) is left on the table.                                                                                                                                                                                       |
+| Bundling/discovery            | One artifact, one check.                                                                                                                               | No "one component, N checks" / `list-checks`.                                                                                                                                                                                                                                                                         |
+| Capability surface clarity    | `capabilities.commands` plumbed into wasm input but unusable by a pure guest.                                                                          | Misleading dead surface that should be removed from the wasm tier.                                                                                                                                                                                                                                                    |
 
 **Conclusion of the audit:** the prototype's pain is the bespoke ABI, not wasm. The Component Model directly closes the two top-row gaps (typed authoring, capability file access via host imports) and gives us the limit/cache/bundling story for the rest. The bespoke path should be superseded, not evolved.
 
@@ -76,7 +76,7 @@ Rejected: this reinvents, by hand and worse, exactly what the Component Model's 
 
 We came close to choosing this route project-wide. A check is an arbitrary binary; the host invokes it with a JSON payload on stdin, reads findings on stdout, and wraps it in an OS sandbox (bazel-style).
 
-Rejected **as the wasm-tier replacement**, but explicitly **kept for what it is good at.** The exec model *already exists* as the declarative tier (`declarative-v1`), which subsumes the former exec tier via the `passthrough` transform and owns the "wrap an existing binary like buildifier" use case. For the *typed-Rust-check* sweet spot it loses on three axes: (1) per-invocation process spawn cost (~1-5 ms each) versus in-process instantiation (~tens of µs); (2) OS-sandbox portability — a deny-by-default file capability that behaves identically on macOS and Linux CI agents is genuinely hard with `sandbox-exec`/Landlock/seccomp and is precisely the problem the declarative tier defers; (3) "typed function over real structs" still requires every author to hand-roll JSON (de)serialization in their language. The two tiers are complementary: declarative for "any binary, framework-invoked," wasm/component for "sandboxed typed check with host-scoped file reads."
+Rejected **as the wasm-tier replacement**, but explicitly **kept for what it is good at.** The exec model _already exists_ as the declarative tier (`declarative-v1`), which subsumes the former exec tier via the `passthrough` transform and owns the "wrap an existing binary like buildifier" use case. For the _typed-Rust-check_ sweet spot it loses on three axes: (1) per-invocation process spawn cost (~1-5 ms each) versus in-process instantiation (~tens of µs); (2) OS-sandbox portability — a deny-by-default file capability that behaves identically on macOS and Linux CI agents is genuinely hard with `sandbox-exec`/Landlock/seccomp and is precisely the problem the declarative tier defers; (3) "typed function over real structs" still requires every author to hand-roll JSON (de)serialization in their language. The two tiers are complementary: declarative for "any binary, framework-invoked," wasm/component for "sandboxed typed check with host-scoped file reads."
 
 ### C. Native dynamic plugins (`cdylib` + `dlopen`)
 
@@ -211,9 +211,9 @@ fn run(input: CheckInput) -> Vec<Finding> {
 fn check_deps(input: CheckInput) -> Vec<Finding> { /* ... */ }
 ```
 
-  The `#[check]` macro registers the function in the component's `list-checks`/`run-check` dispatch table and records the declared `access-scope` (defaulting to `modified-only`). Authors never touch the WIT bindings, pointers, or memory.
+The `#[check]` macro registers the function in the component's `list-checks`/`run-check` dispatch table and records the declared `access-scope` (defaulting to `modified-only`). Authors never touch the WIT bindings, pointers, or memory.
 
-- **Build:** `cargo component build --target wasm32-wasip2` produces the component `.wasm`. The `wasm32-wasip2` target is required (not `wasm32-unknown-unknown`) because it maps `std::fs` onto WASI-p2 interfaces that the host services. A bazel rule wraps this for hermetic, reproducible builds and emits the sha256 that goes in the manifest. There is **no existing rules_rust wasm-component rule in this repo today** (the `musl/` tooling cross-compiles the *host* binary, not guests), so the bazel guest-build rule is real new infra and is sized accordingly in the task breakdown (T9).
+- **Build:** `cargo component build --target wasm32-wasip2` produces the component `.wasm`. The `wasm32-wasip2` target is required (not `wasm32-unknown-unknown`) because it maps `std::fs` onto WASI-p2 interfaces that the host services. A bazel rule wraps this for hermetic, reproducible builds and emits the sha256 that goes in the manifest. There is **no existing rules_rust wasm-component rule in this repo today** (the `musl/` tooling cross-compiles the _host_ binary, not guests), so the bazel guest-build rule is real new infra and is sized accordingly in the task breakdown (T9).
 
 ### Host runtime
 
@@ -247,7 +247,7 @@ Checks read files with **ordinary `std::fs` APIs** — no checkleft-specific cal
 
 ### AOT compilation + caching
 
-- Precompile with `Engine::precompile_component` to a `.cwasm`, cached on disk keyed by **`(artifact_sha256, wasmtime_version, engine_config_hash, target_triple)`**. Load with `Component::deserialize_file` (trusted: checkleft produced the file). The cache key *must* include the wasmtime version because `.cwasm` is not portable across wasmtime releases — this is the central version-discipline risk (see Risks).
+- Precompile with `Engine::precompile_component` to a `.cwasm`, cached on disk keyed by **`(artifact_sha256, wasmtime_version, engine_config_hash, target_triple)`**. Load with `Component::deserialize_file` (trusted: checkleft produced the file). The cache key _must_ include the wasmtime version because `.cwasm` is not portable across wasmtime releases — this is the central version-discipline risk (see Risks).
 - Instantiate per-invocation in-process; no process spawn.
 - **Cost story (to be measured in implementation, expected order-of-magnitude):**
   - Today (`sandbox-v1`): full `Module::new` compile **per invocation** — the dominant, repeated cost.
@@ -261,12 +261,14 @@ The per-invocation filesystem sandbox is designed as a **standalone, runtime-agn
 ### Interface
 
 **Inputs:**
+
 - `changeset: &ChangeSet` — the set of files modified in this change.
 - `scope: AccessScope` — the declared access scope (default: `ModifiedOnly`; see below).
 - `source_tree: &dyn SourceTree` — the repository file tree, used to materialise content for virtual or git-backed trees.
 - `ceiling: HostCeiling` — the host-enforced maximum (e.g. repo root, read-only); the module intersects the declared scope with this ceiling.
 
 **Behavior:**
+
 1. Resolve the **allowlist** from `scope`:
    - `ModifiedOnly` (default): allowlist = `changeset.changed_files` paths only.
    - `WholeRepo`: allowlist = all paths under the repo root, subject to `ceiling`.
@@ -275,6 +277,7 @@ The per-invocation filesystem sandbox is designed as a **standalone, runtime-agn
 3. Apply **path normalisation** (`validate_relative_path`) and reject `..` traversal during allowlist resolution; escape attempts fail structurally.
 
 **Outputs:**
+
 - `sandbox_root: TempDir` — the populated sandbox directory. The caller is responsible for its lifetime; dropping it removes the sandbox.
 - `allowed_paths: Vec<RepoRelativePath>` — the materialised path list, for audit and logging.
 
@@ -383,12 +386,12 @@ The manifest's `artifact_sha256` field must be pinned at build time, not compute
 
 ### Custom rules and toolchain declarations required
 
-| Rule / Declaration | Purpose | Upstream support |
-|---|---|---|
-| `wasm_wasip2_toolchain` | Register the `wasm32-wasip2` Rust cross-compiler triple and its sysroot under bazel | Configuration targets — no new rule body, but must be written; does not exist in-repo today |
-| `wasm_tools_toolchain` | Declare the `wasm-tools` CLI binary as a hermetic bazel toolchain, pinned to a specific version | New toolchain declaration |
-| `rust_wasm_component` | Compile a Rust guest crate to wasm via `rules_rust`, then componentize via `wasm-tools`, and emit a sha256 sidecar | **New custom rule** — not in `rules_rust` or any upstream |
-| `.wit` data exposure | Expose the `checkleft:check` WIT package as a declared bazel `data` dependency visible to the `wit-bindgen` proc-macro at compile time | `data` attribute on existing `rust_library` targets — no new rule |
+| Rule / Declaration      | Purpose                                                                                                                                | Upstream support                                                                            |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `wasm_wasip2_toolchain` | Register the `wasm32-wasip2` Rust cross-compiler triple and its sysroot under bazel                                                    | Configuration targets — no new rule body, but must be written; does not exist in-repo today |
+| `wasm_tools_toolchain`  | Declare the `wasm-tools` CLI binary as a hermetic bazel toolchain, pinned to a specific version                                        | New toolchain declaration                                                                   |
+| `rust_wasm_component`   | Compile a Rust guest crate to wasm via `rules_rust`, then componentize via `wasm-tools`, and emit a sha256 sidecar                     | **New custom rule** — not in `rules_rust` or any upstream                                   |
+| `.wit` data exposure    | Expose the `checkleft:check` WIT package as a declared bazel `data` dependency visible to the `wit-bindgen` proc-macro at compile time | `data` attribute on existing `rust_library` targets — no new rule                           |
 
 The `rust_wasm_component` rule is the largest single piece of new bazel infrastructure. It encapsulates the cross-compile + componentize + sha256-emit pipeline into one bazel target, so a check author writes a single target declaration:
 
@@ -424,42 +427,52 @@ The host-side bazel build (checkleft binary, executor, FS-sandbox module) is sta
 Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks share a dependency level and may run in parallel. Effort hint ∈ `trivial | small | medium | large`.
 
 ### T1 — WIT contract package
+
 **Scope:** Add the in-tree `checkleft:check@0.1.0` WIT package (`types`, `host-fs`, `check` world) mirroring `input.rs`/`output.rs`. Includes the `access-scope` variant type and the updated `check-descriptor` record (with `access-scope: option<access-scope>` replacing the former `reads` field). Includes a host-side `bindgen!` smoke test that the WIT compiles and a doc comment mapping each WIT record to its Rust counterpart. No behavior wired yet.
 **Effort:** small. **Depends on:** none.
 
 ### T2 — Guest SDK crate (`checkleft-check-sdk`)
+
 **Scope:** New guest crate wrapping `wit-bindgen` with the `#[check(name, access_scope?)]` macro (defaulting to `modified-only` when no `access_scope` is given), the `list-checks`/`run-check` dispatch table, and a `CheckInput::config::<T>()` serde helper over `config-json`. Ships a trivial example check that compiles to a component. Authors see only native structs and never touch WIT bindings or `access-scope` unless they need broader access.
 **Effort:** medium. **Depends on:** T1.
 
 ### T3 — Host component executor (typed call path)
+
 **Scope:** Rewrite `DefaultExternalCheckExecutor` to load a component, build a `Store<HostState>` and `Linker`, instantiate, and call `list-checks`/`run-check`, lifting `list<finding>` into `Finding`. No file capability or cache yet (stub `host-fs` that denies all). Replaces the core/fake-component paths' call mechanics.
-**Effort:** medium. **Depends on:** T1. *(Parallel with T2 — both depend only on T1.)*
+**Effort:** medium. **Depends on:** T1. _(Parallel with T2 — both depend only on T1.)_
 
 ### T3a — Shared FS sandbox module
+
 **Scope:** Implement the standalone, runtime-agnostic FS sandbox module defined in §Shared FS sandbox module. Inputs: a changeset, a declared `AccessScope` (defaulting to `ModifiedOnly`), a `SourceTree` reference, and a `HostCeiling`. Behavior: resolve the allowlist per the declared scope (`ModifiedOnly` → changeset paths only; `WholeRepo` → all paths under ceiling; `Globs(patterns)` → glob expansion ∪ changeset, intersected with ceiling), create a per-invocation temp directory, populate it by hardlink (same filesystem) or by materialising content from `SourceTree` for virtual/git-backed trees, preserving repo-relative paths, and apply path normalisation plus `..` traversal rejection throughout. Outputs: the sandbox-root `TempDir` and the materialised path list. Unit tests for all three scope variants, traversal-escape rejection, and virtual-tree materialisation. No WASI, no wasm dependency — pure Rust, consumable by any runtime.
-**Effort:** medium. **Depends on:** none. *(Pure Rust; can start immediately in parallel with T1.)*
+**Effort:** medium. **Depends on:** none. _(Pure Rust; can start immediately in parallel with T1.)_
 
 ### T4 — WASI integration: consume shared FS sandbox module as preopen
+
 **Scope:** Wire the shared FS sandbox module (T3a) into the wasm executor: after T3a produces the sandbox root for the check's declared `access-scope`, call `WasiCtxBuilder::preopened_dir(sandbox_root, "/")` to create the `WasiCtx` and pass it into the `Store<HostState>`. The guest reads via `std::fs` with no checkleft-specific call; capability enforcement is structural. Integration tests for the full grant/deny/traversal-escape path exercised through a running wasm component.
 **Effort:** small. **Depends on:** T3, T3a.
 
 ### T5 — Limit / timeout policy
+
 **Scope:** Epoch-based deadline (engine epoch ticking + store deadline), memory `ResourceLimiter`, generous defaults, and manifest `limits.{timeout_ms,max_memory_mb}` overrides clamped by a host ceiling. Tests for timeout trip and memory cap trip.
-**Effort:** medium. **Depends on:** T3. *(Parallel with T4 and T6.)*
+**Effort:** medium. **Depends on:** T3. _(Parallel with T4 and T6.)_
 
 ### T6 — AOT precompile + `.cwasm` cache
+
 **Scope:** `precompile_component` → on-disk `.cwasm` cache keyed by `(artifact_sha256, wasmtime_version, engine_config_hash, target)`, with safe deserialize-on-load and cache-miss rebuild. Benchmark cold vs. warm invocation to validate the cost story.
-**Effort:** medium. **Depends on:** T3. *(Parallel with T4 and T5.)*
+**Effort:** medium. **Depends on:** T3. _(Parallel with T4 and T5.)_
 
 ### T7 — Manifest schema for `component` mode
+
 **Scope:** Add `mode = "component"` / `runtime = "component-v1"` to the TOML schema in `mod.rs` (`RawExternalCheckMode::Component`, `validate_runtime_for_mode`), carrying `artifact_path`, `artifact_sha256`, optional `limits`, optional `checks` allowlist. Remove the `wasm`/`sandbox-v1` mode and its now-inert `capabilities.commands` handling for this tier. Parser tests.
-**Effort:** small. **Depends on:** T1. *(Parallel with T2/T3.)*
+**Effort:** small. **Depends on:** T1. _(Parallel with T2/T3.)_
 
 ### T8 — Provider + CHECKS rework for component discovery
+
 **Scope:** Map one component artifact to N logical packages (one per `list-checks` export, carrying a `run-check` selector); rework the bundled provider (`bundled.rs`) to `include_bytes!` component bytes; ensure name-based resolution (bundled + exec-path CHECKS `check_definitions`) resolves to the right component+export. Tests across composite-provider resolution.
 **Effort:** medium. **Depends on:** T3, T7.
 
 ### T9 — Bazel rules for wasm component checks
+
 **Scope:** All new bazel infrastructure required to build a `checkleft-check-sdk` guest crate into a `wasm32-wasip2` Component Model component under bazel end-to-end. This is first-class migration work, not an afterthought. Concretely:
 
 1. **`wasm32-wasip2` toolchain registration.** Register the `wasm32-wasip2` Rust cross-compiler triple (and its pre-built `std` sysroot) as a `rust_toolchain` / `platform()` target pair under bazel. `rules_rust` supports arbitrary cross-compile triples; this is new toolchain configuration, not a new rule body, but it does not exist in-repo today.
@@ -472,10 +485,12 @@ Tasks are PR-sized and listed in dependency order. "Depth" notes which tasks sha
 **Effort:** large. **Depends on:** T2.
 
 ### T10 — Port `rust-giant-structs-use-builder` as the end-to-end proof
+
 **Scope:** Re-author the check on the guest SDK (superseding the T1444 `sandbox-v1` port), build it via the `rust_wasm_component` bazel rule (T9) — **not via cargo, not via a shell script** — bundle/resolve it via T8, and run it through the new host (T3-T6) in an end-to-end test that exercises a capability-scoped file read with the default `modified-only` scope and a real finding. This is the project's acceptance proof; the proof is only valid if the check is built end-to-end under bazel.
-**Effort:** medium. **Depends on:** T2, T3a, T4, T8, T9. *(T5/T6 should also be landed for a realistic run, but are not strictly gating the proof's correctness.)*
+**Effort:** medium. **Depends on:** T2, T3a, T4, T8, T9. _(T5/T6 should also be landed for a realistic run, but are not strictly gating the proof's correctness.)_
 
 ### T11 — Remove `sandbox-v1` runtime and dead capability surface
+
 **Scope:** Delete the hand-rolled core ABI and fake-component paths from `runtime.rs`, the `sandbox-v1` constants, and the inert wasm-tier `capabilities.commands` plumbing. Update tests/docs. Strictly after nothing resolves to `sandbox-v1`.
 **Effort:** small. **Depends on:** T8, T10.
 

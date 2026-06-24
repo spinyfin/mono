@@ -200,7 +200,7 @@ Build the SwiftUI app.
 9. **App skeleton**: Create a SwiftUI app with a single window, chat message
    list, and text input.
 10. **Engine connection**: Connect to the engine's Unix socket, send/receive
-   JSON messages.
+    JSON messages.
 11. **Streaming display**: Parse incoming chunks and update the chat view in
     real time.
 12. **Tool call display**: Show basic tool call status inline in the chat.

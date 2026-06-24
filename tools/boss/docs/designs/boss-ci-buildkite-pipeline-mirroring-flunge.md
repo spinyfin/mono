@@ -41,7 +41,7 @@ This design proposes the structural fix: a buildkite pipeline for the mono repo,
 
 GitHub Actions is the obvious "free" option: no infra to stand up, no agent fleet to manage, native PR integration. Rejected:
 
-- Flunge runs on buildkite. Mandate is *mirror flunge*, not *re-pick the CI vendor*.
+- Flunge runs on buildkite. Mandate is _mirror flunge_, not _re-pick the CI vendor_.
 - The mono build is rust + bazel + node + (eventually) Xcode. Bazel cache hit rate matters — GitHub-hosted runners are ephemeral, so a remote cache is mandatory just to be tolerable; we'd have to stand one up anyway. Self-hosted GH runners would re-introduce the agent-fleet question without buying anything over buildkite.
 - We already have buildkite secrets, an org, an agent fleet, and the engine knows how to parse `buildkite.com` job URLs (`ci_watch.rs`, `merge-conflict-handling-in-review.md:998-1007`). Reusing that surface is materially cheaper than building a parallel actions parser.
 
@@ -120,7 +120,7 @@ Agents run a `bootstrap.sh` step that ensures the required toolchain is present:
 - `rustup toolchain install` per `rust-toolchain.toml` if not present.
 - `bazelisk` available on `$PATH`.
 - `pnpm` available on `$PATH`.
-- `jj` *not* installed on agents. Buildkite checks out via git natively; the jj-in-workspace concern is a worker-side issue, not a CI concern (see Risk R3).
+- `jj` _not_ installed on agents. Buildkite checks out via git natively; the jj-in-workspace concern is a worker-side issue, not a CI concern (see Risk R3).
 
 If contention shows up, we can tag and isolate mono jobs separately. Until then, shared queue.
 
@@ -134,6 +134,7 @@ Two-tier:
 v1 ships **disk cache only**. The remote cache is a fast-follow, not a v1 requirement. Reasoning: a single-fleet setup with sticky agents (buildkite has reasonable agent affinity) gets most of the disk-cache benefit without standing up a separate remote-cache service. We'll know remote is needed when (a) `bazel-test` cold-cache exceeds ~10 minutes, or (b) we split fleets and inter-fleet sharing matters.
 
 Cache keying:
+
 - The disk cache key includes `bazel info release` and a hash of `MODULE.bazel.lock` (matches flunge's approach and what the recent PR #439 dispatch-cache fix established for repobin).
 - `cargo` shares the agent-level `~/.cargo/registry` cache; that's it for cargo. Target dirs are not cached across jobs (they're cheap relative to bazel and the cache-poisoning risk is higher).
 
@@ -144,6 +145,7 @@ The original v1 plan ran `cargo test` and `bazel test` side-by-side until P1 clo
 The implementation now wires `bazel test //...` and `bazel build //...` directly as the canonical rust signal steps, with no transitional `cargo-check` or `cargo-test` steps needed.
 
 Verification for bazel-test:
+
 - Spot-check that the bazel-test wall-clock on a warm cache is within the budget assumed by the sharding decision below.
 
 ### Sharding
@@ -156,12 +158,12 @@ Re-evaluate when wall-clock for the slowest required step exceeds 15 minutes on 
 
 This piece has landed ahead of the pipeline itself. `PrCiIndicator` at `tools/boss/app-macos/Sources/ContentView.swift:2683` renders a small `caption2`-weight icon next to the PR link on Review-lane cards:
 
-| Engine-reported state | Icon (SF Symbol)         | Colour | Tooltip                                                |
-|-----------------------|--------------------------|--------|--------------------------------------------------------|
-| `in_progress`         | `clock.fill`             | yellow | "Required CI checks in progress"                       |
-| `success`             | `checkmark.circle.fill`  | green  | "All required CI checks passed"                        |
-| `fail`                | `xmark.circle.fill`      | red    | "Required CI check(s) failed: <names from rollup>"     |
-| `unknown` / other     | (hidden)                 | —      | hidden, so "no signal yet" doesn't look like all-green |
+| Engine-reported state | Icon (SF Symbol)        | Colour | Tooltip                                                |
+| --------------------- | ----------------------- | ------ | ------------------------------------------------------ |
+| `in_progress`         | `clock.fill`            | yellow | "Required CI checks in progress"                       |
+| `success`             | `checkmark.circle.fill` | green  | "All required CI checks passed"                        |
+| `fail`                | `xmark.circle.fill`     | red    | "Required CI check(s) failed: <names from rollup>"     |
+| `unknown` / other     | (hidden)                | —      | hidden, so "no signal yet" doesn't look like all-green |
 
 State is fed by the engine's existing `ci_watch` probe (`tools/boss/engine/src/ci_watch.rs`), which already polls `gh pr view --json statusCheckRollup` for `in_review` rows. The failure detail payload is the same `failed_checks` JSON shape `ci_watch` uses internally — `PrCiIndicator` parses it for the tooltip so reviewers can see which check name(s) reddened the build without leaving the kanban.
 
@@ -174,23 +176,24 @@ No new schema column was needed (the original design speculated a `pr_ci_status`
 The engine's `ci_watch.rs` (and `conflict_watch.rs`) already gate on a per-product `auto_pr_maintenance_disabled` flag. Today nothing red-buttons engine remediation if a flaky CI check fires repeatedly. Once a real pipeline exists, a flake storm could trigger a cascade of CI-remediation workers.
 
 Mitigation:
-- The pipeline ramp above keeps flaky steps advisory until they're stable. `ci_watch` only acts on *required* failures (`merge-conflict-handling-in-review.md` §Q4-Q5).
+
+- The pipeline ramp above keeps flaky steps advisory until they're stable. `ci_watch` only acts on _required_ failures (`merge-conflict-handling-in-review.md` §Q4-Q5).
 - The per-PR opt-out label is already wired (`ci_watch.rs:42`). A human can quiet a remediation loop on a single PR without disabling the product-wide flag.
 - If a product-wide flake storm hits, the user disables the flag, restores green, re-enables. Same playbook as the conflict-watch one.
 
-This is *not* a v1 blocker — `ci_watch` is already defensive — but the implementation task that promotes a step to required must check `ci_watch`'s remediation-budget config and confirm the per-PR cap is sane (default is 3 attempts).
+This is _not_ a v1 blocker — `ci_watch` is already defensive — but the implementation task that promotes a step to required must check `ci_watch`'s remediation-budget config and confirm the per-PR cap is sane (default is 3 attempts).
 
 ### R2 — Engine auto-merge path (project description claim)
 
 The parent project description says "Today the engine auto-merges on PR resolved; the CI gate must come BEFORE that path so red PRs are not auto-merged."
 
-Verified by grep — the engine does *not* call `gh pr merge` anywhere in `tools/boss/engine`. The `merge_poller` *detects* merges that have already happened; it does not perform them. So there is no engine-side path to gate; branch protection on the GitHub side is the only enforcement layer needed for v1.
+Verified by grep — the engine does _not_ call `gh pr merge` anywhere in `tools/boss/engine`. The `merge_poller` _detects_ merges that have already happened; it does not perform them. So there is no engine-side path to gate; branch protection on the GitHub side is the only enforcement layer needed for v1.
 
 If/when the engine grows an auto-merge capability, that design must check the buildkite status before merging. Recommend the implementation task adds a defensive grep-guard test ("no `gh pr merge` calls in engine source") to lock the assumption.
 
 ### R3 — jj-vs-git on the CI worker
 
-Buildkite checks out the repo via git, into a path it controls. There is no jj on the agent. The pipeline scripts (`steps/*.sh`) speak git only; they never invoke `jj`. The repo's `jj` workspace surface only matters when Boss workers run inside leased cube workspaces — *that's worker plumbing, unrelated to CI*.
+Buildkite checks out the repo via git, into a path it controls. There is no jj on the agent. The pipeline scripts (`steps/*.sh`) speak git only; they never invoke `jj`. The repo's `jj` workspace surface only matters when Boss workers run inside leased cube workspaces — _that's worker plumbing, unrelated to CI_.
 
 One gotcha: if any of the test code or check scripts assumes a `.jj/` directory exists (e.g., a checkleft check that reads `jj log`), it will fail in CI. None of the current checks do this (verified against `CHECKS.yaml`), but the implementation task should add a grep-guard or accept a `--no-jj` flag where relevant.
 

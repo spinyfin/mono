@@ -68,7 +68,7 @@ Optional top-level section controlling where first-party check definitions are l
 ```yaml
 check_definitions:
   exec_paths:
-    - tools/checkleft/checks   # relative dir(s) containing check definition yaml files
+    - tools/checkleft/checks # relative dir(s) containing check definition yaml files
   allow_override_bundled: true
 ```
 
@@ -155,7 +155,7 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
-  - id: format/bazel   # resolves to tools/checkleft/checks/format/bazel.yaml
+  - id: format/bazel # resolves to tools/checkleft/checks/format/bazel.yaml
 ```
 
 ## Pattern: Multiple instances of one implementation

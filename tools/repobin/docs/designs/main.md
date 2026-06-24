@@ -508,12 +508,12 @@ repo-local one-off wrappers, not if it grows into a second build system.
 ## Pinned Tools (Build From Source At A Version Tag)
 
 The core model builds a tool from whatever is checked out (HEAD). Some consumers
-instead need a *specific released version* of a tool that lives in another repo
+instead need a _specific released version_ of a tool that lives in another repo
 — for example a repo that runs `checkleft` (released as `checkleft-v*` tags in
 `spinyfin/mono`) and wants to control exactly which release it runs, the way
 flunge historically did with a hand-rolled install plus a `bin/checkleft.lock`.
 
-Repobin folds that into one mechanism: a *pinned tool*.
+Repobin folds that into one mechanism: a _pinned tool_.
 
 ### Configuration
 
@@ -595,7 +595,7 @@ must fail loudly rather than run an unexpected version.
 
 ### Trust Note
 
-Pinning narrows *which* version runs but does not change the trust model: a
+Pinning narrows _which_ version runs but does not change the trust model: a
 pinned build still executes the upstream repo's Bazel-defined behavior at the
 pinned commit. As with the rest of repobin, this is convenient execution of
 repo-owned tools, not sandboxing or artifact verification.

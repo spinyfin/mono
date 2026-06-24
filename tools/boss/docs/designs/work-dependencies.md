@@ -2,9 +2,9 @@
 
 ## Problem
 
-Boss's planning model has products, projects, tasks, and chores, but no way to say *"don't start B until A is done."* Today the only ordering signal is intra-project: tasks within a project are sorted by `ordinal` and `work.rs:462` makes only the first incomplete task `ready`, which collapses every other task into `waiting_dependency` regardless of whether it actually depends on the leader. Anything else — a chore that should follow another chore, a task in project P2 that needs a deliverable from project P1, a project that gates on a small bit of plumbing — has to be enforced by humans pacing the engine.
+Boss's planning model has products, projects, tasks, and chores, but no way to say _"don't start B until A is done."_ Today the only ordering signal is intra-project: tasks within a project are sorted by `ordinal` and `work.rs:462` makes only the first incomplete task `ready`, which collapses every other task into `waiting_dependency` regardless of whether it actually depends on the leader. Anything else — a chore that should follow another chore, a task in project P2 that needs a deliverable from project P1, a project that gates on a small bit of plumbing — has to be enforced by humans pacing the engine.
 
-`status: blocked` exists as a kanban column and a `TaskStatus` variant (`cli/src/main.rs:408`), but it is a *manual* flag. The engine never sets it, never honours it for dispatch (the auto-dispatcher just looks at `work_executions.status`), and never clears it. So in practice it functions as a sticky note for humans, not a scheduling primitive.
+`status: blocked` exists as a kanban column and a `TaskStatus` variant (`cli/src/main.rs:408`), but it is a _manual_ flag. The engine never sets it, never honours it for dispatch (the auto-dispatcher just looks at `work_executions.status`), and never clears it. So in practice it functions as a sticky note for humans, not a scheduling primitive.
 
 This doc proposes an explicit, edge-based dependency model: a separate `work_item_dependencies` table, an automatic `blocked` ↔ `todo` transition driven by prerequisite completion, a cycle-safe CLI surface, and dispatch / kanban behaviour that respects edges. The aim is the smallest change to the existing model that turns "B depends on A" into a first-class declaration the engine understands, while leaving cross-product / multi-repo work to a separate design (`proj_18a2bbe20fc03718_8`).
 
@@ -24,7 +24,7 @@ This doc proposes an explicit, edge-based dependency model: a separate `work_ite
 - **Soft dependencies, "relates-to", "duplicates", FYI links.** v1 ships exactly one edge type: `blocks`. Other kinds get a column for forward compatibility but no codepath beyond storage.
 - **Backfill of inferred edges from project parent-child structure.** The existing intra-project ordering by `ordinal` keeps working as-is for projects that don't add explicit edges; we don't try to materialise it as concrete rows.
 - **Dependency-aware ordering of the kanban column** (i.e. sorting Todo so dependents appear after their prerequisites). Out of scope; the existing ordinal sort is fine.
-- **Engine-side propagation of `done` *across* repositories.** A dependent in repo X cannot have a prerequisite in repo Y until cross-product is built.
+- **Engine-side propagation of `done` _across_ repositories.** A dependent in repo X cannot have a prerequisite in repo Y until cross-product is built.
 - **Per-edge metadata / comments / weights / lag times.** Edges are pure (id → id, kind).
 
 ## Naming
@@ -39,22 +39,22 @@ This doc proposes an explicit, edge-based dependency model: a separate `work_ite
 
 ### Options
 
-| | (a) `depends_on: Vec<id>` column on `tasks` | (b) join table `work_item_dependencies` |
-|---|---|---|
-| Cardinality | One column carries 0..N ids (TEXT JSON or comma-separated) | Standard many-to-many row-per-edge |
-| Indexable lookups (`who depends on X?`) | Painful (LIKE / JSON1) | Cheap (index on `prerequisite_id`) |
-| Cycle detection | Have to parse the column on every check | Trivial recursive CTE |
-| Schema for projects | Need to add the column to `projects` too — duplicated logic | One table covers all kinds |
-| Edge-type field | Awkward (parallel array, or per-element JSON object) | Natural — extra column |
-| Migration cost | One column on each of `tasks`, `projects` | One new table |
+|                                         | (a) `depends_on: Vec<id>` column on `tasks`                 | (b) join table `work_item_dependencies` |
+| --------------------------------------- | ----------------------------------------------------------- | --------------------------------------- |
+| Cardinality                             | One column carries 0..N ids (TEXT JSON or comma-separated)  | Standard many-to-many row-per-edge      |
+| Indexable lookups (`who depends on X?`) | Painful (LIKE / JSON1)                                      | Cheap (index on `prerequisite_id`)      |
+| Cycle detection                         | Have to parse the column on every check                     | Trivial recursive CTE                   |
+| Schema for projects                     | Need to add the column to `projects` too — duplicated logic | One table covers all kinds              |
+| Edge-type field                         | Awkward (parallel array, or per-element JSON object)        | Natural — extra column                  |
+| Migration cost                          | One column on each of `tasks`, `projects`                   | One new table                           |
 
 ### Discussion
 
-(a) is what was originally suggested in the chore. It is appealing because the dependent row "owns" its declaration. But every interesting query is *reverse* — "what depends on X, can X be archived, does completing X unblock anyone?" — and those become full table scans plus JSON parsing. We'd also have to apply the same column twice (tasks and projects), and keep their semantics in sync.
+(a) is what was originally suggested in the chore. It is appealing because the dependent row "owns" its declaration. But every interesting query is _reverse_ — "what depends on X, can X be archived, does completing X unblock anyone?" — and those become full table scans plus JSON parsing. We'd also have to apply the same column twice (tasks and projects), and keep their semantics in sync.
 
 (b) is the standard shape. One row per edge, two foreign keys, cheap lookups in either direction, room for an edge-type column without contortions. The main cost is one more table, but Boss already has nine and the new one fits the pattern.
 
-The interaction with the existing `project_id` parent-child column on `tasks` is conceptually distinct: `project_id` says *which project a task belongs to* (containment), while a dependency edge says *which item gates this one* (ordering). They can coexist — a task can sit in project P and also depend on a task in project Q within the same product — but I do not unify them. Containment is one-to-many and structural; dependency is many-to-many and behavioural. Mashing them together would force every task to either nominate one parent project or pretend its project is "just another prerequisite," and would make the kanban-by-project grouping and the dep-graph rendering collide in ugly ways.
+The interaction with the existing `project_id` parent-child column on `tasks` is conceptually distinct: `project_id` says _which project a task belongs to_ (containment), while a dependency edge says _which item gates this one_ (ordering). They can coexist — a task can sit in project P and also depend on a task in project Q within the same product — but I do not unify them. Containment is one-to-many and structural; dependency is many-to-many and behavioural. Mashing them together would force every task to either nominate one parent project or pretend its project is "just another prerequisite," and would make the kanban-by-project grouping and the dep-graph rendering collide in ugly ways.
 
 ### Recommendation
 
@@ -76,9 +76,9 @@ CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
     ON work_item_dependencies(dependent_id, relation);
 ```
 
-Two indexes because both directions are hot: completion of a prerequisite needs *"who depends on me?"* and the kanban / `show` view needs *"what gates this one?"*
+Two indexes because both directions are hot: completion of a prerequisite needs _"who depends on me?"_ and the kanban / `show` view needs _"what gates this one?"_
 
-`dependent_id` and `prerequisite_id` are not declared as foreign keys to a single physical table because the referent can be a row in `tasks` *or* `projects`. We enforce existence and cross-kind validity in the engine's edge-create path (Q3) rather than at the schema level. Cascade on delete is also in the engine — a dependent or prerequisite that is deleted (`deleted_at` set, or hard-removed from the rare `projects` delete path) drops all its edges in the same transaction.
+`dependent_id` and `prerequisite_id` are not declared as foreign keys to a single physical table because the referent can be a row in `tasks` _or_ `projects`. We enforce existence and cross-kind validity in the engine's edge-create path (Q3) rather than at the schema level. Cascade on delete is also in the engine — a dependent or prerequisite that is deleted (`deleted_at` set, or hard-removed from the rare `projects` delete path) drops all its edges in the same transaction.
 
 ### Self-references and cycles
 
@@ -121,7 +121,7 @@ Reasons:
 
 ### How to apply
 
-The CLI accepts `--relation blocks` and validates against an enum that today only has one valid variant. Storage already allows for more. Engine-side dispatch logic *only* checks `relation = 'blocks'` rows when computing whether a dependent is gated, so adding a `relates-to` row in a future migration has zero behavioural effect.
+The CLI accepts `--relation blocks` and validates against an enum that today only has one valid variant. Storage already allows for more. Engine-side dispatch logic _only_ checks `relation = 'blocks'` rows when computing whether a dependent is gated, so adding a `relates-to` row in a future migration has zero behavioural effect.
 
 ---
 
@@ -153,7 +153,7 @@ Edge create validates `product_id_for_work_item(dependent) == product_id_for_wor
 
 ### The rule
 
-A dependent is **gated** iff there exists at least one edge `(dependent_id = D, prerequisite_id = P, relation = 'blocks')` such that `P` is not in a *satisfied* status.
+A dependent is **gated** iff there exists at least one edge `(dependent_id = D, prerequisite_id = P, relation = 'blocks')` such that `P` is not in a _satisfied_ status.
 
 Satisfied statuses:
 
@@ -169,7 +169,7 @@ Two edge cases need explicit answers:
 
 **(1) The user manually moves a gated dependent to `active` (or any non-`blocked`) status.** Refuse the manual move while edges remain gating. Surface the reason in the CLI output: `cannot move task_X to active: gated by [task_Y, task_Z] (use boss task depend rm to remove)`. This keeps the kanban-vs-engine model honest. The alternative — letting the user override and run anyway — recreates the current ambiguous "blocked" flag and we've already learned that's bad UX.
 
-**(2) The user manually moves a non-gated item to `blocked`.** Allowed. We respect the manual flag — the engine considers an item gated if either (a) any prerequisite is incomplete, or (b) the user has explicitly set status to `blocked`. The auto-unblock path only flips `blocked → todo` when *both* (a) and (b) are false; if the user manually blocked it, the rule (a) clearing is a no-op.
+**(2) The user manually moves a non-gated item to `blocked`.** Allowed. We respect the manual flag — the engine considers an item gated if either (a) any prerequisite is incomplete, or (b) the user has explicitly set status to `blocked`. The auto-unblock path only flips `blocked → todo` when _both_ (a) and (b) are false; if the user manually blocked it, the rule (a) clearing is a no-op.
 
 To make (2) work cleanly without a separate column, we let the existing `tasks.status` carry the manual signal and add a derived "is gated" predicate driven by edges. A small `manual_blocked` bit on `tasks` would be cleaner but it doesn't pay for itself — the rule above handles it without a schema change. Specifically, `clear_auto_block` only fires when both:
 
@@ -209,7 +209,7 @@ If `last_status_actor = 'engine'` and edges are clear, auto-unblock to `todo`. O
                        archived (manual)
 ```
 
-Edges that point at *projects* read the project's status the same way; the diagram applies, and a project entering `done` or `archived` ungates anything depending on it.
+Edges that point at _projects_ read the project's status the same way; the diagram applies, and a project entering `done` or `archived` ungates anything depending on it.
 
 ### Why not refuse manual `active`?
 
@@ -235,13 +235,13 @@ If a row's status is stuck (the chore_18ad2632b2b998f0_6 PR-detection bug) but i
 
 - **A)** Treat `status = done` as the only signal. Rely on humans / the PR-detection fix to keep status accurate.
 - **B)** Treat `pr_url` set + PR merged as "effectively done" for the purposes of unblocking, even if `status` hasn't transitioned.
-- **C)** A hybrid: `status = done` is the canonical signal; if `status != done` but `pr_url` is merged AND merged > 24h ago, surface a *warning* (`bossctl agents probe` style) but don't unblock.
+- **C)** A hybrid: `status = done` is the canonical signal; if `status != done` but `pr_url` is merged AND merged > 24h ago, surface a _warning_ (`bossctl agents probe` style) but don't unblock.
 
 ### Recommendation
 
 **Pick (A) for v1, with a follow-up to fix `chore_18ad2632b2b998f0_6` first.**
 
-(B) is tempting, but it widens the behavioural surface significantly. The "PR merged" check requires a GitHub API call (or a cached state) on every dependency satisfaction probe; it muddies the rule (now `done` *or* `pr_url merged` means satisfied); and it papers over the bug rather than fixing it. (C) compounds (B)'s API cost without the unblock-on-merge benefit.
+(B) is tempting, but it widens the behavioural surface significantly. The "PR merged" check requires a GitHub API call (or a cached state) on every dependency satisfaction probe; it muddies the rule (now `done` _or_ `pr_url merged` means satisfied); and it papers over the bug rather than fixing it. (C) compounds (B)'s API cost without the unblock-on-merge benefit.
 
 The simpler answer is: **fix PR detection.** As long as `status = done` flips reliably when a PR merges, dependencies-on-status is the right model. If we ship dependencies before the PR-detection fix, we add observability — see "Stuck-prerequisite warning" below — but the unblock rule stays simple.
 
@@ -294,7 +294,7 @@ Add to `boss task list`, `boss chore list`, `boss project list`:
 --blocked-by-deps                 items currently gated by at least one incomplete prereq
 ```
 
-`--unblocked` answers the question *"what's actually dispatchable right now?"* without the human having to cross-reference the dep graph. `--blocked-by-deps` answers the inverse for triage.
+`--unblocked` answers the question _"what's actually dispatchable right now?"_ without the human having to cross-reference the dep graph. `--blocked-by-deps` answers the inverse for triage.
 
 ### `boss <kind> show` output
 
@@ -315,11 +315,11 @@ In `--json`, the section becomes:
 {
   "dependencies": {
     "prerequisites": [
-      {"id": "task_18ad...07", "relation": "blocks", "status": "done", "name": "..."},
-      {"id": "proj_18a2...05", "relation": "blocks", "status": "active", "name": "..."}
+      { "id": "task_18ad...07", "relation": "blocks", "status": "done", "name": "..." },
+      { "id": "proj_18a2...05", "relation": "blocks", "status": "active", "name": "..." }
     ],
     "dependents": [
-      {"id": "chore_18ad...22", "relation": "blocks", "status": "blocked", "name": "..."}
+      { "id": "chore_18ad...22", "relation": "blocks", "status": "blocked", "name": "..." }
     ]
   }
 }
@@ -327,7 +327,7 @@ In `--json`, the section becomes:
 
 ### Reference doc
 
-The CLI reference (`boss reference`) gets a new `status_semantics` line: *"`blocked` is set automatically when a work item has at least one incomplete `blocks` prerequisite. Manual moves to non-`blocked` statuses are refused while gated."* And a workflow guidance line: *"Use `boss <kind> depend add A B` to declare 'A depends on B'."*
+The CLI reference (`boss reference`) gets a new `status_semantics` line: _"`blocked` is set automatically when a work item has at least one incomplete `blocks` prerequisite. Manual moves to non-`blocked` statuses are refused while gated."_ And a workflow guidance line: _"Use `boss <kind> depend add A B` to declare 'A depends on B'."_
 
 ---
 
@@ -335,14 +335,14 @@ The CLI reference (`boss reference`) gets a new `status_semantics` line: *"`bloc
 
 ### Kanban card
 
-A dependent whose status is `blocked` is *already* surfaced today by the existing Blocked lane (`work-kanban.md`). Two changes to make the lane carry its weight:
+A dependent whose status is `blocked` is _already_ surfaced today by the existing Blocked lane (`work-kanban.md`). Two changes to make the lane carry its weight:
 
-1. **Card badge.** A small icon on the card — the existing card layout has space in the footer row alongside the project tag and PR link (see `WorkBoardCardView`, `app-macos/Sources/ContentView.swift`). Use a "link" or "chain" SF symbol. Hover / click → tooltip lists the gating prerequisites with their current status, e.g. *"gated by: task_…07 (in_review), proj_…05 (active)"*. The icon only appears when the block is *automatic* (driven by edges); manual blocks get no icon, only the lane.
+1. **Card badge.** A small icon on the card — the existing card layout has space in the footer row alongside the project tag and PR link (see `WorkBoardCardView`, `app-macos/Sources/ContentView.swift`). Use a "link" or "chain" SF symbol. Hover / click → tooltip lists the gating prerequisites with their current status, e.g. _"gated by: task*…07 (in_review), proj*…05 (active)"_. The icon only appears when the block is _automatic_ (driven by edges); manual blocks get no icon, only the lane.
 2. **Dimming.** No. The lane already says "blocked"; dimming on top of it doubles up. Save the dim state for the worker live-status path (different concept — that's about staleness, not blockedness).
 
 ### Drag refusal
 
-When the user drags a card from Blocked → Doing while it has an automatic gate, the kanban refuses the drop and shows an inline warning in the source lane: *"task_X is gated by 2 incomplete prerequisites — clear them or remove the edge first."* For manual blocks, the drop is allowed; the user explicitly chose `blocked`, they can choose to leave.
+When the user drags a card from Blocked → Doing while it has an automatic gate, the kanban refuses the drop and shows an inline warning in the source lane: _"task_X is gated by 2 incomplete prerequisites — clear them or remove the edge first."_ For manual blocks, the drop is allowed; the user explicitly chose `blocked`, they can choose to leave.
 
 ### Card detail — dep graph
 
@@ -360,7 +360,7 @@ No automatic lane swap on a manual move. If a user drags a card to Doing while g
 
 ### Dispatcher gate
 
-`auto_dispatch` (the engine path that turns `ready` executions into running runs) reads the work item's status. We add one filter: if the dependent has *any* `(relation = 'blocks')` edge whose prerequisite is not in a satisfied status, the execution is held in `waiting_dependency`, not `ready`. The existing `waiting_dependency` execution status handles this perfectly — it's already in the enum and already excluded from the dispatcher's pickup pool.
+`auto_dispatch` (the engine path that turns `ready` executions into running runs) reads the work item's status. We add one filter: if the dependent has _any_ `(relation = 'blocks')` edge whose prerequisite is not in a satisfied status, the execution is held in `waiting_dependency`, not `ready`. The existing `waiting_dependency` execution status handles this perfectly — it's already in the enum and already excluded from the dispatcher's pickup pool.
 
 The reconcile path (`work.rs:430`-`485`) already computes `waiting_dependency` for non-leader tasks within a project. We extend it to also consider `work_item_dependencies` rows: an item that's the project's leader still gets `waiting_dependency` if it has unmet edges; a non-leader stays `waiting_dependency` regardless.
 
@@ -368,7 +368,7 @@ The CLI's explicit `RequestExecution` path (`bossctl work start`) bypasses the a
 
 ### Auto-start on unblock
 
-When the last gating prerequisite is satisfied and the dependent's `autostart` flag is true, the engine flips its status from `blocked` → `todo` and reconciles a `ready` execution in the same transaction. The original create-time `autostart` was a one-shot, but the meaning generalises cleanly: `autostart = true` means *"as soon as you're eligible, run me."* The unblock moment is the second eligibility window the engine cares about. If the human flipped `autostart` to false in the meantime (no current CLI verb for this, but it's a column they could edit), respect it.
+When the last gating prerequisite is satisfied and the dependent's `autostart` flag is true, the engine flips its status from `blocked` → `todo` and reconciles a `ready` execution in the same transaction. The original create-time `autostart` was a one-shot, but the meaning generalises cleanly: `autostart = true` means _"as soon as you're eligible, run me."_ The unblock moment is the second eligibility window the engine cares about. If the human flipped `autostart` to false in the meantime (no current CLI verb for this, but it's a column they could edit), respect it.
 
 ### Interaction with the dispatcher cap regression
 
@@ -376,9 +376,9 @@ When the last gating prerequisite is satisfied and the dependent's `autostart` f
 
 ### What happens if a dependent has more deps added after dispatch starts?
 
-A worker is already running on a dependent when a human runs `boss task depend add <running-dependent> <new-prereq>`. The engine accepts the edge — we don't have a hook into "is there a live run on this id" that's cheap, and even if we did, the new edge is *informational about future runs* in this case. The current run continues; if it lands and the dependent transitions to `done`, the new edge had no effect. If the run terminates without completing and a future re-dispatch is requested, the new edge gates it normally.
+A worker is already running on a dependent when a human runs `boss task depend add <running-dependent> <new-prereq>`. The engine accepts the edge — we don't have a hook into "is there a live run on this id" that's cheap, and even if we did, the new edge is _informational about future runs_ in this case. The current run continues; if it lands and the dependent transitions to `done`, the new edge had no effect. If the run terminates without completing and a future re-dispatch is requested, the new edge gates it normally.
 
-The CLI prints a warning when this happens: *"warning: task_X currently has a running execution; the new dependency edge will only affect future re-dispatches."* No engine-side abort.
+The CLI prints a warning when this happens: _"warning: task_X currently has a running execution; the new dependency edge will only affect future re-dispatches."_ No engine-side abort.
 
 ---
 
@@ -448,7 +448,7 @@ A deleted prerequisite is a UI-only deletion (the row sticks around for history)
 - **(a) Auto-drop the edge.** Deletion = "this is no longer a thing" → the gate has no meaning. Engine removes the edge in the same transaction.
 - **(b) Stay gated.** Deletion is reversible (clear `deleted_at`); preserving the edge means re-adding it later is a no-op.
 
-I recommend **(a)**. Deleted-prereq → drop edge → unblock dependent if no other edges remain. Deletion is a deliberate user action, and a dependent stuck on a tombstone is the worst of both worlds. The CLI's `delete` path emits a one-line note: *"removed 2 dependency edges from task_X."*
+I recommend **(a)**. Deleted-prereq → drop edge → unblock dependent if no other edges remain. Deletion is a deliberate user action, and a dependent stuck on a tombstone is the worst of both worlds. The CLI's `delete` path emits a one-line note: _"removed 2 dependency edges from task_X."_
 
 ### Prereq on a different product / repo
 
@@ -632,7 +632,7 @@ Project rows follow the same picture; substitute the project status enum and tre
 
 ## Risks
 
-**R1 — Status-actor column doesn't capture intent.** A human sets a task to `blocked` then later runs `boss task depend add`; from then on the engine's auto-unblock won't fire (because `last_status_actor = 'human'`) and the user has to manually unblock. Mitigation: `boss task depend add` resets `last_status_actor = 'engine'` when the engine confirms the new edge is the *only* gating reason. Worst case: occasional user confusion; easy to fix with a `--force-auto` flag if it becomes a pattern.
+**R1 — Status-actor column doesn't capture intent.** A human sets a task to `blocked` then later runs `boss task depend add`; from then on the engine's auto-unblock won't fire (because `last_status_actor = 'human'`) and the user has to manually unblock. Mitigation: `boss task depend add` resets `last_status_actor = 'engine'` when the engine confirms the new edge is the _only_ gating reason. Worst case: occasional user confusion; easy to fix with a `--force-auto` flag if it becomes a pattern.
 
 **R2 — Cycle detection has a TOCTOU window.** Two concurrent `add` calls could each pass the cycle check and together create a cycle. Mitigation: edge inserts run inside a serializable transaction with `BEGIN IMMEDIATE`; the recursive CTE runs in the same transaction so a second writer sees the first writer's row. SQLite's default isolation handles this if we use a single connection per process (which we do).
 

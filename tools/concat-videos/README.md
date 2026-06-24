@@ -63,16 +63,16 @@ To remove everything later:
 For DJI clips like `DJI_YYYYMMDDHHMMSS_NNNN_X.MP4`, the output keeps the
 earliest timestamp and joins the sequence numbers:
 
-| Inputs                                                                  | Output                                |
-| ----------------------------------------------------------------------- | ------------------------------------- |
-| `DJI_20260510152334_0047_D.MP4`, `DJI_20260510152705_0048_D.MP4`         | `DJI_20260510152334_0047-0048_D.MP4`  |
-| `DJI_20260510150025_0045_D.MP4`, `DJI_20260510150408_0046_D.MP4`         | `DJI_20260510150025_0045-0046_D.MP4`  |
+| Inputs                                                           | Output                               |
+| ---------------------------------------------------------------- | ------------------------------------ |
+| `DJI_20260510152334_0047_D.MP4`, `DJI_20260510152705_0048_D.MP4` | `DJI_20260510152334_0047-0048_D.MP4` |
+| `DJI_20260510150025_0045_D.MP4`, `DJI_20260510150408_0046_D.MP4` | `DJI_20260510150025_0045-0046_D.MP4` |
 
 For other naming patterns, the basenames are joined with `+`:
 
-| Inputs                  | Output                  |
-| ----------------------- | ----------------------- |
-| `clip-a.mp4`, `clip-b.mp4` | `clip-a+clip-b.mp4`   |
+| Inputs                     | Output              |
+| -------------------------- | ------------------- |
+| `clip-a.mp4`, `clip-b.mp4` | `clip-a+clip-b.mp4` |
 
 Files are selected order-independent — inputs are sorted by name before
 concatenation so `0048` always comes after `0047`. Existing output files
@@ -90,7 +90,7 @@ The same binary works as a plain command-line tool:
 
 - **Quick Action doesn't appear in the menu.** Restart Finder
   (`killall Finder`), or check System Settings → Privacy & Security →
-  Extensions → Finder / Quick Actions and make sure *Concat Videos* is
+  Extensions → Finder / Quick Actions and make sure _Concat Videos_ is
   enabled.
 - **"ffmpeg not found" notification.** Install Homebrew ffmpeg
   (`brew install ffmpeg`). The Quick Action probes `/opt/homebrew/bin`,

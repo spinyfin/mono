@@ -2,13 +2,13 @@
 
 ## Problem
 
-Boss's work-item taxonomy assumes the deliverable of every task is a *merged PR*. `task` and `chore` rows carry a `pr_url` column (`protocol/src/types.rs:46`), the kanban surfaces `in_review` by reading that column, and `PrDetector` (`engine/src/completion.rs:109`) is the bridge that flips a row to `in_review` when a worker stops with a pushed branch. Project tasks (`kind = "project_task"`) inherit the same shape.
+Boss's work-item taxonomy assumes the deliverable of every task is a _merged PR_. `task` and `chore` rows carry a `pr_url` column (`protocol/src/types.rs:46`), the kanban surfaces `in_review` by reading that column, and `PrDetector` (`engine/src/completion.rs:109`) is the bridge that flips a row to `in_review` when a worker stops with a pushed branch. Project tasks (`kind = "project_task"`) inherit the same shape.
 
-That shape is a poor fit for the work I do most often when starting a new feature: writing a design document. My current pattern is to file the design as a regular `chore`, point the worker at `tools/boss/docs/designs/<slug>.md`, and accept that the worker is going to land the doc by opening a docs-only PR — `task_18ad650912a35110_16` (PR #234, work-dependencies) and the just-merged auto-rebase design (PR #249) are both examples. The PR adds nothing: there is no review on the design doc itself (the doc is reviewed by me clicking around the eventual implementation chores), the merge is a rubber-stamp, and the project CLAUDE.md already says *"Documentation-only changes ... should be pushed directly to `main` instead of opening a PR."* The PR is purely the engine's mechanism for transitioning the chore through `in_review → done`.
+That shape is a poor fit for the work I do most often when starting a new feature: writing a design document. My current pattern is to file the design as a regular `chore`, point the worker at `tools/boss/docs/designs/<slug>.md`, and accept that the worker is going to land the doc by opening a docs-only PR — `task_18ad650912a35110_16` (PR #234, work-dependencies) and the just-merged auto-rebase design (PR #249) are both examples. The PR adds nothing: there is no review on the design doc itself (the doc is reviewed by me clicking around the eventual implementation chores), the merge is a rubber-stamp, and the project CLAUDE.md already says _"Documentation-only changes ... should be pushed directly to `main` instead of opening a PR."_ The PR is purely the engine's mechanism for transitioning the chore through `in_review → done`.
 
-Worse, the *real* deliverable of a design chore — the pile of follow-up implementation tasks the doc enumerates — is hand-typed by me into `boss task create` calls after the doc lands. Every design doc in `tools/boss/docs/designs/` ends with a "Follow-up Implementation Chores" list precisely because that list is the load-bearing payoff and there is currently no automation that turns it into work-item rows. So the design author writes the work plan, I read it, I retype it, and the model has burned a chore on a docs-only PR in between.
+Worse, the _real_ deliverable of a design chore — the pile of follow-up implementation tasks the doc enumerates — is hand-typed by me into `boss task create` calls after the doc lands. Every design doc in `tools/boss/docs/designs/` ends with a "Follow-up Implementation Chores" list precisely because that list is the load-bearing payoff and there is currently no automation that turns it into work-item rows. So the design author writes the work plan, I read it, I retype it, and the model has burned a chore on a docs-only PR in between.
 
-This doc proposes a first-class **design-producing** work-item kind: one whose deliverable is a markdown document at a configured location, whose `in_review` surface links to the *file* (not a PR), whose review action is "approve the doc" rather than "merge a PR," and whose approval triggers the engine to materialise the projects and follow-up tasks the doc enumerates. The PR detour goes away; the manual list-retyping goes away; the kanban gains a new card type whose visual affordance matches what the work actually is.
+This doc proposes a first-class **design-producing** work-item kind: one whose deliverable is a markdown document at a configured location, whose `in_review` surface links to the _file_ (not a PR), whose review action is "approve the doc" rather than "merge a PR," and whose approval triggers the engine to materialise the projects and follow-up tasks the doc enumerates. The PR detour goes away; the manual list-retyping goes away; the kanban gains a new card type whose visual affordance matches what the work actually is.
 
 ## Goals
 
@@ -25,9 +25,9 @@ This doc proposes a first-class **design-producing** work-item kind: one whose d
 - **Inline / Google-Docs-style commenting on the rendered doc.** Single Approve button only in v1. Threaded review comes via `proj_18a2bb78815be670_3` (the doc-collab project), which already plans for this surface and explicitly subsumes future review tooling.
 - **Cross-product / cross-repo doc location resolution.** v1 handles two cases: same-repo docs (the `mono` convention) and per-product separate-repo docs. Spanning organisations or fan-out across multiple repos for one design is deferred (filed against the same cross-product project as the dependencies design).
 - **Edit-existing-doc diffs as a first-class review surface.** v1 renders the doc post-edit; if the user wants to see what changed, they read the commit diff in the underlying repo. Inline diff rendering inside the renderer is on the post-v1 list.
-- **Approval of partial doc updates.** Each `in_review` cycle approves the *whole* doc as it currently stands; we don't track "approved up to revision X."
+- **Approval of partial doc updates.** Each `in_review` cycle approves the _whole_ doc as it currently stands; we don't track "approved up to revision X."
 - **Round-tripping the manifest back into the doc.** Once a manifest is produced and approved, edits to the doc do not retroactively edit the spawned tasks. Re-running the design task to produce a v2 doc is the supported path; the engine treats it as a separate `in_review` cycle.
-- **Replacing PRs for code-modifying work.** Design tasks are docs-only; a follow-up implementation chore that *modifies code* still produces a PR. The two kinds coexist, with the design task *upstream* of the implementation chores it spawns.
+- **Replacing PRs for code-modifying work.** Design tasks are docs-only; a follow-up implementation chore that _modifies code_ still produces a PR. The two kinds coexist, with the design task _upstream_ of the implementation chores it spawns.
 
 ## Naming
 
@@ -67,7 +67,7 @@ This doc proposes a first-class **design-producing** work-item kind: one whose d
 A row with `kind = 'design'` differs from a `chore` in three places:
 
 1. **The auto-dispatcher's "ready to spawn" check** — same as a chore.
-2. **The completion / `in_review` transition** is driven by **`DesignDetector`**, not `PrDetector` (Q5). The work item flips to `in_review` when the worker pushes the doc and prints its `doc_ref` on its final line, *not* when it opens a PR.
+2. **The completion / `in_review` transition** is driven by **`DesignDetector`**, not `PrDetector` (Q5). The work item flips to `in_review` when the worker pushes the doc and prints its `doc_ref` on its final line, _not_ when it opens a PR.
 3. **The `done` transition** is driven by **`ApproveDesign`** (Q7), not by GitHub merge events. There is no `pr_url` for design rows; the column is permitted to be `NULL` for `kind = 'design'` and the engine never reads it for these rows. (We don't drop the column — schema gymnastics for a per-kind difference aren't worth it; just don't populate it. See Q2.)
 
 Everything else — the kanban swimlanes, dependency edges, transcripts, attention items, executions, runs — works unchanged. A `design` row participates in `work_item_dependencies` like any other; you can have a chore that's blocked on a design (the implementation can't start until the design is approved), and the auto-unblock path from the dependencies design (`work-dependencies.md`) handles it for free.
@@ -89,13 +89,13 @@ The user has stated elsewhere that one PR per task is the philosophy. Designs na
 
 ### Discussion
 
-(A) is tempting and the engine code that surfaces a card's artifact already reads one column. But `pr_url` semantically *means* "PR URL" — every consumer (the macOS app's `Models.swift:825`, the kanban's open-affordance handler) has hardcoded GitHub-PR assumptions: parsing `https://github.com/.../pull/N`, fetching merge state via `gh pr view`, etc. Bending those callers to also handle "this might be a tree URL to a markdown file" is a wide-blast-radius change for a string that's just a discriminated union with extra steps.
+(A) is tempting and the engine code that surfaces a card's artifact already reads one column. But `pr_url` semantically _means_ "PR URL" — every consumer (the macOS app's `Models.swift:825`, the kanban's open-affordance handler) has hardcoded GitHub-PR assumptions: parsing `https://github.com/.../pull/N`, fetching merge state via `gh pr view`, etc. Bending those callers to also handle "this might be a tree URL to a markdown file" is a wide-blast-radius change for a string that's just a discriminated union with extra steps.
 
 (B) is honest: `pr_url` keeps its meaning, `doc_ref` is the design-specific one, and per-`kind` gating in the consumer code says "this row's artifact is over here." The cost is one extra nullable column on `tasks`.
 
 (C) renames a heavily-used column for one new kind. The migration touches every `*-list` / RPC / app shape. The semantic confusion ("artifact_url" — for a chore, it's a PR; for a design, a doc; for a project_task, what?) is exactly what (A) suffers from. Pass.
 
-(D) is overengineering for v1. Designs do need *some* extra metadata beyond the URL — at least the manifest path and the manifest sha for idempotency on approval (Q8) — but a separate table for one kind isn't justified until those grow. JSON-typed `metadata` on `tasks` is plenty.
+(D) is overengineering for v1. Designs do need _some_ extra metadata beyond the URL — at least the manifest path and the manifest sha for idempotency on approval (Q8) — but a separate table for one kind isn't justified until those grow. JSON-typed `metadata` on `tasks` is plenty.
 
 ### Recommendation
 
@@ -116,11 +116,11 @@ ALTER TABLE tasks ADD COLUMN doc_ref TEXT;       -- e.g. 'tools/boss/docs/design
     "doc_branch": "main",
     "doc_repo_remote_url": "https://github.com/brianduff/mono.git",
     "manifest_path": "tools/boss/docs/designs/design-producing-tasks.tasks.json",
-    "manifest_sha": "abc123…",   // sha256 of the manifest file at the moment
-                                  // the worker last reported it; used for
-                                  // idempotency on approval (Q8).
-    "approved_at": "2026-05-09T11:14:02Z",   // null until Approve
-    "approved_by": "human"                    // 'human' or an actor id
+    "manifest_sha": "abc123…", // sha256 of the manifest file at the moment
+    // the worker last reported it; used for
+    // idempotency on approval (Q8).
+    "approved_at": "2026-05-09T11:14:02Z", // null until Approve
+    "approved_by": "human" // 'human' or an actor id
   }
 }
 ```
@@ -155,7 +155,7 @@ For non-design rows, both `doc_ref` and `metadata.design` are NULL.
 
 (β) on its own is too much per-task ceremony — the location is almost always the same per product.
 
-(δ) is the right shape: data on `products` for the canonical location; per-task override for the rare "this design lives somewhere weird" case; standing-instruction is downstream advice for the worker (still useful so the worker knows the *style* expectations) but not the lookup mechanism.
+(δ) is the right shape: data on `products` for the canonical location; per-task override for the rare "this design lives somewhere weird" case; standing-instruction is downstream advice for the worker (still useful so the worker knows the _style_ expectations) but not the lookup mechanism.
 
 ### Recommendation
 
@@ -200,7 +200,7 @@ For a design task, steps 3–5 must change. The deliverable is a commit on `main
 
 ### Options
 
-- **(i) Spawn-prompt tells the worker.** Add explicit instructions to the `design`-kind spawn prompt: *"Commit the doc with `jj describe -m '...'`; push directly to `<docs_branch>` with `jj git push --bookmark <docs_branch>` (or `git push origin HEAD:<docs_branch>`). Do not run `gh pr create`. On the final line of your last response, print `DOC_REF: <repo_remote_url>:<branch>:<file_path>`."*
+- **(i) Spawn-prompt tells the worker.** Add explicit instructions to the `design`-kind spawn prompt: _"Commit the doc with `jj describe -m '...'`; push directly to `<docs_branch>` with `jj git push --bookmark <docs_branch>` (or `git push origin HEAD:<docs_branch>`). Do not run `gh pr create`. On the final line of your last response, print `DOC_REF: <repo_remote_url>:<branch>:<file_path>`."_
 - **(ii) New tool affordance.** A custom tool (e.g. `boss design publish`) that wraps the right git/jj sequence and prints the structured DOC_REF line. The worker calls the tool instead of raw shell.
 - **(iii) Engine post-processing.** The worker creates a feature branch like a normal chore. The engine sees the design task, fast-forwards `<docs_branch>` to the worker's feature branch tip, deletes the feature branch, and updates the row. Worker doesn't need to know about the direct-to-main policy.
 - **(iv) Per-environment branch protection check.** The engine probes the remote: if `<docs_branch>` is protected against direct pushes, fall back to PR; else direct push.
@@ -211,9 +211,9 @@ For a design task, steps 3–5 must change. The deliverable is a commit on `main
 
 (ii) is nicer DX once we have many design tasks, but premature for v1. Same outcome as (i) plus one more dev tool to maintain.
 
-(iii) is clever but couples the engine to the worker's `jj` state and runs `jj` operations inside engine code outside a leased workspace — neither is desirable and we just spent `auto-rebase-stacked-prs.md` Q5 deciding *against* engine-side `jj` for non-trivial cases. Pass.
+(iii) is clever but couples the engine to the worker's `jj` state and runs `jj` operations inside engine code outside a leased workspace — neither is desirable and we just spent `auto-rebase-stacked-prs.md` Q5 deciding _against_ engine-side `jj` for non-trivial cases. Pass.
 
-(iv) is overengineered: branch protection is fine to detect, but the *policy* of "design = direct push" should be a deliberate per-product decision, not an emergent property of GitHub configuration. If `main` is push-protected, the right answer is "configure `docs_branch` to a different name, or unprotect," not "fall back silently to the PR path."
+(iv) is overengineered: branch protection is fine to detect, but the _policy_ of "design = direct push" should be a deliberate per-product decision, not an emergent property of GitHub configuration. If `main` is push-protected, the right answer is "configure `docs_branch` to a different name, or unprotect," not "fall back silently to the PR path."
 
 ### Recommendation
 
@@ -249,6 +249,7 @@ The `DOC_REF:` sentinel is parsed by `DesignDetector` (Q5) — same shape as `Pr
 #### Why a sentinel rather than git-side detection
 
 We could try to detect "the worker pushed a `.md` file to `<docs_branch>`" by polling `git log` on the doc location. But:
+
 - The branch may already have many commits the worker isn't responsible for (it's `main`!), so we'd need to scope to a sha range, which means knowing the worker's start point.
 - Multiple workers may push to `main` between detector runs.
 - The worker's commit could land but the manifest write fail; sentinel says "I'm done with both."
@@ -293,7 +294,7 @@ match task.kind.as_str() {
 1. **Read the worker's transcript final lines.** Same source `PrDetector` uses today.
 2. **Match the sentinel** `^DOC_REF:\s*(?P<repo>\S+?)\|(?P<branch>\S+?)\|(?P<path>.+?)$` on any of the last 5 lines. (Five, not just the last, because tools sometimes append a trailing blank or status line.)
 3. **Validate the doc exists** by issuing `gh api /repos/<owner>/<repo>/contents/<path>?ref=<branch>` (or `git cat-file -p <branch>:<path>` against a local clone if the doc lives in the same repo as the workspace). On 404, treat as detection failure — the worker claimed they pushed but the doc isn't there.
-4. **Validate the manifest exists** at the conventional path (`<doc_path_minus_md>.tasks.json`). On 404, the design is detected as `in_review` but with `metadata.design.manifest_missing = true`; on approval, the engine spawns a *manifest-extractor* worker (Q8) instead of reading a non-existent file.
+4. **Validate the manifest exists** at the conventional path (`<doc_path_minus_md>.tasks.json`). On 404, the design is detected as `in_review` but with `metadata.design.manifest_missing = true`; on approval, the engine spawns a _manifest-extractor_ worker (Q8) instead of reading a non-existent file.
 5. **Capture the manifest's sha** (`gh api /contents/...` returns `sha`) and stash it in `metadata.design.manifest_sha`.
 6. **Return** `Some(DocRef { repo_remote_url, branch, file_path, manifest_present, manifest_sha })`.
 
@@ -339,7 +340,7 @@ A user (or another worker) pushes an edit to the doc directly without going thro
 
 (P) is the most flexible but builds new infrastructure: a `comrak` (or `pulldown-cmark` with `MarkdownExtensions`) pipeline in the engine, an HTML+CSS template, a webview wrapper. It also drags in a "rendered HTML" step that obscures debugging — the user sees HTML, not the raw markdown they wrote.
 
-(R) is the simplest *correct* option. `Textual` already renders CommonMark with SwiftUI views, supports headings, lists, tables, code blocks, and inline styles. We already have it as a dependency for the chat panel. Reusing it for the design renderer is one new SwiftUI view (`DesignRendererView`) that takes a string and a few buttons.
+(R) is the simplest _correct_ option. `Textual` already renders CommonMark with SwiftUI views, supports headings, lists, tables, code blocks, and inline styles. We already have it as a dependency for the chat panel. Reusing it for the design renderer is one new SwiftUI view (`DesignRendererView`) that takes a string and a few buttons.
 
 The honest gap of (R) is **GitHub-specific extensions** (autolinks for issue/PR references, task-list checkboxes inside fenced blocks, footnotes). Textual's CommonMark coverage is strong but not 100% GFM-equivalent. For the docs we write today (the existing `tools/boss/docs/designs/*.md` files), the visible gaps are: no PR-number autolinks, no task-list rendering. Both are tolerable for v1; both are the kind of thing Textual will likely add over its lifetime, or we contribute upstream.
 
@@ -351,7 +352,7 @@ The honest gap of (R) is **GitHub-specific extensions** (autolinks for issue/PR 
 - Renders with `Textual.MarkdownView(document)`.
 - Wraps in a `ScrollView` with a fixed-width content column (~720pt) so long lines don't sprawl across an ultrawide.
 - Header bar carries: doc title (from H1), the design row's name in dimmer text, a status chip (`in_review` / `approved`), the **Approve** button, and an "Open in Editor" button (opens the file in the user's `$EDITOR` or VS Code via the existing repo path resolution).
-- Footer carries the manifest summary: *"On approval, this will create 1 project, 8 tasks. [Show details]"* — clicking expands a tree of the manifest contents (Q7 / Q8).
+- Footer carries the manifest summary: _"On approval, this will create 1 project, 8 tasks. [Show details]"_ — clicking expands a tree of the manifest contents (Q7 / Q8).
 
 Renderer-window lifecycle: opened via the kanban card's chevron / "open" affordance; multiple windows allowed (different designs side-by-side). State (scroll position, expansion) is per-window and not persisted — these are review aids, not editors.
 
@@ -416,6 +417,7 @@ Single-user repo today. `last_status_actor` is set to the calling actor (`'human
 **Approve button on the renderer window is the primary surface.** Put the same affordance on the kanban card hover menu (one menu item, no extra confirmation dialog beyond the standard `last_status_actor` audit trail). CLI verb `boss design approve <selector>` rounds it out for headless use.
 
 The button is only enabled when:
+
 - `task.kind == 'design'`
 - `task.status == 'in_review'`
 - `metadata.design.doc_ref` is set
@@ -424,7 +426,7 @@ Disabled tooltip text in any other state explains why.
 
 #### Confirmation friction
 
-Should approving pop a confirmation dialog *("This will create 1 project and 8 tasks. Approve?")*? Mild yes — but I'd render the confirmation as the renderer-window's footer (Q6), not a modal alert. The user reads the doc; they see "On approval, this will create 1 project, 8 tasks. [Show details]" right there; the Approve button doubles as the confirmation. One click, one consent.
+Should approving pop a confirmation dialog _("This will create 1 project and 8 tasks. Approve?")_? Mild yes — but I'd render the confirmation as the renderer-window's footer (Q6), not a modal alert. The user reads the doc; they see "On approval, this will create 1 project, 8 tasks. [Show details]" right there; the Approve button doubles as the confirmation. One click, one consent.
 
 Modal alerts are friction the user has already opted into by clicking Approve on the renderer; a second confirmation buys nothing.
 
@@ -435,8 +437,8 @@ Modal alerts are friction the user has already opted into by clicking Approve on
 ### Options
 
 - **(α) Convention-driven parser.** Engine reads the doc itself, finds the `## Follow-up Implementation Chores` section, parses it for numbered list items, creates a chore per item. Brittle but cheap.
-- **(β) Worker-driven extractor.** On approval, engine spawns a *new* short-lived worker whose job is to read the doc and emit a structured manifest as JSON; engine then applies the manifest. Slow, LLM cost, but robust to varied doc shapes.
-- **(γ) Worker-emitted manifest.** The design task's worker, while writing the doc, *also* writes a `<slug>.tasks.json` file alongside it. Engine reads the JSON on approval. Predictable, schema-validated, no extra LLM round-trip.
+- **(β) Worker-driven extractor.** On approval, engine spawns a _new_ short-lived worker whose job is to read the doc and emit a structured manifest as JSON; engine then applies the manifest. Slow, LLM cost, but robust to varied doc shapes.
+- **(γ) Worker-emitted manifest.** The design task's worker, while writing the doc, _also_ writes a `<slug>.tasks.json` file alongside it. Engine reads the JSON on approval. Predictable, schema-validated, no extra LLM round-trip.
 - **(δ) Hybrid: γ as primary, β as fallback.** If the worker emitted the manifest, use it; if not, spawn an extractor worker on approval.
 
 ### Discussion
@@ -445,7 +447,7 @@ Modal alerts are friction the user has already opted into by clicking Approve on
 
 (β) makes approval slow — a fresh Claude turn to extract the manifest costs seconds at minimum and dollars at scale, plus the worker can fail (network, model error) at the moment the user just clicked Approve. Bad UX.
 
-(γ) is the cleanest: the design worker is *already* writing the doc, *already* enumerating the tasks at the bottom of it. Asking the worker to also emit a JSON sibling is a small additional step in the same turn, and the engine gets a deterministic, schema-validated input on approval. Schema is small enough to fit in the spawn prompt.
+(γ) is the cleanest: the design worker is _already_ writing the doc, _already_ enumerating the tasks at the bottom of it. Asking the worker to also emit a JSON sibling is a small additional step in the same turn, and the engine gets a deterministic, schema-validated input on approval. Schema is small enough to fit in the spawn prompt.
 
 (δ) hedges: if for some reason the worker didn't emit a manifest (older design, manual doc), fall back to an extractor. The fallback is never fast, but it's also a rare case.
 
@@ -492,7 +494,7 @@ Modal alerts are friction the user has already opted into by clicking Approve on
 }
 ```
 
-`external_id` is a worker-supplied identifier scoped to the manifest — it is *not* the engine task id. The engine resolves dependencies by `external_id` at apply time (a chore that depends on `external_id = "schema-migration"` gets a `work_item_dependencies` row pointing at whichever real task id `schema-migration` materialised as).
+`external_id` is a worker-supplied identifier scoped to the manifest — it is _not_ the engine task id. The engine resolves dependencies by `external_id` at apply time (a chore that depends on `external_id = "schema-migration"` gets a `work_item_dependencies` row pointing at whichever real task id `schema-migration` materialised as).
 
 #### Apply algorithm
 
@@ -523,7 +525,7 @@ Because `ordinal` is a soft hint, not a constraint. The dependencies design (`wo
 
 ### Two sub-cases
 
-- **Editing a previously-approved design doc.** A new design row reopens an existing doc to add a section / revise a recommendation. The `tasks.json` may add new follow-up tasks (already-spawned ones aren't recreated thanks to slug dedup, Q8). Approving the new row applies the manifest's *delta*.
+- **Editing a previously-approved design doc.** A new design row reopens an existing doc to add a section / revise a recommendation. The `tasks.json` may add new follow-up tasks (already-spawned ones aren't recreated thanks to slug dedup, Q8). Approving the new row applies the manifest's _delta_.
 - **Editing an in-flight design (the worker iterates on the doc before it's first approved).** The worker stops, prints `DOC_REF:`, the row goes to `in_review`. The user comments via probe ("nope, the renderer choice is wrong, retry"), the user moves the row back to `active`, the worker spawns again with the doc as starting state. New `DOC_REF:`, new `in_review`, new approve cycle. No special handling needed — the existing `active → in_review` cycle accommodates it.
 
 ### Options for the "what does in_review link to" question
@@ -534,7 +536,7 @@ Because `ordinal` is a soft hint, not a constraint. The dependencies design (`wo
 
 ### Discussion
 
-(♣) on its own is bad: the user is approving the *resulting state*, not the diff. Approving "+ remove paragraph 5" is not the operation they want — they want to approve "the doc says X." Diff alone is a code-review mental model that doesn't fit here.
+(♣) on its own is bad: the user is approving the _resulting state_, not the diff. Approving "+ remove paragraph 5" is not the operation they want — they want to approve "the doc says X." Diff alone is a code-review mental model that doesn't fit here.
 
 (♠) is the v1 ship. The user reads the (now-updated) doc and approves the whole thing.
 
@@ -542,7 +544,7 @@ Because `ordinal` is a soft hint, not a constraint. The dependencies design (`wo
 
 ### Recommendation
 
-**Ship (♠) for v1, file (♥) as a follow-up.** The renderer always shows the file. For edited-existing docs, the renderer footer gains a small line: *"Last approved: 2026-04-22T11:14Z. Click to compare with current."* The compare action opens the file in `$EDITOR` against `git show <prev_sha>:<path>` — it's not in-app, but it's serviceable.
+**Ship (♠) for v1, file (♥) as a follow-up.** The renderer always shows the file. For edited-existing docs, the renderer footer gains a small line: _"Last approved: 2026-04-22T11:14Z. Click to compare with current."_ The compare action opens the file in `$EDITOR` against `git show <prev_sha>:<path>` — it's not in-app, but it's serviceable.
 
 The previously-approved sha is stored: every time `ApproveDesign` succeeds, the engine snapshots `metadata.design.last_approved_sha`. Subsequent approvals can diff against it.
 
@@ -551,8 +553,8 @@ The previously-approved sha is stored: every time `ApproveDesign` succeeds, the 
 When a design row is re-approved with a new doc / new manifest:
 
 - New projects / tasks (slug not seen before) are created normally.
-- Existing projects / tasks (slug already exists) are skipped — *not* updated. Re-approval is additive only.
-- A task that was in the previous manifest but is *not* in the new one is left alone (not deleted). Cleaning up implementation tasks the design abandoned is a manual action the user takes.
+- Existing projects / tasks (slug already exists) are skipped — _not_ updated. Re-approval is additive only.
+- A task that was in the previous manifest but is _not_ in the new one is left alone (not deleted). Cleaning up implementation tasks the design abandoned is a manual action the user takes.
 
 This is conservative and reversible: re-approval can only add, never destroy.
 
@@ -562,7 +564,7 @@ This is conservative and reversible: re-approval can only add, never destroy.
 
 ### The chicken-and-egg
 
-The current chore (this very work item) is *itself* a design task. There's no `design` kind yet. The current work item's `kind` is `chore`, and per project CLAUDE.md it'll be committed direct-to-main as a docs-only change (rather than merging the design via PR).
+The current chore (this very work item) is _itself_ a design task. There's no `design` kind yet. The current work item's `kind` is `chore`, and per project CLAUDE.md it'll be committed direct-to-main as a docs-only change (rather than merging the design via PR).
 
 Once the feature ships, future design tasks use the new affordance; this work item retroactively becomes "the design that bootstrapped the design kind."
 
@@ -572,9 +574,9 @@ Document the bootstrap path explicitly:
 
 1. **This chore is a regular `chore` row.** It produces `tools/boss/docs/designs/design-producing-tasks.md` (this file) and is committed direct-to-main per the project CLAUDE.md doc rule.
 2. **The implementation chores enumerated in this doc's Follow-up Implementation Chores section** are also regular chores until the feature lands. They produce code PRs in the normal way.
-3. **Once the feature is shipped end-to-end** (i.e. once Approve UI works, post-approval manifest application works), the *next* design task uses `kind = 'design'` and the new flow.
+3. **Once the feature is shipped end-to-end** (i.e. once Approve UI works, post-approval manifest application works), the _next_ design task uses `kind = 'design'` and the new flow.
 4. **A retroactive cleanup chore**, low priority, converts this row's `kind` from `chore` to `design`, sets `doc_ref = 'tools/boss/docs/designs/design-producing-tasks.md'`, populates `metadata.design.*` from the existing doc, and closes the row as `done`. The conversion is a one-shot script (`tools/boss/cli/src/migrations/convert_design_chore.rs`?) or a manual `boss design convert <task_id> --doc tools/boss/docs/designs/...`. Either is fine; the row count of pre-design-kind designs is tiny.
-5. **Self-referential follow-up tasks.** This doc's Follow-up Implementation Chores list does *not* yet benefit from the manifest-driven materialisation it describes. Those chores have to be enqueued by hand once the design is approved (i.e. once the user reads this doc and is happy with it). After the feature lands, future design docs benefit.
+5. **Self-referential follow-up tasks.** This doc's Follow-up Implementation Chores list does _not_ yet benefit from the manifest-driven materialisation it describes. Those chores have to be enqueued by hand once the design is approved (i.e. once the user reads this doc and is happy with it). After the feature lands, future design docs benefit.
 
 The retroactive-conversion chore is pure tidiness: nothing breaks if it's never done. Listing it in the Follow-up section is the right place.
 
@@ -584,14 +586,14 @@ The retroactive-conversion chore is pure tidiness: nothing breaks if it's never 
 
 ### `boss task bind-pr`
 
-A separately-queued thread proposes a `boss task bind-pr` verb that *binds* an externally-created PR to an existing task row, addressing the orphan-PR / one-PR-per-task threads. Design tasks **don't have PRs**, so:
+A separately-queued thread proposes a `boss task bind-pr` verb that _binds_ an externally-created PR to an existing task row, addressing the orphan-PR / one-PR-per-task threads. Design tasks **don't have PRs**, so:
 
 - `boss task bind-pr` is irrelevant for `kind = 'design'` rows. The verb's authorisation should reject `kind = 'design'` with a clear error.
 - The orphan-PR detection thread is unaffected: the engine still scans for PRs not associated with any task; design tasks are excluded from that scan because they explicitly never have PRs.
 
 ### One-PR-per-task philosophy
 
-Reaffirmed. Design tasks have *one doc per row*, which is the same shape (1:1 row→artifact). Re-using the same doc for two design rows is forbidden by Q8's `(slug, product_id)` uniqueness on the design row's slug — same as the PR-side rule.
+Reaffirmed. Design tasks have _one doc per row_, which is the same shape (1:1 row→artifact). Re-using the same doc for two design rows is forbidden by Q8's `(slug, product_id)` uniqueness on the design row's slug — same as the PR-side rule.
 
 ### `proj_18a2bb78815be670_3` (doc-collab project)
 
@@ -618,7 +620,7 @@ The manifest's `depends_on_external_ids` becomes `work_item_dependencies` rows o
 The worker's `jj git push --bookmark <docs_branch>` fails. Causes:
 
 - **Network blip / GitHub 5xx.** Retry once, then surface as a `WorkAttentionItem` ("Push to <docs_branch> failed: <reason>; design row remains `active`"). User probes the worker to retry.
-- **Push rejected (branch protection).** This means `<docs_branch>` is protected and direct-push isn't allowed in this environment — Q4 said configure the product to a different branch. Surface as a `WorkAttentionItem` with explicit advice: *"Branch `<docs_branch>` is push-protected. Either configure `products.docs_branch` to a writable branch, or unprotect this branch for design pushes."* Do not silently fall back to a PR — the policy is design = direct push.
+- **Push rejected (branch protection).** This means `<docs_branch>` is protected and direct-push isn't allowed in this environment — Q4 said configure the product to a different branch. Surface as a `WorkAttentionItem` with explicit advice: _"Branch `<docs_branch>` is push-protected. Either configure `products.docs_branch` to a writable branch, or unprotect this branch for design pushes."_ Do not silently fall back to a PR — the policy is design = direct push.
 - **Conflict (someone else just pushed to `main`).** `jj git fetch && jj rebase -d main` and retry once. The worker's spawn prompt should include this retry loop. After two failed retries, attention item.
 
 The design row stays in `active` until the worker successfully pushes and prints `DOC_REF:`.
@@ -637,9 +639,9 @@ Two sub-cases:
 
 ### Approve called on a row whose doc has been edited under us
 
-The engine recorded `manifest_sha = abc123` at detection. The user clicks Approve. Engine fetches the doc / manifest, computes sha, gets `def456`. Mismatch → engine refuses to apply, surfaces a `WorkAttentionItem`: *"The design's manifest has been edited since detection. Re-detect by setting status back to `active` (the worker will produce a fresh `DOC_REF:`) or accept the new manifest by clicking Approve again with `manifest_sha = def456`."*
+The engine recorded `manifest_sha = abc123` at detection. The user clicks Approve. Engine fetches the doc / manifest, computes sha, gets `def456`. Mismatch → engine refuses to apply, surfaces a `WorkAttentionItem`: _"The design's manifest has been edited since detection. Re-detect by setting status back to `active` (the worker will produce a fresh `DOC_REF:`) or accept the new manifest by clicking Approve again with `manifest_sha = def456`."_
 
-The CLI / app's Approve action passes the *currently-displayed* `manifest_sha` from the renderer footer; on mismatch the engine re-checks with the new sha, then proceeds. This guards against approving a stale manifest while gracefully handling legitimate edits.
+The CLI / app's Approve action passes the _currently-displayed_ `manifest_sha` from the renderer footer; on mismatch the engine re-checks with the new sha, then proceeds. This guards against approving a stale manifest while gracefully handling legitimate edits.
 
 ### Apply step partially fails mid-transaction
 
@@ -661,11 +663,11 @@ The manifest's `schema_version` is older than what the engine knows. v1 supports
 
 ### Renderer cannot fetch the doc
 
-Network failure while loading; or the `gh` token doesn't have read access; or the file was renamed. Renderer shows an error state with a "Retry" button and surfaces the underlying error message. Does *not* mark the design row as failed — the row's status is determined by the engine, not the renderer.
+Network failure while loading; or the `gh` token doesn't have read access; or the file was renamed. Renderer shows an error state with a "Retry" button and surfaces the underlying error message. Does _not_ mark the design row as failed — the row's status is determined by the engine, not the renderer.
 
 ### Doc file is moved or deleted between detection and approval
 
-The renderer 404s. The engine's Approve handler also 404s on its manifest fetch (`gh api /contents/...`). Approve fails with `WorkAttentionItem`: *"Doc at <doc_ref> no longer exists. Either restore the doc or move the design row back to `active` and let the worker re-create it."*
+The renderer 404s. The engine's Approve handler also 404s on its manifest fetch (`gh api /contents/...`). Approve fails with `WorkAttentionItem`: _"Doc at <doc_ref> no longer exists. Either restore the doc or move the design row back to `active` and let the worker re-create it."_
 
 ---
 
@@ -863,7 +865,7 @@ Reuse `work_item_changed` for the design row's status flips. Add a single new ev
 
 ## Follow-up Implementation Chores (to enqueue once approved)
 
-Bite-sized; each fits one worker session. Once the manifest-driven flow lands, future design tasks generate this list automatically — but until then, the list below is the canonical hand-typed manifest for *this* design.
+Bite-sized; each fits one worker session. Once the manifest-driven flow lands, future design tasks generate this list automatically — but until then, the list below is the canonical hand-typed manifest for _this_ design.
 
 1. **Schema + migration**: add `tasks.doc_ref` column, `products.docs_location` + `docs_branch` columns, bump `metadata.schema_version`. Idempotent migration; existing rows default `docs_branch = 'main'`. Acceptance: fresh init and migration both yield the new schema; existing rows are unchanged; new column has correct defaults.
 

@@ -19,7 +19,7 @@ surface so tools never have to scrape `--help`.
 
 Because the engine is the system of record, most commands transparently
 start the engine on demand when its socket is unreachable. This is
-distinct from *worker dispatch*: `--no-autostart` suppresses the engine
+distinct from _worker dispatch_: `--no-autostart` suppresses the engine
 auto-dispatching a worker for newly created work, while
 `--no-engine-autostart` forbids the CLI from spawning the engine at all
 (the command then fails unless an engine is already running). The
@@ -54,6 +54,7 @@ Developers who build Boss from source need to set three environment variables be
 Go to **GitHub → Settings → Developer settings → GitHub Apps → New GitHub App** (or the `spinyfin` organisation equivalent).
 
 Required settings:
+
 - **App name**: anything recognisable, e.g. `boss-shake-prod`
 - **Homepage URL**: `https://github.com/spinyfin/mono`
 - **Permissions → Repository permissions → Issues**: `Read and write`

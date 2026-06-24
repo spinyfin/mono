@@ -2,17 +2,17 @@
 
 ## Problem
 
-Boss's work model assumes a human (or the Boss coordinator) decides *what* to do and *when*. Every task is filed by hand, dispatched off the kanban, and the deliverable is a merged PR. That is the right shape for feature work, but it leaves a whole class of work unserved: the recurring, low-stakes housekeeping that nobody wants to remember to file. "Fix clippy warnings." "Look for duplicated code and extract a helper if it makes sense." "Bump the dependencies that have a clean changelog." This work is *valuable* but *episodic* — most days there is nothing to do, and on the days there is, it should not jump the queue ahead of the human's real priorities.
+Boss's work model assumes a human (or the Boss coordinator) decides _what_ to do and _when_. Every task is filed by hand, dispatched off the kanban, and the deliverable is a merged PR. That is the right shape for feature work, but it leaves a whole class of work unserved: the recurring, low-stakes housekeeping that nobody wants to remember to file. "Fix clippy warnings." "Look for duplicated code and extract a helper if it makes sense." "Bump the dependencies that have a clean changelog." This work is _valuable_ but _episodic_ — most days there is nothing to do, and on the days there is, it should not jump the queue ahead of the human's real priorities.
 
 Today the only way to get this is to remember to file a chore, periodically, forever. That is exactly the kind of standing instruction a machine should hold.
 
-This doc designs **Automations**: a standing, triggered instruction that periodically asks "is there a concrete maintenance task to do right now?" and, if so, spawns a normal task to do it. Automations live *outside* the normal backlog — they are created and managed from a new top-level **Automations** tab, and the tasks they produce run in a dedicated 3-agent pool so they never contend with interactive work. The work they spawn is otherwise an ordinary task: it lands in a worker pane, produces a PR, and trampolines to GitHub review like everything else. Only its *origin* (an automation) and its *pool* (automations) differ.
+This doc designs **Automations**: a standing, triggered instruction that periodically asks "is there a concrete maintenance task to do right now?" and, if so, spawns a normal task to do it. Automations live _outside_ the normal backlog — they are created and managed from a new top-level **Automations** tab, and the tasks they produce run in a dedicated 3-agent pool so they never contend with interactive work. The work they spawn is otherwise an ordinary task: it lands in a worker pane, produces a PR, and trampolines to GitHub review like everything else. Only its _origin_ (an automation) and its _pool_ (automations) differ.
 
 ## Goals
 
 - A first-class **automation** entity: a standing instruction with a **trigger**, a **product** (and optional repo), a **standing-instruction prompt**, and an **open-task cap**.
 - Initially one trigger type — a cron-like **schedule** — with a schema that is **open to other trigger types later** (event-driven, manual-only) without a migration to the core shape.
-- A **two-phase execution model**: phase-1 *triage* decides whether concrete work exists right now and is allowed to **skip** the occurrence; phase-2 *execute* spawns a normal task and runs it to a PR.
+- A **two-phase execution model**: phase-1 _triage_ decides whether concrete work exists right now and is allowed to **skip** the occurrence; phase-2 _execute_ spawns a normal task and runs it to a PR.
 - A **dedicated pool of 3 agents**, fully distinct from the main 8-worker pool, with an Agents-tab affordance to switch between the two.
 - **Robust scheduling**: catch up after a missed fire (laptop was closed) unless the next fire is imminent, and **retry** rather than drop an occurrence when execution is transiently impossible (VPN down, remote unreachable).
 - A per-automation **open-task limit** enforced at fire time so pending changes can't pile up.
@@ -34,7 +34,7 @@ This doc designs **Automations**: a standing, triggered instruction that periodi
 
 Register each automation's cron expression with the OS scheduler; on fire, the OS runs `boss automation run <id>`.
 
-Rejected. The engine is the only component that knows the open-task count, the automations-pool capacity, and whether the machine can currently reach the git remote — an OS-level cron firing blind would either ignore the open-task limit or have to re-implement the engine's accounting over the CLI. More decisively, Boss is a laptop app that is *frequently asleep*: launchd's catch-up semantics for missed wakeups are coarse and not configurable per the "skip-if-imminent" rule the brief requires. The engine already runs interval sweepers (`spawn_merge_poller`, the orphan/dead-PID sweeps in `app.rs`, all built on a shared `spawn_loop(... Duration ...)` helper) and already persists `next_due_at`-style bookkeeping for other pollers. An in-engine automation scheduler reuses that machinery and keeps all dispatch policy in one place. **Chosen: in-engine periodic scheduler loop.**
+Rejected. The engine is the only component that knows the open-task count, the automations-pool capacity, and whether the machine can currently reach the git remote — an OS-level cron firing blind would either ignore the open-task limit or have to re-implement the engine's accounting over the CLI. More decisively, Boss is a laptop app that is _frequently asleep_: launchd's catch-up semantics for missed wakeups are coarse and not configurable per the "skip-if-imminent" rule the brief requires. The engine already runs interval sweepers (`spawn_merge_poller`, the orphan/dead-PID sweeps in `app.rs`, all built on a shared `spawn_loop(... Duration ...)` helper) and already persists `next_due_at`-style bookkeeping for other pollers. An in-engine automation scheduler reuses that machinery and keeps all dispatch policy in one place. **Chosen: in-engine periodic scheduler loop.**
 
 ### A2 — Reuse the main worker pool with a priority/quota instead of a second pool
 
@@ -46,7 +46,7 @@ Rejected. The brief mandates isolation, and isolation by quota inside a shared p
 
 The brief sketches a single hidden project that owns every automation-produced task, with backlog exclusion keyed on project membership.
 
-Rejected as the *primary* mechanism (see Chosen approach → Provenance). A project is the wrong primitive here: the open-task limit is **per-automation**, so even with a shared project we still need a per-task `source_automation_id` to count correctly — the project adds nothing to accounting. And automation tasks are product-level housekeeping, structurally like chores (`kind = 'chore'`, `project_id = NULL`), not members of a feature project. Auto-creating a magic project per product just to hang tasks off it adds a lifecycle to manage (what is its status? does it show in `boss project list`?) for no benefit. **Chosen: provenance via a `source_automation_id` FK; exclusion keyed on that FK; no synthetic project.** The brief's "Maintenance tasks" framing is satisfied by the Automations *tab* grouping tasks by their automation, which is what a human actually wants to see.
+Rejected as the _primary_ mechanism (see Chosen approach → Provenance). A project is the wrong primitive here: the open-task limit is **per-automation**, so even with a shared project we still need a per-task `source_automation_id` to count correctly — the project adds nothing to accounting. And automation tasks are product-level housekeeping, structurally like chores (`kind = 'chore'`, `project_id = NULL`), not members of a feature project. Auto-creating a magic project per product just to hang tasks off it adds a lifecycle to manage (what is its status? does it show in `boss project list`?) for no benefit. **Chosen: provenance via a `source_automation_id` FK; exclusion keyed on that FK; no synthetic project.** The brief's "Maintenance tasks" framing is satisfied by the Automations _tab_ grouping tasks by their automation, which is what a human actually wants to see.
 
 ## Chosen approach
 
@@ -102,7 +102,7 @@ The `Automation` struct in `boss-protocol` carries ≥8 fields, so per the repo 
 
 #### `automation_runs` table (run history)
 
-Every fire — including no-ops and transient failures — records a row. This is the source of truth for the open-task limit's denominator is *not* here (that's a live count over `tasks`), but it is the audit trail the Automations tab shows.
+Every fire — including no-ops and transient failures — records a row. This is the source of truth for the open-task limit's denominator is _not_ here (that's a live count over `tasks`), but it is the audit trail the Automations tab shows.
 
 ```sql
 CREATE TABLE IF NOT EXISTS automation_runs (
@@ -138,20 +138,21 @@ CREATE INDEX IF NOT EXISTS tasks_source_automation_idx
 ```
 
 A non-null `source_automation_id`:
+
 1. **Links a produced task back to its automation** — enabling `boss automation tasks <id>` and the tab's per-automation task list.
 2. **Drives backlog/kanban exclusion** — the work-tree RPC and the app filter out any task where `source_automation_id IS NOT NULL`.
 3. **Routes the task's execution to the automations pool** — the dispatcher reads it to pick the pool.
 4. **Is the denominator for the open-task limit** — `COUNT(*) WHERE source_automation_id = ? AND status IN ('todo','ready','doing','in_review','blocked')`.
 
-Produced tasks keep `kind = 'task'` and `project_id = NULL`; they are product-level like chores. We do **not** introduce a `kind = 'maintenance'` — the kind discriminator is about *deliverable shape* (PR vs doc), and a maintenance task's deliverable is an ordinary PR. Provenance, not kind, is the right axis (this is the same reasoning `design-producing-tasks.md` Q1 used to reject a parallel boolean flag).
+Produced tasks keep `kind = 'task'` and `project_id = NULL`; they are product-level like chores. We do **not** introduce a `kind = 'maintenance'` — the kind discriminator is about _deliverable shape_ (PR vs doc), and a maintenance task's deliverable is an ordinary PR. Provenance, not kind, is the right axis (this is the same reasoning `design-producing-tasks.md` Q1 used to reject a parallel boolean flag).
 
 #### Short-id namespace: a new `A` prefix
 
-Automations get their own per-product `A` namespace (`A1`, `A2`, …), allocated by the same `allocate_short_id`/`short_id_sequences` machinery (`work.rs`) used for `T`/`P`. They are **not** added to `resolve_friendly_work_item_id` (that resolver returns *work items*; an automation is not a work item). Instead `boss automation` verbs resolve `A<n>` within the automation namespace. Justification: reusing `T`/`P` would make `boss automation show T42` ambiguous, and automations are a genuinely distinct noun deserving a distinct prefix, consistent with `friendly-numeric-ids-for-work-items.md`.
+Automations get their own per-product `A` namespace (`A1`, `A2`, …), allocated by the same `allocate_short_id`/`short_id_sequences` machinery (`work.rs`) used for `T`/`P`. They are **not** added to `resolve_friendly_work_item_id` (that resolver returns _work items_; an automation is not a work item). Instead `boss automation` verbs resolve `A<n>` within the automation namespace. Justification: reusing `T`/`P` would make `boss automation show T42` ambiguous, and automations are a genuinely distinct noun deserving a distinct prefix, consistent with `friendly-numeric-ids-for-work-items.md`.
 
 ### Repo selection (brief's "prompt-only vs explicit field" question)
 
-**Recommendation: an optional explicit `repo_remote_url` field, authoritative for the cube lease, with the standing instruction as documentation only.** A product can have multiple repos (`multi-repo-work-modeling.md`); the engine must lease a *specific* cube workspace before the triage agent runs, so it needs the target repo as structured data, not buried in prose it would have to parse. If `repo_remote_url` is null, default to the product's primary repo. The standing instruction may still *mention* the repo for the agent's benefit, but the explicit field is what the engine acts on, and the produced task inherits it via the existing `tasks.repo_remote_url` per-task override.
+**Recommendation: an optional explicit `repo_remote_url` field, authoritative for the cube lease, with the standing instruction as documentation only.** A product can have multiple repos (`multi-repo-work-modeling.md`); the engine must lease a _specific_ cube workspace before the triage agent runs, so it needs the target repo as structured data, not buried in prose it would have to parse. If `repo_remote_url` is null, default to the product's primary repo. The standing instruction may still _mention_ the repo for the agent's benefit, but the explicit field is what the engine acts on, and the produced task inherits it via the existing `tasks.repo_remote_url` per-task override.
 
 ### Two-phase execution
 
@@ -161,7 +162,8 @@ When the scheduler decides an automation should fire (due, enabled, under cap, m
 
 The triage worker is spawned into a cube workspace for the automation's repo exactly like any worker (`schedule_execution` → `cube lease` → `SpawnWorkerPane`), but its rendered `CLAUDE.md`/initial input is a **triage preamble** the engine composes:
 
-> You are a maintenance **triage** agent for automation `A<n>` on product `<product>`. Standing instruction: *"<standing_instruction>"*. Decide whether a **single, concrete, actionable** task can be derived from this instruction **right now** in this repo. You are explicitly allowed to conclude that nothing appropriate exists.
+> You are a maintenance **triage** agent for automation `A<n>` on product `<product>`. Standing instruction: _"<standing_instruction>"_. Decide whether a **single, concrete, actionable** task can be derived from this instruction **right now** in this repo. You are explicitly allowed to conclude that nothing appropriate exists.
+>
 > - If there **is** work: create exactly one task with `boss task create --automation A<n> --autostart "<concise title>" --description "<what to do>"`, then end your final message with the line `automation: task <the-new-T-id>`. **Do not do the work or open a PR yourself** — a separate worker will execute the task.
 > - If there is **nothing** appropriate: end your final message with `automation: skip — <one-line reason>`.
 
@@ -190,7 +192,7 @@ let worker = pool.claim_worker(exec_id, preferred_workspace).await;
 
 `claim_worker`/`release_worker`/`release_worker_and_kick` are unchanged — they operate on whichever pool instance they're called against. Pool exhaustion (`DrainOutcome::PoolExhausted`) is per-pool: an exhausted automations pool defers automation work without touching main-pool throughput, and vice-versa. The scheduler heartbeat already re-kicks; nothing new is needed there.
 
-The two pools draw cube workspaces from the same cube pool (workspaces are repo-scoped and fungible); only the *slot/pane* accounting is separate. The app renders 8 panes for the main pool and 3 for the automations pool.
+The two pools draw cube workspaces from the same cube pool (workspaces are repo-scoped and fungible); only the _slot/pane_ accounting is separate. The app renders 8 panes for the main pool and 3 for the automations pool.
 
 ### Scheduling semantics
 
@@ -202,26 +204,27 @@ A new interval loop, `automation_scheduler`, is spawned in `app.rs` alongside th
    - Let `following` be the next occurrence strictly after `next_due_at`.
    - If `following - now <= catch_up_window` → the missed fire is **stale**; skip it (record nothing, or a `skipped`/`detail="stale, within catch-up window"` run for observability) and set `next_due_at = following`. This is the "we're already nearly at the next one" rule.
    - Else → **catch up**: fire the missed occurrence now.
-   `catch_up_window` defaults to an **engine constant of 15 minutes**, overridable per automation via `automations.catch_up_window_secs`. Rationale: 15 min is long enough that a brief sleep/wake doesn't lose a daily job, short enough that a "2pm weekday" job missed until 1:50pm next day correctly skips to the real 2pm.
-4. **Ability check + transient retry.** Firing creates the `automation_triage` execution. If the **pre-start** steps fail transiently — cube lease error, git remote unreachable (VPN down), product repo unresolvable — this is detected exactly as the existing dispatcher detects it: `schedule_execution` increments `WorkExecution::pre_start_failure_count` and sets `dispatch_not_before` to a backoff time (the same `dispatch_not_before` epoch-seconds gate already on `work_executions`). The run is `failed_will_retry`; the scheduler re-attempts after the backoff, **preserving `scheduled_for`** so we retry *this* occurrence, not skip to the next. Backoff is exponential (e.g. 1, 2, 4, 8 … min) capped at the `catch_up_window`; once the backoff would push past the next occurrence, the run becomes `failed_gave_up` and the schedule advances.
+     `catch_up_window` defaults to an **engine constant of 15 minutes**, overridable per automation via `automations.catch_up_window_secs`. Rationale: 15 min is long enough that a brief sleep/wake doesn't lose a daily job, short enough that a "2pm weekday" job missed until 1:50pm next day correctly skips to the real 2pm.
+4. **Ability check + transient retry.** Firing creates the `automation_triage` execution. If the **pre-start** steps fail transiently — cube lease error, git remote unreachable (VPN down), product repo unresolvable — this is detected exactly as the existing dispatcher detects it: `schedule_execution` increments `WorkExecution::pre_start_failure_count` and sets `dispatch_not_before` to a backoff time (the same `dispatch_not_before` epoch-seconds gate already on `work_executions`). The run is `failed_will_retry`; the scheduler re-attempts after the backoff, **preserving `scheduled_for`** so we retry _this_ occurrence, not skip to the next. Backoff is exponential (e.g. 1, 2, 4, 8 … min) capped at the `catch_up_window`; once the backoff would push past the next occurrence, the run becomes `failed_gave_up` and the schedule advances.
 
 **Transient inability vs genuine phase-1 skip — the key distinction:**
 
-| Signal | Meaning | Recorded as |
-|---|---|---|
-| Pre-start failure (lease/remote/VPN) — worker never produced a decision | Can't execute right now | `failed_will_retry` → retry same occurrence |
-| Worker ran, ended with `automation: skip — …` | Agent decided nothing to do | `skipped` → advance schedule, **no** retry |
-| Worker ran, ended with `automation: task <id>` | Found work | `produced_task` → phase 2 |
-| Worker ran but emitted neither marker (crash/reap mid-run) | Ambiguous failure | `failed_will_retry` (bounded retries) |
+| Signal                                                                  | Meaning                     | Recorded as                                 |
+| ----------------------------------------------------------------------- | --------------------------- | ------------------------------------------- |
+| Pre-start failure (lease/remote/VPN) — worker never produced a decision | Can't execute right now     | `failed_will_retry` → retry same occurrence |
+| Worker ran, ended with `automation: skip — …`                           | Agent decided nothing to do | `skipped` → advance schedule, **no** retry  |
+| Worker ran, ended with `automation: task <id>`                          | Found work                  | `produced_task` → phase 2                   |
+| Worker ran but emitted neither marker (crash/reap mid-run)              | Ambiguous failure           | `failed_will_retry` (bounded retries)       |
 
-The discriminator is **whether the worker reached a decision marker**. A skip is an explicit, agent-authored statement; everything that prevents the agent from *getting to* a marker is treated as transient and retried (bounded).
+The discriminator is **whether the worker reached a decision marker**. A skip is an explicit, agent-authored statement; everything that prevents the agent from _getting to_ a marker is treated as transient and retried (bounded).
 
 #### Timezone / DST handling (brief's open question 4)
 
-Store the IANA timezone name (not a fixed UTC offset) alongside the cron, so "every weekday at 2pm" means 2pm *local* across DST transitions. Compute occurrences with `chrono-tz`:
+Store the IANA timezone name (not a fixed UTC offset) alongside the cron, so "every weekday at 2pm" means 2pm _local_ across DST transitions. Compute occurrences with `chrono-tz`:
+
 - **Spring-forward gap** (a wall-clock time that doesn't exist, e.g. 02:30 on the skip day): advance to the next valid instant — the job runs once, slightly later, not zero times.
 - **Fall-back overlap** (a wall-clock time that occurs twice): fire on the **first** occurrence only; dedupe by `scheduled_for` so the second 01:30 doesn't double-fire.
-`automation_runs.scheduled_for` (UTC) is the dedupe key — a given occurrence fires at most once regardless of clock weirdness.
+  `automation_runs.scheduled_for` (UTC) is the dedupe key — a given occurrence fires at most once regardless of clock weirdness.
 
 ### CLI surface (`boss automation`)
 
@@ -279,10 +282,10 @@ These are the PR-sized tasks a human would file once this design is approved; st
 
 1. **Confirmed — no synthetic Maintenance project (open question 1).** Provenance is `tasks.source_automation_id`; exclusion and accounting key on it; the Automations tab provides the grouping a project would have. Reviewer: confirm you're happy dropping the "one hidden project" framing in favor of provenance-by-FK.
 2. **Confirmed — engine owns everything (open question 2).** Scheduling, pool accounting, reconciliation all in-engine; app/CLI are thin. No concern flagged; noted for completeness.
-3. **Triage prompt quality (open question 3).** The whole value of phase 1 hinges on the triage agent reliably emitting exactly one decision marker and *not* doing the work itself. The marker protocol (`automation: task <id>` / `automation: skip — …`) and the "do not open a PR" instruction are the guardrails; the cap re-check at `boss task create --automation` is the backstop against fan-out. Reviewer: is a final-line marker robust enough, or do we want a dedicated `boss automation triage-result` verb the agent must call (stronger contract, more new surface)?
+3. **Triage prompt quality (open question 3).** The whole value of phase 1 hinges on the triage agent reliably emitting exactly one decision marker and _not_ doing the work itself. The marker protocol (`automation: task <id>` / `automation: skip — …`) and the "do not open a PR" instruction are the guardrails; the cap re-check at `boss task create --automation` is the backstop against fan-out. Reviewer: is a final-line marker robust enough, or do we want a dedicated `boss automation triage-result` verb the agent must call (stronger contract, more new surface)?
 4. **Timezone/DST (open question 4).** Resolved: store IANA tz, compute with `chrono-tz`, dedupe occurrences by UTC `scheduled_for`, fire-once on fall-back, run-slightly-later on spring-forward. Reviewer: confirm "fire on first occurrence of an ambiguous wall-clock time" is the desired fall-back behavior.
 5. **Open-task definition + enforcement point (open question 5).** Resolved: enforced at fire time in the scheduler; "open" = `todo|ready|doing|in_review|blocked` (not `done`/`archived`/soft-deleted). Reviewer: should `blocked` count as open? (I say yes — a blocked maintenance task is still pending change pile-up — but it's a judgment call.)
 6. **`open_task_limit` default.** I propose **1** (one outstanding maintenance change per automation at a time — the most conservative anti-pile-up stance). Some automations ("fix any clippy warning") might reasonably allow more. Reviewer: is a default of 1 right, or should it be higher with a per-automation override (which the schema already supports)?
 7. **Cron crate choice.** `croner` (actively maintained, DST-aware, supports seconds field) vs `cron` (older, simpler). Picking one is a small but real dependency decision deferred to implementation task 1.
-8. **Suppressed-at-limit advancement.** I chose to *advance* `next_due_at` past a suppressed occurrence rather than hold it, so a freshly-merged automation doesn't immediately fire its whole missed backlog. The alternative (fire once as soon as it drops below cap) is arguably more responsive. Reviewer: advance-and-skip vs fire-once-on-recovery?
+8. **Suppressed-at-limit advancement.** I chose to _advance_ `next_due_at` past a suppressed occurrence rather than hold it, so a freshly-merged automation doesn't immediately fire its whole missed backlog. The alternative (fire once as soon as it drops below cap) is arguably more responsive. Reviewer: advance-and-skip vs fire-once-on-recovery?
 9. **Pool starvation within automations.** Three slots shared across all automations means a slow maintenance task can block triage of others. With `open_task_limit` defaulting low and maintenance being episodic this is unlikely to bite, but if it does, the fix is per-automation fairness in `claim_worker` — explicitly out of scope for v1.

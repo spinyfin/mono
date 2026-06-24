@@ -3,11 +3,11 @@
 ## Motivating questions
 
 Two recent designs landed observability infrastructure for the engine and
-immediately raised the same follow-up question: *we now know an event
-happened, but how often does it happen, and is the cold path worth keeping?*
+immediately raised the same follow-up question: _we now know an event
+happened, but how often does it happen, and is the cold path worth keeping?_
 
 - PR #465 (`feat(engine): primary-path PR URL capture from worker hook
-  stream`) shipped the primary path for PR-binding. The reconstruction path
+stream`) shipped the primary path for PR-binding. The reconstruction path
   (`detect_pr` → `jj_candidate_commit_shas` → `gh api commits/{sha}/pulls`)
   is preserved as a cold-path fallback for engine-restart recovery. **Open
   question:** does the cold path actually fire in production? If we
@@ -20,8 +20,8 @@ happened, but how often does it happen, and is the cold path worth keeping?*
   dependency-unblock sweeper. A `longest_stale_seconds` gauge per sweep
   pass would have told us before the chore caught it.
 
-In both cases, the question is **rate over time**, not *did this specific
-event happen* — the latter is already covered by
+In both cases, the question is **rate over time**, not _did this specific
+event happen_ — the latter is already covered by
 [`engine-dispatch-instrumentation`](engine-dispatch-instrumentation.md).
 Today the engine grows a bespoke `XxxStats` struct + bossctl verb every
 time someone wants to count something:
@@ -76,9 +76,9 @@ fixes.
   etc. are a different concern.
 - **Replacing
   [`engine-dispatch-instrumentation`](engine-dispatch-instrumentation.md).**
-  That design is about *discrete events* attributed to a specific
+  That design is about _discrete events_ attributed to a specific
   execution — "did stage 5 succeed for `exec_…`?". This design is about
-  *aggregate rates* — "how many stage 5 successes since last restart?".
+  _aggregate rates_ — "how many stage 5 successes since last restart?".
   Both are needed; they don't overlap.
 
 ## Alternatives considered
@@ -111,7 +111,7 @@ weight for the question — or (b) we ship without a scraper and the
 counters are reset on every engine restart, which defeats the
 multi-week-observation use case. The dependency surface and the
 in-memory-only default both fail the goals above. If we ever need true
-TSDB semantics we should bring in Prometheus *as an integration*
+TSDB semantics we should bring in Prometheus _as an integration_
 (scraping an export endpoint we expose alongside our own surface), not
 as the primary storage.
 
@@ -121,12 +121,12 @@ Emit each counter increment as a structured `tracing::info!` line with a
 known target (`metrics.pr_url_capture.primary_path.hit`). An operator
 greps / `jq`s `/tmp/boss-engine.log` to get totals.
 
-**Why not:** O(N events) on disk for the *count* of something is wildly
+**Why not:** O(N events) on disk for the _count_ of something is wildly
 asymmetric — a counter increment is 16 bytes in memory and ~200 bytes
 as a tracing line. Worse, log rotation deletes the counter history; the
 "two weeks of data" question becomes "two weeks of unrotated logs",
-which is fragile. Tracing is the right tool for *what happened with
-context*; it is the wrong tool for *how many times*.
+which is fragile. Tracing is the right tool for _what happened with
+context_; it is the wrong tool for _how many times_.
 
 ### Alternative D — In-memory only, reset on restart (matches DispatcherStats)
 
@@ -149,6 +149,7 @@ start the framework reads the table back into the in-memory counters so
 the values are continuous across restarts.
 
 This gives us:
+
 - the API ergonomics of Alternative D (one-line increment, no lock),
 - the persistence of Alternative B (multi-week answers possible) without
   adding a Prometheus dependency,
@@ -233,6 +234,7 @@ Counters are **truly monotonic across the framework's lifetime** — they
 do not reset on engine startup, because the values are persisted to
 `state.db` and rehydrated on start. The only ways a counter goes back
 to zero are:
+
 1. An operator runs `bossctl metrics reset <name>` (or `--all`), which
    writes 0 to the `state.db` row and clears the in-memory atomic.
 2. The `state.db` is deleted (full Boss state reset).
@@ -241,7 +243,7 @@ This matches the "did the reconstruction path fire in the last two
 weeks?" use case directly: the value is a running total since the last
 explicit reset.
 
-Gauges are *overwritten* on each producer publication; there is no
+Gauges are _overwritten_ on each producer publication; there is no
 "reset" for a gauge — the producer is the source of truth.
 
 ### Persistence: `state.db` table
@@ -270,7 +272,7 @@ existing write traffic.
 
 On engine startup, the framework reads every row and seeds the
 in-memory atomic for the matching registered counter. Rows in the table
-without a matching registered counter are *kept*, not deleted — they
+without a matching registered counter are _kept_, not deleted — they
 represent counters from a previous engine version (e.g. an A/B
 experiment that was removed) and the operator may still want to query
 them via `bossctl metrics show`. They are surfaced as "stale: not
@@ -311,8 +313,8 @@ bossctl metrics reset <name | --all>     # the one write path; goes through engi
   row; doing it via direct sqlite write would leave the atomic stale
   until the next flush, which is confusing.
 
-This intentionally does *not* extend `bossctl live-status debug`. The
-`live-status` verb is a snapshot of *live worker state* — counters are
+This intentionally does _not_ extend `bossctl live-status debug`. The
+`live-status` verb is a snapshot of _live worker state_ — counters are
 engine-global and unrelated. Mixing them would re-introduce the
 "DispatcherStats is buried inside the live-status debug payload" ugliness
 this design is trying to leave behind.
@@ -337,9 +339,9 @@ Both are migrated in phase 2 (see below). Migration replaces:
   reading from the framework registry rather than the struct. We
   keep the wire type as a backwards-compat alias for two releases,
   then delete it.
-- `SweepOutcome` is harder: it is currently a *per-sweep return value*
+- `SweepOutcome` is harder: it is currently a _per-sweep return value_
   used by callers and tests, not a global counter cluster. The
-  migration plan is to *keep* the struct as a return value (callers and
+  migration plan is to _keep_ the struct as a return value (callers and
   tests still need per-sweep counts) but to also `inc()` the matching
   registered counters from within `run_one_pass`. The framework becomes
   the global rate surface; `SweepOutcome` remains the per-call
@@ -356,7 +358,7 @@ Five concrete counters / gauges, each filed as a sibling chore once this
 design is approved:
 
 1. **`pr_url_capture.{primary_path.hit, reconstruction_path.hit,
-   reconstruction_path.failed}`** — the motivating triplet. Three
+reconstruction_path.failed}`** — the motivating triplet. Three
    `inc()` call sites in `on_stop.rs` and `recheck_for_pr`.
 2. **`dependency_unblock.longest_stale_seconds`** (gauge) — set once at
    the end of every dependency-unblock sweep.
@@ -367,8 +369,8 @@ design is approved:
    `DispatcherStats::hook_events_total`. (Plus the rest of
    `DispatcherStats` as part of the migration.)
 5. **`merge_poller.{merged, conflict_flagged, conflict_cleared,
-   pr_recheck_recovered, conflict_redispatched,
-   pr_recheck_unresolved}`** — counters that mirror `SweepOutcome` and
+pr_recheck_recovered, conflict_redispatched,
+pr_recheck_unresolved}`** — counters that mirror `SweepOutcome` and
    make sweep totals queryable across restarts.
 
 ## Implementation phases
@@ -433,7 +435,7 @@ flush, list, show, reset).
    stale on the read side. For "did the cold path fire over two weeks"
    this is irrelevant; for "did my last test increment work?" it's
    surprising. The mitigation is `bossctl metrics show --live` which
-   *does* go through engine RPC and reads the in-memory atomic. Open
+   _does_ go through engine RPC and reads the in-memory atomic. Open
    question: do we ship `--live` in v1, or wait until someone hits the
    30s-staleness surprise? Recommendation: ship `--live` in phase 2,
    it's cheap.
@@ -449,7 +451,7 @@ flush, list, show, reset).
    per module.
 
 3. **Stale rows in `state.db`.** A counter that gets renamed leaves
-   its old row behind under the old name. We choose to *keep* these
+   its old row behind under the old name. We choose to _keep_ these
    (annotated "not registered by current engine") so historical
    answers stay queryable, but the table grows over time. At ~50
    counters expected, this isn't a real problem; we should not need
@@ -462,7 +464,7 @@ flush, list, show, reset).
    `merge.poller.merged` and both pass validation. Mitigation: a
    one-page conventions section in this design plus a lint script
    that diff-checks registered names against a regex. Recommendation:
-   document the convention here, do *not* lint until we see drift in
+   document the convention here, do _not_ lint until we see drift in
    practice.
 
 5. **What about gauges that need a "last reset" semantic?** A gauge
@@ -483,7 +485,7 @@ flush, list, show, reset).
 7. **Test ergonomics.** Unit tests need a way to assert on counter
    values without leaking state across tests. The plan: counters are
    global by default (which is fine for the engine's single-instance
-   shape) but tests construct a *test-local* `Registry` via a
+   shape) but tests construct a _test-local_ `Registry` via a
    `with_test_registry` helper that swaps the global pointer for the
    duration of the test. Cost is one extra Mutex around the global
    handle; benefit is fully-isolated tests. Open question: is the

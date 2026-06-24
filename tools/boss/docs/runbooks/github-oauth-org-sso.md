@@ -79,6 +79,7 @@ If you need to re-authorize a token later (e.g., after a SAML session expires or
 ### When SSO authorization expires
 
 GitHub SAML SSO authorization for an OAuth token does not expire on its own — it remains valid until:
+
 - The token is revoked.
 - The org SAML settings change in a way that invalidates existing authorizations.
 - The user explicitly de-authorizes the app.
@@ -110,14 +111,14 @@ A successful reconcile with no auth-related attention items confirms the full au
 
 ## 5. Troubleshooting
 
-| Symptom | Likely cause | Action |
-|---|---|---|
-| `boss github auth status` → `Org access: needs org-owner approval` | Org has access restrictions and Boss app is not yet approved | Org owner follows §2 |
-| `boss github auth status` → `Org access: needs SAML SSO authorization` | Token not SSO-authorized for `spinyfin` | User follows §3 |
-| `boss github auth status` → `Org access: unknown (probe failed)` | Probe failed for an unexpected reason | Check network; retry; check GitHub status; file a bug if persistent |
-| Sync returns 401 attention items | Token revoked or expired | Run `boss github auth login` to re-authenticate |
-| Sync returns 403 attention items even after `Org access: OK` | Org policy for specific resources (e.g., write-back close) blocked | Check org's fine-grained repository permissions; the token has the scope but the org policy may block it |
-| Device code expires during `boss github auth login` | User did not complete the browser step in time | Re-run `boss github auth login` |
+| Symptom                                                                | Likely cause                                                       | Action                                                                                                   |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `boss github auth status` → `Org access: needs org-owner approval`     | Org has access restrictions and Boss app is not yet approved       | Org owner follows §2                                                                                     |
+| `boss github auth status` → `Org access: needs SAML SSO authorization` | Token not SSO-authorized for `spinyfin`                            | User follows §3                                                                                          |
+| `boss github auth status` → `Org access: unknown (probe failed)`       | Probe failed for an unexpected reason                              | Check network; retry; check GitHub status; file a bug if persistent                                      |
+| Sync returns 401 attention items                                       | Token revoked or expired                                           | Run `boss github auth login` to re-authenticate                                                          |
+| Sync returns 403 attention items even after `Org access: OK`           | Org policy for specific resources (e.g., write-back close) blocked | Check org's fine-grained repository permissions; the token has the scope but the org policy may block it |
+| Device code expires during `boss github auth login`                    | User did not complete the browser step in time                     | Re-run `boss github auth login`                                                                          |
 
 ---
 

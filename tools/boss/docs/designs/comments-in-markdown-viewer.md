@@ -31,12 +31,12 @@ comment.
   the doc.
 - The magic wand dispatches a doc-editing agent. Two dispatch paths:
   - **Engine-owned doc** (e.g. a work-item description): a
-    *specialised, isolated Claude instance* with a deliberately narrow
+    _specialised, isolated Claude instance_ with a deliberately narrow
     tool surface — see [Magic-wand sandbox](#magic-wand-sandbox).
   - **PR-backed doc** (e.g. a design doc on a `boss/exec_*` branch):
     the existing Boss chore-worker path, given a directive that
     encodes the comment's intent against the PR's branch.
-- The interaction model is validated end-to-end on real docs *before*
+- The interaction model is validated end-to-end on real docs _before_
   the engine learns to persist comments or dispatch agents. Phase 1
   ships UI only.
 
@@ -60,7 +60,7 @@ comment.
 - Realtime collaboration (live presence, OT/CRDT). Two simultaneous
   comments at the same anchor just produce two separate comment rows.
 - Auto-applying magic-wand output. Every magic-wand result lands in a
-  *preview* state and requires explicit user accept before the source
+  _preview_ state and requires explicit user accept before the source
   is overwritten.
 
 ## Alternatives considered
@@ -127,7 +127,7 @@ model. Dispatch routes through the engine's existing execution path
 ### Phasing
 
 The user has called for the UI interaction model to be validated
-*before* the agent path is built. The design adopts that explicitly:
+_before_ the agent path is built. The design adopts that explicitly:
 
 - **Phase 1 — UI shell.** Selection → comment author → sidebar render
   → highlight → dismiss. **No engine persistence** (comments live in
@@ -191,9 +191,9 @@ attached, it runs each anchor through this resolution:
    fuzzy match with [`fastdiff`][fastdiff]-style scoring across
    sliding windows. A comment is considered re-anchored if the best
    match scores ≥0.8 against the original `exact + prefix + suffix`
-   *and* is uniquely the best (the second-best match scores <0.7).
+   _and_ is uniquely the best (the second-best match scores <0.7).
 3. **Orphan** — if neither exact nor fuzzy resolution succeeds, the
-   comment is *orphaned*: it still appears in the sidebar with an
+   comment is _orphaned_: it still appears in the sidebar with an
    "anchor lost" badge and the original snippet, but does not paint
    a highlight in the doc. Orphans can be dismissed normally; a
    future "re-attach to current selection" affordance is a natural
@@ -210,7 +210,7 @@ most real-world miles on this exact problem.
 
 **Why not `RangeSelector` or DOM-path-style anchors.** The W3C model
 also defines `RangeSelector` (start/end paths into a structured tree)
-and `XPathSelector`. Both bind to the *rendered DOM*, which means
+and `XPathSelector`. Both bind to the _rendered DOM_, which means
 any structural change to the document (a new heading inserted before
 the anchor, a paragraph split, a list re-bulleted) breaks them. A
 plain `TextQuoteSelector` is content-addressed: it survives any edit
@@ -254,7 +254,7 @@ Notes:
   is the synthetic composite key — repo, branch, path — that uniquely
   identifies the file. This means a single design doc on a PR carries
   its comments as long as the PR's branch lives.
-- `doc_version` is the SHA-256 of the *plain-text projection* of the
+- `doc_version` is the SHA-256 of the _plain-text projection_ of the
   doc at authoring time, not the raw markdown SHA. The plain-text
   projection is what the anchor lives in, so this is the right
   invariant for CAS (Q below).
@@ -267,7 +267,7 @@ Notes:
   hidden from the active sidebar but remains in the history surface.
   Hard delete is not exposed in v1.
 - Author is `user:<email>` for human-authored comments. The
-  magic-wand path may produce *replies* in v2; reserved syntax is
+  magic-wand path may produce _replies_ in v2; reserved syntax is
   `magic_wand:<comment_id>` to keep them visually distinct.
 
 The work-items themselves do not gain any columns; comments are
@@ -277,8 +277,8 @@ unaffected by the addition of comments.
 
 ### Doc-version invariant
 
-`doc_version` is a SHA-256 of the doc's *current plain-text
-projection* at authoring time. The engine computes it; the renderer
+`doc_version` is a SHA-256 of the doc's _current plain-text
+projection_ at authoring time. The engine computes it; the renderer
 provides the plain text inline in the create RPC (so the engine and
 renderer agree on the input).
 
@@ -305,13 +305,13 @@ following the conventions in
 [`engine-app-rpc`](engine-app-rpc.md):
 
 - `comments_create(artifact_kind, artifact_id, doc_version,
-  anchor, body) → Comment` — creates an `active` comment. Returns
+anchor, body) → Comment` — creates an `active` comment. Returns
   the row.
 - `comments_list(artifact_kind, artifact_id, include_dismissed?)
-  → [Comment]` — fetches all comments for an artifact. Default
+→ [Comment]` — fetches all comments for an artifact. Default
   excludes `dismissed` and `resolved`.
 - `comments_update_anchor(comment_id, new_anchor, new_doc_version)
-  → Comment` — called by the renderer after re-anchoring on a fresh
+→ Comment` — called by the renderer after re-anchoring on a fresh
   load, when the anchor resolved fuzzy-match rather than exact-match.
   Lets the engine learn the new shape so subsequent loads exact-match.
 - `comments_set_status(comment_id, status, actor) → Comment` —
@@ -322,7 +322,7 @@ following the conventions in
   magic-wand entry point. Returns an execution-handle the UI can
   subscribe to for status.
 - `comments_fetch_with_doc_version(artifact_kind, artifact_id) →
-  {doc_text, doc_version, comments}` — convenience: one round-trip
+{doc_text, doc_version, comments}` — convenience: one round-trip
   to load both the doc text the engine has on record (for
   work-item descriptions) and its current comments. PR-backed docs
   return `doc_text = null` because the source-of-truth is the git
@@ -406,7 +406,7 @@ hosts the comment overlay. Pieces:
    corresponding doc highlight (bidirectional cursor).
 
 5. **`MagicWandResultSheet`** — modal sheet shown when a magic-wand
-   dispatch completes. Renders the *current* doc and the *proposed*
+   dispatch completes. Renders the _current_ doc and the _proposed_
    doc side-by-side via two `StructuredText` views, with a single
    "Apply" / "Discard" pair below. v1 does not implement an
    intra-paragraph diff; the user is reading two renders of the
@@ -414,7 +414,7 @@ hosts the comment overlay. Pieces:
    post-v1 list.
 
 The sidebar appears only when the artifact has at least one comment
-*or* the user has explicitly toggled it on; toggle state is per-view,
+_or_ the user has explicitly toggled it on; toggle state is per-view,
 not persisted. This keeps the chrome out of the way of users who
 aren't using the feature.
 
@@ -435,7 +435,7 @@ existing `anthropic-sdk` crate — same SDK Boss uses for its other
 direct-API calls). **No Claude Agent SDK, no tools, no system
 prompt beyond the inlined instructions.** The prompt is:
 
-```text
+````text
 You are editing a markdown document. The user has highlighted a
 section and left a comment. Apply their intent to the document and
 return the entire updated markdown verbatim.
@@ -443,17 +443,20 @@ return the entire updated markdown verbatim.
 Document:
 ```markdown
 <doc_text>
-```
+````
 
 Highlighted section:
+
 > <anchor.exact>
 
 Comment:
+
 > <comment.body>
 
 Respond with only the updated markdown. Do not include any
 explanation, header, or trailing prose.
-```
+
+````
 
 **No tool surface.** The model's response is the entire updated
 markdown as a single message. No `Bash`, no `Read`, no `Edit`, no
@@ -513,7 +516,7 @@ CREATE TABLE magic_wand_dispatches (
   created_at    INTEGER NOT NULL,
   resolved_at   INTEGER
 );
-```
+````
 
 This table is the audit trail for "what did the magic wand do." It
 also feeds a future per-comment history surface.
@@ -734,7 +737,7 @@ reasoning visible so the human can override on review.
   the trust path for selectors.** If the renderer's plain-text
   projection ever drifts between versions (e.g. a future Textual
   upgrade changes how a code-block fence is rendered), existing
-  anchors may all silently start orphaning. *Mitigation*: the
+  anchors may all silently start orphaning. _Mitigation_: the
   `doc_version` field will catch coarse drift (the hash changes when
   the projection changes), and the renderer can emit a "projection
   algorithm version" header alongside the plain text so the engine
@@ -743,21 +746,21 @@ reasoning visible so the human can override on review.
   Phase 2 implementation.
 - **Risk: fuzzy re-anchor false positives.** A 0.8 threshold will
   occasionally re-anchor a comment to the wrong piece of text on
-  heavily edited docs. *Mitigation*: the fuzzy outcome is recorded
+  heavily edited docs. _Mitigation_: the fuzzy outcome is recorded
   on `comments_update_anchor` so the user sees "this comment
   re-anchored fuzzily" in the sidebar (e.g. a small ⚠ glyph) and
   can sanity-check.
 - **Risk: magic-wand instance returning subtly broken markdown
   (mis-indented code, dropped fence).** The diff-sanity check
   rejects gross failures, but subtle ones reach the preview sheet
-  and rely on the human to spot. *Mitigation*: the side-by-side
+  and rely on the human to spot. _Mitigation_: the side-by-side
   preview is the explicit checkpoint; the human is in the loop.
   If we see this fail in practice, add a "the result fails to
   parse as markdown" reject (parse with Textual's underlying parser
   before showing the sheet).
 - **Risk: cost / token budget on magic-wand calls.** Long docs
   consume non-trivial input tokens, and a chatty user can ring up
-  many dispatches. *Mitigation*: separate API key allows budget
+  many dispatches. _Mitigation_: separate API key allows budget
   bucketing; the `magic_wand_dispatches` table makes per-comment
   cost trivially reportable. A per-day budget cap is a v2 add if
   needed.

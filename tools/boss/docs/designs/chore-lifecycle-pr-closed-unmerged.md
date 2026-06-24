@@ -4,14 +4,14 @@
 
 The chore lifecycle today assumes a PR ends one of two ways: merged, in which case the merge poller (PR #237) flips `status` from `in_review` to `done`; or still open, in which case the chore stays `in_review` until the next sweep. There is no third path.
 
-Concretely, on 2026-05-07 PR #252 was *closed without merge* because it conflated two layers and the user/coordinator decided to scrap it. Chore `task_18ad6b85b6fdd1e0_f` then sat indefinitely at `status='in_review', pr_url=<#252>` even after GitHub reported `state=CLOSED, merged=false`. The merge poller (`tools/boss/engine/src/merge_poller.rs:108-114`) only flips the chore when `state=MERGED` *or* `mergedAt` is set; close-unmerged matches neither and is silently ignored. The coordinator had to manually reset the chore back to `active`.
+Concretely, on 2026-05-07 PR #252 was _closed without merge_ because it conflated two layers and the user/coordinator decided to scrap it. Chore `task_18ad6b85b6fdd1e0_f` then sat indefinitely at `status='in_review', pr_url=<#252>` even after GitHub reported `state=CLOSED, merged=false`. The merge poller (`tools/boss/engine/src/merge_poller.rs:108-114`) only flips the chore when `state=MERGED` _or_ `mergedAt` is set; close-unmerged matches neither and is silently ignored. The coordinator had to manually reset the chore back to `active`.
 
 The valid chore statuses today (`tools/boss/cli/src/main.rs:569`) are `[todo, active, blocked, in_review, done]`. Two states are missing:
 
-- "the work was attempted, the PR was rejected, the chore is back on the table" — the *retry* state.
-- "the work is abandoned and not coming back" — the *give-up* state.
+- "the work was attempted, the PR was rejected, the chore is back on the table" — the _retry_ state.
+- "the work is abandoned and not coming back" — the _give-up_ state.
 
-The user's framing in the chore notes — *"it's unclear if 'Done' is the right state for such things"* — is right. `done` means the work landed; a closed-unmerged PR did not land. Marking these `done` corrupts history and breaks any consumer that reads `done` as "shipped" (the activity feed, the kanban Done column, and any future dependency edge that gates on `done`). Leaving them `in_review` strands them. Auto-resetting to `active` loses the signal that this chore had a prior failed attempt — and dispatch will happily re-spawn a worker on the same description that just produced a rejected PR, looping the engine indefinitely on bad scope.
+The user's framing in the chore notes — _"it's unclear if 'Done' is the right state for such things"_ — is right. `done` means the work landed; a closed-unmerged PR did not land. Marking these `done` corrupts history and breaks any consumer that reads `done` as "shipped" (the activity feed, the kanban Done column, and any future dependency edge that gates on `done`). Leaving them `in_review` strands them. Auto-resetting to `active` loses the signal that this chore had a prior failed attempt — and dispatch will happily re-spawn a worker on the same description that just produced a rejected PR, looping the engine indefinitely on bad scope.
 
 This doc proposes two new chore statuses, an extension to the merge poller's existing `gh pr view` probe, a `prior_pr_urls` history column, explicit CLI verbs (`boss chore reopen` / `boss chore abandon`), a heuristic re-dispatch policy, a new `FrontendEvent::ChorePrClosedUnmerged` push, and a one-shot startup sweep that reconciles chores whose PRs were closed-unmerged while the engine was offline. Same product, same merge-poller cadence, no new background loop.
 
@@ -40,7 +40,7 @@ This doc proposes two new chore statuses, an extension to the merge poller's exi
 
 - The new non-terminal status is **`needs_attention`**. It reads as a state (not a verb) and matches the kanban / coordinator use ("chores needing my attention"). I deliberately avoid `rejected` (overloaded with PR review-rejection, which is different), `pending_review_decision` (too long), and `attention` (too vague).
 - The new terminal status is **`abandoned`**. Symmetric with `done`: both are terminal, both are written once and not auto-cleared. `abandoned` is the explicit "this is not coming back" state; `done` stays meaning "shipped."
-- The history column is **`prior_pr_urls`** (JSON array of strings). New rows store all closed-unmerged PR URLs in chronological order; the live `pr_url` column continues to point at the *current* PR (or NULL when the chore is between attempts).
+- The history column is **`prior_pr_urls`** (JSON array of strings). New rows store all closed-unmerged PR URLs in chronological order; the live `pr_url` column continues to point at the _current_ PR (or NULL when the chore is between attempts).
 - The CLI verbs are **`boss chore reopen`** (move `needs_attention | abandoned → active`) and **`boss chore abandon`** (move anything → `abandoned`). Symmetric with `bossctl work cancel` (PR #240): both are dispositive coordinator verbs.
 - The bossctl coordinator surface verb is **`bossctl work needs-attention`**, mirroring the existing `bossctl work start` / `bossctl work cancel` shape.
 
@@ -73,7 +73,7 @@ This doc proposes two new chore statuses, an extension to the merge poller's exi
 todo, active, blocked, in_review, needs_attention, done, abandoned
 ```
 
-Two are terminal (`done`, `abandoned`); five are non-terminal. The dispatcher only picks up `active` (and `todo` via the auto-advance path in `work.rs:650`); `needs_attention` is explicitly *not* re-dispatchable until promoted.
+Two are terminal (`done`, `abandoned`); five are non-terminal. The dispatcher only picks up `active` (and `todo` via the auto-advance path in `work.rs:650`); `needs_attention` is explicitly _not_ re-dispatchable until promoted.
 
 `MoveTarget` (`tools/boss/cli/src/main.rs:578`) gains `NeedsAttention` and `Abandoned` so the existing `boss chore move` verb can write the new states without going through the dedicated reopen/abandon verbs (which are still the canonical surface — see Q6).
 
@@ -82,7 +82,7 @@ Two are terminal (`done`, `abandoned`); five are non-terminal. The dispatcher on
 `status` is a `TEXT` column; widening the enum is a CLI / engine validation change, not a schema change. The migration consists of:
 
 - Validation: `WorkDb` accepts the two new strings on read/write paths. The `validate_status` helper in `work.rs` (the inline match in `update_task` is the current home) gets two new arms.
-- Engine literals: anywhere the engine reads `status` with a hard-coded enum (e.g. `list_chores_pending_merge_check`'s `WHERE status = 'in_review'`), audit and adjust. The list of pending-merge candidates is unchanged — `needs_attention` is *not* pending merge — but the kanban grouping and reconcile paths get the new statuses.
+- Engine literals: anywhere the engine reads `status` with a hard-coded enum (e.g. `list_chores_pending_merge_check`'s `WHERE status = 'in_review'`), audit and adjust. The list of pending-merge candidates is unchanged — `needs_attention` is _not_ pending merge — but the kanban grouping and reconcile paths get the new statuses.
 
 The protocol `Task` already serialises `status: String` (`tools/boss/protocol/src/types.rs`), so the Swift side picks up the new strings via JSON without a wire-shape change. A Swift `TaskStatus` enum extension is the only client-side code change.
 
@@ -99,7 +99,7 @@ The merge poller's probe (`merge_poller.rs:66-115`) already extracts `state` and
 "--jq",   r#"[(.state // ""), (.mergedAt // "")] | @tsv"#,
 ```
 
-GitHub's `state` is one of `OPEN | CLOSED | MERGED`. The current code only flags `merged=true` when `state=MERGED` *or* `mergedAt` is non-null. The close-unmerged case is `state=CLOSED, mergedAt=null`. That is already in the response — the code just throws it away.
+GitHub's `state` is one of `OPEN | CLOSED | MERGED`. The current code only flags `merged=true` when `state=MERGED` _or_ `mergedAt` is non-null. The close-unmerged case is `state=CLOSED, mergedAt=null`. That is already in the response — the code just throws it away.
 
 ### Options
 
@@ -173,7 +173,7 @@ A persistent network outage means `needs_attention` transitions land late, not w
 
 (α) is the cheapest schema change but loses signal. A coordinator who reopens a chore can no longer link back to the rejected PR without checking history. The kanban / activity feed can't render a "previous attempt" badge because there's no data left to render.
 
-(β) keeps the PR URL but conflates "this is the chore's current PR" (which is the load-bearing meaning of `pr_url` in `mark_chore_pr_merged`'s WHERE clause and in the auto-detect symmetry) with "this is the last PR we tried." A worker that creates a *new* PR in a re-attempt would either overwrite `pr_url` (losing the old one) or refuse to overwrite (forcing the user to clear it manually). Both are bad.
+(β) keeps the PR URL but conflates "this is the chore's current PR" (which is the load-bearing meaning of `pr_url` in `mark_chore_pr_merged`'s WHERE clause and in the auto-detect symmetry) with "this is the last PR we tried." A worker that creates a _new_ PR in a re-attempt would either overwrite `pr_url` (losing the old one) or refuse to overwrite (forcing the user to clear it manually). Both are bad.
 
 (γ) is the cheapest schema change that keeps both signals. `pr_url` keeps its current meaning (current attempt's PR, or NULL); `prior_pr_urls` is purely additive. The macOS UI can show a "tried N times before" badge that reads the array's length, and the worker spawn prompt (Q8) can include the most recent prior URL so the worker reads what didn't work.
 
@@ -220,7 +220,7 @@ A more aggressive design would add a separate `chore_pr_history` table with one 
 
 - **(A) Auto-pick.** When the chore lands in `needs_attention`, the dispatcher treats it like `active` and re-spawns a worker.
 - **(B) Manual pick.** `needs_attention` is explicitly outside the dispatcher's pickup pool; the user (or coordinator) runs `boss chore reopen` or `bossctl work start` to re-dispatch.
-- **(C) Heuristic.** Auto-pick *only* if the chore description has been edited since the close (i.e. `tasks.updated_at > rebase_attempt's_close_timestamp`); otherwise wait for explicit start.
+- **(C) Heuristic.** Auto-pick _only_ if the chore description has been edited since the close (i.e. `tasks.updated_at > rebase_attempt's_close_timestamp`); otherwise wait for explicit start.
 
 ### Discussion
 
@@ -228,7 +228,7 @@ A more aggressive design would add a separate `chore_pr_history` table with one 
 
 **(B) is the safest default.** The user already has to look at the chore (the `needs_attention` lane is visible, the bossctl `needs-attention` verb surfaces it for the coordinator) before disposing of it; making them flip the verb at the same moment is a single keystroke of friction in exchange for never re-looping on a bad chore.
 
-**(C) sounds tempting but the heuristic is fragile.** "Was the description edited since the close?" requires storing the close timestamp somewhere — either we add a `last_close_unmerged_at` column on `tasks` or we read it from `prior_pr_urls`'s entry shape, which we deliberately kept simple in Q3. Even with the timestamp, the heuristic misses cases where the chore description was edited *before* the close (e.g. the user started editing during review, then the PR closed). And it auto-picks cases where the user edited the description but the edit was non-substantive (whitespace, typo). The false-positive rate is high enough that (B)'s explicit verb is friendlier than (C)'s wrong guess.
+**(C) sounds tempting but the heuristic is fragile.** "Was the description edited since the close?" requires storing the close timestamp somewhere — either we add a `last_close_unmerged_at` column on `tasks` or we read it from `prior_pr_urls`'s entry shape, which we deliberately kept simple in Q3. Even with the timestamp, the heuristic misses cases where the chore description was edited _before_ the close (e.g. the user started editing during review, then the PR closed). And it auto-picks cases where the user edited the description but the edit was non-substantive (whitespace, typo). The false-positive rate is high enough that (B)'s explicit verb is friendlier than (C)'s wrong guess.
 
 ### Recommendation
 
@@ -242,7 +242,7 @@ A user can manually `boss chore move <id> --to active` to reach the same state w
 
 ### Why not auto-pick on reopen?
 
-Reopening already implies the user wants to re-dispatch — that's the whole point of the verb. So `reopen` flips to `active` *and* the auto-dispatcher picks the chore up on its next sweep, no extra action needed. This is symmetric with how `boss chore create --autostart` already auto-dispatches.
+Reopening already implies the user wants to re-dispatch — that's the whole point of the verb. So `reopen` flips to `active` _and_ the auto-dispatcher picks the chore up on its next sweep, no extra action needed. This is symmetric with how `boss chore create --autostart` already auto-dispatches.
 
 ---
 
@@ -261,7 +261,7 @@ There is no typed payload for "what kind of change was this"; the `reason` param
 
 ### Recommendation
 
-**Pick (II).** Both halves: emit the existing `work_item_changed` (so subscribers that just want the new row state get it) *and* a new `FrontendEvent::ChorePrClosedUnmerged` push (so subscribers that want the close-unmerged context — the activity feed, a future "show me what attempts I've abandoned this week" view — get a typed payload).
+**Pick (II).** Both halves: emit the existing `work_item_changed` (so subscribers that just want the new row state get it) _and_ a new `FrontendEvent::ChorePrClosedUnmerged` push (so subscribers that want the close-unmerged context — the activity feed, a future "show me what attempts I've abandoned this week" view — get a typed payload).
 
 ```rust
 // tools/boss/protocol/src/wire.rs (FrontendEvent additions)
@@ -326,7 +326,7 @@ boss chore move     <selector> --to needs_attention | abandoned   # generic
 
 ### `boss chore status set` — the generic verb
 
-The chore notes mention "possibly `boss chore status set` as a generic verb." We *don't* need a new generic verb — `boss chore move` already plays that role. Adding `status set` would duplicate the role with no behavioural delta. Leave it.
+The chore notes mention "possibly `boss chore status set` as a generic verb." We _don't_ need a new generic verb — `boss chore move` already plays that role. Adding `status set` would duplicate the role with no behavioural delta. Leave it.
 
 ### Coordinator surface (bossctl)
 
@@ -374,7 +374,7 @@ The merge poller emits two transitions: `in_review → done` (on merge) and `in_
 - Someone (coordinator, the user from the GitHub UI, a recover script) reopens the closed PR on GitHub and merges it.
 - The merge poller's next sweep sees `state=MERGED` for the URL in `prior_pr_urls`. But the merge poller's pickup query (`list_chores_pending_merge_check`) only returns chores with `status='in_review' AND pr_url IS NOT NULL`. C is `abandoned` and has no live `pr_url`. So the poller never queries that URL, and never observes the merge.
 
-So the poller's *current* shape gives `abandoned` precedence over a future merge — *because the poller can't see the merge.* But that's accidental, not designed. If a future change widened the pickup query (e.g. "any chore whose `prior_pr_urls` contains an unresolved PR"), we'd suddenly have a "what wins, abandoned-terminal or done-on-merge?" question to answer.
+So the poller's _current_ shape gives `abandoned` precedence over a future merge — _because the poller can't see the merge._ But that's accidental, not designed. If a future change widened the pickup query (e.g. "any chore whose `prior_pr_urls` contains an unresolved PR"), we'd suddenly have a "what wins, abandoned-terminal or done-on-merge?" question to answer.
 
 ### Options
 
@@ -393,8 +393,8 @@ The "engine refuses and surfaces an attention item" option is too friction-heavy
 Concretely:
 
 - `abandoned` chores are not in `list_chores_pending_merge_check` (the WHERE excludes them by `status != 'in_review'`). The poller will never see a future merge of their PR through the existing pipeline.
-- We deliberately do *not* extend the pickup query to include `abandoned`-and-prior-PR-URLs. That keeps `abandoned` truly terminal and avoids the conflict.
-- If, at some point, an engine path *does* observe a merge of an abandoned chore's prior PR (e.g. the macOS app's own GitHub-watcher feature), the engine logs `tracing::warn!(chore_id=…, pr_url=…, "merge of abandoned chore's prior PR observed; not transitioning")` and emits an activity-feed entry. Status stays `abandoned`.
+- We deliberately do _not_ extend the pickup query to include `abandoned`-and-prior-PR-URLs. That keeps `abandoned` truly terminal and avoids the conflict.
+- If, at some point, an engine path _does_ observe a merge of an abandoned chore's prior PR (e.g. the macOS app's own GitHub-watcher feature), the engine logs `tracing::warn!(chore_id=…, pr_url=…, "merge of abandoned chore's prior PR observed; not transitioning")` and emits an activity-feed entry. Status stays `abandoned`.
 - If the user explicitly wants to "un-abandon" because of the merge, they run `boss chore reopen` (which moves `abandoned → active`) and then `boss chore move <id> --to done` (which writes `pr_url = <merged PR>` and `status = done`).
 
 ### Symmetric case: `needs_attention` and a future merge
@@ -470,7 +470,7 @@ Some chores in the live engine are in `in_review` with PRs that have already clo
 
 **Pick the startup sweep.** Idempotent (same WHERE clause as `mark_close_unmerged` so a second sweep is a no-op), bounded (at-most-N candidates where N is small in practice), and addresses the documented backfill case.
 
-Concretely: `app.rs::start_engine` calls `merge_poller::run_one_pass(&work_db, &probe, &publisher)` once during startup, *before* the regular poller loop spawns. Today's `run_one_pass` already handles the merge case; it'll handle the close-unmerged case once Q2 lands. The startup sweep is just "call the same function once at boot," and any chores that should have been transitioned while the engine was offline catch up in one pass.
+Concretely: `app.rs::start_engine` calls `merge_poller::run_one_pass(&work_db, &probe, &publisher)` once during startup, _before_ the regular poller loop spawns. Today's `run_one_pass` already handles the merge case; it'll handle the close-unmerged case once Q2 lands. The startup sweep is just "call the same function once at boot," and any chores that should have been transitioned while the engine was offline catch up in one pass.
 
 The startup sweep runs in the background — we don't block engine start on it. If `gh` is slow (cold cache, network blip), the sweep takes longer but the engine is up and serving. The first regular poller tick will overlap with the startup sweep's tail; the existing idempotency on the WHERE-guarded UPDATE makes that safe.
 
@@ -540,7 +540,7 @@ This is symmetric with the existing `ListChores` request shape; we could also re
 
 ### Why not a standing notification
 
-The coordinator could subscribe to the `ChorePrClosedUnmerged` push (Q5) and react in real time. That's strictly better than polling — and bossctl can do this if it wants — but the *verb* (`bossctl work needs-attention`) is the synchronous "show me everything queued up right now" surface, which is the load-bearing thing for a coordinator that just woke up and wants the catch-up view.
+The coordinator could subscribe to the `ChorePrClosedUnmerged` push (Q5) and react in real time. That's strictly better than polling — and bossctl can do this if it wants — but the _verb_ (`bossctl work needs-attention`) is the synchronous "show me everything queued up right now" surface, which is the load-bearing thing for a coordinator that just woke up and wants the catch-up view.
 
 ---
 
@@ -556,7 +556,7 @@ If the engine is restarted during a long outage, the startup sweep (Q9) re-runs 
 
 Sequence: PR closes; poller sweeps, observes `state=CLOSED`, transitions chore to `needs_attention` and clears `pr_url`; user reopens the PR ten seconds later; chore is in `needs_attention` with no live `pr_url`.
 
-The chore does *not* automatically flip back to `in_review` because:
+The chore does _not_ automatically flip back to `in_review` because:
 
 - The poller's pickup query gates on `pr_url IS NOT NULL`, so the reopened PR is invisible to the poller.
 - The engine has no other pathway to discover the reopened PR (nothing watches GitHub for reopen events).
@@ -564,7 +564,7 @@ The chore does *not* automatically flip back to `in_review` because:
 
 The user observes a `needs_attention` chore in the UI and a reopened PR on GitHub, with no link between them. They run `boss chore move <id> --to in_review` and `boss chore bind-pr <id> <pr-url>` (existing verb, `cli/src/main.rs:147`) to relink. We add a one-line note in the `bind-pr` reference doc covering this case.
 
-A more aggressive design would hook the close-unmerged path to *not* clear `pr_url` and instead keep it pointed at the closed PR until a new attempt overwrites it (back to option (β) in Q3). Then a reopen-and-merge could be picked up by widening the merge poller's WHERE to include `status='needs_attention'` chores. I deliberately don't do that for v1: the close-and-reopen-rapidly case is rare, the manual `bind-pr` recovery is cheap, and (γ)'s clean separation of "current PR" vs "history" is more valuable than supporting a 1-in-N edge case that already has a recovery path.
+A more aggressive design would hook the close-unmerged path to _not_ clear `pr_url` and instead keep it pointed at the closed PR until a new attempt overwrites it (back to option (β) in Q3). Then a reopen-and-merge could be picked up by widening the merge poller's WHERE to include `status='needs_attention'` chores. I deliberately don't do that for v1: the close-and-reopen-rapidly case is rare, the manual `bind-pr` recovery is cheap, and (γ)'s clean separation of "current PR" vs "history" is more valuable than supporting a 1-in-N edge case that already has a recovery path.
 
 ### 11.3 Chore deleted while PR was open
 
@@ -792,7 +792,7 @@ bossctl work needs-attention [--product <id>] [--json]
 
 ## Risks
 
-**R1 — `needs_attention` becomes a dumping ground.** Without the coordinator's discipline, chores pile up in the `needs_attention` lane and the user accumulates a backlog they can't tell apart. Mitigation: `bossctl work needs-attention` makes the list explicit; the macOS lane is visible; the badge surfaces the count of prior attempts. If pile-up turns out to be the dominant pattern in practice, a follow-up could add an aging rule (e.g. items in `needs_attention > 30 days` auto-promote to `abandoned`) — but auto-abandonment is dangerous and we should *not* default to it without the user's signal.
+**R1 — `needs_attention` becomes a dumping ground.** Without the coordinator's discipline, chores pile up in the `needs_attention` lane and the user accumulates a backlog they can't tell apart. Mitigation: `bossctl work needs-attention` makes the list explicit; the macOS lane is visible; the badge surfaces the count of prior attempts. If pile-up turns out to be the dominant pattern in practice, a follow-up could add an aging rule (e.g. items in `needs_attention > 30 days` auto-promote to `abandoned`) — but auto-abandonment is dangerous and we should _not_ default to it without the user's signal.
 
 **R2 — User confusion between `needs_attention` and `blocked`.** Both are non-terminal-not-in-progress; the kanban shows both as cards parked outside the active flow. Mitigation: the badge ("`↺ tried N× before`") differentiates `needs_attention`; `blocked` carries the existing dependency-edge tooltip from `work-dependencies.md`. The `boss reference` updates explicitly contrast the two states.
 

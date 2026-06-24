@@ -4,7 +4,7 @@
 
 A Boss project (`projects` row) is the unit of work that owns a coherent
 chunk of feature design plus its implementation tasks. The artefact that
-*describes* a project — what it does, why, the resolved design questions —
+_describes_ a project — what it does, why, the resolved design questions —
 is, in practice, a markdown file. In `mono` it lives at
 `tools/boss/docs/designs/<slug>.md`; at work it would live in a separate
 docs / wiki repo. Today, jumping from a project card in the kanban (or any
@@ -14,16 +14,16 @@ slug haven't drifted.
 
 The recently-merged design-producing-tasks design
 (`tools/boss/docs/designs/design-producing-tasks.md`) tackles a related
-but distinct problem: it makes *the design task itself* a first-class
+but distinct problem: it makes _the design task itself_ a first-class
 work-item kind, with the doc as its deliverable, and gives the engine a
-`tasks.doc_ref` column for the row that *produced* the doc. That is
+`tasks.doc_ref` column for the row that _produced_ the doc. That is
 sufficient while the design task is the active deliverable — the user
-opens the design *task* and the renderer shows the doc. It is *not*
+opens the design _task_ and the renderer shows the doc. It is _not_
 sufficient once the design task is `done` and the project is humming
 along on implementation tasks: the project card still wants a "go to my
 design doc" affordance, and that affordance has to keep working long
 after the design task has fallen out of the active kanban view. It also
-has to work for projects whose design *did not* come from a Boss design
+has to work for projects whose design _did not_ come from a Boss design
 task at all — projects imported from work, projects whose doc was
 hand-written before the design-task kind shipped, projects whose doc
 lives in a docs-only repo Boss does not track as a Product.
@@ -50,7 +50,7 @@ per-project pointer never disagree.
 
 - **Editing or approving the design doc.** That lives entirely under `design-producing-tasks` (the `kind = 'design'` lifecycle, `DesignDetector`, `ApproveDesign`, manifest-driven materialisation). This project provides the pointer; it does not move bytes around or change row statuses.
 - **Inline / threaded comments on the rendered doc.** Out of scope, covered by the doc-collab project (`proj_18a2bb78815be670_3`, archived).
-- **Cross-repo dispatch.** Spawning workers in a repo that's not a Boss-tracked Product is the multi-repo project's concern (`proj_18a2bbe20fc03718_8`). This design only stores and resolves a *link* into such a repo — it does not need to lease a workspace there or track work-items there.
+- **Cross-repo dispatch.** Spawning workers in a repo that's not a Boss-tracked Product is the multi-repo project's concern (`proj_18a2bbe20fc03718_8`). This design only stores and resolves a _link_ into such a repo — it does not need to lease a workspace there or track work-items there.
 - **Multiple design docs per project.** One project, one design pointer. If a project legitimately splits its design across two docs, that's two projects (linked by a dependency edge), not one project with two pointers. This mirrors the one-PR-per-task and one-doc-per-design philosophy from `design-producing-tasks` Q1.
 - **Watching the linked file for changes.** The pointer is data; we don't poll GitHub or `inotify` the workspace. Drift is detected lazily on click / fetch.
 - **Reverse index ("which project owns this doc?").** A naive query is `SELECT * FROM projects WHERE design_doc_path = ?`, which is fine for the scale we're at; a reverse index can be added if it ever matters.
@@ -78,8 +78,8 @@ per-project pointer never disagree.
 (c) is conceptually appealing — the design task already produces the doc and stores the pointer in `tasks.doc_ref`, so why duplicate? Three reasons:
 
 1. **Lifecycle mismatch.** A project may exist long after its design task is `done` and pruned from the active kanban. The user still wants to click the project card and see the design. Joining through `tasks` works, but the row that holds the pointer is then governed by the design task's lifecycle, not the project's. If the design task is deleted (rare, but legal), the project loses its pointer. That's a footgun.
-2. **Cross-environment fit.** At work the design doc may *not* have been produced by a Boss design task — it lives in a wiki repo and was hand-authored, or imported. There's no `tasks` row of `kind = 'design'` for it. (c) requires conjuring a fake design task just to host the pointer. Bad shape.
-3. **Project-create timing.** A project is often created with the design doc *already known* (the user is filing a project for design X they've already drafted). Storing the pointer on the project row at create time is the natural shape; (c) needs the engine to also create a placeholder design task whose only purpose is to carry the field.
+2. **Cross-environment fit.** At work the design doc may _not_ have been produced by a Boss design task — it lives in a wiki repo and was hand-authored, or imported. There's no `tasks` row of `kind = 'design'` for it. (c) requires conjuring a fake design task just to host the pointer. Bad shape.
+3. **Project-create timing.** A project is often created with the design doc _already known_ (the user is filing a project for design X they've already drafted). Storing the pointer on the project row at create time is the natural shape; (c) needs the engine to also create a placeholder design task whose only purpose is to carry the field.
 
 (b) is an honest trade. JSON keeps the migration to one column. But the field is small, structured, and frequently filtered (`SELECT projects WHERE design_doc_repo_remote_url IS NULL` for "projects without a pointer"; `WHERE design_doc_path = ?` for the rare reverse lookup). Three text columns is nine bytes of denormalised redundancy and gains us native SQL filtering. Worth it.
 
@@ -114,7 +114,7 @@ Three columns, not a struct, in the protocol type — consistent with how `Produ
 
 #### Why not `Vec<DesignDocRef>` for forward-compat?
 
-We considered modelling as a list (with `kind` discriminator) so future artefact pointers (PRD, retro, post-mortem) could share infrastructure. It is YAGNI for v1: there is no second kind in scope, the shape is harder to explain, and once we *do* want a second kind we already have the conversion path (table (d) above). The columns ship; if they get joined later, the migration is mechanical.
+We considered modelling as a list (with `kind` discriminator) so future artefact pointers (PRD, retro, post-mortem) could share infrastructure. It is YAGNI for v1: there is no second kind in scope, the shape is harder to explain, and once we _do_ want a second kind we already have the conversion path (table (d) above). The columns ship; if they get joined later, the migration is mechanical.
 
 ---
 
@@ -167,7 +167,7 @@ Because the open affordance behaves differently per kind. `SameProduct` gets fir
 
 #### Error case: `design_doc_path` set but `design_doc_repo_remote_url` NULL and `product.repo_remote_url` NULL
 
-Surface as an attention item on the project: *"Design doc pointer references a path but no repo can be resolved. Either set `design_doc_repo_remote_url` explicitly or set `repo_remote_url` on the product."* The pointer is "broken" until fixed.
+Surface as an attention item on the project: _"Design doc pointer references a path but no repo can be resolved. Either set `design_doc_repo_remote_url` explicitly or set `repo_remote_url` on the product."_ The pointer is "broken" until fixed.
 
 ### Recommendation
 
@@ -187,17 +187,17 @@ Three columns, the resolution rules above. `ResolvedDesignDoc` lives in `engine/
 
 The macOS app's open handler resolves the project's pointer, then dispatches by `ResolvedDesignDocKind`:
 
-| Kind                  | Workspace available? | Open target                                                  |
-|-----------------------|---------------------|--------------------------------------------------------------|
-| `SameProduct`         | yes                 | renderer window (when shipped) **or** `$EDITOR` on the file in the leased workspace |
-| `SameProduct`         | no                  | GitHub web URL (`https://github.com/<owner>/<repo>/blob/<branch>/<path>`) |
-| `OtherProduct`        | yes (cube has it)   | same as `SameProduct` "yes"                                   |
-| `OtherProduct`        | no                  | GitHub web URL                                                |
-| `External`            | n/a                 | GitHub web URL                                                |
+| Kind           | Workspace available? | Open target                                                                         |
+| -------------- | -------------------- | ----------------------------------------------------------------------------------- |
+| `SameProduct`  | yes                  | renderer window (when shipped) **or** `$EDITOR` on the file in the leased workspace |
+| `SameProduct`  | no                   | GitHub web URL (`https://github.com/<owner>/<repo>/blob/<branch>/<path>`)           |
+| `OtherProduct` | yes (cube has it)    | same as `SameProduct` "yes"                                                         |
+| `OtherProduct` | no                   | GitHub web URL                                                                      |
+| `External`     | n/a                  | GitHub web URL                                                                      |
 
 "Workspace available" means cube has at least one workspace leased for the relevant `repo_remote_url`. The macOS app can ask the engine via the existing cube-state RPC; the engine threads through.
 
-For the renderer, this design coordinates with `design-producing-tasks` Q6 (`DesignRendererView`): if that view has shipped, the project's open affordance reuses it (the renderer takes a `ResolvedDesignDoc` rather than only a `task_id`). If it has not yet shipped, fall back to `$EDITOR` / web. The two designs ship independently; the project pointer doesn't *require* the renderer.
+For the renderer, this design coordinates with `design-producing-tasks` Q6 (`DesignRendererView`): if that view has shipped, the project's open affordance reuses it (the renderer takes a `ResolvedDesignDoc` rather than only a `task_id`). If it has not yet shipped, fall back to `$EDITOR` / web. The two designs ship independently; the project pointer doesn't _require_ the renderer.
 
 ### CLI form
 
@@ -297,7 +297,7 @@ ResolveProjectDesignDoc  { request_id: String, project_id: String }
 
 ### Bulk read
 
-`WorkTree` (returned from `Subscribe`) is the kanban's main data feed. `Project`s already serialise into it; the new three columns ride along automatically. The kanban still needs to know *resolved* state (specifically `local_workspace_available`), but that depends on cube's state which can change independently. v1 has the kanban fetch resolution per-project on render; if it becomes a hot path we add a `WorkTree.project_design_doc_states` companion.
+`WorkTree` (returned from `Subscribe`) is the kanban's main data feed. `Project`s already serialise into it; the new three columns ride along automatically. The kanban still needs to know _resolved_ state (specifically `local_workspace_available`), but that depends on cube's state which can change independently. v1 has the kanban fetch resolution per-project on render; if it becomes a hot path we add a `WorkTree.project_design_doc_states` companion.
 
 ### CLI
 
@@ -326,7 +326,7 @@ Three columns on the wire `Project`; one `Set…` RPC for writes; one `Resolve�
 - **Pointer set; repo URL points to a private repo the user can't access.** Resolver doesn't probe. Web URL fallback works (auth happens in the browser); editor fallback works (the leased workspace is already authenticated). Same-product case is unaffected.
 - **Same-product pointer; same-product workspace not leased.** Resolver returns `Resolved` with `local_workspace_available = false`; the open affordance falls back to the GitHub web URL. Same code path as `External`.
 - **Project deleted.** SQL `ON DELETE CASCADE` semantics aren't enabled here (Boss uses soft deletes / status flips elsewhere). When a project is deleted, the columns go with the row. No orphan pointers.
-- **Pointer set explicitly to a path that doesn't exist (yet).** This is *legal* — the user is filing a project ahead of the design doc's existence. The "broken on click" UX is acceptable: the user knows they haven't written the doc yet. We don't validate existence on `SetProjectDesignDoc` because that requires either a network call (separate-repo case) or a workspace lease (same-repo case), neither of which the engine should block on.
+- **Pointer set explicitly to a path that doesn't exist (yet).** This is _legal_ — the user is filing a project ahead of the design doc's existence. The "broken on click" UX is acceptable: the user knows they haven't written the doc yet. We don't validate existence on `SetProjectDesignDoc` because that requires either a network call (separate-repo case) or a workspace lease (same-repo case), neither of which the engine should block on.
 
 ### Probe strategy
 
@@ -353,10 +353,10 @@ Cheap write-time validation, lazy open-time detection, no auto-repair. The lint 
 
 ### Where the truth lives
 
-- **`tasks.doc_ref`** (and `tasks.metadata.design.*`) records *the doc that this `kind = 'design'` task produced*. It is task-local: it survives only as long as the task row, and updates as the task iterates (revise → new sha → new in_review).
-- **`projects.design_doc_path`** (and the two siblings) records *the project's pointer to its design doc*. It is project-local and survives long after the design task is `done`.
+- **`tasks.doc_ref`** (and `tasks.metadata.design.*`) records _the doc that this `kind = 'design'` task produced_. It is task-local: it survives only as long as the task row, and updates as the task iterates (revise → new sha → new in_review).
+- **`projects.design_doc_path`** (and the two siblings) records _the project's pointer to its design doc_. It is project-local and survives long after the design task is `done`.
 
-These are not the same field — they have different lifecycles, different write paths, and answer different questions ("what did this design task produce?" vs "where does this project's design live?"). They *should* agree at any moment in time when both are populated.
+These are not the same field — they have different lifecycles, different write paths, and answer different questions ("what did this design task produce?" vs "where does this project's design live?"). They _should_ agree at any moment in time when both are populated.
 
 ### Sync rules
 
@@ -364,19 +364,19 @@ The engine performs three sync operations:
 
 1. **On `DesignDetector` firing** (the design task moves to `in_review` and stamps `tasks.doc_ref`): copy `(repo_remote_url, branch, file_path)` from the task into the parent project's `design_doc_*` columns **iff** the project's `design_doc_path` is currently `NULL`. The user-set value wins; the auto-populate only fills empty pointers. Reasoning: a user who has already pointed the project at a hand-authored doc should not have it silently overwritten when the design task lands; but a user who has not set anything benefits from auto-population.
 
-2. **On `ApproveDesign`** (the design task moves to `done`): re-affirm the project's pointer matches the approved doc's location. If the project's pointer differs (the user manually set it to something else after auto-population), surface a `WorkAttentionItem`: *"Project pointer (`<project_path>`) and approved design doc (`<task_path>`) differ. Update the project pointer or revoke the approval."* Don't auto-overwrite.
+2. **On `ApproveDesign`** (the design task moves to `done`): re-affirm the project's pointer matches the approved doc's location. If the project's pointer differs (the user manually set it to something else after auto-population), surface a `WorkAttentionItem`: _"Project pointer (`<project_path>`) and approved design doc (`<task_path>`) differ. Update the project pointer or revoke the approval."_ Don't auto-overwrite.
 
 3. **On `boss project set-design-doc`** with values that disagree with an in-flight design task's `doc_ref`: warn but allow. Confirmation prompt in interactive CLI; non-interactive callers proceed with the override.
 
 ### What if `design-producing-tasks` hasn't shipped yet?
 
-This design ships independently. If `design-producing-tasks` is unbuilt, the auto-create design task on `create_project` is still a `kind = 'design'` row (the `insert_design_task_for_project_in_tx` already emits it), but the row never reaches `in_review` via `DesignDetector` because that detector doesn't exist yet. The project's `design_doc_*` columns are then *only* populated via manual CLI / app, which is exactly the same fallback the work environment needs anyway.
+This design ships independently. If `design-producing-tasks` is unbuilt, the auto-create design task on `create_project` is still a `kind = 'design'` row (the `insert_design_task_for_project_in_tx` already emits it), but the row never reaches `in_review` via `DesignDetector` because that detector doesn't exist yet. The project's `design_doc_*` columns are then _only_ populated via manual CLI / app, which is exactly the same fallback the work environment needs anyway.
 
 When `design-producing-tasks` lands, sync rule (1) starts firing automatically and historical projects with manually-set pointers are unaffected.
 
 ### Symmetric direction (project → task)
 
-Setting `design_doc_path` on a project does **not** populate the design task's `doc_ref`. The design task's `doc_ref` is *the artefact the worker produced*, not a hint at the future location. If the project pointer is set first (because the user is filing a project ahead of design work), the design task spawn prompt can still *read* the project's pointer (Q3 of `design-producing-tasks` already feeds `docs_location` / `slug` into the prompt; we extend it to fall back to the project's pointer when set). But the engine does not write `tasks.doc_ref` until the `DesignDetector` fires.
+Setting `design_doc_path` on a project does **not** populate the design task's `doc_ref`. The design task's `doc_ref` is _the artefact the worker produced_, not a hint at the future location. If the project pointer is set first (because the user is filing a project ahead of design work), the design task spawn prompt can still _read_ the project's pointer (Q3 of `design-producing-tasks` already feeds `docs_location` / `slug` into the prompt; we extend it to fall back to the project's pointer when set). But the engine does not write `tasks.doc_ref` until the `DesignDetector` fires.
 
 ### Recommendation
 
@@ -395,13 +395,13 @@ The current state of `tools/boss/docs/designs/` (already-merged docs) covers mos
 3. If the file exists, set `design_doc_path = 'tools/boss/docs/designs/<project.slug>.md'`. Leave `design_doc_repo_remote_url` and `design_doc_branch` `NULL` (inherit).
 4. If no file matches, leave the project with `design_doc_path = NULL` and the affordance hidden. The user fills in manually.
 
-This is a one-shot script run by hand (`boss admin backfill-project-design-docs`) rather than a SQL migration, because the slug→file matching wants to *report* what it did and skip non-matches. Ship it as a CLI verb, not a schema migration.
+This is a one-shot script run by hand (`boss admin backfill-project-design-docs`) rather than a SQL migration, because the slug→file matching wants to _report_ what it did and skip non-matches. Ship it as a CLI verb, not a schema migration.
 
 For the work environment, no bootstrap is run — the user manually points each project as they land.
 
 ### Existing design docs without a project
 
-Some `tools/boss/docs/designs/*.md` files describe *chores* (this very repo's `auto-rebase-stacked-prs.md` was a chore, not a project). Those don't need a project pointer. The bootstrap script ignores files that don't match any project's slug.
+Some `tools/boss/docs/designs/*.md` files describe _chores_ (this very repo's `auto-rebase-stacked-prs.md` was a chore, not a project). Those don't need a project pointer. The bootstrap script ignores files that don't match any project's slug.
 
 ### Recommendation
 
@@ -422,7 +422,7 @@ One-shot `boss admin backfill-project-design-docs` verb; manual fill for the res
 
 (β) is dead on arrival — workspace paths change between machines and lease cycles.
 
-(γ) sounds tidy (one column!) but loses information: the GitHub blob URL is a *rendering* URL, not a source-of-truth. `gh api /contents/...` wants `(owner, repo, path, ref)` and we'd have to *parse* the blob URL back to those four fields, with all the URL-decoding fun that entails. Plus, `https://github.com/foo/bar/blob/refs/heads/main/...` and `https://github.com/foo/bar/blob/main/...` and `https://github.com/foo/bar/tree/main/...` are all different valid forms. Storing structured triples and *rendering* the URL on demand is the right shape.
+(γ) sounds tidy (one column!) but loses information: the GitHub blob URL is a _rendering_ URL, not a source-of-truth. `gh api /contents/...` wants `(owner, repo, path, ref)` and we'd have to _parse_ the blob URL back to those four fields, with all the URL-decoding fun that entails. Plus, `https://github.com/foo/bar/blob/refs/heads/main/...` and `https://github.com/foo/bar/blob/main/...` and `https://github.com/foo/bar/tree/main/...` are all different valid forms. Storing structured triples and _rendering_ the URL on demand is the right shape.
 
 (δ) is a stealth (γ): same parsing problem on read.
 
@@ -450,9 +450,9 @@ The `--repo <url>` CLI flag accepts any GitHub URL form (`https://…/repo`, `ht
 
 ### Context
 
-`design-producing-tasks` Q6 specifies a `DesignRendererView` SwiftUI window that takes a `task_id`, calls a `GetDesignDoc(task_id)` RPC, and renders Textual markdown. v1 of *that* design ties the renderer to a design *task*.
+`design-producing-tasks` Q6 specifies a `DesignRendererView` SwiftUI window that takes a `task_id`, calls a `GetDesignDoc(task_id)` RPC, and renders Textual markdown. v1 of _that_ design ties the renderer to a design _task_.
 
-This project's open-affordance for `SameProduct` (workspace available) wants to render the *project's* design doc. Three options:
+This project's open-affordance for `SameProduct` (workspace available) wants to render the _project's_ design doc. Three options:
 
 - **(M) Reuse the renderer with a `ResolvedDesignDoc` constructor.** Generalise the renderer's input from `task_id` to `(task_id | resolved_doc)`. Add a second RPC `GetDesignDocFromRef(repo, branch, path)` for the project case.
 - **(N) Open in `$EDITOR` only — the renderer is design-task-specific.** Cleaner separation; uglier UX (no in-app preview).
@@ -485,7 +485,7 @@ The engine RPC for the second form is `GetProjectDesignDoc(project_id) -> { cont
 
 ### What gets recorded on `SetProjectDesignDoc`
 
-The `projects.last_status_actor` column is currently used to gate auto-block / unblock decisions; this design does **not** flip status, so we don't touch `last_status_actor`. Setting the pointer is a *property edit*, not a status transition. We do bump `updated_at`.
+The `projects.last_status_actor` column is currently used to gate auto-block / unblock decisions; this design does **not** flip status, so we don't touch `last_status_actor`. Setting the pointer is a _property edit_, not a status transition. We do bump `updated_at`.
 
 ### Audit trail
 
@@ -511,7 +511,7 @@ Covered by Q6. One-way sync, no overwrites, conflicts surfaced as attention item
 
 Overlap is real: a separate-repo design doc points into a repo Boss may or may not track as a Product. This design does **not** require Boss to track the doc's repo as a Product — the pointer stores the bare `repo_remote_url` and the open affordance gracefully degrades to "GitHub web URL." When multi-repo modelling lands, projects whose pointer references a Boss-tracked-but-different Product get fancier behaviour (workspace-resolved open) but the schema doesn't change.
 
-We coordinate: the multi-repo project's design (when written) should treat the per-project pointer as a *consumer* of cross-product workspace lookup, not a source. The pointer's job is to identify *where* the doc is; the multi-repo project's job is to make *getting to* that location reliable when "where" spans repos.
+We coordinate: the multi-repo project's design (when written) should treat the per-project pointer as a _consumer_ of cross-product workspace lookup, not a source. The pointer's job is to identify _where_ the doc is; the multi-repo project's job is to make _getting to_ that location reliable when "where" spans repos.
 
 ### `boss task bind-pr` thread
 
@@ -548,9 +548,9 @@ SQL serialises; last-writer-wins. No conflict handling; the property-edit semant
 
 ### Manifest-driven project creation (from `design-producing-tasks` Q8)
 
-When the engine applies a design manifest, it creates new `projects` rows. Those rows get auto-populated `design_doc_*` columns referencing the *parent design doc* — i.e. the doc that *spawned them*. (Not their *own* design docs, which don't exist yet.) Hmm — that's wrong. Each spawned project's design doc is *its own* future doc, not the parent's.
+When the engine applies a design manifest, it creates new `projects` rows. Those rows get auto-populated `design_doc_*` columns referencing the _parent design doc_ — i.e. the doc that _spawned them_. (Not their _own_ design docs, which don't exist yet.) Hmm — that's wrong. Each spawned project's design doc is _its own_ future doc, not the parent's.
 
-Resolution: the manifest's `projects` entries should NOT auto-populate the spawned project's `design_doc_*`. Spawned projects start with `NULL` pointers and the user fills them in once those projects' design tasks produce docs (or the user hand-points them). The parent design's doc is referenced by the *parent project*, not the children.
+Resolution: the manifest's `projects` entries should NOT auto-populate the spawned project's `design_doc_*`. Spawned projects start with `NULL` pointers and the user fills them in once those projects' design tasks produce docs (or the user hand-points them). The parent design's doc is referenced by the _parent project_, not the children.
 
 Sync rule (1) from Q6 then fires for each spawned project independently when its own design task moves to `in_review`. Clean recursion.
 
@@ -713,7 +713,7 @@ Reuse `work_item_changed` for `Project` rows when their pointer is set/cleared (
 
 **R7 — Resolver is read-heavy.** Every project card calls `ResolveProjectDesignDoc` on render. For 100 projects that's 100 RPC calls. Mitigation: ship the singular RPC v1; if profiling shows hot path, add `ResolveProjectDesignDocs(Vec<id>)` and batch.
 
-**R8 — Manifest-spawned projects' pointers are NULL.** Q12: spawned projects don't auto-populate from the parent design's manifest. The user has to set them manually as those projects produce their own design docs. Mitigation: this is correct behaviour; document it in the manifest schema (the manifest's `projects` entries should NOT carry a `design_doc_path` field, because that field is *that project's own* doc, not yet existing).
+**R8 — Manifest-spawned projects' pointers are NULL.** Q12: spawned projects don't auto-populate from the parent design's manifest. The user has to set them manually as those projects produce their own design docs. Mitigation: this is correct behaviour; document it in the manifest schema (the manifest's `projects` entries should NOT carry a `design_doc_path` field, because that field is _that project's own_ doc, not yet existing).
 
 **R9 — Coordination with cross-product (`proj_18a2bbe20fc03718_8`).** When the doc lives in another Boss-tracked product's repo, the resolver returns `OtherProduct` and the open affordance falls back to web URL until cross-product is built. Mitigation: documented in Q3; cross-product project picks up the local-open path as a consumer.
 

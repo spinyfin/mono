@@ -33,6 +33,7 @@ bootstrap (queue=linux-amd64)┬──► bazel-build ──┐
 ### `bootstrap.sh`
 
 Ensures the agent has the required toolchain:
+
 - Rust: installs / pins via `rust-toolchain.toml` using `rustup`.
 - Bazel: `bazelisk` should be on `$PATH`; version is read from `.bazelversion`.
 - pnpm: installs if not present, pins to the version in `package.json#packageManager`.
@@ -64,6 +65,7 @@ bazel test //... --config=ci
 ```
 
 The CI config is in `.bazelrc.ci`.
+
 ## Required checks (branch protection)
 
 Required checks are managed via branch protection rules. The check names buildkite reports are `buildkite/mono/<step-key>`, e.g. `buildkite/mono/bazel-build`. Treat these as a public contract — renaming a step key in `pipeline.yml` requires updating branch protection in lockstep.
