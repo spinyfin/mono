@@ -134,7 +134,7 @@ enum Commands {
     Run(RunArgs),
     /// Apply fixes to files that are failing checks. Reuses `run`'s discovery
     /// machinery to find failing files, then applies each check's declared fix
-    /// mechanism. Currently prints a dry plan (no files written).
+    /// mechanism. Re-runs each check after fixing to report residual failures.
     Fix(FixArgs),
     List {
         #[command(flatten)]
@@ -593,21 +593,87 @@ enum FixCheckOutcome<'a> {
     NoFixAvailable,
 }
 
+/// Per-check residual failure info after a re-verify pass.
+///
+/// Files are split by their worst-severity finding: a file with any Error
+/// finding goes into `error_files`; a file with only Warning findings goes
+/// into `warning_only_files`. Info-severity findings are excluded entirely.
+/// This distinction drives the fix reporter — errors are blocking, warnings
+/// are advisory and should not be styled as failures.
+#[derive(Debug, Default)]
+struct StillFailingInfo {
+    /// Files with at least one Error-severity finding after re-verify.
+    error_files: Vec<PathBuf>,
+    /// Files with only Warning-severity findings after re-verify (non-blocking).
+    warning_only_files: Vec<PathBuf>,
+}
+
+impl StillFailingInfo {
+    fn contains_error(&self, path: &PathBuf) -> bool {
+        self.error_files.contains(path)
+    }
+
+    fn contains_warning_only(&self, path: &PathBuf) -> bool {
+        self.warning_only_files.contains(path)
+    }
+}
+
 /// Build a per-check map of files still failing after a re-verify pass.
-/// Only Error- and Warning-severity findings count; Info is advisory.
-fn still_failing_from_verify(verify_results: &[CheckResult]) -> std::collections::BTreeMap<String, Vec<PathBuf>> {
+///
+/// Files are split by worst severity: Error beats Warning. Info is excluded.
+fn still_failing_from_verify(verify_results: &[CheckResult]) -> std::collections::BTreeMap<String, StillFailingInfo> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut map: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+
+    // Track worst severity per (check_id, path) — Error beats Warning.
+    let mut error_files: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut warning_files: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+
     for r in verify_results {
         for f in &r.findings {
-            if matches!(f.severity, Severity::Error | Severity::Warning)
-                && let Some(location) = &f.location
-            {
-                map.entry(r.check_id.clone()).or_default().insert(location.path.clone());
+            let Some(location) = &f.location else { continue };
+            match f.severity {
+                Severity::Error => {
+                    error_files
+                        .entry(r.check_id.clone())
+                        .or_default()
+                        .insert(location.path.clone());
+                    // Promote out of warning-only if it was there.
+                    if let Some(wo) = warning_files.get_mut(&r.check_id) {
+                        wo.remove(&location.path);
+                    }
+                }
+                Severity::Warning => {
+                    let already_error = error_files.get(&r.check_id).is_some_and(|s| s.contains(&location.path));
+                    if !already_error {
+                        warning_files
+                            .entry(r.check_id.clone())
+                            .or_default()
+                            .insert(location.path.clone());
+                    }
+                }
+                Severity::Info => {} // advisory — excluded from still-failing tracking
             }
         }
     }
-    map.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
+
+    let all_check_ids: std::collections::BTreeSet<String> =
+        error_files.keys().chain(warning_files.keys()).cloned().collect();
+    all_check_ids
+        .into_iter()
+        .map(|check_id| {
+            let info = StillFailingInfo {
+                error_files: error_files
+                    .get(&check_id)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default(),
+                warning_only_files: warning_files
+                    .get(&check_id)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default(),
+            };
+            (check_id, info)
+        })
+        .collect()
 }
 
 /// Collect the distinct set of applied files across all invocation outcomes for one check.
@@ -622,20 +688,24 @@ fn distinct_applied_files(inv_outcomes: &[FixInvocationOutcome]) -> std::collect
         .collect()
 }
 
-fn print_fix_results(
+fn render_fix_results(
     plan: &FixPlan,
     outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
     verify_results: Option<&[CheckResult]>,
     style: OutputStyle,
     elapsed: Duration,
-) {
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
     if plan.checks.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "{}: no failing files found (in {}s)\n",
             style.paint_info("fix"),
             elapsed.as_secs()
         );
-        return;
+        return out;
     }
 
     // Build a per-check map of files still failing after re-verify.
@@ -643,6 +713,7 @@ fn print_fix_results(
 
     let mut total_fixed = 0usize;
     let mut total_still_failing = 0usize;
+    let mut total_warnings_remaining = 0usize;
     let mut total_errors = 0usize;
     let mut total_no_fix = 0usize;
     let total_dirty_skipped: usize = plan.checks.iter().map(|c| c.dirty_skipped.len()).sum();
@@ -656,12 +727,13 @@ fn print_fix_results(
 
         let check_still_failing = still_failing.get(&check_plan.check_id);
 
-        println!("  {}:", style.paint_check_id(&check_plan.check_id));
+        let _ = writeln!(out, "  {}:", style.paint_check_id(&check_plan.check_id));
         match bucket {
             FixCheckOutcome::NoFixAvailable => {
-                println!("    {}", style.paint_help_body("no fix available"));
+                let _ = writeln!(out, "    {}", style.paint_help_body("no fix available"));
                 for file in &check_plan.failing_files {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "    {} {}",
                         style.paint_help_body("  needs manual fix:"),
                         file.display()
@@ -678,12 +750,13 @@ fn print_fix_results(
                 let mut check_errors = 0usize;
                 for inv in inv_outcomes {
                     for (file, msg) in &inv.per_file_errors {
-                        println!("    {} {}: {msg}", style.paint_error("error"), file.display());
+                        let _ = writeln!(out, "    {} {}: {msg}", style.paint_error("error"), file.display());
                         total_errors += 1;
                         check_errors += 1;
                     }
                     if let Some(ref err) = inv.error {
-                        println!(
+                        let _ = writeln!(
+                            out,
                             "    {}: {}",
                             style.paint_error("fix error"),
                             style.paint_message(&format!("[{}] {err:#}", inv.invocation_id))
@@ -695,61 +768,117 @@ fn print_fix_results(
 
                 let all_applied = distinct_applied_files(inv_outcomes);
 
-                // Print applied files, split into "fixed" vs "still failing" based on verify.
+                // Print applied files, split by post-verify status:
+                //   - not in still_failing → fixed
+                //   - in error_files → still failing (blocking)
+                //   - in warning_only_files → warnings remain (non-blocking)
                 for file in &all_applied {
-                    let still_fails = check_still_failing
-                        .map(|sf: &Vec<PathBuf>| sf.contains(file))
-                        .unwrap_or(false);
-                    if still_fails {
-                        println!("    {} {}", style.paint_warning("still failing"), file.display());
+                    let is_error = check_still_failing.is_some_and(|sf| sf.contains_error(file));
+                    let is_warning_only = check_still_failing.is_some_and(|sf| sf.contains_warning_only(file));
+                    if is_error {
+                        let _ = writeln!(out, "    {} {}", style.paint_warning("still failing"), file.display());
                         total_still_failing += 1;
+                    } else if is_warning_only {
+                        let _ = writeln!(
+                            out,
+                            "    {} {}",
+                            style.paint_warning("warning(s) remain (non-blocking)"),
+                            file.display()
+                        );
+                        total_warnings_remaining += 1;
                     } else {
-                        println!("    {} {}", style.paint_info("fixed"), file.display());
+                        let _ = writeln!(out, "    {} {}", style.paint_info("fixed"), file.display());
                         total_fixed += 1;
                     }
                 }
 
-                // Only print "nothing to fix" when no files were applied and no errors
-                // occurred across all passes. This suppresses the terminating no-op
-                // convergence pass that would otherwise appear as a bare stray line.
+                // When the fixer applied nothing (no auto-fixable violations), print an
+                // accurate message based on what re-verify found:
+                //   - genuine no residue → "nothing to fix (already clean or no matching files)"
+                //   - error residue → "no auto-fixable violations — N error(s) still failing (fix manually)"
+                //   - warning-only residue → "N warning(s) remain (non-blocking)"
                 if all_applied.is_empty() && check_errors == 0 {
-                    println!(
-                        "    {}",
-                        style.paint_help_body("nothing to fix (already clean or no matching files)")
-                    );
+                    let has_error_residue = check_still_failing.is_some_and(|sf| !sf.error_files.is_empty());
+                    let has_warning_residue = check_still_failing.is_some_and(|sf| !sf.warning_only_files.is_empty());
+
+                    if has_error_residue {
+                        let n = check_still_failing.map(|sf| sf.error_files.len()).unwrap_or(0);
+                        let _ = writeln!(
+                            out,
+                            "    {}",
+                            style.paint_warning(&format!(
+                                "no auto-fixable violations — {n} error(s) still failing (fix manually)"
+                            ))
+                        );
+                        total_still_failing += n;
+                    } else if has_warning_residue {
+                        let n = check_still_failing.map(|sf| sf.warning_only_files.len()).unwrap_or(0);
+                        let _ = writeln!(
+                            out,
+                            "    {}",
+                            style.paint_warning(&format!("{n} warning(s) remain (non-blocking)"))
+                        );
+                        total_warnings_remaining += n;
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "    {}",
+                            style.paint_help_body("nothing to fix (already clean or no matching files)")
+                        );
+                    }
                 }
 
                 // Files still failing for this check that appeared in verify but were
                 // not in any invocation's applied set (edge case: a different check
-                // on the same applied file that still fails).
+                // on the same applied file that still fails). Distinguish error vs warning.
                 if let Some(sf) = check_still_failing {
-                    for file in sf {
+                    for file in &sf.error_files {
                         if !all_applied.contains(file) {
-                            println!("    {} {}", style.paint_warning("still failing"), file.display());
+                            let _ = writeln!(out, "    {} {}", style.paint_warning("still failing"), file.display());
                             total_still_failing += 1;
+                        }
+                    }
+                    for file in &sf.warning_only_files {
+                        if !all_applied.contains(file) {
+                            let _ = writeln!(
+                                out,
+                                "    {} {}",
+                                style.paint_warning("warning(s) remain (non-blocking)"),
+                                file.display()
+                            );
+                            total_warnings_remaining += 1;
                         }
                     }
                 }
             }
         }
         for file in &check_plan.dirty_skipped {
-            println!("    {} (skipped: uncommitted changes)", file.display());
+            let _ = writeln!(out, "    {} (skipped: uncommitted changes)", file.display());
         }
-        println!();
+        let _ = writeln!(out);
     }
 
     // Report checks from verify that were not in the fix plan (e.g. a different check
     // failing on a file that was fixed by another check).
-    for (check_id, files) in &still_failing {
+    for (check_id, sf) in &still_failing {
         if plan.checks.iter().any(|c| &c.check_id == check_id) {
             continue; // already rendered above
         }
-        println!("  {} (also failing after fix):", style.paint_check_id(check_id));
-        for file in files {
-            println!("    {} {}", style.paint_warning("still failing"), file.display());
+        let _ = writeln!(out, "  {} (also failing after fix):", style.paint_check_id(check_id));
+        for file in &sf.error_files {
+            let _ = writeln!(out, "    {} {}", style.paint_warning("still failing"), file.display());
             total_still_failing += 1;
         }
-        println!();
+        for file in &sf.warning_only_files {
+            let _ = writeln!(
+                out,
+                "    {} {}",
+                style.paint_warning("warning(s) remain (non-blocking)"),
+                file.display()
+            );
+            total_warnings_remaining += 1;
+        }
+        let _ = writeln!(out);
     }
 
     let verify_note = if verify_results.is_some() {
@@ -762,17 +891,36 @@ fn print_fix_results(
     } else {
         String::new()
     };
-    println!(
-        "{}: {} file(s) fixed, {} still failing, {} error(s), {} check(s) with no fix available{}{} (in {}s)\n",
+    let warnings_note = if total_warnings_remaining > 0 {
+        format!(", {total_warnings_remaining} warning(s) remaining (non-blocking)")
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        out,
+        "{}: {} file(s) fixed, {} still failing, {} error(s), {} check(s) with no fix available{}{}{} (in {}s)\n",
         style.paint_bold("summary"),
         total_fixed,
         total_still_failing,
         total_errors,
         total_no_fix,
+        warnings_note,
         dirty_note,
         verify_note,
         elapsed.as_secs()
     );
+
+    out
+}
+
+fn print_fix_results(
+    plan: &FixPlan,
+    outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
+    verify_results: Option<&[CheckResult]>,
+    style: OutputStyle,
+    elapsed: Duration,
+) {
+    print!("{}", render_fix_results(plan, outcomes, verify_results, style, elapsed));
 }
 
 fn print_fix_results_json(
@@ -807,7 +955,9 @@ fn print_fix_results_json(
                 .unwrap_or_default();
             let check_still_failing: Vec<String> = still_failing
                 .get(&c.check_id)
-                .map(|files| files.iter().map(|p| p.display().to_string()).collect())
+                .map(|sf| {
+                    sf.error_files.iter().chain(sf.warning_only_files.iter()).map(|p| p.display().to_string()).collect()
+                })
                 .unwrap_or_default();
             let distinct_applied: Vec<String> = inv_outcomes
                 .map(|v| {
@@ -834,14 +984,14 @@ fn print_fix_results_json(
     let extra: Vec<serde_json::Value> = still_failing
         .iter()
         .filter(|(check_id, _)| !plan.checks.iter().any(|c| &c.check_id == *check_id))
-        .map(|(check_id, files)| {
+        .map(|(check_id, sf)| {
             serde_json::json!({
                 "check_id": check_id,
                 "failing_files": [],
                 "dirty_skipped": [],
                 "fix_status": "no_fix_available",
                 "invocations": [],
-                "still_failing_after_verify": files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "still_failing_after_verify": sf.error_files.iter().chain(sf.warning_only_files.iter()).map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })
         })
         .collect();

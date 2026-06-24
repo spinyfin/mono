@@ -9,11 +9,11 @@ use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::external::FixInvocationOutcome;
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES, TRUNCATE_MAX_TOTAL_CHARS,
-    ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
-    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer,
-    render_human_results, resolve_github_token_from_sources, should_show_progress, sort_results_for_output,
-    still_failing_from_verify, truncate_tool_output,
+    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES,
+    TRUNCATE_MAX_TOTAL_CHARS, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
+    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_fix_results,
+    render_human_footer, render_human_results, resolve_github_token_from_sources, should_show_progress,
+    sort_results_for_output, still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -1043,7 +1043,8 @@ fn still_failing_from_verify_empty_results() {
 }
 
 #[test]
-fn still_failing_from_verify_collects_error_and_warning_paths() {
+fn still_failing_from_verify_splits_error_and_warning_paths() {
+    // Error → error_files; Warning → warning_only_files; Info → excluded entirely.
     let results = vec![CheckResult {
         check_id: "format/rust".to_owned(),
         findings: vec![
@@ -1054,11 +1055,11 @@ fn still_failing_from_verify_collects_error_and_warning_paths() {
     }];
     let map = still_failing_from_verify(&results);
     assert_eq!(map.len(), 1);
-    let files = &map["format/rust"];
-    assert_eq!(files.len(), 2);
-    assert!(files.contains(&PathBuf::from("src/main.rs")));
-    assert!(files.contains(&PathBuf::from("src/lib.rs")));
-    assert!(!files.contains(&PathBuf::from("src/info.rs")));
+    let sf = &map["format/rust"];
+    assert_eq!(sf.error_files, vec![PathBuf::from("src/main.rs")]);
+    assert_eq!(sf.warning_only_files, vec![PathBuf::from("src/lib.rs")]);
+    assert!(!sf.error_files.contains(&PathBuf::from("src/info.rs")));
+    assert!(!sf.warning_only_files.contains(&PathBuf::from("src/info.rs")));
 }
 
 #[test]
@@ -1073,17 +1074,19 @@ fn still_failing_from_verify_skips_findings_with_no_location() {
 }
 
 #[test]
-fn still_failing_from_verify_deduplicates_paths_per_check() {
+fn still_failing_from_verify_error_beats_warning_for_same_file() {
+    // A file with both Error and Warning findings must land in error_files only.
     let results = vec![CheckResult {
         check_id: "lint/oxc".to_owned(),
         findings: vec![
             make_finding(Severity::Error, "src/foo.ts"),
-            make_finding(Severity::Warning, "src/foo.ts"), // same file, different severity
+            make_finding(Severity::Warning, "src/foo.ts"), // same file, lower severity
         ],
     }];
     let map = still_failing_from_verify(&results);
-    assert_eq!(map["lint/oxc"].len(), 1);
-    assert_eq!(map["lint/oxc"][0], PathBuf::from("src/foo.ts"));
+    let sf = &map["lint/oxc"];
+    assert_eq!(sf.error_files, vec![PathBuf::from("src/foo.ts")], "error wins");
+    assert!(sf.warning_only_files.is_empty(), "must not appear in warning bucket");
 }
 
 #[test]
@@ -1100,8 +1103,8 @@ fn still_failing_from_verify_groups_by_check_id() {
     ];
     let map = still_failing_from_verify(&results);
     assert_eq!(map.len(), 2);
-    assert_eq!(map["format/rust"], vec![PathBuf::from("src/a.rs")]);
-    assert_eq!(map["lint/oxc"], vec![PathBuf::from("src/b.ts")]);
+    assert_eq!(map["format/rust"].error_files, vec![PathBuf::from("src/a.rs")]);
+    assert_eq!(map["lint/oxc"].error_files, vec![PathBuf::from("src/b.ts")]);
 }
 
 #[test]
@@ -1113,6 +1116,28 @@ fn still_failing_from_verify_info_only_check_excluded() {
     }];
     let map = still_failing_from_verify(&results);
     assert!(map.is_empty());
+}
+
+#[test]
+fn still_failing_from_verify_warning_only_check_is_advisory() {
+    // A check where ALL findings are Warning (e.g. lint/oxc in flunge T112) should
+    // appear only in warning_only_files, never in error_files.
+    let results = vec![CheckResult {
+        check_id: "lint/oxc".to_owned(),
+        findings: vec![
+            make_finding(Severity::Warning, "frontend/src/LivePage.tsx"),
+            make_finding(Severity::Warning, "frontend/src/api/v2.ts"),
+        ],
+    }];
+    let map = still_failing_from_verify(&results);
+    let sf = &map["lint/oxc"];
+    assert!(sf.error_files.is_empty(), "no blocking errors");
+    assert_eq!(sf.warning_only_files.len(), 2);
+    assert!(
+        sf.warning_only_files
+            .contains(&PathBuf::from("frontend/src/LivePage.tsx"))
+    );
+    assert!(sf.warning_only_files.contains(&PathBuf::from("frontend/src/api/v2.ts")));
 }
 
 // --- distinct_applied_files: multi-pass dedup ---
@@ -1173,4 +1198,186 @@ fn distinct_applied_files_noop_convergence_pass_does_not_affect_count() {
     ];
     let distinct = distinct_applied_files(&outcomes);
     assert_eq!(distinct.len(), 2, "convergence no-op pass must not inflate the count");
+}
+
+// --- render_fix_results regression tests (T112 / fix reporter accuracy) ---
+
+fn make_plain_style() -> OutputStyle {
+    OutputStyle {
+        level: ColorLevel::None,
+    }
+}
+
+fn make_fix_plan_for(check_id: &str, failing_files: &[&str]) -> FixPlan {
+    FixPlan {
+        checks: vec![FixCheckPlan {
+            check_id: check_id.to_owned(),
+            failing_files: failing_files.iter().map(PathBuf::from).collect(),
+            dirty_skipped: vec![],
+        }],
+    }
+}
+
+#[test]
+fn render_fix_results_empty_applied_with_error_residue_no_contradiction() {
+    // Scenario: fixer applied nothing (no auto-fixable violations), but re-verify
+    // reports error-severity findings. The old code printed BOTH "nothing to fix"
+    // AND "still failing" for the same check — this test asserts that contradiction
+    // is gone and only the accurate message appears.
+    let plan = make_fix_plan_for("lint/check", &["src/a.rs"]);
+    let outcomes = std::collections::BTreeMap::from([(
+        "lint/check".to_owned(),
+        vec![make_fix_outcome("lint/check", &[])], // fixer applied nothing
+    )]);
+    let verify = vec![CheckResult {
+        check_id: "lint/check".to_owned(),
+        findings: vec![make_finding(Severity::Error, "src/a.rs")],
+    }];
+    let output = render_fix_results(
+        &plan,
+        &outcomes,
+        Some(&verify),
+        make_plain_style(),
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        !output.contains("nothing to fix"),
+        "must not say 'nothing to fix' when errors are still failing: {output}"
+    );
+    assert!(
+        output.contains("no auto-fixable violations"),
+        "must report non-auto-fixable accurately: {output}"
+    );
+    assert!(
+        output.contains("still failing"),
+        "must mention that violations are still failing: {output}"
+    );
+}
+
+#[test]
+fn render_fix_results_empty_applied_with_warning_only_residue() {
+    // Scenario (T112 flunge case): fixer applied nothing, re-verify reports only
+    // Warning-severity findings (non-blocking). Should NOT say "still failing" or
+    // "nothing to fix" — should say warnings remain (non-blocking).
+    let plan = make_fix_plan_for("lint/oxc", &["frontend/src/LivePage.tsx"]);
+    let outcomes = std::collections::BTreeMap::from([(
+        "lint/oxc".to_owned(),
+        vec![make_fix_outcome("lint/oxc", &[])], // fixer applied nothing
+    )]);
+    let verify = vec![CheckResult {
+        check_id: "lint/oxc".to_owned(),
+        findings: vec![
+            make_finding(Severity::Warning, "frontend/src/LivePage.tsx"),
+            make_finding(Severity::Warning, "frontend/src/api/v2.ts"),
+        ],
+    }];
+    let output = render_fix_results(
+        &plan,
+        &outcomes,
+        Some(&verify),
+        make_plain_style(),
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        !output.contains("nothing to fix"),
+        "must not say 'nothing to fix' when warnings remain: {output}"
+    );
+    // The summary line contains "0 still failing" — check that no per-file line uses "still failing".
+    assert!(
+        !output.contains("still failing frontend/"),
+        "warning-only residue must not produce per-file 'still failing' lines: {output}"
+    );
+    assert!(
+        output.contains("non-blocking"),
+        "must mark warning residue as non-blocking: {output}"
+    );
+}
+
+#[test]
+fn render_fix_results_truly_clean_says_nothing_to_fix() {
+    // Scenario: fixer applied nothing, re-verify finds nothing → genuinely clean.
+    // The "nothing to fix" message should appear.
+    let plan = make_fix_plan_for("format/rust", &["src/main.rs"]);
+    let outcomes =
+        std::collections::BTreeMap::from([("format/rust".to_owned(), vec![make_fix_outcome("format/rust", &[])])]);
+    // Empty verify results → nothing still failing.
+    let verify: Vec<CheckResult> = vec![];
+    let output = render_fix_results(
+        &plan,
+        &outcomes,
+        Some(&verify),
+        make_plain_style(),
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        output.contains("nothing to fix"),
+        "genuinely clean check must say 'nothing to fix': {output}"
+    );
+}
+
+#[test]
+fn render_fix_results_error_residue_after_apply_shown_as_still_failing() {
+    // Scenario: fixer DID apply changes to a file but re-verify still reports an
+    // error on that same file. It should appear as "still failing", not "fixed".
+    let plan = make_fix_plan_for("format/rust", &["src/a.rs"]);
+    let outcomes = std::collections::BTreeMap::from([(
+        "format/rust".to_owned(),
+        vec![make_fix_outcome("format/rust", &["src/a.rs"])], // fixer touched the file
+    )]);
+    let verify = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_finding(Severity::Error, "src/a.rs")], // still failing
+    }];
+    let output = render_fix_results(
+        &plan,
+        &outcomes,
+        Some(&verify),
+        make_plain_style(),
+        Duration::from_secs(1),
+    );
+
+    assert!(
+        output.contains("still failing src/a.rs"),
+        "applied but still-error file must say 'still failing': {output}"
+    );
+    // The summary always says "N file(s) fixed" — check no per-file "fixed" line appears for the still-failing file.
+    assert!(
+        !output.contains("fixed src/a.rs"),
+        "must not say 'fixed' for a still-failing file: {output}"
+    );
+}
+
+#[test]
+fn render_fix_results_warning_residue_after_apply_shown_as_non_blocking() {
+    // Scenario: fixer applied changes to a file but re-verify reports only warnings.
+    // Should show as non-blocking, not "still failing".
+    let plan = make_fix_plan_for("lint/oxc", &["src/a.ts"]);
+    let outcomes = std::collections::BTreeMap::from([(
+        "lint/oxc".to_owned(),
+        vec![make_fix_outcome("lint/oxc", &["src/a.ts"])], // fixer touched the file
+    )]);
+    let verify = vec![CheckResult {
+        check_id: "lint/oxc".to_owned(),
+        findings: vec![make_finding(Severity::Warning, "src/a.ts")], // warning-only residue
+    }];
+    let output = render_fix_results(
+        &plan,
+        &outcomes,
+        Some(&verify),
+        make_plain_style(),
+        Duration::from_secs(1),
+    );
+
+    // The summary always shows "0 still failing" — check no per-file "still failing" line appears.
+    assert!(
+        !output.contains("still failing src/a.ts"),
+        "warning-only residue on an applied file must not produce a per-file 'still failing' line: {output}"
+    );
+    assert!(
+        output.contains("non-blocking"),
+        "warning residue on an applied file must be marked non-blocking: {output}"
+    );
 }
