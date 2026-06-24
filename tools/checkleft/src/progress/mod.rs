@@ -54,6 +54,11 @@ pub trait ProgressReporter: Send + Sync {
     /// The check has begun executing (starts its elapsed clock + debounce).
     fn start(&self, check_id: &str);
 
+    /// Like [`Self::start`] but marks this as a fix-phase invocation for pass
+    /// `pass` (1-based). Resets the file-progress counter and records the pass
+    /// number so the spinner can show "fixing … — pass 2" for subsequent passes.
+    fn start_fix(&self, check_id: &str, pass: u32);
+
     /// Optional per-file progress: `processed` of the check's files handled so
     /// far. The built-in runner does not currently emit this (checks are opaque
     /// futures), but the channel exists for checks that can report granular
@@ -100,6 +105,7 @@ pub struct NoopProgressReporter;
 impl ProgressReporter for NoopProgressReporter {
     fn register(&self, _check_id: &str, _total_files: usize) {}
     fn start(&self, _check_id: &str) {}
+    fn start_fix(&self, _check_id: &str, _pass: u32) {}
     fn record_progress(&self, _check_id: &str, _processed: usize) {}
     fn finish(&self, _check_id: &str, _files_failed: usize, _elapsed: Duration) {}
     fn stream_findings(&self, _result: &CheckResult) {}
@@ -129,6 +135,10 @@ impl ProgressReporter for LiveReporter {
 
     fn start(&self, check_id: &str) {
         self.shared.lock().unwrap().start(check_id, Instant::now());
+    }
+
+    fn start_fix(&self, check_id: &str, pass: u32) {
+        self.shared.lock().unwrap().start_fix(check_id, Instant::now(), pass);
     }
 
     fn record_progress(&self, check_id: &str, processed: usize) {
