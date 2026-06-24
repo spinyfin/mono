@@ -481,19 +481,20 @@ fn run_bazel_aspect_invocation(
         .map(str::to_owned)
         .collect();
 
-    // 1b. Optionally extend with same-package rust_test targets that directly depend
-    //     on the found lib/binary targets. rust_test targets are compiled with
-    //     --cfg test, so the aspect on them covers #[cfg(test)] modules that are
-    //     invisible to the lib/binary compilation. Non-fatal: if no rust_test targets
-    //     exist in the package (or the query fails for another reason), proceed with
-    //     just the non-test targets.
-    if aspect.include_test_rdeps && !targets.is_empty() {
+    // 1b. Optionally extend with same-package test targets (of configured kinds)
+    //     that directly depend on the found lib/binary targets. Test targets are
+    //     compiled with test-only flags (e.g. --cfg test), so the aspect on them
+    //     covers code invisible to the lib/binary compilation. Non-fatal: if no
+    //     matching targets exist (or the query fails), proceed with just the
+    //     non-test targets. The kinds are joined with `|` as a bazel kind() regex.
+    if !aspect.test_rdeps_kinds.is_empty() && !targets.is_empty() {
         let targets_set = targets
             .iter()
             .map(|t| format!("'{}'", t.replace('\'', "")))
             .collect::<Vec<_>>()
             .join(" ");
-        let test_query = format!("kind(\"rust_test\", same_pkg_direct_rdeps(set({targets_set})))");
+        let kinds = aspect.test_rdeps_kinds.join("|");
+        let test_query = format!("kind(\"{kinds}\", same_pkg_direct_rdeps(set({targets_set})))");
         let test_query_args = vec![
             "query".to_owned(),
             "--keep_going".to_owned(),
