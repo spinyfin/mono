@@ -27,7 +27,7 @@ use checkleft::install::{
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::progress::render::TermRenderer;
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
-use checkleft::runner::Runner;
+use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -68,7 +68,7 @@ struct FixArgs {
     /// Re-run checks after applying fixes and report any remaining failures.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value = "true", value_name = "BOOL")]
     verify: bool,
-    /// Maximum fix passes (re-apply fixes until stable or the cap is hit). Default: 1.
+    /// Maximum fix passes (re-apply fixes until stable or the cap is hit). Default: 10.
     #[arg(long)]
     max_passes: Option<u32>,
     /// Restrict fixing to files under these paths (further intersects the
@@ -906,8 +906,13 @@ async fn dispatch_fix(
     // produce empty outcome vecs (no fix available). The same reporter is reused
     // for the apply phase so the LiveProgress instance covers both phases before
     // finalization.
-    let mut fix_outcomes =
-        runner.run_declarative_fixes(&changeset, &fix_plan_map, root, max_passes.unwrap_or(1), reporter)?;
+    let mut fix_outcomes = runner.run_declarative_fixes(
+        &changeset,
+        &fix_plan_map,
+        root,
+        max_passes.unwrap_or(DEFAULT_FIX_PASSES),
+        reporter,
+    )?;
 
     // Apply suggested_fix edits from built-in check findings (T10). Only fills in
     // entries that run_declarative_fixes left empty (no declarative fix block); a

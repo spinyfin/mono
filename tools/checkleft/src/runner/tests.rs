@@ -945,6 +945,7 @@ async fn stale_exclusion_severity_off_disables_audit() {
 
 include!("tests_policy.rs");
 include!("tests_external.rs");
+include!("tests_fix_multipass.rs");
 
 // ── change-scope finding filter ─────────────────────────────────────────────────
 
