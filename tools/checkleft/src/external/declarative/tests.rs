@@ -254,9 +254,32 @@ fn passthrough_runs_binary_end_to_end() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script_path, permissions).expect("chmod");
 
-    let package = parse_external_check_package_manifest(
-        &PASSTHROUGH_MANIFEST.replace("TOOL_PATH", &script_path.to_string_lossy()),
-    )
+    // Run via /bin/sh to avoid ETXTBSY (Text file busy) on Linux: directly
+    // exec-ing a script that was just written to disk can fail when other test
+    // threads hold a write fd open at the same time. Passing the script as an
+    // argument to the interpreter avoids the exec-on-open-write race entirely.
+    let package = parse_external_check_package_manifest(&format!(
+        r#"id = "passthrough-check"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**"]
+
+[needs.tool.default]
+path = "/bin/sh"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{script}", "{{{{files}}}}"]
+exit = {{ "0" = "findings", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#,
+        script = script_path.display()
+    ))
     .expect("passthrough manifest must parse");
     let declarative = match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
@@ -2717,6 +2740,9 @@ fn eligible_file_count_no_matching_files_returns_zero() {
 /// Build a per_file declarative manifest whose tool just exits 0 (no findings).
 #[cfg(unix)]
 fn per_file_noop_package(tool_path: &std::path::Path) -> ExternalCheckDeclarativePackage {
+    // Use /bin/sh as the binary and pass the script path as the first arg to
+    // avoid ETXTBSY (Text file busy) on Linux when directly exec-ing a script
+    // that was written to disk in the same test process.
     let manifest = format!(
         r#"
 id = "test/per-file-progress"
@@ -2726,13 +2752,13 @@ api_version = "v1"
 applies_to = ["**/*.ts"]
 
 [needs.tool.default]
-path = "{tool}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "run"
 run = "tool"
 mode = "per_file"
-args = ["{{{{file}}}}"]
+args = ["{tool}", "{{{{file}}}}"]
 exit = {{ "0" = "ok", default = "error" }}
 
 [invocations.transform]
@@ -2751,6 +2777,9 @@ message = "hit"
 /// Build a batch declarative manifest whose tool just exits 0 (no findings).
 #[cfg(unix)]
 fn batch_noop_package(tool_path: &std::path::Path) -> ExternalCheckDeclarativePackage {
+    // Use /bin/sh as the binary and pass the script path as the first arg to
+    // avoid ETXTBSY (Text file busy) on Linux when directly exec-ing a script
+    // that was written to disk in the same test process.
     let manifest = format!(
         r#"
 id = "test/batch-progress"
@@ -2760,13 +2789,13 @@ api_version = "v1"
 applies_to = ["**/*.ts"]
 
 [needs.tool.default]
-path = "{tool}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "run"
 run = "tool"
 mode = "batch"
-args = ["{{{{files}}}}"]
+args = ["{tool}", "{{{{files}}}}"]
 exit = {{ "0" = "ok", default = "error" }}
 
 [invocations.transform]
