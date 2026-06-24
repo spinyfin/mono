@@ -1,0 +1,27 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which canonical name should the unified exclusion key use (aliases accepted regardless)?",
+    "choices": [
+      "exclude (short, clearly subtractive) — recommended",
+      "exclude_files (matches what is already deployed in real CHECKS.yaml)",
+      "Support both as first-class, document exclude"
+    ],
+    "anchor": "config-schema"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Global excludes should accumulate (union) down the CHECKS hierarchy, so a child can only ADD excludes and never narrow a parent's. Adopt union for v1?",
+    "anchor": "inheritance-through-the-checks-hierarchy"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Include the finding-location post-filter backstop in v1 (drop any finding located on an excluded path, in addition to selection-time subtraction), to make the no-findings guarantee uniform across all check kinds?",
+    "anchor": "two-enforcement-points-the-behavior-guarantees"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Once framework excludes land, delete the flunge .prettierignore stopgap (T113) entirely? (No = retain it solely for developers invoking oxfmt/prettier directly outside checkleft.)",
+    "anchor": "migration--unification-plan"
+  }
+]
