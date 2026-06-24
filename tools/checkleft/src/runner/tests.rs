@@ -1019,3 +1019,209 @@ fn scope_filter_is_noop_when_all_files_are_in_changeset() {
     super::scope_findings_to_changeset(&mut result, &all);
     assert_eq!(result.findings.len(), 2);
 }
+
+// ── apply_suggested_fixes tests ───────────────────────────────────────────────
+
+use crate::output::{FileEdit, SuggestedFix};
+
+fn make_runner_for_tree(dir: &tempfile::TempDir) -> Runner {
+    Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(dir.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(dir.path()).expect("tree")),
+    )
+}
+
+fn make_result_with_fix(check_id: &str, file: &str, old_text: &str, new_text: &str) -> CheckResult {
+    CheckResult {
+        check_id: check_id.to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: "needs fix".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from(file),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: Some(SuggestedFix {
+                description: "auto-fix".to_owned(),
+                edits: vec![FileEdit {
+                    path: PathBuf::from(file),
+                    old_text: old_text.to_owned(),
+                    new_text: new_text.to_owned(),
+                }],
+            }),
+        }],
+    }
+}
+
+#[test]
+fn apply_suggested_fixes_writes_edited_file_to_real_tree() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("a.txt"), b"hello world").expect("write a.txt");
+
+    let runner = make_runner_for_tree(&dir);
+    let result = make_result_with_fix("my-check", "a.txt", "hello", "goodbye");
+    let fix_plan = BTreeMap::from([("my-check".to_owned(), vec![PathBuf::from("a.txt")])]);
+
+    let outcomes = runner.apply_suggested_fixes(&[result], &fix_plan, dir.path());
+
+    assert_eq!(outcomes.len(), 1);
+    let inv = &outcomes["my-check"];
+    assert_eq!(inv.len(), 1);
+    assert_eq!(inv[0].invocation_id, "suggested_fix");
+    assert!(inv[0].error.is_none(), "expected no error, got: {:?}", inv[0].error);
+    assert_eq!(inv[0].applied, vec![PathBuf::from("a.txt")]);
+    assert_eq!(
+        fs::read(dir.path().join("a.txt")).unwrap(),
+        b"goodbye world",
+        "edit must be applied to the real file"
+    );
+}
+
+#[test]
+fn apply_suggested_fixes_is_absent_when_no_suggested_fix_present() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("a.txt"), b"content").expect("write a.txt");
+
+    let runner = make_runner_for_tree(&dir);
+    // Finding without a suggested_fix.
+    let result = CheckResult {
+        check_id: "my-check".to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: "problem".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from("a.txt"),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: None,
+        }],
+    };
+    let fix_plan = BTreeMap::from([("my-check".to_owned(), vec![PathBuf::from("a.txt")])]);
+
+    let outcomes = runner.apply_suggested_fixes(&[result], &fix_plan, dir.path());
+    assert!(
+        outcomes.is_empty(),
+        "no suggested_fix → no entry (caller treats absent as no fix available)"
+    );
+}
+
+#[test]
+fn apply_suggested_fixes_ignores_edits_outside_fixable_set() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("a.txt"), b"hello").expect("write a.txt");
+    fs::write(dir.path().join("b.txt"), b"world").expect("write b.txt");
+
+    let runner = make_runner_for_tree(&dir);
+    // suggested_fix has edits for both a.txt and b.txt, but only a.txt is fixable.
+    let result = CheckResult {
+        check_id: "my-check".to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: "needs fix".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from("a.txt"),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: Some(SuggestedFix {
+                description: "auto-fix".to_owned(),
+                edits: vec![
+                    FileEdit {
+                        path: PathBuf::from("a.txt"),
+                        old_text: "hello".to_owned(),
+                        new_text: "goodbye".to_owned(),
+                    },
+                    FileEdit {
+                        path: PathBuf::from("b.txt"),
+                        old_text: "world".to_owned(),
+                        new_text: "WORLD".to_owned(),
+                    },
+                ],
+            }),
+        }],
+    };
+    // Only a.txt is in the fix plan.
+    let fix_plan = BTreeMap::from([("my-check".to_owned(), vec![PathBuf::from("a.txt")])]);
+
+    let outcomes = runner.apply_suggested_fixes(&[result], &fix_plan, dir.path());
+
+    assert_eq!(outcomes["my-check"][0].applied, vec![PathBuf::from("a.txt")]);
+    assert_eq!(
+        fs::read(dir.path().join("a.txt")).unwrap(),
+        b"goodbye",
+        "in-plan file must be fixed"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("b.txt")).unwrap(),
+        b"world",
+        "out-of-plan file must be untouched"
+    );
+}
+
+#[test]
+fn apply_suggested_fixes_skips_info_severity_findings() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("a.txt"), b"hello").expect("write a.txt");
+
+    let runner = make_runner_for_tree(&dir);
+    let result = CheckResult {
+        check_id: "my-check".to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Info, // Info → not fixed
+            message: "advisory".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from("a.txt"),
+                line: None,
+                column: None,
+            }),
+            remediations: vec![],
+            suggested_fix: Some(SuggestedFix {
+                description: "auto-fix".to_owned(),
+                edits: vec![FileEdit {
+                    path: PathBuf::from("a.txt"),
+                    old_text: "hello".to_owned(),
+                    new_text: "goodbye".to_owned(),
+                }],
+            }),
+        }],
+    };
+    let fix_plan = BTreeMap::from([("my-check".to_owned(), vec![PathBuf::from("a.txt")])]);
+
+    let outcomes = runner.apply_suggested_fixes(&[result], &fix_plan, dir.path());
+    assert!(outcomes.is_empty(), "Info-severity findings must not be fixed");
+    assert_eq!(
+        fs::read(dir.path().join("a.txt")).unwrap(),
+        b"hello",
+        "file must be untouched"
+    );
+}
+
+#[test]
+fn apply_suggested_fixes_is_idempotent_when_old_text_absent() {
+    // If old_text is no longer in the file (already fixed), the content is
+    // unchanged and no copy-back occurs.
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("a.txt"), b"goodbye world").expect("write a.txt");
+
+    let runner = make_runner_for_tree(&dir);
+    let result = make_result_with_fix("my-check", "a.txt", "hello", "goodbye");
+    let fix_plan = BTreeMap::from([("my-check".to_owned(), vec![PathBuf::from("a.txt")])]);
+
+    let outcomes = runner.apply_suggested_fixes(&[result], &fix_plan, dir.path());
+
+    assert_eq!(outcomes.len(), 1);
+    let inv = &outcomes["my-check"][0];
+    assert!(inv.error.is_none());
+    assert!(inv.applied.is_empty(), "no copy-back when content unchanged");
+    assert_eq!(
+        fs::read(dir.path().join("a.txt")).unwrap(),
+        b"goodbye world",
+        "file content unchanged"
+    );
+}

@@ -736,6 +736,164 @@ impl Runner {
         Ok(accumulated)
     }
 
+    /// Apply `suggested_fix` edits from built-in check findings through the T2
+    /// writable copy sandbox + atomic copy-back path.
+    ///
+    /// For each check in `fix_plan`, collects [`crate::output::FileEdit`]s from
+    /// `Error`- and `Warning`-severity findings that carry a `suggested_fix`. Each
+    /// edit whose `path` is in the check's fixable set is applied as a text
+    /// substitution (first occurrence of `old_text` → `new_text`) inside a staged
+    /// writable sandbox. Only files that actually changed are atomically copied back
+    /// to the real tree.
+    ///
+    /// The returned map uses the same `check_id → Vec<FixInvocationOutcome>`
+    /// shape as [`Self::run_declarative_fixes`]. An absent entry (or empty `Vec`)
+    /// means no `suggested_fix` edits were found for that check; the caller merges
+    /// this with the declarative outcomes and treats empty as "no fix available".
+    pub fn apply_suggested_fixes(
+        &self,
+        results: &[CheckResult],
+        fix_plan: &BTreeMap<String, Vec<PathBuf>>,
+        repo_root: &Path,
+    ) -> BTreeMap<String, Vec<crate::external::FixInvocationOutcome>> {
+        use crate::external::FixInvocationOutcome;
+        use crate::external::sandbox::HostCeiling;
+        use crate::fix::WritableSandbox;
+
+        let mut outcomes: BTreeMap<String, Vec<FixInvocationOutcome>> = BTreeMap::new();
+        let ceiling = HostCeiling::new(repo_root);
+
+        for result in results {
+            let check_id = &result.check_id;
+            let Some(fixable_files) = fix_plan.get(check_id) else {
+                continue;
+            };
+            let fixable_set: HashSet<&PathBuf> = fixable_files.iter().collect();
+
+            // Collect FileEdits from actionable findings, restricted to the fixable
+            // set. Multiple findings may contribute edits for the same file; they are
+            // applied in document order.
+            let mut edits_by_file: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+            for finding in &result.findings {
+                if !matches!(finding.severity, Severity::Error | Severity::Warning) {
+                    continue;
+                }
+                let Some(sf) = &finding.suggested_fix else {
+                    continue;
+                };
+                for edit in &sf.edits {
+                    if fixable_set.contains(&edit.path) {
+                        edits_by_file
+                            .entry(edit.path.clone())
+                            .or_default()
+                            .push((edit.old_text.clone(), edit.new_text.clone()));
+                    }
+                }
+            }
+
+            if edits_by_file.is_empty() {
+                // No suggested_fix edits for this check: leave the entry absent so
+                // the caller falls through to "no fix available".
+                continue;
+            }
+
+            let files_to_stage: Vec<PathBuf> = edits_by_file.keys().cloned().collect();
+
+            // Stage a writable, force-copied sandbox (never hardlinked — a hardlink
+            // would escape copy-back; see safety.rs module doc).
+            let sandbox = match WritableSandbox::stage(&files_to_stage, self.source_tree.as_ref(), &ceiling) {
+                Ok(s) => s,
+                Err(err) => {
+                    outcomes.insert(
+                        check_id.clone(),
+                        vec![FixInvocationOutcome {
+                            invocation_id: "suggested_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(err),
+                        }],
+                    );
+                    continue;
+                }
+            };
+
+            // Apply each edit to the staged sandbox copy as a text substitution.
+            // Files absent from the source tree were silently dropped by staging and
+            // are skipped here. If old_text is absent (file already fixed by a prior
+            // pass or the edit doesn't apply), the content is unchanged and
+            // detect_changes will produce no copy-back for that file.
+            let mut apply_err: Option<anyhow::Error> = None;
+            'files: for (path, edits) in &edits_by_file {
+                let staged = sandbox.root_path().join(path);
+                if !staged.exists() {
+                    continue; // absent from source tree; dropped by staging
+                }
+                let content = match std::fs::read_to_string(&staged) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        apply_err = Some(anyhow!("failed to read staged file {}: {err}", path.display()));
+                        break 'files;
+                    }
+                };
+                let mut new_content = content;
+                for (old_text, new_text) in edits {
+                    new_content = new_content.replacen(old_text.as_str(), new_text.as_str(), 1);
+                }
+                if let Err(err) = std::fs::write(&staged, new_content.as_bytes()) {
+                    apply_err = Some(anyhow!(
+                        "failed to write edited file to sandbox {}: {err}",
+                        path.display()
+                    ));
+                    break 'files;
+                }
+            }
+
+            if let Some(err) = apply_err {
+                outcomes.insert(
+                    check_id.clone(),
+                    vec![FixInvocationOutcome {
+                        invocation_id: "suggested_fix".to_owned(),
+                        applied: Vec::new(),
+                        per_file_errors: Vec::new(),
+                        error: Some(err),
+                    }],
+                );
+                continue;
+            }
+
+            // Detect which staged files actually changed, then copy them back.
+            let changed = match sandbox.detect_changes() {
+                Ok(c) => c,
+                Err(err) => {
+                    outcomes.insert(
+                        check_id.clone(),
+                        vec![FixInvocationOutcome {
+                            invocation_id: "suggested_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(err),
+                        }],
+                    );
+                    continue;
+                }
+            };
+
+            let report = sandbox.copy_back(&changed, repo_root);
+            let error = report.failed.map(|(_, e)| e);
+            outcomes.insert(
+                check_id.clone(),
+                vec![FixInvocationOutcome {
+                    invocation_id: "suggested_fix".to_owned(),
+                    applied: report.applied,
+                    per_file_errors: Vec::new(),
+                    error,
+                }],
+            );
+        }
+
+        outcomes
+    }
+
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
         info!(
             changed_files = changeset.changed_files.len(),
