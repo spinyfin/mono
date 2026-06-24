@@ -922,6 +922,7 @@ impl crate::progress::ProgressReporter for CapturingProgressReporter {
             .push((check_id.to_owned(), total_files));
     }
     fn start(&self, _check_id: &str) {}
+    fn start_fix(&self, _check_id: &str, _pass: u32) {}
     fn record_progress(&self, _check_id: &str, _processed: usize) {}
     fn finish(&self, _check_id: &str, _files_failed: usize, _elapsed: std::time::Duration) {}
     fn stream_findings(&self, _result: &crate::output::CheckResult) {}

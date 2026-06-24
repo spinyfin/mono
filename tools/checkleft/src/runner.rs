@@ -682,7 +682,7 @@ impl Runner {
         let source_tree = Arc::clone(&self.source_tree);
         let max = max_passes.max(1);
 
-        for _pass in 0..max {
+        for pass in 0..max {
             // Run groups concurrently. Groups are file-disjoint so copy-backs
             // in different groups cannot race on any real file.
             let pass_results: Vec<Vec<(String, Vec<crate::external::FixInvocationOutcome>)>> = groups
@@ -696,7 +696,7 @@ impl Runner {
                     // sandboxes the latest bytes written by its predecessor.
                     for check_id in &group.ordered_checks {
                         let fix_start = Instant::now();
-                        reporter.start(check_id);
+                        reporter.start_fix(check_id, pass + 1);
                         let reporter_clone = Arc::clone(&reporter);
                         let check_id_for_progress = check_id.clone();
                         let invocation_outcomes = match declarative_info.get(check_id) {

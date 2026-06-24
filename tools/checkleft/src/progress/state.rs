@@ -35,6 +35,15 @@ pub struct StatusLine {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EntryPhase {
+    #[default]
+    Check,
+    Fix {
+        pass: u32,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Lifecycle {
     Pending,
@@ -48,6 +57,7 @@ struct Entry {
     total_files: usize,
     processed_files: usize,
     lifecycle: Lifecycle,
+    phase: EntryPhase,
 }
 
 /// The shared, renderer-agnostic progress model.
@@ -83,6 +93,7 @@ impl ProgressState {
             total_files: 0,
             processed_files: 0,
             lifecycle: Lifecycle::Pending,
+            phase: EntryPhase::Check,
         });
         self.index.insert(check_id.to_owned(), i);
         &mut self.entries[i]
@@ -98,6 +109,15 @@ impl ProgressState {
     /// Mark a check as started, beginning its elapsed clock and debounce window.
     pub fn start(&mut self, check_id: &str, now: Instant) {
         self.entry_mut(check_id).lifecycle = Lifecycle::Running { started_at: now };
+    }
+
+    /// Transition a check into fix mode for the given pass (1-based), resetting
+    /// file-progress and recording the pass number for the spinner label.
+    pub fn start_fix(&mut self, check_id: &str, now: Instant, pass: u32) {
+        let entry = self.entry_mut(check_id);
+        entry.lifecycle = Lifecycle::Running { started_at: now };
+        entry.phase = EntryPhase::Fix { pass };
+        entry.processed_files = 0;
     }
 
     /// Record that `processed` of the check's files have been handled so far.
@@ -174,36 +194,77 @@ impl ProgressState {
 
 fn in_progress_text(entry: &Entry, elapsed: Duration) -> String {
     let timing = format_elapsed(elapsed);
-    if entry.processed_files > 0 {
-        format!(
-            "{}: {}/{} files checked [{timing}]",
-            entry.id, entry.processed_files, entry.total_files
-        )
-    } else {
-        format!(
-            "{}: checking {} [{timing}]",
-            entry.id,
-            pluralize_files(entry.total_files)
-        )
+    match entry.phase {
+        EntryPhase::Fix { pass } => {
+            let pass_suffix = if pass > 1 {
+                format!(" — pass {pass}")
+            } else {
+                String::new()
+            };
+            if entry.processed_files > 0 {
+                format!(
+                    "{}: {}/{} fixing{pass_suffix} [{timing}]",
+                    entry.id, entry.processed_files, entry.total_files
+                )
+            } else {
+                format!(
+                    "{}: fixing {}{pass_suffix} [{timing}]",
+                    entry.id,
+                    pluralize_files(entry.total_files)
+                )
+            }
+        }
+        EntryPhase::Check => {
+            if entry.processed_files > 0 {
+                format!(
+                    "{}: {}/{} files checked [{timing}]",
+                    entry.id, entry.processed_files, entry.total_files
+                )
+            } else {
+                format!(
+                    "{}: checking {} [{timing}]",
+                    entry.id,
+                    pluralize_files(entry.total_files)
+                )
+            }
+        }
     }
 }
 
 fn done_failed_text(entry: &Entry, files_failed: usize, elapsed: Duration) -> String {
-    format!(
-        "{}: {} failed [{}]",
-        entry.id,
-        pluralize_files(files_failed),
-        format_elapsed(elapsed)
-    )
+    match entry.phase {
+        EntryPhase::Fix { .. } => {
+            let noun = if files_failed == 1 {
+                "fixer error"
+            } else {
+                "fixer errors"
+            };
+            format!("{}: {files_failed} {noun} [{}]", entry.id, format_elapsed(elapsed))
+        }
+        EntryPhase::Check => format!(
+            "{}: {} failed [{}]",
+            entry.id,
+            pluralize_files(files_failed),
+            format_elapsed(elapsed)
+        ),
+    }
 }
 
 fn done_passed_text(entry: &Entry, elapsed: Duration) -> String {
-    format!(
-        "{}: {} passed [{}]",
-        entry.id,
-        pluralize_files(entry.total_files),
-        format_elapsed(elapsed)
-    )
+    match entry.phase {
+        EntryPhase::Fix { .. } => format!(
+            "{}: {} fixed [{}]",
+            entry.id,
+            pluralize_files(entry.total_files),
+            format_elapsed(elapsed)
+        ),
+        EntryPhase::Check => format!(
+            "{}: {} passed [{}]",
+            entry.id,
+            pluralize_files(entry.total_files),
+            format_elapsed(elapsed)
+        ),
+    }
 }
 
 fn done_skipped_text(entry: &Entry, elapsed: Duration) -> String {
@@ -409,5 +470,95 @@ mod tests {
         state.push_log_lines(["line one".to_owned(), "line two".to_owned()]);
         assert_eq!(state.drain_log(), vec!["line one", "line two"]);
         assert!(state.drain_log().is_empty(), "log must be empty after draining");
+    }
+
+    #[test]
+    fn fix_phase_pass1_shows_fixing_without_pass_suffix() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        let t0 = Instant::now();
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", t0, 1);
+
+        let lines = state.visible_lines(t0 + Duration::from_millis(500));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Spinner);
+        assert_eq!(lines[0].text, "format/oxc: fixing 90 files [500ms]");
+    }
+
+    #[test]
+    fn fix_phase_pass2_shows_pass_suffix() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        let t0 = Instant::now();
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", t0, 2);
+
+        let lines = state.visible_lines(t0 + Duration::from_millis(500));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Spinner);
+        assert_eq!(lines[0].text, "format/oxc: fixing 90 files — pass 2 [500ms]");
+    }
+
+    #[test]
+    fn fix_phase_with_file_progress_shows_fraction() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        let t0 = Instant::now();
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", t0, 1);
+        state.record_progress("format/oxc", 42);
+
+        let lines = state.visible_lines(t0 + Duration::from_millis(500));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "format/oxc: 42/90 fixing [500ms]");
+    }
+
+    #[test]
+    fn fix_phase_done_no_errors_shows_fixed() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", Instant::now(), 1);
+        state.finish("format/oxc", 0, Duration::from_millis(1600));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines[0].icon, IconKind::Passed);
+        assert_eq!(lines[0].text, "format/oxc: 90 files fixed [1.6s]");
+    }
+
+    #[test]
+    fn fix_phase_done_with_errors_shows_fixer_errors() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", Instant::now(), 1);
+        state.finish("format/oxc", 2, Duration::from_millis(1600));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines[0].icon, IconKind::Failed);
+        assert_eq!(lines[0].text, "format/oxc: 2 fixer errors [1.6s]");
+    }
+
+    #[test]
+    fn fix_phase_done_singular_error() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("format/oxc", 5);
+        state.start_fix("format/oxc", Instant::now(), 1);
+        state.finish("format/oxc", 1, Duration::from_millis(100));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines[0].icon, IconKind::Failed);
+        assert_eq!(lines[0].text, "format/oxc: 1 fixer error [100ms]");
+    }
+
+    #[test]
+    fn start_fix_resets_file_progress_between_passes() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        let t0 = Instant::now();
+        state.register("format/oxc", 90);
+        state.start_fix("format/oxc", t0, 1);
+        state.record_progress("format/oxc", 90);
+        state.finish("format/oxc", 0, Duration::from_millis(1000));
+
+        // Pass 2: processed_files should reset to 0
+        state.start_fix("format/oxc", t0 + Duration::from_millis(1001), 2);
+        let lines = state.visible_lines(t0 + Duration::from_millis(1600));
+        assert_eq!(lines[0].text, "format/oxc: fixing 90 files — pass 2 [599ms]");
     }
 }
