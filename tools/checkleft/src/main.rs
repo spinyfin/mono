@@ -609,12 +609,12 @@ struct StillFailingInfo {
 }
 
 impl StillFailingInfo {
-    fn contains_error(&self, path: &PathBuf) -> bool {
-        self.error_files.contains(path)
+    fn contains_error(&self, path: &Path) -> bool {
+        self.error_files.iter().any(|p| p.as_path() == path)
     }
 
-    fn contains_warning_only(&self, path: &PathBuf) -> bool {
-        self.warning_only_files.contains(path)
+    fn contains_warning_only(&self, path: &Path) -> bool {
+        self.warning_only_files.iter().any(|p| p.as_path() == path)
     }
 }
 
@@ -831,7 +831,11 @@ fn render_fix_results(
                 // Files still failing for this check that appeared in verify but were
                 // not in any invocation's applied set (edge case: a different check
                 // on the same applied file that still fails). Distinguish error vs warning.
-                if let Some(sf) = check_still_failing {
+                // Only runs when the fixer applied at least one file; when nothing was
+                // applied the block above already handled residue via aggregate messages.
+                if !all_applied.is_empty()
+                    && let Some(sf) = check_still_failing
+                {
                     for file in &sf.error_files {
                         if !all_applied.contains(file) {
                             let _ = writeln!(out, "    {} {}", style.paint_warning("still failing"), file.display());

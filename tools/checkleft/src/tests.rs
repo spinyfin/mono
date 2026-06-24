@@ -1253,6 +1253,15 @@ fn render_fix_results_empty_applied_with_error_residue_no_contradiction() {
         output.contains("still failing"),
         "must mention that violations are still failing: {output}"
     );
+    // Summary must count 1 still-failing, not 2 (double-counting regression).
+    assert!(
+        output.contains("1 still failing"),
+        "summary must report 1 still failing (not double-counted): {output}"
+    );
+    assert!(
+        !output.contains("2 still failing"),
+        "summary must not double-count still failing: {output}"
+    );
 }
 
 #[test]
@@ -1292,6 +1301,15 @@ fn render_fix_results_empty_applied_with_warning_only_residue() {
     assert!(
         output.contains("non-blocking"),
         "must mark warning residue as non-blocking: {output}"
+    );
+    // Summary must report 2 warnings remaining, not 4 (double-counting regression).
+    assert!(
+        output.contains("2 warning(s) remaining (non-blocking)"),
+        "summary must report 2 warnings remaining (not double-counted): {output}"
+    );
+    assert!(
+        !output.contains("4 warning(s) remaining"),
+        "summary must not double-count warnings: {output}"
     );
 }
 
