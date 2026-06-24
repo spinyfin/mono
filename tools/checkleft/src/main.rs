@@ -906,8 +906,20 @@ async fn dispatch_fix(
     // produce empty outcome vecs (no fix available). The same reporter is reused
     // for the apply phase so the LiveProgress instance covers both phases before
     // finalization.
-    let fix_outcomes =
+    let mut fix_outcomes =
         runner.run_declarative_fixes(&changeset, &fix_plan_map, root, max_passes.unwrap_or(1), reporter)?;
+
+    // Apply suggested_fix edits from built-in check findings (T10). Only fills in
+    // entries that run_declarative_fixes left empty (no declarative fix block); a
+    // non-empty entry means the declarative path already ran for that check and
+    // takes precedence.
+    let builtin_outcomes = runner.apply_suggested_fixes(&results, &fix_plan_map, root);
+    for (check_id, inv_outcomes) in builtin_outcomes {
+        let entry = fix_outcomes.entry(check_id).or_default();
+        if entry.is_empty() {
+            *entry = inv_outcomes;
+        }
+    }
 
     // Collect the files that were atomically copied back to the real working tree.
     let applied_files: std::collections::BTreeSet<PathBuf> = fix_outcomes
