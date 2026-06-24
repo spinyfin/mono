@@ -96,16 +96,16 @@ a `GITHUB_TOKEN` environment variable).
 
 ## Flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--from <TAG>` | *(required)* | Start tag, exclusive lower bound. |
-| `--to <REF>` | `HEAD` | End tag or ref, inclusive upper bound. |
-| `--path <GLOB>` | *(none)* | Include only commits touching this glob. Repeatable. |
-| `--paths-file <FILE>` | *(none)* | File of glob patterns (one per line; `#` comments ok). |
-| `--project <FILE>` | *(none)* | `PROJECT.yaml` whose directory and `paths` entries define owned globs. |
-| `--repo <OWNER/NAME>` | *(from `origin` remote)* | GitHub repo slug. |
-| `--enrich` | `false` | Fetch real PR titles and author logins via `gh api`. |
-| `--git-dir <PATH>` | `.` | Path to the git repository. |
+| Flag                  | Default                  | Description                                                            |
+| --------------------- | ------------------------ | ---------------------------------------------------------------------- |
+| `--from <TAG>`        | _(required)_             | Start tag, exclusive lower bound.                                      |
+| `--to <REF>`          | `HEAD`                   | End tag or ref, inclusive upper bound.                                 |
+| `--path <GLOB>`       | _(none)_                 | Include only commits touching this glob. Repeatable.                   |
+| `--paths-file <FILE>` | _(none)_                 | File of glob patterns (one per line; `#` comments ok).                 |
+| `--project <FILE>`    | _(none)_                 | `PROJECT.yaml` whose directory and `paths` entries define owned globs. |
+| `--repo <OWNER/NAME>` | _(from `origin` remote)_ | GitHub repo slug.                                                      |
+| `--enrich`            | `false`                  | Fetch real PR titles and author logins via `gh api`.                   |
+| `--git-dir <PATH>`    | `.`                      | Path to the git repository.                                            |
 
 ## Output format
 
@@ -113,9 +113,9 @@ The output matches GitHub's auto-generated release notes format:
 
 ```markdown
 ## What's Changed
-* Add cool feature by @alice in https://github.com/owner/repo/pull/42
-* Fix nasty bug by @bob in https://github.com/owner/repo/pull/41
 
+- Add cool feature by @alice in https://github.com/owner/repo/pull/42
+- Fix nasty bug by @bob in https://github.com/owner/repo/pull/41
 
 **Full Changelog**: https://github.com/owner/repo/compare/v1.0.0...v1.1.0
 ```

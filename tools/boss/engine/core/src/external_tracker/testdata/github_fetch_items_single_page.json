@@ -22,15 +22,10 @@
                   "nameWithOwner": "spinyfin/mono"
                 },
                 "labels": {
-                  "nodes": [
-                    {"name": "enhancement"},
-                    {"name": "boss"}
-                  ]
+                  "nodes": [{ "name": "enhancement" }, { "name": "boss" }]
                 },
                 "assignees": {
-                  "nodes": [
-                    {"login": "brianduff"}
-                  ]
+                  "nodes": [{ "login": "brianduff" }]
                 },
                 "closedByPullRequestsReferences": {
                   "nodes": []
@@ -52,9 +47,7 @@
                   "nameWithOwner": "spinyfin/mono"
                 },
                 "labels": {
-                  "nodes": [
-                    {"name": "bug"}
-                  ]
+                  "nodes": [{ "name": "bug" }]
                 },
                 "assignees": {
                   "nodes": []

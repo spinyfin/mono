@@ -43,15 +43,15 @@ BYPASS_<CHECK_NAME>=<specific legitimate reason>
 
 The bypass name is derived from the check id by uppercasing and replacing all non-alphanumeric characters (slashes, hyphens) with underscores. For namespaced check ids:
 
-| Check id | Bypass name |
-|---|---|
-| `file/size` | `BYPASS_FILE_SIZE` |
-| `format/rust` | `BYPASS_FORMAT_RUST` |
-| `format/bazel` | `BYPASS_FORMAT_BAZEL` |
-| `lint/rust` | `BYPASS_LINT_RUST` |
-| `lint/bazel` | `BYPASS_LINT_BAZEL` |
+| Check id             | Bypass name                 |
+| -------------------- | --------------------------- |
+| `file/size`          | `BYPASS_FILE_SIZE`          |
+| `format/rust`        | `BYPASS_FORMAT_RUST`        |
+| `format/bazel`       | `BYPASS_FORMAT_BAZEL`       |
+| `lint/rust`          | `BYPASS_LINT_RUST`          |
+| `lint/bazel`         | `BYPASS_LINT_BAZEL`         |
 | `rust/giant-structs` | `BYPASS_RUST_GIANT_STRUCTS` |
-| `file/ifchange` | `BYPASS_FILE_IFCHANGE` |
+| `file/ifchange`      | `BYPASS_FILE_IFCHANGE`      |
 
 For `file/ifchange`:
 

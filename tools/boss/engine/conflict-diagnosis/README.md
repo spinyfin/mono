@@ -2,7 +2,7 @@
 
 Pre-spawn merge-conflict analysis for Boss's conflict-resolution flow.
 When a PR can no longer rebase cleanly onto its base, the engine uses
-this crate to probe *what* would conflict before it spawns a worker to
+this crate to probe _what_ would conflict before it spawns a worker to
 fix it. The result is a structured, JSON-serialisable diagnosis the
 worker prompt embeds so the resolution session starts with concrete
 context instead of discovering the conflicts from scratch.
@@ -15,7 +15,7 @@ resolved. `collect` shells out to `git merge-tree` to compute the
 would-be merge without touching working state, then parses the output
 into a `ConflictDiagnosis` — the base/head shas, a per-file list of
 `ConflictedFile` entries (path and a coarse conflict `shape`), and an
-optional `error`. The diagnosis is deliberately *pure-ish*: it reads
+optional `error`. The diagnosis is deliberately _pure-ish_: it reads
 from git but mutates nothing.
 
 Two design constraints shape the implementation. First, probes must

@@ -115,16 +115,16 @@ policy, upstream API stability) that we do not fully control.
 
 ### Decision dimensions
 
-| Axis | Terminal-embed | Native chat (SDK/ACP) |
-|---|---|---|
-| Rendering surface inherited | Everything Claude Code ships, free | Almost nothing; we reimplement each tool's UI |
-| Control fidelity | Keystroke injection; observation via hooks/scrape/JSONL | Structured events both directions |
-| Failure recovery | `claude --resume` exists; reattach a terminal | We own resume entirely |
-| Boss-side fidelity | Strong — Boss is a real Claude TUI | Weak unless we build a lot |
-| Worker-side fidelity | Strong, but workers are dense TUI panes | Can be nicer if we build the chrome |
-| Company policy fit | Runs the approved binary unchanged | Requires custom-client approval |
-| Reversibility | Easy to swap pane contents to chat later | Hard — humans grow to depend on chat affordances |
-| POC cost | Existing 5-pane prototype to build on | None yet; substantial upfront |
+| Axis                        | Terminal-embed                                          | Native chat (SDK/ACP)                            |
+| --------------------------- | ------------------------------------------------------- | ------------------------------------------------ |
+| Rendering surface inherited | Everything Claude Code ships, free                      | Almost nothing; we reimplement each tool's UI    |
+| Control fidelity            | Keystroke injection; observation via hooks/scrape/JSONL | Structured events both directions                |
+| Failure recovery            | `claude --resume` exists; reattach a terminal           | We own resume entirely                           |
+| Boss-side fidelity          | Strong — Boss is a real Claude TUI                      | Weak unless we build a lot                       |
+| Worker-side fidelity        | Strong, but workers are dense TUI panes                 | Can be nicer if we build the chrome              |
+| Company policy fit          | Runs the approved binary unchanged                      | Requires custom-client approval                  |
+| Reversibility               | Easy to swap pane contents to chat later                | Hard — humans grow to depend on chat affordances |
+| POC cost                    | Existing 5-pane prototype to build on                   | None yet; substantial upfront                    |
 
 ### Decisive unknowns
 
@@ -146,10 +146,10 @@ policy, upstream API stability) that we do not fully control.
 
 4. **Boss product gap.** What specifically does Boss want to give the human
    that Claude Code's TUI doesn't already give? If most of the wanted
-   affordances are *chrome around* a terminal (work-item context next to the
+   affordances are _chrome around_ a terminal (work-item context next to the
    pane, status chips, fixed grid layout, focus management, keyboard
    shortcuts to switch panes), terminal-embed is sufficient. If the wanted
-   affordances are *inside* the conversation (collapsible tool calls,
+   affordances are _inside_ the conversation (collapsible tool calls,
    click-to-jump-to-file, native diff viewer, native attachment UX), that
    pushes toward native chat.
 
@@ -309,23 +309,23 @@ Inventory of 15 candidate Boss-only affordances, each classified as
 chrome-around-the-pane (terminal-embed sufficient) or
 inside-the-conversation (requires rendering control):
 
-| Affordance | Category | Why |
-|---|---|---|
-| Fixed 3×3 Boss + 8 grid | chrome-around | Window-manager concern; outside any single session |
-| Per-pane work-item context strip | chrome-around | Reads engine state, renders adjacent to the pane |
-| Cross-worker capacity / status chips | chrome-around | Header widget, no message rendering needed |
-| Keyboard focus router (cmd-1..9) | chrome-around | OS-level focus routing |
-| Attention / alert surfacing | chrome-around | Triggered at engine layer; surfaced via native notifications |
-| Boss-driven worker dispatch palette | chrome-around | Launcher, agnostic to pane type |
-| Cross-worker search | hybrid | Ingestion works either way; previews + jump-to-message cleaner with native chat |
-| Work-item ↔ session binding & auto-resume | chrome-around | Engine bookkeeping; pane renders whatever it's handed |
-| Inline work-item linking in messages (`#task_123` chips) | inside-conversation | Requires intercepting message render |
-| Native diff viewer for tool calls | inside-conversation | Needs structured `tool_use` payload + render control |
-| Click-to-jump-to-file from tool calls | inside-conversation | Clickable affordance inside the message stream |
-| Collapsible / summarized tool calls | inside-conversation | Selective render; only possible if app owns the view |
-| Custom approval / permission UI | inside-conversation | Permission requests must be intercepted, not consumed by TUI |
-| Boss-authored worker steering messages with distinct provenance | inside-conversation | Requires sender styling control |
-| Aggregate Boss dashboard view | hybrid | Chrome is fine; per-row legibility benefits from message structure |
+| Affordance                                                      | Category            | Why                                                                             |
+| --------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------- |
+| Fixed 3×3 Boss + 8 grid                                         | chrome-around       | Window-manager concern; outside any single session                              |
+| Per-pane work-item context strip                                | chrome-around       | Reads engine state, renders adjacent to the pane                                |
+| Cross-worker capacity / status chips                            | chrome-around       | Header widget, no message rendering needed                                      |
+| Keyboard focus router (cmd-1..9)                                | chrome-around       | OS-level focus routing                                                          |
+| Attention / alert surfacing                                     | chrome-around       | Triggered at engine layer; surfaced via native notifications                    |
+| Boss-driven worker dispatch palette                             | chrome-around       | Launcher, agnostic to pane type                                                 |
+| Cross-worker search                                             | hybrid              | Ingestion works either way; previews + jump-to-message cleaner with native chat |
+| Work-item ↔ session binding & auto-resume                       | chrome-around       | Engine bookkeeping; pane renders whatever it's handed                           |
+| Inline work-item linking in messages (`#task_123` chips)        | inside-conversation | Requires intercepting message render                                            |
+| Native diff viewer for tool calls                               | inside-conversation | Needs structured `tool_use` payload + render control                            |
+| Click-to-jump-to-file from tool calls                           | inside-conversation | Clickable affordance inside the message stream                                  |
+| Collapsible / summarized tool calls                             | inside-conversation | Selective render; only possible if app owns the view                            |
+| Custom approval / permission UI                                 | inside-conversation | Permission requests must be intercepted, not consumed by TUI                    |
+| Boss-authored worker steering messages with distinct provenance | inside-conversation | Requires sender styling control                                                 |
+| Aggregate Boss dashboard view                                   | hybrid              | Chrome is fine; per-row legibility benefits from message structure              |
 
 Tally: 7 chrome-around, 6 inside-conversation, 2 hybrid. Even split by
 count, but the chrome-around items are the **load-bearing scaffolding**
@@ -514,15 +514,15 @@ leased dir) wrote only to the leased path — no escape.
 
 Capability table (`tools/cube/src/`):
 
-| Command | State | Ref |
-|---|---|---|
-| `repo add` / `list` / `info` | IMPLEMENTED | `app.rs:167`, `191`, `209` |
-| `workspace lease` | IMPLEMENTED (single-pool, no auto-create, no setup engine, no flock) | `app.rs:367` |
-| `workspace release` | IMPLEMENTED (resets via `jj git fetch && jj new main`) | `app.rs:410` |
-| `workspace status` | IMPLEMENTED (delegates to `jj status`) | `app.rs:433` |
-| `workspace setup` | STUBBED — returns "No setup steps are configured for {workspace_id}" | `app.rs:447` |
-| `change create` / `info` | IMPLEMENTED (records local change-graph rows; `change checkout` still `NotImplemented` at `app.rs:542`) | `app.rs:474`, `545` |
-| `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented` | `app.rs:559`, `566`, `573`, `579` |
+| Command                              | State                                                                                                   | Ref                               |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| `repo add` / `list` / `info`         | IMPLEMENTED                                                                                             | `app.rs:167`, `191`, `209`        |
+| `workspace lease`                    | IMPLEMENTED (single-pool, no auto-create, no setup engine, no flock)                                    | `app.rs:367`                      |
+| `workspace release`                  | IMPLEMENTED (resets via `jj git fetch && jj new main`)                                                  | `app.rs:410`                      |
+| `workspace status`                   | IMPLEMENTED (delegates to `jj status`)                                                                  | `app.rs:433`                      |
+| `workspace setup`                    | STUBBED — returns "No setup steps are configured for {workspace_id}"                                    | `app.rs:447`                      |
+| `change create` / `info`             | IMPLEMENTED (records local change-graph rows; `change checkout` still `NotImplemented` at `app.rs:542`) | `app.rs:474`, `545`               |
+| `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented`                                                                   | `app.rs:559`, `566`, `573`, `579` |
 
 SQLite store is real and tested (`store.rs`). A repo-pool `flock`
 now wraps `claim_workspace` and `release` via the `lock` module
@@ -578,7 +578,7 @@ rate vs pool utilization — affinity is advisory, never blocking.
 Boundary cases handled:
 
 - Stacked PRs in one task: single lease spans the whole stack;
-  release only when the *task* terminates.
+  release only when the _task_ terminates.
 - Rework after merge / follow-up bugfix on the same `task_id`:
   re-lease with `preferred_workspace_id`; cube's setup-fingerprint
   logic skips redundant provisioning.
@@ -615,10 +615,15 @@ boss-engine                         cube                        claude
 Sample lease JSON:
 
 ```json
-{ "lease_id": "lse_01HZX...", "workspace_id": "mono-agent-007",
+{
+  "lease_id": "lse_01HZX...",
+  "workspace_id": "mono-agent-007",
   "workspace_path": "/Users/brianduff/Documents/dev/workspaces/mono-agent-007",
-  "base_rev": "main@28200da", "expires_at": "2026-04-26T18:00:00Z",
-  "setup_status": "fresh", "holder": "boss/agent-7" }
+  "base_rev": "main@28200da",
+  "expires_at": "2026-04-26T18:00:00Z",
+  "setup_status": "fresh",
+  "holder": "boss/agent-7"
+}
 ```
 
 Error handling:
@@ -654,6 +659,7 @@ Sample contents:
 
 ```markdown
 # Boss worker rules (lease lse_01HZX...)
+
 - This workspace is leased by Boss; do not run `jj git fetch` or
   `jj new main` (cube already did).
 - Use `jj` for all VCS work: `jj st`, `jj diff`, `jj new`,
@@ -796,8 +802,8 @@ Already landed since the original audit:
   (`app.rs::auto_create_workspace`).
 - Lease lifecycle commands: lease TTL (default 1800s) set on claim
   with `lease_expires_at_epoch_s` column; `cube workspace heartbeat
-  --lease <id> [--ttl-seconds <n>]` extends; `cube workspace release
-  --reason <text> --keep-dirty` records reasons and skips reset for
+--lease <id> [--ttl-seconds <n>]` extends; `cube workspace release
+--reason <text> --keep-dirty` records reasons and skips reset for
   forensics; `cube workspace force-release` frees a stuck lease
   without reset; `expire_stale_leases` sweeps expired rows back to
   free at the start of every lease.
@@ -855,13 +861,13 @@ control-socket access remain.
 
 ### Options
 
-| Option | Mechanism | Strength | Cost |
-|---|---|---|---|
-| A | PATH separation only — `bossctl` only on Boss's PATH | Casual misuse only | Trivial |
-| B | Auth token via env to Boss only | Strong if env doesn't leak | Medium |
-| C | LOCAL_PEERPID on AF_UNIX socket; trust root = Boss session pid | Strong; no token mgmt; matches process model | Medium |
-| D | macOS `sandbox-exec` / App Sandbox per worker | Real isolation | Heavy; libghostty+claude under sandbox unproven |
-| E | Per-worker macOS user account | Strong | Heavy; ACL nightmare for cube-shared dirs |
+| Option | Mechanism                                                      | Strength                                     | Cost                                            |
+| ------ | -------------------------------------------------------------- | -------------------------------------------- | ----------------------------------------------- |
+| A      | PATH separation only — `bossctl` only on Boss's PATH           | Casual misuse only                           | Trivial                                         |
+| B      | Auth token via env to Boss only                                | Strong if env doesn't leak                   | Medium                                          |
+| C      | LOCAL_PEERPID on AF_UNIX socket; trust root = Boss session pid | Strong; no token mgmt; matches process model | Medium                                          |
+| D      | macOS `sandbox-exec` / App Sandbox per worker                  | Real isolation                               | Heavy; libghostty+claude under sandbox unproven |
+| E      | Per-worker macOS user account                                  | Strong                                       | Heavy; ACL nightmare for cube-shared dirs       |
 
 ### Hard constraints
 
@@ -1054,13 +1060,13 @@ substrate.
 
 ### Options
 
-| Option | Content source | Transport | Notes |
-|---|---|---|---|
-| A | `claude --output-format stream-json --include-hook-events` | claude's stdout | Single channel, structured |
-| B | Hook scripts | Hook → file (boss-engine tails) | Simple, durable across crashes |
-| C | Hook scripts | Hook → Unix socket (boss-engine listens) | Push-style, low latency |
-| D | Session JSONL transcript | File watcher on `~/.claude/projects/<cwd>/<session>.jsonl` | Rich content; eventual-consistency |
-| E | Screen scrape | Read libghostty buffer | Heuristic last-resort |
+| Option | Content source                                             | Transport                                                  | Notes                              |
+| ------ | ---------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------- |
+| A      | `claude --output-format stream-json --include-hook-events` | claude's stdout                                            | Single channel, structured         |
+| B      | Hook scripts                                               | Hook → file (boss-engine tails)                            | Simple, durable across crashes     |
+| C      | Hook scripts                                               | Hook → Unix socket (boss-engine listens)                   | Push-style, low latency            |
+| D      | Session JSONL transcript                                   | File watcher on `~/.claude/projects/<cwd>/<session>.jsonl` | Rich content; eventual-consistency |
+| E      | Screen scrape                                              | Read libghostty buffer                                     | Heuristic last-resort              |
 
 The realistic answer is layered: a primary structured channel
 (B or C) plus D as a content-rich fallback, plus E only where the
@@ -1296,7 +1302,7 @@ screen-scrape backup.
 
 R4 picked cube as the workspace layer; R2 picked hooks-to-socket as
 the event channel. What's still missing is the policy layer that
-decides *which task gets a worker, when*. Two callers want to start
+decides _which task gets a worker, when_. Two callers want to start
 work — Boss-Claude (autonomous decomposition + dispatch) and the
 human (clicking "start" in the Work mode UI) — and they compete for
 a fixed pool of 8 workers.
@@ -1324,11 +1330,11 @@ R5 is therefore pure design — no new POC needed.
 
 ### Options
 
-| Option | Where policy lives | Pros | Cons |
-|---|---|---|---|
-| A | **Boss-engine** (Rust). Both Boss-Claude and human UI submit intents to one RPC; engine arbitrates. | Single source of truth; deterministic; testable. | Boss-engine grows. |
-| B | **Boss-Claude** decides; engine just executes. | Lets the LLM be smart about priority. | Non-deterministic; capacity races; hard to audit. |
-| C | **Split**: Boss-Claude proposes, engine enforces capacity. | Best of both, in theory. | Two policies in two languages; debugging splits. |
+| Option | Where policy lives                                                                                  | Pros                                             | Cons                                              |
+| ------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------- |
+| A      | **Boss-engine** (Rust). Both Boss-Claude and human UI submit intents to one RPC; engine arbitrates. | Single source of truth; deterministic; testable. | Boss-engine grows.                                |
+| B      | **Boss-Claude** decides; engine just executes.                                                      | Lets the LLM be smart about priority.            | Non-deterministic; capacity races; hard to audit. |
+| C      | **Split**: Boss-Claude proposes, engine enforces capacity.                                          | Best of both, in theory.                         | Two policies in two languages; debugging splits.  |
 
 ### Hard constraints
 
@@ -1362,9 +1368,9 @@ component:
 5. On `WorkerEvent::SessionEnded`: pop the highest-priority queued
    item, repeat step 3.
 
-Boss-Claude's role becomes: decide *which* task to dispatch
-(planning, decomposition, scope judgment). The engine owns *when*
-and *where*. LLMs plan; deterministic schedulers queue.
+Boss-Claude's role becomes: decide _which_ task to dispatch
+(planning, decomposition, scope judgment). The engine owns _when_
+and _where_. LLMs plan; deterministic schedulers queue.
 
 ### Decisive unknowns
 
@@ -1554,7 +1560,7 @@ abandons in-progress work and the user has to re-bootstrap state.
 
 R5 explicitly delegated the recovery semantics here: it committed
 to "queue + active assignments persist in SQLite" but punted
-*reattachment policy* and *what's irrecoverable* to R6.
+_reattachment policy_ and _what's irrecoverable_ to R6.
 
 ### Crash classes
 
@@ -1568,12 +1574,12 @@ subset:
 - **Claude Code on disk**: per-session JSONL transcripts at
   `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
 
-| Class | Engine | Workers | Cube state | Disk JSONL |
-|---|---|---|---|---|
-| App restart | alive | alive | alive | intact |
-| Engine restart | dead → reconciles | alive | alive (TTL holds) | intact |
-| Worker crash | alive | one dead | alive | intact |
-| OS reboot | dead | dead | TTL expires | intact |
+| Class          | Engine            | Workers  | Cube state        | Disk JSONL |
+| -------------- | ----------------- | -------- | ----------------- | ---------- |
+| App restart    | alive             | alive    | alive             | intact     |
+| Engine restart | dead → reconciles | alive    | alive (TTL holds) | intact     |
+| Worker crash   | alive             | one dead | alive             | intact     |
+| OS reboot      | dead              | dead     | TTL expires       | intact     |
 
 ### Hard constraints
 
@@ -1605,9 +1611,9 @@ For each crash class:
     confirm leases still held)
   - claude process state (does the recorded pid still exist?
     is the recorded session_id resumable?)
-  Three-way OK → reattach by resuming the hook event channel
-  (R2's socket) and `claude --resume`-ing if the process died
-  in the gap. Mismatch → see "lost-state policy" below.
+    Three-way OK → reattach by resuming the hook event channel
+    (R2's socket) and `claude --resume`-ing if the process died
+    in the gap. Mismatch → see "lost-state policy" below.
 - **Worker crash** (single `claude` dies): engine sees socket
   disconnect or `WorkerEvent::SessionEnded` reason ≠ `other`.
   Re-spawns `claude --resume <session_id>` in the same workspace.
@@ -1787,7 +1793,7 @@ Implementation work this implies for V2:
   tasks were active when [engine restarted | machine
   restarted]; review and re-dispatch."
 - Cube: implement `workspace heartbeat`, `--reason crash
-  --keep-dirty` on release, and `workspace force-release` (per
+--keep-dirty` on release, and `workspace force-release` (per
   R4 working decision; tracked in cube remaining-work doc).
 
 These should be tracked as Boss V2 implementation tasks. R7
@@ -1820,11 +1826,11 @@ R7 is product-shaped, not architectural. The decision is mostly
 
 ### Options
 
-| Option | Native rendering | Approval | Cost |
-|---|---|---|---|
-| A | **Trampoline**: Boss surfaces PR URL + minimal status; human reviews and merges in browser. | All on GitHub. | Low. |
-| B | **Partial native**: Boss renders diff + PR description; comments + merge stay on GitHub. | GitHub. | Medium. |
-| C | **Full native**: Boss renders diff, comments, threading, CI; "Approve" auto-merges. | Inside Boss. | High. |
+| Option | Native rendering                                                                            | Approval       | Cost    |
+| ------ | ------------------------------------------------------------------------------------------- | -------------- | ------- |
+| A      | **Trampoline**: Boss surfaces PR URL + minimal status; human reviews and merges in browser. | All on GitHub. | Low.    |
+| B      | **Partial native**: Boss renders diff + PR description; comments + merge stay on GitHub.    | GitHub.        | Medium. |
+| C      | **Full native**: Boss renders diff, comments, threading, CI; "Approve" auto-merges.         | Inside Boss.   | High.   |
 
 ### Hard constraints
 
@@ -1974,7 +1980,7 @@ comments as the next prompt.
 Implementation work this implies for V2:
 
 - Boss-engine: PR URL detection from worker `last_assistant_text`
-  + periodic `gh pr list` discovery.
+  - periodic `gh pr list` discovery.
 - Boss-engine: 60-second poll of `gh pr view` for each
   `in_review` task; track `last_seen_comment_id` per PR.
 - Boss-engine: `request_re_engagement(work_item_id)` RPC that
@@ -2158,4 +2164,3 @@ no dependencies past it; this closes the V2 design-risks doc.
 _All identified risks (R1–R8) are now resolved. New risks surfaced
 during V2 implementation should be added here as one-line entries,
 then promoted to full sections when worked through._
-

@@ -80,7 +80,7 @@ Every engine process appends one JSON line per lifecycle transition to
 - **`start`** — written before any work runs. Carries `pid`, `ppid`,
   `argv`, `parent_command` (best-effort `ps -o command=` of the
   parent), `engine_version`, `socket_paths` (the frontend and events
-  sockets the engine *intends* to bind), `state_db_path`, and
+  sockets the engine _intends_ to bind), `state_db_path`, and
   `prior_state_db_size`.
 - **`socket_bound` / `socket_bind_failed`** — emitted at each
   `UnixListener::bind` site. `socket_kind` is `frontend` or `events`.

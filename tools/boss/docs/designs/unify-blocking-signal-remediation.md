@@ -23,7 +23,7 @@ cleared-signal handling are written twice. Every fix has to be made in both
 places and one half keeps getting forgotten:
 
 - **#1007** ("keep the revision's parent in Review while the fix is in flight")
-  implemented the *parent-stays-`in_review`* model — but only for the conflict
+  implemented the _parent-stays-`in_review`_ model — but only for the conflict
   path. The CI path still flips the parent to `blocked: ci_failure` and leaves
   it there while the CI-fix revision runs (live proof at design time: T869 /
   PR #1032 sat at `blocked: ci_failure` while its CI-fix revision T918 was in
@@ -37,7 +37,7 @@ places and one half keeps getting forgotten:
 ## What is already shared (do not rebuild)
 
 - `task_blocked_signals` side table: `(work_item_id, reason, attempt_id,
-  created_at, cleared_at)`. Helpers `upsert_task_blocked_signal`,
+created_at, cleared_at)`. Helpers `upsert_task_blocked_signal`,
   `active_blocked_signals`, `task_blocked_reason`
   (`tools/boss/engine/src/work/blocking.rs`).
 - The merge poller's **polymorphic clear** dispatch iterates active signals /
@@ -52,24 +52,24 @@ places and one half keeps getting forgotten:
 
 ## What diverges
 
-| Concern | conflict | ci_failure | Verdict |
-| --- | --- | --- | --- |
-| upfront flip | `mark_chore_blocked_merge_conflict` | `mark_chore_blocked_ci_signal` | identical logic, different reason literal |
-| retire flip | `clear_chore_blocked_merge_conflict[_for_attempt]` | `clear_chore_blocked_ci_failure` | identical logic |
-| keep-parent-`in_review` while revision in flight | `record_merge_conflict_in_flight` + `clear_*_signal_only` | **missing** | **parity gap (#1007)** |
-| re-arm a pre-blocked parent that has an active revision | `rearm_blocked_merge_conflict_signal` | **missing** | **parity gap** |
-| cleared probe | `mergeable != CONFLICTING` | required checks green | signal-specific hook |
-| attempt budget / exhaustion | n/a | `effective_ci_budget`, `ci_attempts_used`, `ci_failure_exhausted` | CI-only, preserve |
-| manual-move suppression | n/a | `is_ci_failure_suppressed` | CI-only, preserve |
-| never-starts in-flight alerts | n/a | `observe_ci_in_flight`, `mark_ci_inflight_alert_level` | CI-only, preserve |
-| attempt kinds | single | `fix` / `retrigger` / `merge_queue_rebounce` | CI-only, preserve |
+| Concern                                                 | conflict                                                  | ci_failure                                                        | Verdict                                   |
+| ------------------------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------- |
+| upfront flip                                            | `mark_chore_blocked_merge_conflict`                       | `mark_chore_blocked_ci_signal`                                    | identical logic, different reason literal |
+| retire flip                                             | `clear_chore_blocked_merge_conflict[_for_attempt]`        | `clear_chore_blocked_ci_failure`                                  | identical logic                           |
+| keep-parent-`in_review` while revision in flight        | `record_merge_conflict_in_flight` + `clear_*_signal_only` | **missing**                                                       | **parity gap (#1007)**                    |
+| re-arm a pre-blocked parent that has an active revision | `rearm_blocked_merge_conflict_signal`                     | **missing**                                                       | **parity gap**                            |
+| cleared probe                                           | `mergeable != CONFLICTING`                                | required checks green                                             | signal-specific hook                      |
+| attempt budget / exhaustion                             | n/a                                                       | `effective_ci_budget`, `ci_attempts_used`, `ci_failure_exhausted` | CI-only, preserve                         |
+| manual-move suppression                                 | n/a                                                       | `is_ci_failure_suppressed`                                        | CI-only, preserve                         |
+| never-starts in-flight alerts                           | n/a                                                       | `observe_ci_in_flight`, `mark_ci_inflight_alert_level`            | CI-only, preserve                         |
+| attempt kinds                                           | single                                                    | `fix` / `retrigger` / `merge_queue_rebounce`                      | CI-only, preserve                         |
 
 ## Unified state machine
 
 One driver, parameterised by a `SignalStrategy` (kind = `merge_conflict` |
 `ci_failure`). Signal-specific behaviour is confined to small strategy hooks;
 CI-only concerns (budget, suppression, in-flight alerts, attempt kinds) are
-pre/post hooks the CI adapter wraps around the shared core, *not* branches
+pre/post hooks the CI adapter wraps around the shared core, _not_ branches
 inside it.
 
 Strategy hooks:
@@ -84,8 +84,8 @@ Strategy hooks:
 Shared `on_signal_detected(strategy, candidate, probe)`:
 
 1. If `strategy.is_cleared(probe)` → no-op (the retire path owns clearing).
-2. *(CI adapter pre-hook: budget/suppression/in-flight observe; an exhausted
-   budget short-circuits to the terminal `blocked: ci_failure_exhausted`.)*
+2. _(CI adapter pre-hook: budget/suppression/in-flight observe; an exhausted
+   budget short-circuits to the terminal `blocked: ci_failure_exhausted`.)_
 3. Attempt the upfront WHERE-guarded flip `in_review -> blocked: <reason>`.
    - **Guard miss** (parent already `blocked: <reason>`, or human-moved):
      reconcile. If there is an active fix revision, clear the parent back to
@@ -101,9 +101,9 @@ Shared `on_signal_resolved(strategy, candidate, probe)` (the polymorphic clear):
 
 1. If `strategy.is_cleared(probe)`: mark the active attempt `succeeded`,
    `clear_signal_only(reason)`, and — if the parent is still `blocked:
-   <reason>` — `clear_chore_blocked_<reason>` back to `in_review`.
-2. *(CI adapter post-hook: `reset_ci_attempts_used`,
-   `clear_ci_inflight_observations`.)*
+<reason>` — `clear_chore_blocked_<reason>` back to `in_review`.
+2. _(CI adapter post-hook: `reset_ci_attempts_used`,
+   `clear_ci_inflight_observations`.)_
 
 Net behaviour: the #1007 parent-state model applies to CI for free, and T911's
 retire-at-dispatch is written once.

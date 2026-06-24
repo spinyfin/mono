@@ -4,20 +4,20 @@ This design covers two parallel auto-remediation flows for in-review PRs that sh
 
 ## Problem
 
-The kanban's `Review` column is supposed to mean "this PR is settled state — the worker is done, the human is the bottleneck." Once a worker pushes its branch, opens the PR, and exits, the chore sits in `in_review` until the merge poller observes the merge (`merge_poller.rs:122`) and flips it to `done`. The contract is *the engine watches; the human reviews.*
+The kanban's `Review` column is supposed to mean "this PR is settled state — the worker is done, the human is the bottleneck." Once a worker pushes its branch, opens the PR, and exits, the chore sits in `in_review` until the merge poller observes the merge (`merge_poller.rs:122`) and flips it to `done`. The contract is _the engine watches; the human reviews._
 
 That contract quietly breaks the moment `main` moves under the open PR's feet. Some unrelated PR lands that touches a file the in-review PR also touches; GitHub re-evaluates the PR and reports `mergeable = CONFLICTING`. The reviewer clicks the merge button, sees the red "this branch has conflicts that must be resolved" banner, and bounces — the PR is no longer review-ready. Today nothing in Boss notices. The chore stays in `in_review`, the kanban happily shows a clean Review card, the merge poller's `state, mergedAt` probe says "still OPEN, not merged" forever, and the user is the one who eventually pings the worker to come back and rebase.
 
 This is the close cousin of [`auto-rebase-stacked-prs`](auto-rebase-stacked-prs.md), but the trigger and idempotency model are different:
 
-- **Auto-rebase fires on `base PR merged`.** It scans `gh pr list --base feat-A` for dependents and rebases each onto `main`. The trigger is a specific upstream event the engine *sees*.
+- **Auto-rebase fires on `base PR merged`.** It scans `gh pr list --base feat-A` for dependents and rebases each onto `main`. The trigger is a specific upstream event the engine _sees_.
 - **This design fires on `the in-review PR is no longer mergeable against its current base`.** The trigger isn't tied to a particular upstream merge — `main` may have moved several times, possibly through PRs Boss never tracked (manual `gh` merges, web UI clicks, external contributors). The signal is GitHub's own evaluation of the diff.
 
-The two flows converge on the same *action*: lease a workspace, run `jj rebase`, push the result. They diverge on *who notices the need* and on *whether one work-item-shaped record should represent the rebase request* (auto-rebase: yes, a `rebase_attempts` row plus possibly an escalated chore for conflicts; this design: see Q3).
+The two flows converge on the same _action_: lease a workspace, run `jj rebase`, push the result. They diverge on _who notices the need_ and on _whether one work-item-shaped record should represent the rebase request_ (auto-rebase: yes, a `rebase_attempts` row plus possibly an escalated chore for conflicts; this design: see Q3).
 
-The project description anticipates an **ephemeral work item** concept: a record that is auto-created when the conflict appears, auto-completed when the PR is mergeable again, and tied to a parent. The challenge — explicit in the project framing — is to design it so it doesn't conflate with the existing chore / task / project_task taxonomy. Tasks are *planned* work. Chores are *standalone* work. Project_tasks are *ordered, design-driven* work. None of those describe "the engine spotted that PR #243 stopped being mergeable, spun up a worker for 90 seconds, then made the symptom go away." Making that a `tasks` row pollutes the kanban, the dispatcher's pickup query, and the `boss task list` surface with engine plumbing that the human doesn't manage.
+The project description anticipates an **ephemeral work item** concept: a record that is auto-created when the conflict appears, auto-completed when the PR is mergeable again, and tied to a parent. The challenge — explicit in the project framing — is to design it so it doesn't conflate with the existing chore / task / project*task taxonomy. Tasks are \_planned* work. Chores are _standalone_ work. Project*tasks are \_ordered, design-driven* work. None of those describe "the engine spotted that PR #243 stopped being mergeable, spun up a worker for 90 seconds, then made the symptom go away." Making that a `tasks` row pollutes the kanban, the dispatcher's pickup query, and the `boss task list` surface with engine plumbing that the human doesn't manage.
 
-This doc proposes a shape parallel to `rebase_attempts`: a side table `conflict_resolutions` that records the engine's *attempts* to clear conflicts on an in-review PR, with full worker-spawn handoff for the conflict-resolution turn, and tight coordination with the existing `auto-rebase-stacked-prs` and the in-flight `review-feedback` projects (`proj_18ad7d43affb0370_2a`). The parent chore / project_task gets a new `blocked_reason = 'merge_conflict'` state plus a pointer to the active attempt, so the human sees *why* the card is suddenly in Doing-with-blocked-badge and can drill in. Auto-completion is the engine's job; the user is told *after the fact* by an activity-feed entry, not interrupted while the engine is still trying.
+This doc proposes a shape parallel to `rebase_attempts`: a side table `conflict_resolutions` that records the engine's _attempts_ to clear conflicts on an in-review PR, with full worker-spawn handoff for the conflict-resolution turn, and tight coordination with the existing `auto-rebase-stacked-prs` and the in-flight `review-feedback` projects (`proj_18ad7d43affb0370_2a`). The parent chore / project*task gets a new `blocked_reason = 'merge_conflict'` state plus a pointer to the active attempt, so the human sees \_why* the card is suddenly in Doing-with-blocked-badge and can drill in. Auto-completion is the engine's job; the user is told _after the fact_ by an activity-feed entry, not interrupted while the engine is still trying.
 
 ### The parallel signal: CI on the PR turns red
 
@@ -25,11 +25,11 @@ The same contract is broken by a parallel signal: **CI on the PR turns red.** A 
 
 The motivating real-world examples sit in this project's own chore history: `task_18ae9a0d732db7e8_31` (the merge-conflict case) and `task_18ae9a26abd65dc0_36` (a CI failure on flunge#647). The user filed both manually. The system this doc specifies should have handled both without the user filing chores at all.
 
-The framing is identical to the merge-conflict case: a *mechanical* (not reviewer-driven) regression to review-readiness, on the same kanban column, with the same "auto-spawn a worker, snap back when fixed" remediation shape. Everything the merge-conflict flow builds — the `blocked_reason` discriminator, the `blocked_attempt_id` soft-FK, the side-table-not-tasks-row attempt model, the merge-poller probe extension, the activity-feed surface, the unified `boss engine attempts ...` CLI — is load-bearing for the CI flow too. The CI flow adds a parallel attempt subsystem (`ci_remediations`) and parallel `blocked_reason` values (`ci_failure` / `ci_failure_exhausted`), composes the state machine, and answers the open questions specific to CI as a signal.
+The framing is identical to the merge-conflict case: a _mechanical_ (not reviewer-driven) regression to review-readiness, on the same kanban column, with the same "auto-spawn a worker, snap back when fixed" remediation shape. Everything the merge-conflict flow builds — the `blocked_reason` discriminator, the `blocked_attempt_id` soft-FK, the side-table-not-tasks-row attempt model, the merge-poller probe extension, the activity-feed surface, the unified `boss engine attempts ...` CLI — is load-bearing for the CI flow too. The CI flow adds a parallel attempt subsystem (`ci_remediations`) and parallel `blocked_reason` values (`ci_failure` / `ci_failure_exhausted`), composes the state machine, and answers the open questions specific to CI as a signal.
 
 The crucial difference from merge-conflict is the framing the user emphasised: **CI failures are not always tractable for a worker.** A merge conflict is a closed mechanical problem — `jj rebase` either succeeds or the worker resolves the conflicts. A failing test could be a typo, a flaky integration test, an infra outage, a semantic regression that needs design judgment, or a CI config bug that has nothing to do with this PR. The worker must try at least once — that is the whole point of automating this — but a worker that keeps spinning on a test it fundamentally can't fix burns cube leases, accumulates noisy force-pushes on the PR, and trains the user to ignore the activity feed. **An attempt budget caps that risk.** After N attempts, the engine stops trying, leaves the parent `blocked: ci_failure_exhausted`, and pages the user.
 
-The CI flow's `ci_remediations` row follows the same ephemerality rule as `conflict_resolutions`: auto-created when CI goes red, may auto-complete when CI is green again, tied to a parent — same shape, same anti-taxonomy-pollution argument. The parent's `blocked_attempt_id` points at the active CI remediation just as it points at an active conflict resolution. The two attempt subsystems coexist on the same parent state machine, clear independently, and the parent returns to `in_review` only when *all* active blocking signals clear.
+The CI flow's `ci_remediations` row follows the same ephemerality rule as `conflict_resolutions`: auto-created when CI goes red, may auto-complete when CI is green again, tied to a parent — same shape, same anti-taxonomy-pollution argument. The parent's `blocked_attempt_id` points at the active CI remediation just as it points at an active conflict resolution. The two attempt subsystems coexist on the same parent state machine, clear independently, and the parent returns to `in_review` only when _all_ active blocking signals clear.
 
 ## Goals
 
@@ -38,28 +38,28 @@ The CI flow's `ci_remediations` row follows the same ephemerality rule as `confl
 - Auto-spawn a worker to resolve the conflict, with the workspace pre-leased and the PR's conflict diagnosis pre-loaded into the spawn prompt — same playbook the auto-rebase escalation path already uses.
 - Once the worker pushes and GitHub re-evaluates the PR as `mergeable = MERGEABLE`, retire the conflict-resolution attempt, flip the parent back to `in_review` automatically, and emit an activity-feed entry. The human's only interruption is "by the way, while you were away, the engine cleared a conflict on this PR."
 - Stay coherent with the in-flight [review-feedback workflow](https://github.com/spinyfin/mono/issues?q=proj_18ad7d43affb0370_2a) (`proj_18ad7d43affb0370_2a`). Both flows are "an `in_review` item temporarily leaves its settled state and snaps back." They should share the `blocked_reason` enum, the parent-side state shape, and the engine activity feed; they differ only in trigger and worker prompt.
-- Stay coherent with [`auto-rebase-stacked-prs`](auto-rebase-stacked-prs.md). When a base PR merges and the dependent develops a conflict, auto-rebase's escalation path should *not* also trigger this design's attempt — they would collide. See Q7.
-- Make ephemeral *operationally invisible* (no kanban card for the resolve-conflicts turn) but *operationally inspectable* (activity feed entry, attempt record retained for history, retry verb).
+- Stay coherent with [`auto-rebase-stacked-prs`](auto-rebase-stacked-prs.md). When a base PR merges and the dependent develops a conflict, auto-rebase's escalation path should _not_ also trigger this design's attempt — they would collide. See Q7.
+- Make ephemeral _operationally invisible_ (no kanban card for the resolve-conflicts turn) but _operationally inspectable_ (activity feed entry, attempt record retained for history, retry verb).
 - **Detect when an in-review PR's required checks fail** automatically, on the same poll cadence as merge detection, sharing the same `gh pr view` round-trip. No new background loop for CI either.
 - **Flip the parent from `in_review → blocked` with `blocked_reason = 'ci_failure'`** (and `'ci_failure_exhausted'` after budget exhaustion). The kanban and inspector make the reason visible and distinguishable from `merge_conflict`.
 - **Auto-spawn a worker to fix CI**, capped by a per-PR attempt budget (default 3, per-product configurable). The worker tries at least once even on suspicious failures; the budget prevents perpetual spin.
-- **Distinguish re-trigger from fix.** A failure that looks like infra/flake is *re-triggered* (CI re-run, no code change) and *does not* consume a budget slot. A failure that looks code-shaped is *fixed* (worker pushes), and consumes one slot.
+- **Distinguish re-trigger from fix.** A failure that looks like infra/flake is _re-triggered_ (CI re-run, no code change) and _does not_ consume a budget slot. A failure that looks code-shaped is _fixed_ (worker pushes), and consumes one slot.
 - **Auto-retire on green.** Once the required checks pass, retire the attempt, flip the parent back to `in_review`, post an activity-feed entry. Same UX shape as the merge-conflict resolve-then-snap-back.
-- **Compose cleanly within this doc.** A PR can be `blocked` for `merge_conflict`, `ci_failure`, or *both*. The parent unblocks only when both clear. Order the resolution flows so they don't race (merge-conflict first, then CI re-check).
+- **Compose cleanly within this doc.** A PR can be `blocked` for `merge_conflict`, `ci_failure`, or _both_. The parent unblocks only when both clear. Order the resolution flows so they don't race (merge-conflict first, then CI re-check).
 - **Provide a manual reset.** `boss engine ci retry <work-item-id>` resets the per-PR budget and re-fires the auto-fix flow. Cheap escape hatch when the user wants to override the engine's "I give up" decision.
 
 ## Non-Goals
 
 - **Resolving conflicts the engine can't push for.** PRs from a fork (`headRepositoryOwner != owner`) are out, same exclusion as [`auto-rebase-stacked-prs`](auto-rebase-stacked-prs.md) Q2. The engine can't force-push to a fork branch.
-- **Detecting non-conflict review-readiness regressions other than failing CI.** Going stale because a reviewer left comments but didn't approve is handled by the in-flight `review-feedback` workflow (`proj_18ad7d43affb0370_2a`), not here. This design's two flows narrowly handle the *git-state-conflicting-with-base* case and the *required-CI-check-failing* case.
+- **Detecting non-conflict review-readiness regressions other than failing CI.** Going stale because a reviewer left comments but didn't approve is handled by the in-flight `review-feedback` workflow (`proj_18ad7d43affb0370_2a`), not here. This design's two flows narrowly handle the _git-state-conflicting-with-base_ case and the _required-CI-check-failing_ case.
 - **Auto-fixing failing CI on items NOT in `in_review`.** A `done` item that just got reverted may have failing pre-merge CI; that is a different concern (reactivation lifecycle) and is briefly addressed in Q10 but deferred to its own design.
 - **Re-architecting CI itself.** This design assumes the CI provider (Buildkite, GitHub Actions) is the source of truth; we read its outputs, we don't try to second-guess them.
 - **Fixing flaky tests at the test level.** The CI worker re-triggers flake-looking failures but does not modify the test to mark it `@flaky`, retry-decorate it, or skip it. That kind of fix is human-judgment territory; if the worker recognises chronic flake, it bails and pages the user.
 - **Detecting CI on a base PR that hasn't merged yet.** A stacked PR's failing CI on its base is the base's problem; this design probes the in-review item's own checks against the head ref of that item.
 - **Pre-empting CI that is still pending.** A `PENDING` rollup is the wait-state; we don't act on it. Q1 covers the rollup-state mapping.
-- **Pre-merge mechanical-vs-conflict split.** In `auto-rebase-stacked-prs.md` the engine first attempts a *mechanical* in-engine rebase and only escalates to a worker on conflict. That makes sense when the trigger is "I know main moved because A merged" and the upstream diff is small. Here the trigger is *already* "conflict exists" — GitHub has computed that no straight three-way merge succeeds. There is no mechanical path left; we go straight to the worker. (See Q4 for the edge case where main has moved again *during* our resolution and the conflict has self-cleared — we *do* re-probe and skip in that case.)
-- **Conflicts inside the *base* branch.** A PR based on `feat-X` (a stacked PR) developing a conflict against `feat-X` is auto-rebase-stacked-prs' territory once `feat-X` merges. Until `feat-X` merges, GitHub considers the dependent mergeable-vs-its-own-base regardless of what's happening on `main`, so this design's probe doesn't trip.
-- **Aggregating multiple conflict episodes into one attempt.** If the worker resolves the conflict, pushes, then `main` moves *again* an hour later and produces a new conflict, that's a second attempt. The history is "this PR conflicted twice."
+- **Pre-merge mechanical-vs-conflict split.** In `auto-rebase-stacked-prs.md` the engine first attempts a _mechanical_ in-engine rebase and only escalates to a worker on conflict. That makes sense when the trigger is "I know main moved because A merged" and the upstream diff is small. Here the trigger is _already_ "conflict exists" — GitHub has computed that no straight three-way merge succeeds. There is no mechanical path left; we go straight to the worker. (See Q4 for the edge case where main has moved again _during_ our resolution and the conflict has self-cleared — we _do_ re-probe and skip in that case.)
+- **Conflicts inside the _base_ branch.** A PR based on `feat-X` (a stacked PR) developing a conflict against `feat-X` is auto-rebase-stacked-prs' territory once `feat-X` merges. Until `feat-X` merges, GitHub considers the dependent mergeable-vs-its-own-base regardless of what's happening on `main`, so this design's probe doesn't trip.
+- **Aggregating multiple conflict episodes into one attempt.** If the worker resolves the conflict, pushes, then `main` moves _again_ an hour later and produces a new conflict, that's a second attempt. The history is "this PR conflicted twice."
 - **Auto-merging once the conflict is resolved.** Auto-merge is explicitly deferred elsewhere in the codebase; we restore the PR to `in_review` and leave the merge button to the human.
 - **Cross-product / cross-repo PRs.** Same exclusion as `auto-rebase-stacked-prs.md`. Boss's merge poller operates per-product; this design extends the same per-product probe and stays within it.
 - **Watching GitHub branch-protection settings to predict whether the engine's force-push will dismiss approvals.** Same answer as `auto-rebase-stacked-prs.md` Q9: it will; we post a comment explaining it. No prediction logic.
@@ -68,7 +68,7 @@ The CI flow's `ci_remediations` row follows the same ephemerality rule as `confl
 
 - The new module is **`conflict_watch`** (`engine/src/conflict_watch.rs`). It owns the detection-trigger pipeline. The actual rebase work is done by a worker via the existing spawn flow; the module orchestrates detection, attempt creation, handoff, and retirement.
 - The unit of work it tracks is a **conflict resolution** (the action) recorded as a **conflict-resolution attempt** (the row). Status values: `pending`, `running`, `succeeded`, `superseded`, `failed`, `abandoned`.
-- The persisted record (Q3) is the **`conflict_resolutions`** row. It is *not* a work item — see Q3 for why; it lives in its own table, alongside `rebase_attempts`. Both are "engine-tracked attempts at a mechanical correction"; they share an activity-feed surface.
+- The persisted record (Q3) is the **`conflict_resolutions`** row. It is _not_ a work item — see Q3 for why; it lives in its own table, alongside `rebase_attempts`. Both are "engine-tracked attempts at a mechanical correction"; they share an activity-feed surface.
 - The new column on `tasks` is **`blocked_reason TEXT`**. Values are an open-ended set (initially `'merge_conflict'`; the review-feedback project adds `'review_feedback'`; the existing dependency-graph blocked path adopts `'dependency'`). `NULL` for chores blocked by the original opaque reason (rows pre-migration; see Q9).
 - The new column on `tasks` is **`blocked_attempt_id TEXT`**, a soft FK to either `conflict_resolutions.id` or (future) the review-feedback attempt's id. Discriminated by `blocked_reason`. Allows the inspector to one-click "show me the attempt that's holding this card."
 - The parent work item is the **target PR** or **target chore** (the in-review item whose PR conflicted). The resolution worker is referred to as the **resolution worker** to distinguish from the original chore's worker (which has long since exited).
@@ -93,8 +93,8 @@ The CI flow's `ci_remediations` row follows the same ephemerality rule as `confl
 
 The merge poller currently queries `--json state,mergedAt` (`merge_poller.rs:66-115`). GitHub's PR JSON includes two more fields that answer "is this PR mergeable?":
 
-- **`mergeable`**: `MERGEABLE | CONFLICTING | UNKNOWN`. The mergeability of the head ref into the base ref *as currently computed by GitHub*. `UNKNOWN` is the transient state while GitHub recomputes after a base move; eventually it resolves to `MERGEABLE` or `CONFLICTING`.
-- **`mergeStateStatus`**: `CLEAN | BLOCKED | BEHIND | HAS_HOOKS | DIRTY | UNKNOWN | UNSTABLE | DRAFT`. A finer breakdown of merge-readiness. The two values relevant here are `DIRTY` (= conflicts) and `BEHIND` (= the head ref is behind the base; mergeable but a rebase is recommended). `BEHIND` is *not* a conflict — GitHub still considers the PR mergeable via merge commit — and we explicitly do not act on it (rebasing-because-behind is a different feature, not in scope).
+- **`mergeable`**: `MERGEABLE | CONFLICTING | UNKNOWN`. The mergeability of the head ref into the base ref _as currently computed by GitHub_. `UNKNOWN` is the transient state while GitHub recomputes after a base move; eventually it resolves to `MERGEABLE` or `CONFLICTING`.
+- **`mergeStateStatus`**: `CLEAN | BLOCKED | BEHIND | HAS_HOOKS | DIRTY | UNKNOWN | UNSTABLE | DRAFT`. A finer breakdown of merge-readiness. The two values relevant here are `DIRTY` (= conflicts) and `BEHIND` (= the head ref is behind the base; mergeable but a rebase is recommended). `BEHIND` is _not_ a conflict — GitHub still considers the PR mergeable via merge commit — and we explicitly do not act on it (rebasing-because-behind is a different feature, not in scope).
 
 The two fields are correlated but `mergeable=CONFLICTING` is the load-bearing signal. `mergeStateStatus=DIRTY` is the more precise variant of the same answer; we read both and require them to agree before acting.
 
@@ -104,25 +104,25 @@ GitHub's PR JSON also includes:
 
 - **`statusCheckRollup`**: an array of leaf check entries, each with `name`, `status` (`COMPLETED | IN_PROGRESS | QUEUED | PENDING | WAITING`), `conclusion` (`SUCCESS | FAILURE | NEUTRAL | CANCELLED | SKIPPED | TIMED_OUT | ACTION_REQUIRED | STALE | STARTUP_FAILURE | null` while in-progress), `targetUrl` (the provider's job page), and `isRequired` (whether it gates merge per branch protection).
 
-`mergeStateStatus` overloads several signals: `UNSTABLE` means "mergeable but failing optional checks"; `BLOCKED` can mean "failing required checks" but also covers "requires N approvals" and other branch-protection reasons. The summary is not load-bearing for CI; we read the full rollup to know *which* check failed and route to the right provider's log reader. `mergeStateStatus` is at most a cheap pre-filter (skip the rollup walk on `CLEAN`).
+`mergeStateStatus` overloads several signals: `UNSTABLE` means "mergeable but failing optional checks"; `BLOCKED` can mean "failing required checks" but also covers "requires N approvals" and other branch-protection reasons. The summary is not load-bearing for CI; we read the full rollup to know _which_ check failed and route to the right provider's log reader. `mergeStateStatus` is at most a cheap pre-filter (skip the rollup walk on `CLEAN`).
 
 #### The CI failure predicate
 
-A PR has *required-checks failing* iff:
+A PR has _required-checks failing_ iff:
 
 - there is at least one rollup leaf with `isRequired = true` AND `status = 'COMPLETED'` AND `conclusion ∈ {FAILURE, CANCELLED, TIMED_OUT, STARTUP_FAILURE, ACTION_REQUIRED}`.
 
 Notes on each conclusion value:
 
 - `FAILURE` — straightforward red.
-- `CANCELLED` — a prior job was cancelled (user, or a re-run superseded it). Conservative: treat as failure; the re-run, if it happened, will produce a fresh `IN_PROGRESS` leaf that supersedes this one in the rollup. We only flag when the *latest* leaf for a given check name is in this state.
+- `CANCELLED` — a prior job was cancelled (user, or a re-run superseded it). Conservative: treat as failure; the re-run, if it happened, will produce a fresh `IN_PROGRESS` leaf that supersedes this one in the rollup. We only flag when the _latest_ leaf for a given check name is in this state.
 - `TIMED_OUT` — count as failure; usually a real problem.
-- `STARTUP_FAILURE` — provider could not start the job (image missing, dependency unavailable). Treat as a *re-trigger candidate* in Q4, not a fix-budget consumer.
+- `STARTUP_FAILURE` — provider could not start the job (image missing, dependency unavailable). Treat as a _re-trigger candidate_ in Q4, not a fix-budget consumer.
 - `ACTION_REQUIRED` — GitHub Actions waits for a manual approval. Out of scope; flag the parent as `blocked: ci_failure` but mark the attempt `failed` immediately with `failure_reason='manual_action_required'`. The worker can't approve workflows.
 - `NEUTRAL` and `SKIPPED` — not failures.
 - `STALE` — the check ran on an old head sha; not a current-head failure. Don't flag.
 
-Non-required checks (`isRequired = false`) failing do *not* gate merge per branch protection, so they do not trip this design's flag. The kanban inspector still shows them ("optional check X failing") as informational; no auto-remediation fires.
+Non-required checks (`isRequired = false`) failing do _not_ gate merge per branch protection, so they do not trip this design's flag. The kanban inspector still shows them ("optional check X failing") as informational; no auto-remediation fires.
 
 A check `IN_PROGRESS`, `QUEUED`, `PENDING`, `WAITING` is the wait-state. Treat as Clean for triggering purposes — do not act. Q6 covers the "checks never start" edge case.
 
@@ -293,13 +293,13 @@ SELECT ... FROM tasks
    AND pr_url IS NOT NULL
 ```
 
-Worth noting: `blocked: ci_failure_exhausted` items are still probed, because the *symmetric* exit (CI eventually went green on its own, or a human pushed a fix) should auto-clear them too. Probing exhausted items does *not* re-fire the auto-fix flow; it only watches for the clear signal.
+Worth noting: `blocked: ci_failure_exhausted` items are still probed, because the _symmetric_ exit (CI eventually went green on its own, or a human pushed a fix) should auto-clear them too. Probing exhausted items does _not_ re-fire the auto-fix flow; it only watches for the clear signal.
 
 ### Transient `UNKNOWN` and flapping
 
 `mergeable=UNKNOWN` is GitHub's "I'm still computing" state. Common timing: a base merge happens, GitHub asynchronously re-evaluates open PRs against the new base, and the eval takes seconds to minutes. We must not flap a chore between `in_review` and `blocked` while GitHub is mid-recompute.
 
-Recommended: treat `UNKNOWN` as Clean for the purposes of this design — i.e. do *not* trigger a conflict-resolution attempt on `UNKNOWN`. The poller will re-probe on its next pass; if mergeability resolves to `CONFLICTING`, the next sweep catches it. The cost of waiting one poller interval (~30s) for `UNKNOWN → CONFLICTING` is preferable to false-positive blocked transitions during normal base-merge churn.
+Recommended: treat `UNKNOWN` as Clean for the purposes of this design — i.e. do _not_ trigger a conflict-resolution attempt on `UNKNOWN`. The poller will re-probe on its next pass; if mergeability resolves to `CONFLICTING`, the next sweep catches it. The cost of waiting one poller interval (~30s) for `UNKNOWN → CONFLICTING` is preferable to false-positive blocked transitions during normal base-merge churn.
 
 To mitigate the very-rare case where `mergeable` is stuck at `UNKNOWN` for an extended period (sometimes GitHub gets confused), the engine logs `tracing::warn!(pr_url=…, "PR mergeable=UNKNOWN for >5 minutes; will not auto-flag conflict")` after the third consecutive UNKNOWN probe. This is observability, not action — we still wait for a definitive `CONFLICTING`.
 
@@ -307,7 +307,7 @@ To mitigate the very-rare case where `mergeable` is stuck at `UNKNOWN` for an ex
 
 A check that has just started will have `status='IN_PROGRESS'` and `conclusion=null`. The latest-leaf rule filters these out via the `status='COMPLETED'` requirement. Good.
 
-A trickier case: a push happens, GitHub re-evaluates, the rollup briefly contains only the *old* head-sha's leaves (because new jobs haven't started yet) before the new head's jobs appear. Solution: tag every probe with the rollup's per-leaf `headSha`; only consider leaves whose `headSha` matches the PR's current `headRefOid`. A leaf whose `headSha != current_head_sha` is a stale leaf from the prior head and is ignored. Concretely:
+A trickier case: a push happens, GitHub re-evaluates, the rollup briefly contains only the _old_ head-sha's leaves (because new jobs haven't started yet) before the new head's jobs appear. Solution: tag every probe with the rollup's per-leaf `headSha`; only consider leaves whose `headSha` matches the PR's current `headRefOid`. A leaf whose `headSha != current_head_sha` is a stale leaf from the prior head and is ignored. Concretely:
 
 ```rust
 let current_head = probe.head_ref_oid;
@@ -323,7 +323,7 @@ If, after filtering by head_sha, the rollup is empty for the current head, treat
 
 ### What `blocked` already means
 
-The `tasks.status='blocked'` state today is set by the dependency-graph machinery (`work.rs:3450-3478` and `work-dependencies.md` Q4): when a prereq is non-terminal, the dependent flips to `blocked` and `last_status_actor='engine'`. The state is *uniform* — the only way to know *why* a chore is blocked is to inspect the work-dependencies graph and find a non-`done` prereq. There's no `blocked_reason` discriminator today.
+The `tasks.status='blocked'` state today is set by the dependency-graph machinery (`work.rs:3450-3478` and `work-dependencies.md` Q4): when a prereq is non-terminal, the dependent flips to `blocked` and `last_status_actor='engine'`. The state is _uniform_ — the only way to know _why_ a chore is blocked is to inspect the work-dependencies graph and find a non-`done` prereq. There's no `blocked_reason` discriminator today.
 
 This design needs to add `merge_conflict` as a second cause of `blocked`. The review-feedback project will add a third (`review_feedback`). And the dependency-graph case is implicitly the fourth (`dependency`). Without a discriminator, the UI has no way to render different "why" badges for each, and the engine has no way to know whose retirement logic owns a given blocked row.
 
@@ -335,7 +335,7 @@ This design needs to add `merge_conflict` as a second cause of `blocked`. The re
 
 ### Discussion
 
-**(A) is conceptually clean** — "the resolve-conflicts attempt is a prereq of the parent's merge" is a true statement — but the implementation is awful. The dependency-graph machinery is wired for `tasks` rows on both sides; making it accept a `conflict_resolutions` row as a prereq either requires a polymorphic prereq table (big refactor) or creating a *fake* `tasks` row for each attempt (the exact taxonomy pollution this design is supposed to avoid). The kanban and dispatcher would have to learn to filter out the fake rows everywhere. No.
+**(A) is conceptually clean** — "the resolve-conflicts attempt is a prereq of the parent's merge" is a true statement — but the implementation is awful. The dependency-graph machinery is wired for `tasks` rows on both sides; making it accept a `conflict_resolutions` row as a prereq either requires a polymorphic prereq table (big refactor) or creating a _fake_ `tasks` row for each attempt (the exact taxonomy pollution this design is supposed to avoid). The kanban and dispatcher would have to learn to filter out the fake rows everywhere. No.
 
 **(C) is the smallest schema change** but conflates two pieces of information into one column. "Is this chore blocked because of an attempt?" is a yes/no the FK answers; "what kind of attempt?" is a separate question the FK doesn't answer without a join. For the inspector to render "Blocked: merge conflict (resolution worker running)" vs "Blocked: review feedback (response worker running)", it'd have to join through whichever table the FK points at — and there's no way to know which table without an explicit type tag. Three different attempt subsystems (conflict, review-feedback, future) means three speculative joins per render. Bad.
 
@@ -393,11 +393,11 @@ The kanban projection rule from [`work-kanban.md`](work-kanban.md#status-mapping
 
 The badge's secondary line is presence-driven: if a resolution worker is `running`, show "resolution worker running"; if it's `pending` (workspace lease unavailable), show "queued"; if `failed`, show "needs attention" (the failure surfacing path, Q6).
 
-A subtle but important point: the parent card *does not get a separate card for the resolution attempt*. The attempt is invisible on the kanban. The user sees the parent card with a richer badge; clicking it opens the inspector, which shows the attempt's state inline. This is the operational shape of "ephemeral" in this design — the side-record exists, is inspectable, but does not produce its own kanban card.
+A subtle but important point: the parent card _does not get a separate card for the resolution attempt_. The attempt is invisible on the kanban. The user sees the parent card with a richer badge; clicking it opens the inspector, which shows the attempt's state inline. This is the operational shape of "ephemeral" in this design — the side-record exists, is inspectable, but does not produce its own kanban card.
 
 ### Engine status actor
 
-The `last_status_actor` convention (from `work-dependencies.md` Q4) is `'engine'` when the engine flips the row and `'human'` when the user does. Conflict-resolution writes `'engine'`. This keeps the existing rule — *the engine can only undo engine moves; human moves are sticky* — intact: a human who manually moves a `blocked: merge_conflict` chore to `active` is asserting authority, and the engine's resolution path will refuse to silently flip it back to `in_review` on a successful resolution (it'll log the divergence; see Q6).
+The `last_status_actor` convention (from `work-dependencies.md` Q4) is `'engine'` when the engine flips the row and `'human'` when the user does. Conflict-resolution writes `'engine'`. This keeps the existing rule — _the engine can only undo engine moves; human moves are sticky_ — intact: a human who manually moves a `blocked: merge_conflict` chore to `active` is asserting authority, and the engine's resolution path will refuse to silently flip it back to `in_review` on a successful resolution (it'll log the divergence; see Q6).
 
 ### Composing multiple simultaneous signals on the same parent
 
@@ -411,7 +411,7 @@ If we only have a single `blocked_reason`, we'd have to pick one to surface — 
 
 - **(I) Allow multiple `blocked_reason` values, comma-joined.** Compact; every consumer parses the field. Bad: scalar typing was the whole point of option (B) above.
 - **(II) Promote `blocked_reason` to a side table.** A row per (work_item_id, reason) pair; scalar `tasks.blocked_reason` is dropped or becomes a denormalised "primary reason" cache.
-- **(III) Keep `tasks.blocked_reason` scalar but back it with a side table; a *priority order* on reasons picks which one the scalar holds.** Compatible with the columns (B) introduces and adds one side table for the multi-signal case.
+- **(III) Keep `tasks.blocked_reason` scalar but back it with a side table; a _priority order_ on reasons picks which one the scalar holds.** Compatible with the columns (B) introduces and adds one side table for the multi-signal case.
 
 **Pick (III).** Preserves the column API surface from earlier in this DQ; adds one side table for the (currently uncommon) case where two engine-managed signals coexist. The scalar `tasks.blocked_reason` is "what the UI shows by default"; the side table is the authoritative set.
 
@@ -499,17 +499,17 @@ The detail-view inspector renders all active signals as a list, each with its at
 
 ### Restate the requirement
 
-The project description names an "ephemeral 'resolve conflicts' work item" that the engine auto-creates and auto-completes. The framing is *carefully* — "design it so it doesn't conflate with the existing chore/task/project_task taxonomy."
+The project description names an "ephemeral 'resolve conflicts' work item" that the engine auto-creates and auto-completes. The framing is _carefully_ — "design it so it doesn't conflate with the existing chore/task/project_task taxonomy."
 
 ### Options
 
 - **(α) New `tasks.kind = 'resolve_conflict'`** alongside `chore`, `project_task`. Hidden from the kanban by a status-filter or kind-filter. Reuses the worker spawn flow via the normal kind-aware dispatcher.
 - **(β) New side table `conflict_resolutions`** (parallel to `rebase_attempts` from `auto-rebase-stacked-prs.md` Q3). NOT a work item. Worker spawn uses a "pre-leased" path the auto-rebase escalation already proposes. No kanban presence.
-- **(γ) A flag `tasks.is_resolving = TRUE`** on the parent itself. No new row at all — the parent just temporarily owns the worker. State: the parent has both an open PR *and* an active worker, which today is not a legal combination.
+- **(γ) A flag `tasks.is_resolving = TRUE`** on the parent itself. No new row at all — the parent just temporarily owns the worker. State: the parent has both an open PR _and_ an active worker, which today is not a legal combination.
 
 ### Discussion
 
-**(α) is the kind-extension shape this user already considered for `system` work in `auto-rebase-stacked-prs.md` Q3.** That doc explicitly rejected it for v1 ("widens the taxonomy and forces every kanban / boss task list consumer to learn a `system` filter") and recommended the side-table shape (D). The argument is the same here. Even with kind-aware filtering, every consumer of `tasks` rows — kanban projection, `boss task list`, work-dependencies graph, project rollups — has to learn to ignore `resolve_conflict` rows. The footprint is broad, and the failure mode "forgot to filter" is silent. A small dedicated kind also doesn't give us the *attempt-history* semantics naturally; a chore has `status` (kanban lane), `pr_url` (the produced PR), `priority` — none of which map cleanly to "this is a single rebase attempt with an outcome." A `pr_url` on a resolve_conflict task points where? At the parent's PR? Then `boss task list --status in_review` returns the resolve_conflict rows when their PR is the parent's. Confusing.
+**(α) is the kind-extension shape this user already considered for `system` work in `auto-rebase-stacked-prs.md` Q3.** That doc explicitly rejected it for v1 ("widens the taxonomy and forces every kanban / boss task list consumer to learn a `system` filter") and recommended the side-table shape (D). The argument is the same here. Even with kind-aware filtering, every consumer of `tasks` rows — kanban projection, `boss task list`, work-dependencies graph, project rollups — has to learn to ignore `resolve_conflict` rows. The footprint is broad, and the failure mode "forgot to filter" is silent. A small dedicated kind also doesn't give us the _attempt-history_ semantics naturally; a chore has `status` (kanban lane), `pr_url` (the produced PR), `priority` — none of which map cleanly to "this is a single rebase attempt with an outcome." A `pr_url` on a resolve_conflict task points where? At the parent's PR? Then `boss task list --status in_review` returns the resolve_conflict rows when their PR is the parent's. Confusing.
 
 **(γ) collapses the data model** but the unstated invariant "an in-review chore has no active worker" is load-bearing in several places (the kanban-doing column has a contract about live workers, `merge_poller`'s pickup query assumes no worker is touching `pr_url` mid-flight, and the dispatch rehydrate on startup assumes `in_review` chores aren't dispatch candidates). Breaking that invariant to hold one extra bit on the parent is more disruption than a side table costs.
 
@@ -569,7 +569,7 @@ Two side tables, similar shape, different trigger. They can coexist. The unifica
 - `rebase_attempts` is "we noticed PR A merged; we tried to rebase its dependents."
 - `conflict_resolutions` is "we noticed PR X conflicts with main; we tried to resolve."
 
-Both record one rebase attempt. The natural follow-up is a single `engine_attempts` table with a discriminator column. The CI flow adds a *third* such subsystem (`ci_remediations`, below), which is the threshold at which the unification CLI surface (`boss engine attempts ...`, Q11) becomes worth shipping — schema-level unification stays a follow-up.
+Both record one rebase attempt. The natural follow-up is a single `engine_attempts` table with a discriminator column. The CI flow adds a _third_ such subsystem (`ci_remediations`, below), which is the threshold at which the unification CLI surface (`boss engine attempts ...`, Q11) becomes worth shipping — schema-level unification stays a follow-up.
 
 ### The CI remediations side table
 
@@ -614,11 +614,11 @@ Bump `metadata.schema_version`.
 
 #### Why `attempt_kind` and `consumes_budget` are separate columns
 
-`attempt_kind` is the worker's *initial* classification. `consumes_budget` is the engine's *post-hoc* answer to "did this count against the budget?" They diverge in one common case: the worker classifies a failure as `flaky_or_infra` and re-triggers; CI then fails again with the same conclusion on the re-run. At that point the worker may pivot to `fix`. The original attempt row's `attempt_kind='retrigger'` and `consumes_budget=0` is correct historically; a *new* attempt row is created for the fix attempt, with `attempt_kind='fix'` and `consumes_budget=1`.
+`attempt_kind` is the worker's _initial_ classification. `consumes_budget` is the engine's _post-hoc_ answer to "did this count against the budget?" They diverge in one common case: the worker classifies a failure as `flaky_or_infra` and re-triggers; CI then fails again with the same conclusion on the re-run. At that point the worker may pivot to `fix`. The original attempt row's `attempt_kind='retrigger'` and `consumes_budget=0` is correct historically; a _new_ attempt row is created for the fix attempt, with `attempt_kind='fix'` and `consumes_budget=1`.
 
-The budget counter on the parent (`tasks.ci_attempts_used`) is incremented only when a fix attempt actually progresses past the worker's go/no-go decision. A worker that reads the log and immediately bails (`triage_class='unfixable'`) does *not* consume a budget slot, because no force-push was attempted; the attempt is marked `failed` with `failure_reason='triage_bailout'` and the parent transitions to `ci_failure_exhausted` only if the budget was already exhausted. Otherwise the parent remains `ci_failure`, waiting — there's nothing the engine can do; the user must intervene.
+The budget counter on the parent (`tasks.ci_attempts_used`) is incremented only when a fix attempt actually progresses past the worker's go/no-go decision. A worker that reads the log and immediately bails (`triage_class='unfixable'`) does _not_ consume a budget slot, because no force-push was attempted; the attempt is marked `failed` with `failure_reason='triage_bailout'` and the parent transitions to `ci_failure_exhausted` only if the budget was already exhausted. Otherwise the parent remains `ci_failure`, waiting — there's nothing the engine can do; the user must intervene.
 
-An explicit rule worth restating: **a worker that triages and bails without pushing does not decrement the budget *and* does not re-trigger another attempt for the same head sha.** The unique-key constraint enforces this — the engine cannot create a second `('fix', same_head_sha, same_item)` row. If the user pushes a different head sha or runs `boss engine ci retry`, the budget unlocks. Q4 details the worker's decision-tree.
+An explicit rule worth restating: **a worker that triages and bails without pushing does not decrement the budget _and_ does not re-trigger another attempt for the same head sha.** The unique-key constraint enforces this — the engine cannot create a second `('fix', same_head_sha, same_item)` row. If the user pushes a different head sha or runs `boss engine ci retry`, the budget unlocks. Q4 details the worker's decision-tree.
 
 ### The attempt budget and its counters
 
@@ -631,19 +631,19 @@ ALTER TABLE products ADD COLUMN ci_attempt_budget INTEGER NOT NULL DEFAULT 3;
 ```
 
 - **Default**: 3 attempts per PR.
-- **What counts as one attempt**: a *fix* attempt that proceeds past the worker's go/no-go (i.e. the worker decided this is tractable, tried to edit and push). Re-triggers do not count; triage-bailouts (worker decided unfixable before pushing) do not count.
+- **What counts as one attempt**: a _fix_ attempt that proceeds past the worker's go/no-go (i.e. the worker decided this is tractable, tried to edit and push). Re-triggers do not count; triage-bailouts (worker decided unfixable before pushing) do not count.
 
 The "do not count" cases are not free — each spawns a worker pane and burns a cube lease — so they are bounded separately by the unique-key constraint on `ci_remediations`.
 
 #### Per-PR vs per-failure-signature
 
-If the worker pushes a fix and CI runs again, a *different* check fails — is that attempt 2 for the PR or attempt 1 for a fresh failure?
+If the worker pushes a fix and CI runs again, a _different_ check fails — is that attempt 2 for the PR or attempt 1 for a fresh failure?
 
 **Recommendation: per-PR.** Cleaner; harder to game. A fix that flipped check A's failure into check B's failure (e.g. fixed the lint, broke the test) is two attempts; not one and one. The per-failure-signature variant encourages workers to play whack-a-mole — fix one check, push, see the next check fail, fix that one, push — until every check has been hit once. The user's feedback "do not spin forever" is precisely the prohibition on whack-a-mole.
 
 #### Budget reset rules
 
-The budget resets when the PR successfully transitions back to `in_review` *and stays there* (i.e. the parent's `task_blocked_signals` is empty of CI signals for at least one full poll cycle):
+The budget resets when the PR successfully transitions back to `in_review` _and stays there_ (i.e. the parent's `task_blocked_signals` is empty of CI signals for at least one full poll cycle):
 
 ```rust
 // When transitioning parent from blocked → in_review (last signal cleared)
@@ -652,7 +652,7 @@ if reason_cleared == "ci_failure" {
 }
 ```
 
-A `blocked: ci_failure_exhausted` parent does *not* auto-reset on its own. Three paths out:
+A `blocked: ci_failure_exhausted` parent does _not_ auto-reset on its own. Three paths out:
 
 1. **The user runs `boss engine ci retry <work-item-id>`.** Resets `ci_attempts_used=0`, clears the `ci_failure_exhausted` signal, re-fires the auto-fix flow.
 2. **The user pushes their own fix.** CI re-runs; if green, the auto-retire path fires; the budget is reset on transition back to `in_review`.
@@ -783,7 +783,7 @@ Original head: <head_sha_before>; new head: <head_sha_after>.
 
 ### Why no pre-load of the conflict into the workspace
 
-`auto-rebase-stacked-prs.md` Q5 hands off a pre-loaded conflict (engine ran `jj rebase`, conflict markers are already in the working copy, worker continues from there). That makes sense when the engine has *also* attempted a mechanical rebase. Here, the engine never attempted one — we go straight to the worker — so there's no pre-load to hand off. A fresh lease with the branch checked out is cheaper and lets the worker control the rebase strategy (e.g. `jj rebase -s` vs `jj rebase -b` for split-commit cases).
+`auto-rebase-stacked-prs.md` Q5 hands off a pre-loaded conflict (engine ran `jj rebase`, conflict markers are already in the working copy, worker continues from there). That makes sense when the engine has _also_ attempted a mechanical rebase. Here, the engine never attempted one — we go straight to the worker — so there's no pre-load to hand off. A fresh lease with the branch checked out is cheaper and lets the worker control the rebase strategy (e.g. `jj rebase -s` vs `jj rebase -b` for split-commit cases).
 
 A future optimisation could pre-run the rebase in the engine just to populate the diagnosis collector with a real conflict tree, then hand it off pre-loaded. v1 skips that — the diagnosis collector can also run against a not-yet-rebased state by computing the would-be conflicts via `git merge-tree`, which is what `auto-rebase-stacked-prs.md` Q11 already does. Reuse that code path.
 
@@ -846,7 +846,9 @@ You are NOT adding new functionality, refactoring, addressing TODOs you happen t
 ### Log excerpt (worst failing check, tail 200 lines)
 
 ```
+
 <log_excerpt>
+
 ```
 
 For the full log: `bk job log <provider_job_id>` (Buildkite) or `gh run view --log-failed --job <provider_job_id>` (GitHub Actions).
@@ -972,7 +974,7 @@ The first three map to UPDATEs on `ci_remediations`. The engine knows to expect 
 
 ### CI provider abstraction
 
-Mono builds on Buildkite. Flunge builds on Buildkite *and* GitHub Actions. The signal source for *detection* is provider-agnostic: GitHub's `statusCheckRollup` aggregates both. The signal source for *fixing* is provider-specific: reading the failing job's log requires `bk` (Buildkite) or `gh run view` (GitHub Actions).
+Mono builds on Buildkite. Flunge builds on Buildkite _and_ GitHub Actions. The signal source for _detection_ is provider-agnostic: GitHub's `statusCheckRollup` aggregates both. The signal source for _fixing_ is provider-specific: reading the failing job's log requires `bk` (Buildkite) or `gh run view` (GitHub Actions).
 
 #### The trait
 
@@ -1016,7 +1018,7 @@ fn provider_of(target_url: &str) -> CiProvider {
 
 The engine and the worker route the same way. The abstraction is thin: four methods; the concrete impls each wrap two CLI calls. Adding a third provider is one new impl plus one new arm in `provider_of`.
 
-Explicitly *not* abstracted in v1: re-running a workflow vs re-running a single job (providers differ; `retrigger` papers over the difference per-impl) and provider-specific failure metadata (Buildkite's "blocked step", GHA's environment-protection holds — out of scope; would be classified `unfixable`).
+Explicitly _not_ abstracted in v1: re-running a workflow vs re-running a single job (providers differ; `retrigger` papers over the difference per-impl) and provider-specific failure metadata (Buildkite's "blocked step", GHA's environment-protection holds — out of scope; would be classified `unfixable`).
 
 ---
 
@@ -1030,7 +1032,7 @@ After the worker pushes, GitHub re-evaluates the PR. On the next merge-poller sw
 
 ### Agent-driven validated-green retire (`ci mark-noop`)
 
-The retire signal above is **engine-detected**: the poller observes green on its own cadence. There is a second, **agent-driven** way an attempt retires — for the case where the worker was dispatched to fix a failure that is *no longer there* (a flaky check settled, `main` moved, or a stale failure was re-detected on an unchanged head). Without a sanctioned escape the worker is badgered to fix something impossible; with one, it can authoritatively close the loop. The hard constraint (operator's requirement): the signal must be **validated** — the engine must never take the worker's word that CI is green.
+The retire signal above is **engine-detected**: the poller observes green on its own cadence. There is a second, **agent-driven** way an attempt retires — for the case where the worker was dispatched to fix a failure that is _no longer there_ (a flaky check settled, `main` moved, or a stale failure was re-detected on an unchanged head). Without a sanctioned escape the worker is badgered to fix something impossible; with one, it can authoritatively close the loop. The hard constraint (operator's requirement): the signal must be **validated** — the engine must never take the worker's word that CI is green.
 
 The verb is `boss engine ci mark-noop <attempt-id> [--observed-sha <sha>] [--reason <r>]`, and it is a synchronous request/response (not a Stop-boundary marker): the worker gets an immediate honored/rejected receipt so it knows whether to stop or keep working.
 
@@ -1041,17 +1043,18 @@ The verb is `boss engine ci mark-noop <attempt-id> [--observed-sha <sha>] [--rea
 3. **Independently re-probes LIVE CI** for the PR via `CommandMergeProbe` — the same `gh pr view … statusCheckRollup` source of truth `ci_watch` and the merge-poller use. Never a cached status, never the worker's assertion. A probe error → reject (cannot verify ⇒ do not honor).
 4. Classifies the probe with `classify_noop_validation`, which reuses the merge-poller's `OpenPrCiStatus::Clean` notion of green (every required check `SUCCESS`/`NEUTRAL`/`SKIPPED`, rollup terminal). This is the **exact same predicate** `on_ci_resolved` clears on, so the validated-green decision and the engine-detected retire share one notion of "CI status for the head SHA".
 
-**Keyed to the live head SHA.** The verdict is always derived from the probe's *current* `head_ref_oid`, never the SHA the worker happened to observe. `--observed-sha` is advisory: if the head advanced since the worker looked, the claim is re-validated against the new commit (honored only if the new head is green; the CLI notes the re-validation). There is no path that honors a stale commit.
+**Keyed to the live head SHA.** The verdict is always derived from the probe's _current_ `head_ref_oid`, never the SHA the worker happened to observe. `--observed-sha` is advisory: if the head advanced since the worker looked, the claim is re-validated against the new commit (honored only if the new head is green; the CLI notes the re-validation). There is no path that honors a stale commit.
 
 **Honored** (`NoopValidation::Green`, or a `Merged` PR — branch protection means it could not have landed red, so the loop is moot): `mark_ci_remediation_validated_green` runs one transaction that (a) flips the `pending`/`running` attempt to terminal `succeeded`, stamping the validated `head_sha_after` and a `validated_green` audit discriminator, (b) clears the parent's `blocked: ci_failure` / `ci_failure_exhausted` back to `in_review` (and clears any in-flight signal for the in_review-with-revision model), and (c) resets `ci_attempts_used` for a fresh budget on the next cycle. Making the attempt **terminal** is what stops the stranded-rescue re-dispatch (its query requires `status='pending'`) — i.e. it is the validated terminal, not a generic re-dispatch throttle, that ends the badgering.
 
 **Rejected** (`NoopValidation::Rejected`: required checks still failing, still in-flight/pending, PR closed-unmerged, or the probe failed): the row is left untouched and actionable, the CLI exits non-zero with `CI not green on <sha>: <status>`, and the rejected claim is logged. The worker cannot escape a real or pending failure.
 
-This is complementary to the watcher-idempotency fix (T1743), which stops the engine from *falsely re-detecting* a failure on an unchanged SHA; both share the one `OpenPrCiStatus` notion of green. Where T1743 keeps a green PR from being re-flagged, this lets a worker authoritatively retire an attempt when the failure it was sent to fix is genuinely gone.
+This is complementary to the watcher-idempotency fix (T1743), which stops the engine from _falsely re-detecting_ a failure on an unchanged SHA; both share the one `OpenPrCiStatus` notion of green. Where T1743 keeps a green PR from being re-flagged, this lets a worker authoritatively retire an attempt when the failure it was sent to fix is genuinely gone.
 
 ### What "retire" means
 
 1. **Update the parent** atomically:
+
    ```sql
    UPDATE tasks SET
        status            = 'in_review',
@@ -1064,9 +1067,11 @@ This is complementary to the watcher-idempotency fix (T1743), which stops the en
      AND blocked_reason = 'merge_conflict'
      AND blocked_attempt_id = ?attempt_id;
    ```
-   The fully-qualified WHERE clause ensures we only flip back rows we *put* in this state. A human who manually moved the chore elsewhere during the resolution stays where they put it; the engine logs the divergence and abandons the attempt without forcing.
+
+   The fully-qualified WHERE clause ensures we only flip back rows we _put_ in this state. A human who manually moved the chore elsewhere during the resolution stays where they put it; the engine logs the divergence and abandons the attempt without forcing.
 
 2. **Update the attempt row**:
+
    ```sql
    UPDATE conflict_resolutions SET
        status         = 'succeeded',
@@ -1094,9 +1099,9 @@ If the user manually flips a `blocked: merge_conflict` chore back to `in_review`
 
 A `boss engine conflicts abandon <id>` verb (Q11) lets the coordinator explicitly mark an attempt abandoned, e.g. when the underlying PR has been closed.
 
-### What if `main` moves *during* the resolution but the rebase still applies cleanly
+### What if `main` moves _during_ the resolution but the rebase still applies cleanly
 
-The worker rebased against the `main` it saw at lease time. `main` moves once more before the push lands. GitHub's re-evaluation against the *new* `main` may say `MERGEABLE` (the new main commits don't touch the resolved files) or `CONFLICTING` (they do).
+The worker rebased against the `main` it saw at lease time. `main` moves once more before the push lands. GitHub's re-evaluation against the _new_ `main` may say `MERGEABLE` (the new main commits don't touch the resolved files) or `CONFLICTING` (they do).
 
 - If `MERGEABLE`: normal retire path. No special handling.
 - If `CONFLICTING`: superseded path above — new attempt with the new base sha.
@@ -1136,23 +1141,23 @@ async fn maybe_clear_blocked(
 
 For `ci_failure` and `ci_failure_exhausted`, the side-effects on clear are:
 
-1. Mark the corresponding `ci_remediations` row as `succeeded` if it was `running`; this is the *most recent* row for the work item (queried by `created_at DESC LIMIT 1`).
+1. Mark the corresponding `ci_remediations` row as `succeeded` if it was `running`; this is the _most recent_ row for the work item (queried by `created_at DESC LIMIT 1`).
 2. Reset `tasks.ci_attempts_used` to 0 (Q3's reset rule — completed cycle = reset).
 3. Release the worker's cube lease.
 4. Broadcast `FrontendEvent::CiRemediationSucceeded` plus the generic `WorkItemChanged`.
 5. Activity-feed entry: "Engine cleared a CI failure on PR #647; PR is back in review."
 
-#### What if the worker pushed but a *different* check now fails
+#### What if the worker pushed but a _different_ check now fails
 
 The push succeeded; the previous check went green; a new check went red. The next probe sees `ci=Failing` with a different `failed_checks` set. The previous `ci_remediations` row is `running` (the worker exited but the engine hadn't yet observed green). The flow:
 
 1. Probe observes failure on new head sha.
 2. `on_ci_failure_detected` for the new head sha is called.
-3. Pre-check: is there an active running attempt for an *older* head sha? If yes, mark it `superseded` (the new push superseded it; the worker exited cleanly, but the outcome on the new sha isn't green).
+3. Pre-check: is there an active running attempt for an _older_ head sha? If yes, mark it `superseded` (the new push superseded it; the worker exited cleanly, but the outcome on the new sha isn't green).
 4. Create a new `ci_remediations` row for the new head sha. `consumes_budget=1` (this is attempt 2 for the PR).
 5. Spawn a new fixer worker.
 
-The transition `running → superseded` does *not* decrement the budget — the worker did consume one slot when it ran; we just observe its outcome retroactively as "did not produce green."
+The transition `running → superseded` does _not_ decrement the budget — the worker did consume one slot when it ran; we just observe its outcome retroactively as "did not produce green."
 
 #### What if the worker pushed and CI was already green on the new head
 
@@ -1160,11 +1165,11 @@ Push lands; some checks ran instantly (lint), passed; others (long test suites) 
 
 Wait one more sweep. If eventually all required checks are `SUCCESS` → retire. If a check goes `FAILURE` while others are still running → flip back to fixing.
 
-The auto-retire is conservative: it requires *all* required checks at `SUCCESS` (latest-leaf-per-name). Any `InFlight` blocks retire; any new `FAILURE` reopens.
+The auto-retire is conservative: it requires _all_ required checks at `SUCCESS` (latest-leaf-per-name). Any `InFlight` blocks retire; any new `FAILURE` reopens.
 
 #### Manual override (CI)
 
-If the user manually flips `blocked: ci_failure` to `in_review`, the WHERE-guarded UPDATE refuses to second-guess. The next probe will, however, observe the chore as `in_review` with still-failing CI. To avoid an immediate re-flip-to-blocked loop, the manual move resets the budget and inserts a *suppression record*:
+If the user manually flips `blocked: ci_failure` to `in_review`, the WHERE-guarded UPDATE refuses to second-guess. The next probe will, however, observe the chore as `in_review` with still-failing CI. To avoid an immediate re-flip-to-blocked loop, the manual move resets the budget and inserts a _suppression record_:
 
 ```sql
 CREATE TABLE IF NOT EXISTS ci_failure_suppressions (
@@ -1179,7 +1184,7 @@ A row in this table tells `ci_watch::on_ci_failure_detected` to suppress for the
 
 If the user wants permanent suppression for a check, that's a branch-protection-level decision they make on GitHub, not in Boss.
 
-The suppression record is a thin escape hatch. It is *not* used by the `boss engine ci retry` verb — retry explicitly *re-enables* auto-fix; manual move *disables* auto-fix. The two verbs are mirrored.
+The suppression record is a thin escape hatch. It is _not_ used by the `boss engine ci retry` verb — retry explicitly _re-enables_ auto-fix; manual move _disables_ auto-fix. The two verbs are mirrored.
 
 #### Exhausted parent goes green organically
 
@@ -1195,8 +1200,8 @@ The activity feed entry on this transition is celebratory: "✅ CI green on PR #
 
 The worker tries `jj git push --bookmark <branch>` and the push is rejected. Two sub-cases parallel to `auto-rebase-stacked-prs.md` Q4:
 
-- **Concurrent human push.** The user rebased the branch by hand and pushed while the worker was working. The worker's local branch is now stale. The right behaviour: the worker detects the rejection, fetches, *does not* try to force-overwrite the human's push (the human's resolution is canonical), and stops. The engine marks the attempt `superseded` (a new `mergeable` probe will pick up whether the human's push fixed the conflict; if so, the parent goes back to `in_review` naturally; if not, a new attempt fires).
-- **Push genuinely rejected** (auth, branch protection). Engine marks the attempt `failed` with `failure_reason='push_rejected'`. The parent stays `blocked`. UI surfaces it loudly via the activity feed. Auto-retry does *not* fire on auth failures — human intervention required (same policy as `auto-rebase-stacked-prs.md` Q4).
+- **Concurrent human push.** The user rebased the branch by hand and pushed while the worker was working. The worker's local branch is now stale. The right behaviour: the worker detects the rejection, fetches, _does not_ try to force-overwrite the human's push (the human's resolution is canonical), and stops. The engine marks the attempt `superseded` (a new `mergeable` probe will pick up whether the human's push fixed the conflict; if so, the parent goes back to `in_review` naturally; if not, a new attempt fires).
+- **Push genuinely rejected** (auth, branch protection). Engine marks the attempt `failed` with `failure_reason='push_rejected'`. The parent stays `blocked`. UI surfaces it loudly via the activity feed. Auto-retry does _not_ fire on auth failures — human intervention required (same policy as `auto-rebase-stacked-prs.md` Q4).
 
 ### Worker crashes / pane dies
 
@@ -1220,7 +1225,7 @@ GitHub somehow merges the PR while it's `blocked: merge_conflict`. This shouldn'
 
 Worker pushed; engine flipped parent to `in_review`. On the very next poller pass, `main` has moved again and the PR is `CONFLICTING` again. A new attempt is created (unique key allows it — new `base_sha_at_trigger`). The parent flips back to `blocked`. The activity feed shows two entries; the operator sees the churn.
 
-If the churn rate is excessive (>3 conflict cycles for one PR in a short window), the engine should *not* keep auto-resolving — at that point the PR is fundamentally racing main and needs human attention. A simple guard: count `conflict_resolutions WHERE work_item_id = ? AND created_at > ?-1h`; if ≥ 3, the new attempt is created with `status='abandoned'` immediately and a `failure_reason='churn_threshold_exceeded'` annotation. The parent stays `blocked` and surfaces an attention item. The user can `boss engine conflicts retry --force <id>` to override.
+If the churn rate is excessive (>3 conflict cycles for one PR in a short window), the engine should _not_ keep auto-resolving — at that point the PR is fundamentally racing main and needs human attention. A simple guard: count `conflict_resolutions WHERE work_item_id = ? AND created_at > ?-1h`; if ≥ 3, the new attempt is created with `status='abandoned'` immediately and a `failure_reason='churn_threshold_exceeded'` annotation. The parent stays `blocked` and surfaces an attention item. The user can `boss engine conflicts retry --force <id>` to override.
 
 ### Worker takes too long
 
@@ -1228,7 +1233,7 @@ If the churn rate is excessive (>3 conflict cycles for one PR in a short window)
 
 ### Worker resolves the conflict in a way that breaks the PR's intent
 
-Same risk as `auto-rebase-stacked-prs.md` Q11 ("conflicts the worker resolves 'incorrectly'"). Same mitigation: the worker's post-resolution PR comment enumerates per-file resolutions; the human reviewer is the second line of defence. The auto-retire path *does* flip the parent back to `in_review` automatically, so the reviewer's first action — clicking the PR — surfaces the worker's resolution comment immediately.
+Same risk as `auto-rebase-stacked-prs.md` Q11 ("conflicts the worker resolves 'incorrectly'"). Same mitigation: the worker's post-resolution PR comment enumerates per-file resolutions; the human reviewer is the second line of defence. The auto-retire path _does_ flip the parent back to `in_review` automatically, so the reviewer's first action — clicking the PR — surfaces the worker's resolution comment immediately.
 
 ### Resolution succeeds but local tests were not run
 
@@ -1241,7 +1246,7 @@ The worker prompt instructs the worker to run `<test_command>` before pushing. I
 Mirrors the conflict resolver's two sub-cases:
 
 - **Concurrent human push.** User pushed their own fix while the fixer was working; the fixer's local branch is stale. On `jj git push`, the push is rejected. The fixer detects the rejection, fetches, observes the new head, classifies as `superseded`, exits without forcing. The engine marks the attempt `superseded`. **Does not consume budget.** The next probe re-evaluates CI on the user's head sha.
-- **Push genuinely rejected** (auth, branch protection). Engine marks the attempt `failed` with `failure_reason='push_rejected'`. The parent stays `ci_failure`. UI surfaces it. Auto-retry does *not* fire on auth failures.
+- **Push genuinely rejected** (auth, branch protection). Engine marks the attempt `failed` with `failure_reason='push_rejected'`. The parent stays `ci_failure`. UI surfaces it. Auto-retry does _not_ fire on auth failures.
 
 #### Two fixer workers on the same PR
 
@@ -1251,7 +1256,7 @@ If the engine restarts mid-attempt: the startup sweep observes the row in `runni
 
 #### CI provider outage
 
-`bk` or `gh run view` returns transient errors when reading logs. The fixer worker retries the provider call (up to 3 immediate retries with exponential backoff). If still failing, the worker classifies the attempt as `flaky_or_infra` (the *provider* is the flake) and bails; no budget consumed. The engine logs a warning; the next probe re-fires once the rollup updates (which won't happen during the outage, so the system naturally waits).
+`bk` or `gh run view` returns transient errors when reading logs. The fixer worker retries the provider call (up to 3 immediate retries with exponential backoff). If still failing, the worker classifies the attempt as `flaky_or_infra` (the _provider_ is the flake) and bails; no budget consumed. The engine logs a warning; the next probe re-fires once the rollup updates (which won't happen during the outage, so the system naturally waits).
 
 #### Parent PR closed while fixer is mid-flight
 
@@ -1267,7 +1272,7 @@ One push per attempt is the contract. The worker pushes a fix and exits; it does
 
 #### Worker force-pushes to an unrelated SHA (bug)
 
-The worker should *not* do this — its prompt forbids scope-expansion. If it does, the next probe sees a head sha mismatch from what the engine snapshotted at attempt time. The attempt is *still* the relevant one; we don't fail it on sha mismatch. The probe just re-evaluates CI on the new head and the flow continues.
+The worker should _not_ do this — its prompt forbids scope-expansion. If it does, the next probe sees a head sha mismatch from what the engine snapshotted at attempt time. The attempt is _still_ the relevant one; we don't fail it on sha mismatch. The probe just re-evaluates CI on the new head and the flow continues.
 
 #### Worker resolves CI in a way that breaks the PR's intent
 
@@ -1281,12 +1286,12 @@ Same risk and mitigation as the conflict resolver's incorrect-resolution case ab
 
 PR A (base = main) merges. PR B (base = feat-A) has its base swept up by auto-rebase. Auto-rebase's engine-direct attempt fails on conflict; auto-rebase's escalation path creates a chore (`auto-rebase-stacked-prs.md` Q5) and hands off a pre-loaded conflict workspace.
 
-Meanwhile, this design's merge-poller probe of PR B *also* observes `mergeable=CONFLICTING` (it's the same conflict, after all). Without coordination, this design's path would *also* fire, creating a `conflict_resolutions` row, spawning a *second* worker, and racing the auto-rebase escalation chore.
+Meanwhile, this design's merge-poller probe of PR B _also_ observes `mergeable=CONFLICTING` (it's the same conflict, after all). Without coordination, this design's path would _also_ fire, creating a `conflict_resolutions` row, spawning a _second_ worker, and racing the auto-rebase escalation chore.
 
 ### Options
 
 - **(i) Suppress this design's path when the conflict is from a base-PR-merge.** Detect by joining `rebase_attempts WHERE dependent_pr_url = ? AND status IN ('running', 'escalated')`; if a row exists, don't create a `conflict_resolutions` row.
-- **(ii) Suppress auto-rebase's path when this design has an active attempt.** Symmetric. Auto-rebase already runs first (it's the trigger that *put* the PR in this state), so this is unnatural.
+- **(ii) Suppress auto-rebase's path when this design has an active attempt.** Symmetric. Auto-rebase already runs first (it's the trigger that _put_ the PR in this state), so this is unnatural.
 - **(iii) Run both** and let the unique-key on `conflict_resolutions` plus the cube-lease contention naturally serialise them. Inefficient (two workers race for one fix) but correct.
 
 ### Recommendation
@@ -1307,7 +1312,7 @@ async fn on_conflict_detected(work_item_id: &str, pr_url: &str) {
 
 When the auto-rebase escalation chore lands its push and the PR returns to mergeable, the auto-rebase path retires the rebase_attempt (`succeeded`) and the parent's `blocked: dependency` returns to `in_review` (auto-rebase's own retire path). No `conflict_resolutions` row was ever created — clean.
 
-If the auto-rebase escalation chore *fails* (failure_reason set, status `failed`), the auto-rebase path leaves the parent in whatever state it was in (typically `blocked` with a dependency reason). The next conflict-watch sweep will see no active rebase attempt and *will* fire — picking up where auto-rebase left off. The handoff is clean.
+If the auto-rebase escalation chore _fails_ (failure*reason set, status `failed`), the auto-rebase path leaves the parent in whatever state it was in (typically `blocked` with a dependency reason). The next conflict-watch sweep will see no active rebase attempt and \_will* fire — picking up where auto-rebase left off. The handoff is clean.
 
 ### The reverse: PR comes back to merge poller and conflict is "free-floating"
 
@@ -1317,7 +1322,7 @@ If a PR conflicts against `main` and no `rebase_attempt` is associated (i.e. the
 
 Auto-rebase skips fork PRs and opted-out products (`auto-rebase-stacked-prs.md` Q8). For fork PRs, this design also skips (same auth limitation; engine can't push to a fork). For opted-out products, this design should also skip — the opt-out is a "leave my PRs alone" signal, and triggering conflict resolution would violate it.
 
-Recommendation: the opt-out is *unified*. `products.auto_rebase_enabled` becomes `products.auto_pr_maintenance_enabled` (rename), governing all auto-remediation flows. Auto-rebase, conflict-resolution, and CI-remediation check this flag before firing. If a user wants finer control, the per-PR label opt-out (auto-rebase Q8) extends similarly: a label `boss/no-auto-rebase` also suppresses conflict resolution and CI fixing for that PR.
+Recommendation: the opt-out is _unified_. `products.auto_rebase_enabled` becomes `products.auto_pr_maintenance_enabled` (rename), governing all auto-remediation flows. Auto-rebase, conflict-resolution, and CI-remediation check this flag before firing. If a user wants finer control, the per-PR label opt-out (auto-rebase Q8) extends similarly: a label `boss/no-auto-rebase` also suppresses conflict resolution and CI fixing for that PR.
 
 This is the cleanest opt-out story: one product setting, one PR label, all auto-remediation flows respect both.
 
@@ -1347,11 +1352,11 @@ async fn on_ci_failure_detected(work_item_id: &str, pr_url: &str, failures: Vec<
 
 The deferral is silent (debug-level log; no activity-feed entry). Once the higher-priority flow completes and the PR is back to `in_review`, the next probe's sweep will re-observe the CI failure (if it still exists) and fire normally.
 
-The reverse — conflict resolution running while CI is failing — does *not* require any change. The conflict resolver only cares about the merge-conflict signal; it pushes when the rebase is clean; CI re-runs on the new head; the next probe picks up the new CI state.
+The reverse — conflict resolution running while CI is failing — does _not_ require any change. The conflict resolver only cares about the merge-conflict signal; it pushes when the rebase is clean; CI re-runs on the new head; the next probe picks up the new CI state.
 
 #### Auto-rebase escalation produces a push that fails CI
 
-Auto-rebase escalates a conflict to a worker; the worker pushes the resolved rebase; CI then runs on the new head and fails. This is *new* CI failure data; the auto-rebase attempt's row is `succeeded` (it cleared the conflict). The chore went `blocked: dependency → in_review`. The next merge-poller probe sees `mergeable=MERGEABLE, ci=Failing` and `ci_watch::on_ci_failure_detected` fires normally — no special handling.
+Auto-rebase escalates a conflict to a worker; the worker pushes the resolved rebase; CI then runs on the new head and fails. This is _new_ CI failure data; the auto-rebase attempt's row is `succeeded` (it cleared the conflict). The chore went `blocked: dependency → in_review`. The next merge-poller probe sees `mergeable=MERGEABLE, ci=Failing` and `ci_watch::on_ci_failure_detected` fires normally — no special handling.
 
 ---
 
@@ -1359,14 +1364,14 @@ Auto-rebase escalates a conflict to a worker; the worker pushes the resolved reb
 
 ### What the sibling project does
 
-`proj_18ad7d43affb0370_2a` handles the *reviewer-driven* round trip: a reviewer leaves comments on an `in_review` PR; Boss notices the new comments; the parent flips from `in_review` to a temporarily-out-of-settled-state column; a worker iterates on the feedback; the parent returns to `in_review`. Same shape as this design — `in_review` items briefly leaving and snapping back — different trigger (mechanical/main-moved vs. reviewer-comment-arrived).
+`proj_18ad7d43affb0370_2a` handles the _reviewer-driven_ round trip: a reviewer leaves comments on an `in_review` PR; Boss notices the new comments; the parent flips from `in_review` to a temporarily-out-of-settled-state column; a worker iterates on the feedback; the parent returns to `in_review`. Same shape as this design — `in_review` items briefly leaving and snapping back — different trigger (mechanical/main-moved vs. reviewer-comment-arrived).
 
 ### Where they should agree
 
 These design choices should be shared:
 
 1. **The parent's state model.** Both flows write `status='blocked'` with a `blocked_reason`. This design picks `'merge_conflict'`; the review-feedback project picks `'review_feedback'`. The `blocked_reason` column is single, shared.
-2. **The `blocked_attempt_id` pointer.** Both flows populate it with the id of *their* attempt row. The inspector renders the right detail by switching on `blocked_reason`.
+2. **The `blocked_attempt_id` pointer.** Both flows populate it with the id of _their_ attempt row. The inspector renders the right detail by switching on `blocked_reason`.
 3. **The activity feed surface.** Both surface entries to the same engine-activity stream. The list view `boss engine attempts list` (proposed Q11) shows both kinds.
 4. **The auto-retire pattern.** Both flows watch for a "resolved" signal (mergeable=MERGEABLE here; new commits / comments-addressed signal in review-feedback) and flip parent back via the same WHERE-guarded UPDATE.
 5. **The "engine put me here, only engine can take me back" rule** via `last_status_actor='engine'`.
@@ -1471,7 +1476,7 @@ Rows that remain `blocked_reason IS NULL` are legacy — typically chores moved 
 
 Bump `metadata.schema_version`.
 
-### Existing in-review chores whose PRs are conflicting *right now*
+### Existing in-review chores whose PRs are conflicting _right now_
 
 When the engine starts after the migration, the merge-poller's startup sweep (mirroring `chore-lifecycle-pr-closed-unmerged.md` Q9) will run `run_one_pass` once. The new conflict-detection branch fires for any in-review chore whose PR is currently `CONFLICTING`. Those chores transition to `blocked: merge_conflict`, attempts are created, workers spawn (subject to pool capacity).
 
@@ -1492,7 +1497,7 @@ if table_has_column(conn, "products", "auto_rebase_enabled")?
 }
 ```
 
-If `auto_rebase_enabled` does *not* exist yet (this design ships first), the column is created directly as `auto_pr_maintenance_enabled BOOLEAN NOT NULL DEFAULT 1`.
+If `auto_rebase_enabled` does _not_ exist yet (this design ships first), the column is created directly as `auto_pr_maintenance_enabled BOOLEAN NOT NULL DEFAULT 1`.
 
 The CLI verb `boss product update <selector> --auto-rebase on|off` is preserved as an alias for `--auto-pr-maintenance` for back-compat; documentation moves to `--auto-pr-maintenance`.
 
@@ -1552,7 +1557,7 @@ fn migrate_auto_remediation(conn: &Connection) -> Result<()> {
 
 If the merge-conflict portion of this design has already shipped (`tasks.blocked_reason` and the dependency backfill exists), the CI migration is purely additive and the backfill step idempotently mirrors any in-flight scalar reason into the side table. If both portions ship together, the backfill runs once.
 
-### Existing in-review chores with failing CI *right now*
+### Existing in-review chores with failing CI _right now_
 
 Mirrors the merge-conflict case. The merge-poller's startup sweep (run_one_pass) probes once after migration. The new CI-detection branch fires for any in-review chore with failing required checks. Those chores transition to `blocked: ci_failure`, attempts are created, workers spawn (subject to pool capacity and budget). The activity feed records each transition.
 
@@ -1563,8 +1568,8 @@ Mirrors the merge-conflict case. The merge-poller's startup sweep (run_one_pass)
 ### The hazards
 
 - Two probe sweeps observe the same `CONFLICTING` state for the same PR before the first one has finished writing the `blocked` transition. (Race within the poller; bounded by the poller's serial sweep.)
-- The probe observes `CONFLICTING`, the engine creates an attempt, the worker pushes successfully, the *next* probe (before retire ran) still sees `MERGEABLE`. The retire path fires; the attempt completes. So far so good.
-- The probe observes `CONFLICTING` *during* an active attempt's window — main moved again, conflict regenerated. The unique-key `(work_item_id, base_sha_at_trigger)` differentiates: same base_sha = same attempt (no-op); different base_sha = new attempt.
+- The probe observes `CONFLICTING`, the engine creates an attempt, the worker pushes successfully, the _next_ probe (before retire ran) still sees `MERGEABLE`. The retire path fires; the attempt completes. So far so good.
+- The probe observes `CONFLICTING` _during_ an active attempt's window — main moved again, conflict regenerated. The unique-key `(work_item_id, base_sha_at_trigger)` differentiates: same base_sha = same attempt (no-op); different base_sha = new attempt.
 
 ### The invariants
 
@@ -1578,15 +1583,15 @@ The merge poller's sweep order is `list_chores_pending_merge_check` ASC by `upda
 
 ### Ordering with auto-rebase
 
-If a PR is being auto-rebased *and* its base is itself conflicting, both flows have opinions. The recommendation in Q7 — defer to auto-rebase when its row is active — gives a clean precedence: auto-rebase owns the slot until its attempt terminates; only then does this design potentially fire.
+If a PR is being auto-rebased _and_ its base is itself conflicting, both flows have opinions. The recommendation in Q7 — defer to auto-rebase when its row is active — gives a clean precedence: auto-rebase owns the slot until its attempt terminates; only then does this design potentially fire.
 
 ### CI-specific idempotency and race conditions
 
 #### A re-trigger and a fix race on the same head sha
 
-The engine's pre-triage in Q4 chooses `attempt_kind='retrigger'` if every failure has unambiguous infra conclusion; else `'fix'`. The unique-key `(work_item_id, head_sha_at_trigger, attempt_kind)` allows *both* row types to exist for the same head sha — but only sequentially. If a retrigger fired and exited (`succeeded` with `consumes_budget=0`), and CI subsequently re-runs and still fails on the same head sha, the next probe's sweep is allowed to create a fix attempt for the same head sha (different `attempt_kind`). The unique key permits this.
+The engine's pre-triage in Q4 chooses `attempt_kind='retrigger'` if every failure has unambiguous infra conclusion; else `'fix'`. The unique-key `(work_item_id, head_sha_at_trigger, attempt_kind)` allows _both_ row types to exist for the same head sha — but only sequentially. If a retrigger fired and exited (`succeeded` with `consumes_budget=0`), and CI subsequently re-runs and still fails on the same head sha, the next probe's sweep is allowed to create a fix attempt for the same head sha (different `attempt_kind`). The unique key permits this.
 
-What is *not* allowed: a fix attempt followed by another fix attempt on the same head sha. The unique key blocks it. To create a new fix attempt, either the head sha must change (new push) or the user must `boss engine ci retry` (which the engine treats as authorisation to bump and creates an attempt with a synthetic `head_sha_at_trigger` suffix; see Q11).
+What is _not_ allowed: a fix attempt followed by another fix attempt on the same head sha. The unique key blocks it. To create a new fix attempt, either the head sha must change (new push) or the user must `boss engine ci retry` (which the engine treats as authorisation to bump and creates an attempt with a synthetic `head_sha_at_trigger` suffix; see Q11).
 
 #### CI invariants
 
@@ -1604,7 +1609,7 @@ Within a sweep, sweep_one for each PR is atomic with respect to writes to `task_
 
 A push happens; CI is supposed to run; nothing in the rollup ever appears (provider outage, mis-config). Without a timeout, the parent could sit forever in `in_review` despite an effectively-failing CI gate.
 
-**Recommendation.** Add a soft timeout on the *post-push wait*:
+**Recommendation.** Add a soft timeout on the _post-push wait_:
 
 ```rust
 // In the merge poller, when we observe `ci=InFlight` for a head sha:
@@ -1705,9 +1710,9 @@ $ boss engine ci retry chore_18ad…77
 → Parent will re-enter in_review on next probe; engine will auto-fix on detection of failure.
 ```
 
-When invoked on an *attempt id*, the engine resolves the attempt to its `work_item_id` and acts on the parent. The dual signature is for ergonomics; the user usually has the chore id, not the attempt id.
+When invoked on an _attempt id_, the engine resolves the attempt to its `work_item_id` and acts on the parent. The dual signature is for ergonomics; the user usually has the chore id, not the attempt id.
 
-`retry` does *not* immediately spawn a worker — it resets the parent's state and lets the next merge-poller sweep do its thing. This keeps the retry behaviour aligned with normal sweeps and avoids a separate "force immediate spawn" code path. Worst-case latency is one poller interval (~30s); acceptable.
+`retry` does _not_ immediately spawn a worker — it resets the parent's state and lets the next merge-poller sweep do its thing. This keeps the retry behaviour aligned with normal sweeps and avoids a separate "force immediate spawn" code path. Worst-case latency is one poller interval (~30s); acceptable.
 
 ### Unified `boss engine attempts list` (three subsystems)
 
@@ -2239,15 +2244,15 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 - The trigger is the merge poller's existing per-PR `gh pr view` round-trip, extended with `mergeable` and `mergeStateStatus`. No new background loop.
 - The parent's blocked-reason is encoded as a dedicated `tasks.blocked_reason` column. Values are an open set; `'merge_conflict'`, `'dependency'`, and `'review_feedback'` are reserved.
 - The parent's `blocked_attempt_id` is a soft FK whose target table is discriminated by `blocked_reason`.
-- The ephemeral resolve-conflicts unit is recorded as a row in a new `conflict_resolutions` side table, *not* as a `tasks` row. This avoids contaminating the chore / task / project_task taxonomy.
-- The kanban does *not* render an extra card for the conflict-resolution attempt. The parent card surfaces the state via a richer blocked badge. The attempt is inspectable via the inspector, the activity feed, and the CLI.
+- The ephemeral resolve-conflicts unit is recorded as a row in a new `conflict_resolutions` side table, _not_ as a `tasks` row. This avoids contaminating the chore / task / project_task taxonomy.
+- The kanban does _not_ render an extra card for the conflict-resolution attempt. The parent card surfaces the state via a richer blocked badge. The attempt is inspectable via the inspector, the activity feed, and the CLI.
 - The engine spawns a worker for every conflict — there is no engine-direct mechanical path (in contrast to `auto-rebase-stacked-prs.md`, which is engine-direct first and worker-on-conflict). Justification: the trigger is "conflict already exists by GitHub's evaluation," so the engine has no mechanical path left to attempt.
 - Coordination with `auto-rebase-stacked-prs.md`: this design suppresses its trigger when an active `rebase_attempts` row covers the same PR. Auto-rebase escalation owns the slot until terminal.
 - Coordination with `review-feedback`: both flows share `blocked_reason`, `blocked_attempt_id`, the activity feed surface, and the `last_status_actor` rules. They differ in trigger, attempt table, and worker prompt.
 - Opt-out is unified: a single `products.auto_pr_maintenance_enabled` flag and a single `boss/no-auto-rebase` label govern both auto-rebase and conflict-resolution flows.
 - Auto-retire is automatic and unguarded: when GitHub reports `MERGEABLE` for a parent we put in `blocked: merge_conflict`, the engine flips back to `in_review` without further prompting. The user is informed via the activity feed; no interruption.
 - The CI failure predicate is the latest-leaf-per-name on required checks (`isRequired=true`) with a closed set of failure conclusions. Pending/in-flight/skipped/neutral do not fire.
-- A new `task_blocked_signals` side table makes the parent's blocked state a *set* of reasons rather than a scalar. The `tasks.blocked_reason` scalar remains as the denormalised "primary reason" cache for UI rendering, with an explicit priority order.
+- A new `task_blocked_signals` side table makes the parent's blocked state a _set_ of reasons rather than a scalar. The `tasks.blocked_reason` scalar remains as the denormalised "primary reason" cache for UI rendering, with an explicit priority order.
 - New `tasks.blocked_reason` values: `'ci_failure'` (auto-fix in flight) and `'ci_failure_exhausted'` (budget exhausted, user attention needed). The two-value split avoids re-decoding budget state at render time.
 - Per-PR attempt budget (`tasks.ci_attempts_used` / `tasks.ci_attempt_budget`) with a product-level default (`products.ci_attempt_budget`, default 3). Per-PR budget = 0 is "notify only"; budget ≥ 10 is rejected.
 - Budget reset rule: a complete success cycle (failure → fix → green → parent back to `in_review`) resets `ci_attempts_used` to 0. Manual `boss engine ci retry` also resets.
@@ -2256,12 +2261,12 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 - Composed ordering across all auto-remediation flows: `rebase_attempts > conflict_resolutions > ci_remediations`. CI watch defers when an active higher-priority attempt covers the same PR.
 - Opt-out remains unified under `products.auto_pr_maintenance_enabled` and the per-PR `boss/no-auto-rebase` label. A single switch governs auto-rebase, conflict resolution, and CI fixing.
 - CI provider abstraction is a thin `CiLogReader` trait with concrete Buildkite and GHA impls. Provider inferred from `targetUrl` host.
-- Auto-retire for CI requires *all* required checks at `SUCCESS` for the current head sha. `InFlight` blocks retire; any new `FAILURE` reopens the flow.
+- Auto-retire for CI requires _all_ required checks at `SUCCESS` for the current head sha. `InFlight` blocks retire; any new `FAILURE` reopens the flow.
 - Manual `boss engine ci retry <work-item-id>` is the user's escape hatch from `ci_failure_exhausted`. Resets counter; clears exhaustion; lets the next probe re-fire.
 
 ## Open Questions
 
-- **Does the resolution worker need to read review comments?** A PR with conflict may also have pending reviewer feedback that the worker, while in the workspace, *could* address — but the project description scopes this design to mechanical conflict resolution. The recommendation here is to defer that to the `review-feedback` flow; the resolution worker does only the rebase. But: if the same chore is *also* `blocked: review_feedback`, we have two attempts on the same parent. The state model in Q2 allows only one `blocked_attempt_id`. Resolve by ordering: this design's flow defers to review-feedback if one of its attempts is active for the same parent (same shape as Q7's deferral to auto-rebase). Confirm with the review-feedback design.
+- **Does the resolution worker need to read review comments?** A PR with conflict may also have pending reviewer feedback that the worker, while in the workspace, _could_ address — but the project description scopes this design to mechanical conflict resolution. The recommendation here is to defer that to the `review-feedback` flow; the resolution worker does only the rebase. But: if the same chore is _also_ `blocked: review_feedback`, we have two attempts on the same parent. The state model in Q2 allows only one `blocked_attempt_id`. Resolve by ordering: this design's flow defers to review-feedback if one of its attempts is active for the same parent (same shape as Q7's deferral to auto-rebase). Confirm with the review-feedback design.
 
 - **Should we support `boss engine conflicts cancel <id>`?** Stopping an in-flight resolution worker mid-rebase. Today the user can `bossctl work cancel <agent-id>`, which would also fail the attempt via the completion path. A dedicated verb is sugar. Defer to Phase 6 if it's worth it; not critical for v1.
 
@@ -2285,7 +2290,7 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 
 - **Notification channels for exhaustion.** Today `ci_failure_exhausted` surfaces only via the activity feed and a kanban badge. Some users may want a desktop notification or a Slack ping when the engine has given up on auto-fixing a PR. Defer to a notifications-system design; not specific to this flow.
 
-- **Test-run flake detection on the worker side.** The worker's triage step 5 runs the project's `test_command` locally and expects green before pushing. If the local test run *itself* flakes (e.g. a test that passed locally fails on CI), the worker has no signal to distinguish that from a real fix. Currently we trust the worker's judgement; the user reviews the PR comment afterwards. A future enhancement: the worker re-runs the failing test N times locally before declaring green. Defer.
+- **Test-run flake detection on the worker side.** The worker's triage step 5 runs the project's `test_command` locally and expects green before pushing. If the local test run _itself_ flakes (e.g. a test that passed locally fails on CI), the worker has no signal to distinguish that from a real fix. Currently we trust the worker's judgement; the user reviews the PR comment afterwards. A future enhancement: the worker re-runs the failing test N times locally before declaring green. Defer.
 
 ## Post-Unification Reconciliation — Revision-Based Parent-State Model
 
@@ -2310,6 +2315,7 @@ Detection flipped `in_review → blocked: merge_conflict` immediately on conflic
 `task_blocked_signals` still carries an active `merge_conflict` row throughout the fix (cleared_at IS NULL). This ensures `maybe_clear_blocked` dispatches `on_resolved` when the PR becomes mergeable, even though the parent's status column reads `in_review` instead of `blocked`.
 
 `on_resolved` handles both cases:
+
 - Parent was `blocked: merge_conflict` (churn terminal, create_revision failure, or pre-unification row) → flip to `in_review`, clear signal, emit `merge_conflict_resolved` work-item event.
 - Parent was already `in_review` (fix vehicle in flight) → skip the status flip, clear the signal, retire the attempt, emit `ConflictResolutionSucceeded` typed event only. No `merge_conflict_resolved` work-item event (parent didn't change status).
 

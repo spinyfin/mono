@@ -4,11 +4,11 @@
 
 The Boss UI tells the human three different things about a working agent and none of them answer the question a human actually asks while watching the board:
 
-- `tasks.name` — what the worker was *asked* to do, set when the chore was filed.
+- `tasks.name` — what the worker was _asked_ to do, set when the chore was filed.
 - `pane_summaries.summary` — a 3–6-word gerund phrase (e.g. `"fixing the fencer scraper"`) generated **once at task pickup** from the work item's name and description (`engine/src/pane_summary.rs`, PR #185). It never refreshes.
-- `live_worker_states.activity` — a coarse `WorkerActivity` enum: `Spawning` / `Working` / `Idle` / `WaitingForInput` / `Errored` / `Terminated`. Drives the kanban Doing dot and the pane status pill (PR #182, PR #193). It tells you the *lifecycle phase*, not the *content of work*.
+- `live_worker_states.activity` — a coarse `WorkerActivity` enum: `Spawning` / `Working` / `Idle` / `WaitingForInput` / `Errored` / `Terminated`. Drives the kanban Doing dot and the pane status pill (PR #182, PR #193). It tells you the _lifecycle phase_, not the _content of work_.
 
-What the human wants, glancing at the board, is a sentence: *"Investigating why the scroll handler doesn't fire when lane content overflows"* or *"Running tests after the layout fix; one failure in `KanbanLaneViewTests`."* That is neither the original chore name nor a phase label — it is the worker's own moment-to-moment state, in natural language, refreshed often enough to be useful and rarely enough to be cheap.
+What the human wants, glancing at the board, is a sentence: _"Investigating why the scroll handler doesn't fire when lane content overflows"_ or _"Running tests after the layout fix; one failure in `KanbanLaneViewTests`."_ That is neither the original chore name nor a phase label — it is the worker's own moment-to-moment state, in natural language, refreshed often enough to be useful and rarely enough to be cheap.
 
 This doc proposes a **live status** field — a short free-text sentence per slot, alongside (not on top of) `activity` and the existing pane summary — and the engine plumbing, wire shape, UI surfaces, and policy needed to keep it useful, cheap, and safe.
 
@@ -24,7 +24,7 @@ This doc proposes a **live status** field — a short free-text sentence per slo
 ## Non-Goals
 
 - Replacing `activity` (the coarse enum is still load-bearing for the kanban dot and gating logic — `WorkBoardCardView` keys behaviour on it).
-- Replacing the at-pickup `pane_summary` (still the right shape for the pane titlebar's *"Riker is fixing the fencer scraper"* sentence — derived from the work item, stable, and a useful identifier even when the worker is between turns).
+- Replacing the at-pickup `pane_summary` (still the right shape for the pane titlebar's _"Riker is fixing the fencer scraper"_ sentence — derived from the work item, stable, and a useful identifier even when the worker is between turns).
 - Streaming partial summaries token-by-token — the field updates discretely and the UI just re-renders.
 - Building a generic "worker observability" framework. This is one field with one purpose.
 - Engine-side decision-making off the field's content (e.g., "if the status mentions the word 'stuck', escalate"). The string is for humans.
@@ -43,32 +43,32 @@ The display string is one sentence, present-continuous voice or short clause; ca
 
 The chore lays out four candidates. Summarised:
 
-| | (a) Probe round-trip | (b) Transcript tail + summarize | (c) Hybrid (b + occasional probe) | (d) Hook-event-only |
-|---|---|---|---|---|
-| Worker tokens | Yes (model output) | No | Rare | No |
-| Engine tokens | Tiny | Yes | Yes | None |
-| Authoritativeness | High (worker self-reports) | Medium (depends on transcript content) | Medium-high | Low (events are structural) |
-| Latency | Stop-boundary blocked | Independent of worker | Mostly independent | Fastest |
-| Secret-leak risk | Low (worker can sanitise) | Real (raw tool output in transcript) | Real | Low |
+|                          | (a) Probe round-trip                                       | (b) Transcript tail + summarize                         | (c) Hybrid (b + occasional probe)   | (d) Hook-event-only                   |
+| ------------------------ | ---------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------- | ------------------------------------- |
+| Worker tokens            | Yes (model output)                                         | No                                                      | Rare                                | No                                    |
+| Engine tokens            | Tiny                                                       | Yes                                                     | Yes                                 | None                                  |
+| Authoritativeness        | High (worker self-reports)                                 | Medium (depends on transcript content)                  | Medium-high                         | Low (events are structural)           |
+| Latency                  | Stop-boundary blocked                                      | Independent of worker                                   | Mostly independent                  | Fastest                               |
+| Secret-leak risk         | Low (worker can sanitise)                                  | Real (raw tool output in transcript)                    | Real                                | Low                                   |
 | Plumbing already exists? | Probe queue exists; no slot for "what are you doing" reply | Yes (`transcript_tail.rs`, `pane_summary`'s API client) | Same as b plus an unused probe slot | Yes (`live_worker_state.apply_event`) |
 
 ### Discussion
 
 **(a) Probe** has the appeal of authority — the worker writes its own status. It also has the deepest cost: each refresh is a real Claude turn, billed at worker model rates (Opus 4.7), forcing a Stop-boundary round-trip and ~thousands of input tokens of context per refresh because the worker re-reads its own conversation. At eight concurrent workers and a 30s cadence we'd be looking at ~$/hour numbers in the same ballpark as the workers' actual work, for a feature that is decoration. Probes also serialise behind whatever else the worker is doing, so the "live" status is exactly never live.
 
-**(d) Hooks-only** is free but doesn't tell us anything we don't already render. PreToolUse with `tool_name=Bash` and `tool_input={"command": "cargo test --package boss-engine completion"}` could in principle be templated into *"running cargo test for boss-engine completion"*, but the moment the worker is *thinking* between tools (which is most of the user-visible interesting time) the hook stream goes quiet. We'd render *"using Bash"* — strictly worse than the existing dot.
+**(d) Hooks-only** is free but doesn't tell us anything we don't already render. PreToolUse with `tool_name=Bash` and `tool_input={"command": "cargo test --package boss-engine completion"}` could in principle be templated into _"running cargo test for boss-engine completion"_, but the moment the worker is _thinking_ between tools (which is most of the user-visible interesting time) the hook stream goes quiet. We'd render _"using Bash"_ — strictly worse than the existing dot.
 
 **(b) Transcript-tail + cheap summarizer** is the right default. We already tail transcripts (`transcript_tail.rs`), already call the Anthropic API for `pane_summary`, and already have a precedent for "fall back silently if the API call fails" (the same module). The summarizer reads only the last N lines of the transcript — assistant text and a redacted tool view — and emits one sentence. Worker is never paused; cost is bounded; fall-back is silent.
 
-**(c) Hybrid** — keep (b) as the steady state, but allow an out-of-band probe trigger from the human (e.g., right-click → "Ask this worker what it's doing"). That gives an escape hatch for the rare *"the summarizer's confused, what's actually happening?"* case without paying for it on every refresh. The probe path uses the existing `pending_probes` queue (`app.rs:295-298`); we'd just need a frontend RPC to seed it with a canned prompt and a `ProbeReplied` event (currently pending per the v2 plan) to land the answer back into `live_status`.
+**(c) Hybrid** — keep (b) as the steady state, but allow an out-of-band probe trigger from the human (e.g., right-click → "Ask this worker what it's doing"). That gives an escape hatch for the rare _"the summarizer's confused, what's actually happening?"_ case without paying for it on every refresh. The probe path uses the existing `pending_probes` queue (`app.rs:295-298`); we'd just need a frontend RPC to seed it with a canned prompt and a `ProbeReplied` event (currently pending per the v2 plan) to land the answer back into `live_status`.
 
 ### Recommendation
 
 **Pick (c).** Steady state is (b): tail transcript on Stop boundaries plus a low-rate timer, summarize via Haiku 4.5 (see Q3 below), write the result into `live_worker_states.live_status`, broadcast on the existing `worker.live_states` topic. The probe escape hatch is a nice-to-have that uses existing primitives — ship it in a follow-up, not the first cut.
 
-**Why (b) over (a) for the steady state.** The objection "the transcript may not faithfully reflect what the worker is doing" is real but the transcript is *literally what the worker is doing*. The summarizer is just compressing. A probe would extract the same information through a more expensive channel.
+**Why (b) over (a) for the steady state.** The objection "the transcript may not faithfully reflect what the worker is doing" is real but the transcript is _literally what the worker is doing_. The summarizer is just compressing. A probe would extract the same information through a more expensive channel.
 
-**Why include (c)'s probe at all.** Two cases the transcript can't answer cleanly: a worker that has spent five minutes in a single tool call (no new transcript content), and a worker that's mid-thinking on a contested decision and has produced verbose, contradictory text. In both cases a human asking *"what are you doing"* gets a much cleaner sentence from the worker than from a bag of recent transcript lines.
+**Why include (c)'s probe at all.** Two cases the transcript can't answer cleanly: a worker that has spent five minutes in a single tool call (no new transcript content), and a worker that's mid-thinking on a contested decision and has produced verbose, contradictory text. In both cases a human asking _"what are you doing"_ gets a much cleaner sentence from the worker than from a bag of recent transcript lines.
 
 ---
 
@@ -97,7 +97,7 @@ Per-slot floor: at most one summarizer in flight at a time, and at most one comp
 
 ### Why this shape
 
-A pure timer (every 30s, say) wastes calls when the worker is genuinely idle and is too slow when the worker just made a sharp pivot. A pure event drive misses long thinking turns. Combining them is cheap (the rate limit dominates) and gives a UI that *"feels live but isn't twitchy"* — which is the actual ask.
+A pure timer (every 30s, say) wastes calls when the worker is genuinely idle and is too slow when the worker just made a sharp pivot. A pure event drive misses long thinking turns. Combining them is cheap (the rate limit dominates) and gives a UI that _"feels live but isn't twitchy"_ — which is the actual ask.
 
 ---
 
@@ -105,12 +105,12 @@ A pure timer (every 30s, say) wastes calls when the worker is genuinely idle and
 
 ### Setting a target
 
-Boss-mono workers run on Opus 4.7 at roughly $15/MTok input, $75/MTok output. The existing `pane_summary` module uses Sonnet 4.6 and produces a one-shot 60-token response per spawn. We are about to add a *recurring* summary call. Even at small per-call cost, multiplied by frequency × concurrency, this can balloon.
+Boss-mono workers run on Opus 4.7 at roughly $15/MTok input, $75/MTok output. The existing `pane_summary` module uses Sonnet 4.6 and produces a one-shot 60-token response per spawn. We are about to add a _recurring_ summary call. Even at small per-call cost, multiplied by frequency × concurrency, this can balloon.
 
 Conservative estimate, with the recommended cadence:
 
 - 8 workers active.
-- Steady-state effective rate (after rate limit + Stop bursts): ~1 summarizer call per slot every 30–45s of *actively working* time. Idle/waiting slots produce zero. Call this 100 calls/hour/slot in the worst case → 800/hour total.
+- Steady-state effective rate (after rate limit + Stop bursts): ~1 summarizer call per slot every 30–45s of _actively working_ time. Idle/waiting slots produce zero. Call this 100 calls/hour/slot in the worst case → 800/hour total.
 - Per call, we send ~2KB of trimmed transcript context (≈ 500 input tokens after redaction) and expect ≤ 80 output tokens.
 - Sonnet 4.6 at $3 / $15 per MTok: ≈ $0.0027 per call → **~$2/hour at 8 workers fully busy**.
 - Haiku 4.5 at $1 / $5 per MTok: ≈ $0.0009 per call → **~$0.70/hour at 8 workers fully busy**.
@@ -137,19 +137,19 @@ Conservative estimate, with the recommended cadence:
 
 The status is a string and a timestamp. Render rules:
 
-| Worker condition | `live_status` content | UI render |
-|---|---|---|
-| `Spawning`, no transcript yet | `None` | empty (card shows existing activity dot only) |
-| `Working`, first summary still in flight | `None` | empty |
-| `Working`, summary landed | the sentence | sentence |
-| `Idle` and last summary ≤ 30s old | last sentence (still relevant) | sentence, dimmed |
-| `Idle` > 30s | cleared to `None` | empty |
-| `WaitingForInput` | last sentence if recent, else `"awaiting input"` | sentence, accent colour to match the "needs human" pill |
-| `Errored` | `"errored — check logs"` (literal) | sentence, red |
-| `Terminated` | `None` | (slot is being released anyway) |
-| Summarizer call failed | keep prior value (do not overwrite) | as before; `last_status_at` timestamp does not advance — the staleness UI takes over after 90s |
-| Summarizer call timed out (>5s) | keep prior; log and back off the timer to 120s for this slot for the next two cycles | as before |
-| No summarizer activity for >5min while `Working` | dim the rendered status and append `" (stale)"` | dimmed sentence with `(stale)` suffix |
+| Worker condition                                 | `live_status` content                                                                | UI render                                                                                      |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `Spawning`, no transcript yet                    | `None`                                                                               | empty (card shows existing activity dot only)                                                  |
+| `Working`, first summary still in flight         | `None`                                                                               | empty                                                                                          |
+| `Working`, summary landed                        | the sentence                                                                         | sentence                                                                                       |
+| `Idle` and last summary ≤ 30s old                | last sentence (still relevant)                                                       | sentence, dimmed                                                                               |
+| `Idle` > 30s                                     | cleared to `None`                                                                    | empty                                                                                          |
+| `WaitingForInput`                                | last sentence if recent, else `"awaiting input"`                                     | sentence, accent colour to match the "needs human" pill                                        |
+| `Errored`                                        | `"errored — check logs"` (literal)                                                   | sentence, red                                                                                  |
+| `Terminated`                                     | `None`                                                                               | (slot is being released anyway)                                                                |
+| Summarizer call failed                           | keep prior value (do not overwrite)                                                  | as before; `last_status_at` timestamp does not advance — the staleness UI takes over after 90s |
+| Summarizer call timed out (>5s)                  | keep prior; log and back off the timer to 120s for this slot for the next two cycles | as before                                                                                      |
+| No summarizer activity for >5min while `Working` | dim the rendered status and append `" (stale)"`                                      | dimmed sentence with `(stale)` suffix                                                          |
 
 ### Why prefer "keep prior" over "blank" on failure
 
@@ -157,7 +157,7 @@ A flickering label that empties on every transient API hiccup is worse than a la
 
 ### "Awaiting input" literal
 
-When `activity` flips to `WaitingForInput`, the most useful sentence is generally "what was the worker doing right before it hit the prompt?" (which the prior value gives us) — but if there is no prior value, a literal *"awaiting input"* is fine and keeps the card from being misleading. Engine writes this directly without a model call.
+When `activity` flips to `WaitingForInput`, the most useful sentence is generally "what was the worker doing right before it hit the prompt?" (which the prior value gives us) — but if there is no prior value, a literal _"awaiting input"_ is fine and keeps the card from being misleading. Engine writes this directly without a model call.
 
 ---
 
@@ -184,7 +184,7 @@ Conflating them was the original sin of `activity`-vs-status-pill in the old pro
 
 ### Optional: snapshot to db on Stop only
 
-If we later want bossctl `agents log` to show *"what was Worf doing 20 minutes ago"*, a thin append-only `live_status_history` table written only on Stop boundaries (one row per Stop) would do it. **Out of scope for v1.** Filed as a follow-up.
+If we later want bossctl `agents log` to show _"what was Worf doing 20 minutes ago"_, a thin append-only `live_status_history` table written only on Stop boundaries (one row per Stop) would do it. **Out of scope for v1.** Filed as a follow-up.
 
 ### Schema delta
 
@@ -322,7 +322,7 @@ Idle / blank state collapses the row entirely (no awkward empty spacing).
 
 ### Why under the title, not in the footer
 
-The footer is for static badges. Live status is the *most informative* thing on the card while a worker is active and deserves to read like prose, not a tag. Two-line truncation under the title puts it where the human's eye lands second.
+The footer is for static badges. Live status is the _most informative_ thing on the card while a worker is active and deserves to read like prose, not a tag. Two-line truncation under the title puts it where the human's eye lands second.
 
 ### Layout pre-existing concerns
 
@@ -347,7 +347,7 @@ The Doing-card layout was just polished in PR #225 (chore `task_18ad60cfc01e7808
 "Riker is fixing the fencer scraper"   <-- pane_summary (static)
 ```
 
-Proposal: when `liveState?.liveStatus` is non-empty, render that *instead*:
+Proposal: when `liveState?.liveStatus` is non-empty, render that _instead_:
 
 ```
 "running tests after the layout fix; one failure in KanbanLaneViewTests"
@@ -355,13 +355,13 @@ Proposal: when `liveState?.liveStatus` is non-empty, render that *instead*:
 
 Fall back to `"Riker is fixing the fencer scraper"` when `liveStatus` is empty (Spawning, idle long enough for clear, or post-failure with no prior). The pane_summary remains a stable identifier-ish thing for tooltips and titles.
 
-Note: live status is a *full sentence*, not a gerund phrase, and rendering it raw (without `"Riker is "` prefix) reads correctly. The two strings have different grammatical shapes on purpose — the static pane_summary is the *role*, the live status is the *moment*.
+Note: live status is a _full sentence_, not a gerund phrase, and rendering it raw (without `"Riker is "` prefix) reads correctly. The two strings have different grammatical shapes on purpose — the static pane*summary is the \_role*, the live status is the _moment_.
 
 ---
 
 ## Design Question 8 — Privacy and Safety
 
-Transcripts contain raw tool output: file contents, bash output, environment variable dumps, fetched HTTP bodies. Anything in the worker's tool path is in the transcript verbatim. A naive summarizer prompt that says *"summarize what's happening"* will quote a file path, an env var, or an API token directly into the status string, where it ends up on the kanban board, which is screenshotted, which is shared.
+Transcripts contain raw tool output: file contents, bash output, environment variable dumps, fetched HTTP bodies. Anything in the worker's tool path is in the transcript verbatim. A naive summarizer prompt that says _"summarize what's happening"_ will quote a file path, an env var, or an API token directly into the status string, where it ends up on the kanban board, which is screenshotted, which is shared.
 
 ### Layered defence
 
@@ -379,10 +379,10 @@ The redactor lives in `engine/src/live_status_redact.rs` and is testable in isol
 
 - Forbids quoting any literal value longer than 4 words from the input.
 - Forbids including any string that looks like a token, key, password, URL, file path under `/private`, `/etc`, `/Users/*/.ssh`, or `~/.config`.
-- Asks for description-of-action, not description-of-content. *"Reading the auth config file"* is OK; *"Reading `/Users/.../api_key.txt` containing `sk-ant-…`"* is not.
+- Asks for description-of-action, not description-of-content. _"Reading the auth config file"_ is OK; _"Reading `/Users/.../api_key.txt` containing `sk-ant-…`"_ is not.
 - Caps at one sentence, ≤25 words.
 
-Even if Layer 1 misses something, a model asked specifically *not to quote literals* is much less likely to surface them in a 25-word output.
+Even if Layer 1 misses something, a model asked specifically _not to quote literals_ is much less likely to surface them in a 25-word output.
 
 **Layer 3 — output filter.** The string returned by the model is run through the same redactor patterns from Layer 1 before being written to `live_status`. If after redaction the string is empty or 90% redaction markers, drop it (set to `None`) and log a warning.
 
@@ -468,7 +468,7 @@ pub struct LiveWorkerState {
 
 **R4 — `live_worker_states` topic broadcast spam.** Each summarizer success is one broadcast on top of the existing activity-driven broadcasts. With 8 workers and a 30s effective rate, that's < 1Hz aggregate. App side already does a full snapshot replace. No regression.
 
-**R5 — Ordering vs `activity`.** A summarizer call could land *just after* the slot transitions to `Idle`, briefly painting a stale sentence under an `Idle` dot. Mitigation: in `set_live_status`, if `activity == Idle && live_status_at < activity_changed_at - 30s`, drop the write.
+**R5 — Ordering vs `activity`.** A summarizer call could land _just after_ the slot transitions to `Idle`, briefly painting a stale sentence under an `Idle` dot. Mitigation: in `set_live_status`, if `activity == Idle && live_status_at < activity_changed_at - 30s`, drop the write.
 
 **R6 — Race between transcript tail and Stop hook.** The transcript file is flushed asynchronously. A Stop hook may fire before the last assistant message lands on disk. Mitigation: `live_status::tick` polls the tail with a 200ms wait + retry on Stop triggers. Falls back to "tick on next event" if still empty.
 
@@ -496,7 +496,7 @@ These are bite-sized so each one fits in a single worker session.
 
 9. **macOS: per-worker toggle**: add an "Live status: On/Off" control in the Agents-tab worker row, wired to the engine RPC from chore 6. Acceptance: toggle persists across engine restarts.
 
-10. **Probe escape hatch (optional, hybrid path)**: a frontend RPC that seeds the `pending_probes` queue for a given run with a canned *"In one short sentence, what are you working on?"* and routes the reply (via the not-yet-wired `ProbeReplied` event) into `live_status` directly, bypassing the summarizer for that one update. Out of v1; file as a stretch.
+10. **Probe escape hatch (optional, hybrid path)**: a frontend RPC that seeds the `pending_probes` queue for a given run with a canned _"In one short sentence, what are you working on?"_ and routes the reply (via the not-yet-wired `ProbeReplied` event) into `live_status` directly, bypassing the summarizer for that one update. Out of v1; file as a stretch.
 
 ---
 

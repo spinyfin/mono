@@ -13,9 +13,9 @@ them manually, and what state survives the cycle.
 
 `orphaned` is a terminal status on the `work_executions` table,
 alongside `completed` / `failed` / `cancelled` / `abandoned`. It
-specifically denotes: *a worker was spawned for this execution, then
+specifically denotes: _a worker was spawned for this execution, then
 the engine lost the ability to verify it was still alive (typically
-because the libghostty pane died across an engine restart).*
+because the libghostty pane died across an engine restart)._
 
 Compared to the other terminal statuses:
 
@@ -98,7 +98,7 @@ Once the predecessor is `orphaned`:
 
 ## Automatic workspace patch backup
 
-Preserving the lease keeps the in-flight work *reachable* only as long as
+Preserving the lease keeps the in-flight work _reachable_ only as long as
 the workspace's dirty working copy survives — it is still lost the moment
 that workspace is re-leased and reset, or if cube cannot reclaim it. As a
 precaution, every path that transitions a live execution to `orphaned`
@@ -138,7 +138,7 @@ reap proceeds regardless. To replay the work into a fresh workspace:
 git apply --3way "$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch"
 ```
 
-**Scope:** the patch captures *uncommitted* working-copy changes only.
+**Scope:** the patch captures _uncommitted_ working-copy changes only.
 Local commits the worker already `jj describe`d into ancestors of `@`
 are not captured (capturing `trunk..@` is a possible future
 enhancement), and branches already pushed to origin are already durable
@@ -175,6 +175,6 @@ deliberately doesn't, because:
   it), which makes the in-flight state harder to recover.
 - Cube's lease TTL provides a safety net: orphaned leases that no
   worker is heartbeating expire on their own within 30 minutes.
-- A human who *does* want a clean slate can invoke `bossctl agents
-  stop <run-id>` first, then `agents reap` — the stop path is the
+- A human who _does_ want a clean slate can invoke `bossctl agents
+stop <run-id>` first, then `agents reap` — the stop path is the
   documented way to release the lease deliberately.

@@ -90,7 +90,7 @@ normal `mono` development flow.
 
 15. Update `flunge` to consume the `mono` version of `checkleft`.
 16. Remove the duplicated implementation from `flunge` once consumers are cut
-   over.
+    over.
 17. Add any packaging or distribution workflow needed for cross-repo use.
 
 ## Recommended Order

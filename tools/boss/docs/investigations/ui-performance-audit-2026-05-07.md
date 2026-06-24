@@ -31,6 +31,7 @@ Note: the singleton `GhosttyRuntime.shared` is intentionally never deallocated, 
 ### 2. Per-pane 0.5 s "Claude monitor" timer doing main-thread viewport scraping for every live pane **(HIGH)**
 
 `startClaudeMonitor()` (`tools/boss/app-macos/Sources/Ghostty/GhosttyTerminalView.swift:363-372`) installs a 0.5 s repeating `Timer.scheduledTimer` per host view. Each tick:
+
 - calls `ghostty_surface_read_text` for the entire visible viewport (`GhosttyTerminalView.swift:384-408`),
 - builds a fresh Swift `String` from the C buffer,
 - runs `localizedCaseInsensitiveContains("esc to interrupt")` and three `String.contains(...)` checks,
@@ -38,9 +39,9 @@ Note: the singleton `GhosttyRuntime.shared` is intentionally never deallocated, 
 - reverse-iterates lines looking for the `❯` prompt prefix,
 - assigns `claudeState` on `TerminalPaneSession` (an `ObservableObject` `@Published`).
 
-This is the *only* work in `GhosttyTerminalHostView` that runs on the main actor on a regular timer. With 8 worker panes plus the Boss pane all visible, the app does ~18 viewport scrapes per second, every second, for the entire lifetime of the app, on the main thread. The `ClaudeMonitorTracker` debounce (`TerminalPaneSession.swift:57-133`) is cheap, but the read + string work is not.
+This is the _only_ work in `GhosttyTerminalHostView` that runs on the main actor on a regular timer. With 8 worker panes plus the Boss pane all visible, the app does ~18 viewport scrapes per second, every second, for the entire lifetime of the app, on the main thread. The `ClaudeMonitorTracker` debounce (`TerminalPaneSession.swift:57-133`) is cheap, but the read + string work is not.
 
-`worker-live-status.md` (PR #232) explicitly intends `claudeState` to become a *fallback*, with the engine-supplied `LiveWorkerState` as the authoritative signal — `WorkersDetailView.swift:131-142` already prefers `liveState` and only falls back to `claudeState` "until the worker's first hook fires". The screen-scrape is therefore mostly redundant in steady state, but it keeps running at 2 Hz per pane regardless.
+`worker-live-status.md` (PR #232) explicitly intends `claudeState` to become a _fallback_, with the engine-supplied `LiveWorkerState` as the authoritative signal — `WorkersDetailView.swift:131-142` already prefers `liveState` and only falls back to `claudeState` "until the worker's first hook fires". The screen-scrape is therefore mostly redundant in steady state, but it keeps running at 2 Hz per pane regardless.
 
 **Impact.** Constant main-thread cost that scales with active pane count; scales further if Ghostty's text read is O(viewport) which it likely is. Doesn't grow unbounded over time, but is a continuous baseline drag that gets worse as more workers spawn.
 
@@ -68,7 +69,7 @@ Kanban re-renders fire every time `worker.live_states` pushes (see #4) and every
 
 ### 4. `worker.live_states` topic pushes invalidate the entire `ContentView` subtree **(MEDIUM)**
 
-`workerLiveStatesByRunID` and `workerLiveStatesBySlot` are `@Published` on `ChatViewModel` (`ChatViewModel.swift:41,44`). On every `worker_live_states_list` event from the engine the handler reassigns *both dictionaries* by rebuilding from scratch (`ChatViewModel.swift:820-826`):
+`workerLiveStatesByRunID` and `workerLiveStatesBySlot` are `@Published` on `ChatViewModel` (`ChatViewModel.swift:41,44`). On every `worker_live_states_list` event from the engine the handler reassigns _both dictionaries_ by rebuilding from scratch (`ChatViewModel.swift:820-826`):
 
 ```swift
 workerLiveStatesByRunID = Dictionary(uniqueKeysWithValues: states.map { ($0.runId, $0) })
@@ -94,7 +95,7 @@ $ grep -n "messageList" tools/boss/app-macos/Sources/ContentView.swift
 
 So every `chunk` event from the engine still hits `appendAssistantChunk`, mutates `agents[bossIdx].timeline`, fires `objectWillChange` on `ChatViewModel`, invalidates the whole `ContentView` subtree (#4), and stores the chunk in a buffer that no view ever reads. The same pattern applies to `terminalStarted` / `terminalOutput` / `terminalDone`: `agents[i].timeline` and `agents[i].terminalEntryIndexByID` grow unboundedly during a session.
 
-`maxTerminalOutputChars = 200_000` (`ChatViewModel.swift:159, 1126-1129`) caps the *contents* of any one terminal entry, but does not cap the *number* of entries. A long-running session that makes many tool calls accumulates indefinitely many entries.
+`maxTerminalOutputChars = 200_000` (`ChatViewModel.swift:159, 1126-1129`) caps the _contents_ of any one terminal entry, but does not cap the _number_ of entries. A long-running session that makes many tool calls accumulates indefinitely many entries.
 
 **Impact.** Twofold:
 
@@ -111,7 +112,7 @@ So every `chunk` event from the engine still hits `appendAssistantChunk`, mutate
 - filter on `showBlockedOnly`,
 - if the search box is non-empty, do four `localizedCaseInsensitiveContains` calls per item.
 
-Then `workItems(in:)` filters by column and sorts the result. `workColumn` (`ContentView.swift:632-684`) calls `workSections(in: column)` — once per column — every time `body` runs, which is every time *any* `@Published` property on `ChatViewModel` fires (so every push from #4, every chunk from #5, etc.).
+Then `workItems(in:)` filters by column and sorts the result. `workColumn` (`ContentView.swift:632-684`) calls `workSections(in: column)` — once per column — every time `body` runs, which is every time _any_ `@Published` property on `ChatViewModel` fires (so every push from #4, every chunk from #5, etc.).
 
 For a single `worker.live_states` push: 4 columns × full `visibleWorkItems` walk = 4 × O(N log N) of all tasks plus chores. With dozens of cards across columns, this is a non-trivial main-thread cost on every event.
 
@@ -133,7 +134,7 @@ Tied to #5 — the dictionary on `Agent` (`Models.swift:34`) maps every terminal
 
 ## Surfaces audited and ruled clean (so nobody re-digs)
 
-- **JSON decode is off main.** `EngineClient.consumeLines` runs on `Boss.EngineClient` queue; the JSON parse uses `JSONSerialization.jsonObject` and runs *before* the MainActor hop. No JSON decode happens on the main actor (`EngineClient.swift:479-683`). This is correct.
+- **JSON decode is off main.** `EngineClient.consumeLines` runs on `Boss.EngineClient` queue; the JSON parse uses `JSONSerialization.jsonObject` and runs _before_ the MainActor hop. No JSON decode happens on the main actor (`EngineClient.swift:479-683`). This is correct.
 - **Reconnect logic is bounded.** `EngineClient.scheduleReconnect` checks `shouldReconnect` and `connection == nil` before scheduling, and the cancellation path nils `connection` correctly (`EngineClient.swift:691-702`). No double-scheduling, no orphan reconnect tasks.
 - **`NotificationCenter` observers are tracked and removed.** `GhosttyRuntime.installObservers` stores tokens in `observers`, and `deinit` removes them all (`GhosttyRuntime.swift:101-107, 113-135`). The runtime is a singleton so `deinit` never fires in practice, but the bookkeeping is correct — no observer leak path.
 - **`pendingGeometrySync` cancellation is correct.** `GhosttyTerminalHostView.deinit` cancels the pending coalesced reflow (`GhosttyTerminalView.swift:120-122`). The 30 Hz throttle on `ghostty_surface_set_size` is correct — drag-resize won't reflow scrollback at frame rate.
@@ -155,7 +156,7 @@ Each one bite-sized and independently mergeable. Severity in `[ ]`.
 
 4. **[MEDIUM] Stop accumulating Boss assistant chunks into `agents[].timeline` now that the Boss pane is libghostty.** Either drop the `appendAssistantChunk` / terminal-activity accumulation for the Boss agent specifically, or remove the `messageList` dead code path entirely and stop accumulating for all agents (workers don't render their timeline either; they're libghostty panes). Acceptance: a 1-hour Boss session keeps `agents[bossIdx].timeline.count` bounded; RSS growth attributable to `Agent.timeline` is zero.
 
-5. **[MEDIUM] Memoize / split the `worker.live_states` published surface.** Split `workerLiveStatesByRunID` and `workerLiveStatesBySlot` into a child `ObservableObject` (e.g. `LiveWorkerStateStore`), or move them off `@Published` and emit a slimmer `ObservableObjectPublisher` that only fires when the *set of slot ids* or per-slot `activity` changes (not every payload reassignment). Acceptance: a `worker.live_states` push that doesn't change any slot's activity does not invalidate `ContentView.body`.
+5. **[MEDIUM] Memoize / split the `worker.live_states` published surface.** Split `workerLiveStatesByRunID` and `workerLiveStatesBySlot` into a child `ObservableObject` (e.g. `LiveWorkerStateStore`), or move them off `@Published` and emit a slimmer `ObservableObjectPublisher` that only fires when the _set of slot ids_ or per-slot `activity` changes (not every payload reassignment). Acceptance: a `worker.live_states` push that doesn't change any slot's activity does not invalidate `ContentView.body`.
 
 6. **[MEDIUM] Cache `visibleWorkItems` and per-column `workSections`.** Compute once per `workTree` / filter / search-text change, not per `body`. A `private var cachedVisibleItems: [WorkTask]` invalidated on any input mutation is enough; or precompute a `[WorkBoardColumnKey: [WorkBoardSection]]` map. Acceptance: scrolling the kanban with no engine traffic produces zero calls into `visibleWorkItems`.
 

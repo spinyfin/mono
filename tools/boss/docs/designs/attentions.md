@@ -2,9 +2,9 @@
 
 ## Problem
 
-Agents working on Boss tasks routinely reach a point where they need the human. A design worker writing a doc has genuine open questions ("should this be one table or two?", "yes/no: do we gate extraction behind a flag?"). An implementation worker finishing a chore notices three follow-on pieces of work worth filing. Today none of this reaches the operator as an *actionable* signal. It lives in the transcript, or at best in an "Open questions" section of a design doc that nobody is paged about. The operator finds out by reading, then has to hand-translate "the agent asked X" into a doc edit or a new task.
+Agents working on Boss tasks routinely reach a point where they need the human. A design worker writing a doc has genuine open questions ("should this be one table or two?", "yes/no: do we gate extraction behind a flag?"). An implementation worker finishing a chore notices three follow-on pieces of work worth filing. Today none of this reaches the operator as an _actionable_ signal. It lives in the transcript, or at best in an "Open questions" section of a design doc that nobody is paged about. The operator finds out by reading, then has to hand-translate "the agent asked X" into a doc edit or a new task.
 
-There *is* an existing attention surface — `work_attention_items` (`attn_…` ids, the `work_attention_items` table) — but it is a fundamentally different thing: engine-raised **operational alerts** ("repo unresolved", "manifest missing", "CI budget exhausted", "parent PR merged mid-revision"). Those are conditions the system surfaces and that auto-resolve when the underlying state clears. They carry no question, no answer, no proposed work, and no grouping. They are not what an agent raises to *ask the human something*.
+There _is_ an existing attention surface — `work_attention_items` (`attn_…` ids, the `work_attention_items` table) — but it is a fundamentally different thing: engine-raised **operational alerts** ("repo unresolved", "manifest missing", "CI budget exhausted", "parent PR merged mid-revision"). Those are conditions the system surfaces and that auto-resolve when the underlying state clears. They carry no question, no answer, no proposed work, and no grouping. They are not what an agent raises to _ask the human something_.
 
 This doc designs **Attentions**: actionable notifications an agent raises to pull the human into the loop. Every attention always has an action attached — an attention with no possible action is not an attention. The two launch kinds are **Question** (the agent wants the human to answer something, typically feeding back into a design doc) and **Followup** (the agent proposes a piece of work it noticed while completing a task). Attentions surface in a new **Notifications** toolbar window and, for questions about a design doc, **inline in the design-doc viewer**. Critically, related attentions **batch into groups** so that answering ten questions about one doc produces **one** revision, not ten.
 
@@ -22,14 +22,14 @@ This doc designs **Attentions**: actionable notifications an agent raises to pul
 
 ## Non-Goals
 
-- **Folding `work_attention_items` into this store.** Operational alerts stay where they are and keep their own lifecycle. The new Notifications window may *present* both later behind a category filter, but the stores stay separate (see Alternatives). Renaming/migrating the legacy table is explicitly out of scope.
-- **Blocking a worker on an answer.** When an agent raises a mid-task question, the task does not halt waiting for a human. The agent proceeds with its best judgement; the answer feeds a *later* revision. Synchronous "agent waits for human" is a future concern.
-- **Building the GitHub PR-review-comment triage UI.** That effort (noted in the revision-tasks design) is a separate producer that may *create* attentions later; this design must not preclude it, but does not build it.
+- **Folding `work_attention_items` into this store.** Operational alerts stay where they are and keep their own lifecycle. The new Notifications window may _present_ both later behind a category filter, but the stores stay separate (see Alternatives). Renaming/migrating the legacy table is explicitly out of scope.
+- **Blocking a worker on an answer.** When an agent raises a mid-task question, the task does not halt waiting for a human. The agent proceeds with its best judgement; the answer feeds a _later_ revision. Synchronous "agent waits for human" is a future concern.
+- **Building the GitHub PR-review-comment triage UI.** That effort (noted in the revision-tasks design) is a separate producer that may _create_ attentions later; this design must not preclude it, but does not build it.
 - **A general inbox / chat with the agent.** Attentions are discrete, typed, actionable items — not a conversation thread.
 - **Auto-applying answers without producing a reviewable artifact.** Answering a question never silently rewrites a merged doc; it spawns a revision/design task whose output is a PR the human reviews and merges.
 - **Auto-accepting followups.** A proposed followup is never turned into a task without an explicit human gesture.
 - **Cross-product attentions.** An attention belongs to exactly one product, inherited from its association.
-- **New friendly-id scheme beyond a per-product `A<n>` for groups.** Individual member attentions are referenced by primary id in the CLI (like `cir_…` ci-remediation ids today); only the actionable *group* earns a short id.
+- **New friendly-id scheme beyond a per-product `A<n>` for groups.** Individual member attentions are referenced by primary id in the CLI (like `cir_…` ci-remediation ids today); only the actionable _group_ earns a short id.
 
 ## Alternatives considered
 
@@ -37,13 +37,13 @@ This doc designs **Attentions**: actionable notifications an agent raises to pul
 
 Reuse the existing `attn_…` table: add `question_type`, `answer`, `choice_options`, `proposed_*`, and a `group_id`, and discriminate via new `kind` values (`question`, `followup`).
 
-**Rejected.** `work_attention_items` is read by the engine's *operational* loop — a `repo_unresolved` row gates dispatch; rows auto-resolve when the condition clears. Mixing human-answered questions into that table risks engine code treating a question as a dispatch blocker (or auto-resolving a question because some unrelated state changed). The shapes barely overlap: operational alerts have no answer payload, no question type, no grouping, no proposed-work payload, and no notion of "actioning produces a revision". The only genuine overlap is the *UI list*, which we get by giving both stores a common list-presentation shape (below) — not by sharing a table. Keeping a clean store also lets the operational table be renamed later without disturbing this feature.
+**Rejected.** `work_attention_items` is read by the engine's _operational_ loop — a `repo_unresolved` row gates dispatch; rows auto-resolve when the condition clears. Mixing human-answered questions into that table risks engine code treating a question as a dispatch blocker (or auto-resolving a question because some unrelated state changed). The shapes barely overlap: operational alerts have no answer payload, no question type, no grouping, no proposed-work payload, and no notion of "actioning produces a revision". The only genuine overlap is the _UI list_, which we get by giving both stores a common list-presentation shape (below) — not by sharing a table. Keeping a clean store also lets the operational table be renamed later without disturbing this feature.
 
 ### B. Pure post-hoc extraction as the primary creation path
 
 Don't change agent instructions at all. Run a supervisor model pass over every completed transcript and every design doc to extract questions and followups, and turn whatever it finds into attentions.
 
-**Rejected as the primary path** (kept as a backstop). Extraction is brittle and lossy for exactly the data we most need: it can't reliably tell a yes/no question from a multiple-choice one, can't recover the *choices*, and can't anchor a question to the doc section it's about (which the inline surface needs). It also costs a model call per transcript/doc and can hallucinate questions or work that the agent never actually raised. Structured emission — the agent telling us, in a fenced manifest, exactly `{type, prompt, choices, anchor}` — is precise, cheap (no extra model call), idempotent, and reuses machinery we already have for design-producing tasks (the `DOC_REF:` sentinel + sibling-manifest pattern). We therefore **lead with structured emission and fall back to extraction**, flagging extracted rows as lower-confidence.
+**Rejected as the primary path** (kept as a backstop). Extraction is brittle and lossy for exactly the data we most need: it can't reliably tell a yes/no question from a multiple-choice one, can't recover the _choices_, and can't anchor a question to the doc section it's about (which the inline surface needs). It also costs a model call per transcript/doc and can hallucinate questions or work that the agent never actually raised. Structured emission — the agent telling us, in a fenced manifest, exactly `{type, prompt, choices, anchor}` — is precise, cheap (no extra model call), idempotent, and reuses machinery we already have for design-producing tasks (the `DOC_REF:` sentinel + sibling-manifest pattern). We therefore **lead with structured emission and fall back to extraction**, flagging extracted rows as lower-confidence.
 
 ### C. One attention = one downstream artifact (no grouping)
 
@@ -55,7 +55,7 @@ Each question answered immediately spawns its own revision; each followup immedi
 
 When the human answers, the engine itself rewrites the markdown and commits it.
 
-**Rejected.** It loses the agentic reconciliation that makes the answer *land well* (the answer "yes, two tables" needs a worker to actually restructure the schema section, not a string splice). It can't handle the "doc already merged → needs a fresh PR" case, bypasses review, and fights the PR-branch model. Spawning a revision (open PR) or a fresh design task (merged doc) reuses the pipeline we already trust and keeps a human in the merge loop.
+**Rejected.** It loses the agentic reconciliation that makes the answer _land well_ (the answer "yes, two tables" needs a worker to actually restructure the schema section, not a string splice). It can't handle the "doc already merged → needs a fresh PR" case, bypasses review, and fights the PR-branch model. Spawning a revision (open PR) or a fresh design task (merged doc) reuses the pipeline we already trust and keeps a human in the merge loop.
 
 ## Chosen approach
 
@@ -67,54 +67,54 @@ Two new tables, mirroring the conventions in `tools/boss/protocol/src/types.rs` 
 
 **`attention_groups`** — the actionable unit. Id prefix `atg`.
 
-| column | type | notes |
-|---|---|---|
-| `id` | TEXT PK | `atg_{nanos:x}_{counter:x}` |
-| `product_id` | TEXT NOT NULL | FK `products(id)`; inherited from association |
-| `short_id` | INTEGER NULL | per-product `A<n>` friendly id; partial-unique index, mirrors tasks/projects |
-| `kind` | TEXT NOT NULL | `question` \| `followup` (extensible) |
-| `association_project_id` | TEXT NULL | FK `projects(id)` |
-| `association_task_id` | TEXT NULL | FK `tasks(id)` |
-| `source_kind` | TEXT NOT NULL | `design_doc` \| `task_transcript` \| `manual` |
-| `source_task_id` | TEXT NULL | originating design/impl task (the jump-back target) |
-| `source_run_id` | TEXT NULL | transcript pointer (`runs.id`); pairs with `runs.transcript_path` |
-| `source_doc_path` | TEXT NULL | repo-relative design-doc path (for `design_doc`) |
-| `source_doc_repo_remote_url` | TEXT NULL | canonical repo form |
-| `source_doc_branch` | TEXT NULL | head branch for in-review viewing |
-| `grouping_key` | TEXT NOT NULL | derived stable key (below); upsert dedup target |
-| `generation` | INTEGER NOT NULL | bump per source re-run so a new run never merges into a closed group |
-| `state` | TEXT NOT NULL | `open` \| `partially_answered` \| `actioned` \| `dismissed` (default `open`) |
-| `produced_artifact_kind` | TEXT NULL | `revision` \| `design_task` \| `tasks` (set on action) |
-| `produced_artifact_ref` | TEXT NULL | JSON: revision task id / new task ids / PR url |
-| `created_at` | TEXT NOT NULL | RFC 3339 / epoch seconds, repo convention |
-| `actioned_at` | TEXT NULL | |
-| `dismissed_at` | TEXT NULL | |
+| column                       | type             | notes                                                                        |
+| ---------------------------- | ---------------- | ---------------------------------------------------------------------------- |
+| `id`                         | TEXT PK          | `atg_{nanos:x}_{counter:x}`                                                  |
+| `product_id`                 | TEXT NOT NULL    | FK `products(id)`; inherited from association                                |
+| `short_id`                   | INTEGER NULL     | per-product `A<n>` friendly id; partial-unique index, mirrors tasks/projects |
+| `kind`                       | TEXT NOT NULL    | `question` \| `followup` (extensible)                                        |
+| `association_project_id`     | TEXT NULL        | FK `projects(id)`                                                            |
+| `association_task_id`        | TEXT NULL        | FK `tasks(id)`                                                               |
+| `source_kind`                | TEXT NOT NULL    | `design_doc` \| `task_transcript` \| `manual`                                |
+| `source_task_id`             | TEXT NULL        | originating design/impl task (the jump-back target)                          |
+| `source_run_id`              | TEXT NULL        | transcript pointer (`runs.id`); pairs with `runs.transcript_path`            |
+| `source_doc_path`            | TEXT NULL        | repo-relative design-doc path (for `design_doc`)                             |
+| `source_doc_repo_remote_url` | TEXT NULL        | canonical repo form                                                          |
+| `source_doc_branch`          | TEXT NULL        | head branch for in-review viewing                                            |
+| `grouping_key`               | TEXT NOT NULL    | derived stable key (below); upsert dedup target                              |
+| `generation`                 | INTEGER NOT NULL | bump per source re-run so a new run never merges into a closed group         |
+| `state`                      | TEXT NOT NULL    | `open` \| `partially_answered` \| `actioned` \| `dismissed` (default `open`) |
+| `produced_artifact_kind`     | TEXT NULL        | `revision` \| `design_task` \| `tasks` (set on action)                       |
+| `produced_artifact_ref`      | TEXT NULL        | JSON: revision task id / new task ids / PR url                               |
+| `created_at`                 | TEXT NOT NULL    | RFC 3339 / epoch seconds, repo convention                                    |
+| `actioned_at`                | TEXT NULL        |                                                                              |
+| `dismissed_at`               | TEXT NULL        |                                                                              |
 
 CHECK: exactly one of `association_project_id` / `association_task_id` is non-null (mirrors the `work_attention_items` XOR CHECK). Unique index on `(grouping_key, generation)` makes reconciliation an upsert.
 
 **`attentions`** — a single member of a group. Id prefix `atn`. (Distinct from the legacy operational `attn_…` ids; the extra `t` is the only visible difference, so implementation should treat the prefix as a hint only and never key logic on it. A later cleanup may rename the operational prefix — out of scope here.)
 
-| column | type | notes |
-|---|---|---|
-| `id` | TEXT PK | `atn_{nanos:x}_{counter:x}` |
-| `group_id` | TEXT NOT NULL | FK `attention_groups(id)` ON DELETE CASCADE |
-| `ordinal` | INTEGER NOT NULL | display order within the group |
-| `source_anchor` | TEXT NULL | doc section / heading slug (questions) or transcript offset hint; drives inline placement |
-| `answer_state` | TEXT NOT NULL | `open` \| `answered` \| `skipped` \| `dismissed` (default `open`) |
-| `created_at` | TEXT NOT NULL | |
-| `answered_at` | TEXT NULL | |
-| **question fields** | | populated when `group.kind = question` |
-| `question_type` | TEXT NULL | `yes_no` \| `multiple_choice` \| `prompt` |
-| `prompt_text` | TEXT NULL | the question shown to the human |
-| `choice_options` | TEXT NULL | JSON array of strings (for `multiple_choice`) |
-| `answer` | TEXT NULL | captured answer: `"yes"`/`"no"`, chosen index/value, or free text |
-| **followup fields** | | populated when `group.kind = followup` |
-| `proposed_name` | TEXT NULL | pre-fills task name |
-| `proposed_description` | TEXT NULL | pre-fills task description |
-| `proposed_effort` | TEXT NULL | effort hint (`trivial`…`max`) |
-| `proposed_work_kind` | TEXT NULL | `task` \| `chore` \| `project` |
-| `rationale` | TEXT NULL | why the agent suggested it |
-| `confidence_source` | TEXT NOT NULL | `structured` \| `extracted` (provenance / trust flag) |
+| column                 | type             | notes                                                                                     |
+| ---------------------- | ---------------- | ----------------------------------------------------------------------------------------- |
+| `id`                   | TEXT PK          | `atn_{nanos:x}_{counter:x}`                                                               |
+| `group_id`             | TEXT NOT NULL    | FK `attention_groups(id)` ON DELETE CASCADE                                               |
+| `ordinal`              | INTEGER NOT NULL | display order within the group                                                            |
+| `source_anchor`        | TEXT NULL        | doc section / heading slug (questions) or transcript offset hint; drives inline placement |
+| `answer_state`         | TEXT NOT NULL    | `open` \| `answered` \| `skipped` \| `dismissed` (default `open`)                         |
+| `created_at`           | TEXT NOT NULL    |                                                                                           |
+| `answered_at`          | TEXT NULL        |                                                                                           |
+| **question fields**    |                  | populated when `group.kind = question`                                                    |
+| `question_type`        | TEXT NULL        | `yes_no` \| `multiple_choice` \| `prompt`                                                 |
+| `prompt_text`          | TEXT NULL        | the question shown to the human                                                           |
+| `choice_options`       | TEXT NULL        | JSON array of strings (for `multiple_choice`)                                             |
+| `answer`               | TEXT NULL        | captured answer: `"yes"`/`"no"`, chosen index/value, or free text                         |
+| **followup fields**    |                  | populated when `group.kind = followup`                                                    |
+| `proposed_name`        | TEXT NULL        | pre-fills task name                                                                       |
+| `proposed_description` | TEXT NULL        | pre-fills task description                                                                |
+| `proposed_effort`      | TEXT NULL        | effort hint (`trivial`…`max`)                                                             |
+| `proposed_work_kind`   | TEXT NULL        | `task` \| `chore` \| `project`                                                            |
+| `rationale`            | TEXT NULL        | why the agent suggested it                                                                |
+| `confidence_source`    | TEXT NOT NULL    | `structured` \| `extracted` (provenance / trust flag)                                     |
 
 The Rust `Attention` and `AttentionGroup` structs follow the repo's builder convention — `#[derive(bon::Builder)]` with `#[builder(on(String, into))]` once they cross the 8-field threshold (both do), `Option<T>` fields auto-optional, `#[builder(default = …)]` for `state`/`answer_state`/`generation`. The production DB mapper functions (`map_attention`, `map_attention_group`) use struct literals so a new column is a compile error until mapped, per the repo convention.
 
@@ -125,7 +125,7 @@ The **grouping key** is the stable string `kind|association|source-discriminator
 - **Questions from a design doc**: `question|{project_id}|doc:{source_doc_path}`. All questions a worker raises about one doc collapse into one group.
 - **Followups from a task transcript**: `followup|{originating_task_id}`. All followups a worker proposes while completing one task collapse into one group.
 
-`generation` separates re-runs: if the same design task runs again (a revision worker re-emits its question manifest), the engine reconciles into the *open* group of the current generation, or — if the prior group is already `actioned`/`dismissed` — bumps `generation` and starts a fresh group. This is what keeps "one group ⇒ one revision" true across iteration.
+`generation` separates re-runs: if the same design task runs again (a revision worker re-emits its question manifest), the engine reconciles into the _open_ group of the current generation, or — if the prior group is already `actioned`/`dismissed` — bumps `generation` and starts a fresh group. This is what keeps "one group ⇒ one revision" true across iteration.
 
 **Partial answers (multi-sitting).** Members carry their own `answer_state`. A human can answer 3 of 10 questions now and the rest later; each `answer`/`answer_state` is persisted independently and the group sits at `partially_answered`. Nothing downstream happens until the human **actions** the group.
 
@@ -135,7 +135,7 @@ The **grouping key** is the stable string `kind|association|source-discriminator
 2. records `produced_artifact_kind` + `produced_artifact_ref` on the group,
 3. transitions the group to `actioned` (terminal).
 
-If, later, the source emits *new* questions/followups, they land in a **new** group (next `generation`) — they never reopen a closed one. This is the mechanism that prevents the N-revisions explosion while still letting iteration continue.
+If, later, the source emits _new_ questions/followups, they land in a **new** group (next `generation`) — they never reopen a closed one. This is the mechanism that prevents the N-revisions explosion while still letting iteration continue.
 
 ### Creation pipeline (engine-owned, structured-first hybrid)
 
@@ -205,7 +205,7 @@ boss attention action <A12|atg_…> [--skip-unanswered] [--confirm]
   # --json returns { "attention_group": <group>, "produced": { "kind": …, "ref": … } }
 ```
 
-**Who creates attentions via the CLI?** The dominant path is engine-side (manifests + extraction during completion processing) and does **not** round-trip through the CLI — the engine writes the store directly. `boss attention create` exists for the explicit mid-task emission case and for tooling/tests; it is a thin RPC client like every other verb. Agents are *encouraged* to use the structured manifest/sentinel emission over imperative `create` calls, because the manifest path is reconciled idempotently and survives re-runs, whereas a bare `create` is a one-shot.
+**Who creates attentions via the CLI?** The dominant path is engine-side (manifests + extraction during completion processing) and does **not** round-trip through the CLI — the engine writes the store directly. `boss attention create` exists for the explicit mid-task emission case and for tooling/tests; it is a thin RPC client like every other verb. Agents are _encouraged_ to use the structured manifest/sentinel emission over imperative `create` calls, because the manifest path is reconciled idempotently and survives re-runs, whereas a bare `create` is a one-shot.
 
 New RPC variants mirror the existing `*AttentionItem*` ones in `wire.rs`: `ListAttentionGroups`, `GetAttentionGroup`, `CreateAttention`, `AnswerAttention`, `ActionAttentionGroup`, `DismissAttention`; events `AttentionCreated`, `AttentionGroupUpdated`, `AttentionGroupActioned`.
 
@@ -222,7 +222,7 @@ New RPC variants mirror the existing `*AttentionItem*` ones in `wire.rs`: `ListA
 
 The card footer is a single button: **Submit answers** (questions) or **Create selected** (followups), with a "skip remaining" affordance. Pressing it calls `ActionAttentionGroup` and the group leaves the open list, leaving a link to the produced revision/tasks.
 
-**Inline in the design-doc viewer.** `DesignRendererView` gains a **questions surface** — a collapsible right sidebar (or bottom bar) listing the open question group(s) whose `source_doc_path` matches the doc on screen, with the *same* inline answer controls as the window. Because each question carries a `source_anchor` (heading slug), questions render next to the section they concern, reusing the anchored-placement substrate from the comments-in-markdown-viewer design (text-anchor resilience across edits). Answering here calls the identical `AnswerAttention` / `ActionAttentionGroup` RPC, so a doc revision produced inline is indistinguishable from one produced in the Notifications window.
+**Inline in the design-doc viewer.** `DesignRendererView` gains a **questions surface** — a collapsible right sidebar (or bottom bar) listing the open question group(s) whose `source_doc_path` matches the doc on screen, with the _same_ inline answer controls as the window. Because each question carries a `source_anchor` (heading slug), questions render next to the section they concern, reusing the anchored-placement substrate from the comments-in-markdown-viewer design (text-anchor resilience across edits). Answering here calls the identical `AnswerAttention` / `ActionAttentionGroup` RPC, so a doc revision produced inline is indistinguishable from one produced in the Notifications window.
 
 **Grouped everywhere** so a batch of questions is always answered together and yields one revision.
 
@@ -253,6 +253,6 @@ These are the points a reviewer should land on before implementation tasks are f
 
 7. **Extraction hallucination / cost.** The backstop can invent questions/followups the agent never raised. Mitigation: flag clearly as `extracted`, gate behind a feature flag, and consider requiring human confirmation before an extracted followup can be actioned. Open: do we ship the backstop in v1 or defer it?
 
-8. **Short-id namespace.** Proposal gives *groups* a per-product `A<n>` and references *members* by primary id. Confirm `A` doesn't collide with any planned namespace and that members don't also need friendly ids for CLI ergonomics.
+8. **Short-id namespace.** Proposal gives _groups_ a per-product `A<n>` and references _members_ by primary id. Confirm `A` doesn't collide with any planned namespace and that members don't also need friendly ids for CLI ergonomics.
 
 9. **Mid-task questions are non-blocking (non-goal, confirm).** An agent that raises a question via `boss attention create` keeps working with its best guess; the answer lands in a later revision. Confirm we don't want a synchronous "agent waits" mode in v1.

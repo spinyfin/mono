@@ -37,7 +37,7 @@ What it supports:
 - Thematic breaks (`---`, `***`, `___`)
 - GFM-style pipe tables with a separator row
 - Inline formatting via `AttributedString(markdown:source, options:
-  .inlineOnlyPreservingWhitespace)` — emphasis, strong, inline code,
+.inlineOnlyPreservingWhitespace)` — emphasis, strong, inline code,
   links resolve to attributed runs but SwiftUI's `Text` renders only a
   subset of those attributes (no real link affordance, no underline on
   hover, no theming hook).
@@ -97,13 +97,13 @@ was already proven to work.
 
 ### Candidates evaluated
 
-| Library | What it is | Renders SwiftUI? | GFM | Code highlighting | Theming | Async images | Maintained |
-|---|---|---|---|---|---|---|---|
-| `gonzalezreal/textual` | SwiftUI text engine, Markdown via Foundation's `AttributedString` + `PresentationIntent`, custom `MarkupParser` protocol | yes | tables, strikethrough, task lists, blockquotes, code blocks | built-in, themeable | full style protocol (`.default`, `.gitHub`, custom) | yes, with `AttachmentLoader` | yes (gonzalezreal, swift-package-index) |
-| `gonzalezreal/swift-markdown-ui` (MarkdownUI) | SwiftUI-native CommonMark + GFM renderer, predecessor to Textual | yes | full GFM, task lists | via `CodeSyntaxHighlighter` protocol, no built-in | block-level theme protocol (`MarkdownStyle`, `Theme`) | yes | maintenance mode — author redirects to Textual |
-| Apple `swift-markdown` | Parser only, produces an AST (`Document` of `Markup` nodes); no rendering | no | full CommonMark + tables | n/a | n/a | n/a | yes (apple) |
-| `iwasrobbed/Down` | Swift wrapper around `cmark-gfm`; outputs `NSAttributedString` / HTML | no (AppKit/UIKit only) | full GFM | no | limited (`DownStyler` for fonts/colors) | no | low activity since 2023 |
-| `JohnSundell/Ink` | Pure-Swift CommonMark-ish renderer → HTML string | no | partial | no | no | no | low activity, server-flavoured |
+| Library                                       | What it is                                                                                                               | Renders SwiftUI?       | GFM                                                         | Code highlighting                                 | Theming                                               | Async images                 | Maintained                                     |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------- | ---------------------------- | ---------------------------------------------- |
+| `gonzalezreal/textual`                        | SwiftUI text engine, Markdown via Foundation's `AttributedString` + `PresentationIntent`, custom `MarkupParser` protocol | yes                    | tables, strikethrough, task lists, blockquotes, code blocks | built-in, themeable                               | full style protocol (`.default`, `.gitHub`, custom)   | yes, with `AttachmentLoader` | yes (gonzalezreal, swift-package-index)        |
+| `gonzalezreal/swift-markdown-ui` (MarkdownUI) | SwiftUI-native CommonMark + GFM renderer, predecessor to Textual                                                         | yes                    | full GFM, task lists                                        | via `CodeSyntaxHighlighter` protocol, no built-in | block-level theme protocol (`MarkdownStyle`, `Theme`) | yes                          | maintenance mode — author redirects to Textual |
+| Apple `swift-markdown`                        | Parser only, produces an AST (`Document` of `Markup` nodes); no rendering                                                | no                     | full CommonMark + tables                                    | n/a                                               | n/a                                                   | n/a                          | yes (apple)                                    |
+| `iwasrobbed/Down`                             | Swift wrapper around `cmark-gfm`; outputs `NSAttributedString` / HTML                                                    | no (AppKit/UIKit only) | full GFM                                                    | no                                                | limited (`DownStyler` for fonts/colors)               | no                           | low activity since 2023                        |
+| `JohnSundell/Ink`                             | Pure-Swift CommonMark-ish renderer → HTML string                                                                         | no                     | partial                                                     | no                                                | no                                                    | no                           | low activity, server-flavoured                 |
 
 ### Recommendation: `gonzalezreal/textual`
 
@@ -220,7 +220,7 @@ forces one.**
    Worst case if the renderer mis-handles something, the user closes
    the window — no impact on the kanban. Swap
    `MarkdownBodyView(source:)` for `StructuredText(markdown:)
-   .textual.structuredTextStyle(.boss)`. Keep the old
+.textual.structuredTextStyle(.boss)`. Keep the old
    `MarkdownBodyView` / `MarkdownParser` types alive for now — the
    Designs tab still uses them.
 3. **Second surface: the Designs file viewer.** Larger and more varied

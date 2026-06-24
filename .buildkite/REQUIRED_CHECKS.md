@@ -12,13 +12,13 @@ Buildkite emits check names in the form `buildkite/mono/<step-key>`, where `<ste
 
 These checks are currently **required** (block merge if red):
 
-| Check name | Step key in pipeline.yml |
-|---|---|
-| `buildkite/mono/bootstrap` | `bootstrap` |
-| `buildkite/mono/bazel-build` | `bazel-build` |
-| `buildkite/mono/mac-app-build` | `mac-app-build` |
-| `buildkite/mono/checks` | `checks` |
-| `buildkite/mono/bazel-test` | `bazel-test` |
+| Check name                     | Step key in pipeline.yml |
+| ------------------------------ | ------------------------ |
+| `buildkite/mono/bootstrap`     | `bootstrap`              |
+| `buildkite/mono/bazel-build`   | `bazel-build`            |
+| `buildkite/mono/mac-app-build` | `mac-app-build`          |
+| `buildkite/mono/checks`        | `checks`                 |
+| `buildkite/mono/bazel-test`    | `bazel-test`             |
 
 ## How contexts are emitted
 

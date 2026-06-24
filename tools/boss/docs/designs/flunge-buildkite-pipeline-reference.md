@@ -2,7 +2,7 @@
 
 Audit of flunge's `.buildkite/` setup, captured for the engineer who will land mono's `.buildkite/` skeleton (Boss CI #2). Source: `~/Documents/dev/flunge/.buildkite/` and the live GitHub branch-protection config on `brianduff/flunge`.
 
-The parent design doc (`boss-ci-buildkite-pipeline-mirroring-flunge.md`) describes the *target* mono pipeline. This doc describes the *current* flunge pipeline. Where the two disagree, see "Where mono should diverge" at the bottom — those gaps are the load-bearing decisions for #2.
+The parent design doc (`boss-ci-buildkite-pipeline-mirroring-flunge.md`) describes the _target_ mono pipeline. This doc describes the _current_ flunge pipeline. Where the two disagree, see "Where mono should diverge" at the bottom — those gaps are the load-bearing decisions for #2.
 
 ## TL;DR
 
@@ -29,28 +29,29 @@ Buildkite reads this on every trigger. The upload step does the real work: detec
 
 Computes four booleans — `need_backend`, `need_cli`, `need_frontend`, `need_ios` — from `git diff --name-only <merge-base> <commit>`:
 
-| Path pattern | Flips on |
-|---|---|
-| `backend/*` | `need_backend` |
-| `cli/*`, `checks/*`, `tools/checks_bazel/*`, `tools/checks_js_componentizer/*`, `tools/flunge-debug/*`, `tools/release-prod`, `tools/release-main` | `need_cli` |
+| Path pattern                                                                                                                                                                                   | Flips on                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `backend/*`                                                                                                                                                                                    | `need_backend`                                    |
+| `cli/*`, `checks/*`, `tools/checks_bazel/*`, `tools/checks_js_componentizer/*`, `tools/flunge-debug/*`, `tools/release-prod`, `tools/release-main`                                             | `need_cli`                                        |
 | `rbe/*`, `BUILD`, `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`, `Cargo.toml`, `Cargo.lock`, `tools/checks`, `CHECKS.yaml`, `*/CHECKS.yaml`, `.buildkite/*`, `.github/actions/setup-bazel/*` | both `need_backend` and `need_cli` (shared infra) |
-| `frontend/*`, `.buildkite/*` | `need_frontend` |
-| `mobile/ios/*` | `need_ios` |
+| `frontend/*`, `.buildkite/*`                                                                                                                                                                   | `need_frontend`                                   |
+| `mobile/ios/*`                                                                                                                                                                                 | `need_ios`                                        |
 
 If base-ref detection fails (first commit, shallow clone, etc.), all four are set — fail safe by running everything.
 
 Steps the dispatcher can emit:
 
-| Step key | When | Queue | Depends on | Script |
-|---|---|---|---|---|
-| `checks-framework` | `need_backend OR need_cli` | `linux-amd64` | — | `run_checks.sh` |
-| `backend-bazel-tests` | `need_backend` | `linux-amd64` | `checks-framework` | `run_backend_bazel_tests.sh` |
-| `cli-bazel-tests` | `need_cli` | `linux-amd64` | `checks-framework` | `run_cli_bazel_tests.sh` |
-| `frontend-tests` | `need_frontend` | `linux-amd64` | — | `run_frontend_tests.sh` |
-| `ios-bazel-build` | `need_ios` | `macos-arm64` (`BUILDKITE_IOS_QUEUE` overrides) | — | `run_ios_bazel_build.sh` |
-| `no-ci-steps` | nothing else fires | `linux-amd64` | — | inline `echo` |
+| Step key              | When                       | Queue                                           | Depends on         | Script                       |
+| --------------------- | -------------------------- | ----------------------------------------------- | ------------------ | ---------------------------- |
+| `checks-framework`    | `need_backend OR need_cli` | `linux-amd64`                                   | —                  | `run_checks.sh`              |
+| `backend-bazel-tests` | `need_backend`             | `linux-amd64`                                   | `checks-framework` | `run_backend_bazel_tests.sh` |
+| `cli-bazel-tests`     | `need_cli`                 | `linux-amd64`                                   | `checks-framework` | `run_cli_bazel_tests.sh`     |
+| `frontend-tests`      | `need_frontend`            | `linux-amd64`                                   | —                  | `run_frontend_tests.sh`      |
+| `ios-bazel-build`     | `need_ios`                 | `macos-arm64` (`BUILDKITE_IOS_QUEUE` overrides) | —                  | `run_ios_bazel_build.sh`     |
+| `no-ci-steps`         | nothing else fires         | `linux-amd64`                                   | —                  | inline `echo`                |
 
 Notes:
+
 - `checks-framework` is a fan-out point: backend and CLI bazel tests both wait on it.
 - `frontend-tests` and `ios-bazel-build` are independent of the bazel chain — they run in parallel with everything else.
 - The `no-ci-steps` step exists so the umbrella `buildkite/flunge-ci` check still goes green for, say, a docs-only PR; without it the check would never report and merge would block forever.
@@ -76,7 +77,7 @@ Sourced by every step script. Three exported behaviours worth knowing:
 
 1. `decrypt_backend_config.sh` (see Secrets).
 2. `bazel test --build_tests_only //backend/...` with the wrapped args.
-3. `bazel query` for every rule under `//backend/...` *except* OCI image/push rules (`oci_image|oci_push|pkg_tar_impl|directory_path|jq_rule|_copy_file|_write_file`) and then `bazel build` them. The query/build is the "everything that isn't a test target still has to compile" guard. OCI rules are excluded because they belong to the release flow, not PR validation.
+3. `bazel query` for every rule under `//backend/...` _except_ OCI image/push rules (`oci_image|oci_push|pkg_tar_impl|directory_path|jq_rule|_copy_file|_write_file`) and then `bazel build` them. The query/build is the "everything that isn't a test target still has to compile" guard. OCI rules are excluded because they belong to the release flow, not PR validation.
 
 ### `run_cli_bazel_tests.sh`
 
@@ -116,16 +117,16 @@ This matters for mono: mono will need rust on every agent (flunge agents don't h
 
 Secrets referenced (all sourced via buildkite's `secrets:` step key, which the agent exposes as env vars):
 
-| Secret name | Used by | Purpose |
-|---|---|---|
-| `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` | `run_checks.sh`, both bazel-test scripts, all release scripts | BuildBuddy remote-exec container-registry creds. Injected as `--remote_exec_header=x-buildbuddy-platform.container-registry-username/password` by `buildkite_bazel_args`. |
-| `CONFIG_SECRET_KEY` | `decrypt_backend_config.sh`, prod/staging release | Symmetric key for `backend/config-secrets.toml.gpg`. |
-| `GITHUB_TOKEN` | `run_checks.sh`, prod release, frontend release, frontend-promote, iOS-testflight mutate | PR comments, release-note authoring, asset uploads. |
-| `REGISTRY_LOGIN_SERVER` | prod/staging mutate | Container registry endpoint for image push. |
-| `AZURE_CREDENTIALS`, `AZURE_STORAGE_KEY` | prod mutate, frontend release | Azure deploy / storage. |
-| `CF_PAGES_ACCOUNT_ID`, `CF_PAGES_STAGING_TOKEN`, `CF_PAGES_PROD_TOKEN` | frontend release, frontend-promote | Cloudflare Pages deploy. |
-| `SWA_DEPLOYMENT_TOKEN` | frontend release | Azure SWA deploy. |
-| `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY` | iOS-testflight mutate | TestFlight upload auth. |
+| Secret name                                                            | Used by                                                                                  | Purpose                                                                                                                                                                   |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REGISTRY_USERNAME` / `REGISTRY_PASSWORD`                              | `run_checks.sh`, both bazel-test scripts, all release scripts                            | BuildBuddy remote-exec container-registry creds. Injected as `--remote_exec_header=x-buildbuddy-platform.container-registry-username/password` by `buildkite_bazel_args`. |
+| `CONFIG_SECRET_KEY`                                                    | `decrypt_backend_config.sh`, prod/staging release                                        | Symmetric key for `backend/config-secrets.toml.gpg`.                                                                                                                      |
+| `GITHUB_TOKEN`                                                         | `run_checks.sh`, prod release, frontend release, frontend-promote, iOS-testflight mutate | PR comments, release-note authoring, asset uploads.                                                                                                                       |
+| `REGISTRY_LOGIN_SERVER`                                                | prod/staging mutate                                                                      | Container registry endpoint for image push.                                                                                                                               |
+| `AZURE_CREDENTIALS`, `AZURE_STORAGE_KEY`                               | prod mutate, frontend release                                                            | Azure deploy / storage.                                                                                                                                                   |
+| `CF_PAGES_ACCOUNT_ID`, `CF_PAGES_STAGING_TOKEN`, `CF_PAGES_PROD_TOKEN` | frontend release, frontend-promote                                                       | Cloudflare Pages deploy.                                                                                                                                                  |
+| `SWA_DEPLOYMENT_TOKEN`                                                 | frontend release                                                                         | Azure SWA deploy.                                                                                                                                                         |
+| `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY`             | iOS-testflight mutate                                                                    | TestFlight upload auth.                                                                                                                                                   |
 
 Injection point is the buildkite step's `secrets:` array — agent-side, before the command runs, the agent exports them as env vars. No plugin involvement, no inline `${{ secrets.X }}` interpolation in YAML. `decrypt_backend_config.sh` shows the secondary path (`buildkite-agent secret get`) for when a step forgets to declare the secret; both work but declared-on-step is the convention.
 
@@ -163,6 +164,7 @@ Live config (`gh api repos/brianduff/flunge/branches/main/protection` at audit t
 ```
 
 Key facts:
+
 - **One required context**: `buildkite/flunge-ci`. This is the umbrella name buildkite reports for the whole build. Per-step success/failure rolls up into this one check; branch protection never sees individual step names.
 - `enforce_admins: true` — repo owner cannot merge through a red build either.
 - `strict: false` — PRs are not required to be up-to-date with `main` before merge.
@@ -180,9 +182,9 @@ These are the points where copying flunge verbatim would be wrong for mono — f
 3. **Required-check granularity.** Flunge gates on the umbrella `buildkite/flunge-ci`. The mono design currently proposes six per-step required checks (`buildkite/mono/bootstrap`, `buildkite/mono/cargo-check`, etc.). Pick one model deliberately:
    - Umbrella check (flunge-style): simpler branch-protection config, but a single failing step reddens the whole build and reviewers must drill into the buildkite UI to see which.
    - Per-step required checks (current mono proposal): more explicit signal in the GitHub UI, but renames are now a contract change (see parent design Q2). Branch protection has to be updated in lockstep with `pipeline.yml`.
-   The reference implementation here (flunge) chose umbrella. The mono design has not. Flag for the reviewer.
+     The reference implementation here (flunge) chose umbrella. The mono design has not. Flag for the reviewer.
 4. **Dynamic vs. static pipeline.** Flunge emits steps conditionally based on path filtering — a docs-only PR runs `no-ci-steps` and goes green in seconds. The mono design as written assumes a fully static pipeline. For a small repo (mono today) this is fine; once mono grows enough that "do we need to rerun bazel for a frontend-only change?" matters, port flunge's `upload_dynamic_pipeline.sh` shape. Not a v1 requirement.
-5. **BuildBuddy remote execution.** Flunge's CI runs bazel actions on BuildBuddy's remote executors (`--config=remote` activates `--remote_executor`). The mono design proposes disk-cache-only v1, remote-cache-only v2 (no remote *execution*). Document this as a deliberate divergence — remote execution is a meaningful operational lift (container image for the executor platform, registry creds, debugging when remote and local diverge). Don't pick it up implicitly just because flunge has it.
+5. **BuildBuddy remote execution.** Flunge's CI runs bazel actions on BuildBuddy's remote executors (`--config=remote` activates `--remote_executor`). The mono design proposes disk-cache-only v1, remote-cache-only v2 (no remote _execution_). Document this as a deliberate divergence — remote execution is a meaningful operational lift (container image for the executor platform, registry creds, debugging when remote and local diverge). Don't pick it up implicitly just because flunge has it.
 6. **iOS pipeline plumbing is not relevant.** Mono has no iOS surface today. Skip `macos-arm64` queue + the cache-plugin pattern for v1.
 7. **Release pipelines stay out of scope.** Flunge has five separate release pipelines (prod/staging/frontend-swa/frontend-promote/ios-testflight). The mono "Boss CI" project covers PR gating only. Release pipelines for the macOS app or any future surface are a follow-up.
 

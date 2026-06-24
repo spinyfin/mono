@@ -7,13 +7,20 @@
   {
     "question_type": "multiple_choice",
     "prompt": "Which model tier should run the creation-time dedup decision (frequent, bounded binary judgment)?",
-    "choices": ["Haiku (cheapest; default proposed)", "Sonnet (higher precision, higher cost)", "Opus (max precision, only if false-fold cost is high)"],
+    "choices": [
+      "Haiku (cheapest; default proposed)",
+      "Sonnet (higher precision, higher cost)",
+      "Opus (max precision, only if false-fold cost is high)"
+    ],
     "anchor": "risks-open-questions"
   },
   {
     "question_type": "multiple_choice",
     "prompt": "At creation time, when a High/Medium-confidence duplicate is detected, should we fully suppress the candidate or stage it?",
-    "choices": ["Suppress candidate, score++ only (proposed)", "Stage: score++ AND still surface the candidate with a 'possible duplicate' hint for the first rollout"],
+    "choices": [
+      "Suppress candidate, score++ only (proposed)",
+      "Stage: score++ AND still surface the candidate with a 'possible duplicate' hint for the first rollout"
+    ],
     "anchor": "risks-open-questions"
   },
   {

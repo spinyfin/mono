@@ -17,6 +17,7 @@ boss product set-external-tracker <product-id-or-slug> \
 ```
 
 **Parameters:**
+
 - `<product-id-or-slug>`: The Boss product to bind (can be the product name, slug, or UUID).
 - `--kind github`: Currently only GitHub is supported.
 - `--org`: GitHub organization name (e.g., `spinyfin`).
@@ -24,11 +25,13 @@ boss product set-external-tracker <product-id-or-slug> \
 - `--project`: GitHub project number (visible in the project's URL: `github.com/orgs/<org>/projects/<number>`).
 
 **Example:**
+
 ```sh
 boss product set-external-tracker Boss --kind github --org spinyfin --repo mono --project 1
 ```
 
 After binding, the reconciler automatically:
+
 - Pulls new upstream issues into Boss as chores.
 - Mirrors upstream status changes (when an issue closes upstream, the Boss work item moves to `done`).
 - Attaches PR URLs to Boss work items when a PR is linked upstream.
@@ -36,7 +39,7 @@ After binding, the reconciler automatically:
 
 ### Enabling reverse-close (optional)
 
-By default, Boss only closes upstream issues when a linked PR merges. To also close upstream issues when a Boss work item is marked `done` *without* a merged PR, enable reverse-close:
+By default, Boss only closes upstream issues when a linked PR merges. To also close upstream issues when a Boss work item is marked `done` _without_ a merged PR, enable reverse-close:
 
 ```sh
 boss product set-external-tracker <product-id-or-slug> --reverse-close
@@ -46,6 +49,7 @@ boss product set-external-tracker <product-id-or-slug> --reverse-close
 When `--reverse-close` is enabled, marking a Boss work item as `done` (without a merged PR driving the transition) also closes the corresponding upstream issue. This is useful if your Boss and upstream tracker are tightly synchronized and you want all status changes to flow both ways.
 
 **When to enable:**
+
 - Enable if your team uses Boss as the primary source of truth and wants upstream issues closed automatically.
 - Leave disabled (default) if upstream issues are filed publicly and you want to avoid closing them without explicit evidence of shipment.
 
@@ -72,11 +76,13 @@ boss task link-external <work-item-id> --kind github --id <owner>/<repo>#<number
 ```
 
 **Parameters:**
+
 - `<work-item-id>`: The Boss task or chore ID.
 - `--kind github`: Tracker kind (currently only GitHub).
 - `--id <owner>/<repo>#<number>`: The upstream issue identifier (e.g., `spinyfin/mono#560`).
 
 **Example:**
+
 ```sh
 boss task link-external T-abc123 --kind github --id spinyfin/mono#560
 ```
@@ -112,6 +118,7 @@ gh auth status
 ```
 
 **Expected output:**
+
 ```
   ✓ Logged in to github.com as <your-username> (keyring)
   ✓ Git operations for github.com configured to use ssh protocol.
@@ -126,6 +133,7 @@ gh auth login
 ```
 
 When prompted, select:
+
 - **Protocol:** `ssh` (or `https` if ssh is not configured).
 - **Scopes:** Be sure to include `repo` (for public and private repositories).
 
@@ -157,70 +165,79 @@ When the reconciler detects problems, it surfaces attention items on the product
 
 ### `config_invalid`
 
-**Message:** *"External tracker binding points at `<org>/<repo>` project `<number>` which does not exist or is not visible."*
+**Message:** _"External tracker binding points at `<org>/<repo>` project `<number>` which does not exist or is not visible."_
 
 **Cause:** The product's external tracker configuration points at a GitHub project that:
+
 - Does not exist.
 - Exists but is private and your `gh` login lacks access.
 - Was moved to a different organization or deleted.
 
 **Fix:**
+
 1. Verify the project number in the GitHub UI (`github.com/orgs/<org>/projects/<number>`).
 2. Confirm your `gh` login has access: `gh auth status`.
 3. Update the binding with correct parameters: `boss product set-external-tracker <product> --kind github --org <org> --repo <repo> --project <number>`.
 
 ### `auth_failed`
 
-**Message:** *"Boss could not resolve GitHub credentials. Run `gh auth status` and ensure you are logged in."*
+**Message:** _"Boss could not resolve GitHub credentials. Run `gh auth status` and ensure you are logged in."_
 
 **Cause:** The `gh auth status` check failed, typically because:
+
 - You are not logged in (`gh auth login` not run).
 - Your `~/.config/gh/` or `~/.ssh/` is corrupted.
 - The engine started before you logged in and cached the failure.
 
 **Fix:**
+
 1. Run `gh auth login` and complete the login flow.
 2. Confirm `gh auth status` shows `✓ Logged in to github.com as <username>`.
 3. Restart the engine (see "Engine startup and credential caching" above).
 
 ### `permission_denied`
 
-**Message:** *"Boss could not close upstream issue `<canonical_id>`: credential lacks write scope. Re-run `gh auth login --scopes repo` to grant write permission."*
+**Message:** _"Boss could not close upstream issue `<canonical_id>`: credential lacks write scope. Re-run `gh auth login --scopes repo` to grant write permission."_
 
 **Cause:** Typically appears when:
+
 - Reverse-close is enabled (`--reverse-close`) but your credential lacks write scope.
 - A PR merge triggered close-on-merge (always on) but your credential lacks write scope.
 
 **Fix:**
+
 1. Run `gh auth login --scopes repo` to refresh your login with write scope.
 2. Restart the engine.
 3. The attention item clears once the next reconcile pass succeeds or observes the issue already closed.
 
 ### `transient_failure`
 
-**Message:** *"Boss has been unable to close `<canonical_id>` after a merged PR. Last error: <classified-reason>. The Boss work item is already `done`; the upstream issue may be closed manually or Boss will retry indefinitely."*
+**Message:** _"Boss has been unable to close `<canonical_id>` after a merged PR. Last error: <classified-reason>. The Boss work item is already `done`; the upstream issue may be closed manually or Boss will retry indefinitely."_
 
 **Cause:** A temporary network issue, GitHub API outage, or rate limit prevented the close attempt. Boss retried multiple times (default: 10 times, ~20 minutes) without success.
 
 **Fix:**
+
 1. Wait for the GitHub incident to resolve (check [GitHub Status](https://www.githubstatus.com/)).
 2. Once GitHub is healthy, the reconciler automatically retries on the next tick.
 3. If the issue persists, manually close the upstream issue via GitHub and the attention item will clear on the next sync.
 
 ## Reverse-close flag reference
 
-| Flag | Default | Behavior | Example |
-|------|---------|----------|---------|
+| Flag              | Default  | Behavior                                                                                           | Example                                                       |
+| ----------------- | -------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `--reverse-close` | Disabled | When a Boss work item is marked `done` (without a merged PR), Boss also closes the upstream issue. | `boss product set-external-tracker <product> --reverse-close` |
-| (not specified) | Enabled | When a PR linked to a Boss work item merges, Boss closes the upstream issue (close-on-merge). | Always active; no flag needed. |
+| (not specified)   | Enabled  | When a PR linked to a Boss work item merges, Boss closes the upstream issue (close-on-merge).      | Always active; no flag needed.                                |
 
 **When reverse-close closes upstream issues:**
+
 - A Boss user marks a work item `done` in the app or CLI.
 - The work item has an external reference (is bound to an upstream issue).
 - The upstream issue is currently `Open`.
 - The product has `reverse_close` enabled.
 
 **When reverse-close does NOT close upstream issues:**
+
 - The upstream issue is already `Closed`.
 - The work item status is not `done`.
 - `reverse_close` is disabled (default).
@@ -233,6 +250,7 @@ When the reconciler detects problems, it surfaces attention items on the product
 ### Metrics
 
 The reconciler emits Prometheus metrics. Common ones:
+
 - `external_tracker.fetch_succeeded` — successful upstream fetches.
 - `external_tracker.imported` — new upstream items imported as Boss chores.
 - `external_tracker.closed` — work items flipped to `done` because upstream closed.
@@ -245,6 +263,7 @@ View metrics via the engine's metrics endpoint (if exposed).
 ### Logs
 
 The engine logs each reconcile pass. Look for lines like:
+
 ```
 external_tracker: reconciling product <product_id>
 external_tracker: product <product_id> result: 5 imported, 2 closed, 1 pr_attached
@@ -254,7 +273,7 @@ external_tracker: product <product_id> result: 5 imported, 2 closed, 1 pr_attach
 
 **Q: Why doesn't my locally-created Boss work item sync upstream?**
 
-A: The reconciler only pulls *downstream* — it imports upstream issues into Boss but does not create upstream issues when you create a Boss work item. To link a pre-existing Boss item to an upstream issue, use `boss task link-external`.
+A: The reconciler only pulls _downstream_ — it imports upstream issues into Boss but does not create upstream issues when you create a Boss work item. To link a pre-existing Boss item to an upstream issue, use `boss task link-external`.
 
 **Q: Can I bind the same upstream issue to multiple Boss products?**
 
@@ -262,7 +281,7 @@ A: No. One upstream issue can be bound to at most one Boss work item. If you lin
 
 **Q: What happens if my upstream issue title changes?**
 
-A: The Boss work item name is mirrored at *create time* only. Later upstream renames do not re-sync the name — you own the Boss title freely.
+A: The Boss work item name is mirrored at _create time_ only. Later upstream renames do not re-sync the name — you own the Boss title freely.
 
 **Q: Can I use reverse-close to auto-reopen closed issues?**
 

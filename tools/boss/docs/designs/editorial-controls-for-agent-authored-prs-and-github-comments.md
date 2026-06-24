@@ -57,7 +57,7 @@ or a combination. This document picks one.
 - Rules apply to every GitHub-visible surface a Boss worker writes to:
   branch name, PR title, PR body, commit-message body, PR / issue
   comments, review replies, merge-conflict-resolution notes.
-- A **sane default** for *every* product (including personal ones)
+- A **sane default** for _every_ product (including personal ones)
   that strips known Boss-internal identifier shapes from worker
   output, without the user having to write anything. The opt-in
   ergonomic is "I want repo-template conformance"; the opt-out
@@ -72,7 +72,7 @@ or a combination. This document picks one.
      and either rewrites the body in place (for redactable taxonomy
      leaks) or blocks the call with actionable feedback (for
      structural failures like a missing template section).
-- Repo conventions the user *already documented* in
+- Repo conventions the user _already documented_ in
   `.github/PULL_REQUEST_TEMPLATE.md` (or its directory variant) are
   picked up automatically — the user does not re-type the template
   into Boss config.
@@ -129,18 +129,18 @@ or a combination. This document picks one.
 Walking the existing worker flow makes the leak surfaces concrete and
 keeps the design honest about what each mitigation actually covers.
 
-| Surface                               | Authored by | Controlled by today                                   |
-|---------------------------------------|-------------|-------------------------------------------------------|
-| Branch name (`boss/exec_<id>`)        | Engine       | `expected_branch_name` in `engine/src/completion.rs`  |
-| PR title                              | Worker       | Model + CLAUDE.md / AGENTS.md                         |
-| PR body                               | Worker       | Model + CLAUDE.md / AGENTS.md                         |
-| Commit message subject                | Worker       | Model + CLAUDE.md / AGENTS.md                         |
-| Commit message body                   | Worker       | Model                                                 |
-| `gh pr comment` body                  | Worker       | Model                                                 |
-| `gh pr review --body` body            | Worker       | Model                                                 |
-| `gh issue comment` body               | Worker       | Model                                                 |
-| Merge-conflict commit / PR comment    | Worker       | Conflict-resolution prompt + model                    |
-| Worker's "final response" to engine   | Worker       | Engine's "## Summary / ## Validation" template        |
+| Surface                             | Authored by | Controlled by today                                  |
+| ----------------------------------- | ----------- | ---------------------------------------------------- |
+| Branch name (`boss/exec_<id>`)      | Engine      | `expected_branch_name` in `engine/src/completion.rs` |
+| PR title                            | Worker      | Model + CLAUDE.md / AGENTS.md                        |
+| PR body                             | Worker      | Model + CLAUDE.md / AGENTS.md                        |
+| Commit message subject              | Worker      | Model + CLAUDE.md / AGENTS.md                        |
+| Commit message body                 | Worker      | Model                                                |
+| `gh pr comment` body                | Worker      | Model                                                |
+| `gh pr review --body` body          | Worker      | Model                                                |
+| `gh issue comment` body             | Worker      | Model                                                |
+| Merge-conflict commit / PR comment  | Worker      | Conflict-resolution prompt + model                   |
+| Worker's "final response" to engine | Worker      | Engine's "## Summary / ## Validation" template       |
 
 The first row (branch name) is **already engine-controlled** — the
 worker is told the exact bookmark to push to. Anything that's
@@ -164,7 +164,7 @@ are baked-in patterns the redactor knows about without user config):
   the literal text "lease" / "cube" within ~40 characters
 - Branch namespace: `boss/exec_…` substrings in body text
 - Free-text giveaways: `"Boss worker"`, `"the engine"`, `"the
-  coordinator"`, `"cube workspace"`, `"work item"`, `"execution id"`,
+coordinator"`, `"cube workspace"`, `"work item"`, `"execution id"`,
   `"PostToolUse"`, `"PreToolUse"` — only matched as standalone
   phrases (not inside code blocks; see Q3 quoting rules)
 
@@ -205,7 +205,7 @@ distracted by a hard task, or running on a smaller variant will
 forget the rule and emit a non-compliant PR. There's no enforcement
 — a "do not mention Boss" rule still gets violated, and the human
 reviewer notices on GitHub before the engine does. The design's
-*goal* is to give the user something they can trust in a work
+_goal_ is to give the user something they can trust in a work
 environment; "the model will probably do the right thing" is not
 that.
 
@@ -264,7 +264,7 @@ a rewritten body) or `deny` with a `decisionReason` the worker reads
 and acts on.
 
 **Pros.** The bad body **never reaches GitHub**, so no race with
-notifications. The worker is told *why* its call was denied and can
+notifications. The worker is told _why_ its call was denied and can
 fix the body and retry on the same turn — fast feedback loop. The
 plumbing is a sibling to existing `pr_url_capture.rs`'s PostToolUse
 handler on the same Bash invocations, so the bash-cmd parsing /
@@ -307,7 +307,7 @@ its own and the later phases build on the earlier ones:
    set that redacts Boss identifier shapes. Most PRs comply on the
    first try after this.
 3. **(D)** — PreToolUse hook on `gh pr|issue {create,edit,comment,
-   review}` Bash commands, applies the same rules deterministically,
+review}` Bash commands, applies the same rules deterministically,
    either auto-rewrites (regex-replaceable leaks) or denies with
    actionable feedback (structural failures, template missing
    sections, mentions of forbidden phrases the redactor isn't
@@ -447,7 +447,7 @@ strategy is read off the product's `editorial_rules` at execution
 spawn time and stored on the `executions` row (so a rule change after
 spawn doesn't break the detector's reconstruction — the row remembers
 which scheme it was opened under). This mirrors how
-`expected_branch_name` is *already* read off `executions.id` rather
+`expected_branch_name` is _already_ read off `executions.id` rather
 than recomputed from the chore row; the same "snapshot at spawn,
 detect deterministically forever after" invariant holds.
 
@@ -469,7 +469,7 @@ Today the prompt assembly in `engine/src/runner.rs` already prepends
 is non-empty or the baked-in defaults are active. The block is
 rendered as:
 
-```text
+````text
 [editorial-rules]
 **Editorial rules for PRs / GitHub comments in this product.**
 Apply these rules to every PR title, PR body, PR / issue comment,
@@ -497,7 +497,7 @@ Template policy: {Off | Advise: see <path> | Enforce: see <path>}
 
 ```PR template```
 {verbatim contents of the repo's template, if one exists and policy != Off}
-```
+````
 
 Enforcement:
 The engine's PreToolUse hook intercepts `gh pr create`, `gh pr edit`,
@@ -506,7 +506,8 @@ If your body / title violates a rule, the call is denied or
 rewritten and you will see feedback. Comply on the first try when
 you can — denials cost a worker turn.
 [/editorial-rules]
-```
+
+````
 
 The block is injected *after* the workspace-rules / RESUME-EXISTING-PR
 preamble and *before* the per-kind directive (the design or
@@ -530,14 +531,14 @@ invocations matching:
 
 ```text
 ^\s*(GIT_DIR=\S+\s+)?gh\s+(pr|issue)\s+(create|edit|comment|review)\b
-```
+````
 
 (the same envelope `pr_url_capture::is_gh_pr_invocation` already
 recognises; the regex moves to a shared module). The handler:
 
 1. Parses out `--body`, `--body-file` (reads the file), `--title`,
    `--message`, `--editor`, and `--web` flags.
-2. If `--editor` or `--web` is present, the hook *allows* the call
+2. If `--editor` or `--web` is present, the hook _allows_ the call
    (the worker is delegating to the human / browser — no body the
    hook can inspect).
 3. Otherwise: runs the body / title through the redactor, applies
@@ -552,23 +553,23 @@ recognises; the regex moves to a shared module). The handler:
      to use the new body (substitute the `--body` arg's value, or
      overwrite the `--body-file`'s contents) and return
      `{ "permissionDecision": "allow", "decisionReason": "Editorial
-     hook rewrote: <list>" }`. The worker sees the success path with
+hook rewrote: <list>" }`. The worker sees the success path with
      a one-line explanation it can echo in its final summary if it
      wants.
    - **Any finding is `Block` or a template / structural failure**
      → return `{ "permissionDecision": "deny", "decisionReason":
-     "Body violates editorial rules: <numbered list>; please fix
-     and retry." }`. The worker reads the deny reason, edits the
+"Body violates editorial rules: <numbered list>; please fix
+and retry." }`. The worker reads the deny reason, edits the
      body, and re-issues `gh pr create`.
 
 Step 3's "in-place rewrite" is the only delicate part: claude's
 PreToolUse contract supports `permissionDecisionInput` mutation,
-which lets the hook return a *modified* `tool_input` instead of the
+which lets the hook return a _modified_ `tool_input` instead of the
 original. The hook substitutes the rewritten body into the
 `tool_input.command` string (the same parsing the redactor already
 did), and claude runs the modified command.
 
-For `--body-file <path>`, the hook *overwrites* the file at the
+For `--body-file <path>`, the hook _overwrites_ the file at the
 referenced path on disk before allowing the call. The path is
 inside the leased workspace (the worker is the only writer), so
 there's no shared-state concern.
@@ -582,7 +583,7 @@ there's no shared-state concern.
   as every other PostToolUse the engine has — the design treats
   editorial controls as advisory in a partition rather than
   blocking the worker mid-task. Cleanup is a follow-up `boss admin
-  audit-pr-bodies <product>` chore that runs the rules over the
+audit-pr-bodies <product>` chore that runs the rules over the
   product's open PRs and emits attention items for any violations.
 - **The redactor's regex is too greedy and strips legitimate text**:
   the worker sees the rewrite in `decisionReason`, can spot the
@@ -596,8 +597,8 @@ there's no shared-state concern.
   product to ship something the rules say not to mention): the hook
   denies, the worker retries, the hook denies again. After three
   denies on the same `gh pr create` invocation within one execution
-  (the engine tracks this in-memory), the hook flips to *allow with
-  a `WorkAttentionItem`* — the body ships, but the user gets a
+  (the engine tracks this in-memory), the hook flips to _allow with
+  a `WorkAttentionItem`_ — the body ships, but the user gets a
   flagged item to review. Prevents infinite loops without
   silently surrendering the rule.
 
@@ -605,7 +606,7 @@ there's no shared-state concern.
 
 Every product gets the identifier-redaction list and the
 "don't say Boss / engine / coordinator / work item" plain-text rules
-applied *without* any per-product config. This is the design's
+applied _without_ any per-product config. This is the design's
 ergonomic answer to "I don't want to write rules for my personal
 product but I'd still like my PRs to not say `exec_18b07a…`":
 
@@ -613,12 +614,12 @@ product but I'd still like my PRs to not say `exec_18b07a…`":
   above, applied as `Rewrite` (replacement = empty string +
   whitespace collapse).
 - Baked-in phrase redactions: `Boss worker`, `the engine`, `the
-  coordinator`, `cube lease`, `cube workspace`, `work item`,
+coordinator`, `cube lease`, `cube workspace`, `work item`,
   `execution id`. Applied as `Block` (the worker is told what to
   rephrase rather than silently scrubbed, because phrase deletion
   is more likely to mangle a sentence than id-deletion is).
 - Default `template_policy = Off`, default `branch_naming =
-  BossExecPrefix`, default `commit_trailer_policy = Default`. Each
+BossExecPrefix`, default `commit_trailer_policy = Default`. Each
   one of those defaults preserves today's behaviour exactly. The
   user opts in to `Advise` / `Enforce` / `OpaqueHash` / `NoAiTrailer`
   per product.
@@ -738,7 +739,7 @@ diagnose` for the conflict-resolution worker.
 
 - `engine/src/editorial.rs` (new) — rule loading, baked-in default
   list, regex compilation + caching, `evaluate(body, rules) ->
-  EditorialDecision` (the pure function).
+EditorialDecision` (the pure function).
 - `engine/src/runner.rs` — assemble the `[editorial-rules]` block
   in `compose_execution_prompt`, read `editorial_rules` off the
   product row.
@@ -775,9 +776,9 @@ per call. Pre-compile regexes at engine startup and cache by product.
 
 **R2 — Auto-rewrite can corrupt code blocks.** A worker that wrote
 `This fixes the bug where exec_18b07a506d2518d0_1b appears in
-output` is fine to rewrite. A worker that wrote a *literal example*
+output` is fine to rewrite. A worker that wrote a _literal example_
 of a Boss id inside a fenced code block (`This system uses ids like
-\`exec_…\``) is not, but the redactor will strip it anyway.
+\`exec\_…\``) is not, but the redactor will strip it anyway.
 Mitigation: the evaluator parses the body's markdown structure
 (commonmark; the repo already depends on a markdown parser for the
 designs renderer) and skips matches inside fenced code blocks. Inline
@@ -826,6 +827,7 @@ same hash see distinct PRs.
 or a non-`gh` tool.** A worker that's hostile to the editorial
 rules could `curl -X POST https://api.github.com/repos/.../pulls`
 directly and bypass the hook. Two responses:
+
 1. Boss workers are not adversaries; the rules protect the user
    from the model's defaults, not from a malicious agent.
 2. If we ever need adversarial-grade enforcement, it has to move
@@ -868,7 +870,7 @@ content into `dispatch_preamble` today migrates by moving it into
 The `boss product show` line can flag products that have both,
 suggesting consolidation.
 
-**R12 — Where do rules apply to the worker's *final response*?**
+**R12 — Where do rules apply to the worker's _final response_?**
 The worker's final response to the engine (the `## Summary / ##
 Validation / ## Open Questions` block) is not GitHub-visible but
 is shown to the user and stored in the engine's transcript. The
@@ -881,14 +883,14 @@ add a `apply_to_worker_summary: bool` flag.
 **R13 — Template policy interaction with the engine's own
 "Respond with `## Summary / ## Validation / ## Open Questions`"
 instruction in `runner.rs`.** That sectioning is for the worker's
-*final response*, not the PR body. Workers historically use the
+_final response_, not the PR body. Workers historically use the
 same sectioning for their PR body (because it's what they just
 wrote). With `template_policy = Enforce` + a repo template that
 uses different headings, the worker has two competing structures
 and may produce a PR body with both, then `## Summary` etc. at
 the bottom. Mitigation: the `[editorial-rules]` block in the
 prompt is explicit that "the PR body must match the template
-*regardless of the final-response sectioning rules*." Test
+_regardless of the final-response sectioning rules_." Test
 empirically; if compliance is poor, revisit.
 
 **R14 — `--body-file` paths can be relative.** The hook resolves
@@ -911,7 +913,7 @@ Each fits one worker session.
    `RedactionKind`, `TemplatePolicy`, `BranchNaming`,
    `TrailerPolicy`, `EditorialAction`. Mirror in `Models.swift`.
 3. **`engine/src/editorial.rs` — pure evaluator.** `evaluate(body,
-   title, rules) -> EditorialDecision`. Baked-in default list. Unit
+title, rules) -> EditorialDecision`. Baked-in default list. Unit
    tests for every redaction kind, code-fence skipping, template
    missing-section detection.
 4. **Engine: `expected_branch_name(execution_id, branch_naming)`
@@ -925,7 +927,7 @@ Each fits one worker session.
    baked-in identifier rules only; configured product renders
    the user instructions + template + enforcement banner.
 6. **Engine: PreToolUse handler for `gh pr|issue {create,edit,
-   comment,review}` Bash invocations.** Acceptance: integration
+comment,review}` Bash invocations.** Acceptance: integration
    test against a stub `gh` shim — a worker that runs
    `gh pr create --body "<bad body>"` sees a deny; a worker that
    runs with a body containing redactable identifiers sees an

@@ -16,16 +16,16 @@ The impact is bounded: the data loss is reversible by hand (move rows back to Ba
 
 All times UTC. Anchors come from `state.db` execution status transitions and from GitHub PR merge timestamps; gaps in the dispatch-events log around the May 14 window are noted under §7.
 
-| Time | Event |
-|---|---|
-| 02:04:02 | PR #478 merged. |
-| ~02:05:12–02:05:15 | Workers running on T404, T407, T409, T410 each receive a `release_pane` IPC from the engine within 70–73 seconds of the merge. Their executions transition to terminal status. Each row's `pr_url` is now #478. (Four-way fan-out — see §3.) |
-| 06:22:43 | PR #483 merged. PR #483 is a markdown text-selection change. |
-| ~06:24 | T415's execution is bound to #483 and killed. T415 is the work item titled "Engine PR-URL capture binds a single PR to multiple work items — fan-out closes wrong rows as done." |
-| 06:38:10 | PR #486 merged. PR #486 is a Cmd-Q confirmation change. |
-| ~06:39–06:40 | Workers running on T404 and T407 are bound to PR #486 and killed. T404 is "Sidebar toggle still visible on Agents tab — PR #469 fix incomplete"; T407 is "PR-URL capture binds the right URL to the wrong work_item — T404/T405 both got PR #475". |
-| 06:40+ | Human notices three closed rows on the kanban whose bound PRs make no sense for their titles. Begins halting workers, clearing `pr_url` fields, moving rows back from Done to Backlog. |
-| (later) | Halt complete. Affected work items repaired by hand. State.db inspection identifies `detect_pr` as the firing path. |
+| Time               | Event                                                                                                                                                                                                                                              |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 02:04:02           | PR #478 merged.                                                                                                                                                                                                                                    |
+| ~02:05:12–02:05:15 | Workers running on T404, T407, T409, T410 each receive a `release_pane` IPC from the engine within 70–73 seconds of the merge. Their executions transition to terminal status. Each row's `pr_url` is now #478. (Four-way fan-out — see §3.)       |
+| 06:22:43           | PR #483 merged. PR #483 is a markdown text-selection change.                                                                                                                                                                                       |
+| ~06:24             | T415's execution is bound to #483 and killed. T415 is the work item titled "Engine PR-URL capture binds a single PR to multiple work items — fan-out closes wrong rows as done."                                                                   |
+| 06:38:10           | PR #486 merged. PR #486 is a Cmd-Q confirmation change.                                                                                                                                                                                            |
+| ~06:39–06:40       | Workers running on T404 and T407 are bound to PR #486 and killed. T404 is "Sidebar toggle still visible on Agents tab — PR #469 fix incomplete"; T407 is "PR-URL capture binds the right URL to the wrong work_item — T404/T405 both got PR #475". |
+| 06:40+             | Human notices three closed rows on the kanban whose bound PRs make no sense for their titles. Begins halting workers, clearing `pr_url` fields, moving rows back from Done to Backlog.                                                             |
+| (later)            | Halt complete. Affected work items repaired by hand. State.db inspection identifies `detect_pr` as the firing path.                                                                                                                                |
 
 ## 3. What we saw (observed effects)
 
@@ -41,28 +41,28 @@ The earlier 02:04 batch was a 4-way fan-out across T404a/b, T407a, T409, T410 �
 
 The kill-after-merge correlation is tight enough to be the smoking gun. Reading `work_executions.started_at` and `finished_at` out of `state.db` for each affected execution and lining them up against the GitHub merge timestamps:
 
-| Execution | Started (UTC) | Finished (UTC) | Wrong-PR merged at (UTC) | Gap from merge → kill |
-|---|---|---|---|---|
-| T407a (`exec_18af4bc13c377510_1f`) | 01:54:45 | 02:05:12 | #478 — 02:04:02 | 70s |
-| T404b (`exec_18af4c03a1f30350_22`) | 01:59:22 | 02:05:15 | #478 — 02:04:02 | 73s |
-| T415 (`exec_18af5a98696c2860_2b`) | 06:26:31 | 06:39:38 | #483 — 06:22:43 | started 4 min after merge; killed on next fallback sweep |
-| T407b (`exec_18af5aeb58f73a58_2d`) | 06:32:27 | 06:39:40 | #486 — 06:38:10 | 90s |
-| T404c (`exec_18af5aeb59b21260_2f`) | 06:32:32 | 06:39:43 | #486 — 06:38:10 | 93s |
+| Execution                          | Started (UTC) | Finished (UTC) | Wrong-PR merged at (UTC) | Gap from merge → kill                                    |
+| ---------------------------------- | ------------- | -------------- | ------------------------ | -------------------------------------------------------- |
+| T407a (`exec_18af4bc13c377510_1f`) | 01:54:45      | 02:05:12       | #478 — 02:04:02          | 70s                                                      |
+| T404b (`exec_18af4c03a1f30350_22`) | 01:59:22      | 02:05:15       | #478 — 02:04:02          | 73s                                                      |
+| T415 (`exec_18af5a98696c2860_2b`)  | 06:26:31      | 06:39:38       | #483 — 06:22:43          | started 4 min after merge; killed on next fallback sweep |
+| T407b (`exec_18af5aeb58f73a58_2d`) | 06:32:27      | 06:39:40       | #486 — 06:38:10          | 90s                                                      |
+| T404c (`exec_18af5aeb59b21260_2f`) | 06:32:32      | 06:39:43       | #486 — 06:38:10          | 93s                                                      |
 
-The 02:05 cluster (T407a finishing 3 seconds before T404b, on two different workspaces) and the 06:39 cluster (three executions across three workspaces all finishing within 5 seconds of each other) are the engine-wide fire of the fallback against multiple in-flight workers in the same sweep window. The T415 row is the slightly different shape that confirms the mechanism: T415 started *after* #483 was already merged, ran for 13 minutes doing its own investigation, and was killed when its next Stop hook fired the fallback and matched #483's still-recent bookmark.
+The 02:05 cluster (T407a finishing 3 seconds before T404b, on two different workspaces) and the 06:39 cluster (three executions across three workspaces all finishing within 5 seconds of each other) are the engine-wide fire of the fallback against multiple in-flight workers in the same sweep window. The T415 row is the slightly different shape that confirms the mechanism: T415 started _after_ #483 was already merged, ran for 13 minutes doing its own investigation, and was killed when its next Stop hook fired the fallback and matched #483's still-recent bookmark.
 
 ### Per-execution worker output
 
 The transcripts of the killed workers confirm that none of them ever produced a PR of their own. Counting tool-use messages from the on-disk `.jsonl` session files for each execution:
 
-| Execution | `Bash` calls | `Read` calls | `Edit` calls | `gh pr create` / `jj git push` |
-|---|---|---|---|---|
-| T404a (mono-006) | 5 | 5 | 0 | 0 |
-| T404b (mono-005) | 14 | 8 | 0 | 0 |
-| T404c (mono-004) | 27 | 12 | 0 | 0 |
-| T407a (mono-004) | 22 | 24 | 0 | 0 |
-| T407b (mono-002) | 29 | 16 | 0 | 0 |
-| T415 (mono-001) | 40 | 25 | 9 | 0 |
+| Execution        | `Bash` calls | `Read` calls | `Edit` calls | `gh pr create` / `jj git push` |
+| ---------------- | ------------ | ------------ | ------------ | ------------------------------ |
+| T404a (mono-006) | 5            | 5            | 0            | 0                              |
+| T404b (mono-005) | 14           | 8            | 0            | 0                              |
+| T404c (mono-004) | 27           | 12           | 0            | 0                              |
+| T407a (mono-004) | 22           | 24           | 0            | 0                              |
+| T407b (mono-002) | 29           | 16           | 0            | 0                              |
+| T415 (mono-001)  | 40           | 25           | 9            | 0                              |
 
 Every affected worker terminated mid-thought — the last assistant message in each transcript is investigatory, not a summary or hand-off. Five of the six executions never reached an edit phase; T415 had reached editing (9 `Edit` calls, adding regression tests to engine source) but had not run `gh pr create` or `jj git push` yet when killed. That is why the staging cache was empty for each of these executions: not because the engine missed a staging event, but because there was no staging event to miss. The fallback then ran as the only path the engine had, and ran it against jj state that, under cube's shared store, included sibling workers' just-pushed bookmarks.
 
@@ -86,11 +86,11 @@ The three clauses are meant to expand coverage from "just the working copy" to "
 
 Cube workspaces share a single `.jj/repo/store/git`. The git store is the source of truth for bookmarks; the per-workspace `.jj/` is a thin checkout layer over it. `bookmarks()` in any workspace's `jj log` therefore returns every bookmark in the shared store, including bookmarks pushed by sibling workers running in parallel. The `committer_date(after:...)` filter narrows by time but does not narrow by workspace; a sibling worker's push committed in the same window passes the filter trivially.
 
-Once the sibling's bookmark tip is in the SHA list, `gh api commits/<sha>/pulls` returns the sibling's PR; `finalize_pr_transition` (`completion.rs:974`) writes that URL onto the *current* execution's work item; the work item's `pr_url` is now wrong, its status is now `done`, and `pane_releaser.release_pane(execution_id)` (`completion.rs:1016`) is called to free the worker's slot. The macOS-side handler `WorkersWorkspaceModel.releaseWorkerPane` (`tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift:70-84`) clears the slot's session reference, SwiftUI tears down the Ghostty surface, and the worker's `claude` process dies. The investigation-only worker, which was still actively reasoning, is gone mid-turn.
+Once the sibling's bookmark tip is in the SHA list, `gh api commits/<sha>/pulls` returns the sibling's PR; `finalize_pr_transition` (`completion.rs:974`) writes that URL onto the _current_ execution's work item; the work item's `pr_url` is now wrong, its status is now `done`, and `pane_releaser.release_pane(execution_id)` (`completion.rs:1016`) is called to free the worker's slot. The macOS-side handler `WorkersWorkspaceModel.releaseWorkerPane` (`tools/boss/app-macos/Sources/Ghostty/WorkersWorkspaceModel.swift:70-84`) clears the slot's session reference, SwiftUI tears down the Ghostty surface, and the worker's `claude` process dies. The investigation-only worker, which was still actively reasoning, is gone mid-turn.
 
 ### The per-turn firing multiplier
 
-`on_stop_inner` proceeds for executions in `running` *or* `waiting_human` status (`completion.rs:767`). In Claude Code, the `Stop` hook fires after every assistant turn, not just at worker exit. A 30-turn investigation session emits 30 `Stop` events; each one is a chance for the fallback to fire, each one a fresh race against whatever bookmarks any sibling worker pushed in the intervening seconds. Investigation-only workers are the most exposed: they have no staged URL of their own, so the cache is empty every turn; the fallback runs every turn.
+`on_stop_inner` proceeds for executions in `running` _or_ `waiting_human` status (`completion.rs:767`). In Claude Code, the `Stop` hook fires after every assistant turn, not just at worker exit. A 30-turn investigation session emits 30 `Stop` events; each one is a chance for the fallback to fire, each one a fresh race against whatever bookmarks any sibling worker pushed in the intervening seconds. Investigation-only workers are the most exposed: they have no staged URL of their own, so the cache is empty every turn; the fallback runs every turn.
 
 The shape of the incident — kills clustered ~60–90 seconds after sibling PR merges — is the predictable consequence: a sibling pushes, opens, and merges a PR within a couple of minutes; in that interval, every still-running investigation's next `Stop` event finds the sibling's recent bookmark in the revset and binds it. The narrower the merge-to-Stop interval, the more workers get caught.
 
@@ -104,7 +104,7 @@ The action items below are reproduced verbatim from the running investigation li
 
 1. **Boss needs to be able to pull transcripts for executions that have completed.** Observed gap: `bossctl agents transcript` only works on live workers; the historical-fallback that `bossctl agents status` advertises returned `unknown run` for the dead execution. The on-disk transcript directory under `~/Library/Application Support/Boss/` is coordinator-off-limits. There's currently no supported surface for retrieving the conversation log of a completed worker, which blocks forensic investigation of mis-bind / wrong-PR incidents.
 
-2. **There needs to be a one-step, atomic way to transition a row from Done (or any state with `autostart=true`) back to Backlog without the row being eligible for dispatch in between.** Observed gap: clearing PR + moving Done→Todo with `--no-autostart` doesn't clear the row's stored `autostart=true` column, so the reconciler can pick the row up and flip it to Doing again before the human notices. The only state empirically safe from re-dispatch is `blocked`, which lives in a different kanban lane than Backlog. Going via `blocked` as an intermediate step is also unsafe because each transition is observable by the reconciler. The fix doesn't have to be exactly "an `--unset-autostart` flag" — the requirement is that the *user-visible reset gesture* (drag from Done to Backlog, CLI verb, or whatever) is atomic with respect to the dispatch loop: the row must not be eligible for dispatch at any moment during or after the gesture, until the human explicitly releases it.
+2. **There needs to be a one-step, atomic way to transition a row from Done (or any state with `autostart=true`) back to Backlog without the row being eligible for dispatch in between.** Observed gap: clearing PR + moving Done→Todo with `--no-autostart` doesn't clear the row's stored `autostart=true` column, so the reconciler can pick the row up and flip it to Doing again before the human notices. The only state empirically safe from re-dispatch is `blocked`, which lives in a different kanban lane than Backlog. Going via `blocked` as an intermediate step is also unsafe because each transition is observable by the reconciler. The fix doesn't have to be exactly "an `--unset-autostart` flag" — the requirement is that the _user-visible reset gesture_ (drag from Done to Backlog, CLI verb, or whatever) is atomic with respect to the dispatch loop: the row must not be eligible for dispatch at any moment during or after the gesture, until the human explicitly releases it.
 
    **Addendum:** the simplest version of the fix is probably to clear `autostart` automatically the first time the row transitions to Doing (i.e. treat `autostart` as a single-shot "first dispatch" flag rather than a persistent property of the row). Once a task has been picked up once, the flag has served its purpose; leaving it set turns the flag into a re-dispatch hazard for every later state change. With this semantics, reopening a Done row (or moving anything back to Backlog) is safe by construction because `autostart` is already false from the original Doing transition.
 
@@ -126,9 +126,9 @@ The action items below are reproduced verbatim from the running investigation li
 
    This is the highest-blast-radius item on the list — the engine is silently closing the wrong chores as done, which is data loss.
 
-   **Per-turn fallback firing (the multiplier).** `on_stop_inner` proceeds for executions in `running` *or* `waiting_human` status — but in Claude Code the `Stop` hook fires after every assistant turn, not just at worker exit. So the fallback runs on every turn of every still-running worker whose staging cache is empty. That's dozens of fire-attempts per worker session, each one a race against any sibling worker's recent push to the shared jj store. This is why the 2026-05-14 mis-binds correlated tightly with sibling-PR-merge times even though the affected workers were still actively investigating: every turn-end was a chance for `detect_pr` to match a sibling's bookmark and kill the worker. Investigation-only workers were the most exposed — they fire many Stop events without producing their own staged URL, so they have many windows for the fan-out to catch them. The fix should also include: do not run `detect_pr` for an execution still in `running` status; reserve the fallback for genuinely-terminal cases.
+   **Per-turn fallback firing (the multiplier).** `on_stop_inner` proceeds for executions in `running` _or_ `waiting_human` status — but in Claude Code the `Stop` hook fires after every assistant turn, not just at worker exit. So the fallback runs on every turn of every still-running worker whose staging cache is empty. That's dozens of fire-attempts per worker session, each one a race against any sibling worker's recent push to the shared jj store. This is why the 2026-05-14 mis-binds correlated tightly with sibling-PR-merge times even though the affected workers were still actively investigating: every turn-end was a chance for `detect_pr` to match a sibling's bookmark and kill the worker. Investigation-only workers were the most exposed — they fire many Stop events without producing their own staged URL, so they have many windows for the fan-out to catch them. The fix should also include: do not run `detect_pr` for an execution still in `running` status; reserve the fallback for genuinely-terminal cases.
 
-7. **`boss project create` needs a way to skip the auto-generated `kind=design` seed task.** Observed gap: every `boss project create` invocation atomically files the project plus a `kind=design` task underneath it (`created_via=engine_auto`), and `--no-autostart` only suppresses dispatch of the seed task — it doesn't suppress *creation* of it. For projects that aren't design-shaped (a postmortem tracking project, a milestone aggregator, a checklist of action items, etc.) the seed task is awkward dead weight: either you repurpose it for something it wasn't designed for, or you delete it after creation. There should be a flag like `--no-design-task` that creates the project alone, no seed task spawned.
+7. **`boss project create` needs a way to skip the auto-generated `kind=design` seed task.** Observed gap: every `boss project create` invocation atomically files the project plus a `kind=design` task underneath it (`created_via=engine_auto`), and `--no-autostart` only suppresses dispatch of the seed task — it doesn't suppress _creation_ of it. For projects that aren't design-shaped (a postmortem tracking project, a milestone aggregator, a checklist of action items, etc.) the seed task is awkward dead weight: either you repurpose it for something it wasn't designed for, or you delete it after creation. There should be a flag like `--no-design-task` that creates the project alone, no seed task spawned.
 
 ### Priority and ordering
 
@@ -136,7 +136,7 @@ AI #6 is a blocker for any engine work that depends on PR-binding correctness. W
 
 AI #5 (feature flags) and AI #6 are paired: if #5 lands first, the fix for #6 can ship under a flag, letting the broken behaviour be killed immediately while the structural fix is staged. AI #5 is therefore the lowest-cost-of-implementation way to reduce the live blast radius today.
 
-AI #1 (transcripts for completed executions) and AI #3 (IPC traffic log) are forensic-tooling items. Neither prevents the next incident, but together they would have shortened *this* investigation by at least an order of magnitude — much of the timeline reconstruction was inferred rather than read. Land both before the next high-blast-radius engine change.
+AI #1 (transcripts for completed executions) and AI #3 (IPC traffic log) are forensic-tooling items. Neither prevents the next incident, but together they would have shortened _this_ investigation by at least an order of magnitude — much of the timeline reconstruction was inferred rather than read. Land both before the next high-blast-radius engine change.
 
 AI #2 (atomic reset-to-Backlog) and AI #4 (kill path actually kills) are correctness items that are independent of #6 but make recovery from a #6-class event safer. Implement after #6.
 
@@ -146,12 +146,12 @@ AI #7 (skip the auto-generated design task on project create) is low-priority su
 
 The four candidate fixes for AI #6 trade off differently against (a) recovery semantics when staging is empty, (b) the worker-side contract burden, and (c) the structural soundness of the attribution signal.
 
-| Candidate | Recovers engine-restart? | Worker contract burden | Structural soundness |
-|---|---|---|---|
-| 1. Drop bookmark clause | Only if worker's `@`/`@-` still names the pushed commit | None | Sound — but the signal is weaker, so recovery is best-effort. |
-| 2. Per-execution bookmark naming + filter | Yes | Worker must push to a deterministic branch name | Sound — signal is unique by construction. |
-| 3. Remove fallback entirely | No | None | Sound — no signal, no misattribution. |
-| 4. GitHub-side scoping by branch name | Yes | Worker must push to a deterministic branch name | Sound — signal is unique by construction. |
+| Candidate                                 | Recovers engine-restart?                                | Worker contract burden                          | Structural soundness                                          |
+| ----------------------------------------- | ------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------- |
+| 1. Drop bookmark clause                   | Only if worker's `@`/`@-` still names the pushed commit | None                                            | Sound — but the signal is weaker, so recovery is best-effort. |
+| 2. Per-execution bookmark naming + filter | Yes                                                     | Worker must push to a deterministic branch name | Sound — signal is unique by construction.                     |
+| 3. Remove fallback entirely               | No                                                      | None                                            | Sound — no signal, no misattribution.                         |
+| 4. GitHub-side scoping by branch name     | Yes                                                     | Worker must push to a deterministic branch name | Sound — signal is unique by construction.                     |
 
 **Recommendation: combine #2 and #4.** The engine should require workers to push to a deterministic branch name that encodes `execution_id` (or `work_item_id` — either uniquely identifies the binding the engine wants to write), and the detector should switch from `gh api commits/<sha>/pulls` (a SHA-keyed query that depends on local jj state being attributable) to `gh pr list --head <branch>` (a branch-keyed query that depends only on the GitHub-side branch name). The combined fix gives a per-execution unique attribution signal that is reconstructible from `state.db` alone — no local jj reads, no shared-store contamination, and no loss of engine-restart recovery.
 
@@ -200,4 +200,4 @@ A fourth, smaller pattern: **per-turn hook events should be treated as a rate, n
 
 ---
 
-*This is the first postmortem in `tools/boss/docs/postmortems/`. Future incidents follow the `incident-NNN-<slug>.md` naming convention.*
+_This is the first postmortem in `tools/boss/docs/postmortems/`. Future incidents follow the `incident-NNN-<slug>.md` naming convention._

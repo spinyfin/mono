@@ -22,20 +22,20 @@ names a Bazel target, which is built from the current checkout (HEAD) and
 resolved to a runnable executable via a `BazelAdapter` (the production impl
 shells out to `bazel build` and `cquery`). A matching `[pins]` entry instead
 points at an upstream repo + version tag: repobin resolves the tag to a commit,
-checks that commit out into a local cache, and builds the tool from source *at
-the pinned tag* (see [Pinned tools](#pinned-tools)). When no `REPOBIN.toml`
+checks that commit out into a local cache, and builds the tool from source _at
+the pinned tag_ (see [Pinned tools](#pinned-tools)). When no `REPOBIN.toml`
 matches — or it declares neither a tool nor a pin for the requested name —
-dispatch falls back to *default mode*: a `repobin.yaml` peer to the installed
+dispatch falls back to _default mode_: a `repobin.yaml` peer to the installed
 binary maps the tool to a remote repo (optionally pinned to a SHA), which is
 cloned into a local cache and built from the `REPOBIN.toml` inside that
 checkout. The canonical target therefore always lives in the source repo, never
 duplicated in the yaml.
 
-Two caches keep repeated invocations cheap. A *dispatch cache* records the
+Two caches keep repeated invocations cheap. A _dispatch cache_ records the
 resolved executable path keyed by repo root and target, witnessed by the
 mtimes of the target's `BUILD` file, sources, and the built binary; on a warm
 hit it skips `bazel build`/`cquery` entirely and re-execs the cached path,
-falling back to the slow path on any mismatch or corruption. A *repo cache*
+falling back to the slow path on any mismatch or corruption. A _repo cache_
 backs default mode: HEAD-tracking and pinned checkouts live in separate slots,
 refreshes are gated by a fetch stamp and `git ls-remote`, and concurrent
 invocations serialise on a per-cache `flock`.
@@ -110,7 +110,7 @@ version: 1
 tools:
   boss:
     repo: git@github.com:spinyfin/mono.git
-    sha: 4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d  # optional: pin to a specific commit
+    sha: 4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d # optional: pin to a specific commit
   cube:
     repo: git@github.com:spinyfin/mono.git
     # no sha → always tracks HEAD
@@ -169,7 +169,7 @@ invocations serialise on a per-cache `flock`. Override the cache root via
 ## Pinned tools
 
 Default mode (above) pins by **commit SHA** in a user-local `repobin.yaml`. A
-*pinned tool* is different: it is declared in the consuming repo's checked-in
+_pinned tool_ is different: it is declared in the consuming repo's checked-in
 `REPOBIN.toml` and pins by **version tag**, so the pin travels with the repo and
 is reviewed like any other source change. repobin builds the tool from source at
 that tag — its usual build-from-source flow, just at the tagged commit rather

@@ -333,7 +333,7 @@ Key RPCs:
   `create_project`, `create_task`, `create_chore`, `update_work_item`,
   `delete_work_item`, `reorder_project_tasks`, `get_work_tree`.
 - Execution control: `request_execution(work_item_id, opts) →
-  {state: started|queued, worker_id?}`,
+{state: started|queued, worker_id?}`,
   `cancel_execution(work_item_id, force?)`,
   `request_re_engagement(work_item_id)`.
 - Agent control: `agents_list`, `agents_status`, `agents_send`,
@@ -640,7 +640,7 @@ What's preserved:
 What's replaced:
 
 - ACP transcript model for live agents → libghostty terminal panes
-  + hook events.
+  - hook events.
 - Single-agent connection handling → multi-client subscription
   protocol.
 - Per-connection agent registry → server-global execution coordinator.
@@ -675,7 +675,7 @@ Phasing follows the work-execution rollout (Phase A through G); see
   inside leased workspaces). See
   [cube remaining work](../../../cube/docs/remaining-work.md).
 - Cube prereqs: `workspace heartbeat`, release `--reason crash
-  --keep-dirty`, `workspace force-release`, `workspace setup`,
+--keep-dirty`, `workspace force-release`, `workspace setup`,
   pool auto-create from `--source`. These must land before V2 takes
   the cube hard dependency.
 

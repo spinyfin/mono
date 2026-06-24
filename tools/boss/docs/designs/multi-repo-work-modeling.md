@@ -2,14 +2,14 @@
 
 ## Problem
 
-Boss today treats every work item as belonging to *one* repo, derived from the product it sits under. `products.repo_remote_url` is nominally `Option<String>` in the schema (`tools/boss/engine/src/work.rs:1579`) but every code path treats it as effectively required: the reconciler at `work.rs:675` reads `product.repo_remote_url`, threads it into `reconcile_work_item_execution`, and if it's `None` for a new execution the function silently returns without creating a row (`work.rs:2926`). The cube dispatch path (`coordinator.rs:743`) then leases against that exact URL.
+Boss today treats every work item as belonging to _one_ repo, derived from the product it sits under. `products.repo_remote_url` is nominally `Option<String>` in the schema (`tools/boss/engine/src/work.rs:1579`) but every code path treats it as effectively required: the reconciler at `work.rs:675` reads `product.repo_remote_url`, threads it into `reconcile_work_item_execution`, and if it's `None` for a new execution the function silently returns without creating a row (`work.rs:2926`). The cube dispatch path (`coordinator.rs:743`) then leases against that exact URL.
 
 This is the right shape for the two products that exist today:
 
 - **Boss** itself — a single mono repo at `git@github.com:spinyfin/mono.git`. Every Boss task / chore touches that repo.
 - **Flunge** — likewise a single repo.
 
-It is the wrong shape for the user's day job, where a single coherent "product" (the job, the platform, the team's surface area) spans dozens of git repos with no single integration repo. Forcing one Boss product per repo there would shred the kanban into many tiny columns that share no real organising principle — the user thinks in terms of *the work*, not *the repo it touches*. And it would produce a kanban full of products that all mean "work" without disambiguating what each one is *for*.
+It is the wrong shape for the user's day job, where a single coherent "product" (the job, the platform, the team's surface area) spans dozens of git repos with no single integration repo. Forcing one Boss product per repo there would shred the kanban into many tiny columns that share no real organising principle — the user thinks in terms of _the work_, not _the repo it touches_. And it would produce a kanban full of products that all mean "work" without disambiguating what each one is _for_.
 
 This doc proposes a small extension: make `repo_remote_url` truly optional on the product, and let each individual work item carry its own `repo_remote_url` override that wins when set. Resolution at dispatch time is a single fallback chain:
 
@@ -35,7 +35,7 @@ This preserves the existing Boss / Flunge behaviour byte-for-byte (the product c
 
 ## Non-Goals
 
-- **Multi-repo *within* a single work item.** A chore that touches two repos in one run is out for v1. The proposed model resolves to exactly one repo; a chore that legitimately spans two becomes two chores with a dependency edge between them (`work-dependencies.md`).
+- **Multi-repo _within_ a single work item.** A chore that touches two repos in one run is out for v1. The proposed model resolves to exactly one repo; a chore that legitimately spans two becomes two chores with a dependency edge between them (`work-dependencies.md`).
 - **Cross-product references.** Work items in product A linking to / depending on work items in product B is a different concern; same parent project (`proj_18a2bbe20fc03718_8`) tracks it, but a separate design doc covers it once this lands. The dependency design's same-product constraint stays unchanged.
 - **A separate `repos` table / repo registry.** We thought about modelling repos as first-class rows with their own ids, descriptions, short-names, and pool config. It's appealing but premature — the schema we already have (`products.repo_remote_url`, plus the new `tasks.repo_remote_url`) is two text columns and a fallback rule, and cube already owns the repo→pool mapping (`cube repo list`). Promoting to a table is a follow-up if the URL-as-key pattern hurts.
 - **Auto-detection of "which repo does this prompt touch" via LLM call.** Q4's parser is regex / known-name matching only. Calling out to an LLM at chore-create time is overkill given the small number of repos any one product realistically references.
@@ -44,10 +44,10 @@ This preserves the existing Boss / Flunge behaviour byte-for-byte (the product c
 
 ## Naming
 
-- **Field name on `tasks`**: `repo_remote_url`, same as on `products`. `NULL` = inherit from product. We don't call it `repo_override` because the resolution rule is "the work-item value wins iff set" — it's not a true override of an underlying setting, it's the leaf in a two-step fallback. Using the same name on both rows lets the resolver read like prose: *"work_item.repo_remote_url or product.repo_remote_url."*
+- **Field name on `tasks`**: `repo_remote_url`, same as on `products`. `NULL` = inherit from product. We don't call it `repo_override` because the resolution rule is "the work-item value wins iff set" — it's not a true override of an underlying setting, it's the leaf in a two-step fallback. Using the same name on both rows lets the resolver read like prose: _"work_item.repo_remote_url or product.repo_remote_url."_
 - **Resolution function**: `WorkDb::resolve_repo_for_work_item(work_item_id) -> Result<ResolvedRepo>` where `ResolvedRepo` is either `Some(url)` or a typed `RepoResolutionError::NoRepo`. The error is fatal at dispatch but recoverable in the UI ("click here to set one").
 - **CLI flag**: `--repo <url>` on every create / update verb. `--repo ""` means "explicitly clear" (used on `boss product update` to remove the default, and on `boss chore update` / `boss task update` to revert to inheriting). The empty-string form is the same shape as `boss project update --pr-url ""` for clearing.
-- **Filter flag**: `--repo <selector>` on every `list` verb. Selector matches against the *resolved* repo, not the raw column, so `--repo nimbus` finds work items that *effectively* run against `nimbus` regardless of whether the override is set explicitly or inherited.
+- **Filter flag**: `--repo <selector>` on every `list` verb. Selector matches against the _resolved_ repo, not the raw column, so `--repo nimbus` finds work items that _effectively_ run against `nimbus` regardless of whether the override is set explicitly or inherited.
 - **Short name**: cube already uses a `<REPO>` argument (`cube workspace lease --task '...' <REPO>`) that takes either the canonical repo identifier (e.g. `mono`) or a full URL. Boss stores URLs; the CLI / UI derive the short name for display (basename of the URL, without `.git`). No registry; just a parse.
 
 ---
@@ -63,11 +63,11 @@ This preserves the existing Boss / Flunge behaviour byte-for-byte (the product c
 
 ### Discussion
 
-(b) is the right shape *if* and only if we expect multiple repos per work item in v2. The non-goals rule that out — and even when it changes, two chores linked by a dependency are a cleaner shape than one chore with two repos. (b) buys flexibility we explicitly don't want.
+(b) is the right shape _if_ and only if we expect multiple repos per work item in v2. The non-goals rule that out — and even when it changes, two chores linked by a dependency are a cleaner shape than one chore with two repos. (b) buys flexibility we explicitly don't want.
 
 (c) wraps a small structured value behind JSON. Branch / subpath aren't load-bearing for dispatch (cube leases the repo's main branch checkout by convention, then the worker `jj git fetch` && `jj new <branch>` if it cares about a different branch — there's no per-work-item branch in v1). Storing JSON costs us indexability for `--repo` filters and gives us no real win.
 
-(d) is the table-promotion path the *Non-Goals* section already declined. It's reversible: a future migration can carve a `repos` table out of the column if it pays for itself.
+(d) is the table-promotion path the _Non-Goals_ section already declined. It's reversible: a future migration can carve a `repos` table out of the column if it pays for itself.
 
 (a) is the natural extension of how `products` already shapes the repo. One column, nullable, defaults to `NULL`. Indexable for the listing filter. Trivial migration. Mirror name on both row kinds reads as a fallback chain.
 
@@ -97,7 +97,7 @@ The `products` table is unchanged: it already permits `NULL` (`work.rs:1579`). T
 
 ### Why not also add the column to `projects`?
 
-Q2 covers this — short answer: project-level override is an attractive nuisance. Tasks under the project inherit either from the project (one extra layer) or directly from the product (the current shape, simpler). A two-layer fallback is harder to reason about than a one-layer one, and the v1 use case (a work product with no default repo and per-task overrides) doesn't need it. If a project legitimately spans repos, that's *one project per actual cluster of work*, and the work items carry the repo, not the project.
+Q2 covers this — short answer: project-level override is an attractive nuisance. Tasks under the project inherit either from the project (one extra layer) or directly from the product (the current shape, simpler). A two-layer fallback is harder to reason about than a one-layer one, and the v1 use case (a work product with no default repo and per-task overrides) doesn't need it. If a project legitimately spans repos, that's _one project per actual cluster of work_, and the work items carry the repo, not the project.
 
 ---
 
@@ -111,7 +111,7 @@ Does `projects.repo_remote_url` also exist? If so, do tasks under that project r
 
 - **(α) No project-level override.** Projects ignore repo entirely; tasks inherit straight from product.
 - **(β) Project-level override, two-layer.** A task with no `repo_remote_url` falls back to `project.repo_remote_url`, then `product.repo_remote_url`.
-- **(γ) Project-level override that *replaces* the product default for that project's tasks.** Different semantics: setting `project.repo_remote_url = foo` *forces* every child task to use `foo` unless the task explicitly carries its own override.
+- **(γ) Project-level override that _replaces_ the product default for that project's tasks.** Different semantics: setting `project.repo_remote_url = foo` _forces_ every child task to use `foo` unless the task explicitly carries its own override.
 
 ### Discussion
 
@@ -119,23 +119,23 @@ Does `projects.repo_remote_url` also exist? If so, do tasks under that project r
 
 (β) generalises the model symmetrically — every row kind that contains work has an optional repo, and resolution walks up the tree. The cost is one more layer in the resolver and one more place to look when debugging "why is this task dispatching to the wrong repo." That cost is real: future-Brian (or a worker session reading the rules) has to reason about three potential sources for the same value.
 
-(α) keeps the resolver flat. A project is a *grouping of design + tasks*, not a repo declaration. The motivating use case ("at work, the product has no repo and each chore picks its own") doesn't involve projects — chores live directly under the product. The case where it *would* matter — a project whose tasks all touch one repo that's distinct from the product default — is handled cleanly by either (1) setting each task's `repo_remote_url`, which is a few keystrokes per task and a one-shot batch via `boss task create-many`, or (2) by making that "project" a separate Boss product with its own repo, which is its actual semantic shape.
+(α) keeps the resolver flat. A project is a _grouping of design + tasks_, not a repo declaration. The motivating use case ("at work, the product has no repo and each chore picks its own") doesn't involve projects — chores live directly under the product. The case where it _would_ matter — a project whose tasks all touch one repo that's distinct from the product default — is handled cleanly by either (1) setting each task's `repo_remote_url`, which is a few keystrokes per task and a one-shot batch via `boss task create-many`, or (2) by making that "project" a separate Boss product with its own repo, which is its actual semantic shape.
 
-I considered the third reading: a project that *describes design and implementation that crosses repos*. The user has at least one of these (the multi-repo project itself!). But the tasks within such a project each touch a specific repo, not "the project's repo" — so per-task overrides win there too.
+I considered the third reading: a project that _describes design and implementation that crosses repos_. The user has at least one of these (the multi-repo project itself!). But the tasks within such a project each touch a specific repo, not "the project's repo" — so per-task overrides win there too.
 
 ### Recommendation
 
 **Pick (α). No project-level override in v1.**
 
-Tasks under a project follow the same resolver as chores: `task.repo_remote_url ?? product.repo_remote_url`. The project row is *transparent* in the resolution chain.
+Tasks under a project follow the same resolver as chores: `task.repo_remote_url ?? product.repo_remote_url`. The project row is _transparent_ in the resolution chain.
 
-This keeps the resolver one-line and the mental model crisp: *"the only places a repo can be set are on the product (default) and on the work item (override)."*
+This keeps the resolver one-line and the mental model crisp: _"the only places a repo can be set are on the product (default) and on the work item (override)."_
 
 If a real case for project-level override appears later, this is purely additive — one ALTER TABLE, one extra fallback step in `resolve_repo_for_work_item`, no caller has to change.
 
 ### What about design tasks?
 
-`kind = 'design'` rows are tasks; they sit in the same `tasks` table as project tasks and chores. They get the column for free under recommendation (a). For the at-work multi-repo product, that's important: a design task may produce a doc *outside* any of the work product's chore repos (e.g. in a wiki repo). That works today using `design-producing-tasks.md`'s `products.docs_location` field for the doc location, and orthogonally now the design task can carry its own override for the repo it dispatches into. The two fields are independent: `tasks.repo_remote_url` is "where do I work," `products.docs_location` / `tasks.metadata.design.doc_branch` is "where do I write the doc." They can name the same repo or different repos; the resolver doesn't conflate them.
+`kind = 'design'` rows are tasks; they sit in the same `tasks` table as project tasks and chores. They get the column for free under recommendation (a). For the at-work multi-repo product, that's important: a design task may produce a doc _outside_ any of the work product's chore repos (e.g. in a wiki repo). That works today using `design-producing-tasks.md`'s `products.docs_location` field for the doc location, and orthogonally now the design task can carry its own override for the repo it dispatches into. The two fields are independent: `tasks.repo_remote_url` is "where do I work," `products.docs_location` / `tasks.metadata.design.doc_branch` is "where do I write the doc." They can name the same repo or different repos; the resolver doesn't conflate them.
 
 ---
 
@@ -155,7 +155,7 @@ What goes into the column? A remote URL (`git@github.com:spinyfin/mono.git`), a 
 
 Cube's CLI takes either: `cube workspace lease --task '...' <REPO>` accepts the short name (the column it uses as the stable repo identifier) and `cube repo ensure --origin <URL>` accepts the URL. Internally cube maps URL ↔ short-name via its `cube_repos` table.
 
-(II) is friendlier in the UI ("`nimbus` chip on a card" beats "`git@github.com:myorg/nimbus.git` chip") but requires Boss to either *be* the registry or *trust* cube's registry as a source of truth. Both are wrong: the registry that cube already maintains is for the workspace pool, not for "which repo URL is short-named what." If we make Boss its own registry we duplicate state; if we delegate to cube the column is meaningless without a live cube DB to resolve against. Either failure mode is worse than just storing the URL.
+(II) is friendlier in the UI ("`nimbus` chip on a card" beats "`git@github.com:myorg/nimbus.git` chip") but requires Boss to either _be_ the registry or _trust_ cube's registry as a source of truth. Both are wrong: the registry that cube already maintains is for the workspace pool, not for "which repo URL is short-named what." If we make Boss its own registry we duplicate state; if we delegate to cube the column is meaningless without a live cube DB to resolve against. Either failure mode is worse than just storing the URL.
 
 (III) papers over the choice. The column's parser sometimes does and sometimes doesn't have a URL; downstream code can't tell which without a `match`. That bleeds across every consumer.
 
@@ -180,7 +180,7 @@ Canonicalisation happens once at write time (`SetRepoForWorkItem` and `CreatePro
 
 ### What about the `--repo <selector>` filter?
 
-The filter accepts *either* a short name (matched against `short_name_for(url)` on every row's resolved repo) or a full URL (matched against the canonicalised form). This is the only place where short-name → URL "resolution" happens, and it's a `WHERE LOWER(short_name_for(...)) = LOWER(?)` not a global registry. A short-name collision across two different URLs (`foo/nimbus` vs `bar/nimbus`) becomes a single match for the filter, which is the right UX — the user typed `nimbus`, they get all `nimbus`.
+The filter accepts _either_ a short name (matched against `short_name_for(url)` on every row's resolved repo) or a full URL (matched against the canonicalised form). This is the only place where short-name → URL "resolution" happens, and it's a `WHERE LOWER(short_name_for(...)) = LOWER(?)` not a global registry. A short-name collision across two different URLs (`foo/nimbus` vs `bar/nimbus`) becomes a single match for the filter, which is the right UX — the user typed `nimbus`, they get all `nimbus`.
 
 If a collision becomes painful in real life, the filter accepts the disambiguating full URL and the user moves on. Boss does not need to police it.
 
@@ -192,7 +192,7 @@ If a collision becomes painful in real life, the filter accepts the disambiguati
 
 When the user runs `boss chore create --product work` (no `--repo`), we have three signals to consult, in order:
 
-1. **The prompt text.** *"In the nimbus repo, please fix the deploy script"* — the user said the repo out loud.
+1. **The prompt text.** _"In the nimbus repo, please fix the deploy script"_ — the user said the repo out loud.
 2. **Recent-context memory.** The last repo this product's work items used. Cached cheaply.
 3. **Product default.** `product.repo_remote_url`, if set.
 4. **Ask once interactively, or fail in `--no-input`.**
@@ -219,7 +219,7 @@ Two-step match:
 - **Exact-token match wins.** `"in the nimbus repo"` matches the short name `nimbus`.
 - **`in <name>`, `<name> repo`, `<name>/...` patterns** as a fallback. Same regex shape as the `git@host:<owner>/<repo>` extractor.
 
-If multiple known names match, pick the *first one mentioned in the prompt* (left-most position wins). If two short names collide on the same position (rare, but `nimbus-frontend` and `nimbus`), pick the longer match.
+If multiple known names match, pick the _first one mentioned in the prompt_ (left-most position wins). If two short names collide on the same position (rare, but `nimbus-frontend` and `nimbus`), pick the longer match.
 
 If zero match → fall through to step (2).
 
@@ -242,20 +242,20 @@ If even this returns nothing (the product has never had a per-work-item override
 
 ### Step (3): product default
 
-If `product.repo_remote_url` is set, use it. This *is* the Boss / Flunge case — there is no inference because the answer is unambiguous.
+If `product.repo_remote_url` is set, use it. This _is_ the Boss / Flunge case — there is no inference because the answer is unambiguous.
 
 ### Step (4): ask or fail
 
 If steps 1–3 all whiffed, the CLI behaviour is:
 
-- **Interactive mode (`isatty` and no `--no-input`).** Prompt: *"No repo could be resolved. Known repos for `work`: nimbus, ledger, console. Pick one or enter a full URL:"*. The list shows the same `known_repos_for_product` set, plus an "Enter URL…" option. The chosen value is written to the new chore, *not* to the product default — the product genuinely has no default in this scenario.
-- **`--no-input` mode (the engine / scripted callers).** Error: *"could not resolve repo for new chore under product `work` (product has no default; prompt mentions no known repo; no prior work-item repo cached). Re-run with `--repo <url>` or set a product default with `boss product update work --repo <url>`."* Exit non-zero. The engine sees this as an `invalid_request`.
+- **Interactive mode (`isatty` and no `--no-input`).** Prompt: _"No repo could be resolved. Known repos for `work`: nimbus, ledger, console. Pick one or enter a full URL:"_. The list shows the same `known_repos_for_product` set, plus an "Enter URL…" option. The chosen value is written to the new chore, _not_ to the product default — the product genuinely has no default in this scenario.
+- **`--no-input` mode (the engine / scripted callers).** Error: _"could not resolve repo for new chore under product `work` (product has no default; prompt mentions no known repo; no prior work-item repo cached). Re-run with `--repo <url>` or set a product default with `boss product update work --repo <url>`."_ Exit non-zero. The engine sees this as an `invalid_request`.
 
 ### How the known-repo set is populated
 
-It's not a manually-maintained registry. The set is the *empirical* distinct-URL set across all of a product's tasks plus the product default — which means the first time a user creates a chore against a new repo, the parser misses it (because nothing else under the product references that repo yet); the user supplies `--repo` once; subsequent chores can be auto-inferred from the prompt because the URL is now in the empirical set.
+It's not a manually-maintained registry. The set is the _empirical_ distinct-URL set across all of a product's tasks plus the product default — which means the first time a user creates a chore against a new repo, the parser misses it (because nothing else under the product references that repo yet); the user supplies `--repo` once; subsequent chores can be auto-inferred from the prompt because the URL is now in the empirical set.
 
-This bootstraps cleanly from zero. The drawback: a brand-new product with no chores and a wiki-style prompt-text inference *cannot* work — the parser has nothing to match against. That's fine because step (4) catches it (ask the human once).
+This bootstraps cleanly from zero. The drawback: a brand-new product with no chores and a wiki-style prompt-text inference _cannot_ work — the parser has nothing to match against. That's fine because step (4) catches it (ask the human once).
 
 ### Recommendation
 
@@ -287,19 +287,19 @@ Cube workspace lease (`cube workspace lease --task '...' <REPO>`) takes one repo
 self.cube_client.ensure_repo(&execution.repo_remote_url).await
 ```
 
-`work_executions.repo_remote_url` is already populated *per execution row* by `reconcile_work_item_execution` (`work.rs:2935`), which gets it as a `repo_remote_url: Option<&str>` argument from the per-product reconciler (`work.rs:675`). Three changes needed:
+`work_executions.repo_remote_url` is already populated _per execution row_ by `reconcile_work_item_execution` (`work.rs:2935`), which gets it as a `repo_remote_url: Option<&str>` argument from the per-product reconciler (`work.rs:675`). Three changes needed:
 
-1. **Resolution at reconcile time.** `reconcile_work_item_execution` should look at the *work item's* `repo_remote_url` first, then the product's. New helper `resolve_repo_for_work_item(conn, work_item_id) -> Option<String>`; the existing per-product reconciler stops threading `product.repo_remote_url` as the only signal and instead per-row resolves.
-2. **No-repo path.** Today `reconcile_work_item_execution` returns `Ok(())` silently when `repo_remote_url` is `None` (`work.rs:2926`). Replace the silent skip with a `WorkAttentionItem` recording *"work item X has no repo resolution; set one with `boss <kind> update --repo <url>` or set a product default."* The item is sticky until the user fixes the row. Existing dispatch flow is unchanged for any row whose repo *does* resolve.
+1. **Resolution at reconcile time.** `reconcile_work_item_execution` should look at the _work item's_ `repo_remote_url` first, then the product's. New helper `resolve_repo_for_work_item(conn, work_item_id) -> Option<String>`; the existing per-product reconciler stops threading `product.repo_remote_url` as the only signal and instead per-row resolves.
+2. **No-repo path.** Today `reconcile_work_item_execution` returns `Ok(())` silently when `repo_remote_url` is `None` (`work.rs:2926`). Replace the silent skip with a `WorkAttentionItem` recording _"work item X has no repo resolution; set one with `boss <kind> update --repo <url>` or set a product default."_ The item is sticky until the user fixes the row. Existing dispatch flow is unchanged for any row whose repo _does_ resolve.
 3. **Pool config.** Cube's pool configuration is per-repo. The engine's `ensure_repo(&url)` call (`coordinator.rs:745`) already handles this — cube auto-materialises a pool from the origin URL if none exists. So the dispatch story for a brand-new repo (no pool yet) is: the engine asks cube to ensure it, cube creates the pool, the lease proceeds. That's the existing flow; no engine change here.
 
 ### The "where does the pool come from" question
 
-The work item description asks: *"Pool config currently assumes one product → one repo pool. Spec how a repo-less product's work items find the right pool."*
+The work item description asks: _"Pool config currently assumes one product → one repo pool. Spec how a repo-less product's work items find the right pool."_
 
-This is moot under the actual cube model. Pools are keyed by *repo*, not by *product*. `cube repo ensure --origin <URL>` materialises a pool for a URL; `cube workspace lease --task '...' <REPO>` leases against the pool. Boss has never enforced "one product → one pool" except by virtue of every product carrying one URL. With per-work-item URLs, the same cube machinery applies: the dispatcher resolves URL → pool via `cube repo ensure` (which is idempotent and cheap) every time it dispatches, regardless of which row the URL came from.
+This is moot under the actual cube model. Pools are keyed by _repo_, not by _product_. `cube repo ensure --origin <URL>` materialises a pool for a URL; `cube workspace lease --task '...' <REPO>` leases against the pool. Boss has never enforced "one product → one pool" except by virtue of every product carrying one URL. With per-work-item URLs, the same cube machinery applies: the dispatcher resolves URL → pool via `cube repo ensure` (which is idempotent and cheap) every time it dispatches, regardless of which row the URL came from.
 
-The only operational concern is *workspace count*. Each repo's pool has a workspace count; for a multi-repo product, the engine may want to keep more workspaces alive across repos than for a single-repo product. That's a cube configuration concern, not a Boss one — set the per-repo `workspace_count` in cube to taste. We document it in the bootstrap note (Q6) but don't model it.
+The only operational concern is _workspace count_. Each repo's pool has a workspace count; for a multi-repo product, the engine may want to keep more workspaces alive across repos than for a single-repo product. That's a cube configuration concern, not a Boss one — set the per-repo `workspace_count` in cube to taste. We document it in the bootstrap note (Q6) but don't model it.
 
 ### Resolver and the explicit `RequestExecution` path
 
@@ -370,7 +370,7 @@ The gap is in cube's `repo ensure` — it accepts `--origin` plus a stable ident
 ### Options
 
 - **(A) Trust cube's auto-provision for cold repos.** No Boss change. First worker dispatch against a new repo triggers cube's `repo ensure`, which creates a pool with defaults. The user can `cube repo add <short> --origin <url> --workspace-root <dir> --workspace-prefix <prefix>` later to retroactively configure if defaults are wrong.
-- **(B) Require a `cube repo add` for every new repo before Boss can dispatch against it.** Bossctl checks `cube repo list` on first dispatch; if missing, refuses with *"run `cube repo add <short> --origin <url> --workspace-root <dir> --workspace-prefix <prefix>` first."*
+- **(B) Require a `cube repo add` for every new repo before Boss can dispatch against it.** Bossctl checks `cube repo list` on first dispatch; if missing, refuses with _"run `cube repo add <short> --origin <url> --workspace-root <dir> --workspace-prefix <prefix>` first."_
 - **(C) Surface a "cold repo" attention item but allow dispatch.** First dispatch proceeds with cube defaults; an attention item flags that the workspace_root might be unexpected, and the user can opt into a custom configuration.
 
 ### Discussion
@@ -396,7 +396,7 @@ To customize, run:
 
 The detection is: on every successful `ensure_repo` call, the engine asks cube `repo list --json` (one round-trip, ~1ms) and checks whether the returned row's `workspace_root` was the cube default or human-configured. If default, raise the attention item once per repo (deduped by repo URL).
 
-The attention item is *advisory*, not blocking. The user can ignore it and dispatch keeps working with cube defaults.
+The attention item is _advisory_, not blocking. The user can ignore it and dispatch keeps working with cube defaults.
 
 If the user resolves the attention item (`boss attention resolve <id>`) it doesn't reappear. If they re-add the repo with custom config, the resolver no longer sees the "default config" state and never raises it again.
 
@@ -410,7 +410,7 @@ Each pool has a configurable workspace count (concurrent workers per repo). For 
 
 ### Kanban card
 
-Today's card layout (`WorkBoardCardView`, `app-macos/Sources/ContentView.swift`) shows a project tag, the title, the status pill, and a PR link in the footer. For multi-repo products, the *repo* becomes a load-bearing field that the user needs to scan at a glance.
+Today's card layout (`WorkBoardCardView`, `app-macos/Sources/ContentView.swift`) shows a project tag, the title, the status pill, and a PR link in the footer. For multi-repo products, the _repo_ becomes a load-bearing field that the user needs to scan at a glance.
 
 Three options:
 
@@ -422,8 +422,8 @@ Three options:
 
 **Hybrid:**
 
-- **When the product has a single resolved repo** (i.e. `product.repo_remote_url` is set AND no card's `task.repo_remote_url` deviates) — *no chip*. The whole column shares the repo; printing it on every card is noise. The product header lane (top of kanban) shows the repo once.
-- **When the product has no default OR any card overrides** — *show the chip on every card* (option P, in the header). The repo chip carries the short name (`short_name_for(url)`). Two chips with different repos in the same column scan instantly; one of them being different from the rest is a visible signal.
+- **When the product has a single resolved repo** (i.e. `product.repo_remote_url` is set AND no card's `task.repo_remote_url` deviates) — _no chip_. The whole column shares the repo; printing it on every card is noise. The product header lane (top of kanban) shows the repo once.
+- **When the product has no default OR any card overrides** — _show the chip on every card_ (option P, in the header). The repo chip carries the short name (`short_name_for(url)`). Two chips with different repos in the same column scan instantly; one of them being different from the rest is a visible signal.
 
 Implementation lives in `WorkBoardView`'s render loop: the column computes `effective_repo_for_product = if all cards resolve to the same URL { Some(url) } else { None }`. If `Some`, the column header carries the chip and per-card chips are suppressed; if `None`, per-card chips appear.
 
@@ -433,22 +433,22 @@ Hover on the chip shows the full URL.
 
 Add a `Repo` column (after `Status`, before the dependency-related columns) showing the short name. Sortable, filterable via `--repo`.
 
-For a single-repo product (every row resolves to the same URL), the column collapses to a one-line legend at the top of the table — *"All rows under `boss` resolve to `mono`."* This is consistent with how the kanban handles it.
+For a single-repo product (every row resolves to the same URL), the column collapses to a one-line legend at the top of the table — _"All rows under `boss` resolve to `mono`."_ This is consistent with how the kanban handles it.
 
 ### `boss <kind> show` output
 
-Add a *Repo* line near the top, after the *Status* line:
+Add a _Repo_ line near the top, after the _Status_ line:
 
 ```text
 Repo:    git@github.com:myorg/nimbus.git  (override on this work item)
          git@github.com:spinyfin/mono.git (inherited from product `boss`)
 ```
 
-The parenthetical explains *which row supplied the value* — a small UX win for debugging "why is this dispatching against the wrong repo." If neither row supplies one, the line reads *"(none — work item cannot dispatch)"* and the show output gains a hint about how to set one.
+The parenthetical explains _which row supplied the value_ — a small UX win for debugging "why is this dispatching against the wrong repo." If neither row supplies one, the line reads _"(none — work item cannot dispatch)"_ and the show output gains a hint about how to set one.
 
 ### Recommendation
 
-**Repo chip on the card header *only* when the product is multi-repo. Repo column on list verbs, with single-repo collapsing. Repo line on show output, always present, indicating the source row.**
+**Repo chip on the card header _only_ when the product is multi-repo. Repo column on list verbs, with single-repo collapsing. Repo line on show output, always present, indicating the source row.**
 
 ---
 
@@ -496,7 +496,7 @@ boss project list    [--repo <selector>]
 
 `--repo <url>`: set / override the repo for this row.
 `--repo ""`: explicitly clear the override (revert to inheriting). Same shape as `--pr-url ""` already supported on `boss <kind> update`.
-`--repo <selector>` on list verbs: filter by *resolved* repo (matches short name or full URL, per Q3).
+`--repo <selector>` on list verbs: filter by _resolved_ repo (matches short name or full URL, per Q3).
 
 ### Showing the resolved repo
 
@@ -522,14 +522,14 @@ Verb signatures as above. The empty-string form (`--repo ""`) consistently means
 
 ### Product create form
 
-The current form has a *Repo* field that's required. Change to optional, with helper text *"Leave empty if work items will specify their own repo."*
+The current form has a _Repo_ field that's required. Change to optional, with helper text _"Leave empty if work items will specify their own repo."_
 
 ### Work-item create form (chore + task)
 
 Today there's no repo field on the chore/task create form because the product carries it implicitly. With the override column added:
 
-- **When the parent product has a default repo:** the form hides the repo field by default, with a *"Override repo…"* disclosure that expands a repo picker. The picker is pre-populated with the known-repo set from `known_repos_for_product` (Q4), with a *"Custom URL…"* option at the bottom.
-- **When the parent product has no default:** the repo field is shown by default, required, with the same picker as above plus a *"Set as product default"* checkbox that, if checked, sets `product.repo_remote_url` in the same submit.
+- **When the parent product has a default repo:** the form hides the repo field by default, with a _"Override repo…"_ disclosure that expands a repo picker. The picker is pre-populated with the known-repo set from `known_repos_for_product` (Q4), with a _"Custom URL…"_ option at the bottom.
+- **When the parent product has no default:** the repo field is shown by default, required, with the same picker as above plus a _"Set as product default"_ checkbox that, if checked, sets `product.repo_remote_url` in the same submit.
 
 ### Recent-repos picker
 
@@ -537,7 +537,7 @@ Populated from the per-product distinct-URL query. Cached in the app's view mode
 
 ### Editing an existing work item
 
-The chore / task detail surface (when it exists; today it's a popover) gains a *Repo* row that shows the resolved repo with a parenthetical source (Q7). Clicking the row opens the same picker.
+The chore / task detail surface (when it exists; today it's a popover) gains a _Repo_ row that shows the resolved repo with a parenthetical source (Q7). Clicking the row opens the same picker.
 
 ### macOS kanban repo chip
 
@@ -585,7 +585,7 @@ The user runs `boss chore update <selector> --repo <new_url>`. The new URL canon
 
 Allowed. Stored as the literal URL. Functionally equivalent to no override. The UI doesn't show a chip because the resolver result equals the product default, satisfying the "show chip iff card differs" rule from Q7.
 
-The CLI could warn — *"override matches product default; you could clear with `--repo \"\"`"* — but doesn't, because the user may be intentionally pinning to a URL they expect to differ from the product default someday.
+The CLI could warn — _"override matches product default; you could clear with `--repo \"\"`"_ — but doesn't, because the user may be intentionally pinning to a URL they expect to differ from the product default someday.
 
 ### Resolving repo for a work item whose product was deleted
 
@@ -597,11 +597,11 @@ Returns an empty list. Same shape as any other filter that matches nothing.
 
 ### Resolver and the per-execution repo snapshot
 
-`work_executions.repo_remote_url` is `NOT NULL` (`work.rs:1632`). The reconciler writes the *resolved* URL at execution-creation time. Once a row is in `running` / `completed` / `failed`, the URL is frozen — even if the user changes the override or the product default afterwards, the execution row still shows the URL it ran against. This is correct: executions are history.
+`work_executions.repo_remote_url` is `NOT NULL` (`work.rs:1632`). The reconciler writes the _resolved_ URL at execution-creation time. Once a row is in `running` / `completed` / `failed`, the URL is frozen — even if the user changes the override or the product default afterwards, the execution row still shows the URL it ran against. This is correct: executions are history.
 
 ### Work item with override pointing at a repo cube can't reach
 
-Cube returns an error from `ensure_repo` or `lease_workspace`. The engine's existing error path (`coordinator.rs:783` — *"cube workspace lease failed; marking execution start as failed"*) catches it. The work item moves to a failure state with the cube error verbatim. The user diagnoses and updates the override.
+Cube returns an error from `ensure_repo` or `lease_workspace`. The engine's existing error path (`coordinator.rs:783` — _"cube workspace lease failed; marking execution start as failed"_) catches it. The work item moves to a failure state with the cube error verbatim. The user diagnoses and updates the override.
 
 ### Multi-repo product where one repo's pool exhausts
 
@@ -745,7 +745,7 @@ INSERT work_executions    record attention item
 
 **R1 — Resolution drift.** The resolver is called from at least three places (reconciler, explicit-request, attention probe). If they diverge, "why is this row dispatching against the wrong repo" becomes hard to debug. Mitigation: single helper `resolve_repo_for_work_item`, every caller routes through it; unit tests cover the three callers explicitly.
 
-**R2 — Prompt-text parser false positives.** *"Don't touch the nimbus repo, leave it alone"* matches `nimbus`. The user expected step (3) (recent context) or step (4) (ask). Mitigation: the parser matches short-name *tokens* in prompt text; negation phrases are out of scope. If a user repeatedly hits this, they pass `--repo` explicitly or accept the friction. A future enhancement could bring in a small grammar; v1 doesn't.
+**R2 — Prompt-text parser false positives.** _"Don't touch the nimbus repo, leave it alone"_ matches `nimbus`. The user expected step (3) (recent context) or step (4) (ask). Mitigation: the parser matches short-name _tokens_ in prompt text; negation phrases are out of scope. If a user repeatedly hits this, they pass `--repo` explicitly or accept the friction. A future enhancement could bring in a small grammar; v1 doesn't.
 
 **R3 — Empirical known-repo set bootstraps slowly.** A brand-new product has zero known repos and the prompt parser whiffs every time until the user manually `--repo`'s one chore. Acceptable; document in the help text. The "recent context" query covers it after one chore exists.
 
@@ -753,15 +753,15 @@ INSERT work_executions    record attention item
 
 **R5 — Cube default workspace_root mismatch.** The cube auto-provision uses defaults that don't match the user's filesystem conventions. The first workspace is in the wrong place. Mitigation: cold-repo attention item names the exact `cube repo add` command to override; once configured, subsequent workspaces are created correctly.
 
-**R6 — Per-execution URL freeze.** An execution kicked off against the old URL keeps dispatching against the old URL even after the user updates the override. Mitigation: this is the correct behaviour (executions are history), but document on `boss <kind> show` that the work item's *current* repo and an in-flight execution's repo may differ — and that the next execution will use the new value.
+**R6 — Per-execution URL freeze.** An execution kicked off against the old URL keeps dispatching against the old URL even after the user updates the override. Mitigation: this is the correct behaviour (executions are history), but document on `boss <kind> show` that the work item's _current_ repo and an in-flight execution's repo may differ — and that the next execution will use the new value.
 
 **R7 — Empty-string vs NULL ambiguity.** SQLite distinguishes `''` from `NULL`; the resolver checks both (`s.filter(|s| !s.is_empty())`). If a caller mis-writes `''` we still inherit. Mitigation: `apply_optional_patch` normalises empty strings to `NULL` on write; this is already the pattern for the existing optional columns.
 
 **R8 — A multi-repo product's tasks accidentally inherit `NULL` when the user expects inheritance from another work item.** The resolver doesn't walk between work items. Mitigation: documented in Q2 — the only fallback is `product`. Users who want sibling-inheritance create separate products. If a real pattern emerges (one design task supplies its repo to its sibling implementation tasks), it's a follow-up; not v1.
 
-**R9 — App rendering mid-migration.** An app build that decodes `Task` and crashes on unknown field doesn't exist (serde / Codable default to ignoring unknown fields), but a build that *expects* the field and crashes on missing field could exist if we mark it required. Mitigation: `#[serde(default)]` and `Codable` with `decodeIfPresent`; existing wire-shape tests catch regressions.
+**R9 — App rendering mid-migration.** An app build that decodes `Task` and crashes on unknown field doesn't exist (serde / Codable default to ignoring unknown fields), but a build that _expects_ the field and crashes on missing field could exist if we mark it required. Mitigation: `#[serde(default)]` and `Codable` with `decodeIfPresent`; existing wire-shape tests catch regressions.
 
-**R10 — Filter behaviour on `--repo` with substring match.** Q3's filter says short-name match is case-insensitive substring. `--repo m` matches `mono`, `metrics`, and `samonette`. Mitigation: substring is *prefix*, not free substring; reject filters shorter than 2 chars to keep false-positive density low.
+**R10 — Filter behaviour on `--repo` with substring match.** Q3's filter says short-name match is case-insensitive substring. `--repo m` matches `mono`, `metrics`, and `samonette`. Mitigation: substring is _prefix_, not free substring; reject filters shorter than 2 chars to keep false-positive density low.
 
 ---
 
@@ -803,7 +803,7 @@ These are bite-sized so each fits in a single worker session.
 
 ## Out of Scope
 
-- Multi-repo *within* a single work item (one chore touching two repos in one run).
+- Multi-repo _within_ a single work item (one chore touching two repos in one run).
 - Cross-product references (work item in product A pointing at work item in product B).
 - LLM-based prompt-text parsing for repo inference.
 - A separate `repos` registry table.

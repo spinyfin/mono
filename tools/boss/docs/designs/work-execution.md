@@ -1006,7 +1006,7 @@ If you want the smallest practical delivery sequence, build in this order:
 9. Transcript storage:
    structured logs plus derived markdown.
 10. Recovery:
-   stale lease handling, abandoned executions, operator tooling.
+    stale lease handling, abandoned executions, operator tooling.
 
 That ordering is intentional:
 

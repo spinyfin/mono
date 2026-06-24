@@ -32,5 +32,5 @@ carrying the offending text.
 This is a leaf crate with no internal dependencies, building on `tokio`
 async filesystem I/O and `serde_json`. It is depended on by `boss-engine`,
 and pairs conceptually with `boss-transcript-markdown`: this crate is
-responsible for *getting* transcript records off disk, while
+responsible for _getting_ transcript records off disk, while
 `boss-transcript-markdown` renders them for human consumption.

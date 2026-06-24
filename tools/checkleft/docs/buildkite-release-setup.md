@@ -2,7 +2,7 @@
 
 This document is the operator checklist for the **checkleft release pipeline** — the Buildkite pipeline that builds prebuilt `checkleft` binaries for Linux and macOS and publishes them as assets on a GitHub Release of `spinyfin/mono`. External repos consume these prebuilts instead of building checkleft from source.
 
-It is modeled on the Boss release pipeline; for that reference see [`../../boss/docs/buildkite-release-setup.md`](../../boss/docs/buildkite-release-setup.md). The two differ in one important way: Boss releases run as a *step inside the existing `mono` pipeline*, while checkleft releases run as a **separate pipeline** with its own cron schedule and its own manual trigger. **Creating the in-repo pipeline file is not enough — the pipeline must be registered in Buildkite using the steps below.**
+It is modeled on the Boss release pipeline; for that reference see [`../../boss/docs/buildkite-release-setup.md`](../../boss/docs/buildkite-release-setup.md). The two differ in one important way: Boss releases run as a _step inside the existing `mono` pipeline_, while checkleft releases run as a **separate pipeline** with its own cron schedule and its own manual trigger. **Creating the in-repo pipeline file is not enough — the pipeline must be registered in Buildkite using the steps below.**
 
 - Pipeline definition: [`../../../.buildkite/pipeline-checkleft-release.yml`](../../../.buildkite/pipeline-checkleft-release.yml)
 - Release script: [`../../../.buildkite/steps/checkleft-release.sh`](../../../.buildkite/steps/checkleft-release.sh)
@@ -12,10 +12,10 @@ It is modeled on the Boss release pipeline; for that reference see [`../../boss/
 
 ## How releases are triggered
 
-| Trigger | When | Change-detection |
-|---|---|---|
-| Buildkite cron schedule | e.g. daily | Skips if nothing under checkleft changed since the last `checkleft-v*` tag |
-| Manual build (`bk build create`, BK UI **New Build**, or REST API) | On demand | Always releases (skips change-detection) |
+| Trigger                                                            | When       | Change-detection                                                           |
+| ------------------------------------------------------------------ | ---------- | -------------------------------------------------------------------------- |
+| Buildkite cron schedule                                            | e.g. daily | Skips if nothing under checkleft changed since the last `checkleft-v*` tag |
+| Manual build (`bk build create`, BK UI **New Build**, or REST API) | On demand  | Always releases (skips change-detection)                                   |
 
 The pipeline should **not** be wired to build on push. It pushes only a tag, never a commit to `main` (the version bump is patched into the release checkout, never committed), and an idempotency guard no-ops any run whose `HEAD` is already the latest release commit — but the cleanest configuration is push-builds disabled, schedule + manual only.
 

@@ -7,11 +7,11 @@ Date: 2026-06-14.
 
 > **Update (2026-06-15, implementation):** the `require-companion-change` half was
 > implemented as a single generic WASM check `file/require-companion-change` that
-> *subsumes* both the marker-based `ifchange-thenchange` / `file/ifchange` check and
+> _subsumes_ both the marker-based `ifchange-thenchange` / `file/ifchange` check and
 > the glob-based `api-breaking-surface` check, rather than keeping them as two
 > separate complementary primitives (§1.2's table below). The unified check supports
 > both coupling-declaration mechanisms — in-source `LINT.IfChange`/`LINT.ThenChange`
-> markers *and* config `trigger_globs`/`required_globs` — and exports `file/ifchange`
+> markers _and_ config `trigger_globs`/`required_globs` — and exports `file/ifchange`
 > and `api-breaking-surface` as deprecated aliases for the migration window. This
 > consolidation (one implementation, not two) follows the T1775 rewrite of this
 > decision. The "complementary, not substitutes" framing in §1.2 is superseded.
@@ -40,7 +40,7 @@ This is the existing `forbidden-imports-deps` check (`tools/checkleft/src/checks
 **Config surface:**
 
 ```yaml
-- id: no-legacy-api-fencingtracker          # policy id: drives findings, bypasses, severity
+- id: no-legacy-api-fencingtracker # policy id: drives findings, bypasses, severity
   check: forbidden-patterns
   config:
     rules:
@@ -62,7 +62,7 @@ This is the existing `api-breaking-surface` implementation (`tools/checkleft/src
 **Config surface:**
 
 ```yaml
-- id: api-breaking-surface               # local policy label — flunge's choice, not the check mechanism
+- id: api-breaking-surface # local policy label — flunge's choice, not the check mechanism
   check: require-companion-change
   policy: { allow_bypass: true }
   config:
@@ -79,12 +79,12 @@ This is the existing `api-breaking-surface` implementation (`tools/checkleft/src
 
 **Relationship to `ifchange-thenchange`.** These are complementary primitives, not substitutes:
 
-| | `ifchange-thenchange` | `require-companion-change` |
-|---|---|---|
-| Coupling declaration | `LINT.IfChange` annotations in source files | `CHECKS.yaml` config entry |
-| Trigger granularity | Marked region within a specific file | Any file matching `trigger_globs` |
-| New-file coverage | Manual — each new file must be annotated | Automatic — glob covers files not yet written |
-| Policy location | Scattered across source files | One config entry |
+|                      | `ifchange-thenchange`                       | `require-companion-change`                    |
+| -------------------- | ------------------------------------------- | --------------------------------------------- |
+| Coupling declaration | `LINT.IfChange` annotations in source files | `CHECKS.yaml` config entry                    |
+| Trigger granularity  | Marked region within a specific file        | Any file matching `trigger_globs`             |
+| New-file coverage    | Manual — each new file must be annotated    | Automatic — glob covers files not yet written |
+| Policy location      | Scattered across source files               | One config entry                              |
 
 `ifchange-thenchange` is _code-declared_ coupling, best for co-evolution contracts between specific code blocks a developer explicitly marks as coupled. `require-companion-change` is _policy-declared_ coupling, best for organizational rules like "API-surface changes must include a docs update" where the scope is defined by path globs that automatically cover future files. Neither replaces the other.
 
@@ -128,13 +128,13 @@ No policy change required. Flunge's existing globs, message, remediation, and `a
 
 ```yaml
 - id: api-breaking-surface
-  check: require-companion-change        # was: api-breaking-surface
+  check: require-companion-change # was: api-breaking-surface
   policy: { allow_bypass: true }
   config:
-    trigger_globs: [ ... ]               # unchanged
-    required_globs: [ ... ]              # unchanged
-    message: "..."                       # unchanged
-    remediation: "..."                   # unchanged
+    trigger_globs: [...] # unchanged
+    required_globs: [...] # unchanged
+    message: "..." # unchanged
+    remediation: "..." # unchanged
 ```
 
 ---

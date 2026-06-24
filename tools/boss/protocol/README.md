@@ -10,8 +10,8 @@ talks to nothing — it is pure data plus a little serde glue.
 
 ## Architecture
 
-The crate is organised around two concerns: the *domain* model and the
-*wire* envelope that carries it.
+The crate is organised around two concerns: the _domain_ model and the
+_wire_ envelope that carries it.
 
 The domain types are the serializable projections of the rows the engine
 keeps in its work database. They are deliberately plain — `String`-typed

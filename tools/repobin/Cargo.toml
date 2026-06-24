@@ -12,13 +12,7 @@ documentation = "https://docs.rs/repobin"
 keywords = ["bazel", "cli", "repository", "tooling"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.93.1"
-include = [
-  "src/**",
-  "Cargo.toml",
-  "Cargo.lock",
-  "README.md",
-  "LICENSE",
-]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [lib]
 path = "src/lib.rs"

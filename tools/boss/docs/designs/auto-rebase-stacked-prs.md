@@ -8,7 +8,7 @@ Stacked PRs are routine in this repo: a worker lands a chore, opens PR A on bran
 - B's diff now contains every commit from A as well as its own — the GitHub diff view is unreadable, CI re-runs A's tests, and reviewers can't see what's new.
 - A human (typically the user) has to notice, retarget B's base to `main` with `gh pr edit --base main`, rebase B's branch on `main`, force-push, and re-poke CI. If a third PR C was stacked on B, the same dance has to repeat once B lands.
 
-Today this is manual. The user pings the worker, the worker leases a cube workspace, runs `jj rebase`, force-pushes, and retargets — for a mechanical operation that almost always succeeds without conflicts. When there *is* a conflict, the worker is the right tool. When there isn't, spending a full Claude turn on `jj rebase --to main` is pure overhead.
+Today this is manual. The user pings the worker, the worker leases a cube workspace, runs `jj rebase`, force-pushes, and retargets — for a mechanical operation that almost always succeeds without conflicts. When there _is_ a conflict, the worker is the right tool. When there isn't, spending a full Claude turn on `jj rebase --to main` is pure overhead.
 
 This doc proposes Boss handles the maintenance automatically: when `PrDetector` (PR #237) and the merge poller see PR A merge, the engine scans for any open PR whose `baseRefName` is `feat-A`, attempts an in-engine mechanical rebase, and only spawns a worker if the rebase needs human judgment (conflict). The user stops being the rebase-noticer-of-last-resort.
 
@@ -50,9 +50,9 @@ This doc proposes Boss handles the maintenance automatically: when `PrDetector` 
 
 (a) duplicates `merge_poller`'s GitHub call cadence. Anything we'd query — "is PR X merged?" — `merge_poller` already asks. Two pollers means two `gh` round-trips per PR per minute.
 
-(b) is the right shape. `merge_poller::run_one_pass` already iterates "chores that have a PR and might be merged," already calls `gh pr view`, and already has the moment we want: *"this PR just merged."* Today its only side effect is `mark_chore_pr_merged` + a `work_item_changed` broadcast. Adding "scan for stacked dependents and rebase them" is one more side effect at the same site.
+(b) is the right shape. `merge_poller::run_one_pass` already iterates "chores that have a PR and might be merged," already calls `gh pr view`, and already has the moment we want: _"this PR just merged."_ Today its only side effect is `mark_chore_pr_merged` + a `work_item_changed` broadcast. Adding "scan for stacked dependents and rebase them" is one more side effect at the same site.
 
-(c) catches *some* merges but only the ones that happen during a worker's run. The whole reason `merge_poller` exists (per the doc-comment in `merge_poller.rs:1-19`) is that most merges land *after* the worker has exited. (c) would miss those, which is the bulk of cases.
+(c) catches _some_ merges but only the ones that happen during a worker's run. The whole reason `merge_poller` exists (per the doc-comment in `merge_poller.rs:1-19`) is that most merges land _after_ the worker has exited. (c) would miss those, which is the bulk of cases.
 
 ### Recommendation
 
@@ -62,7 +62,7 @@ This doc proposes Boss handles the maintenance automatically: when `PrDetector` 
 
 #### Scoping the dependent scan
 
-When PR A on `feat-A` merges, list open PRs in the *same repo* with `baseRefName = feat-A`:
+When PR A on `feat-A` merges, list open PRs in the _same repo_ with `baseRefName = feat-A`:
 
 ```
 gh pr list --repo <owner/repo> --state open --base feat-A \
@@ -75,7 +75,7 @@ gh pr list --repo <owner/repo> --state open --base feat-A \
 
 #### Cross-product reach
 
-The merge poller's `PendingMergeCheck` carries a `product_id`, so we know which product's repo the merged PR was in. The `gh pr list` call uses *that* repo only. Cross-product / cross-repo stacks are out of scope; if we wanted them, we'd need a separate index of "PRs known to Boss across all products," and that's a bigger lift. Recommend explicitly: v1 scopes the dependent scan to the merged PR's own repo, no cross-product fan-out.
+The merge poller's `PendingMergeCheck` carries a `product_id`, so we know which product's repo the merged PR was in. The `gh pr list` call uses _that_ repo only. Cross-product / cross-repo stacks are out of scope; if we wanted them, we'd need a separate index of "PRs known to Boss across all products," and that's a bigger lift. Recommend explicitly: v1 scopes the dependent scan to the merged PR's own repo, no cross-product fan-out.
 
 ---
 
@@ -102,7 +102,7 @@ Reasoning:
 
 - `jj` is the canonical VCS in this repo. A `git merge-tree` check would have to be paired with the actual `jj rebase` execution, so we're running two tools where one suffices, and `git`'s answer about conflicts isn't necessarily the same as `jj`'s (different conflict markers, jj-specific divergence resolution).
 - `jj rebase` on conflict leaves the workspace in a recognisable state — `jj log` will show conflict markers in the working copy, and `jj st` will surface them. Detection is reliable.
-- The "dirty workspace after failed rebase" worry is solvable cheaply: the engine's rebase attempt runs in its own cube workspace (leased for the attempt), so failure just means we hand that workspace to the worker as-is, *with the conflict already loaded in*. That's strictly better than asking the worker to redo `jj rebase` from scratch.
+- The "dirty workspace after failed rebase" worry is solvable cheaply: the engine's rebase attempt runs in its own cube workspace (leased for the attempt), so failure just means we hand that workspace to the worker as-is, _with the conflict already loaded in_. That's strictly better than asking the worker to redo `jj rebase` from scratch.
 
 #### Engine-direct attempt sequence
 
@@ -111,10 +111,10 @@ Reasoning:
 3. **Rebase**: `jj rebase -d main -b <dependent-bookmark>`. Capture exit, stderr, working-copy state.
 4. **Detect conflict**: parse `jj st --no-graph` for `Conflict in` markers, or check `jj log -r 'conflicts()' --no-graph` for any conflicted commit in the rebased range.
 5. **If clean** → `jj git push --bookmark <dependent-bookmark>` (force-with-lease equivalent — `jj` push semantics are bookmark-replace, which is the right thing here), then `gh pr edit <PR#> --base main --repo <owner/repo>`.
-6. **If conflicted** → leave the workspace as-is, *do not* clean up the conflict, and escalate to a worker chore that takes over the same lease (see Q5).
+6. **If conflicted** → leave the workspace as-is, _do not_ clean up the conflict, and escalate to a worker chore that takes over the same lease (see Q5).
 7. **Release lease** only on success or on a non-conflict failure. On escalation, hand the lease over to the worker.
 
-#### When *not* to try engine-direct
+#### When _not_ to try engine-direct
 
 - The dependent PR's branch is on a fork (`headRepositoryOwner != owner`). The engine can't push to a fork. Skip auto-rebase entirely; emit a UI notification (Q7).
 - The dependent PR has unresolved review comments that requested specific commits be kept (we can't see this from the API cleanly; assume not for v1, revisit if it bites).
@@ -129,7 +129,7 @@ Reasoning:
 - **(A) New `system` work-item kind.** Alongside `task`, `chore`, `project_task` in the `tasks.kind` enum. Hidden from the kanban by default; surfaces in a dedicated "system" lane or a settings filter. Provides observability, idempotency, retry semantics.
 - **(B) `system: bool` flag on existing chores.** Reuses chore lifecycle and storage. Kanban filters `WHERE system = 0` in its primary view.
 - **(C) No work-item record at all** for engine-direct attempts; only conflict-driven rebases get a normal chore.
-- **(D) New first-class `rebase_attempt` table** that is *not* a work item — it's a side log, joined to the dependent PR and the merged PR. Only when escalation happens do we materialise a chore (which links back to the rebase_attempt by id).
+- **(D) New first-class `rebase_attempt` table** that is _not_ a work item — it's a side log, joined to the dependent PR and the merged PR. Only when escalation happens do we materialise a chore (which links back to the rebase_attempt by id).
 
 ### Discussion
 
@@ -139,7 +139,7 @@ Reasoning:
 
 (C) is the simplest v1, but trades observability for simplicity. "Why didn't B get rebased?" / "How many auto-rebases ran today?" become invisible. The only retry path is "wait for the next merge of A" which never comes. Cleanups (e.g., a stale rebase that pushed but didn't retarget) become impossible to find.
 
-(D) — a separate `rebase_attempts` table — gives the observability of (A) without polluting `tasks.kind`. The escalation path materialises a normal chore *and* keeps the `rebase_attempt` row as the audit record. It's also a natural fit for the "Engine activity" surface that we'll likely want for any future automated background work (auto-label, auto-add-reviewers, etc.), without committing the whole system-task taxonomy now.
+(D) — a separate `rebase_attempts` table — gives the observability of (A) without polluting `tasks.kind`. The escalation path materialises a normal chore _and_ keeps the `rebase_attempt` row as the audit record. It's also a natural fit for the "Engine activity" surface that we'll likely want for any future automated background work (auto-label, auto-add-reviewers, etc.), without committing the whole system-task taxonomy now.
 
 ### Recommendation
 
@@ -149,7 +149,7 @@ The argument for (D) over (A):
 
 - The data we want about auto-rebase isn't task-shaped. Tasks have `status` (kanban lane), `pr_url` (the PR they produced), `assignee` (none for system work). Trying to reuse task fields for engine bookkeeping ends up with awkward overloading — what does `pr_url` mean for an auto-rebase? The merged PR? The rebased PR? Both?
 - An attempt has its own lifecycle (`pending → running → succeeded | escalated | failed`) that doesn't map to kanban columns.
-- When the rebase escalates, we *do* create a chore. That chore is a normal `chore` row — no `system` flag, surfaces in the Doing lane like any other worker work — with `description` like *"Resolve rebase conflicts on PR #243 after PR #238 merged"* and a foreign-key `rebase_attempt_id` linking back. So the user always sees worker-driven work in the kanban; only the in-engine attempts are hidden, and they're surfaced via the engine activity feed instead.
+- When the rebase escalates, we _do_ create a chore. That chore is a normal `chore` row — no `system` flag, surfaces in the Doing lane like any other worker work — with `description` like _"Resolve rebase conflicts on PR #243 after PR #238 merged"_ and a foreign-key `rebase_attempt_id` linking back. So the user always sees worker-driven work in the kanban; only the in-engine attempts are hidden, and they're surfaced via the engine activity feed instead.
 
 The argument for (D) over (A) loses if/when we get three of these. At that point the right move is to introduce `system` as a work-item kind and migrate `rebase_attempt` to be one row per `tasks.kind = 'system_rebase'`. v1 is small enough that the standalone table is the cleaner ship.
 
@@ -198,23 +198,23 @@ Five sub-cases, in increasing severity:
 4. **Push rejected.** Either the dependent's branch was force-pushed by a human between fetch and push (we should retry — likely the human did the rebase manually), or the engine's auth doesn't have push rights to that branch (rare; surface as `failed` with an explicit "push rejected — auth or concurrent push" reason; do NOT auto-promote, this needs a human to look).
 5. **`gh pr edit --base main` fails.** Push succeeded, retarget failed. Bad state: dependent PR's branch contains the rebased commits but its base still points at the deleted `feat-A`. Retry the retarget call directly (no rebase needed; the push already happened). If retry fails, mark `failed` with a high-priority `failure_reason`, and surface a notification to the user — this is the worst residual state and worth alerting.
 
-The general policy: **automatic retries for transient/contention errors; promotion to worker chore only after retries exhaust *and* the failure isn't auth-shaped**. Auth failures (push rejected, retarget rejected) should stop and ask, not silently spawn a worker that will hit the same wall.
+The general policy: **automatic retries for transient/contention errors; promotion to worker chore only after retries exhaust _and_ the failure isn't auth-shaped**. Auth failures (push rejected, retarget rejected) should stop and ask, not silently spawn a worker that will hit the same wall.
 
 ### Downstream PR has CI red after rebase
 
 We've pushed the rebased commits. CI re-runs. Three observations:
 
 - Whether CI passes is independent of whether the rebase was mechanical. A clean text rebase can still break a build (e.g. A renamed a function, B called it).
-- The auto-rebase doesn't claim to make B mergeable — it claims to make B *no longer based on a merged branch*. CI failure is the human's signal that something needs human attention.
-- We should *not* spawn a worker just because CI went red. The user has not asked for "auto-fix-CI" and that's a separate, much larger feature.
+- The auto-rebase doesn't claim to make B mergeable — it claims to make B _no longer based on a merged branch_. CI failure is the human's signal that something needs human attention.
+- We should _not_ spawn a worker just because CI went red. The user has not asked for "auto-fix-CI" and that's a separate, much larger feature.
 
 So: **the engine attempts the rebase, force-pushes, retargets. CI re-running is GitHub's job. If CI fails, the PR card surfaces it the way any other red CI does today.** Don't auto-react.
 
 ### Merged PR's branch was deleted from the remote
 
-GitHub's default for many orgs is to auto-delete the head branch after merge. The dependent PR's `baseRefName` *still resolves* to the (now deleted) ref name as a string — that's just text in the PR record. `gh pr edit --base main` works fine even when the original base is gone (in fact this is the most common case in practice). So branch deletion is not a blocker.
+GitHub's default for many orgs is to auto-delete the head branch after merge. The dependent PR's `baseRefName` _still resolves_ to the (now deleted) ref name as a string — that's just text in the PR record. `gh pr edit --base main` works fine even when the original base is gone (in fact this is the most common case in practice). So branch deletion is not a blocker.
 
-The only thing that *can* break is `jj git fetch` if it tried to fetch the deleted bookmark — but `jj` handles this fine (the bookmark just goes away in the local view). No special handling needed.
+The only thing that _can_ break is `jj git fetch` if it tried to fetch the deleted bookmark — but `jj` handles this fine (the bookmark just goes away in the local view). No special handling needed.
 
 ### Multiple dependents stacked off the same merged base (a tree, not a chain)
 
@@ -224,9 +224,9 @@ PR A merges; B, C, and D were all stacked on `feat-A`. Three independent rebase 
 
 ### Chains: A → B → C, where B was already stacked on A
 
-A merges. B's auto-rebase succeeds, B is now based on `main` (and so is its branch on the remote, and the PR's `baseRefName` is now `main`). C was based on `feat-B`; C's `baseRefName` is still `feat-B`. C is *not* affected by A's merge in the GitHub view — it's correctly based on B, which still hasn't merged.
+A merges. B's auto-rebase succeeds, B is now based on `main` (and so is its branch on the remote, and the PR's `baseRefName` is now `main`). C was based on `feat-B`; C's `baseRefName` is still `feat-B`. C is _not_ affected by A's merge in the GitHub view — it's correctly based on B, which still hasn't merged.
 
-So the chain doesn't trigger anything special: the auto-rebase only fires when *C's base PR (B)* merges. Which is correct.
+So the chain doesn't trigger anything special: the auto-rebase only fires when _C's base PR (B)_ merges. Which is correct.
 
 ---
 
@@ -234,10 +234,10 @@ So the chain doesn't trigger anything special: the auto-rebase only fires when *
 
 ### The problem
 
-A normal chore creation hands the worker a fresh cube workspace and tells it "do this work, then push to your own branch." For an escalated rebase chore, the worker has to push to *someone else's* branch (e.g. Riker opened PR #243 on bookmark `riker/feat-B`; the worker spawned for the auto-rebase chore is Worf). Two questions:
+A normal chore creation hands the worker a fresh cube workspace and tells it "do this work, then push to your own branch." For an escalated rebase chore, the worker has to push to _someone else's_ branch (e.g. Riker opened PR #243 on bookmark `riker/feat-B`; the worker spawned for the auto-rebase chore is Worf). Two questions:
 
-1. Does the worker have *push* rights to that branch? On the same `gh` token, yes — the token belongs to the user's GitHub account and has write access to all their branches. So in this single-user-but-many-personas setup, no auth mismatch in v1.
-2. Should the engine pass any extra context to the worker so it knows it's working on someone else's branch? Yes — the chore description should explicitly call out *which PR*, *which branch*, and *that the cube workspace already contains the failed rebase state*.
+1. Does the worker have _push_ rights to that branch? On the same `gh` token, yes — the token belongs to the user's GitHub account and has write access to all their branches. So in this single-user-but-many-personas setup, no auth mismatch in v1.
+2. Should the engine pass any extra context to the worker so it knows it's working on someone else's branch? Yes — the chore description should explicitly call out _which PR_, _which branch_, and _that the cube workspace already contains the failed rebase state_.
 
 ### Recommendation
 
@@ -250,7 +250,7 @@ A normal chore creation hands the worker a fresh cube workspace and tells it "do
 
    > Rebase PR #243 (`riker/feat-B`) onto `main`. The base PR #238 (`feat-A`) merged at 2026-05-07T14:22:01Z. The cube workspace already has the failed `jj rebase -d main` loaded — `jj st` shows the conflicted files. Resolve, `jj squash` if appropriate, push with `jj git push --bookmark riker/feat-B`, and run `gh pr edit 243 --base main` once the push succeeds. PR will need its CI re-run (just push); do not change anything else.
 
-3. Engine creates a `work_executions` row for the chore *with the existing cube_lease_id, cube_workspace_id, workspace_path pre-populated* — i.e. the spawn flow takes a "pre-leased" path that skips the lease step. The worker session inherits the workspace as-is.
+3. Engine creates a `work_executions` row for the chore _with the existing cube_lease_id, cube_workspace_id, workspace_path pre-populated_ — i.e. the spawn flow takes a "pre-leased" path that skips the lease step. The worker session inherits the workspace as-is.
 4. The `rebase_attempts.escalated_chore_id` records the link.
 5. The spawn flow proceeds normally from there: pane spawned, transcript starts, worker takes over.
 
@@ -269,7 +269,7 @@ If a future world has multiple GitHub accounts (e.g. a service account for the e
 
 ### The hazard
 
-PR #238 merges. Engine starts an auto-rebase of #242 (which was based on #238). Mid-rebase, PR #244 also merges (#244 was *also* based on #238 — a tree, not a chain). The merge poller's next pass sees #244, finds the same dependent #242 in its `gh pr list --base feat-244` query? No — #244 has a different branch. But what if #242 was based on #244 instead, and we're racing two passes against the same dependent?
+PR #238 merges. Engine starts an auto-rebase of #242 (which was based on #238). Mid-rebase, PR #244 also merges (#244 was _also_ based on #238 — a tree, not a chain). The merge poller's next pass sees #244, finds the same dependent #242 in its `gh pr list --base feat-244` query? No — #244 has a different branch. But what if #242 was based on #244 instead, and we're racing two passes against the same dependent?
 
 Or worse: PR A merges, B is rebased onto main, then a week later A is reverted (which on GitHub is itself a merge of a revert PR, not an unmerge). Does the merge poller see that as a new merge of `feat-A`? No, because the revert PR has its own branch.
 
@@ -289,8 +289,8 @@ If A and B both merge before the engine has rebased C (which was on B, which was
 
 - After A merges: engine sees C is based on `feat-B`, NOT `feat-A`. So C is not in scope for A's auto-rebase pass — only B is.
 - A's pass attempts to rebase B onto main. Depending on how fast B then merges:
-  - If B merges *after* A's rebase of B succeeds: the rebased B is what merges. Then B's merge triggers C's rebase onto main. Correct chain.
-  - If B's merge happens *before* the engine rebases B: A's rebase of B is racing the merge. The unique key on `(dependent='feat-B', base='feat-A')` means we record the attempt; the rebase may push B forward, *then* B is merged. CI green is the merge gate; the user merging B by hand sees a normal-looking PR. C's rebase fires from B's merge.
+  - If B merges _after_ A's rebase of B succeeds: the rebased B is what merges. Then B's merge triggers C's rebase onto main. Correct chain.
+  - If B's merge happens _before_ the engine rebases B: A's rebase of B is racing the merge. The unique key on `(dependent='feat-B', base='feat-A')` means we record the attempt; the rebase may push B forward, _then_ B is merged. CI green is the merge gate; the user merging B by hand sees a normal-looking PR. C's rebase fires from B's merge.
 - If both A and B merge in the same merge-poller sweep: the sweep processes them in `updated_at ASC` order today (`work.rs:1613`). A is older, so A is processed first; B's chore probably also flips to `done` in the same sweep, and B's auto-rebase pass for C runs against a B-branch that's now mainline. No conflict.
 
 So the order is enforced by `merge_poller`'s existing iteration order (oldest merge first), and the unique-key invariant on `rebase_attempts` prevents double-processing.
@@ -307,14 +307,14 @@ If a real-world tree fan-out turns out to require explicit batching (e.g. five P
 
 ### What the user should see
 
-- **Successful engine-direct rebase**: a passive, low-volume notification. The user didn't ask for this; surfacing it loudly (a toast, a modal) is annoying. A quiet entry in an "Engine activity" feed (new in v1, see below) plus a small badge on the dependent PR card saying *"auto-rebased after #238 merged"* with a click-through to the activity entry.
+- **Successful engine-direct rebase**: a passive, low-volume notification. The user didn't ask for this; surfacing it loudly (a toast, a modal) is annoying. A quiet entry in an "Engine activity" feed (new in v1, see below) plus a small badge on the dependent PR card saying _"auto-rebased after #238 merged"_ with a click-through to the activity entry.
 - **Failed engine-direct rebase that escalated to a worker**: visible as the worker chore now in the Doing lane (normal chore — appears as any other worker run). The chore's description carries the context. The activity feed records the escalation.
-- **Failed engine-direct rebase that did NOT escalate (auth-shaped failure)**: this is the loudest case. A persistent banner on the dependent PR card: *"auto-rebase failed: push rejected, needs attention."* Click → activity entry with full failure_reason and a "retry" button.
+- **Failed engine-direct rebase that did NOT escalate (auth-shaped failure)**: this is the loudest case. A persistent banner on the dependent PR card: _"auto-rebase failed: push rejected, needs attention."_ Click → activity entry with full failure_reason and a "retry" button.
 - **Skipped (fork, opted-out)**: just the activity entry, no card-level surfacing. Skipping a fork PR is the expected behaviour.
 
 ### Engine activity feed
 
-There is no engine activity feed today. v1 doesn't *need* a full feed — we can render the `rebase_attempts` table as a list view, ordered by `created_at DESC`, with a filter (`status`, `product_id`). CLI surface:
+There is no engine activity feed today. v1 doesn't _need_ a full feed — we can render the `rebase_attempts` table as a list view, ordered by `created_at DESC`, with a filter (`status`, `product_id`). CLI surface:
 
 ```
 boss engine rebase-attempts list [--product <selector>] [--status succeeded|failed|escalated|...] [--limit 50]
@@ -326,7 +326,7 @@ The macOS app gets a small "Engine" tab next to "Workers" / "Work" with the same
 
 ### PR card badge
 
-When a Boss kanban card has an associated `pr_url` and that PR is the *dependent* of a successful rebase attempt within the last 24h, render a small "↶ rebased" chip in the card footer. Click → activity feed scrolled to the attempt. After 24h the chip ages out (the data is still available via the activity view, but the card stops calling attention to it).
+When a Boss kanban card has an associated `pr_url` and that PR is the _dependent_ of a successful rebase attempt within the last 24h, render a small "↶ rebased" chip in the card footer. Click → activity feed scrolled to the attempt. After 24h the chip ages out (the data is still available via the activity view, but the card stops calling attention to it).
 
 ### Notifications
 
@@ -373,9 +373,9 @@ This is a real cost. A reviewer who already +1'd PR B before A merged is now exp
 ### Options to mitigate
 
 1. **Do nothing.** Accept that a force-push dismisses approvals; the human re-approves. This is the only behaviour that's safe across all org configurations.
-2. **Detect "approvals will be dismissed" via the GitHub Branch Protection API and skip auto-rebase if so.** Too defensive — dismissal is the *default*, not an exceptional configuration. Skipping any time it would dismiss means skipping nearly always.
+2. **Detect "approvals will be dismissed" via the GitHub Branch Protection API and skip auto-rebase if so.** Too defensive — dismissal is the _default_, not an exceptional configuration. Skipping any time it would dismiss means skipping nearly always.
 3. **Try to opt out of dismissal via the API.** GitHub does not expose a per-push override for this (the org-level setting `dismiss_stale_reviews` is the only knob; we can't temporarily disable it from a PR-side action).
-4. **Comment on the PR after a successful auto-rebase**: *"This PR was auto-rebased onto `main` after #238 merged. Approvals were dismissed by GitHub's branch protection; please re-approve when you have a moment."* This converts the surprise into a notification.
+4. **Comment on the PR after a successful auto-rebase**: _"This PR was auto-rebased onto `main` after #238 merged. Approvals were dismissed by GitHub's branch protection; please re-approve when you have a moment."_ This converts the surprise into a notification.
 
 ### Recommendation
 
@@ -414,7 +414,7 @@ There is no "merged-PR-event" callback abstraction. Both paths just mutate the D
 
 ### Recommendation
 
-**Pick (iii) for v1.** The auto-rebase subsystem is engine-internal; we don't need a generic observer abstraction yet, and pub/sub adds latency for no benefit (we *want* the auto-rebase scan to start as soon as the merge is detected, not after a topic round-trip).
+**Pick (iii) for v1.** The auto-rebase subsystem is engine-internal; we don't need a generic observer abstraction yet, and pub/sub adds latency for no benefit (we _want_ the auto-rebase scan to start as soon as the merge is detected, not after a topic round-trip).
 
 `merge_poller::sweep_one` becomes:
 
@@ -453,7 +453,7 @@ This is tiny (one extra call site) and avoids a window where a same-run merge sk
 
 ### Why this needs its own section
 
-Q2 establishes the mechanical-vs-conflict split and Q5 covers the auth side of escalation, but neither answers the operational question: *what does the worker actually do with the conflict, and how does the engine set them up to succeed?* Conflicts are the case where the engine has done the cheap part and a human-in-the-loop (the worker) has to do the expensive part — so the loading dock matters. A worker that opens the chore and sees "rebase failed, fix it" is going to spend a turn re-running `jj rebase` to figure out what went wrong; a worker that opens the chore and sees a structured diagnosis can go straight to resolving.
+Q2 establishes the mechanical-vs-conflict split and Q5 covers the auth side of escalation, but neither answers the operational question: _what does the worker actually do with the conflict, and how does the engine set them up to succeed?_ Conflicts are the case where the engine has done the cheap part and a human-in-the-loop (the worker) has to do the expensive part — so the loading dock matters. A worker that opens the chore and sees "rebase failed, fix it" is going to spend a turn re-running `jj rebase` to figure out what went wrong; a worker that opens the chore and sees a structured diagnosis can go straight to resolving.
 
 ### Conflict diagnosis the engine collects before escalating
 
@@ -461,7 +461,7 @@ Between detecting the conflict and creating the chore, `auto_rebase` runs a smal
 
 1. **Conflicted-file list**. `jj st --no-graph` lists conflicted files; `jj log -r 'conflicts()' --no-graph -T '...'` lists the conflicted commits in the rebased range.
 2. **Per-file conflict shape**. For each conflicted file, run `jj resolve --list <file>` to get the conflict marker view (jj's three-way conflict format: base + two sides). For text files under ~200 lines, capture the full conflict block; for larger files, capture the first 60 lines around the first conflict marker plus a count of total markers.
-3. **Upstream change summary**. `gh pr view <base-PR#> --json files,additions,deletions` gives the merged PR's file-level footprint. The intersection of *that* file set with the dependent's conflicted-file set is exactly the *"what did the upstream change touch that we also touched"* answer.
+3. **Upstream change summary**. `gh pr view <base-PR#> --json files,additions,deletions` gives the merged PR's file-level footprint. The intersection of _that_ file set with the dependent's conflicted-file set is exactly the _"what did the upstream change touch that we also touched"_ answer.
 4. **Dependent-side commits in the rebased range**. `jj log -r 'main..<dependent-bookmark>' --no-graph -T 'change_id ++ " " ++ description.first_line()'` — so the worker sees which of their own commits are in play.
 5. **Build / test signal (optional, time-boxed)**. If the conflict is in a small set of files (≤ 5), kick a 30-second `bazel query 'deps(//path/...)'` to identify which targets the conflicted files belong to. Skip if it would take longer than the 30s budget.
 
@@ -511,7 +511,7 @@ If the engine can't determine a sensible test command for the product, the chore
 
 ### Stop conditions in detail
 
-Three patterns where the worker should *not* push a resolved rebase but instead stop and surface the situation:
+Three patterns where the worker should _not_ push a resolved rebase but instead stop and surface the situation:
 
 1. **Semantic obsolescence.** The merged PR's diff and the dependent PR's diff overlap heavily and accomplish the same thing. The dependent is no longer needed. The worker closes the dependent PR with `gh pr close <PR#> --comment "Closing — the work in this PR was superseded by #<merged-PR>."`, marks the chore `done`, and the engine records the rebase attempt as `succeeded_via_close` (a new substatus we add to `rebase_attempts.status`). The user sees this in the activity feed and can object if the worker misjudged.
 
@@ -519,7 +519,7 @@ Three patterns where the worker should *not* push a resolved rebase but instead 
 
 3. **Architectural mismatch.** The merged PR removed the abstraction the dependent was extending. The dependent isn't obsolete — it might still be wanted — but it needs re-scoping or splitting, which is well beyond a rebase. Same handling as (2): comment, block, stop.
 
-In all three cases, the dependent PR's branch is *not* pushed, the GitHub state is unchanged, and the user has a clear breadcrumb (kanban + activity feed entry) to take over.
+In all three cases, the dependent PR's branch is _not_ pushed, the GitHub state is unchanged, and the user has a clear breadcrumb (kanban + activity feed entry) to take over.
 
 ### What about conflicts the worker resolves "incorrectly"?
 
@@ -527,7 +527,7 @@ A worker could in principle resolve a conflict in a way that looks clean (compil
 
 ### PR comment template (post-resolution)
 
-The worker's final step before marking the chore done is a comment on the dependent PR explaining what they resolved. This is *the* surface where the human reviewer sees what the auto/manual rebase actually did:
+The worker's final step before marking the chore done is a comment on the dependent PR explaining what they resolved. This is _the_ surface where the human reviewer sees what the auto/manual rebase actually did:
 
 ```
 🤖 boss escalated this auto-rebase to manual conflict resolution after #238 merged.
@@ -649,7 +649,7 @@ A worker that closes a dependent PR mistakenly classifying it as obsolete is the
       │                │ (chore Stop → completion path → in_review → done on PR merge later)
 ```
 
-The escalated chore from this point looks like any other chore in the kanban: it appears in Doing, transitions to Review when the worker pushes, and to Done when its (no-op) PR detection sees the dependent PR is updated. Note: the chore does NOT open a new PR — it pushes to an existing branch — so the completion path's "find a PR for the worker's commits" call returns the *dependent* PR (B) as the associated PR, and that's correct.
+The escalated chore from this point looks like any other chore in the kanban: it appears in Doing, transitions to Review when the worker pushes, and to Done when its (no-op) PR detection sees the dependent PR is updated. Note: the chore does NOT open a new PR — it pushes to an existing branch — so the completion path's "find a PR for the worker's commits" call returns the _dependent_ PR (B) as the associated PR, and that's correct.
 
 ---
 
@@ -757,15 +757,15 @@ boss product update <selector>    --auto-rebase on|off
 ### App / UI deltas
 
 - New "Engine" tab (or add into existing Settings/Activity surface) listing `RebaseAttempt` rows with filters and per-row detail.
-- PR-card chip: *"↶ rebased after #N"* on cards for dependent PRs with a successful attempt < 24h old.
-- PR-card banner (red): *"auto-rebase failed: <reason>"* on cards for dependent PRs with a failed attempt that didn't escalate.
+- PR-card chip: _"↶ rebased after #N"_ on cards for dependent PRs with a successful attempt < 24h old.
+- PR-card banner (red): _"auto-rebase failed: <reason>"_ on cards for dependent PRs with a failed attempt that didn't escalate.
 - Product settings: per-product toggle for `auto_rebase_enabled`.
 
 ---
 
 ## Risks
 
-**R1 — `jj rebase` corner cases on bookmark-relative ranges.** `jj rebase -d main -b <bookmark>` rebases all commits reachable from the bookmark that aren't in `main`. If the dependent branch has commits from *both* the merged base and the dependent's own work intermixed (rare but possible after a sloppy local rebase), the range may include more or less than expected. Mitigation: the v1 implementation runs `jj log -r main..<bookmark>` first and logs the range it's about to operate on; the integration test covers the "branch contains a merge commit" edge case explicitly. If it gets weird, fall back to `--source` form.
+**R1 — `jj rebase` corner cases on bookmark-relative ranges.** `jj rebase -d main -b <bookmark>` rebases all commits reachable from the bookmark that aren't in `main`. If the dependent branch has commits from _both_ the merged base and the dependent's own work intermixed (rare but possible after a sloppy local rebase), the range may include more or less than expected. Mitigation: the v1 implementation runs `jj log -r main..<bookmark>` first and logs the range it's about to operate on; the integration test covers the "branch contains a merge commit" edge case explicitly. If it gets weird, fall back to `--source` form.
 
 **R2 — Push race with a human.** A user notices PR B is stranded and rebases it manually at the same moment the engine is doing the rebase. Both push. The engine's push is `--bookmark` (jj's bookmark-set semantics, equivalent to force-with-lease) — if the remote moved between fetch and push, the push fails. Mitigation: catch the rejected push, refresh, and retry once; on second rejection, mark `failed` with reason "concurrent push", do NOT escalate (the human is already on it).
 
@@ -775,7 +775,7 @@ boss product update <selector>    --auto-rebase on|off
 
 **R5 — `gh pr view` rate-limit pressure.** Adding `gh pr list --base <branch>` to every detected merge increases the engine's GitHub API call volume. GitHub's REST limit is 5000/hour for an authenticated user; this should be well under it for any realistic workload. Mitigation: piggyback on the existing rate-limit handling in the merge poller (which retries on 403 with a backoff); if we hit ceilings, switch to GraphQL batching.
 
-**R6 — Mixed-jj / mixed-git histories.** A PR that was rebased manually with `git rebase -i` (not `jj`) might leave commits with descriptions or signatures that `jj` doesn't expect. Auto-rebase shouldn't touch the *contents* of commits — `jj rebase -d main` is a parent-pointer change only — but signed commits will need re-signing, and that requires the signing key to be available in the cube workspace's environment. Mitigation: v1 documents that signed commits will lose their signatures on auto-rebase; if signing matters for a repo, opt out.
+**R6 — Mixed-jj / mixed-git histories.** A PR that was rebased manually with `git rebase -i` (not `jj`) might leave commits with descriptions or signatures that `jj` doesn't expect. Auto-rebase shouldn't touch the _contents_ of commits — `jj rebase -d main` is a parent-pointer change only — but signed commits will need re-signing, and that requires the signing key to be available in the cube workspace's environment. Mitigation: v1 documents that signed commits will lose their signatures on auto-rebase; if signing matters for a repo, opt out.
 
 **R7 — Wrong-branch confusion.** A worker chore was created for branch `riker/feat-B`, but in the time between creation and worker pickup, the user (or another worker) merged B and created a new PR on the same branch. The escalated chore acts on a stale state. Mitigation: the escalated chore's first action should be `gh pr view <PR#> --json state,headRefOid` to verify the PR is still open and the branch's tip matches what the engine recorded; if not, exit with a "PR state changed since rebase attempt was created" message and mark the rebase attempt `failed` for human review.
 
@@ -826,7 +826,7 @@ Bite-sized; each fits one worker session.
 - Cross-product / cross-repo PR stacks.
 - Auto-merging downstream PRs once rebased.
 - Auto-fix CI failures introduced by a rebase.
-- Detecting "stack relationships" Boss didn't see opened (e.g. a PR opened directly via `gh` outside Boss). Auto-rebase will still process them via the `gh pr list --base` query — *that is the intended behaviour* — but no special-case handling.
+- Detecting "stack relationships" Boss didn't see opened (e.g. a PR opened directly via `gh` outside Boss). Auto-rebase will still process them via the `gh pr list --base` query — _that is the intended behaviour_ — but no special-case handling.
 - Per-PR opt-out via anything other than a label (no comment-driven opt-outs, no per-attempt CLI vetoes; if the user wants to stop one attempt, they retry it as `failed` and we don't restart it).
 - Heuristics to skip the force-push when the rebase is a no-op (always push; idempotency is at the `rebase_attempts` row, not the git push).
 - Multi-account `gh` authentication. Single user / single token in v1.

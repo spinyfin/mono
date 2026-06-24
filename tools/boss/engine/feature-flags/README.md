@@ -106,7 +106,7 @@ detect_pr_cold_fallback = false
 Writes use a temp-then-rename, so a concurrent reader either sees the
 old file or the new one — never a half-written file. The in-memory
 map is the source of truth between reads; `set` updates the map
-*before* it writes, so the next consumer-side `is_enabled` call sees
+_before_ it writes, so the next consumer-side `is_enabled` call sees
 the new value the instant the RPC returns.
 
 Stale entries in the file (names that no longer match any registered

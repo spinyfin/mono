@@ -19,6 +19,7 @@ Required behavior: fix the real problem — split the oversized file, fix the li
 Structs with **8 or more fields** in `boss-protocol` (and in `boss-engine`'s internal types) use `#[derive(bon::Builder)]` with `#[builder(on(String, into))]`. This prevents additive-change PRs from touching every construction site across the repo.
 
 Rules:
+
 - `Option<T>` fields are automatically optional in the builder (bon defaults them to `None`).
 - Non-optional fields that have a sensible runtime default (e.g. `autostart = true`, `priority = "medium"`, `last_status_actor = "human"`) carry `#[builder(default = ...)]`; use the existing `default_*()` helpers from `types.rs`.
 - Fields with no sensible default remain required in the builder — omitting them is a compile error.
