@@ -1,4 +1,5 @@
 pub mod sarif;
+pub mod upload;
 
 use std::path::Path;
 

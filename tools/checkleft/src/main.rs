@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use checkleft::annotate::check_run;
-use checkleft::annotate::sarif::write_sarif;
+use checkleft::annotate::sarif::{to_sarif, write_sarif};
+use checkleft::annotate::upload::{SarifUploadContext, upload_sarif};
 use checkleft::annotate::{Annotation, annotation_from_finding, cap_gha_annotations, format_gha_workflow_commands};
 use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha, resolve_owner_repo};
 use checkleft::change_detection::scenario::Scenario;
@@ -76,6 +77,14 @@ struct RunArgs {
     /// masks a dirty one.
     #[arg(long)]
     annotations_strict: bool,
+    /// Upload SARIF findings to GitHub code scanning (POST /repos/{owner}/{repo}/code-scanning/sarifs).
+    /// Requires a GitHub token with the `security_events` scope (checked in order:
+    /// CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, `gh auth token`). Can be combined
+    /// with `--annotations=sarif --annotations-out` to also write SARIF to a file.
+    /// Non-fatal when the repository, commit SHA, or token cannot be resolved, or when
+    /// the API call fails — checkleft logs a warning and continues.
+    #[arg(long)]
+    upload: bool,
 }
 
 /// Arguments for `checkleft fix`.
@@ -471,6 +480,7 @@ async fn dispatch_run(
         annotations,
         annotations_out,
         annotations_strict,
+        upload,
     }: RunArgs,
     root: &Path,
     vcs: &Vcs,
@@ -543,6 +553,10 @@ async fn dispatch_run(
         OutputFormat::Json => print_json_results(&results)?,
     }
 
+    // Generate SARIF once if needed for file writing or upload.
+    let needs_sarif = upload || annotations.contains(&AnnotationBackend::Sarif);
+    let sarif_doc = if needs_sarif { Some(to_sarif(&results)) } else { None };
+
     if annotations.contains(&AnnotationBackend::Sarif) {
         let path = annotations_out
             .as_deref()
@@ -551,6 +565,11 @@ async fn dispatch_run(
     }
     if annotations.contains(&AnnotationBackend::Gha) {
         emit_gha_annotations(&results, env);
+    }
+
+    if upload {
+        let sarif = sarif_doc.as_ref().expect("sarif_doc set when upload=true");
+        attempt_sarif_upload(sarif, env, vcs).await;
     }
 
     let has_error = results
@@ -1160,6 +1179,7 @@ async fn dispatch_fix(
                 annotations,
                 annotations_out: _,
                 annotations_strict: _,
+                upload: _,
             },
         allow_dirty,
         verify,
@@ -1732,6 +1752,102 @@ fn build_env_filter(verbose: u8, log_level: Option<LogLevel>) -> EnvFilter {
         return EnvFilter::new(level);
     }
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"))
+}
+
+/// Attempt a SARIF upload to GitHub code scanning. Non-fatal: missing context
+/// (repository, commit SHA, token) and API errors are logged as warnings.
+async fn attempt_sarif_upload(sarif: &serde_json::Value, env: &CiEnvironment, vcs: &Vcs) {
+    let repository = match resolve_repository(vcs) {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "warning: checkleft: SARIF upload skipped — could not determine repository. \
+                 Set CHECKS_REPOSITORY=owner/repo or ensure the git remote is configured."
+            );
+            return;
+        }
+    };
+
+    let token = match detect_github_token() {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "warning: checkleft: SARIF upload skipped — no GitHub token found \
+                 (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars and `gh auth token`). \
+                 A token with the `security_events` scope is required."
+            );
+            return;
+        }
+    };
+
+    let event_payload = env.read_github_event_payload();
+    let commit_sha = match resolve_head_sha(env, event_payload.as_ref()) {
+        Some(sha) => sha,
+        None => {
+            eprintln!(
+                "warning: checkleft: SARIF upload skipped — could not determine commit SHA. \
+                 Set GITHUB_SHA (GHA) or BUILDKITE_COMMIT (Buildkite) to enable upload."
+            );
+            return;
+        }
+    };
+
+    let git_ref = match resolve_ref_for_upload(env, vcs) {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "warning: checkleft: SARIF upload skipped — could not determine git ref. \
+                 Set GITHUB_REF (GHA) or BUILDKITE_BRANCH (Buildkite) to enable upload."
+            );
+            return;
+        }
+    };
+
+    let ctx = SarifUploadContext {
+        repository: &repository,
+        token: &token,
+        commit_sha: &commit_sha,
+        git_ref: &git_ref,
+    };
+    upload_sarif(sarif, &ctx).await;
+}
+
+/// Resolve the full git ref to attach to the SARIF upload.
+///
+/// The GitHub code scanning API requires a `ref` — ideally the same ref as the
+/// CI event so findings appear inline in PRs. Resolution order (first match wins):
+///
+/// 1. GHA: `GITHUB_REF` (already a full ref: `refs/heads/...` or `refs/pull/.../merge`).
+/// 2. Buildkite PR build: `BUILDKITE_PULL_REQUEST` → `refs/pull/{N}/merge`.
+/// 3. Buildkite push build: `BUILDKITE_BRANCH` → `refs/heads/{branch}`.
+/// 4. VCS fallback: current branch → `refs/heads/{branch}`.
+fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
+    // GHA: GITHUB_REF is already a full ref.
+    if let Some(github_ref) = env.github_ref.as_deref().filter(|r| !r.is_empty()) {
+        return Some(github_ref.to_owned());
+    }
+
+    // Buildkite PR build: BUILDKITE_PULL_REQUEST is the PR number (not "false").
+    if let Some(pr) = env
+        .buildkite_pull_request
+        .as_deref()
+        .filter(|v| *v != "false" && !v.is_empty())
+        && pr.parse::<u64>().is_ok()
+    {
+        return Some(format!("refs/pull/{pr}/merge"));
+    }
+
+    // Buildkite push build: BUILDKITE_BRANCH is the branch name.
+    if let Some(branch) = env
+        .buildkite_branch
+        .as_deref()
+        .filter(|b| !b.is_empty() && !b.starts_with("gh-readonly-queue/"))
+    {
+        return Some(format!("refs/heads/{branch}"));
+    }
+
+    // VCS fallback: current branch (local or any unrecognized CI).
+    normalize_optional_description(vcs.current_branch().ok()).map(|b| format!("refs/heads/{b}"))
 }
 
 fn detect_github_token() -> Option<String> {
