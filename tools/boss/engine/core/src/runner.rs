@@ -1919,7 +1919,7 @@ fn compose_revision_directive(
         "   a. Read the current title and description: `gh pr view {pr_number} -R {repo_slug} --json title,body -q '\"title: \" + .title + \"\\n\\n\" + .body'`\n"
     ));
     out.push_str("   b. Compare the title and description carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
-    out.push_str("   b2. **PR title — check it explicitly.** If the revision changes or overturns the PR's scope or conclusion (e.g. the original PR claimed something was not a bug but this revision fixes the bug), the title MUST be updated to reflect the final state. A title that contradicts the committed code is a defect. Update it with: `gh pr edit {pr_number} --title \"<accurate new title>\" -R {repo_slug}`\n");
+    out.push_str(&format!("   b2. **PR title — check it explicitly.** If the revision changes or overturns the PR's scope or conclusion (e.g. the original PR claimed something was not a bug but this revision fixes the bug), the title MUST be updated to reflect the final state. A title that contradicts the committed code is a defect. Update it with: `gh pr edit {pr_number} --title \"<accurate new title>\" -R {repo_slug}`\n"));
     out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
     out.push_str(&format!(
         "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
@@ -3946,6 +3946,14 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("--title"),
             "revision directive must show the gh pr edit --title command:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("gh pr edit 77 --title"),
+            "revision directive must interpolate the actual PR number into the title command, not emit literal {{pr_number}}:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("{pr_number}"),
+            "revision directive must not emit the literal placeholder {{pr_number}} — it must be interpolated:\n{prompt}",
         );
     }
 
