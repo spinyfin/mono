@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use checkleft::annotate::check_run;
 use checkleft::annotate::sarif::write_sarif;
-use checkleft::change_detection::environment::CiEnvironment;
+use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha, resolve_owner_repo};
 use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
 use checkleft::check::CheckRegistry;
@@ -55,14 +56,23 @@ struct RunArgs {
     /// (or `=true`) forces it on.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     show_progress: Option<bool>,
-    /// Activate an annotation output backend. Repeatable: `--annotations=sarif`
-    /// (file-writing mode; also set `--annotations-out`). Default: none.
-    /// Existing `--format` stdout output and exit-code behavior are unchanged.
-    #[arg(long, value_name = "MODE")]
-    annotations: Vec<AnnotationsMode>,
+    /// Emit findings to a GitHub-UI annotation backend after the run. Repeatable,
+    /// so several backends can be active at once; default is none (off — output
+    /// is unchanged). Supported: `check-run` (POST findings to the GitHub Check
+    /// Runs API; needs a token with `Checks: write` via
+    /// `CHECKS_GITHUB_TOKEN`/`GITHUB_TOKEN`), `sarif` (write SARIF 2.1.0 JSON
+    /// to `--annotations-out=<path>`). `none` is an explicit no-op.
+    #[arg(long = "annotations", value_name = "MODE")]
+    annotations: Vec<AnnotationBackend>,
     /// File path for annotation backends that write to a file (e.g. `--annotations=sarif`).
     #[arg(long, value_name = "PATH")]
     annotations_out: Option<PathBuf>,
+    /// Make a failure to *post* annotations fatal (non-zero exit) instead of the
+    /// default: logging a warning and preserving checkleft's content-driven exit
+    /// code. Off by default, so a posting failure never turns a clean run red nor
+    /// masks a dirty one.
+    #[arg(long)]
+    annotations_strict: bool,
 }
 
 /// Arguments for `checkleft fix`.
@@ -95,13 +105,6 @@ enum LogLevel {
     Info,
     Debug,
     Trace,
-}
-
-/// Annotation output mode requested via `--annotations`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum AnnotationsMode {
-    /// Emit SARIF 2.1.0 JSON to `--annotations-out=<path>`.
-    Sarif,
 }
 
 impl LogLevel {
@@ -195,6 +198,22 @@ struct ConfigArgs {
 enum OutputFormat {
     Human,
     Json,
+}
+
+/// A GitHub-UI annotation backend selectable via `--annotations`.
+///
+/// Only shipped backends appear here (clap renders the variants kebab-cased:
+/// `check-run`, `sarif`, `none`); the enum grows one variant per backend as it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AnnotationBackend {
+    /// Post findings to the GitHub Check Runs API. CI-agnostic (GitHub Actions,
+    /// Buildkite, or anywhere a token reaches it); renders as a checkleft-named
+    /// check plus inline PR-diff annotations.
+    CheckRun,
+    /// Write SARIF 2.1.0 JSON to `--annotations-out=<path>`.
+    Sarif,
+    /// Explicit no-op; selects no backend.
+    None,
 }
 
 const CHECKS_PR_DESCRIPTION_ENV: &str = "CHECKS_PR_DESCRIPTION";
@@ -444,6 +463,7 @@ async fn dispatch_run(
         show_progress,
         annotations,
         annotations_out,
+        annotations_strict,
     }: RunArgs,
     root: &Path,
     vcs: &Vcs,
@@ -516,25 +536,102 @@ async fn dispatch_run(
         OutputFormat::Json => print_json_results(&results)?,
     }
 
-    for mode in &annotations {
-        match mode {
-            AnnotationsMode::Sarif => {
-                let path = annotations_out
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("--annotations=sarif requires --annotations-out=<path>"))?;
-                write_sarif(&results, path)?;
-            }
-        }
+    if annotations.contains(&AnnotationBackend::Sarif) {
+        let path = annotations_out
+            .as_deref()
+            .ok_or_else(|| anyhow!("--annotations=sarif requires --annotations-out=<path>"))?;
+        write_sarif(&results, path)?;
     }
 
     let has_error = results
         .iter()
         .any(|result| result.findings.iter().any(|f| f.severity == Severity::Error));
+
+    // Annotation backends are a side output: they post the same `results` to a
+    // GitHub-UI surface and never change the content-driven exit code below.
+    // In strict mode a posting failure is fatal (propagated as an `Err`).
+    emit_annotations(&annotations, annotations_strict, &results, env, vcs).await?;
+
     Ok(if has_error {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Run the selected `--annotations` backends against a completed run's results.
+///
+/// Today only `check-run` is wired up. Posting failures are **non-fatal by
+/// default**: the failure is logged as a warning and `Ok(())` is returned so the
+/// caller keeps its content-driven exit code. With `strict` set, any posting
+/// failure (including missing token / repo / head SHA) is returned as an `Err`,
+/// which the caller propagates into a non-zero exit.
+async fn emit_annotations(
+    backends: &[AnnotationBackend],
+    strict: bool,
+    results: &[CheckResult],
+    env: &CiEnvironment,
+    vcs: &Vcs,
+) -> Result<()> {
+    if !backends.contains(&AnnotationBackend::CheckRun) {
+        return Ok(());
+    }
+
+    if let Err(error) = post_check_run_annotations(results, env, vcs).await {
+        if strict {
+            return Err(
+                error.context("failed to post check-run annotations (--annotations-strict is set, so this is fatal)")
+            );
+        }
+        // Surface on stderr (not via tracing, whose default filter is off) so the
+        // warning is visible without -v — matching `github_auth_unavailable_warning`.
+        eprintln!(
+            "warning: checkleft: could not post check-run annotations: {error:#}. Continuing — \
+             the exit code reflects the checks themselves, not the posting failure. Pass \
+             --annotations-strict to make this fatal."
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the GitHub context (owner/repo, head SHA, token) and POST the findings
+/// as a check run. Each missing prerequisite is a distinct, actionable error so a
+/// non-fatal warning (or strict failure) explains exactly what was absent.
+async fn post_check_run_annotations(results: &[CheckResult], env: &CiEnvironment, vcs: &Vcs) -> Result<()> {
+    let owner_repo = resolve_owner_repo(
+        env,
+        std::env::var(CHECKS_REPOSITORY_ENV).ok().as_deref(),
+        vcs.remote_repo_slug().as_deref(),
+    )
+    .context(
+        "could not resolve owner/repo (set GITHUB_REPOSITORY or CHECKS_REPOSITORY, or run inside \
+         a git repository with an `origin` remote)",
+    )?;
+
+    let payload = env.read_github_event_payload();
+    let head_sha = resolve_head_sha(env, payload.as_ref())
+        .context("could not resolve the head commit SHA (no GitHub Actions or Buildkite commit env detected)")?;
+
+    let token = detect_github_token().context(
+        "no GitHub token found (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN and \
+         `gh auth token`); a token with `Checks: write` is required to create a check run",
+    )?;
+
+    let base_url = github_api_base_url();
+    let id = check_run::post_check_run(&base_url, &owner_repo, &token, &head_sha, results).await?;
+    info!(check_run_id = id, owner_repo = %owner_repo, "posted checkleft check-run annotations");
+    Ok(())
+}
+
+/// Base URL for GitHub REST API calls, honoring `GITHUB_API_URL` (set by GitHub
+/// Actions, including on GitHub Enterprise Server) and otherwise defaulting to
+/// public github.com.
+fn github_api_base_url() -> String {
+    std::env::var("GITHUB_API_URL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| check_run::GITHUB_API_BASE_URL.to_owned())
 }
 
 /// Per-check slice of a fix plan: which files the fix phase would process.
@@ -1050,8 +1147,11 @@ async fn dispatch_fix(
                 default_branch,
                 format,
                 show_progress,
+                // Annotation backends run on `checkleft run` only for now; `fix`
+                // mutates the tree, and posting its findings is out of T4's scope.
                 annotations: _,
                 annotations_out: _,
+                annotations_strict: _,
             },
         allow_dirty,
         verify,
