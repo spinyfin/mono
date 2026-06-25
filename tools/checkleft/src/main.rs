@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use checkleft::annotate::check_run;
 use checkleft::annotate::sarif::write_sarif;
+use checkleft::annotate::{Annotation, annotation_from_finding, cap_gha_annotations, format_gha_workflow_commands};
 use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha, resolve_owner_repo};
 use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
@@ -61,7 +62,9 @@ struct RunArgs {
     /// is unchanged). Supported: `check-run` (POST findings to the GitHub Check
     /// Runs API; needs a token with `Checks: write` via
     /// `CHECKS_GITHUB_TOKEN`/`GITHUB_TOKEN`), `sarif` (write SARIF 2.1.0 JSON
-    /// to `--annotations-out=<path>`). `none` is an explicit no-op.
+    /// to `--annotations-out=<path>`), `gha` (emit `::error::`/`::warning::`/
+    /// `::notice::` workflow-command lines to stderr for GitHub Actions). `none`
+    /// is an explicit no-op.
     #[arg(long = "annotations", value_name = "MODE")]
     annotations: Vec<AnnotationBackend>,
     /// File path for annotation backends that write to a file (e.g. `--annotations=sarif`).
@@ -203,7 +206,7 @@ enum OutputFormat {
 /// A GitHub-UI annotation backend selectable via `--annotations`.
 ///
 /// Only shipped backends appear here (clap renders the variants kebab-cased:
-/// `check-run`, `sarif`, `none`); the enum grows one variant per backend as it lands.
+/// `check-run`, `sarif`, `gha`, `none`); the enum grows one variant per backend as it lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AnnotationBackend {
     /// Post findings to the GitHub Check Runs API. CI-agnostic (GitHub Actions,
@@ -212,6 +215,10 @@ enum AnnotationBackend {
     CheckRun,
     /// Write SARIF 2.1.0 JSON to `--annotations-out=<path>`.
     Sarif,
+    /// Emit `::error::` / `::warning::` / `::notice::` workflow-command lines
+    /// to stderr for GitHub Actions. Self-disables when `GITHUB_ACTIONS` is not
+    /// `true`/`1`.
+    Gha,
     /// Explicit no-op; selects no backend.
     None,
 }
@@ -541,6 +548,9 @@ async fn dispatch_run(
             .as_deref()
             .ok_or_else(|| anyhow!("--annotations=sarif requires --annotations-out=<path>"))?;
         write_sarif(&results, path)?;
+    }
+    if annotations.contains(&AnnotationBackend::Gha) {
+        emit_gha_annotations(&results, env);
     }
 
     let has_error = results
@@ -1147,9 +1157,7 @@ async fn dispatch_fix(
                 default_branch,
                 format,
                 show_progress,
-                // Annotation backends run on `checkleft run` only for now; `fix`
-                // mutates the tree, and posting its findings is out of T4's scope.
-                annotations: _,
+                annotations,
                 annotations_out: _,
                 annotations_strict: _,
             },
@@ -1293,6 +1301,46 @@ async fn dispatch_fix(
         OutputFormat::Json => print_fix_results_json(&fix_plan, &fix_outcomes, verify_results.as_deref())?,
     }
 
+    // Emit GHA workflow commands for residual findings (post-fix state).
+    // Mirror the exit-code logic: when --verify ran, annotations come from
+    // two sources — (a) verify_results for applied files (post-fix state),
+    // and (b) original results filtered to files never applied (no fix was
+    // available or the fixer failed). Merging both ensures the annotation set
+    // matches the exit-code signal; omitting (b) would silently drop errors
+    // that still contribute to exit code 1.
+    // When --verify did not run (verify_results is None), fall back to the
+    // original results (pre-fix state, the only available snapshot).
+    if annotations.contains(&AnnotationBackend::Gha) {
+        match verify_results.as_deref() {
+            Some(vr) => {
+                // Build a merged view: verify results for applied files + original
+                // results for files that had no fix applied.
+                let mut merged: Vec<CheckResult> = vr.to_vec();
+                for r in &results {
+                    let unresolved_findings: Vec<Finding> = r
+                        .findings
+                        .iter()
+                        .filter(|f| {
+                            f.location
+                                .as_ref()
+                                .map(|l| !applied_files.contains(&l.path))
+                                .unwrap_or(true)
+                        })
+                        .cloned()
+                        .collect();
+                    if !unresolved_findings.is_empty() {
+                        merged.push(CheckResult {
+                            check_id: r.check_id.clone(),
+                            findings: unresolved_findings,
+                        });
+                    }
+                }
+                emit_gha_annotations(&merged, env);
+            }
+            None => emit_gha_annotations(&results, env),
+        }
+    }
+
     // Exit 0 when no Error-severity finding remains after fixing and re-verifying (§A).
     // Fixer invocation errors count as operational Error findings regardless of verify mode.
     let fix_has_error = fix_outcomes
@@ -1329,6 +1377,30 @@ async fn dispatch_fix(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Collect annotations from all check results, apply the GHA per-step cap, and
+/// print the workflow-command lines to stderr.
+///
+/// Stderr is used so that `--format=json` stdout output remains valid JSON;
+/// the GitHub Actions runner intercepts workflow commands from both stdout and
+/// stderr, so annotations still reach the UI either way.
+///
+/// Self-disables when `GITHUB_ACTIONS` is not `true`/`1` in the environment —
+/// so `--annotations=gha` is safe to pass unconditionally in workflows that
+/// also run locally; the lines are simply not printed on non-GHA platforms.
+/// Force-enabling on non-GHA platforms is not currently implemented.
+fn emit_gha_annotations(results: &[CheckResult], env: &CiEnvironment) {
+    if !env.github_actions {
+        return;
+    }
+    let raw: Vec<Annotation> = results
+        .iter()
+        .flat_map(|r| r.findings.iter().map(|f| (r.check_id.as_str(), f)))
+        .filter_map(|(check_id, f)| annotation_from_finding(check_id, f))
+        .collect();
+    let capped = cap_gha_annotations(raw);
+    eprint!("{}", format_gha_workflow_commands(&capped));
 }
 
 async fn build_runner(
