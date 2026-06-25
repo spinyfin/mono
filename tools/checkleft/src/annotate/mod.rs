@@ -6,6 +6,8 @@ use tracing::warn;
 
 use crate::output::{Finding, Severity};
 
+pub mod check_run;
+
 /// GitHub's three-level annotation vocabulary, shared across GHA workflow
 /// commands, the Check Runs API, and SARIF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

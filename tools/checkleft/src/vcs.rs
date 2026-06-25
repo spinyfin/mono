@@ -13,7 +13,11 @@ mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
 
-fn ensure_rustls_provider() {
+/// Install the process-wide rustls crypto provider exactly once, before the
+/// first TLS handshake. Shared by every authenticated GitHub API path (PR
+/// description lookup here, and the Check Runs backend in
+/// [`crate::annotate::check_run`]) so they all serialize through one `OnceLock`.
+pub(crate) fn ensure_rustls_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
