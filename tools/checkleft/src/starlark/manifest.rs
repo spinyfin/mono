@@ -1,0 +1,236 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use crate::input::SourceTree;
+use crate::path::validate_relative_path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageManifest {
+    pub package: PackageIdentity,
+    pub version_sets: BTreeMap<String, PackageRef>,
+    pub dependencies: BTreeMap<String, PackageRef>,
+    pub includes: BTreeMap<String, PackageRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIdentity {
+    pub name: String,
+    pub version: String,
+    pub kind: PackageKind,
+    pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageKind {
+    CheckPackage,
+    VersionSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRef {
+    pub source: String,
+    pub version: String,
+}
+
+impl PackageManifest {
+    pub fn read_from_tree(tree: &dyn SourceTree, checkleft_root: &Path) -> Result<Self> {
+        validate_relative_path(checkleft_root)?;
+        let manifest_path = checkleft_root.join("package.toml");
+        let bytes = tree
+            .read_file(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let contents =
+            String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", manifest_path.display()))?;
+        Self::parse(&contents).with_context(|| format!("failed to parse {}", manifest_path.display()))
+    }
+
+    pub fn parse(contents: &str) -> Result<Self> {
+        let raw: RawManifest = toml::from_str(contents).context("invalid package.toml")?;
+        let package = raw.package.context("package.toml must contain [package]")?;
+        if package.name.trim().is_empty() {
+            bail!("[package].name must not be empty");
+        }
+        if package.version.trim().is_empty() {
+            bail!("[package].version must not be empty");
+        }
+
+        let version_sets = validate_refs("version_sets", raw.version_sets)?;
+        let dependencies = validate_refs("dependencies", raw.dependencies)?;
+        let includes = validate_refs("includes", raw.includes)?;
+
+        Ok(Self {
+            package: PackageIdentity {
+                name: package.name,
+                version: package.version,
+                kind: package.kind,
+                exclude_patterns: package.exclude_patterns,
+            },
+            version_sets,
+            dependencies,
+            includes,
+        })
+    }
+}
+
+fn validate_refs(section: &'static str, refs: BTreeMap<String, RawPackageRef>) -> Result<BTreeMap<String, PackageRef>> {
+    let mut result = BTreeMap::new();
+    for (alias, package_ref) in refs {
+        if alias.trim().is_empty() {
+            bail!("[{section}] aliases must not be empty");
+        }
+        if package_ref.source.trim().is_empty() {
+            bail!("[{section}.{alias}].source must not be empty");
+        }
+        if package_ref.version.trim().is_empty() {
+            bail!("[{section}.{alias}].version must not be empty");
+        }
+        validate_source_uri(section, &alias, &package_ref.source)?;
+        validate_exact_version(section, &alias, &package_ref.version)?;
+        result.insert(
+            alias,
+            PackageRef {
+                source: package_ref.source,
+                version: package_ref.version,
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn validate_source_uri(section: &str, alias: &str, source: &str) -> Result<()> {
+    let Some((scheme, rest)) = source.split_once("://") else {
+        bail!("[{section}.{alias}].source must use registry://, git://, or path://");
+    };
+    match scheme {
+        "registry" | "git" => {
+            if rest.is_empty() {
+                bail!("[{section}.{alias}].source must include a non-empty {scheme} target");
+            }
+        }
+        "path" => {
+            let path = Path::new(rest);
+            validate_relative_path(path)
+                .with_context(|| format!("[{section}.{alias}].source path:// value must be repo-root-relative"))?;
+            if rest.is_empty() {
+                bail!("[{section}.{alias}].source path:// value must not be empty");
+            }
+        }
+        _ => bail!("[{section}.{alias}].source uses unsupported scheme `{scheme}`"),
+    }
+    Ok(())
+}
+
+fn validate_exact_version(section: &str, alias: &str, version: &str) -> Result<()> {
+    if version.contains('*')
+        || version.contains('^')
+        || version.contains('~')
+        || version.contains('<')
+        || version.contains('>')
+    {
+        bail!("[{section}.{alias}].version must be an exact version pin");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct RawManifest {
+    package: Option<RawPackage>,
+    #[serde(default)]
+    version_sets: BTreeMap<String, RawPackageRef>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, RawPackageRef>,
+    #[serde(default)]
+    includes: BTreeMap<String, RawPackageRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    kind: PackageKind,
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawPackageRef {
+    source: String,
+    version: String,
+}
+
+impl Default for PackageKind {
+    fn default() -> Self {
+        Self::CheckPackage
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "check_package" => Ok(Self::CheckPackage),
+            "version_set" => Ok(Self::VersionSet),
+            other => Err(serde::de::Error::custom(format!("unsupported package kind `{other}`"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_package_manifest_with_refs() {
+        let manifest = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/repo-checks"
+version = "0.1.0"
+exclude_patterns = ["third_party/**", "vendor/**"]
+
+[version_sets.acme]
+source = "registry://checkleft-hub/acme"
+version = "2026.06.1"
+
+[dependencies.local]
+source = "path://a/b/c/checkleft"
+version = "0.0.0"
+"#,
+        )
+        .expect("parse manifest");
+
+        assert_eq!(manifest.package.name, "myorg/repo-checks");
+        assert_eq!(manifest.package.kind, PackageKind::CheckPackage);
+        assert_eq!(
+            manifest.package.exclude_patterns,
+            vec!["third_party/**".to_owned(), "vendor/**".to_owned()]
+        );
+        assert_eq!(manifest.version_sets["acme"].source, "registry://checkleft-hub/acme");
+        assert_eq!(manifest.dependencies["local"].source, "path://a/b/c/checkleft");
+    }
+
+    #[test]
+    fn rejects_path_dependencies_with_parent_traversal() {
+        let err = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/repo-checks"
+version = "0.1.0"
+
+[dependencies.bad]
+source = "path://../other/checkleft"
+version = "0.0.0"
+"#,
+        )
+        .expect_err("parent traversal must fail");
+
+        assert!(err.to_string().contains("repo-root-relative"), "{err:#}");
+    }
+}
