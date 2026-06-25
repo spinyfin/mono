@@ -29,34 +29,29 @@ Every repository (or sub-project) that wants custom checks places a `checkleft/`
 repo-root/
 ├── checkleft/
 │   ├── package.toml                       # package manifest (required)
-│   ├── lib/                               # shared helper modules (always private)
+│   ├── lib/                               # shared helper modules
 │   │   ├── matchers.checkleft
 │   │   └── proto_helpers.checkleft
 │   ├── proto/                             # adapter = proto
-│   │   ├── public/                        # exported to consumers
-│   │   │   └── evolution/
-│   │   │       ├── check.checkleft
-│   │   │       └── fix.checkleft
-│   │   └── private/                       # local-only, not exported
-│   │       └── team_policy/
-│   │           └── check.checkleft
+│   │   ├── evolution/
+│   │   │   ├── check.checkleft
+│   │   │   └── fix.checkleft
+│   │   └── team_policy/
+│   │       └── check.checkleft
 │   ├── module_json/                       # adapter = module_json
-│   │   └── public/
-│   │       └── required_fields/
-│   │           └── check.checkleft
+│   │   └── required_fields/
+│   │       └── check.checkleft
 │   └── java/                              # adapter = java
-│       └── public/
-│           └── api_stability/
-│               ├── check.checkleft
-│               └── fix.checkleft
+│       └── api_stability/
+│           ├── check.checkleft
+│           └── fix.checkleft
 ├── services/
 │   └── payments/
 │       └── checkleft/                     # nested project-level checks
 │           ├── package.toml
 │           └── proto/
-│               └── private/               # project-specific, not exported
-│                   └── billing_compat/
-│                       └── check.checkleft
+│               └── billing_compat/
+│                   └── check.checkleft
 ```
 
 ### 2.2 Design philosophy: one way to do things
@@ -64,36 +59,34 @@ repo-root/
 This folder structure is **intentionally opinionated**. There is exactly one way to determine each property of a check:
 
 - **Which adapter?** → look at the first-level folder (`proto/`, `module_json/`, etc.)
-- **Public or private?** → look at the second-level folder (`public/` or `private/`)
-- **Which check?** → look at the third-level folder (the check name)
+- **Which check?** → look at the remaining path under the adapter folder
 - **What files does it run on?** → read `check_meta()` in `check.checkleft`
+- **Which files does this repo choose to validate?** → read `CHECKS.yaml`
 - **Where are shared helpers?** → `lib/`
-- **Where are external deps?** → `package.toml`
+- **Where are external package/version-set pins?** → `CHECKS.yaml`
 
-No config flags, no overrides, no implicit conventions. The directory tree is the source of truth. This minimizes the number of ways to do things, making the system predictable and auditable.
+No config flags, no overrides, no implicit conventions in package source. The directory tree is the source of truth for check identity and author tests; `CHECKS.yaml` is the source of truth for consumer activation and path policy.
 
 ### 2.3 Rules
 
 | Path pattern                                               | Role                                                                                                                    |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `checkleft/package.toml`                                   | **Package manifest.** Declares metadata and external dependencies. Required.                                            |
-| `checkleft/lib/*.checkleft`                                | **Shared modules.** Importable helpers. Always private — never exported to consumers.                                   |
-| `checkleft/<adapter>/public/<name>/check.checkleft`        | **Public check.** Exported when this package is consumed as a dependency.                                               |
-| `checkleft/<adapter>/private/<name>/check.checkleft`       | **Private check.** Runs locally but not exported to consumers.                                                          |
-| `checkleft/<adapter>/<visibility>/<name>/fix.checkleft`    | **Fix definition.** Optional. Must export a `fix()` function.                                                           |
-| `checkleft/<adapter>/<visibility>/<name>/testdata/<case>/` | **Functional tests.** Fixture-based test cases. See §13.                                                                |
-| `checkleft/<adapter>/<visibility>/<name>/*.checkleft`      | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
+| `checkleft/package.toml`                      | **Package manifest.** Declares producer metadata and publishing/version-set metadata. Required.                         |
+| `checkleft/lib/*.checkleft`                   | **Shared modules.** Importable helpers for checks in the same package.                                                  |
+| `checkleft/<adapter>/<name>/check.checkleft`  | **Check definition.** Exported as part of the package API when published.                                               |
+| `checkleft/<adapter>/<name>/fix.checkleft`    | **Fix definition.** Optional. Must export a `fix()` function.                                                           |
+| `checkleft/<adapter>/<name>/testdata/<case>/` | **Functional tests.** Fixture-based test cases discovered by path. See §13.                                             |
+| `checkleft/<adapter>/<name>/*.checkleft`      | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
 
-The path structure is: `<adapter>/<visibility>/<name>`.
+The path structure is: `<adapter>/<name>`.
 
 - **`<adapter>`** — selects the Rust format adapter (e.g. `proto`, `module_json`, `java`, `text`). Must match a registered `FormatAdapter::kind()`. This is the structural guarantee that every check under `proto/` uses the proto adapter and receives a `ProtoEvolutionContext`.
-- **`<visibility>`** — exactly `public` or `private`. No other values.
 - **`<name>`** — the check name. Can be nested (e.g. `evolution/deletions`). Forms the check ID as `<adapter>/<name>` (e.g. `proto/evolution` or `proto/evolution/deletions`). Visibility is not part of the check ID.
 
 Checks can be nested under a parent to create logical groupings:
 
 ```
-checkleft/proto/public/
+checkleft/proto/
 ├── evolution/
 │   ├── check.checkleft              # check ID: proto/evolution
 │   ├── deletions/
@@ -108,8 +101,7 @@ Each directory with a `check.checkleft` is an independent check. Nesting is pure
 
 **Enforcement:**
 
-- A directory containing `check.checkleft` must be at least three levels deep under `checkleft/` (adapter + visibility + name, with name being one or more levels).
-- The second level must be literally `public` or `private`. Anything else is an error.
+- A directory containing `check.checkleft` must be at least two levels deep under `checkleft/` (adapter + name, with name being one or more levels).
 - The first level must match a registered adapter. Unknown adapter names are an error at discovery time.
 - `package.toml` must exist at the `checkleft/` root. Without it, the directory is ignored.
 - File extension is always `.checkleft`. No `.star`, `.bzl`, or `.py`.
@@ -126,17 +118,15 @@ A nested `checkleft/` directory (e.g. `a/b/c/checkleft/`) defines checks that ap
 repo/
 ├── checkleft/                                  # root-level checks
 │   └── proto/
-│       └── public/
-│           └── evolution/
-│               └── check.checkleft             # applies_to: ["**/*.proto"]
+│       └── evolution/
+│           └── check.checkleft                 # applies_to: ["**/*.proto"]
 ├── a/
 │   └── b/
 │       └── c/
 │           ├── checkleft/                      # project-level checks
 │           │   └── proto/
-│           │       └── private/
-│           │           └── billing_compat/
-│           │               └── check.checkleft # applies_to: ["**/*.proto"]
+│           │       └── billing_compat/
+│           │           └── check.checkleft     # applies_to: ["**/*.proto"]
 │           ├── foo.proto                       # changed file
 │           └── d/
 │               └── e/
@@ -148,110 +138,91 @@ If `a/b/c/foo.proto` and `a/b/c/d/e/f/bar.proto` are both changed:
 
 - **`a/b/c/foo.proto`** is checked by:
 
-  - `repo/checkleft/proto/public/evolution/` (root ancestor, glob matches)
+  - `repo/checkleft/proto/evolution/` (root ancestor, glob matches)
   - `repo/a/b/c/checkleft/proto/billing_compat/` (sibling checkleft, glob matches)
 
 - **`a/b/c/d/e/f/bar.proto`** is checked by:
-  - `repo/checkleft/proto/public/evolution/` (root ancestor, glob matches)
+  - `repo/checkleft/proto/evolution/` (root ancestor, glob matches)
   - `repo/a/b/c/checkleft/proto/billing_compat/` (ancestor checkleft, glob matches)
 
 Both proto files get **all** applicable checks run on them. A nested `checkleft/` adds checks for its subtree — it does not remove or replace ancestor checks. Root-level checks always apply repo-wide.
 
 Nested packages can `load()` from ancestor `checkleft/lib/` directories (resolved upward), but not from sibling or child packages.
 
-### 2.5 Producer/consumer model and the meaning of `public` vs `private`
+### 2.5 Producer/consumer model
 
-**Every `checkleft/` directory with a `package.toml` is a package.** Root or nested, no distinction. The repo-root `checkleft/` is not special — it's just the top-level package. Its checks apply repo-wide because of the ancestor scoping rule (§2.4), not because of any export magic.
+**Every `checkleft/` directory with a `package.toml` is a package.** Root or nested, no distinction. The repo-root `checkleft/` is not special — it is just the top-level package. Its local checks apply repo-wide because of the ancestor scoping rule (§2.4), not because of any export magic.
 
-**`public` vs `private` only matters when a package is consumed as a dependency.** Locally, within the repo, all checks run regardless of visibility. A `private/` check under `a/b/c/checkleft/` still runs on files in `a/b/c/` and its descendants. The distinction only kicks in when another package pulls in your package via `[dependencies]`, `[version_sets]`, or `path://` in its `package.toml`.
+**A check in a published package is part of that package's API.** There is no `public`/`private` split in v1. If a check should not be visible to consumers, keep it out of the published package root or keep it in a local package that is not selected by consumer policy.
 
-**Cross-package consumption — even within the same monorepo — goes through `package.toml` dependencies.** If project D wants to reuse checks from project C, it declares a `path://` dependency:
-
-```toml
-# a/b/d/checkleft/package.toml
-
-[package]
-name = "myorg/service-d"
-version = "0.1.0"
-
-[dependencies.service_c_checks]
-source = "path://a/b/c/checkleft"
-version = "0.0.0"
-```
-
-At that point, only `a/b/c/checkleft/<adapter>/public/` checks become active in D's scope. Private checks stay private to C.
+**Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects packages, version sets, and local path packages in validation policy. `package.toml` never decides what another repo runs.
 
 **Full scenario table:**
 
-| Scenario                                                                           | Mechanism        | What runs?                                                           |
-| ---------------------------------------------------------------------------------- | ---------------- | -------------------------------------------------------------------- |
-| Root `checkleft/proto/public/evolution/` runs on `foo.proto` anywhere in repo      | Ancestor scoping | **Runs.** All checks run locally regardless of public/private.       |
-| Root `checkleft/proto/private/internal_lint/` runs on `foo.proto` anywhere in repo | Ancestor scoping | **Runs.** Private just means not exportable — locally it still runs. |
-| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/foo.proto`                 | Ancestor scoping | **Runs.** Same package, all checks run locally.                      |
-| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/d/e/foo.proto`             | Ancestor scoping | **Runs.** Ancestor checks apply to all descendant files.             |
-| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/private/billing/` check       | `path://` dep    | **Not visible.** Billing is private.                                 |
-| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/public/wire_compat/` check    | `path://` dep    | **Visible.** Wire_compat is public.                                  |
-| External repo consumes root package via `git://`                                   | `git://` dep     | Only `public/` checks visible.                                       |
-| Version set includes a package                                                     | `version_set`    | Only `public/` checks activated in consumers.                        |
+| Scenario                                                        | Mechanism                         | What runs?                                                                 |
+| --------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------- |
+| Root `checkleft/proto/evolution/` runs on `foo.proto`           | Ancestor scoping                  | **Runs** when local checks are enabled and `CHECKS.yaml` policy includes it. |
+| `a/b/c/checkleft/proto/billing/` runs on `a/b/c/foo.proto`      | Ancestor scoping                  | **Runs** for the package subtree when local policy includes local packages. |
+| `a/b/c/checkleft/proto/billing/` runs on `a/b/c/d/e/foo.proto`  | Ancestor scoping                  | **Runs** for descendants when selected.                                     |
+| `a/b/d/` wants `a/b/c/checkleft/`'s `proto/billing` check       | `CHECKS.yaml` `path` package      | **Runs** if D selects that path package/check.                              |
+| External repo consumes root package via `registry://` or `git://` | `CHECKS.yaml` package selection | Selected package mode decides whether all checks or explicit checks run.    |
+| Version set includes a package                                  | `CHECKS.yaml` version set         | **All checks** from all included packages run.                              |
 
 **Example: monorepo with cross-project consumption**
 
 ```
 repo/
-├── checkleft/                           # root package — applies to entire repo
+├── CHECKS.yaml                            # validation policy for this repo
+├── checkleft/                             # root package — applies to entire repo when selected
 │   ├── package.toml
 │   └── proto/
-│       ├── public/
-│       │   └── evolution/               # runs repo-wide, exported to external consumers
-│       │       └── check.checkleft
-│       └── private/
-│           └── internal_lint/           # runs repo-wide, NOT exported
-│               └── check.checkleft
+│       ├── evolution/
+│       │   └── check.checkleft
+│       └── internal_lint/
+│           └── check.checkleft
 ├── a/b/c/
-│   ├── checkleft/                       # project C's package
+│   ├── checkleft/                         # project C's package
 │   │   ├── package.toml
 │   │   └── proto/
-│   │       ├── public/
-│   │       │   └── wire_compat/         # runs on a/b/c/**, visible to other packages
-│   │       │       └── check.checkleft
-│   │       └── private/
-│   │           └── billing/             # runs on a/b/c/**, NOT visible to other packages
-│   │               └── check.checkleft
+│   │       ├── wire_compat/
+│   │       │   └── check.checkleft
+│   │       └── billing/
+│   │           └── check.checkleft
 │   └── service.proto
 ├── a/b/d/
-│   ├── checkleft/                       # project D's package
-│   │   └── package.toml                 # depends on path://a/b/c/checkleft
 │   └── api.proto
 ```
 
-What runs on `a/b/d/api.proto`:
+If `CHECKS.yaml` selects root local checks and a `path` package for `a/b/c/checkleft`, `a/b/d/api.proto` can run:
 
-1. Root `proto/public/evolution/` — ancestor, runs locally
-2. Root `proto/private/internal_lint/` — ancestor, runs locally
-3. C's `proto/public/wire_compat/` — pulled in via D's `path://` dep on C
-4. C's `proto/private/billing/` — **NOT visible** to D (private)
+1. Root `proto/evolution` — selected local package, path policy matches.
+2. Root `proto/internal_lint` — selected local package, path policy matches.
+3. C's `proto/wire_compat` — selected path package, path policy matches.
+4. C's `proto/billing` — selected path package, path policy matches.
 
-What runs on `a/b/c/service.proto`:
-
-1. Root `proto/public/evolution/` — ancestor, runs locally
-2. Root `proto/private/internal_lint/` — ancestor, runs locally
-3. C's `proto/public/wire_compat/` — same package, runs locally
-4. C's `proto/private/billing/` — same package, runs locally
+If `CHECKS.yaml` instead selects an external version set, all checks from every included package run by design.
 
 **Key principles:**
 
-- Locally, visibility is irrelevant — all checks run on their subtree.
-- `public` vs `private` is exclusively about what other packages can see.
-- Cross-package consumption always requires an explicit dependency declaration.
-- The root package is not special — it just has the widest scope due to ancestor scoping.
+- `package.toml` is producer metadata, not consumer validation policy.
+- Check source paths define reusable check IDs and same-package helper loading.
+- `CHECKS.yaml` decides what runs in a consumer repo, on which paths, with which config and policy.
+- Version sets are curated bundles: selecting a version set activates all checks from all packages it includes.
+- The root package is not special — it is just the normal place for repo-wide local checks and policy.
 
 ---
 
-## 3. `package.toml` — the package manifest
+## 3. Package metadata, check layout, and activation
 
-Written in TOML. Parsed before any checks. Declares package-level metadata.
+The Starlark package system deliberately separates producer concerns from consumer validation concerns:
 
-Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has three jobs: declare package identity, pull in exact external package refs/version sets, and declare file exclusions.
+- `package.toml` answers "what package is this, and how is it published?"
+- Check/fix/lib paths answer "what reusable checks does this package define?"
+- `CHECKS.yaml` answers "which packages/version sets run here, against which files, with which policy?"
+
+### 3.1 `package.toml` — producer metadata
+
+Written in TOML. Parsed before publishing, package testing, and package loading. It declares package identity and publishing metadata. It does **not** declare consumer validation policy, repo path scope, excludes, or which checks should run.
 
 ```toml
 # checkleft/package.toml
@@ -259,56 +230,64 @@ Local checks are auto-discovered from the folder structure — they are **not** 
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
-exclude_patterns = [
-    "third_party/**",
-    "vendor/**",
-]
+kind = "check_package"
 
-# Pull in a curated version set — all its public checks become active.
-[version_sets.acme-versionset]
-source = "registry://checkleft-hub/acme-versionset"
-version = "2025.06.1"
-sha256 = "b3d1..."
-
-# Pull in an individual external check package.
-[dependencies.acme_java_checks]
-source = "git://github.com/acme/checkleft-java.git"
-version = "1.0.3"
-sha256 = "7aa9..."
+[publish]
+description = "Repository policy checks for myorg"
+license = "Apache-2.0"
 ```
 
-### 3.1 `[package]` fields
+#### `[package]` fields
 
-| Field              | Type        | Required | Description                                                                                                                                                                        |
-| ------------------ | ----------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`             | `str`       | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                                                                                                                    |
-| `version`          | `str`       | yes      | SemVer. Used when this package is consumed as a dependency.                                                                                                                        |
-| `exclude_patterns` | `list[str]` | no       | Glob patterns for files that should be excluded from all checks in this package. Matched relative to the package root. Common uses: `third_party/**`, `vendor/**`, `generated/**`. |
+| Field     | Type  | Required | Description                                                                                 |
+| --------- | ----- | -------- | ------------------------------------------------------------------------------------------- |
+| `name`    | `str` | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                             |
+| `version` | `str` | yes      | SemVer package version. Used by consumers and version sets when pinning this package.        |
+| `kind`    | `str` | no       | `check_package` (default) or `version_set`.                                                  |
 
-### 3.2 `[version_sets]` — curated check collections
+`package.toml` intentionally has no `exclude`, no consumer `[dependencies]`, and no "activate these checks" section. Those belong in `CHECKS.yaml`.
 
-Inspired by Amazon's Brazil build system: instead of individually pinning N check packages, you depend on a single **version set** — a curated, tested-together collection that pins a coherent set of check versions. The version set author tests that all included checks work together, so consumers get a single version to track.
+### 3.2 Check package layout
 
-```toml
-[version_sets.acme-versionset]
-source = "registry://checkleft-hub/acme-versionset"
-version = "2025.06.1"   # one number, many checks
-sha256 = "b3d1..."
+Local check files are auto-discovered from the package folder structure. They are **not** listed in `package.toml`.
+
+```
+checkleft/
+├── package.toml
+├── lib/
+│   └── proto_helpers.checkleft
+├── proto/
+│   └── evolution/
+│       ├── check.checkleft
+│       ├── fix.checkleft
+│       └── testdata/
+│           └── removes_field/
+│               ├── before/
+│               ├── after/
+│               └── expected.toml
+└── text/
+    └── no_debug/
+        └── check.checkleft
 ```
 
-A version set is itself a `package.toml` that re-exports other packages. The version set's manifest:
+- Any directory matching `checkleft/<adapter>/<name>/` that contains a `check.checkleft` is a check.
+- The check ID is derived from the path: `<adapter>/<name>` (for example, `proto/evolution`).
+- There is no `public`/`private` split in v1. A check in a published package is part of that package's API.
+- Experiments that should not be part of a package API belong outside the published package root or in an unpublished local package.
+- `check_meta(applies_to = [...])` declares intrinsic file compatibility: what files the check knows how to inspect. Consumer policy can further narrow the target set in `CHECKS.yaml`.
+- `checkleft/lib/*.checkleft` modules are same-package helpers. Checks inside the package can `load("//lib/foo", ...)`; consumers cannot import package libs directly.
+
+### 3.3 Version-set packages
+
+A version set is a separate `checkleft/` package whose `package.toml` has `kind = "version_set"`. It pins a curated set of exact package refs and hashes.
 
 ```toml
 # Published as: acme-versionset v2025.06.1
-# This file IS the version set — it pins exact versions of constituent packages.
 
 [package]
 name = "acme/versionset"
 version = "2025.06.1"
-kind = "version_set"   # marks this as a version set, not a regular check package
-
-# The version set pins all its constituent packages at tested-together versions.
-# Consumers inherit these versions and all public checks automatically.
+kind = "version_set"
 
 [includes.proto_evolution]
 source = "registry://checkleft-hub/proto-evolution"
@@ -331,136 +310,89 @@ version = "3.1.0"
 sha256 = "e91d..."
 ```
 
-**Note on adapter overlap:** Multiple packages (from the same or different version sets) can provide checks for the same file type. For example, `proto_evolution` and `security_baseline` might both have `proto/` category checks that apply to `**/*.proto`. All applicable checks from all active packages run — there is no conflict. Each package's checks are independently auto-discovered and independently executed.
+Selecting a version set in `CHECKS.yaml` activates all checks from all included packages. A version set is therefore a curated API surface: adding, removing, or renaming a check is a meaningful version-set change.
 
-**Consumer usage** — depend on the version set and all of its public checks are automatically active. No need to individually activate them:
+#### `[includes.<name>]` fields
 
-```toml
-# Consumer's package.toml
+| TOML key    | Type  | Required | Description                                                 |
+| ----------- | ----- | -------- | ----------------------------------------------------------- |
+| (table key) | `str` | yes      | Local alias for this constituent package.                   |
+| `source`    | `str` | yes      | Source URI of the constituent package.                      |
+| `version`   | `str` | yes      | Exact version pin. The version set author tests this pin.   |
+| `sha256`    | `str` | yes      | SHA-256 of the published constituent package bytes.         |
 
-[package]
-name = "myorg/my-repo"
-version = "0.1.0"
+### 3.4 `CHECKS.yaml` — consumer validation policy
 
-# One version_set dependency pulls in all public checks from every
-# package in the set. No individual check activation needed.
-[version_sets.acme-versionset]
-source = "registry://checkleft-hub/acme-versionset"
-version = "2025.06.1"
-sha256 = "b3d1..."
-# ^ This single line activates proto_evolution/wire_compat,
-#   module_json_checks/required_fields, java_api_compat/*,
-#   security_baseline/* — every public check from every included package.
+Consumers select validation policy in `CHECKS.yaml`, alongside existing built-in/declarative check config. This keeps "what runs here?" reviewable in the file that already owns checkleft policy.
 
-# You can still add individual dependencies alongside a version set
-# for packages not in the version set.
-[dependencies.custom_team_checks]
-source = "git://github.com/myteam/checkleft-checks.git"
-version = "0.3.0"
-sha256 = "9f20..."
+```yaml
+checkleft_packages:
+  version_sets:
+    acme_baseline:
+      source: registry://checkleft-hub/acme-versionset
+      version: "2025.06.1"
+      sha256: "b3d1..."
+
+  packages:
+    team_checks:
+      source: git://github.com/myteam/checkleft-checks.git
+      version: "0.3.0"
+      sha256: "9f20..."
+
+    local_experiments:
+      path: tools/checkleft-experiments/checkleft
+      mode: explicit
+
+checks:
+  # Version sets activate all checks from their included packages.
+  # This entry narrows/configures one activated check for this repo.
+  - id: proto/evolution
+    include:
+      - "api/**/*.proto"
+    exclude:
+      - "api/generated/**"
+    config:
+      allow_reserved_field_removal: true
+
+  # Local explicit packages do not auto-activate; opt in check-by-check.
+  - id: local_experiments:text/no_debug
+    include:
+      - "**/*.txt"
 ```
 
-### 3.3 `[version_sets.<name>]` fields (consumer side)
+`checkleft_packages.version_sets` entries activate every check in every package listed by the selected version set. `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration.
 
-| TOML key    | Type  | Required | Description                                |
-| ----------- | ----- | -------- | ------------------------------------------ |
-| (table key) | `str` | yes      | Local alias for the version set.           |
-| `source`    | `str` | yes      | Source URI (same schemes as dependencies). |
-| `version`   | `str` | yes      | Exact version set version pin.             |
-| `sha256`    | `str` | yes      | SHA-256 of the published version-set package bytes. The version-set package lists exact constituent package hashes. |
+Path selection is two-stage:
 
-### 3.4 `[includes.<name>]` fields (version set author side)
+1. The check's `check_meta(applies_to = [...])` declares compatible files.
+2. `CHECKS.yaml` `include`/`exclude` narrows the effective file set for this repo.
 
-| TOML key    | Type  | Required | Description                                                                          |
-| ----------- | ----- | -------- | ------------------------------------------------------------------------------------ |
-| (table key) | `str` | yes      | Local alias for this constituent package. Consumers use this as the check ID prefix. |
-| `source`    | `str` | yes      | Source URI of the constituent package.                                               |
-| `version`   | `str` | yes      | Exact version pin. The version set author tests this version.                        |
-| `sha256`    | `str` | yes      | SHA-256 of the published constituent package bytes.                                  |
+`CHECKS.yaml` remains the only place for consumer excludes, severity/bypass policy, and per-repo check config.
 
-### 3.5 Version set resolution rules
+### 3.5 Resolution rules
 
-Resolution is intentionally simple: there is no transitive dependency graph and no dependency solver. A consumer activates exactly the packages listed in `[dependencies]` plus the packages explicitly listed by each selected version set.
+Resolution is intentionally simple: there is no transitive dependency graph and no dependency solver. A consumer activates exactly the version sets and packages selected in `CHECKS.yaml`.
 
 1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`.
-2. **Version sets are empty package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not export checks of its own and it cannot depend on another version set.
+2. **Version sets are curated package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not define checks of its own and it cannot depend on another version set.
 3. **A version set's `sha256` covers the version-set package.** The package contains the exact ordered constituent `(source, version, sha256)` refs, so changing any included package changes the version-set package hash.
-4. **No transitive dependency closure is loaded.** A package's own `[dependencies]` are not activated when that package is consumed. Dependencies provide checks only when directly listed by the consumer or by a selected version set.
+4. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from selected packages or packages included by selected version sets.
 5. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
-6. **All public checks from all selected packages are automatically active.** No individual activation needed.
-7. **Private checks** (under `<adapter>/private/`) in selected packages are **not** activated in consumers — they only run in the package's own repo.
+6. **Version sets activate all checks from included packages.** Consumers control the selected version-set version; the version-set author controls the check set.
+7. **Individual packages can be activated in `all` or `explicit` mode.** Version sets are always `all`.
 
-### 3.6 `[dependencies.<name>]` fields
+### 3.6 Self-hosted guard check for policy integrity
 
-| TOML key    | Type  | Required | Description                                                      |
-| ----------- | ----- | -------- | ---------------------------------------------------------------- |
-| (table key) | `str` | yes      | Local alias used to reference this dependency's checks.          |
-| `source`    | `str` | yes      | Source URI. Schemes: `registry://`, `git://`, `path://` (local). |
-| `version`   | `str` | yes      | SemVer version or git tag. Exact pin, no ranges.                 |
-| `sha256`    | `str` | yes for fetched packages, no for `path://` | SHA-256 of the published package bytes. `path://` reads live local content for temporary monorepo iteration and is intentionally not reproducible. |
+Organizations that want to prevent removal or downgrade of required policy can supply an external root `CHECKS.yaml` through the existing external config mechanism. That root config enables a Starlark guard check targeting `CHECKS.yaml` / `CHECKS.toml`.
 
-### 3.7 Auto-discovery of local checks
+Initial guard behavior:
 
-**Local checks are never listed in `package.toml`.** They are auto-discovered from the folder structure:
+- Compare the base and current config files.
+- Fail if a selected version set or package pin is downgraded.
+- Fail if a hardcoded protected version set or package entry is removed.
+- Use hardcoded placeholder protected entries in v1 to prove the API path; later this can become normal check config.
 
-- Any directory matching `checkleft/<category>/<name>/` that contains a `check.checkleft` is a check.
-- The check ID is derived from the path: `<adapter>/<name>` (e.g. `proto/evolution`). Visibility (`public`/`private`) is not part of the ID.
-- The `applies_to` globs, `tier`, and `config` are declared **inside `check.checkleft` itself** via a `check_meta()` call at the top of the file (see §4.1).
-
-This means `package.toml` has exactly two jobs:
-
-1. Declare package identity (`[package]`).
-2. Pull in external dependencies (`[version_sets]`, `[dependencies]`).
-
-### 3.8 Public vs. private visibility (path semantics)
-
-Visibility is determined entirely by the `public/` or `private/` directory in the path. No convention tricks — it's a literal directory name.
-
-**Checks:**
-
-| Path pattern                          | Visibility   | Description                                                                                              |
-| ------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------- |
-| `checkleft/<adapter>/public/<name>/`  | **Public.**  | Exported when this package is consumed via `[dependencies]` or `[version_sets]`. Activated in consumers. |
-| `checkleft/<adapter>/private/<name>/` | **Private.** | Runs locally but not exported to consumers.                                                              |
-
-**Libraries (`lib/`):**
-
-| Path pattern                | Visibility          | Description                                                                                                                                      |
-| --------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `checkleft/lib/*.checkleft` | **Always private.** | All `lib/` modules are private. Loadable by checks in the same package but never exported. Consumers cannot `load()` from a dependency's `lib/`. |
-
-This means consumers can use a dependency's **public checks** but never import its **helper functions** or run its **private checks**.
-
-**Examples:**
-
-```
-checkleft/
-├── lib/
-│   └── proto_helpers.checkleft                     # private — same-package only
-├── proto/
-│   ├── public/
-│   │   └── evolution/
-│   │       └── check.checkleft                     # PUBLIC — exported to consumers
-│   └── private/
-│       └── team_policy/
-│           └── check.checkleft                     # PRIVATE — local only
-├── module_json/
-│   └── public/
-│       └── required_fields/
-│           └── check.checkleft                     # PUBLIC — exported to consumers
-└── text/
-    └── private/
-        └── lint_style/
-            └── check.checkleft                     # PRIVATE — local only
-```
-
-When consumed via `[dependencies]` or `[version_sets]`:
-
-- `proto/evolution` — **activated** (public)
-- `module_json/required_fields` — **activated** (public)
-- `proto/team_policy` — **not activated** (private)
-- `text/lint_style` — **not activated** (private)
-- `lib/*` — **not loadable** by consumer checks
+This keeps the platform rule explicit: the guard is just another Starlark check supplied by org policy, not hidden behavior in package resolution.
 
 ---
 
@@ -474,7 +406,7 @@ Every check file must:
 2. Define exactly one `check()` function with a typed signature. The parameter type depends on the **file format adapter** (see §6).
 
 ```python
-# checkleft/proto/public/evolution/check.checkleft
+# checkleft/proto/evolution/check.checkleft
 
 load("//lib/proto_helpers", "is_reserved")
 
@@ -518,7 +450,7 @@ The check and fix interact through **`fix_data`** — a strongly typed struct at
 **Step 1: Define a shared `fix_data` type in a check-local helper.**
 
 ```python
-# checkleft/proto/public/evolution/types.checkleft
+# checkleft/proto/evolution/types.checkleft
 
 # Each fix_data variant is a struct with typed fields.
 # The check constructs these; the fix pattern-matches on them.
@@ -540,7 +472,7 @@ FieldNotReserved = struct(
 **Step 2: The check constructs typed `fix_data`.**
 
 ```python
-# checkleft/proto/public/evolution/check.checkleft
+# checkleft/proto/evolution/check.checkleft
 
 load(":types", "field_not_reserved")
 
@@ -564,7 +496,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 **Step 3: The fix reads typed `fix_data` — no string parsing, no dict key guessing.**
 
 ```python
-# checkleft/proto/public/evolution/fix.checkleft
+# checkleft/proto/evolution/fix.checkleft
 
 load(":types", "FieldNotReserved")
 
@@ -893,7 +825,7 @@ Third-party or in-repo Rust adapters register via:
 registry.register_adapter(Box::new(MyCustomAdapter));
 ```
 
-The adapter's `kind()` return value must match the top-level `<adapter>` folder name in the check directory structure. This is a structural guarantee: every check under `checkleft/proto/` (whether `public/` or `private/`) uses the adapter whose `kind() == "proto"` and receives a `ProtoEvolutionContext`. There is exactly one way to determine which adapter a check uses — look at its parent folder.
+The adapter's `kind()` return value must match the top-level `<adapter>` folder name in the check directory structure. This is a structural guarantee: every check under `checkleft/proto/` uses the adapter whose `kind() == "proto"` and receives a `ProtoEvolutionContext`. There is exactly one way to determine which adapter a check uses — look at its parent folder.
 
 ---
 
@@ -908,7 +840,7 @@ Rust checks implement the existing `Check` + `ConfiguredCheck` traits. They are 
 A `check.checkleft` can delegate to a Rust implementation via `source` in `check_meta()`:
 
 ```python
-# checkleft/proto/public/wire_compat_fast/check.checkleft
+# checkleft/proto/wire_compat_fast/check.checkleft
 # This is a thin shim — the real work happens in Rust.
 
 check_meta(
@@ -948,9 +880,9 @@ Every `checkleft/` directory with a `package.toml` is a distributable package. T
 
 ### 8.2 Resolution
 
-Dependencies declared in `[dependencies]` and packages listed by selected `[version_sets]` are resolved at `checkleft` startup before any checks run:
+Packages and version sets selected in `CHECKS.yaml` are resolved at `checkleft` startup before any checks run:
 
-1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs containing `package.toml`, public `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those public checks load. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/<sha256>/`.
+1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs containing `package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/<sha256>/`.
 2. **`git://`** — cloned at the specified tag and packed into the same package byte format. Sparse checkout of the `checkleft/` directory only. Cached similarly and verified against `sha256`.
 3. **`path://`** — local filesystem path. For monorepo cross-project dependencies. No caching; always reads live. Always relative to the repo root (e.g. `path://a/b/c/checkleft`). Relative paths (`../`) are not allowed — use the repo-root-relative path instead, similar to Bazel's `//` convention.
 
@@ -959,13 +891,13 @@ Dependencies declared in `[dependencies]` and packages listed by selected `[vers
 - Only exact versions are supported. No ranges, no `^`, no `~`.
 - Fetched packages must declare `sha256` in `package.toml`; the resolver verifies fetched bytes before any checks are loaded.
 - Version sets are reproducible because the version-set package is itself hash-pinned, and its manifest lists exact constituent package refs and hashes.
-- There is no `PACKAGE.lock`. The manifest is already the lock because every selected external package is exact and hash-pinned.
+- There is no `PACKAGE.lock`. `CHECKS.yaml` package refs and version-set manifests already carry the exact versions and hashes that make selected packages reproducible.
 - `path://` dependencies are an explicit local-iteration escape hatch. They read live local content and are not reproducible until replaced by a fetched, hash-pinned ref.
 - `checkleft update <dep_name> <new_version>` updates the manifest's exact version and hash.
 
 ### 8.4 Publishing
 
-Publishing produces a simple `tar.gz` package. The archive contains `package.toml`, public `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those public checks load. It does not include private checks and it does not vendor package dependencies; consumers activate dependencies only when they list them directly or select a version set.
+Publishing produces a simple `tar.gz` package. The archive contains `package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. It does not vendor package dependencies; consumers activate packages only when they list them directly or select a version set in `CHECKS.yaml`.
 
 The publishable tarball should be buildable by Bazel (for example with a `pkg_tar`-style target) so check authors can iterate under the same build system that schedules their package tests. A `checkleft publish` command is a future convenience layer over the same package format.
 
@@ -978,7 +910,7 @@ The publishable tarball should be buildable by Bazel (for example with a `pkg_ta
 ```
 1. From the changeset, walk upward from changed file paths to find ancestor checkleft/ directories.
 2. For each, parse package.toml.
-3. Resolve directly selected packages from [dependencies] and selected version-set includes (fetch and verify hashes as needed).
+3. Resolve packages and version sets selected by `CHECKS.yaml` (fetch and verify hashes as needed).
 4. Auto-discover checks from folder structure in each selected package.
 5. Scope local checks to their package subtree; consumed package checks run against their declared `applies_to` globs over the consumer repo.
 ```
@@ -1070,9 +1002,9 @@ Step 2 is the bottleneck (invoking protoc, running tree-sitter). Step 3 is pure 
 Multiple checks under the same adapter folder share the same parsed output. The runner parses once per `(adapter, file_set, revision)` triple and hands the result to every check under that adapter.
 
 ```
-checkleft/proto/public/evolution/       ─┐
-checkleft/proto/public/no_deletion/      ├─ all receive the SAME ProtoEvolutionContext
-checkleft/proto/private/team_policy/    ─┘
+checkleft/proto/evolution/       ─┐
+checkleft/proto/no_deletion/      ├─ all receive the SAME ProtoEvolutionContext
+checkleft/proto/team_policy/    ─┘
 ```
 
 **Implementation:** The runner groups checks by adapter kind. For each adapter, it calls `parse()` and `diff()` once. The resulting `AdapterOutput` is `Arc`-shared across all checks in that group. `inject_globals()` borrows the shared output — it does not clone it. Starlark values are allocated in each check's own `Module` heap, but they hold references (via `StarlarkValue` wrappers) to the shared Rust-side data.
@@ -1176,10 +1108,9 @@ checkleft/
 ├── lib/
 │   └── proto_helpers.checkleft
 └── proto/
-    └── public/
-        └── evolution/
-            ├── check.checkleft
-            └── fix.checkleft
+    └── evolution/
+        ├── check.checkleft
+        └── fix.checkleft
 ```
 
 **`package.toml`:**
@@ -1189,7 +1120,7 @@ checkleft/
 name = "mono/checks"
 version = "0.1.0"
 
-# No external dependencies yet — local checks are auto-discovered from the folder structure.
+# Producer metadata only. Consumer activation belongs in CHECKS.yaml.
 ```
 
 **`lib/proto_helpers.checkleft`:**
@@ -1205,7 +1136,7 @@ def is_internal_package(pkg: str) -> bool:
     return pkg.startswith("internal.") or ".internal." in pkg
 ```
 
-**`proto/public/evolution/types.checkleft`:**
+**`proto/evolution/types.checkleft`:**
 
 ```python
 # Typed fix_data structs shared between check and fix.
@@ -1224,7 +1155,7 @@ def field_not_reserved(field_number: int, field_name: str, insertion_line: int) 
     )
 ```
 
-**`proto/public/evolution/check.checkleft`:**
+**`proto/evolution/check.checkleft`:**
 
 ```python
 load("//lib/proto_helpers", "has_reservation", "is_internal_package")
@@ -1280,7 +1211,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-**`proto/public/evolution/fix.checkleft`:**
+**`proto/evolution/fix.checkleft`:**
 
 ```python
 load(":types", "FieldNotReserved")
@@ -1308,12 +1239,11 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
 ```
 checkleft/
 └── module_json/
-    └── public/
-        └── required_fields/
-            └── check.checkleft
+    └── required_fields/
+        └── check.checkleft
 ```
 
-**`module_json/public/required_fields/check.checkleft`:**
+**`module_json/required_fields/check.checkleft`:**
 
 ```python
 check_meta(
@@ -1362,12 +1292,11 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
 ```
 checkleft/
 └── java/
-    └── public/
-        └── api_stability/
-            └── check.checkleft
+    └── api_stability/
+        └── check.checkleft
 ```
 
-**`java/public/api_stability/check.checkleft`:**
+**`java/api_stability/check.checkleft`:**
 
 ```python
 check_meta(
@@ -1421,10 +1350,10 @@ This is a purely functional, black-box approach: files in, findings out. No mock
 
 ### 13.1 Test directory structure
 
-Each test case is a directory under `testdata/` containing a `before/` workspace, an `after/` workspace, and an `expected.toml` file declaring the expected findings.
+Each test case is a directory under `testdata/` containing a `before/` workspace, an `after/` workspace, and an `expected.toml` file declaring the expected findings. The test path is part of the authoring API: check IDs come from `<adapter>/<name>`, and test cases live directly beside the check they exercise.
 
 ```
-checkleft/proto/public/evolution/
+checkleft/proto/evolution/
 ├── check.checkleft
 ├── fix.checkleft
 └── testdata/
@@ -1838,7 +1767,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ### 16.6 Proto check: blocking proto file deletion
 
 ```python
-# checkleft/proto/public/no_deletion/check.checkleft
+# checkleft/proto/no_deletion/check.checkleft
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Proto files must never be deleted — they represent a published contract."""
@@ -1859,7 +1788,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
 ```python
-# checkleft/proto/public/move_detection/check.checkleft
+# checkleft/proto/move_detection/check.checkleft
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Allow proto file moves/renames as long as the package stays the same."""
@@ -2068,7 +1997,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 The fix function receives typed `fix_data` from the check (see §4.2). No string parsing — pattern-match on the struct type.
 
 ```python
-# proto/public/evolution/fix.checkleft
+# proto/evolution/fix.checkleft
 
 load(":types", "FieldNotReserved")
 
@@ -2094,37 +2023,36 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 16.12 Package manifest with a version set
+### 16.12 `CHECKS.yaml` selecting a version set
 
-```toml
-# checkleft/package.toml
+```yaml
+# CHECKS.yaml
 # Instead of pinning 5+ individual check packages, depend on one version set.
 
-[package]
-name = "acme/payments"
-version = "1.0.0"
+checkleft_packages:
+  version_sets:
+    acme_versionset:
+      source: registry://checkleft-hub/acme-versionset
+      version: "2025.06.1"
+      sha256: "b3d1..."
 
-# One version set gives us proto, module_json, java, and security checks.
-# All public checks from every included package are automatically active.
-[version_sets.acme-versionset]
-source = "registry://checkleft-hub/acme-versionset"
-version = "2025.06.1"
-sha256 = "b3d1..."
+  packages:
+    custom_team_checks:
+      source: git://github.com/myteam/checkleft-checks.git
+      version: "0.3.0"
+      sha256: "9f20..."
+      mode: all
 
-# Add a package directly alongside the version set.
-[dependencies.custom_team_checks]
-source = "git://github.com/myteam/checkleft-checks.git"
-version = "0.3.0"
-sha256 = "9f20..."
-
-# Local checks (checkleft/proto/public/evolution/, etc.) are auto-discovered.
-# package.toml is purely for external deps.
+checks:
+  - id: proto/evolution
+    include:
+      - "api/**/*.proto"
 ```
 
 ### 16.13 Network tier: checking field reservations against a remote service
 
 ```python
-# checkleft/proto/public/reservation_check/check.checkleft
+# checkleft/proto/reservation_check/check.checkleft
 
 check_meta(
     applies_to: list[str] = ["**/*.proto"],
@@ -2219,13 +2147,13 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Convention          | Rule                                                                                                 |
 | ------------------- | ---------------------------------------------------------------------------------------------------- |
 | File extension      | `.checkleft` always                                                                                  |
-| Check location      | `checkleft/<adapter>/<visibility>/<name>/check.checkleft`                                            |
-| Fix location        | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft`                                              |
+| Check location      | `checkleft/<adapter>/<name>/check.checkleft`                                                         |
+| Fix location        | `checkleft/<adapter>/<name>/fix.checkleft`                                                           |
 | Shared code         | `checkleft/lib/*.checkleft`                                                                          |
-| Check-local helpers | `checkleft/<adapter>/<visibility>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`) |
+| Check-local helpers | `checkleft/<adapter>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`)              |
 | Package manifest    | `checkleft/package.toml`                                                                             |
-| Package integrity   | Exact `source`/`version`/`sha256` refs in `package.toml`; no `PACKAGE.lock`                          |
-| Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`) — visibility is not part of the ID                       |
+| Package integrity   | Exact `source`/`version`/`sha256` refs in `CHECKS.yaml` and version-set includes; no `PACKAGE.lock`  |
+| Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`)                                                          |
 | Type annotations    | Required on all function signatures                                                                  |
 | Default sandbox     | `hermetic`                                                                                           |
 | Adapter linkage     | `<adapter>` top-level folder name matches `FormatAdapter::kind()`                                    |
