@@ -291,7 +291,7 @@ Creating a check run is **not** something an arbitrary token can do. The reliabl
 
 - **GHA**: pass the job's `GITHUB_TOKEN` (with `permissions: checks: write`) to checkleft via `CHECKS_GITHUB_TOKEN`/`GITHUB_TOKEN`. checkleft's existing `detect_github_token()` already finds it. No new app needed.
 - **Buildkite**: there is no ambient installation token. You must **stand up a GitHub App** (org-owned, `checks: write`, installed on the repo), store its **app id + private key** as Buildkite secrets, and have checkleft mint an installation token at runtime: sign a short-lived JWT with the private key → `POST /app/installations/{id}/access_tokens` → use the returned token. This is the **heaviest credential lift of the four**, and the real cost behind the operator's "best for Buildkite" hypothesis.
-- **PATs**: a **classic PAT cannot create check runs** (returns 403 "Resource not accessible by personal access token"). A **fine-grained PAT with explicit `Checks: write`** _may_ work, but this must be **validated empirically** before relying on it (see Risks). The safe assumption for production is "GitHub App installation token required."
+- **PATs**: a **classic PAT cannot create check runs** (returns 403 "Resource not accessible by personal access token"). A **fine-grained PAT with explicit `Checks: write`** is a **supported credential path** and the recommended lighter-weight onboarding story for Buildkite (and other non-GHA CI) environments — it passes through the existing `CHECKS_GITHUB_TOKEN` env var with no new infrastructure. The **GitHub App installation token** (app id + private key) is the **fallback** for environments where PAT provisioning is not an option or where the fine-grained PAT proves insufficient in practice.
 - **How the secret reaches checkleft**: token via the existing `CHECKS_GITHUB_TOKEN` env var (already wired). For the GitHub-App-minting path, new inputs are needed — `CHECKS_GITHUB_APP_ID`, `CHECKS_GITHUB_APP_PRIVATE_KEY` (or a file path), and optionally `CHECKS_GITHUB_INSTALLATION_ID` (else discover it via `GET /repos/{owner}/{repo}/installation`). These are **secrets** and must be flagged as such in any consuming pipeline.
 
 ### Resolving repo + head SHA from CI
@@ -313,7 +313,7 @@ Strictly more than #1/#2: a checkleft-named check with its own named check entry
 
 ### Buildkite verdict — **works, and is the only option that lights up inline PR annotations on Buildkite without GHAS** (credentials required)
 
-This **confirms the operator's hypothesis** — with one critical caveat: it is provider-agnostic _as an HTTP call_, but it requires a **GitHub App installation token**, which on Buildkite means provisioning an app and managing its private key as a secret. It is the best Buildkite option **and** the most operationally involved.
+This **confirms the operator's hypothesis**. It is provider-agnostic as an HTTP call, and supports two credential tiers: the **recommended lighter-weight path** is a **fine-grained PAT with `Checks: write`** passed via `CHECKS_GITHUB_TOKEN` — no new app to provision, no private key to manage. The **fallback path** (for environments where PAT provisioning is not an option) is a **GitHub App installation token** (app id + private key as Buildkite secrets). It is the best Buildkite option; the PAT path is the recommended starting point.
 
 ### checkleft-side implementation
 
@@ -332,7 +332,16 @@ steps:
     env: { CHECKS_GITHUB_TOKEN: ${{ github.token }} }
 ```
 
-Buildkite (requires the GitHub App secrets):
+Buildkite — recommended path (fine-grained PAT with `Checks: write`):
+
+```yaml
+steps:
+  - command: checkleft run --annotations=check-run
+    env:
+      CHECKS_GITHUB_TOKEN: "$CHECKLEFT_GH_PAT" # fine-grained PAT, Checks:write, from Buildkite secrets
+```
+
+Buildkite — fallback path (GitHub App, for environments where PAT provisioning is not an option):
 
 ```yaml
 steps:
@@ -342,7 +351,7 @@ steps:
       CHECKS_GITHUB_APP_PRIVATE_KEY: "$GH_APP_PEM" # from Buildkite secrets
 ```
 
-Checked-in files: none. Secrets: the App id + private key (Buildkite) or just the ambient token (GHA).
+Checked-in files: none. Secrets: GHA uses the ambient token; Buildkite uses either a fine-grained PAT (lighter) or GitHub App id + private key (heavier, fallback).
 
 ### Limitations & failure modes
 
@@ -468,12 +477,12 @@ Recommended: a **small shared foundation (T0)** — the `Annotation` type, `anno
 
 ### Comparison matrix
 
-| Option                    | GHA                                     | Buildkite                            | UI surface                                      | Complexity             | Credentials                                          | Checked-in files         |
-| ------------------------- | --------------------------------------- | ------------------------------------ | ----------------------------------------------- | ---------------------- | ---------------------------------------------------- | ------------------------ |
-| 1 · Workflow commands     | ✅ works                                | ❌ ignored                           | Inline PR diff + job annotations                | Trivial                | None                                                 | None                     |
-| 2 · Problem matchers      | ✅ works (weaker than #1)               | ❌ ignored                           | Inline PR diff + job annotations                | Low (regex drift risk) | None                                                 | `.github/*.matcher.json` |
-| 3 · Check Runs API        | ✅ works (ambient token)                | ✅ **works** (needs GitHub App)      | **Own check in Checks tab** + inline PR diff    | High                   | GHA: ambient token; Buildkite: **GitHub App id+key** | None                     |
-| 4 · SARIF + code scanning | ✅ public free / **private needs GHAS** | ✅ via REST / **private needs GHAS** | **Security/code-scanning tab** + inline PR diff | Medium                 | `security-events`/`security_events: write` token     | None (GHA action)        |
+| Option                    | GHA                                     | Buildkite                            | UI surface                                      | Complexity             | Credentials                                                                            | Checked-in files         |
+| ------------------------- | --------------------------------------- | ------------------------------------ | ----------------------------------------------- | ---------------------- | -------------------------------------------------------------------------------------- | ------------------------ |
+| 1 · Workflow commands     | ✅ works                                | ❌ ignored                           | Inline PR diff + job annotations                | Trivial                | None                                                                                   | None                     |
+| 2 · Problem matchers      | ✅ works (weaker than #1)               | ❌ ignored                           | Inline PR diff + job annotations                | Low (regex drift risk) | None                                                                                   | `.github/*.matcher.json` |
+| 3 · Check Runs API        | ✅ works (ambient token)                | ✅ **works** (PAT or GitHub App)     | **Own check in Checks tab** + inline PR diff    | High                   | GHA: ambient token; Buildkite: fine-grained PAT (recommended) or GitHub App (fallback) | None                     |
+| 4 · SARIF + code scanning | ✅ public free / **private needs GHAS** | ✅ via REST / **private needs GHAS** | **Security/code-scanning tab** + inline PR diff | Medium                 | `security-events`/`security_events: write` token                                       | None (GHA action)        |
 
 ### Recommendation: co-primary paths for GHA and Buildkite
 
@@ -486,7 +495,7 @@ The recommendation delivers a first-class supported option for each ecosystem ra
 
 **CI-agnostic / Buildkite path (credentials required):**
 
-3. **#3 (Check Runs API) is confirmed best for Buildkite** — the **only** option that surfaces inline PR-diff annotations _and_ a checkleft-named check on Buildkite without a GHAS license. **The operator's hypothesis is confirmed**, with the essential caveat that it requires a **GitHub App installation token** (app id + private key as Buildkite secrets) — the heaviest credential lift, and the one piece that needs operator provisioning. On GHA, #3 also works via the ambient token (with `permissions: checks: write`) and produces a checkleft-named check — a meaningful improvement for enterprise GHA workflows that want check-level granularity separate from the workflow.
+3. **#3 (Check Runs API) is confirmed best for Buildkite** — the **only** option that surfaces inline PR-diff annotations _and_ a checkleft-named check on Buildkite without a GHAS license. **The operator's hypothesis is confirmed.** The recommended Buildkite onboarding path is a **fine-grained PAT with `Checks: write`** (passed as `CHECKS_GITHUB_TOKEN`), which is materially lighter to adopt than a GitHub App. The **GitHub App installation token** (app id + private key as Buildkite secrets) is the fallback for environments where PAT provisioning is not an option. On GHA, #3 also works via the ambient token (with `permissions: checks: write`) and produces a checkleft-named check — a meaningful improvement for enterprise GHA workflows that want check-level granularity separate from the workflow.
 4. **Build the #4 SARIF serializer regardless (cheap, credential-free)** — independently useful for public repos and as the foundation for the REST upload path on Buildkite. The REST-based SARIF upload path (`POST /code-scanning/sarifs`) works on Buildkite and requires GHAS for private mono; it is the preferred Buildkite #4 path once GHAS is licensed.
 
 **#2 (problem matchers) remains deferred** — same surface as #1 on GHA, with added fragility (text-format coupling) and a checked-in file to maintain. Build it only if a no-`--annotations`-mode scraper is specifically wanted; otherwise mark it `future / not a v1 blocker`.
@@ -509,13 +518,18 @@ Since #3 is the most CI-agnostic, build only it and skip the rest. **Rejected** 
 
 ## Risks / open questions
 
-- **Check Runs credential model on Buildkite.** Confirmed-needed: a GitHub App installation token. **Open**: does a _fine-grained PAT with `Checks: write`_ also create check runs (which would dramatically simplify Buildkite onboarding), or is a GitHub App strictly required? Needs an empirical test before committing the Buildkite onboarding story. (Classic PATs are confirmed _not_ to work.)
+### Decided
+
+- **Check Runs credential model on Buildkite.** ✅ **Decided**: support both ambient token / fine-grained PAT (recommended lighter-weight onboarding path) and GitHub App installation token (fallback for environments where PAT provisioning is not an option). Fine-grained PAT with `Checks: write` is the primary Buildkite onboarding story; the GitHub App path (T4a) is the fallback. Classic PATs are confirmed _not_ to work.
+- **Flag surface.** ✅ **Decided**: single repeatable `--annotations=<mode>` enum (+ `--annotations-out`) confirmed over per-mode boolean flags.
+- **Posting failures non-fatal by default.** ✅ **Decided**: a failure to _post_ annotations (missing token, network error, 403) logs a warning and preserves the content-driven exit code. `--annotations-strict` is the opt-in to make posting failures fatal; default is non-fatal.
+- **Problem matchers (Option 2) in v1.** ✅ **Decided**: Option 1 only; Option 2 is deferred as future / not a v1 blocker. T2 is superseded by T1 for the same GHA surface.
+
+### Open
+
 - **Is GitHub Advanced Security licensed for the private `spinyfin/mono` repo?** In a large enterprise GHA environment, GHAS is often licensed at the org or enterprise tier — if so, #4 becomes immediately viable and is the richest annotation surface (Security tab, durable alert lifecycle, inline PR annotations via `upload-sarif` with zero extra credentials beyond `security-events: write`). This single fact decides whether #4's upload path is a v1 priority (GHAS on) or deferred (GHAS off). Treat this as high-priority to resolve; a human must answer it.
 - **PR head SHA vs merge SHA on GHA `pull_request` events.** Annotate `pull_request.head.sha` (the contributor's commit) or `GITHUB_SHA` (the synthetic merge commit)? Head SHA is more intuitive for reviewers; confirm the choice (and the new payload capture in T3).
 - **Annotation caps must be loud.** #1's per-step cap and #4's upload caps silently drop/reject overflow on GitHub's side. The `cap_with_log` chokepoint must log every truncation; reviewers should confirm the default ceilings.
-- **Flag surface.** Confirm the single repeatable `--annotations=<mode>` enum (+ `--annotations-out`) over per-mode boolean flags.
-- **Posting failures non-fatal by default.** Confirm that a failure to _post_ annotations (missing token, network, 403) logs a warning and preserves the content-driven exit code, rather than failing the run (with `--annotations-strict` as the opt-out).
-- **Problem-matcher `info` handling.** Map `info` → `warning`, or omit info findings from the matcher? (#1 has no such loss.)
 
 ## Proposed implementation task breakdown
 
@@ -531,7 +545,7 @@ Tasks are PR-sized and **each backend is independently shippable behind its own 
 
 ### T2 — Problem-matcher generator
 
-**Scope:** Add `checkleft gen-problem-matcher` emitting the multi-line matcher JSON built from the shared text-format constants; a golden test asserting the regex captures real `checkleft run` output; a staleness check that fails when a checked-in matcher diverges from the generator; usage docs + the add/remove workflow snippet. **Effort:** small. **Dependencies:** none (couples only to the text-format contract; can run parallel with T0/T1). _Lower priority — alternative to T1._
+**Scope:** Add `checkleft gen-problem-matcher` emitting the multi-line matcher JSON built from the shared text-format constants; a golden test asserting the regex captures real `checkleft run` output; a staleness check that fails when a checked-in matcher diverges from the generator; usage docs + the add/remove workflow snippet. **Effort:** small. **Dependencies:** none (couples only to the text-format contract; can run parallel with T0/T1). **Status: deferred / not a v1 blocker** — produces the same surface as T1 on GHA with added fragility and a checked-in file to maintain; superseded by T1 for the same use case. Build only if a no-`--annotations`-mode scraper is specifically requested.
 
 ### T3 — CI-context resolution extension
 
@@ -543,7 +557,7 @@ Tasks are PR-sized and **each backend is independently shippable behind its own 
 
 ### T4a — GitHub App installation-token credential support _(credential/secret handling)_
 
-**Scope:** Add the App-token path for environments without an ambient installation token (Buildkite): read `CHECKS_GITHUB_APP_ID` + `CHECKS_GITHUB_APP_PRIVATE_KEY` (+ optional `CHECKS_GITHUB_INSTALLATION_ID`, else discover via `GET /repos/{owner}/{repo}/installation`), sign a JWT, exchange for an installation token, feed it to T4. **FLAGGED: secret handling.** **Effort:** medium. **Dependencies:** T4. _(Blocked on the open question: whether a fine-grained PAT suffices — if so, this task may shrink or defer.)_
+**Scope:** Add the GitHub App token path as the **fallback credential** for environments where a fine-grained PAT is not an option: read `CHECKS_GITHUB_APP_ID` + `CHECKS_GITHUB_APP_PRIVATE_KEY` (+ optional `CHECKS_GITHUB_INSTALLATION_ID`, else discover via `GET /repos/{owner}/{repo}/installation`), sign a JWT, exchange for an installation token, feed it to T4. Note: the **recommended Buildkite onboarding path** is a fine-grained PAT with `Checks: write` (already handled by T4's existing `detect_github_token()` plumbing via `CHECKS_GITHUB_TOKEN`); T4a is only needed for the heavier GitHub App fallback. **FLAGGED: secret handling.** **Effort:** medium. **Dependencies:** T4.
 
 ### T5 — SARIF serializer
 
