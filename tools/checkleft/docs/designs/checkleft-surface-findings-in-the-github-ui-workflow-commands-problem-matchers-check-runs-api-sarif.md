@@ -11,7 +11,7 @@ Four candidate mechanisms exist, and the operator requirement is that **all four
 3. **GitHub Check Runs API** — a provider-agnostic REST call that creates a check run and POSTs annotations.
 4. **SARIF + code scanning** — checkleft emits SARIF JSON; the consuming repo uploads it to the code-scanning service.
 
-The mono/flunge ecosystem's primary CI is **Buildkite** (with a GHA minority — e.g. the public `checkleft-sandbox`). Buildkite support is a first-class requirement, not an afterthought: each option below states plainly whether it works on Buildkite at all, and the recommendation is driven by the Buildkite-first reality and by the fact that **mono is a private repository** (`git@github.com:spinyfin/mono.git`).
+The mono/flunge ecosystem uses both **GitHub Actions and Buildkite** as co-primary CI platforms. Checkleft is being designed for use in a large enterprise that uses GHA, so GHA-native ergonomics and zero-credential paths matter as much as Buildkite support — the GHA-native options (#1 workflow commands, #2 problem matchers, and #4 SARIF via `upload-sarif`) are first-class, not nice-to-haves. Each option below states plainly how it works on each CI, and the recommendation delivers a first-class supported path for each ecosystem. All options are evaluated against the fact that **mono is a private repository** (`git@github.com:spinyfin/mono.git`).
 
 This document is a design only. No feature code is included; the final section is a dependency-ordered, PR-sized implementation breakdown of independent, flag-gated tasks.
 
@@ -20,7 +20,7 @@ This document is a design only. No feature code is included; the final section i
 - Define a **single internal annotation representation** that maps a checkleft `Finding` (+ its check id) to a GitHub annotation, and specify how each backend renders it.
 - Specify **four independently shippable backends**, each behind its own flag/output mode, so they ship and are adopted separately.
 - For **each** backend produce: the mechanism + the exact GitHub UI surface it lights up; a GHA-usefulness AND Buildkite-usefulness verdict; checkleft-side implementation requirements (output mode/subcommand, flag, credential handling, batching/limits, severity mapping); consuming-repo usage (workflow YAML, checked-in files, secrets/permissions); and limitations / failure modes.
-- Treat **Buildkite as first-class** and validate-or-refute the operator's hypothesis that the Check Runs API (#3) is the best option there.
+- Treat **both GHA and Buildkite as first-class** co-primary targets; validate-or-refute the operator's hypothesis that the Check Runs API (#3) is the best option for Buildkite.
 - Make **annotation caps loud, never silent**: whenever a backend drops findings to fit a GitHub-imposed limit, it must log that it did.
 - Keep the **default off** — existing `checkleft run` stdout, JSON, and exit-code behavior are unchanged unless an annotation mode is explicitly requested.
 - Recommend a shared-core-vs-independent architecture and a prioritization for the mono/flunge environment.
@@ -157,9 +157,9 @@ During the run, checkleft prints magic lines to stdout that the GitHub Actions r
 - **Escaping** (toolkit rules): in the **message**, `%`→`%25`, `\r`→`%0D`, `\n`→`%0A`. In **property values**, additionally `:`→`%3A` and `,`→`%2C`. Multiline messages are encoded with `%0A` and render as a multi-line annotation body.
 - **UI surface lit up**: **inline annotations on the PR "Files changed" diff** (on the line) **and** in the job's annotations summary, attributed to the running workflow's check. No Security tab, no separate check run.
 
-### GHA verdict — **works, zero credentials, trivial**
+### GHA verdict — **first-class GHA path: zero credentials, idiomatic, trivial**
 
-This is the canonical, frictionless GHA path. The default `GITHUB_TOKEN` already drives it implicitly (the runner parses stdout; no token needed at all). Nothing is checked in.
+This is the canonical, frictionless GHA path — idiomatic on GHA and ZERO-credential (the runner parses stdout; no token needed at all, nothing checked in). In an enterprise GHA setting, the absence of any credential requirement is a real advantage: no GitHub App to provision, no PAT to manage, no secret to rotate. This is a first-class GHA option.
 
 ### Buildkite verdict — **does not work**
 
@@ -309,7 +309,7 @@ Creating a check run is **not** something an arbitrary token can do. The reliabl
 
 ### GHA verdict — **works (credentials = the ambient `GITHUB_TOKEN`)**
 
-Strictly more than #1/#2: a checkleft-named check + summary + inline annotations, no checked-in file. Costs one `permissions: checks: write` line and passing the token. Slightly more work than #1 for a marginal gain _on GHA_ — its real value is Buildkite.
+Strictly more than #1/#2: a checkleft-named check with its own named check entry, a rich per-check summary, and inline PR-diff annotations — with no checked-in file. Costs one `permissions: checks: write` line and passing the ambient token. For enterprise GHA deployments that want a distinct, independently-named checkleft check (visible in the Checks tab separately from the workflow), this is meaningfully better than #1. For lightweight GHA usage where only inline annotations matter, #1 (workflow commands) remains the zero-credential, zero-configuration first choice.
 
 ### Buildkite verdict — **works, and is the only option that lights up inline PR annotations on Buildkite without GHAS** (credentials required)
 
@@ -401,9 +401,11 @@ checkleft emits **SARIF 2.1.0** JSON; the consuming repo uploads it to GitHub's 
 
 Code scanning is **free on public repos** but on **private/internal repos requires GitHub Advanced Security (GHAS)** to be licensed and enabled. **mono is private** (`spinyfin/mono`). Therefore: **#4 does not light up anything on mono unless GHAS is enabled**, regardless of CI provider. The SARIF _serializer_ is still worth building (it's cheap and works for the public `checkleft-sandbox` and any future public repo), but the _upload-surfacing_ on mono is gated on a licensing decision outside checkleft's control.
 
-### GHA verdict — **works on public repos for free; private repos need GHAS** (credentials = ambient token + `security-events: write`)
+**Enterprise context:** A large GitHub enterprise commonly has GHAS licensed at the org or enterprise tier — if this deployment is in such an environment, GHAS may already be available on mono. That would make #4 immediately viable as the richest annotation surface (Security tab + inline PR annotations + durable fingerprint-based alert lifecycle). This materially raises #4's value and priority: in an enterprise GHA setting it is the native Code-Scanning path via `github/codeql-action/upload-sarif`, zero-credential beyond the ambient `security-events: write` permission. The GHAS licensing question (flagged in Risks) should be treated as high-priority precisely because the answer changes #4 from "deferred" to "recommended first."
 
-Upload via the official action:
+### GHA verdict — **native Code-Scanning path on GHA; free on public repos, private repos need GHAS** (credentials = ambient token + `security-events: write`)
+
+This is the idiomatic GHA code-scanning integration via `github/codeql-action/upload-sarif` — ZERO additional credentials beyond the ambient token with `security-events: write`. In an enterprise GHA environment where GHAS is licensed, this is the recommended primary GHA path for the richest surface (Security tab, durable alert lifecycle, inline annotations). Upload via the official action:
 
 ```yaml
 permissions: { security-events: write }
@@ -473,14 +475,23 @@ Recommended: a **small shared foundation (T0)** — the `Annotation` type, `anno
 | 3 · Check Runs API        | ✅ works (ambient token)                | ✅ **works** (needs GitHub App)      | **Own check in Checks tab** + inline PR diff    | High                   | GHA: ambient token; Buildkite: **GitHub App id+key** | None                     |
 | 4 · SARIF + code scanning | ✅ public free / **private needs GHAS** | ✅ via REST / **private needs GHAS** | **Security/code-scanning tab** + inline PR diff | Medium                 | `security-events`/`security_events: write` token     | None (GHA action)        |
 
-### Recommendation for the Buildkite-first, private-repo mono/flunge environment
+### Recommendation: co-primary paths for GHA and Buildkite
 
-1. **Prioritize #3 (Check Runs API) for Buildkite** — it is the **only** option that surfaces inline PR-diff annotations _and_ a checkleft-named check on Buildkite **without** a GHAS license, which mono lacks by default. **The operator's hypothesis is confirmed**, with the essential caveat that it requires a **GitHub App installation token** (app id + private key as Buildkite secrets), not a PAT — the heaviest credential lift, and the one piece that needs operator provisioning. This is the strategic Buildkite investment.
-2. **Ship #1 (workflow commands) as a near-free GHA win** for the GHA repos (e.g. `checkleft-sandbox`): trivial, zero credentials, zero checked-in files. It is strictly more capable than #2.
-3. **Treat #2 (problem matchers) as a lower-value alternative to #1, not additive.** Same surface, weaker (no info level, fragile text coupling, a file to maintain). Build it only if a "no `--annotations` mode, scrape existing output" solution is specifically wanted; otherwise mark it `future / not a v1 blocker`.
-4. **Build the #4 SARIF serializer (cheap, credential-free) but gate its mono upload on a GHAS decision.** The serializer is independently useful for the public `checkleft-sandbox` and future public repos; the private-mono Security-tab surfacing is blocked until/unless GHAS is licensed — a human call, flagged below.
+The recommendation delivers a first-class supported option for each ecosystem rather than optimizing for one:
 
-In short: **#3 for Buildkite mono, #1 for GHA repos, #4 serializer now / #4 upload when GHAS exists, #2 deferred.**
+**GHA-native path (zero credentials on GHA):**
+
+1. **#1 (GHA workflow commands) is the idiomatic, zero-credential GHA path** — just add `--annotations=gha` to the workflow step. No GitHub App, no PAT, no secret to manage. This is a first-class GHA option and the right default starting point for GHA deployments.
+2. **#4 (SARIF via `upload-sarif`) is the native Code-Scanning path on GHA** and the recommended next step once GHAS is confirmed. In a large enterprise GHA environment, GHAS is often already licensed — which makes #4 immediately viable and the richest surface available (Security tab, durable alert lifecycle with fingerprint-based dedupe, inline PR annotations). Confirm GHAS availability before deprioritizing this; if GHAS is on, #4 becomes the primary GHA recommendation.
+
+**CI-agnostic / Buildkite path (credentials required):**
+
+3. **#3 (Check Runs API) is confirmed best for Buildkite** — the **only** option that surfaces inline PR-diff annotations _and_ a checkleft-named check on Buildkite without a GHAS license. **The operator's hypothesis is confirmed**, with the essential caveat that it requires a **GitHub App installation token** (app id + private key as Buildkite secrets) — the heaviest credential lift, and the one piece that needs operator provisioning. On GHA, #3 also works via the ambient token (with `permissions: checks: write`) and produces a checkleft-named check — a meaningful improvement for enterprise GHA workflows that want check-level granularity separate from the workflow.
+4. **Build the #4 SARIF serializer regardless (cheap, credential-free)** — independently useful for public repos and as the foundation for the REST upload path on Buildkite. The REST-based SARIF upload path (`POST /code-scanning/sarifs`) works on Buildkite and requires GHAS for private mono; it is the preferred Buildkite #4 path once GHAS is licensed.
+
+**#2 (problem matchers) remains deferred** — same surface as #1 on GHA, with added fragility (text-format coupling) and a checked-in file to maintain. Build it only if a no-`--annotations`-mode scraper is specifically wanted; otherwise mark it `future / not a v1 blocker`.
+
+In short: **GHA path → #1 now + #4 when GHAS confirmed; Buildkite path → #3 (GitHub App required); #4 SARIF serializer ships regardless; #2 deferred.**
 
 ## Alternatives considered
 
@@ -499,7 +510,7 @@ Since #3 is the most CI-agnostic, build only it and skip the rest. **Rejected** 
 ## Risks / open questions
 
 - **Check Runs credential model on Buildkite.** Confirmed-needed: a GitHub App installation token. **Open**: does a _fine-grained PAT with `Checks: write`_ also create check runs (which would dramatically simplify Buildkite onboarding), or is a GitHub App strictly required? Needs an empirical test before committing the Buildkite onboarding story. (Classic PATs are confirmed _not_ to work.)
-- **Is GitHub Advanced Security licensed for the private `spinyfin/mono` repo?** This single fact decides whether #4 is a v1 task (GHAS on) or deferred (GHAS off). A human must answer it.
+- **Is GitHub Advanced Security licensed for the private `spinyfin/mono` repo?** In a large enterprise GHA environment, GHAS is often licensed at the org or enterprise tier — if so, #4 becomes immediately viable and is the richest annotation surface (Security tab, durable alert lifecycle, inline PR annotations via `upload-sarif` with zero extra credentials beyond `security-events: write`). This single fact decides whether #4's upload path is a v1 priority (GHAS on) or deferred (GHAS off). Treat this as high-priority to resolve; a human must answer it.
 - **PR head SHA vs merge SHA on GHA `pull_request` events.** Annotate `pull_request.head.sha` (the contributor's commit) or `GITHUB_SHA` (the synthetic merge commit)? Head SHA is more intuitive for reviewers; confirm the choice (and the new payload capture in T3).
 - **Annotation caps must be loud.** #1's per-step cap and #4's upload caps silently drop/reject overflow on GitHub's side. The `cap_with_log` chokepoint must log every truncation; reviewers should confirm the default ceilings.
 - **Flag surface.** Confirm the single repeatable `--annotations=<mode>` enum (+ `--annotations-out`) over per-mode boolean flags.
