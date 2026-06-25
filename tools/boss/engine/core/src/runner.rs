@@ -1914,11 +1914,12 @@ fn compose_revision_directive(
     out.push_str(
         "4. `cube pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or --allow-new needed.\n",
     );
-    out.push_str("5. **Update the PR description** — this is a required step, not optional:\n");
+    out.push_str("5. **Update the PR title AND description** — this is a required step, not optional:\n");
     out.push_str(&format!(
-        "   a. Read the current description: `gh pr view {pr_number} -R {repo_slug} --json body -q .body`\n"
+        "   a. Read the current title and description: `gh pr view {pr_number} -R {repo_slug} --json title,body -q '\"title: \" + .title + \"\\n\\n\" + .body'`\n"
     ));
-    out.push_str("   b. Compare it carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
+    out.push_str("   b. Compare the title and description carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
+    out.push_str(&format!("   b2. **PR title — check it explicitly.** If the revision changes or overturns the PR's scope or conclusion (e.g. the original PR claimed something was not a bug but this revision fixes the bug), the title MUST be updated to reflect the final state. A title that contradicts the committed code is a defect. Update it with: `gh pr edit {pr_number} --title \"<accurate new title>\" -R {repo_slug}`\n"));
     out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
     out.push_str(&format!(
         "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
@@ -1927,7 +1928,7 @@ fn compose_revision_directive(
         "      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n",
     );
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
-    out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review.\n");
+    out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
     out.push('\n');
     out.push_str(&format!(
         "6. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
@@ -1955,7 +1956,7 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
-         - Update the PR description per step 5 above — a stale or contradictory description is a defect.\n\
+         - Update the PR title and description per step 5 above — a stale or contradictory title or description is a defect. If this revision changes or overturns the PR's scope or conclusion, the title MUST reflect the final state.\n\
          - Confirm the parent PR shows your new commit with `gh pr view {pr_number} -R {repo_slug}`.\n\
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
          - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
@@ -3915,6 +3916,44 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
             "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn revision_directive_requires_pr_title_update() {
+        // Issue #843 (motivating incident T132 / PR #713): the revision worker
+        // correctly fixed the code but left the original PR title and body
+        // arguing the now-overturned conclusion. The directive must instruct
+        // the worker to update BOTH the title and the description to match the
+        // final state — not just the description.
+        let work_item = revision_task_with_created_via(None, "operator");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("Update the PR title AND description"),
+            "revision directive must instruct updating BOTH title and description:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("title MUST be updated") || prompt.contains("title MUST reflect"),
+            "revision directive must have a hard instruction to update the title when scope/conclusion changes:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("--title"),
+            "revision directive must show the gh pr edit --title command:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("gh pr edit 77 --title"),
+            "revision directive must interpolate the actual PR number into the title command, not emit literal {{pr_number}}:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("{pr_number}"),
+            "revision directive must not emit the literal placeholder {{pr_number}} — it must be interpolated:\n{prompt}",
         );
     }
 
