@@ -2397,7 +2397,11 @@ fn workspace_goto(
         run_jj(
             runner,
             database_path,
-            &RealCommandRunner::invocation(&cwd, "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref]),
+            &RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
+            ),
         )?;
     }
 
@@ -14133,7 +14137,12 @@ steps:
     fn goto_set_pr_bookmark_cmd(pr: u64, branch: &str) -> ExpectedCommand {
         let remote_ref = format!("{branch}@{GOTO_REMOTE}");
         let pr_bm = format!("pr/{pr}");
-        ExpectedCommand::ok(goto_cwd(), "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref], "")
+        ExpectedCommand::ok(
+            goto_cwd(),
+            "jj",
+            &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
+            "",
+        )
     }
 
     fn goto_positioned_cmd(branch: &str, sha: &str) -> ExpectedCommand {
