@@ -211,8 +211,19 @@ struct DesignRendererView: View {
         let path = content.filePath
         let result: Result<String, Error> = await Task.detached {
             do {
+                let url = URL(fileURLWithPath: path)
+                let maxBytes = 5 * 1024 * 1024
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                   let size = attrs[.size] as? Int, size > maxBytes {
+                    let mb = size / (1024 * 1024)
+                    throw NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFileReadTooLargeError,
+                        userInfo: [NSLocalizedDescriptionKey: "File is \(mb) MB, which exceeds the 5 MB display limit."]
+                    )
+                }
                 let raw = try String(
-                    contentsOf: URL(fileURLWithPath: path),
+                    contentsOf: url,
                     encoding: .utf8
                 )
                 return .success(raw)
