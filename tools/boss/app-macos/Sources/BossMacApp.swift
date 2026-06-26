@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import UpdateCore
 import os.log
 
@@ -24,6 +25,9 @@ struct BossMacApp: App {
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
+            CommandGroup(after: .newItem) {
+                OpenMarkdownFileCommand()
+            }
             // Show BossFullVersion (e.g. "1.0.4-dev-f3be785") in the About panel
             // rather than CFBundleShortVersionString (numeric-only — plisttool
             // enforces Apple's format requirement for that key).
@@ -161,6 +165,42 @@ private struct CheckForUpdatesCommand: View {
         Button("Check for Updates…") {
             updateModel.presentUpdateSheet()
         }
+    }
+}
+
+/// File ▸ Open (⌘O): shows an NSOpenPanel filtered to .md/.markdown and
+/// opens the chosen file in the design-renderer window, reusing the same
+/// markdown rendering path as project design docs.
+private struct OpenMarkdownFileCommand: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Open…") {
+            openMarkdownFile()
+        }
+        .keyboardShortcut("o", modifiers: .command)
+    }
+
+    private func openMarkdownFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "md") ?? .plainText,
+            UTType(filenameExtension: "markdown") ?? .plainText,
+        ]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        openWindow(
+            id: "design-renderer",
+            value: DesignRendererContent(
+                title: url.deletingPathExtension().lastPathComponent,
+                filePath: url.path,
+                webURL: "",
+                repoLabel: "",
+                projectID: ""
+            )
+        )
     }
 }
 
