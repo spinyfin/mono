@@ -160,6 +160,22 @@ id = "rust/giant-structs"
 stale_exclusion_severity = "warning"
 ```
 
+## Surfacing findings in the GitHub UI
+
+`checkleft run --annotations=<mode>` surfaces findings directly in the GitHub UI
+— as inline PR-diff annotations, a checkleft-named entry in the Checks tab, or
+alerts in the Security / code-scanning tab. Three backends are available:
+
+| Backend                                                 | When to use                                                            |
+| ------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `--annotations=gha`                                     | GitHub Actions; zero credentials                                       |
+| `--annotations=check-run`                               | GHA or Buildkite; own "checkleft" check in the Checks tab              |
+| `--annotations=sarif --annotations-out=checkleft.sarif` | GHA or Buildkite; Security tab alerts (requires GHAS on private repos) |
+
+See [`docs/surface-findings-github-ui.md`](docs/surface-findings-github-ui.md)
+for workflow YAML snippets, required permissions/secrets, and setup instructions
+for each backend.
+
 ## Notes
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.
