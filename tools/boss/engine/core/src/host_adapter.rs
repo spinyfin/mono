@@ -595,7 +595,7 @@ impl HostAdapter for SshHostAdapter {
             false,
             self.cfg.work.max_review_embed_diff_lines,
         )
-        .await;
+        .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
         // workspace path — so probe the remote and append it ourselves.

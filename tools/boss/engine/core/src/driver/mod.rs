@@ -52,6 +52,29 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// Returns all defined capability variants in a stable, canonical order.
+    ///
+    /// Used by [`CapabilityResolver::check_dispatch`] to iterate every
+    /// capability and resolve its effective disposition for a `(kind, driver)`
+    /// pair. New capabilities should be appended here when added to the enum.
+    pub fn all() -> impl Iterator<Item = Self> {
+        [
+            Self::Spawn,
+            Self::WorkspaceProvisioning,
+            Self::PermissionPolicy,
+            Self::ModelAndEffortMenu,
+            Self::ProgressObservation,
+            Self::ToolUseInterception,
+            Self::TurnBoundary,
+            Self::StructuredOutput,
+            Self::TranscriptAccess,
+            Self::ControlVerbs,
+            Self::ToolProvisioning,
+            Self::PromptComposition,
+        ]
+        .into_iter()
+    }
+
     /// Default absence disposition: what Boss does when a driver does not
     /// declare this capability. Per-kind escalation via [`KindRequirements`]
     /// can upgrade Degrade/Synthesize to Refuse.
@@ -227,6 +250,135 @@ impl KindRequirements {
         Some(driver_caps.absence_disposition(cap))
     }
 }
+
+// ── Dispatch-gate types ─────────────────────────────────────────────────────
+
+/// Resolves the capability set for a `(kind, driver)` pair, producing a
+/// [`DispatchPlan`] on success or a [`CapabilityGateError`] when any
+/// required capability has a `Refuse` disposition.
+///
+/// Implements the dispatch-gate step from the agent-driver design
+/// (§Chosen approach):
+/// ```text
+/// required(kind) ∩ declared(driver) → synthesize | degrade | refuse
+/// ```
+///
+/// Construct via [`DriverRegistry::resolver`].
+pub struct CapabilityResolver<'a> {
+    driver: &'a dyn AgentDriver,
+}
+
+impl<'a> CapabilityResolver<'a> {
+    /// Create a resolver for the given driver instance.
+    pub fn new(driver: &'a dyn AgentDriver) -> Self {
+        Self { driver }
+    }
+
+    /// Check whether this driver can dispatch a work item of `kind`.
+    ///
+    /// Iterates every [`Capability`], resolves each one's effective
+    /// disposition under `(kind, driver)` using [`KindRequirements`] and
+    /// the driver's [`CapabilitySet`], and:
+    ///
+    /// - Returns [`Ok(DispatchPlan)`] if no capability has `Refuse`
+    ///   disposition. The plan lists what is provided, synthesized, and
+    ///   degraded for observability.
+    /// - Returns [`Err(CapabilityGateError)`] listing every refused
+    ///   capability with an actionable message if the driver is ineligible.
+    pub fn check_dispatch(&self, kind: &TaskKind) -> Result<DispatchPlan, CapabilityGateError> {
+        let caps = self.driver.capabilities();
+        let kind_reqs = KindRequirements::for_kind(kind.clone());
+        let descriptor = self.driver.descriptor();
+
+        let mut provided = Vec::new();
+        let mut synthesized = Vec::new();
+        let mut degraded = Vec::new();
+        let mut refused = Vec::new();
+
+        for cap in Capability::all() {
+            match kind_reqs.resolve_absence_disposition(cap, &caps) {
+                None => provided.push(cap),
+                Some(AbsenceDisposition::Synthesize) => synthesized.push(cap),
+                Some(AbsenceDisposition::Degrade) => degraded.push(cap),
+                Some(AbsenceDisposition::Refuse) => refused.push(cap),
+            }
+        }
+
+        if refused.is_empty() {
+            Ok(DispatchPlan {
+                driver_name: descriptor.name,
+                provided,
+                synthesized,
+                degraded,
+            })
+        } else {
+            Err(CapabilityGateError {
+                driver_name: descriptor.name,
+                driver_label: descriptor.label,
+                task_kind: kind.clone(),
+                refused,
+            })
+        }
+    }
+}
+
+/// Result of a successful [`CapabilityResolver::check_dispatch`] call.
+///
+/// Lists the effective capability disposition for the `(kind, driver)` pair.
+/// Synthesized and degraded capabilities are noted for observability; the
+/// dispatch can proceed for all three.
+#[derive(Debug, Clone)]
+pub struct DispatchPlan {
+    /// Slug of the resolved driver (e.g. `"claude"`).
+    pub driver_name: &'static str,
+    /// Capabilities the driver fully provides.
+    pub provided: Vec<Capability>,
+    /// Capabilities absent but synthesizable from a lower-fidelity channel.
+    pub synthesized: Vec<Capability>,
+    /// Capabilities absent; Boss dispatches with reduced fidelity.
+    pub degraded: Vec<Capability>,
+}
+
+impl DispatchPlan {
+    /// `true` when the driver provides every capability at full fidelity.
+    pub fn is_full_fidelity(&self) -> bool {
+        self.synthesized.is_empty() && self.degraded.is_empty()
+    }
+}
+
+/// Error from [`CapabilityResolver::check_dispatch`] when one or more
+/// capabilities have a `Refuse` disposition for the `(kind, driver)` pair.
+///
+/// Fails the dispatch gate before any pane spawns, with an actionable message
+/// naming the refused capabilities so the kanban item shows the root cause.
+#[derive(Debug)]
+pub struct CapabilityGateError {
+    /// Slug of the driver that was checked (e.g. `"copilot"`).
+    pub driver_name: &'static str,
+    /// Human-readable driver label (e.g. `"GitHub Copilot CLI"`).
+    pub driver_label: &'static str,
+    /// Work-item kind that triggered the refusal.
+    pub task_kind: TaskKind,
+    /// Capabilities the driver lacks that are required for this kind.
+    pub refused: Vec<Capability>,
+}
+
+impl std::fmt::Display for CapabilityGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let refused: Vec<_> = self.refused.iter().map(|c| format!("{c:?}")).collect();
+        write!(
+            f,
+            "driver '{}' cannot dispatch a {} work item: refused capabilities: {}",
+            self.driver_label,
+            self.task_kind,
+            refused.join(", "),
+        )
+    }
+}
+
+impl std::error::Error for CapabilityGateError {}
+
+// ── Error classification ─────────────────────────────────────────────────────
 
 /// Abstract classification of a worker error for recovery decisions.
 /// Each driver translates its backend-specific error strings into this type.
@@ -483,7 +635,10 @@ pub trait AgentDriver: Send + Sync {
 }
 
 pub mod claude;
+pub mod registry;
+
 pub use claude::ClaudeDriver;
+pub use registry::DriverRegistry;
 
 #[cfg(test)]
 mod tests {
@@ -619,5 +774,165 @@ mod tests {
         assert!(config.is_revision);
         assert!(config.is_standard_worker);
         assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
+    }
+
+    #[test]
+    fn all_capabilities_covers_every_variant() {
+        let all: Vec<_> = Capability::all().collect();
+        // Every variant must appear exactly once.
+        assert_eq!(all.len(), 12, "Capability::all() must cover all 12 variants");
+        // Spot-check a few to ensure the enum and all() stay in sync.
+        assert!(all.contains(&Capability::Spawn));
+        assert!(all.contains(&Capability::StructuredOutput));
+        assert!(all.contains(&Capability::PromptComposition));
+    }
+
+    #[test]
+    fn capability_resolver_returns_ok_plan_when_no_refused_caps() {
+        // A driver that provides every capability must always yield Ok for any kind.
+        let all_caps = CapabilitySet::new(Capability::all());
+        let driver = StubDriver { caps: all_caps };
+        let resolver = CapabilityResolver::new(&driver);
+        let plan = resolver.check_dispatch(&TaskKind::Design).unwrap();
+        assert!(plan.is_full_fidelity(), "full-capability driver must be full-fidelity");
+        assert_eq!(plan.driver_name, "stub");
+    }
+
+    #[test]
+    fn capability_resolver_refuses_design_task_without_structured_output() {
+        let caps = CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]);
+        let driver = StubDriver { caps };
+        let resolver = CapabilityResolver::new(&driver);
+        let err = resolver.check_dispatch(&TaskKind::Design).unwrap_err();
+        assert!(
+            err.refused.contains(&Capability::StructuredOutput),
+            "Design kind must refuse StructuredOutput when absent: {:?}",
+            err.refused,
+        );
+        assert!(
+            err.refused.contains(&Capability::ToolUseInterception),
+            "Design kind must refuse ToolUseInterception when absent: {:?}",
+            err.refused,
+        );
+    }
+
+    #[test]
+    fn capability_resolver_refuses_any_kind_without_spawn() {
+        // Spawn has Refuse as its global default; any kind without Spawn fails.
+        let caps = CapabilitySet::new(Capability::all().filter(|c| *c != Capability::Spawn));
+        let driver = StubDriver { caps };
+        let resolver = CapabilityResolver::new(&driver);
+        let err = resolver.check_dispatch(&TaskKind::Chore).unwrap_err();
+        assert!(
+            err.refused.contains(&Capability::Spawn),
+            "Spawn must be refused when absent: {:?}",
+            err.refused,
+        );
+    }
+
+    #[test]
+    fn dispatch_plan_degraded_and_synthesized_populated_for_partial_driver() {
+        // ModelAndEffortMenu is Degrade by default; ProgressObservation is Synthesize.
+        let caps = CapabilitySet::new(
+            Capability::all().filter(|c| *c != Capability::ModelAndEffortMenu && *c != Capability::ProgressObservation),
+        );
+        let driver = StubDriver { caps };
+        let resolver = CapabilityResolver::new(&driver);
+        let plan = resolver.check_dispatch(&TaskKind::Chore).unwrap();
+        assert!(!plan.is_full_fidelity());
+        assert!(
+            plan.degraded.contains(&Capability::ModelAndEffortMenu),
+            "ModelAndEffortMenu must appear in degraded: {:?}",
+            plan.degraded,
+        );
+        assert!(
+            plan.synthesized.contains(&Capability::ProgressObservation),
+            "ProgressObservation must appear in synthesized: {:?}",
+            plan.synthesized,
+        );
+    }
+
+    #[test]
+    fn capability_gate_error_message_names_driver_and_refused_caps() {
+        let err = CapabilityGateError {
+            driver_name: "copilot",
+            driver_label: "GitHub Copilot CLI",
+            task_kind: TaskKind::Design,
+            refused: vec![Capability::StructuredOutput, Capability::ToolUseInterception],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("GitHub Copilot CLI"), "error must name the driver label");
+        assert!(msg.contains("design"), "error must name the task kind");
+        assert!(msg.contains("StructuredOutput"), "error must name refused caps");
+        assert!(msg.contains("ToolUseInterception"), "error must name refused caps");
+    }
+
+    // ── Test-only stub driver ──────────────────────────────────────────────
+
+    use async_trait::async_trait;
+    use boss_protocol::{NormalizeError, WorkerEvent};
+    use std::path::{Path, PathBuf};
+
+    static STUB_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
+        name: "stub",
+        label: "Stub Driver",
+        binary: "stub",
+        config_dir: ".stub",
+        agent_rules_filename: "AGENTS.md",
+        initial_prompt_filename: "initial-prompt.txt",
+        model_menu: ModelMenu {
+            engine_default: "stub-model",
+            effort_value_for_level: |_| None,
+            default_model_for_level: |_| "stub-model",
+            prompt_addendum_for_level: |_| None,
+            model_requires_auto_permissions: |_| false,
+        },
+    };
+
+    struct StubDriver {
+        caps: CapabilitySet,
+    }
+
+    #[async_trait]
+    impl AgentDriver for StubDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &STUB_DESCRIPTOR
+        }
+        fn capabilities(&self) -> CapabilitySet {
+            self.caps.clone()
+        }
+        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool) -> String {
+            unimplemented!()
+        }
+        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_permission_config(&self, _: &Path) -> anyhow::Result<PathBuf> {
+            unimplemented!()
+        }
+        fn progress_fidelity(&self) -> ProgressFidelity {
+            unimplemented!()
+        }
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+            unimplemented!()
+        }
+        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            unimplemented!()
+        }
+        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
+            unimplemented!()
+        }
+        fn agent_rules_preamble(&self) -> &'static str {
+            unimplemented!()
+        }
+        fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+            raw.clone()
+        }
+        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
+            None
+        }
+        fn classify_error(&self, _: &str) -> WorkerErrorClass {
+            unimplemented!()
+        }
     }
 }
