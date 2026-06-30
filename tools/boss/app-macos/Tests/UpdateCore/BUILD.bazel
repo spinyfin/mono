@@ -6,6 +6,14 @@ package(default_visibility = ["//visibility:private"])
 macos_unit_test(
     name = "UpdateTests",
     size = "small",
+    # Unique CFBundleIdentifier so this bundle never collides with the sibling
+    # //tools/boss/app-macos:BossTests bundle. Both rules default to
+    # rules_apple's "com.bazelbuild.rulesapple.Tests"; when the two test
+    # actions run concurrently under `bazel test //tools/boss/app-macos/...`,
+    # the shared bundle identifier makes one xctest session fail to load its
+    # bundle on macOS 26.5+ ("Failed to create a bundle instance"). Keep this
+    # distinct from BossTests' bundle_id.
+    bundle_id = "dev.spinyfin.bossmacapp.UpdateTests",
     minimum_os_version = "15.0",
     deps = [":update_tests_lib"],
 )
