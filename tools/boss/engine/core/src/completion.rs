@@ -4436,8 +4436,7 @@ must not be asked to open one",
                 .await
             }
             PrLifecycleState::Open(ref open)
-                if open.mergeability != OpenPrMergeability::Conflict
-                    && matches!(open.ci, OpenPrCiStatus::Clean) =>
+                if open.mergeability != OpenPrMergeability::Conflict && matches!(open.ci, OpenPrCiStatus::Clean) =>
             {
                 tracing::info!(
                     execution_id,
@@ -4472,9 +4471,7 @@ must not be asked to open one",
         Some(match inner {
             StopOutcome::PrDetected { pr_url }
             | StopOutcome::PrMerged { pr_url }
-            | StopOutcome::ReviewerEnqueued { pr_url } => {
-                StopOutcome::DeliverableSatisfied { pr_url }
-            }
+            | StopOutcome::ReviewerEnqueued { pr_url } => StopOutcome::DeliverableSatisfied { pr_url },
             other => other,
         })
     }
@@ -12337,14 +12334,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1490";
         let head = "abcdef1111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         // SHA unchanged → SHA-delta gate returns NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
         // PR is open, CI clean, no conflict.
-        let probe: Arc<dyn MergeProbe> =
-            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -12371,7 +12366,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Revision advances to InReview — deliverable satisfied.
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-                t.status, TaskStatus::InReview,
+                t.status,
+                TaskStatus::InReview,
                 "revision must advance to in_review when deliverable satisfied",
             ),
             other => panic!("expected task, got {other:?}"),
@@ -12399,18 +12395,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1491";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         // SHA unchanged → NoContribution.
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
         // PR is open but CI is still in-flight.
-        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(
-            OpenPrStatus {
-                mergeability: OpenPrMergeability::Clean,
-                ci: OpenPrCiStatus::InFlight,
-            },
-        )));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::InFlight,
+        })));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -12476,18 +12469,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Implement feature X".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Implement feature X")
+                    .build(),
+            )
             .unwrap();
         {
             let conn = db.connect().unwrap();
@@ -12535,8 +12522,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let verifier = StubBranchVerifier::ok("boss/exec_chore");
         verifier.set_head_oid(Ok(head.into())).await;
         // PR open, CI clean, no conflict.
-        let probe: Arc<dyn MergeProbe> =
-            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
