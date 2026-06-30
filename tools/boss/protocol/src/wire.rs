@@ -892,6 +892,25 @@ pub enum FrontendRequest {
         dep_filter: Option<DependencyFilter>,
     },
 
+    /// Read-only: enumerate `kind = 'revision'` rows for a product. Revisions
+    /// are excluded from `ListTasks` and `ListChores` by design; this request
+    /// is the only way to list them in bulk. Replies with
+    /// [`FrontendEvent::RevisionsList`].
+    ListRevisions {
+        product_id: String,
+        /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
+        #[serde(default)]
+        dep_filter: Option<DependencyFilter>,
+        /// Restrict results to revisions whose `parent_task_id` matches this
+        /// canonical task id. When absent, all revisions in the product are
+        /// returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+        /// See [`Self::ListTasks::include_deleted`].
+        #[serde(default)]
+        include_deleted: bool,
+    },
+
     ListRuns {
         execution_id: String,
     },
@@ -1512,6 +1531,10 @@ pub enum FrontendEvent {
     ChoresList {
         product_id: String,
         chores: Vec<Task>,
+    },
+    RevisionsList {
+        product_id: String,
+        revisions: Vec<Task>,
     },
     WorkTree {
         product: Product,

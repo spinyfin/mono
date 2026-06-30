@@ -677,6 +677,51 @@ impl WorkDb {
         Ok(())
     }
 
+    /// List `kind = 'revision'` rows for a product. Revisions are excluded
+    /// from `list_tasks` and `list_chores` by design; this is the only bulk
+    /// enumeration path. Optionally restrict to a single parent via
+    /// `parent_id`.
+    pub fn list_revisions(
+        &self,
+        product_id: &str,
+        dep_filter: Option<&DependencyFilter>,
+        include_deleted: bool,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        let conn = self.connect()?;
+        ensure_product_exists(&conn, product_id)?;
+
+        let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
+        let parent_clause = if parent_id.is_some() {
+            " AND parent_task_id = ?2"
+        } else {
+            ""
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver, parent_task_id, origin_task_short_id, origin_pr_number
+             FROM tasks
+             WHERE product_id = ?1 AND kind = 'revision'{deleted_clause}{parent_clause}
+             ORDER BY created_at ASC",
+        ))?;
+        let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id {
+            let rows = stmt.query_map(params![product_id, parent_id], map_task_with_parent_and_provenance)?;
+            collect_rows(rows)?
+        } else {
+            let rows = stmt.query_map([product_id], map_task_with_parent_and_provenance)?;
+            collect_rows(rows)?
+        };
+        if let Some(filter) = dep_filter {
+            apply_dep_filter(
+                &conn,
+                filter,
+                |revision: &Task| revision.id.as_str(),
+                |revision: &Task| revision.status.as_str(),
+                &mut revisions,
+            )?;
+        }
+        Ok(revisions)
+    }
+
     pub fn list_chores(
         &self,
         product_id: &str,

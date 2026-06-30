@@ -424,6 +424,13 @@ enum TaskCommand {
     /// root's PR even when `--parent` itself is a revision.
     #[command(name = "create-revision")]
     CreateRevision(RevisionCreateArgs),
+    /// List `kind = 'revision'` tasks for a product. Revisions are excluded
+    /// from `task list` and `chore list` by default; this is the only way to
+    /// enumerate them in bulk. Scope with `--product`, `--status`,
+    /// `--priority`, or `--parent` (filter to one parent task's revision
+    /// chain).
+    #[command(name = "list-revisions")]
+    ListRevisions(RevisionListArgs),
 }
 
 /// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
@@ -1963,6 +1970,50 @@ struct RevisionCreateArgs {
     force_duplicate: bool,
 }
 
+/// Args for `boss task list-revisions`.
+#[derive(Debug, Clone, Args)]
+struct RevisionListArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
+
+    /// Filter by status. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<TaskStatusArg>,
+
+    /// Filter by priority. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    priority: Vec<TaskPriority>,
+
+    /// Case-insensitive substring match against name and description.
+    #[arg(long = "match")]
+    match_term: Option<String>,
+
+    /// Cap the number of returned rows (applied after filtering).
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Filter to specific id(s); repeatable.
+    #[arg(long)]
+    id: Vec<String>,
+
+    /// Include soft-deleted (tombstoned) revisions in the listing. See
+    /// `boss task list --help`.
+    #[arg(long = "deleted", alias = "include-deleted")]
+    include_deleted: bool,
+
+    /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
+    /// ids (e.g. `T651`) or full `task_<hex>` ids.
+    #[arg(long)]
+    parent: Option<String>,
+
+    #[command(flatten)]
+    dep: DependencyFilterArgs,
+}
+
 /// Args for `boss task create-many`. The CLI reads a JSON array of
 /// item objects from `--from-file <path>` (use `-` for stdin) and
 /// fans them out into a single batched engine request. Top-level
@@ -3468,6 +3519,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
         TaskCommand::CreateInvestigation(args) => run_create_investigation(&mut client, ctx, args).await,
         TaskCommand::CreateRevision(args) => run_create_revision(&mut client, ctx, args).await,
+        TaskCommand::ListRevisions(args) => run_list_revisions(&mut client, ctx, args).await,
     }
 }
 
@@ -6073,6 +6125,31 @@ async fn list_chores(
     }
 }
 
+async fn list_revisions(
+    client: &mut BossClient,
+    product_id: &str,
+    dep_filter: Option<DependencyFilter>,
+    include_deleted: bool,
+    parent_id: Option<String>,
+) -> Result<Vec<Task>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListRevisions {
+            product_id: product_id.to_owned(),
+            dep_filter,
+            include_deleted,
+            parent_id,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::RevisionsList { revisions, .. } => Ok(revisions),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("revisions list", &other)),
+    }
+}
+
 async fn find_work_items_by_pr(client: &mut BossClient, pr_number: i64) -> Result<Vec<PrWorkItemMatch>, CliError> {
     match client
         .send_request(&FrontendRequest::FindWorkItemsByPr { pr_number })
@@ -6374,6 +6451,32 @@ async fn create_revision_rpc(client: &mut BossClient, input: CreateRevisionInput
         }
         other => Err(unexpected_event("revision create", &other)),
     }
+}
+
+async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: RevisionListArgs) -> Result<(), CliError> {
+    let product = resolve_product_inferable(client, args.product, None, ctx).await?;
+    let dep_filter = args.dep.into_filter();
+    // Resolve --parent to a canonical id if provided.
+    let parent_id = if let Some(selector) = args.parent {
+        Some(resolve_create_revision_parent(client, &selector).await?)
+    } else {
+        None
+    };
+    let revisions = list_revisions(client, &product.id, dep_filter, args.include_deleted, parent_id).await?;
+    let revisions = apply_task_list_filters(
+        revisions,
+        &args.status,
+        &args.priority,
+        args.match_term.as_deref(),
+        &args.id,
+        args.limit,
+        None,
+        product.repo_remote_url.as_deref(),
+    );
+    let revisions: Vec<Task> = revisions.into_iter().map(with_display_status).collect();
+    print_entity(ctx, &serde_json::json!({ "revisions": revisions }), || {
+        print_tasks_table(&revisions, args.with_primary_id)
+    })
 }
 
 /// Resolve a `--parent` selector for `create-revision` to a primary task id.
