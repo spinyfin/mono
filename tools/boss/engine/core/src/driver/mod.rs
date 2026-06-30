@@ -880,6 +880,13 @@ mod tests {
         config_dir: ".stub",
         agent_rules_filename: "AGENTS.md",
         initial_prompt_filename: "initial-prompt.txt",
+        model_menu: ModelMenu {
+            engine_default: "stub-model",
+            effort_value_for_level: |_| None,
+            default_model_for_level: |_| "stub-model",
+            prompt_addendum_for_level: |_| None,
+            model_requires_auto_permissions: |_| false,
+        },
     };
 
     struct StubDriver {
@@ -917,6 +924,12 @@ mod tests {
         }
         fn agent_rules_preamble(&self) -> &'static str {
             unimplemented!()
+        }
+        fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+            raw.clone()
+        }
+        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
+            None
         }
         fn classify_error(&self, _: &str) -> WorkerErrorClass {
             unimplemented!()
