@@ -629,3 +629,5 @@ actor StagedRecorder {
         }
     }
 }
+
+// repro: force fresh test execution (output-base revert test)

@@ -1,1 +1,3 @@
-startup --output_user_root=/Volumes/ssd/bazel/output_base
+# TEST (revert of #1663): move darwin CI bazel output base back to internal disk
+# to check whether running xctest bundles from /Volumes/ssd is what breaks mac-app-build.
+startup --output_user_root=/private/var/tmp/bazel_ci_darwin_internal

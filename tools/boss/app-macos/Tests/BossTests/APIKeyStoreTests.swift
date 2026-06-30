@@ -93,3 +93,5 @@ final class APIKeyStoreTests: XCTestCase {
         XCTAssertEqual(perms.map { $0 & 0o777 }, 0o600)
     }
 }
+
+// repro: force fresh test execution (output-base revert test)
