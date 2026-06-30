@@ -38,19 +38,9 @@ swift_library(
 macos_unit_test(
     name = "BossTests",
     size = "small",
-    # Give this bundle a unique CFBundleIdentifier. Without it, rules_apple
-    # falls back to the default "com.bazelbuild.rulesapple.Tests", which the
-    # sibling UpdateTests bundle would also use. When `bazel test
-    # //tools/boss/app-macos/...` runs both targets concurrently (which only
-    # happens when BossTests is rebuilt, invalidating its cached test result),
-    # two `xcodebuild test-without-building` sessions register two different
-    # .xctest bundles under the SAME identifier with the shared per-user
-    # testmanagerd/CFBundle registry. On macOS 26.5+ that collision is fatal:
-    # the loser fails to load its bundle with "Failed to create a bundle
-    # instance representing '<path>'. Check that the bundle exists on disk."
-    # Distinct identifiers eliminate the collision. See mac-app-build incident.
     bundle_id = "dev.spinyfin.bossmacapp.BossTests",
     minimum_os_version = "15.0",
+    runner = "//tools/boss/app-macos/testing:macos_runner",
     deps = [":boss_mac_app_tests_lib"],
 )
 
