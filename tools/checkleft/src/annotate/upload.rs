@@ -17,6 +17,9 @@ const POLL_DELAY_SECS: u64 = 2;
 
 /// Context required to upload a SARIF document to GitHub code scanning.
 pub struct SarifUploadContext<'a> {
+    /// GitHub REST API base URL, e.g. `https://api.github.com` or a GitHub
+    /// Enterprise Server URL. Drives both upload and poll endpoints.
+    pub base_url: &'a str,
     /// `owner/repo` slug, e.g. `spinyfin/mono`.
     pub repository: &'a str,
     /// GitHub token with `security_events` scope.
@@ -91,7 +94,11 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
         }
     };
 
-    let url = format!("https://api.github.com/repos/{}/code-scanning/sarifs", ctx.repository);
+    let url = format!(
+        "{}/repos/{}/code-scanning/sarifs",
+        ctx.base_url.trim_end_matches('/'),
+        ctx.repository
+    );
     let body = serde_json::json!({
         "commit_sha": ctx.commit_sha,
         "ref": ctx.git_ref,
@@ -153,13 +160,16 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
         submission.id
     );
 
-    poll_sarif_status(&client, ctx.repository, &submission.id, ctx.token).await;
+    poll_sarif_status(&client, ctx.base_url, ctx.repository, &submission.id, ctx.token).await;
 
     true
 }
 
-async fn poll_sarif_status(client: &reqwest::Client, repository: &str, id: &str, token: &str) {
-    let url = format!("https://api.github.com/repos/{repository}/code-scanning/sarifs/{id}");
+async fn poll_sarif_status(client: &reqwest::Client, base_url: &str, repository: &str, id: &str, token: &str) {
+    let url = format!(
+        "{}/repos/{repository}/code-scanning/sarifs/{id}",
+        base_url.trim_end_matches('/')
+    );
 
     for attempt in 0..POLL_ATTEMPTS {
         if attempt > 0 {
@@ -177,13 +187,13 @@ async fn poll_sarif_status(client: &reqwest::Client, repository: &str, id: &str,
         {
             Ok(r) => r,
             Err(e) => {
-                info!("checkleft: SARIF status poll failed: {e}");
+                warn!("checkleft: SARIF status poll failed: {e}");
                 return;
             }
         };
 
         if !response.status().is_success() {
-            info!("checkleft: SARIF status poll returned HTTP {}", response.status());
+            warn!("checkleft: SARIF status poll returned HTTP {}", response.status());
             return;
         }
 
@@ -223,7 +233,42 @@ async fn poll_sarif_status(client: &reqwest::Client, repository: &str, id: &str,
 
 #[cfg(test)]
 mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    #[tokio::test]
+    async fn upload_uses_base_url_not_hardcoded_github() {
+        // Verifies that the upload and poll requests are sent to the base_url
+        // rather than the hardcoded https://api.github.com string.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/code-scanning/sarifs"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({ "id": "abc-123" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Poll endpoint — one attempt; return non-success so it exits early.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/code-scanning/sarifs/abc-123"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "processing_status": "complete" })),
+            )
+            .mount(&server)
+            .await;
+
+        let sarif = serde_json::json!({"version": "2.1.0", "runs": []});
+        let ctx = SarifUploadContext {
+            base_url: &server.uri(),
+            repository: "o/r",
+            token: "tok",
+            commit_sha: "deadbeef",
+            git_ref: "refs/heads/main",
+        };
+        let ok = upload_sarif(&sarif, &ctx).await;
+        assert!(ok, "upload should succeed against mock server");
+    }
 
     #[test]
     fn gzip_and_base64_produces_nonempty_output() {

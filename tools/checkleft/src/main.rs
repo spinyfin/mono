@@ -1845,7 +1845,9 @@ async fn attempt_sarif_upload(sarif: &serde_json::Value, env: &CiEnvironment, vc
         }
     };
 
+    let base_url = github_api_base_url();
     let ctx = SarifUploadContext {
+        base_url: &base_url,
         repository: &repository,
         token: &token,
         commit_sha: &commit_sha,
