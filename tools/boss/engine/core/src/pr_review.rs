@@ -458,7 +458,30 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
 
     let mut out = format!(
         "Automated PR review found {} finding(s) requiring attention.\n\
-         Address all findings before finalising this revision.\n\n",
+         Address ALL findings before finalising this revision.\n\
+         \n\
+         ## HARD RULE: no punting — do the actual work\n\
+         \n\
+         Each finding below requires a real code change that resolves it.\n\
+         The following are FORBIDDEN — they do NOT count as addressing a finding:\n\
+         \n\
+         - Filing a follow-up task, chore, or issue in lieu of fixing the finding.\n\
+         - Leaving a `TODO`, `FIXME`, `Phase N`, \"wire this later\", or similar\n\
+           deferral comment and calling the finding done.\n\
+         - Acknowledging the finding in a comment or PR description without making\n\
+           the substantive code change it requires.\n\
+         - Marking the revision complete while a finding's core work is unaddressed.\n\
+         \n\
+         For example: a \"write-only field\" finding requires wiring the READ/consumer\n\
+         side so the field is actually used — not a TODO comment promising to do so\n\
+         later, and not a follow-up task filed for someone else.\n\
+         \n\
+         **If — and only if — a finding genuinely cannot or should not be fixed within\n\
+         this revision's scope**, you must EXPLICITLY SURFACE that in your response:\n\
+         state which finding you are not fixing and exactly why (technical blocker,\n\
+         out-of-scope dependency, requires operator decision, etc.). Do NOT silently\n\
+         file a follow-up or leave a TODO. The default is to do the work.\n\
+         \n",
         findings.len()
     );
 
@@ -1883,5 +1906,51 @@ mod tests {
         let critical_pos = instructions.find("Critical finding").expect("present");
         let low_pos = instructions.find("Low finding").expect("present");
         assert!(critical_pos < low_pos, "critical must appear before low");
+    }
+
+    #[test]
+    fn render_revision_instructions_forbids_punt_patterns() {
+        let result = ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/5".to_owned(),
+            head_sha: String::new(),
+            summary: "A finding.".to_owned(),
+            revision_warranted: true,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::Medium)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("src/lib.rs")
+                    .title("Write-only field")
+                    .detail("The field is written but never read; wire the read path.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let instructions = render_revision_instructions(&result);
+        // Anti-punt mandates must be present.
+        assert!(
+            instructions.contains("no punting"),
+            "instructions must forbid punting: {instructions}"
+        );
+        assert!(
+            instructions.contains("follow-up task"),
+            "instructions must forbid filing a follow-up task: {instructions}"
+        );
+        assert!(
+            instructions.contains("TODO"),
+            "instructions must forbid TODO deferral: {instructions}"
+        );
+        assert!(
+            instructions.contains("Phase N"),
+            "instructions must forbid Phase N deferral: {instructions}"
+        );
+        assert!(
+            instructions.contains("EXPLICITLY SURFACE"),
+            "instructions must require explicit surfacing when a finding cannot be fixed: {instructions}"
+        );
     }
 }
