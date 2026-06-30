@@ -49,6 +49,44 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+pub(super) async fn handle_list_revisions(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListRevisions {
+        product_id,
+        dep_filter,
+        include_deleted,
+        parent_id,
+    } = req
+    else {
+        unreachable!()
+    };
+    match work_db.list_revisions(&product_id, dep_filter.as_ref(), include_deleted, parent_id.as_deref()) {
+        Ok(revisions) => {
+            send_response_with_revision(
+                &sink,
+                &request_id,
+                server_state.current_work_revision(),
+                FrontendEvent::RevisionsList { product_id, revisions },
+            );
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+        }
+    }
+}
+
 pub(super) async fn handle_list_chores(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

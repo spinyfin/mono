@@ -2414,6 +2414,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
+            r @ FrontendRequest::ListRevisions { .. } => work_items::handle_list_revisions(ctx, r).await,
             r @ FrontendRequest::ListWorkerLiveStates => panes::handle_list_worker_live_states(ctx, r).await,
             r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
                 ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
