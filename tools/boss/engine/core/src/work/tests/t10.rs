@@ -248,6 +248,108 @@ fn migration_completed_at_backfills_from_created_at_not_updated_at() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// record_worker_pr_completion with WorkerPrCompletionTarget::Done must set
+/// completed_at on the task. This is the primary path for tasks whose PR was
+/// already merged at Stop time (PrStatus::Merged → Done in completion.rs).
+#[test]
+fn record_worker_pr_completion_done_sets_completed_at() {
+    let db = WorkDb::open(temp_db_path("rwpc-done-completed-at")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-done");
+    let pr_url = "https://github.com/spinyfin/mono/pull/9010";
+
+    assert!(
+        task_completed_at(&db, &chore_id).is_none(),
+        "completed_at must be NULL before completion",
+    );
+
+    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::Done)
+        .unwrap();
+
+    assert!(
+        task_completed_at(&db, &chore_id).is_some(),
+        "completed_at must be set after record_worker_pr_completion with target=Done",
+    );
+}
+
+/// A second record_worker_pr_completion call on an already-done task must NOT
+/// re-bump completed_at (COALESCE stability).
+#[test]
+fn record_worker_pr_completion_done_coalesce_stability() {
+    let db = WorkDb::open(temp_db_path("rwpc-done-coalesce")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-coalesce");
+    let pr_url = "https://github.com/spinyfin/mono/pull/9011";
+
+    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::Done)
+        .unwrap();
+    let first = task_completed_at(&db, &chore_id);
+    assert!(first.is_some(), "completed_at must be set after first completion");
+
+    // Simulate a bulk re-stamp of updated_at (the original bug trigger).
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET updated_at = '9999999999' WHERE id = ?1",
+        rusqlite::params![chore_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let after_bump = task_completed_at(&db, &chore_id);
+    assert_eq!(
+        first, after_bump,
+        "completed_at must not change when updated_at is re-stamped on a done row",
+    );
+}
+
+/// record_worker_no_op_completion must set completed_at when it closes a
+/// non-terminal task as done. This is the path for workers that detect the
+/// change is already present on main (completion.rs:3685).
+#[test]
+fn record_worker_no_op_completion_sets_completed_at() {
+    let db = WorkDb::open(temp_db_path("rwnoc-completed-at")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnoc");
+
+    assert!(
+        task_completed_at(&db, &chore_id).is_none(),
+        "completed_at must be NULL before no-op completion",
+    );
+
+    db.record_worker_no_op_completion(&exec_id, "already done on main")
+        .unwrap();
+
+    assert!(
+        task_completed_at(&db, &chore_id).is_some(),
+        "completed_at must be set after record_worker_no_op_completion",
+    );
+}
+
+/// A second record_worker_no_op_completion on an already-terminal task must
+/// return Ok(None) (idempotent) and leave completed_at unchanged.
+#[test]
+fn record_worker_no_op_completion_coalesce_stability() {
+    let db = WorkDb::open(temp_db_path("rwnoc-coalesce")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwnoc-c");
+
+    db.record_worker_no_op_completion(&exec_id, "already done on main")
+        .unwrap();
+    let first = task_completed_at(&db, &chore_id);
+    assert!(first.is_some(), "completed_at must be set after first no-op");
+
+    // Simulate a bulk re-stamp of updated_at.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET updated_at = '9999999999' WHERE id = ?1",
+        rusqlite::params![chore_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let after_bump = task_completed_at(&db, &chore_id);
+    assert_eq!(
+        first, after_bump,
+        "completed_at must not change when updated_at is re-stamped on a done row",
+    );
+}
+
 /// Idempotency: running migrate_tasks_completed_at a second time must not
 /// overwrite already-set completed_at values (the COALESCE/column-exists guard).
 #[test]
