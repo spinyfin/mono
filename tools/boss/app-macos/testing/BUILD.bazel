@@ -1,0 +1,13 @@
+load(":macos_runner.bzl", "macos_runner")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files([
+    "runner.template.sh",
+    "runner.template.xctestrun",
+])
+
+macos_runner(
+    name = "macos_runner",
+    visibility = ["//tools/boss/app-macos:__subpackages__"],
+)

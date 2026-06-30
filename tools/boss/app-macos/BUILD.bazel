@@ -38,7 +38,9 @@ swift_library(
 macos_unit_test(
     name = "BossTests",
     size = "small",
+    bundle_id = "dev.spinyfin.bossmacapp.BossTests",
     minimum_os_version = "15.0",
+    runner = "//tools/boss/app-macos/testing:macos_runner",
     deps = [":boss_mac_app_tests_lib"],
 )
 

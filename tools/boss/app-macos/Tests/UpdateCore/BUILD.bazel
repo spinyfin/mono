@@ -6,7 +6,9 @@ package(default_visibility = ["//visibility:private"])
 macos_unit_test(
     name = "UpdateTests",
     size = "small",
+    bundle_id = "dev.spinyfin.bossmacapp.UpdateTests",
     minimum_os_version = "15.0",
+    runner = "//tools/boss/app-macos/testing:macos_runner",
     deps = [":update_tests_lib"],
 )
 
