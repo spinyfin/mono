@@ -10,6 +10,44 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
 
+/// All inputs Boss provides to a driver for its [`Capability::PermissionPolicy`]:
+/// the abstract deny-set and autonomy mode rendered into backend-specific form
+/// (for Claude Code: settings.json deny rules + permission-mode; for a future
+/// Copilot driver: `--deny-tool` filters + equivalent autonomy flag).
+#[derive(bon::Builder, Debug, Clone)]
+#[builder(on(String, into))]
+pub struct PermissionInput {
+    /// Worker posture — determines the per-kind deny rules (reviewer read-only,
+    /// triage blanket-write deny, standard implementation no extras) and the
+    /// `fastMode` setting for latency-sensitive review passes.
+    pub worker_kind: crate::worker_setup::WorkerKind,
+    /// Workspace path. Needed by the reviewer deny rules: file-write denies are
+    /// scoped to the workspace-parent so out-of-tree artifact writes are allowed.
+    pub workspace_path: PathBuf,
+    /// Absolute path to the engine events socket. Used to derive the Boss state
+    /// directory for sandbox deny globs and the deterministic path-guard hook.
+    /// Ignored (no sandbox installed) when `is_remote = true`.
+    pub events_socket_path: PathBuf,
+    /// Absolute path to the `boss-event` shim binary. Baked into every hook
+    /// command as the final argument so the shim fires regardless of `PATH`.
+    pub boss_event_path: PathBuf,
+    /// Run ID baked into every hook command as `BOSS_RUN_ID=<id>` so the engine
+    /// correlates hook events to runs even when env inheritance is unreliable.
+    pub run_id: String,
+    /// Cube lease ID baked into every hook command as `BOSS_LEASE_ID=<id>`.
+    pub lease_id: String,
+    /// Execution kind (e.g. `"revision_implementation"`). Triggers the revision
+    /// PR-creation guard when set to a revision value.
+    pub execution_kind: String,
+    /// Task kind (e.g. `"revision"`). Defense-in-depth for the revision PR guard:
+    /// the guard fires when either `execution_kind` or `task_kind` signals revision.
+    pub task_kind: Option<String>,
+    /// When `true`, omit the engine-data-dir sandbox (state-dir deny globs +
+    /// path-guard hook). Remote SSH workers set this because their
+    /// `events_socket_path` is a forwarded `/tmp` socket, not a Boss data dir.
+    pub is_remote: bool,
+}
+
 /// A named capability Boss needs from an agent driver.
 ///
 /// A driver declares, per capability, that it provides that capability; for
@@ -560,7 +598,12 @@ pub trait AgentDriver: Send + Sync {
     /// Write the driver's permission/hooks config to `dest_dir` and return the
     /// path to the settings file (passed as `--settings` or equivalent to the
     /// worker CLI).
-    async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>;
+    ///
+    /// `input` carries the abstract deny-set + autonomy-mode that the driver
+    /// renders into its backend-specific format. For Claude Code this produces a
+    /// `settings.json` with `permissions.deny` rules and `defaultMode: "auto"`,
+    /// plus `boss-event` hook wiring for every hook event.
+    async fn write_permission_config(&self, input: &PermissionInput, dest_dir: &Path) -> anyhow::Result<PathBuf>;
 
     // ── ProgressObservation capability ──────────────────────────────────────
 
