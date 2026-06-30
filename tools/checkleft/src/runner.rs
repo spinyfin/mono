@@ -773,10 +773,14 @@ impl Runner {
     ///
     /// For each check in `fix_plan`, collects [`crate::output::FileEdit`]s from
     /// `Error`- and `Warning`-severity findings that carry a `suggested_fix`. Each
-    /// edit whose `path` is in the check's fixable set is applied as a text
-    /// substitution (first occurrence of `old_text` → `new_text`) inside a staged
-    /// writable sandbox. Only files that actually changed are atomically copied back
-    /// to the real tree.
+    /// edit whose `path` is in the check's fixable set is applied by position
+    /// (using the finding's `location.line` to target the correct occurrence when
+    /// `old_text` is not unique) inside a staged writable sandbox. Only files that
+    /// actually changed are atomically copied back to the real tree.
+    ///
+    /// When `old_text` appears more than once and no position is available to
+    /// disambiguate, the edit is refused and recorded in `per_file_errors` rather
+    /// than silently mis-editing the wrong occurrence.
     ///
     /// The returned map uses the same `check_id → Vec<FixInvocationOutcome>`
     /// shape as [`Self::run_declarative_fixes`]. An absent entry (or empty `Vec`)
@@ -804,8 +808,11 @@ impl Runner {
 
             // Collect FileEdits from actionable findings, restricted to the fixable
             // set. Multiple findings may contribute edits for the same file; they are
-            // applied in document order.
-            let mut edits_by_file: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+            // applied bottom-up (descending line) so position offsets remain valid
+            // across sequential edits. Each edit carries an optional line number from
+            // the finding's location (when the edit targets the same file as the
+            // finding) — used for positional targeting when old_text is non-unique.
+            let mut edits_by_file: BTreeMap<PathBuf, Vec<(String, String, Option<u32>)>> = BTreeMap::new();
             for finding in &result.findings {
                 if !matches!(finding.severity, Severity::Error | Severity::Warning) {
                     continue;
@@ -813,12 +820,21 @@ impl Runner {
                 let Some(sf) = &finding.suggested_fix else {
                     continue;
                 };
+                let finding_line = finding.location.as_ref().and_then(|l| l.line);
+                let finding_path = finding.location.as_ref().map(|l| &l.path);
                 for edit in &sf.edits {
                     if fixable_set.contains(&edit.path) {
-                        edits_by_file
-                            .entry(edit.path.clone())
-                            .or_default()
-                            .push((edit.old_text.clone(), edit.new_text.clone()));
+                        // Only use line hint when the edit targets the same file as the finding.
+                        let line = if finding_path == Some(&edit.path) {
+                            finding_line
+                        } else {
+                            None
+                        };
+                        edits_by_file.entry(edit.path.clone()).or_default().push((
+                            edit.old_text.clone(),
+                            edit.new_text.clone(),
+                            line,
+                        ));
                     }
                 }
             }
@@ -849,12 +865,12 @@ impl Runner {
                 }
             };
 
-            // Apply each edit to the staged sandbox copy as a text substitution.
+            // Apply each edit to the staged sandbox copy.
             // Files absent from the source tree were silently dropped by staging and
-            // are skipped here. If old_text is absent (file already fixed by a prior
-            // pass or the edit doesn't apply), the content is unchanged and
-            // detect_changes will produce no copy-back for that file.
+            // are skipped here. Refused edits (ambiguous old_text) are recorded in
+            // per_file_errors but do not abort remaining edits or other files.
             let mut apply_err: Option<anyhow::Error> = None;
+            let mut per_file_errors: Vec<(PathBuf, String)> = Vec::new();
             'files: for (path, edits) in &edits_by_file {
                 let staged = sandbox.root_path().join(path);
                 if !staged.exists() {
@@ -867,9 +883,22 @@ impl Runner {
                         break 'files;
                     }
                 };
+                // Sort edits descending by line so bottom-up application keeps the
+                // line offsets of earlier (higher-up) edits valid for subsequent iterations.
+                let mut sorted_edits: Vec<(String, String, Option<u32>)> = edits.clone();
+                sorted_edits.sort_by(|a, b| match (a.2, b.2) {
+                    (Some(al), Some(bl)) => bl.cmp(&al),         // higher line first
+                    (Some(_), None) => std::cmp::Ordering::Less, // positioned before unpositioned
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
                 let mut new_content = content;
-                for (old_text, new_text) in edits {
-                    new_content = new_content.replacen(old_text.as_str(), new_text.as_str(), 1);
+                for (old_text, new_text, line) in &sorted_edits {
+                    match apply_positioned_edit(&new_content, old_text, new_text, *line) {
+                        Ok(Some(updated)) => new_content = updated,
+                        Ok(None) => {} // old_text absent; already fixed or inapplicable
+                        Err(msg) => per_file_errors.push((path.clone(), msg)),
+                    }
                 }
                 if let Err(err) = std::fs::write(&staged, new_content.as_bytes()) {
                     apply_err = Some(anyhow!(
@@ -886,7 +915,7 @@ impl Runner {
                     vec![FixInvocationOutcome {
                         invocation_id: "suggested_fix".to_owned(),
                         applied: Vec::new(),
-                        per_file_errors: Vec::new(),
+                        per_file_errors,
                         error: Some(err),
                     }],
                 );
@@ -917,7 +946,7 @@ impl Runner {
                 vec![FixInvocationOutcome {
                     invocation_id: "suggested_fix".to_owned(),
                     applied: report.applied,
-                    per_file_errors: Vec::new(),
+                    per_file_errors,
                     error,
                 }],
             );
@@ -1319,6 +1348,114 @@ fn apply_policy_to_result(
     }
 
     result
+}
+
+/// Convert a 1-based line number to the byte offset of the start of that line
+/// in `content`. Returns `None` when `line` is 0 or exceeds the file's line count.
+pub(crate) fn line_start_offset(content: &str, line: u32) -> Option<usize> {
+    if line == 0 {
+        return None;
+    }
+    if line == 1 {
+        return Some(0);
+    }
+    let mut current_line: u32 = 1;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            current_line += 1;
+            if current_line == line {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Apply a single suggested-fix edit to `content`, respecting `line` when available.
+///
+/// - **With position** (`line = Some(n)`): finds the first occurrence of `old_text`
+///   at or after the byte offset of 1-based line `n` and replaces it. Falls back to
+///   uniqueness validation when `old_text` is not found at or after that line.
+/// - **Without position** (`line = None`): validates that `old_text` appears exactly
+///   once and replaces it; refuses when there are multiple occurrences.
+///
+/// Returns:
+/// - `Ok(Some(new_content))` — edit applied.
+/// - `Ok(None)` — `old_text` absent; already fixed or inapplicable (not an error).
+/// - `Err(msg)` — edit refused: ambiguous target (multiple occurrences, no position) or empty `old_text`.
+pub(crate) fn apply_positioned_edit(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+    line: Option<u32>,
+) -> Result<Option<String>, String> {
+    if old_text.is_empty() {
+        return Err("suggested-fix old_text is empty; cannot apply safely".to_owned());
+    }
+
+    if let Some(line_num) = line {
+        let start = match line_start_offset(content, line_num) {
+            Some(o) => o,
+            None => {
+                let n = count_nonoverlapping(content, old_text);
+                return match n {
+                    0 => Ok(None),
+                    1 => Ok(Some(content.replacen(old_text, new_text, 1))),
+                    _ => Err(format!(
+                        "line {line_num} is out of range and old_text is not unique \
+                         ({n} occurrences); refusing to avoid mis-editing"
+                    )),
+                };
+            }
+        };
+        // Search for old_text at or after the start of line_num.
+        if let Some(rel) = content[start..].find(old_text) {
+            let abs = start + rel;
+            let mut result = String::with_capacity(content.len());
+            result.push_str(&content[..abs]);
+            result.push_str(new_text);
+            result.push_str(&content[abs + old_text.len()..]);
+            Ok(Some(result))
+        } else {
+            // Not found at or after the declared line; fall back to uniqueness check.
+            let n = count_nonoverlapping(content, old_text);
+            match n {
+                0 => Ok(None),
+                1 => Ok(Some(content.replacen(old_text, new_text, 1))),
+                _ => Err(format!(
+                    "old_text not found at or after line {line_num} but appears \
+                     {n} times in the file; refusing to avoid mis-editing"
+                )),
+            }
+        }
+    } else {
+        // No position hint: validate uniqueness.
+        let n = count_nonoverlapping(content, old_text);
+        match n {
+            0 => Ok(None),
+            1 => Ok(Some(content.replacen(old_text, new_text, 1))),
+            _ => Err(format!(
+                "old_text appears {n} times in the file but no line position is \
+                 available to disambiguate; refusing to avoid mis-editing"
+            )),
+        }
+    }
+}
+
+fn count_nonoverlapping(content: &str, pat: &str) -> usize {
+    if pat.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = content[start..].find(pat) {
+        count += 1;
+        start += pos + pat.len();
+    }
+    count
 }
 
 #[cfg(test)]
