@@ -62,6 +62,7 @@ rust_library(
         "src/doc_fetcher.rs",
         "src/driver/claude.rs",
         "src/driver/mod.rs",
+        "src/driver/registry.rs",
         "src/editorial_hook.rs",
         "src/effort.rs",
         "src/engine_control.rs",

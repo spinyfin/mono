@@ -16,9 +16,9 @@ use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::WorkerKind;
-use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TemplatePolicy, WorkItemBinding};
 #[cfg(test)]
-use boss_protocol::{TaskKind, TaskStatus};
+use boss_protocol::TaskStatus;
+use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TaskKind, TemplatePolicy, WorkItemBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -410,7 +410,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             editorial_enabled,
             self.cfg.work.max_review_embed_diff_lines,
         )
-        .await;
+        .await?;
 
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
@@ -739,7 +739,7 @@ pub(crate) async fn compose_worker_spawn(
     cube_change_id: Option<&str>,
     editorial_enabled: bool,
     max_embed_diff_lines: u64,
-) -> ComposedWorkerSpawn {
+) -> anyhow::Result<ComposedWorkerSpawn> {
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -1035,6 +1035,29 @@ pub(crate) async fn compose_worker_spawn(
         row_driver.as_deref(),
         product_default_driver.as_deref(),
     );
+
+    // Capability gate: fail closed before the pane spawns when the resolved
+    // driver cannot satisfy the work-item kind's requirements. Products and
+    // projects do not have a TaskKind; only Task/Chore rows are gated.
+    if let Some(kind) = work_item_task_kind_enum(work_item) {
+        let registry = crate::driver::DriverRegistry::default();
+        match registry.resolver(&spawn_config.driver) {
+            Some(resolver) => {
+                resolver
+                    .check_dispatch(kind)
+                    .map_err(|e| anyhow::anyhow!("capability gate: {e}"))?;
+            }
+            None => {
+                anyhow::bail!(
+                    "capability gate: driver '{}' is not registered; \
+                     cannot dispatch {} work item",
+                    spawn_config.driver,
+                    kind,
+                );
+            }
+        }
+    }
+
     // Per-level prompt addendum lands at the very top of the file
     // (design §Q2: "concatenated to .claude/initial-prompt.txt
     // BEFORE the existing prompt body"). The existing task /
@@ -1059,10 +1082,10 @@ pub(crate) async fn compose_worker_spawn(
         None => prompt_text,
     };
 
-    ComposedWorkerSpawn {
+    Ok(ComposedWorkerSpawn {
         prompt_text,
         spawn_config,
-    }
+    })
 }
 
 #[derive(bon::Builder)]
@@ -2631,6 +2654,15 @@ fn work_item_id(work_item: &WorkItem) -> &str {
 pub(crate) fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => Some(task.kind.as_str()),
+        WorkItem::Product(_) | WorkItem::Project(_) => None,
+    }
+}
+
+/// Return the typed [`TaskKind`] for task work items; `None` for products and
+/// projects. Used by the capability gate in [`compose_worker_spawn`].
+fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind> {
+    match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
         WorkItem::Product(_) | WorkItem::Project(_) => None,
     }
 }
@@ -4304,7 +4336,8 @@ mod compose_worker_spawn_tests {
             false,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             !composed.prompt_text.contains("# PR review"),
@@ -4340,7 +4373,8 @@ mod compose_worker_spawn_tests {
             false,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             composed.prompt_text.contains("# PR review"),
@@ -4379,7 +4413,8 @@ mod compose_worker_spawn_tests {
             false,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             !composed.prompt_text.contains("# PR review"),
@@ -4418,7 +4453,8 @@ mod compose_worker_spawn_tests {
             false,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             !composed.prompt_text.contains("expected branch name"),
