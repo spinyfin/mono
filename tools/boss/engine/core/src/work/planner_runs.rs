@@ -228,6 +228,25 @@ impl WorkDb {
         let changed = conn.execute("DELETE FROM planner_runs WHERE id = ?1", params![id])?;
         Ok(changed > 0)
     }
+
+    /// Return the ids of all non-deleted tasks tagged with `planner_run_id` —
+    /// i.e. the batch of tasks the Materializer created for that run.
+    ///
+    /// `tasks.planner_run_id` is a targeted column omitted from the standard
+    /// `map_task` SELECT (like `review_cycle` / `completed_at`), so this is
+    /// the read side of the Materializer's tag. Ordered by `created_at` for
+    /// a stable, reviewable listing. Used by the undo path
+    /// (`boss project unpopulate --run <id>`) and by Materializer tests.
+    pub fn list_task_ids_for_planner_run(&self, planner_run_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks
+             WHERE planner_run_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![planner_run_id], |row| row.get::<_, String>(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
 }
 
 // ---- tests ----
