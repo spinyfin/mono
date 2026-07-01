@@ -2590,6 +2590,23 @@ async fn mark_merged(
             probe.base_ref_name.as_deref(),
         )
         .await;
+
+        // Auto-populate the project's implementation tasks from the merged
+        // design doc (P783 task 7). `on_design_pr_merged` above has just
+        // written the project's design-doc pointer, so the Populator reads
+        // it fresh. The enqueue is cheap and synchronous — it spawns the
+        // multi-second Planner call on a background task so the poller loop
+        // never blocks — and a no-op unless the capability was installed at
+        // engine startup (so unit tests never reach the network).
+        crate::populator::enqueue_from_merge(
+            work_db,
+            crate::populator::PopulateContext {
+                project_id: project_id.clone(),
+                product_id: candidate.product_id.clone(),
+                design_task_id: updated.id.clone(),
+                pr_url: candidate.pr_url.clone(),
+            },
+        );
     }
     true
 }

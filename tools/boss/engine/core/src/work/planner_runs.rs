@@ -229,6 +229,32 @@ impl WorkDb {
         Ok(changed > 0)
     }
 
+    /// Return `(id, name, kind)` for every non-deleted task in `project_id`,
+    /// across **all** kinds.
+    ///
+    /// Unlike [`WorkDb::list_tasks`] (which restricts to
+    /// `project_task`/`design`/`investigation`), this counts *any* kind so the
+    /// Populator's pre-seeded refusal honours its "any non-design task under
+    /// the project" contract — a `task`/`revision`/`followup` row attached to
+    /// the project still blocks auto-populate. It also feeds the Planner's
+    /// existing-name dedup hint. Ordered by `created_at` for a stable listing.
+    pub fn list_project_task_briefs(&self, project_id: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind FROM tasks
+             WHERE project_id = ?1 AND deleted_at IS NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Return the ids of all non-deleted tasks tagged with `planner_run_id` —
     /// i.e. the batch of tasks the Materializer created for that run.
     ///

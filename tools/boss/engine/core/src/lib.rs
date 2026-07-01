@@ -56,6 +56,7 @@ pub mod pane_summary;
 pub mod planner;
 pub mod planner_validation;
 pub mod pool_claim_sweep;
+pub mod populator;
 pub use boss_pr_template as pr_template;
 pub mod pr_review;
 pub mod pr_url_capture;
