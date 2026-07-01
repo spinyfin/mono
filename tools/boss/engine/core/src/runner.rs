@@ -412,12 +412,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         )
         .await?;
 
-        let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
-        if let Some(parent) = prompt_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&prompt_path, &prompt_text)
-            .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+        // Write the initial prompt (and gitignore + pre-trust) via the driver's
+        // WorkspaceProvisioning capability. The driver's config_dir and
+        // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
+        // the exact path the spawn_invocation `$(cat ...)` reads from.
+        crate::driver::ClaudeDriver
+            .provision_workspace(workspace_path, &prompt_text, &execution.id)
+            .await
+            .with_context(|| {
+                format!(
+                    "provisioning workspace {} for execution {}",
+                    workspace_path.display(),
+                    execution.id,
+                )
+            })?;
 
         // Structured-output artifact (review findings / task followups): create
         // the engine-owned scratch dir and clear any stale file from a prior

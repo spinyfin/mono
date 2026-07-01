@@ -24,6 +24,7 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
+use crate::driver::ClaudeDriver;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -66,7 +67,8 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct StartWorkerInput {
     pub run_id: String,
     pub lease_id: String,
@@ -224,7 +226,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         task_kind: input.task_kind.clone(),
         worker_kind: input.worker_kind.clone(),
     };
-    let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
+    let written = write_workspace_files(&setup, &ClaudeDriver).map_err(StartWorkerError::WriteFiles)?;
 
     // 2. Build the SpawnWorkerPane request. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
