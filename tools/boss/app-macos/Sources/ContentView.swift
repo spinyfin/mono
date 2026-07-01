@@ -1077,11 +1077,10 @@ private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-
-                Spacer(minLength: 0)
 
                 accessory()
             }
