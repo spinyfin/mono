@@ -1,0 +1,31 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Reopen-on-abandon needs a closed/abandoned terminal signal, which the poller does not emit today (the ClosedUnmerged arm is a no-op). How should v1 get it?",
+    "choices": [
+      "Depend on the chore-lifecycle-pr-closed-unmerged work landing and hook its transition",
+      "Add a minimal comment-only reopen hook in the poller's ClosedUnmerged arm now (stopgap)",
+      "Ship v1 with resolve-on-merge only; reopen-on-abandon is a fast-follow"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should one [Revise] click address ALL currently-unresolved comments as a single batch (yes), or should v1 let the reviewer select a subset (no)?",
+    "anchor": "association-model"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the 'reply' linking each comment to its work item be represented?",
+    "choices": [
+      "Engine-authored status annotation chip on the comment (no threading, recommended)",
+      "A literal single-level threaded reply comment row authored by boss"
+    ],
+    "anchor": "replylink-mechanics"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep the per-comment magic wand (CommentsDispatchMagicWand) and this per-doc [Revise] as two coexisting paths in v1 (yes), or converge them now (no)?",
+    "anchor": "relationship-to-the-magic-wand"
+  }
+]
