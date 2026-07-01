@@ -34,18 +34,23 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 
 /// Default model slug for a given effort level.
 ///
-/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine auto-tracks the
-/// latest snapshot per family without requiring a code change on each model release.
+/// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the engine
+/// auto-tracks the latest snapshot per family without requiring a code
+/// change on each model release.
 ///
 /// `Trivial` maps to `sonnet`, NOT `haiku`. Per issue #746 ("don't use haiku")
 /// Boss must never dispatch a worker on Haiku: on the user's work machine Haiku
 /// supports neither auto mode nor `--dangerously-skip-permissions`, so it prompts
 /// for every edit. Trivial work still runs at `--effort low`; only the model floor
 /// is raised to Sonnet. Do not lower it back to Haiku.
+///
+/// Tier ordering, highest to lowest:
+/// Fable (`fable`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
 fn claude_default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
-        EffortLevel::Large | EffortLevel::Max => "opus",
+        EffortLevel::Large => "opus",
+        EffortLevel::Max => "fable",
     }
 }
 
@@ -66,9 +71,6 @@ fn claude_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> 
 /// Returns `true` iff the model slug belongs to the Opus or Fable tier (both require
 /// `--permission-mode auto` instead of `--dangerously-skip-permissions`).
 /// Matching is case-insensitive substring search.
-///
-/// Note: Fable (`claude-fable-5`) has been suspended but existing rows may carry it
-/// as a `model_override`; they still receive `--permission-mode auto`.
 fn claude_model_requires_auto_permissions(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("opus") || lower.contains("fable")
