@@ -1328,7 +1328,7 @@ struct ProductSetDefaultModelArgs {
     selector: String,
 
     /// Claude model slug to store as the product default (e.g.
-    /// `opus`, `sonnet`, `haiku`, `claude-opus-4-8`). Stored verbatim
+    /// `fable`, `opus`, `sonnet`, `haiku`, `claude-fable-5`, `claude-opus-4-8`). Stored verbatim
     /// — no validation against the engine. Mutually exclusive with
     /// `--unset`; one of the two is required.
     #[arg(long, value_name = "SLUG", conflicts_with = "unset")]
@@ -1731,8 +1731,8 @@ struct TaskCreateArgs {
     #[arg(long, value_enum)]
     effort: Option<EffortLevelArg>,
 
-    /// Model slug for the resolved driver (e.g. `opus`, `sonnet`, `haiku`,
-    /// or a fully-qualified id like `claude-opus-4-8`). Stored verbatim — the driver
+    /// Model slug for the resolved driver (e.g. `fable`, `opus`, `sonnet`, `haiku`,
+    /// or a fully-qualified id like `claude-fable-5`). Stored verbatim — the driver
     /// is the source of truth on valid slugs.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
@@ -7910,8 +7910,11 @@ fn validate_driver_model_pair(driver: Option<&str>, model: Option<&str>) -> Resu
     }
     let Some(m) = model else { return Ok(()) };
     let m_lower = m.trim().to_ascii_lowercase();
-    let is_claude_slug =
-        m_lower.starts_with("claude-") || m_lower == "opus" || m_lower == "sonnet" || m_lower == "haiku";
+    let is_claude_slug = m_lower.starts_with("claude-")
+        || m_lower == "opus"
+        || m_lower == "sonnet"
+        || m_lower == "haiku"
+        || m_lower == "fable";
     if is_claude_slug {
         return Err(CliError::usage(format!(
             "model slug `{m}` is for the Claude driver but `--driver {d}` was specified; \

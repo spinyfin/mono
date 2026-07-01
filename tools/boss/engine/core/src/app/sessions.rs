@@ -300,3 +300,22 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the `EnginePoolConfig.coordinator_model` push (computed in
+    /// `handle_register_app_session` above) to the Max-effort Claude model.
+    /// Guards against the coordinator wiring drifting from the effort tier
+    /// table without a test catching it (e.g. if `default_model_for_level`
+    /// changed but this call site wasn't updated).
+    #[test]
+    fn coordinator_model_tracks_max_effort_model() {
+        let coordinator_model = (crate::driver::ClaudeDriver
+            .descriptor()
+            .model_menu
+            .default_model_for_level)(boss_protocol::EffortLevel::Max);
+        assert_eq!(coordinator_model, "fable");
+    }
+}
