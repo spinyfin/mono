@@ -959,41 +959,23 @@ struct ContentView: View {
 
     @ViewBuilder
     private func workSectionView(_ section: WorkBoardSection, column: WorkBoardColumnKey) -> some View {
+        let sectionProject = section.projectID.flatMap { model.project(withID: $0) }
         if section.isCollapsible {
             CollapsibleWorkBoardSection(
                 sectionID: section.id,
                 title: section.title,
                 count: section.items.count,
                 defaultExpanded: section.defaultExpanded,
-                shortIDLabel: section.projectID
-                    .flatMap { model.project(withID: $0)?.shortID }
-                    .map { "P" + String($0) }
+                shortIDLabel: sectionProject?.shortID.map { "P" + String($0) }
             ) {
+                if let sectionProject {
+                    ProjectDesignDocAffordance(model: model, project: sectionProject)
+                }
+            } content: {
                 workSectionItems(section.items, column: column)
             }
         } else {
-            VStack(alignment: .leading, spacing: 10) {
-                if model.workBoardGrouping == .project {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(section.title)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        if let projectID = section.projectID,
-                           let project = model.project(withID: projectID),
-                           let id = project.shortID {
-                            Text("P" + String(id))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                        if let projectID = section.projectID,
-                           let project = model.project(withID: projectID) {
-                            ProjectDesignDocAffordance(model: model, project: project)
-                        }
-                    }
-                }
-                workSectionItems(section.items, column: column)
-            }
+            workSectionItems(section.items, column: column)
         }
     }
 
@@ -1034,12 +1016,13 @@ struct ContentView: View {
     }
 }
 
-private struct CollapsibleWorkBoardSection<Content: View>: View {
+private struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     let sectionID: String
     let title: String
     let count: Int
     let defaultExpanded: Bool
     var shortIDLabel: String? = nil
+    @ViewBuilder let accessory: () -> Accessory
     @ViewBuilder let content: () -> Content
 
     @State private var userToggled: Bool
@@ -1050,6 +1033,7 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
         count: Int,
         defaultExpanded: Bool,
         shortIDLabel: String? = nil,
+        @ViewBuilder accessory: @escaping () -> Accessory = { EmptyView() },
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.sectionID = sectionID
@@ -1057,6 +1041,7 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
         self.count = count
         self.defaultExpanded = defaultExpanded
         self.shortIDLabel = shortIDLabel
+        self.accessory = accessory
         self.content = content
         let stored = UserDefaults.standard.object(
             forKey: "boss.kanban.section.\(sectionID).userToggled"
@@ -1070,31 +1055,36 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Button {
-                let next = !userToggled
-                userToggled = next
-                UserDefaults.standard.set(
-                    next, forKey: "boss.kanban.section.\(sectionID).userToggled"
-                )
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 10)
-                    Text("\(title) (\(count))")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    if let label = shortIDLabel {
-                        Text(label)
-                            .font(.system(.caption2, design: .monospaced))
+            HStack(spacing: 6) {
+                Button {
+                    let next = !userToggled
+                    userToggled = next
+                    UserDefaults.standard.set(
+                        next, forKey: "boss.kanban.section.\(sectionID).userToggled"
+                    )
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
+                            .frame(width: 10)
+                        Text("\(title) (\(count))")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        if let label = shortIDLabel {
+                            Text(label)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    Spacer()
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 0)
+
+                accessory()
             }
-            .buttonStyle(.plain)
 
             if isExpanded {
                 content()

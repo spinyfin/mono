@@ -2729,6 +2729,8 @@ final class ChatViewModel: ObservableObject {
                 id: "\(column.rawValue)-\(key)",
                 title: key,
                 items: sectionItems,
+                isCollapsible: true,
+                defaultExpanded: true,
                 projectID: projectID
             )
         }
