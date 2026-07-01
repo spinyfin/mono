@@ -361,6 +361,11 @@ impl WorkDb {
         // Done-lane bucketing fix: add completed_at so the kanban can group
         // done tasks by their actual completion time instead of updated_at.
         migrate_tasks_completed_at(&conn)?;
+        // P783 task 5: tag tasks created by an auto-populate run with the
+        // originating planner_runs.id, so the undo path can delete exactly
+        // that batch. Purely additive nullable column; NULL for every
+        // non-planner task.
+        migrate_tasks_planner_run_id(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '21')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

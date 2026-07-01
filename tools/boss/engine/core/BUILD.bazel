@@ -84,6 +84,7 @@ rust_library(
         "src/live_status_redact.rs",
         "src/live_worker_state.rs",
         "src/magic_wand.rs",
+        "src/materializer.rs",
         "src/merge_poller.rs",
         "src/merge_when_ready.rs",
         "src/metrics/mod.rs",
