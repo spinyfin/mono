@@ -31,13 +31,13 @@ final class BossPaneModel: ObservableObject {
     var claudeInvocation: String { coordinatorInvocation(model: coordinatorModel) }
 
     init() {
-        // Seed with the current effort=max model (opus).  The engine will
+        // Seed with the current effort=max model (fable).  The engine will
         // push the authoritative value via engine_pool_config shortly after
         // connect; updateCoordinatorModel(_:) picks it up then.
-        self.coordinatorModel = "opus"
+        self.coordinatorModel = "fable"
         self.runtime = GhosttyRuntime.shared
         let workingDirectory = Self.ensureBossWorkingDirectory()
-        let invocation = coordinatorInvocation(model: "opus")
+        let invocation = coordinatorInvocation(model: "fable")
         // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
         // session authenticates via OAuth (~/.claude/.credentials.json)
         // rather than the engine's API key. The macOS app process still

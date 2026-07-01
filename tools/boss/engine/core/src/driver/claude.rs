@@ -84,6 +84,12 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "CLAUDE.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
+        // Intentionally stays "opus", not "fable": this is only the step-5
+        // fallback in resolve_spawn_config for a row with no model_override,
+        // no pool override, no effort_level, and no product default — a
+        // conservative mid-tier fallback for untagged/misconfigured rows,
+        // not the effort=max dispatch tier. It was introduced post-suspension
+        // by the ModelMenu refactor and was never "fable" pre-suspension.
         engine_default: "opus",
         effort_value_for_level: claude_effort_value_for_level,
         default_model_for_level: claude_default_model_for_level,

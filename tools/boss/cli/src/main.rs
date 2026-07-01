@@ -7910,8 +7910,11 @@ fn validate_driver_model_pair(driver: Option<&str>, model: Option<&str>) -> Resu
     }
     let Some(m) = model else { return Ok(()) };
     let m_lower = m.trim().to_ascii_lowercase();
-    let is_claude_slug =
-        m_lower.starts_with("claude-") || m_lower == "opus" || m_lower == "sonnet" || m_lower == "haiku";
+    let is_claude_slug = m_lower.starts_with("claude-")
+        || m_lower == "opus"
+        || m_lower == "sonnet"
+        || m_lower == "haiku"
+        || m_lower == "fable";
     if is_claude_slug {
         return Err(CliError::usage(format!(
             "model slug `{m}` is for the Claude driver but `--driver {d}` was specified; \
