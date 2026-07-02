@@ -496,6 +496,12 @@ struct DependAddArgs {
     /// Edge type. Only `blocks` is supported in v1.
     #[arg(long, default_value = "blocks")]
     relation: String,
+    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
+    /// for a selector that already embeds a product slug (`boss/42`) or is a
+    /// primary id.
+    #[arg(long)]
+    product: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -504,6 +510,12 @@ struct DependRmArgs {
     prerequisite: String,
     #[arg(long, default_value = "blocks")]
     relation: String,
+    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// (slug or id). Applies to both `dependent` and `prerequisite`. Ignored
+    /// for a selector that already embeds a product slug (`boss/42`) or is a
+    /// primary id.
+    #[arg(long)]
+    product: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -513,6 +525,11 @@ struct DependListArgs {
     /// Which side(s) of the edge to return. Defaults to `both`.
     #[arg(long, value_enum, default_value_t = DependDirectionArg::Both)]
     direction: DependDirectionArg,
+    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// (slug or id). Ignored for a selector that already embeds a product
+    /// slug (`boss/42`) or is a primary id.
+    #[arg(long)]
+    product: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -7134,8 +7151,8 @@ async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem
 async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         DependCommand::Add(args) => {
-            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, None).await?;
-            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, None).await?;
+            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
+            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, args.product).await?;
             let edge = add_dependency(
                 client,
                 AddDependencyInput {
@@ -7155,8 +7172,8 @@ async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx
             })
         }
         DependCommand::Rm(args) => {
-            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, None).await?;
-            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, None).await?;
+            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
+            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, args.product).await?;
             let removed = remove_dependency(
                 client,
                 RemoveDependencyInput {
@@ -7186,7 +7203,7 @@ async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx
             )
         }
         DependCommand::List(args) => {
-            let selector = resolve_selector_to_primary_id(client, ctx, &args.selector, None).await?;
+            let selector = resolve_selector_to_primary_id(client, ctx, &args.selector, args.product).await?;
             let view = list_dependencies(
                 client,
                 ListDependenciesInput {
@@ -9134,12 +9151,12 @@ mod tests {
 
     use super::{
         AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
-        Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand, ProductStatus,
-        ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskStatusArg, classify_bind_pr,
-        classify_lint_finding, compile_schedule, decide_open_design_action, ensure_explicit_product_matches,
-        expect_leaf_work_item, format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
-        lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
-        split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
+        Commands, DependCommand, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand,
+        ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskStatusArg,
+        classify_bind_pr, classify_lint_finding, compile_schedule, decide_open_design_action,
+        ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
+        is_typed_work_item_id, lint_summary_line, parse_attention_group_selector, parse_automation_selector,
+        pick_by_index, split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -9225,6 +9242,51 @@ mod tests {
                 command: TaskCommand::Move(args),
             } => assert!(matches!(args.target, MoveTarget::Backlog)),
             _ => panic!("expected task move command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_depend_add_with_product() {
+        let cli = Cli::parse_from(["boss", "task", "depend", "add", "T2075", "T2074", "--product", "boss"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Depend {
+                    command: DependCommand::Add(args),
+                },
+            } => {
+                assert_eq!(args.dependent, "T2075");
+                assert_eq!(args.prerequisite, "T2074");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected task depend add command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_depend_rm_and_list_with_product() {
+        let cli = Cli::parse_from(["boss", "task", "depend", "rm", "T2075", "T2074", "--product", "boss"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Depend {
+                    command: DependCommand::Rm(args),
+                },
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected task depend rm command"),
+        }
+
+        let cli = Cli::parse_from(["boss", "task", "depend", "list", "T2075", "--product", "boss"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Depend {
+                    command: DependCommand::List(args),
+                },
+            } => {
+                assert_eq!(args.selector, "T2075");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected task depend list command"),
         }
     }
 
