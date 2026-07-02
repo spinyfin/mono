@@ -60,6 +60,7 @@ mod hosts;
 mod live_status;
 mod metrics;
 mod panes;
+mod planner_ops;
 mod products;
 mod projects;
 mod review;
@@ -2415,6 +2416,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
+            r @ FrontendRequest::ListPlannerRuns { .. } => planner_ops::handle_list_planner_runs(ctx, r).await,
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
@@ -2441,12 +2443,14 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
             r @ FrontendRequest::MetricsShowLive { .. } => metrics::handle_metrics_show_live(ctx, r).await,
             r @ FrontendRequest::OpenReviewTerminal { .. } => review::handle_open_review_terminal(ctx, r).await,
+            r @ FrontendRequest::PlanProject { .. } => planner_ops::handle_plan_project(ctx, r).await,
             r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
             r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
             r @ FrontendRequest::RecordEffortEscalation { .. } => effort::handle_record_effort_escalation(ctx, r).await,
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,
+            r @ FrontendRequest::ReleaseProject { .. } => planner_ops::handle_release_project(ctx, r).await,
             r @ FrontendRequest::ReleaseReviewTerminal { .. } => review::handle_release_review_terminal(ctx, r).await,
             r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,
             r @ FrontendRequest::RemoveHost { .. } => hosts::handle_remove_host(ctx, r).await,
@@ -2498,6 +2502,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
             }
+            r @ FrontendRequest::UnpopulateProject { .. } => planner_ops::handle_unpopulate_project(ctx, r).await,
             r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,

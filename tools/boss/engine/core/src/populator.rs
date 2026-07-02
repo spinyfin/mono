@@ -74,6 +74,10 @@ pub const DEFAULT_MAX_TASKS: usize = 30;
 /// in the audit ledger.
 pub const CALLER_MERGE_TRIGGER: &str = "merge_trigger";
 
+/// `caller` value stamped on `planner_runs` rows claimed by the operator
+/// command (`boss project plan <project>` / `--dry-run` preview / replan).
+pub const CALLER_OPERATOR: &str = "operator";
+
 /// `kind` of the `WorkAttentionItem` the Populator raises against the design
 /// task. A single kind keeps the surface simple; the outcome-specific text
 /// lives in the title/body.
@@ -176,6 +180,9 @@ pub enum PopulateOutcome {
     Staged {
         created: usize,
         edges: usize,
+        /// Proposed tasks skipped because a non-deleted task with the same
+        /// name already existed in the project (dedup, not an error).
+        skipped: usize,
         low_confidence: bool,
     },
     /// An internal DB error prevented the pass from claiming or completing.
@@ -199,6 +206,50 @@ impl PopulateOutcome {
             PopulateOutcome::Errored => "errored",
         }
     }
+}
+
+/// Result of [`Populator::attempt_plan`] — the gather → fetch → plan →
+/// validate steps shared by a claimed run ([`Populator::run_claimed`]) and a
+/// read-only preview ([`Populator::preview`]). `Terminal` bundles everything
+/// [`Populator::finish`] needs (the caller decides whether to actually
+/// persist the patch and raise the attention item, or discard it for a
+/// preview); `Valid` is a proposal ready for [`Populator::apply_and_stage`]
+/// (or, for a preview, just for display).
+enum PlanAttempt {
+    Terminal {
+        outcome: PopulateOutcome,
+        patch: PlannerRunPatch,
+        title: &'static str,
+        body: String,
+    },
+    Valid {
+        output: PlannerOutput,
+        low_confidence: bool,
+    },
+}
+
+/// Result of [`Populator::preview`] (`boss project plan --dry-run`). Mirrors
+/// [`PopulateOutcome`]'s branches but nothing was written — this is a report
+/// of what a real run would do.
+#[derive(Debug)]
+pub enum PreviewOutcome {
+    /// A live planner run already exists for this project (`running`,
+    /// `staged`, or `applied`); a real run would skip. `outcome` is the live
+    /// row's current outcome tag.
+    AlreadyPopulated { outcome: String },
+    /// The project already has implementation tasks; a real run without
+    /// `--force` would refuse.
+    PreSeeded { existing: usize },
+    /// One of the fetch/plan/validate failure or no-op outcomes a real run
+    /// could hit, reported without writing anything. `message` is the
+    /// human-readable explanation a real run would also raise as an
+    /// attention item.
+    Terminal { outcome: PopulateOutcome, message: String },
+    /// A valid proposal — what a real run would materialize.
+    Valid {
+        output: PlannerOutput,
+        low_confidence: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -236,13 +287,34 @@ impl Populator {
         max_tasks: usize,
         publisher: &dyn ExecutionPublisher,
     ) -> PopulateOutcome {
+        Self::run_with_force(db, steps, ctx, max_tasks, CALLER_MERGE_TRIGGER, false, publisher).await
+    }
+
+    /// Generalization of [`Self::run`] used by every caller (design §2
+    /// "Reusability"): the merge trigger (`run`, always `caller =
+    /// "merge_trigger"`, `force = false`) and the operator command
+    /// (`run_operator`, `caller = "operator"`, `force` from `--force`).
+    ///
+    /// `caller` is stamped on the claimed `planner_runs` row. `force`
+    /// bypasses the pre-seeded refusal — the Materializer's `(name,
+    /// project_id)` dedup makes a forced re-populate additive, never
+    /// destructive, so bypassing the refusal is safe.
+    pub async fn run_with_force(
+        db: &WorkDb,
+        steps: &dyn PopulatorSteps,
+        ctx: &PopulateContext,
+        max_tasks: usize,
+        caller: &str,
+        force: bool,
+        publisher: &dyn ExecutionPublisher,
+    ) -> PopulateOutcome {
         // 1. Idempotency claim. The UNIQUE-per-project partial index makes
         //    this the circuit breaker: at most one live row per project.
         let run = match db.claim_planner_run(ClaimPlannerRunInput {
             project_id: &ctx.project_id,
             product_id: &ctx.product_id,
             design_task_id: Some(&ctx.design_task_id),
-            caller: CALLER_MERGE_TRIGGER,
+            caller,
         }) {
             Ok(Some(run)) => run,
             Ok(None) => {
@@ -263,7 +335,7 @@ impl Populator {
         // From here every early return records a terminal outcome on the
         // claimed row (releasing the idempotency gate for a later re-plan)
         // and surfaces an attention item.
-        match Self::run_claimed(db, steps, ctx, &run_id, max_tasks, publisher).await {
+        match Self::run_claimed(db, steps, ctx, &run_id, max_tasks, force, publisher).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Internal DB error after the claim. Record it so the row is
@@ -281,6 +353,81 @@ impl Populator {
         }
     }
 
+    /// Resolve a project's `kind = 'design'` task id — every project has
+    /// exactly one, auto-created at `ordinal = 0` when the project is
+    /// created. Used by [`Self::run_operator`] to build the same
+    /// [`PopulateContext`] shape the merge trigger builds, so operator-
+    /// initiated runs get an attention-item target and a
+    /// `planner_runs.design_task_id` audit column just like trigger runs.
+    fn design_task_id_for_project(db: &WorkDb, product_id: &str, project_id: &str) -> anyhow::Result<String> {
+        db.list_tasks(product_id, Some(project_id), None, false)?
+            .into_iter()
+            .find(|t| t.kind == TaskKind::Design)
+            .map(|t| t.id)
+            .ok_or_else(|| anyhow::anyhow!("project {project_id} has no design task"))
+    }
+
+    /// Operator entry point for `boss project plan <project> [--force]`
+    /// (design §2 "Reusability" #2). Resolves the project's product and
+    /// design task, builds the [`PopulateContext`] the merge trigger would
+    /// have built, and runs the identical pipeline with `caller =
+    /// "operator"`.
+    pub async fn run_operator(
+        db: &WorkDb,
+        steps: &dyn PopulatorSteps,
+        project_id: &str,
+        max_tasks: usize,
+        force: bool,
+        publisher: &dyn ExecutionPublisher,
+    ) -> anyhow::Result<PopulateOutcome> {
+        let project = db.get_project(project_id)?;
+        let design_task_id = Self::design_task_id_for_project(db, &project.product_id, project_id)?;
+        let ctx = PopulateContext {
+            project_id: project_id.to_owned(),
+            product_id: project.product_id.clone(),
+            design_task_id,
+            pr_url: "n/a (operator-invoked `boss project plan`)".to_owned(),
+        };
+        Ok(Self::run_with_force(db, steps, &ctx, max_tasks, CALLER_OPERATOR, force, publisher).await)
+    }
+
+    /// Read-only preview for `boss project plan <project> --dry-run`
+    /// (design §2 "Reusability" #2). Runs the same gather → fetch → plan →
+    /// validate steps a real run would, but never claims the `planner_runs`
+    /// idempotency gate and never applies — nothing is written. `force`
+    /// mirrors the real run's flag so a combined `--dry-run --force`
+    /// previews what a forced apply would produce instead of reporting the
+    /// pre-seeded refusal.
+    pub async fn preview(
+        db: &WorkDb,
+        steps: &dyn PopulatorSteps,
+        project_id: &str,
+        max_tasks: usize,
+        force: bool,
+    ) -> anyhow::Result<PreviewOutcome> {
+        if let Some(run) = db.live_planner_run_for_project(project_id)? {
+            return Ok(PreviewOutcome::AlreadyPopulated { outcome: run.outcome });
+        }
+
+        let project = db.get_project(project_id)?;
+        let product_id = project.product_id.clone();
+        let project_tasks = db.list_project_task_briefs(project_id)?;
+        let existing_impl = project_tasks
+            .iter()
+            .filter(|(_, _, kind)| kind != TaskKind::Design.as_str())
+            .count();
+        if existing_impl > 0 && !force {
+            return Ok(PreviewOutcome::PreSeeded {
+                existing: existing_impl,
+            });
+        }
+
+        match Self::attempt_plan(db, steps, project_id, &product_id, &project_tasks, None, max_tasks).await? {
+            PlanAttempt::Terminal { outcome, body, .. } => Ok(PreviewOutcome::Terminal { outcome, message: body }),
+            PlanAttempt::Valid { output, low_confidence } => Ok(PreviewOutcome::Valid { output, low_confidence }),
+        }
+    }
+
     /// The body after a successful claim. Split out so the claim path can map
     /// any propagated error to a recorded `planner_failed` row.
     async fn run_claimed(
@@ -289,6 +436,7 @@ impl Populator {
         ctx: &PopulateContext,
         run_id: &str,
         max_tasks: usize,
+        force: bool,
         publisher: &dyn ExecutionPublisher,
     ) -> anyhow::Result<PopulateOutcome> {
         // 2. Pre-seeded refusal. Belt-and-suspenders beyond the claim gate:
@@ -297,13 +445,16 @@ impl Populator {
         //    contradictory edges. Refuse and surface the `--force` escape.
         //    Counts *any* non-design kind (not just project_task/investigation)
         //    so the "any non-design task" contract holds even for a stray
-        //    `task`/`revision`/`followup` row on the project.
+        //    `task`/`revision`/`followup` row on the project. `force` (the
+        //    operator's `--force` flag) bypasses this refusal — the
+        //    Materializer's `(name, project_id)` dedup makes the merge
+        //    additive, never destructive, either way.
         let project_tasks = db.list_project_task_briefs(&ctx.project_id)?;
         let existing_impl = project_tasks
             .iter()
             .filter(|(_, _, kind)| kind != TaskKind::Design.as_str())
             .count();
-        if existing_impl > 0 {
+        if existing_impl > 0 && !force {
             let n = existing_impl;
             tracing::info!(
                 project_id = %ctx.project_id,
@@ -331,29 +482,68 @@ impl Populator {
             return Ok(PopulateOutcome::SkippedPreSeeded { existing: n });
         }
 
+        // 3-6. Gather context, fetch the doc, plan, and validate — shared with
+        // the operator's dry-run preview ([`Self::preview`]).
+        match Self::attempt_plan(
+            db,
+            steps,
+            &ctx.project_id,
+            &ctx.product_id,
+            &project_tasks,
+            Some(run_id),
+            max_tasks,
+        )
+        .await?
+        {
+            PlanAttempt::Terminal {
+                outcome,
+                patch,
+                title,
+                body,
+            } => {
+                Self::finish(db, ctx, run_id, patch, title, body, publisher).await;
+                Ok(outcome)
+            }
+            PlanAttempt::Valid { output, low_confidence } => {
+                Self::apply_and_stage(db, ctx, run_id, &output, low_confidence, publisher).await
+            }
+        }
+    }
+
+    /// 3-6. Gather project/product context, fetch the design doc live, run
+    /// the Planner, and validate the structured proposal. Shared by the
+    /// claimed-run path ([`Self::run_claimed`], `run_id = Some(..)` so
+    /// progress is persisted to the `planner_runs` row before the slow LLM
+    /// call) and the read-only preview path ([`Self::preview`], `run_id =
+    /// None` so nothing is written). Performs no claim, no pre-seeded check,
+    /// and no apply — those are the caller's responsibility.
+    async fn attempt_plan(
+        db: &WorkDb,
+        steps: &dyn PopulatorSteps,
+        project_id: &str,
+        product_id: &str,
+        project_tasks: &[(String, String, String)],
+        run_id: Option<&str>,
+        max_tasks: usize,
+    ) -> anyhow::Result<PlanAttempt> {
         // 3. Gather context. The design-doc pointer was written by
         //    `on_design_pr_merged` before this pass; read it back.
-        let project = db.get_project(&ctx.project_id)?;
-        let product = db.get_product(&ctx.product_id)?;
+        let project = db.get_project(project_id)?;
+        let product = db.get_product(product_id)?;
 
         let Some(doc_path) = project.design_doc_path.clone() else {
-            tracing::warn!(project_id = %ctx.project_id, "populator: project has no design_doc_path pointer");
-            Self::finish(
-                db,
-                ctx,
-                run_id,
-                PlannerRunPatch::builder()
+            tracing::warn!(project_id, "populator: project has no design_doc_path pointer");
+            return Ok(PlanAttempt::Terminal {
+                outcome: PopulateOutcome::DocMissing,
+                patch: PlannerRunPatch::builder()
                     .outcome(PLANNER_OUTCOME_DOC_MISSING)
                     .result_summary("project has no design_doc_path pointer")
                     .build(),
-                "Auto-populate failed: no design doc pointer",
-                "The design PR merged but no design-doc path was recorded for this project, so the \
-                 planner has nothing to read. Set the pointer and re-run `boss project plan <project>`."
+                title: "Auto-populate failed: no design doc pointer",
+                body: "The design PR merged but no design-doc path was recorded for this project, so the \
+                       planner has nothing to read. Set the pointer and re-run `boss project plan <project>`."
                     .to_owned(),
-                publisher,
-            )
-            .await;
-            return Ok(PopulateOutcome::DocMissing);
+            });
         };
 
         // Repo the doc lives in: the design-doc pointer's repo (which may be a
@@ -363,23 +553,18 @@ impl Populator {
             .clone()
             .or_else(|| product.as_ref().and_then(|p| p.repo_remote_url.clone()));
         let Some(repo_remote_url) = repo_remote_url else {
-            tracing::warn!(project_id = %ctx.project_id, "populator: no repo_remote_url to fetch the doc from");
-            Self::finish(
-                db,
-                ctx,
-                run_id,
-                PlannerRunPatch::builder()
+            tracing::warn!(project_id, "populator: no repo_remote_url to fetch the doc from");
+            return Ok(PlanAttempt::Terminal {
+                outcome: PopulateOutcome::DocMissing,
+                patch: PlannerRunPatch::builder()
                     .outcome(PLANNER_OUTCOME_DOC_MISSING)
                     .result_summary("no repo_remote_url resolvable for the design doc")
                     .build(),
-                "Auto-populate failed: no repo for design doc",
-                "The design PR merged but neither the project's design-doc pointer nor its product \
-                 resolves to a repository URL, so the planner cannot fetch the doc."
+                title: "Auto-populate failed: no repo for design doc",
+                body: "The design PR merged but neither the project's design-doc pointer nor its product \
+                       resolves to a repository URL, so the planner cannot fetch the doc."
                     .to_owned(),
-                publisher,
-            )
-            .await;
-            return Ok(PopulateOutcome::DocMissing);
+            });
         };
         let git_ref = project
             .design_doc_branch
@@ -397,48 +582,38 @@ impl Populator {
         let doc = match steps.fetch_doc(&repo_remote_url, &doc_path, &git_ref).await {
             DocFetchOutcome::Content(text) => text,
             DocFetchOutcome::DocMissing => {
-                tracing::warn!(project_id = %ctx.project_id, doc_path, git_ref, "populator: design doc 404 at merged ref");
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
+                tracing::warn!(project_id, doc_path, git_ref, "populator: design doc 404 at merged ref");
+                return Ok(PlanAttempt::Terminal {
+                    outcome: PopulateOutcome::DocMissing,
+                    patch: PlannerRunPatch::builder()
                         .outcome(PLANNER_OUTCOME_DOC_MISSING)
                         .doc_ref(doc_ref_summary.clone())
                         .result_summary(format!("design doc not found at {git_ref}: {doc_path}"))
                         .build(),
-                    "Auto-populate failed: design doc not found",
-                    format!(
+                    title: "Auto-populate failed: design doc not found",
+                    body: format!(
                         "The design doc `{doc_path}` was not found at `{git_ref}` when the planner \
                          tried to read it (it may have moved after merge). No tasks were created. \
                          Re-run `boss project plan <project>` once the path is correct."
                     ),
-                    publisher,
-                )
-                .await;
-                return Ok(PopulateOutcome::DocMissing);
+                });
             }
             DocFetchOutcome::FetchFailed { reason } => {
-                tracing::warn!(project_id = %ctx.project_id, reason, "populator: doc fetch failed");
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
+                tracing::warn!(project_id, reason, "populator: doc fetch failed");
+                return Ok(PlanAttempt::Terminal {
+                    outcome: PopulateOutcome::FetchFailed,
+                    patch: PlannerRunPatch::builder()
                         .outcome(PLANNER_OUTCOME_FETCH_FAILED)
                         .doc_ref(doc_ref_summary.clone())
                         .result_summary(format!("doc fetch failed: {reason}"))
                         .build(),
-                    "Auto-populate failed: could not fetch design doc",
-                    format!(
+                    title: "Auto-populate failed: could not fetch design doc",
+                    body: format!(
                         "The planner could not fetch the design doc from GitHub after retries \
                          ({reason}). No tasks were created. Re-run `boss project plan <project>` \
                          once GitHub is reachable."
                     ),
-                    publisher,
-                )
-                .await;
-                return Ok(PopulateOutcome::FetchFailed);
+                });
             }
         };
 
@@ -474,7 +649,7 @@ impl Populator {
                 goal: project.goal.clone(),
             })
             .product(ProductContext {
-                id: ctx.product_id.clone(),
+                id: product_id.to_owned(),
                 slug: product.as_ref().map(|p| p.slug.clone()).unwrap_or_default(),
                 name: product.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
                 repo_remote_url,
@@ -484,145 +659,128 @@ impl Populator {
             .build();
 
         // Record what we're about to send before the (slow) LLM call, so the
-        // audit row is informative even if the process dies mid-call.
-        let _ = db.update_planner_run(
-            run_id,
-            PlannerRunPatch::builder()
-                .doc_ref(doc_ref_summary.clone())
-                .model(PLANNER_MODEL)
-                .input_summary(input_summary)
-                .build(),
-        );
+        // audit row is informative even if the process dies mid-call. Skipped
+        // entirely for a dry-run preview (`run_id = None`) — nothing is
+        // written for a preview.
+        if let Some(run_id) = run_id {
+            let _ = db.update_planner_run(
+                run_id,
+                PlannerRunPatch::builder()
+                    .doc_ref(doc_ref_summary.clone())
+                    .model(PLANNER_MODEL)
+                    .input_summary(input_summary)
+                    .build(),
+            );
+        }
 
         // 5. Plan (the one LLM step).
         let output = match steps.plan(&planner_input).await {
             PlannerOutcome::Success(output) => output,
             failure => {
                 let detail = failure.detail();
-                tracing::warn!(project_id = %ctx.project_id, outcome = failure.tag(), detail, "populator: planner failed");
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
+                tracing::warn!(project_id, outcome = failure.tag(), detail, "populator: planner failed");
+                return Ok(PlanAttempt::Terminal {
+                    outcome: PopulateOutcome::PlannerFailed,
+                    patch: PlannerRunPatch::builder()
                         .outcome(PLANNER_OUTCOME_PLANNER_FAILED)
                         .result_summary(format!("planner {}: {detail}", failure.tag()))
                         .build(),
-                    "Auto-populate failed: planner error",
-                    format!(
+                    title: "Auto-populate failed: planner error",
+                    body: format!(
                         "The planner could not produce a task graph ({detail}). No tasks were \
                          created. Re-run `boss project plan <project>` (configure ANTHROPIC_API_KEY \
                          first if that is the cause)."
                     ),
-                    publisher,
-                )
-                .await;
-                return Ok(PopulateOutcome::PlannerFailed);
+                });
             }
         };
 
         // Persist the raw structured output + rationale + effort audit before
         // validating, so the operator can always read exactly what the model
-        // proposed (design §"Durable audit trail").
-        let raw_output = serde_json::to_string(&output).unwrap_or_else(|e| format!("<unserializable: {e}>"));
-        let _ = db.update_planner_run(
-            run_id,
-            PlannerRunPatch::builder()
-                .raw_output(raw_output)
-                .notes(output.notes.clone())
-                .effort_audit(output.effort_audit.join("\n"))
-                .build(),
-        );
+        // proposed (design §"Durable audit trail"). Skipped for a preview.
+        if let Some(run_id) = run_id {
+            let raw_output = serde_json::to_string(&output).unwrap_or_else(|e| format!("<unserializable: {e}>"));
+            let _ = db.update_planner_run(
+                run_id,
+                PlannerRunPatch::builder()
+                    .raw_output(raw_output)
+                    .notes(output.notes.clone())
+                    .effort_audit(output.effort_audit.join("\n"))
+                    .build(),
+            );
+        }
 
         // 6. Validate the structured proposal.
         match validate(&output, max_tasks) {
-            ValidationResult::NoBreakdown => {
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
-                        .outcome(PLANNER_OUTCOME_NO_BREAKDOWN)
-                        .result_summary("no task-breakdown section in the doc")
-                        .build(),
-                    "Auto-populate: no task breakdown found",
-                    "The design doc for this project had no implementation task-breakdown section, \
-                     so no tasks were created. Plan manually, or add a breakdown and re-run \
-                     `boss project plan <project>`."
-                        .to_owned(),
-                    publisher,
-                )
-                .await;
-                Ok(PopulateOutcome::NoBreakdown)
-            }
-            ValidationResult::EmptyBreakdown => {
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
-                        .outcome(PLANNER_OUTCOME_NO_BREAKDOWN)
-                        .result_summary("breakdown section present but no tasks extracted")
-                        .build(),
-                    "Auto-populate: empty task breakdown",
-                    "The planner found a task-breakdown section but extracted no tasks from it. \
-                     No tasks were created. Re-run `boss project plan <project>` or plan manually."
-                        .to_owned(),
-                    publisher,
-                )
-                .await;
-                Ok(PopulateOutcome::EmptyBreakdown)
-            }
-            ValidationResult::RejectedTooMany { count, max } => {
-                Self::finish(
-                    db,
-                    ctx,
-                    run_id,
-                    PlannerRunPatch::builder()
-                        .outcome(PLANNER_OUTCOME_REJECTED_TOO_MANY)
-                        .result_summary(format!("rejected: proposed {count} tasks, cap is {max}"))
-                        .build(),
-                    "Auto-populate rejected: too many tasks",
-                    format!(
-                        "The planner proposed {count} tasks, over the cap of {max}. The whole \
-                         proposal was rejected (nothing is silently truncated) and no tasks were \
-                         created. Split the project, or re-run `boss project plan <project>` with a \
-                         higher cap."
-                    ),
-                    publisher,
-                )
-                .await;
-                Ok(PopulateOutcome::RejectedTooMany { count, max })
-            }
+            ValidationResult::NoBreakdown => Ok(PlanAttempt::Terminal {
+                outcome: PopulateOutcome::NoBreakdown,
+                patch: PlannerRunPatch::builder()
+                    .outcome(PLANNER_OUTCOME_NO_BREAKDOWN)
+                    .result_summary("no task-breakdown section in the doc")
+                    .build(),
+                title: "Auto-populate: no task breakdown found",
+                body: "The design doc for this project had no implementation task-breakdown section, \
+                       so no tasks were created. Plan manually, or add a breakdown and re-run \
+                       `boss project plan <project>`."
+                    .to_owned(),
+            }),
+            ValidationResult::EmptyBreakdown => Ok(PlanAttempt::Terminal {
+                outcome: PopulateOutcome::EmptyBreakdown,
+                patch: PlannerRunPatch::builder()
+                    .outcome(PLANNER_OUTCOME_NO_BREAKDOWN)
+                    .result_summary("breakdown section present but no tasks extracted")
+                    .build(),
+                title: "Auto-populate: empty task breakdown",
+                body: "The planner found a task-breakdown section but extracted no tasks from it. \
+                       No tasks were created. Re-run `boss project plan <project>` or plan manually."
+                    .to_owned(),
+            }),
+            ValidationResult::RejectedTooMany { count, max } => Ok(PlanAttempt::Terminal {
+                outcome: PopulateOutcome::RejectedTooMany { count, max },
+                patch: PlannerRunPatch::builder()
+                    .outcome(PLANNER_OUTCOME_REJECTED_TOO_MANY)
+                    .result_summary(format!("rejected: proposed {count} tasks, cap is {max}"))
+                    .build(),
+                title: "Auto-populate rejected: too many tasks",
+                body: format!(
+                    "The planner proposed {count} tasks, over the cap of {max}. The whole \
+                     proposal was rejected (nothing is silently truncated) and no tasks were \
+                     created. Split the project, or re-run `boss project plan <project>` with a \
+                     higher cap."
+                ),
+            }),
             ValidationResult::RejectedDuplicateHandle { handle } => {
-                Self::reject_bad_graph(db, ctx, run_id, format!("duplicate task handle: {handle}"), publisher).await;
-                Ok(PopulateOutcome::RejectedBadGraph)
+                Ok(Self::bad_graph_attempt(format!("duplicate task handle: {handle}")))
             }
-            ValidationResult::RejectedUnknownHandle { handle } => {
-                Self::reject_bad_graph(
-                    db,
-                    ctx,
-                    run_id,
-                    format!("edge references unknown handle: {handle}"),
-                    publisher,
-                )
-                .await;
-                Ok(PopulateOutcome::RejectedBadGraph)
-            }
-            ValidationResult::RejectedCycle { cycle } => {
-                Self::reject_bad_graph(
-                    db,
-                    ctx,
-                    run_id,
-                    format!("dependency cycle: {}", cycle.join(" → ")),
-                    publisher,
-                )
-                .await;
-                Ok(PopulateOutcome::RejectedBadGraph)
-            }
-            ValidationResult::Valid { low_confidence } => {
-                Self::apply_and_stage(db, ctx, run_id, &output, low_confidence, publisher).await
-            }
+            ValidationResult::RejectedUnknownHandle { handle } => Ok(Self::bad_graph_attempt(format!(
+                "edge references unknown handle: {handle}"
+            ))),
+            ValidationResult::RejectedCycle { cycle } => Ok(Self::bad_graph_attempt(format!(
+                "dependency cycle: {}",
+                cycle.join(" → ")
+            ))),
+            ValidationResult::Valid { low_confidence } => Ok(PlanAttempt::Valid { output, low_confidence }),
+        }
+    }
+
+    /// Build the terminal [`PlanAttempt`] for a rejected malformed graph
+    /// (cyclic, unknown-handle, or duplicate-handle proposal — the design's
+    /// `rejected_cycle` bucket covers all three). Nothing is written; the
+    /// caller decides whether to persist the patch (a claimed run) or
+    /// discard it (a preview).
+    fn bad_graph_attempt(reason: String) -> PlanAttempt {
+        tracing::warn!(reason, "populator: rejected malformed task graph");
+        PlanAttempt::Terminal {
+            outcome: PopulateOutcome::RejectedBadGraph,
+            patch: PlannerRunPatch::builder()
+                .outcome(PLANNER_OUTCOME_REJECTED_CYCLE)
+                .result_summary(format!("rejected: {reason}"))
+                .build(),
+            title: "Auto-populate rejected: malformed task graph",
+            body: format!(
+                "The planner's proposed task graph was rejected as malformed ({reason}). No tasks \
+                 were created. Re-run `boss project plan <project>` or plan manually."
+            ),
         }
     }
 
@@ -761,37 +919,9 @@ impl Populator {
         Ok(PopulateOutcome::Staged {
             created,
             edges,
+            skipped,
             low_confidence,
         })
-    }
-
-    /// Record a rejected-graph outcome (`rejected_cycle` bucket covers cyclic,
-    /// unknown-handle, and duplicate-handle proposals per the design) plus an
-    /// attention item. Nothing was written.
-    async fn reject_bad_graph(
-        db: &WorkDb,
-        ctx: &PopulateContext,
-        run_id: &str,
-        reason: String,
-        publisher: &dyn ExecutionPublisher,
-    ) {
-        tracing::warn!(project_id = %ctx.project_id, run_id, reason, "populator: rejected malformed task graph");
-        Self::finish(
-            db,
-            ctx,
-            run_id,
-            PlannerRunPatch::builder()
-                .outcome(PLANNER_OUTCOME_REJECTED_CYCLE)
-                .result_summary(format!("rejected: {reason}"))
-                .build(),
-            "Auto-populate rejected: malformed task graph",
-            format!(
-                "The planner's proposed task graph was rejected as malformed ({reason}). No tasks \
-                 were created. Re-run `boss project plan <project>` or plan manually."
-            ),
-            publisher,
-        )
-        .await;
     }
 
     /// Update the claimed `planner_runs` row with the terminal patch and raise
@@ -1127,6 +1257,7 @@ mod tests {
             PopulateOutcome::Staged {
                 created: 2,
                 edges: 1,
+                skipped: 0,
                 low_confidence: false
             }
         );
@@ -1156,13 +1287,12 @@ mod tests {
             DocFetchOutcomeKind::Content("# doc".to_owned()),
             PlannerOutcomeKind::Success(output),
         );
-        let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
             &db,
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
-            &publisher,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(
@@ -1170,6 +1300,7 @@ mod tests {
             PopulateOutcome::Staged {
                 created: 1,
                 edges: 0,
+                skipped: 0,
                 low_confidence: true
             }
         );
@@ -1409,5 +1540,188 @@ mod tests {
         enqueue_from_merge(&db, ctx(&product_id, &project_id, &design_id));
         // No planner run was claimed.
         assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
+    }
+
+    // ---- operator entry points (`boss project plan`) -----------------------
+
+    #[tokio::test]
+    async fn run_operator_stages_tasks_with_caller_operator() {
+        let db = open();
+        let (product_id, project_id, _design_id) = seed(&db);
+        let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+        let outcome = Populator::run_operator(
+            &db,
+            &steps,
+            &project_id,
+            DEFAULT_MAX_TASKS,
+            false,
+            &RecordingPublisher::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PopulateOutcome::Staged {
+                created: 1,
+                edges: 0,
+                skipped: 0,
+                low_confidence: false,
+            }
+        );
+        let run = db.live_planner_run_for_project(&project_id).unwrap().unwrap();
+        assert_eq!(run.caller, CALLER_OPERATOR);
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 1);
+    }
+
+    #[tokio::test]
+    async fn run_operator_refuses_pre_seeded_without_force() {
+        let db = open();
+        let (product_id, project_id, _design_id) = seed(&db);
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project_id.clone())
+                .name("Hand-written task")
+                .build(),
+        )
+        .unwrap();
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
+        );
+        let outcome = Populator::run_operator(
+            &db,
+            &steps,
+            &project_id,
+            DEFAULT_MAX_TASKS,
+            false,
+            &RecordingPublisher::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, PopulateOutcome::SkippedPreSeeded { existing: 1 });
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 1);
+    }
+
+    #[tokio::test]
+    async fn run_operator_force_bypasses_pre_seeded_refusal() {
+        let db = open();
+        let (product_id, project_id, _design_id) = seed(&db);
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project_id.clone())
+                .name("Hand-written task")
+                .build(),
+        )
+        .unwrap();
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
+        );
+        let outcome = Populator::run_operator(
+            &db,
+            &steps,
+            &project_id,
+            DEFAULT_MAX_TASKS,
+            true,
+            &RecordingPublisher::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PopulateOutcome::Staged {
+                created: 1,
+                edges: 0,
+                skipped: 0,
+                low_confidence: false,
+            }
+        );
+        // The pre-seeded task is preserved alongside the newly staged one.
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 2);
+    }
+
+    // ---- dry-run preview (`boss project plan --dry-run`) -------------------
+
+    #[tokio::test]
+    async fn preview_reports_valid_proposal_without_writing_anything() {
+        let db = open();
+        let (product_id, project_id, _design_id) = seed(&db);
+        let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+        let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
+            .await
+            .unwrap();
+        match preview {
+            PreviewOutcome::Valid { output, low_confidence } => {
+                assert_eq!(output.tasks.len(), 1);
+                assert!(!low_confidence);
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        // Nothing was claimed or written.
+        assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
+    }
+
+    #[tokio::test]
+    async fn preview_reports_pre_seeded_without_force() {
+        let db = open();
+        let (product_id, project_id, _design_id) = seed(&db);
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project_id.clone())
+                .name("Hand-written task")
+                .build(),
+        )
+        .unwrap();
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
+        );
+        let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
+            .await
+            .unwrap();
+        assert!(matches!(preview, PreviewOutcome::PreSeeded { existing: 1 }));
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 1);
+    }
+
+    #[tokio::test]
+    async fn preview_reports_already_populated() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+        // A real run first stages the batch...
+        let first = Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
+        )
+        .await;
+        assert!(matches!(first, PopulateOutcome::Staged { .. }));
+
+        // ...then a preview must report it rather than re-planning.
+        let preview = Populator::preview(&db, &steps, &project_id, DEFAULT_MAX_TASKS, false)
+            .await
+            .unwrap();
+        match preview {
+            PreviewOutcome::AlreadyPopulated { outcome } => assert_eq!(outcome, PLANNER_OUTCOME_STAGED),
+            other => panic!("expected AlreadyPopulated, got {other:?}"),
+        }
     }
 }

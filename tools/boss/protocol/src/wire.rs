@@ -78,6 +78,15 @@ fn default_pool_size() -> i64 {
     1
 }
 
+/// One task preserved (not deleted) by [`FrontendRequest::UnpopulateProject`]
+/// because it already had an execution — i.e. it was released and
+/// dispatched, so undoing the populate would destroy in-flight work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnpopulatePreservedTask {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendRequestEnvelope {
     pub request_id: String,
@@ -879,6 +888,15 @@ pub enum FrontendRequest {
     /// state on the Agents-tab worker row.
     ListLiveStatusDisabledSlots,
 
+    /// All `planner_runs` audit rows for a project, newest first. Backs
+    /// `boss project plan-runs <project>` — the operator's after-the-fact
+    /// window into auto-populate invocations they could not watch. See
+    /// `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
+    /// §"Durable audit trail". Replies with [`FrontendEvent::PlannerRunsList`].
+    ListPlannerRuns {
+        project_id: String,
+    },
+
     ListProducts,
 
     ListProjects {
@@ -1069,6 +1087,29 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    /// Operator entry point for the auto-populate Planner/Materializer
+    /// (design P783 §2 "Reusability" #2 — "plan this project now" /
+    /// replan). Builds the same `PlannerInput` the design-PR-merge
+    /// trigger builds — from the project's stored `design_doc_path`,
+    /// fetched live from GitHub — and runs the identical claim →
+    /// pre-seeded check → fetch → plan → validate → apply → audit →
+    /// surface pipeline, stamping `planner_runs.caller = "operator"`.
+    ///
+    /// `dry_run` runs infer + validate and returns the proposal without
+    /// materializing or claiming the per-project idempotency gate — a
+    /// preview of what a real run would do. `force` bypasses the
+    /// pre-seeded refusal (a project that already has implementation
+    /// tasks); the Materializer's `(name, project_id)` dedup makes a
+    /// forced re-populate additive, never destructive. Replies with
+    /// [`FrontendEvent::PlanProjectResult`].
+    PlanProject {
+        project_id: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
+
     /// Boss-tier RPC: queue a probe prompt for `run_id`. By default
     /// the engine holds the text until the next `Stop` hook event for
     /// that run, then writes it into the worker's pty as if it were
@@ -1146,6 +1187,17 @@ pub enum FrontendRequest {
     /// immediately reflects accurate `capability_present` state.
     RegisterCapabilities {
         capability_ids: Vec<String>,
+    },
+
+    /// Release a project's staged auto-populate batch (design
+    /// §"Operator review checkpoint"): flips `autostart = true` on every
+    /// non-deleted task tagged with the project's live `planner_runs`
+    /// row (`outcome = 'staged'`), so the normal dispatcher picks them up
+    /// on its next pass. Errors if there is no staged run for the
+    /// project (nothing to release, or it was already released).
+    /// Replies with [`FrontendEvent::ReleaseProjectResult`].
+    ReleaseProject {
+        project_id: String,
     },
 
     /// App notifies the engine that a review terminal window has closed
@@ -1460,6 +1512,20 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] if the work item is not found.
     UnlinkWorkItemExternalRef {
         work_item_id: String,
+    },
+
+    /// Undo an auto-populate batch (design §"Undo / rollback"):
+    /// soft-deletes every task tagged with `run_id`'s `planner_runs.id`
+    /// that has no execution yet (i.e. was never released and
+    /// dispatched), and deletes the `planner_runs` row itself — clearing
+    /// the per-project idempotency gate so a corrected re-plan can run.
+    /// Tasks that already have an execution are preserved, not deleted,
+    /// and reported back so the operator decides what to do with them.
+    /// Replies with [`FrontendEvent::UnpopulateProjectResult`].
+    UnpopulateProject {
+        project_id: String,
+        /// The `planner_runs.id` (`run_…`) to undo.
+        run_id: String,
     },
 
     Unsubscribe {
@@ -2153,6 +2219,50 @@ pub enum FrontendEvent {
     /// `created_at`.
     EffortEscalationRecorded {
         event: crate::EffortEscalation,
+    },
+    /// Response to [`FrontendRequest::ListPlannerRuns`]: every
+    /// `planner_runs` audit row for the project, newest first.
+    PlannerRunsList {
+        project_id: String,
+        runs: Vec<crate::PlannerRun>,
+    },
+    /// Response to [`FrontendRequest::PlanProject`]. `outcome` is one of
+    /// the `PLANNER_OUTCOME_*` tags (e.g. `"staged"`, `"no_breakdown"`,
+    /// `"rejected_cycle"`) for a real run, or a `"preview_"`-prefixed
+    /// variant for a `dry_run` preview (see the CLI's rendering of this
+    /// event). `message` is a human-readable summary. `proposal` carries
+    /// the full task-graph proposal only when the plan produced a valid
+    /// one — a real `staged` apply or a successful dry-run preview.
+    PlanProjectResult {
+        project_id: String,
+        outcome: String,
+        message: String,
+        #[serde(default)]
+        created: usize,
+        #[serde(default)]
+        edges: usize,
+        #[serde(default)]
+        skipped: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal: Option<crate::PlannerOutput>,
+    },
+    /// Response to [`FrontendRequest::ReleaseProject`].
+    ReleaseProjectResult {
+        project_id: String,
+        run_id: String,
+        released: usize,
+    },
+    /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
+    /// carries the ids of tasks soft-deleted; `preserved` carries the
+    /// tasks that already had an execution (released and dispatched)
+    /// and were left alone.
+    UnpopulateProjectResult {
+        project_id: String,
+        run_id: String,
+        deleted: Vec<String>,
+        preserved: Vec<UnpopulatePreservedTask>,
     },
     /// Response to [`FrontendRequest::ListFeatureFlags`]: a snapshot
     /// of every registered engine feature flag plus its current

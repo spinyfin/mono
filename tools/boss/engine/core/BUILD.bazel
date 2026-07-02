@@ -22,6 +22,7 @@ rust_library(
         "src/app/live_status.rs",
         "src/app/metrics.rs",
         "src/app/panes.rs",
+        "src/app/planner_ops.rs",
         "src/app/products.rs",
         "src/app/projects.rs",
         "src/app/review.rs",
