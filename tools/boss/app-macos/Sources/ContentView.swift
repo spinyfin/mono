@@ -315,6 +315,15 @@ struct ContentView: View {
             )
         }
         .sheet(isPresented: Binding(
+            get: { model.plannerInspectorProjectID != nil },
+            set: { if !$0 { model.closePlannerInspector() } }
+        )) {
+            if let projectID = model.plannerInspectorProjectID,
+               let project = model.project(withID: projectID) {
+                PlannerRunInspectorView(model: model, project: project)
+            }
+        }
+        .sheet(isPresented: Binding(
             get: { model.editorialControlsProductID != nil && model.isEditorialControlsEnabled },
             set: { if !$0 { model.editorialControlsProductID = nil } }
         )) {
@@ -969,7 +978,10 @@ struct ContentView: View {
                 shortIDLabel: sectionProject?.shortID.map { "P" + String($0) }
             ) {
                 if let sectionProject {
-                    ProjectDesignDocAffordance(model: model, project: sectionProject)
+                    HStack(spacing: 6) {
+                        ProjectDesignDocAffordance(model: model, project: sectionProject)
+                        PlannerRunAffordance(model: model, project: sectionProject)
+                    }
                 }
             } content: {
                 workSectionItems(section.items, column: column)
@@ -2251,6 +2263,13 @@ struct WorkBoardCardView: View {
                             .help("Created by automation")
                             .accessibilityLabel("Created by automation")
                     }
+                    if task.isPlannerStaged {
+                        Image(systemName: "sparkle.magnifyingglass")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.indigo)
+                            .help("Staged by the Planner — release the project to begin dispatch")
+                            .accessibilityLabel("Staged by the Planner")
+                    }
                     if let extRef = externalRefLink {
                         ExternalRefLinkView(presentation: extRef)
                     }
@@ -2719,6 +2738,343 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
             return trimmed
         }
         return repoURL
+    }
+}
+
+// ===========================================================================
+// Planner review/release/undo surface (design: tools/boss/docs/designs/
+// auto-populate-project-tasks-on-design-pr-merge.md, task 10). Thin client
+// over `list_planner_runs` / `release_project` / `unpopulate_project`: a
+// kanban project-header accessory summarising the project's latest planner
+// run, a popover with the Release/Undo actions, and a full inspector sheet
+// (raw model output + rationale) for the whole audit trail.
+// ===========================================================================
+
+/// Per-project Planner affordance for the kanban project-section header,
+/// mirroring [[ProjectDesignDocAffordance]]. Fetches the project's planner
+/// runs on first appearance and stays empty until the first reply lands
+/// (or the project has never been planned), then shows an outcome-tinted
+/// icon that opens [[PlannerRunPopoverView]].
+struct PlannerRunAffordance: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+    @State private var isPopoverPresented = false
+    @State private var hasRequestedRuns = false
+
+    private var latestRun: PlannerRun? { model.latestPlannerRun(forProjectID: project.id) }
+
+    var body: some View {
+        Group {
+            if let latestRun {
+                Button {
+                    isPopoverPresented = true
+                } label: {
+                    Image(systemName: systemImage(for: latestRun))
+                        .font(.caption)
+                        .foregroundStyle(tint(for: latestRun))
+                        .accessibilityLabel("Planner: \(latestRun.outcomeLabel)")
+                }
+                .buttonStyle(.plain)
+                .help(latestRun.outcomeLabel)
+                .popover(isPresented: $isPopoverPresented) {
+                    PlannerRunPopoverView(model: model, project: project, run: latestRun)
+                }
+            }
+        }
+        .onAppear {
+            guard !hasRequestedRuns else { return }
+            hasRequestedRuns = true
+            model.refreshPlannerRuns(projectID: project.id)
+        }
+    }
+
+    private func systemImage(for run: PlannerRun) -> String {
+        switch run.outcome {
+        case "staged": return "tray.and.arrow.down.fill"
+        case "applied": return "checkmark.circle"
+        case "running": return "hourglass"
+        default: return "exclamationmark.circle"
+        }
+    }
+
+    private func tint(for run: PlannerRun) -> Color {
+        switch run.outcome {
+        case "staged": return .accentColor
+        case "applied", "running": return .secondary
+        default: return .orange
+        }
+    }
+}
+
+/// Compact popover shown from [[PlannerRunAffordance]]: the latest run's
+/// outcome and summary, a Release action while staged, an Undo action
+/// while the batch could still be reverted, and a link into the full
+/// [[PlannerRunInspectorView]].
+private struct PlannerRunPopoverView: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+    let run: PlannerRun
+
+    private var isBusy: Bool { model.plannerActionInFlightProjectIDs.contains(project.id) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .foregroundStyle(.secondary)
+                Text("Planner").font(.headline)
+                Spacer(minLength: 0)
+            }
+            Text(run.outcomeLabel)
+                .font(.subheadline.weight(.medium))
+            if let summary = run.resultSummary, !summary.isEmpty {
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack(spacing: 8) {
+                if run.isStaged {
+                    Button {
+                        model.releaseProject(projectID: project.id)
+                    } label: {
+                        Label("Release", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isBusy)
+                }
+                if run.isStaged || run.isApplied {
+                    PlannerUndoButton(model: model, project: project, run: run, isBusy: isBusy)
+                }
+                Spacer(minLength: 0)
+                if isBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            Button {
+                model.openPlannerInspector(projectID: project.id)
+            } label: {
+                Text("View all planner runs…")
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+        }
+        .padding(14)
+        .frame(minWidth: 300)
+    }
+}
+
+/// Shared "Undo" control with a confirmation dialog — deleting a staged
+/// batch is reversible only via re-plan, so it warrants a confirm step
+/// unlike Release (which is purely additive: flip `autostart`).
+private struct PlannerUndoButton: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+    let run: PlannerRun
+    let isBusy: Bool
+    @State private var isConfirmingUndo = false
+
+    var body: some View {
+        Button(role: .destructive) {
+            isConfirmingUndo = true
+        } label: {
+            Label("Undo", systemImage: "arrow.uturn.backward")
+        }
+        .buttonStyle(.bordered)
+        .disabled(isBusy)
+        .confirmationDialog(
+            "Undo this planner run?",
+            isPresented: $isConfirmingUndo,
+            titleVisibility: .visible
+        ) {
+            Button("Delete staged tasks", role: .destructive) {
+                model.unpopulateProject(projectID: project.id, runID: run.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Deletes the tasks this run staged that haven't been released and dispatched yet. "
+                    + "Tasks already in progress are preserved."
+            )
+        }
+    }
+}
+
+/// Full planner-run audit view for one project ("planner-run inspector
+/// (raw output + rationale)" — task 10). Lists every `planner_runs` row,
+/// newest first, each expandable to its rationale notes, effort-
+/// classification audit lines, and the verbatim raw model output.
+struct PlannerRunInspectorView: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+    @Environment(\.dismiss) private var dismiss
+
+    private var runs: [PlannerRun] { model.plannerRuns(forProjectID: project.id) }
+    private var isBusy: Bool { model.plannerActionInFlightProjectIDs.contains(project.id) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if runs.isEmpty {
+                emptyState
+            } else {
+                List {
+                    ForEach(runs) { run in
+                        PlannerRunRow(model: model, project: project, run: run, isBusy: isBusy)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .frame(minWidth: 560, minHeight: 420)
+        .onAppear { model.refreshPlannerRuns(projectID: project.id) }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkle.magnifyingglass")
+                .foregroundStyle(.secondary)
+            Text("Planner runs")
+                .font(.headline)
+            Text(project.name)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Button("Done") { dismiss() }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "tray")
+                .font(.system(size: 28))
+                .foregroundStyle(.tertiary)
+            Text("No planner runs recorded")
+                .font(.headline)
+            Text("Runs appear here once the design doc merges, or after an operator runs `boss project plan`.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
+
+/// One expandable row in [[PlannerRunInspectorView]] — collapsed shows the
+/// outcome, caller, and timestamp; expanded adds rationale, effort audit,
+/// raw output, and the Release/Undo actions when this run is still live.
+private struct PlannerRunRow: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+    let run: PlannerRun
+    let isBusy: Bool
+    @State private var isExpanded: Bool
+
+    init(model: ChatViewModel, project: WorkProject, run: PlannerRun, isBusy: Bool) {
+        self.model = model
+        self.project = project
+        self.run = run
+        self.isBusy = isBusy
+        _isExpanded = State(initialValue: run.isStaged)
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                if let notes = run.notes, !notes.isEmpty {
+                    section(title: "Rationale") {
+                        Text(notes)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                let auditLines = run.effortAuditLines
+                if !auditLines.isEmpty {
+                    section(title: "Effort classification") {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(auditLines, id: \.self) { line in
+                                Text(line).font(.caption.monospaced())
+                            }
+                        }
+                    }
+                }
+                if let rawOutput = run.rawOutput, !rawOutput.isEmpty {
+                    section(title: "Raw model output") {
+                        ScrollView {
+                            Text(rawOutput)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 200)
+                    }
+                }
+                if run.isStaged || run.isApplied {
+                    actions
+                }
+            }
+            .padding(.top, 6)
+            .padding(.leading, 16)
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Circle().fill(tint).frame(width: 8, height: 8).padding(.top, 5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(run.outcomeLabel).font(.subheadline.weight(.medium))
+                    Text("\(run.caller) · \(run.createdAt)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let summary = run.resultSummary, !summary.isEmpty {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var tint: Color {
+        switch run.outcome {
+        case "staged": return .accentColor
+        case "applied": return .green
+        case "running": return .secondary
+        default: return .orange
+        }
+    }
+
+    @ViewBuilder
+    private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        HStack(spacing: 8) {
+            if run.isStaged {
+                Button {
+                    model.releaseProject(projectID: project.id)
+                } label: {
+                    Label("Release", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isBusy)
+            }
+            PlannerUndoButton(model: model, project: project, run: run, isBusy: isBusy)
+            if isBusy {
+                ProgressView().controlSize(.small)
+            }
+        }
     }
 }
 

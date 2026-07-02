@@ -227,6 +227,24 @@ enum EngineEvent {
     /// Response to `list_attention_items_for_work_item` — open and
     /// resolved attention items for a given product/work-item id.
     case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])
+    /// Response to `list_planner_runs` — every `planner_runs` audit row
+    /// for the project, newest first. Drives the Planner review/release/
+    /// undo surface (design auto-populate-project-tasks-on-design-pr-merge.md
+    /// task 10).
+    case plannerRunsList(projectID: String, runs: [PlannerRun])
+    /// Response to `release_project` — the engine flipped `autostart =
+    /// true` on every task in `runID`'s staged batch; dispatch begins on
+    /// the next reconcile pass.
+    case releaseProjectResult(projectID: String, runID: String, released: Int)
+    /// Response to `unpopulate_project` — `deleted` carries the ids of
+    /// tasks soft-deleted; `preserved` carries tasks that already had an
+    /// execution (released and dispatched) and were left alone.
+    case unpopulateProjectResult(
+        projectID: String,
+        runID: String,
+        deleted: [String],
+        preserved: [UnpopulatePreservedTask]
+    )
     /// Response to `open_review_terminal` — the engine has leased a
     /// workspace, fetched the PR branch, and created a new jj commit
     /// atop `<branch>@origin`. The app should open a Ghostty terminal
@@ -551,6 +569,38 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
+        ])
+    }
+
+    // MARK: Planner review/release/undo (auto-populate-project-tasks-on-design-pr-merge.md)
+
+    /// List every `planner_runs` audit row for a project, newest first.
+    /// Replies with `planner_runs_list`.
+    func sendListPlannerRuns(projectId: String) {
+        sendLine([
+            "type": "list_planner_runs",
+            "project_id": projectId,
+        ])
+    }
+
+    /// Release a project's staged auto-populate batch: flips `autostart =
+    /// true` on every task tagged with the project's live (staged) planner
+    /// run. Replies with `release_project_result`.
+    func sendReleaseProject(projectId: String) {
+        sendLine([
+            "type": "release_project",
+            "project_id": projectId,
+        ])
+    }
+
+    /// Undo an auto-populate batch: soft-deletes every task tagged with
+    /// `runId` that has no execution yet, and clears the run's idempotency
+    /// gate. Replies with `unpopulate_project_result`.
+    func sendUnpopulateProject(projectId: String, runId: String) {
+        sendLine([
+            "type": "unpopulate_project",
+            "project_id": projectId,
+            "run_id": runId,
         ])
     }
 
@@ -1620,6 +1670,34 @@ final class EngineClient: @unchecked Sendable {
                 if !workItemID.isEmpty {
                     emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
                 }
+            case "planner_runs_list":
+                let projectID = payload["project_id"] as? String ?? ""
+                let raw = payload["runs"] as? [[String: Any]] ?? []
+                let runs = raw.compactMap(parsePlannerRun)
+                if !projectID.isEmpty {
+                    emit(.plannerRunsList(projectID: projectID, runs: runs))
+                }
+            case "release_project_result":
+                let projectID = payload["project_id"] as? String ?? ""
+                let runID = payload["run_id"] as? String ?? ""
+                let released = (payload["released"] as? NSNumber)?.intValue ?? 0
+                if !projectID.isEmpty, !runID.isEmpty {
+                    emit(.releaseProjectResult(projectID: projectID, runID: runID, released: released))
+                }
+            case "unpopulate_project_result":
+                let projectID = payload["project_id"] as? String ?? ""
+                let runID = payload["run_id"] as? String ?? ""
+                let deleted = payload["deleted"] as? [String] ?? []
+                let preservedRaw = payload["preserved"] as? [[String: Any]] ?? []
+                let preserved = preservedRaw.compactMap(parseUnpopulatePreservedTask)
+                if !projectID.isEmpty, !runID.isEmpty {
+                    emit(.unpopulateProjectResult(
+                        projectID: projectID,
+                        runID: runID,
+                        deleted: deleted,
+                        preserved: preserved
+                    ))
+                }
             case "attention_groups_list":
                 let productID = payload["product_id"] as? String ?? ""
                 let groups = (payload["groups"] as? [[String: Any]] ?? [])
@@ -2215,6 +2293,24 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
         return item
+    }
+
+    private func parsePlannerRun(_ payload: [String: Any]) -> PlannerRun? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let run = try? JSONDecoder().decode(PlannerRun.self, from: data)
+        else {
+            return nil
+        }
+        return run
+    }
+
+    private func parseUnpopulatePreservedTask(_ payload: [String: Any]) -> UnpopulatePreservedTask? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let task = try? JSONDecoder().decode(UnpopulatePreservedTask.self, from: data)
+        else {
+            return nil
+        }
+        return task
     }
 
     private func parseAttentionGroup(_ payload: [String: Any]) -> AttentionGroup? {
