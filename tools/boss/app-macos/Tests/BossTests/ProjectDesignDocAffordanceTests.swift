@@ -525,6 +525,63 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertEqual(section.projectID, project.id)
     }
 
+    /// Project-grouped sections must be collapsible, mirroring the
+    /// Done column's day buckets, so `CollapsibleWorkBoardSection`
+    /// renders the same disclosure affordance and persists expanded
+    /// state the same way.
+    func testProjectGroupedSectionIsCollapsibleAndExpandedByDefault() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        model.workBoardGrouping = .project
+        let sections = model.workSections(in: .backlog)
+        guard let section = sections.first(where: { $0.title == project.name }) else {
+            XCTFail("expected a section titled \(project.name)"); return
+        }
+        XCTAssertTrue(section.isCollapsible)
+        XCTAssertTrue(section.defaultExpanded)
+    }
+
+    /// The Chores section is a project-grouped section too — it must be
+    /// collapsible on the same terms as project sections, not just
+    /// exempt from the affordance icon.
+    func testChoreSectionIsCollapsible() {
+        let model = makeModelWithProject()
+        let productID = model.products.first!.id
+        let chore = WorkTask(
+            id: "chore_collapsible",
+            productID: productID,
+            projectID: nil,
+            kind: "chore",
+            name: "Sweep",
+            description: "",
+            status: "todo",
+            priority: "medium",
+            ordinal: 1,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z"
+        )
+        model.choresByProductID[productID] = [chore]
+        model.workBoardGrouping = .project
+        let sections = model.workSections(in: .backlog)
+        guard let chores = sections.first(where: { $0.title == "Chores" }) else {
+            XCTFail("expected a Chores section"); return
+        }
+        XCTAssertTrue(chores.isCollapsible)
+    }
+
+    /// Non-project groupings (the default board view) must remain a
+    /// single, non-collapsible section — the disclosure affordance only
+    /// applies once items are actually split into named sections.
+    func testUngroupedColumnSectionIsNotCollapsible() {
+        let model = makeModelWithProject()
+        model.workBoardGrouping = .none
+        let sections = model.workSections(in: .backlog)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertFalse(sections[0].isCollapsible)
+    }
+
     /// Chores live in their own section titled "Chores" — they have no
     /// project, so the section must carry `projectID == nil` and the
     /// view code must skip the affordance entirely (the design's "one
