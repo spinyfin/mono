@@ -163,6 +163,14 @@ pub enum ReviewFindingCategory {
     /// Boundary condition, nullability, concurrency, failure mode.
     #[serde(rename = "edgecase")]
     EdgeCase,
+    /// New hand-rolled infrastructure (HTTP/API client, external-service
+    /// wiring — endpoints, auth headers, version constants —, serialization
+    /// helper, retry/backoff logic, utility module) that reimplements an
+    /// equivalent already present elsewhere in the repo, instead of reusing
+    /// or extracting a shared module. Forces a revision regardless of
+    /// assigned severity (see [`passes_severity_gate`]) — the same
+    /// treatment as [`Self::Regression`].
+    Duplication,
 }
 
 /// Reviewer's confidence in a finding.
@@ -425,7 +433,12 @@ fn extract_balanced_object(s: &str) -> Option<&str> {
 ///
 /// Returns `true` when `result` qualifies for a revision:
 /// - any finding with `severity = Critical` or `High`, **or**
-/// - any finding with `category = Regression` (regardless of severity).
+/// - any finding with `category = Regression` (regardless of severity), **or**
+/// - any finding with `category = Duplication` (regardless of severity) —
+///   confirmed infrastructure reimplementation is a revision-required finding,
+///   not advisory (operator directive: reuse/duplication findings get the
+///   exact same forcing treatment as regressions, not a parallel escalation
+///   path).
 ///
 /// `revision_warranted = false` in the `ReviewResult` does not suppress the
 /// gate — the engine's own threshold governs.
@@ -434,7 +447,10 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
         matches!(
             f.severity,
             ReviewFindingSeverity::Critical | ReviewFindingSeverity::High
-        ) || matches!(f.category, ReviewFindingCategory::Regression)
+        ) || matches!(
+            f.category,
+            ReviewFindingCategory::Regression | ReviewFindingCategory::Duplication
+        )
     })
 }
 
@@ -494,6 +510,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
             ReviewFindingCategory::Readability => "readability",
             ReviewFindingCategory::Tests => "tests",
             ReviewFindingCategory::EdgeCase => "edgecase",
+            ReviewFindingCategory::Duplication => "duplication",
         };
         out.push_str(&format!(
             "### [{severity}] {title}\n\
@@ -798,7 +815,7 @@ pub fn render_reviewer_initial_prompt(
            \"findings\": [\n\
              {{\n\
                \"severity\": \"critical | high | medium | low\",\n\
-               \"category\": \"correctness | regression | architecture | readability | tests | edgecase\",\n\
+               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication\",\n\
                \"file\": \"path/to/file.rs\",\n\
                \"location\": \"fn foo, ~L42\",\n\
                \"title\": \"<short scannable title>\",\n\
@@ -817,9 +834,10 @@ pub fn render_reviewer_initial_prompt(
          \n\
          - `revision_warranted`: set to `true` when there is at least one \
            finding at `critical`/`high` severity, or any finding with \
-           `category: \"regression\"`, regardless of severity. Set to `false` \
-           for findings that are purely `medium`/`low` correctness/style \
-           (the engine applies its own gate on top).\n\
+           `category: \"regression\"` or `category: \"duplication\"`, \
+           regardless of severity. Set to `false` for findings that are \
+           purely `medium`/`low` correctness/style (the engine applies its \
+           own gate on top).\n\
          - `regression_check.performed` MUST be `true` — you cannot skip the \
            deletion check. Always set `suspected_deletions: []`; regression \
            findings go in `findings` with `category: \"regression\"` and the \
@@ -866,6 +884,29 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
              - **Architectural issues** — wrong layer, missed reuse, abstraction \
                that fights the codebase's conventions. (`category: \
                \"architecture\"`)\n\
+             - **Reuse/duplication** *(first-class, explicit check)* — for \
+               every substantial new construct the PR introduces (an \
+               HTTP/API client, external-service wiring such as endpoints, \
+               auth headers, or version constants, a serialization helper, \
+               retry/backoff logic, or a utility module), search the WHOLE \
+               repo — not just the changed files — for an existing \
+               equivalent before accepting the new code as necessary: grep \
+               for distinctive strings (the exact endpoint URL, header name, \
+               version constant, or a crate-typical helper/module name). If \
+               an equivalent already exists, raise a finding naming the \
+               existing file/module and recommending reuse or extraction of \
+               a shared module — do not let a plausible-looking \
+               reimplementation pass just because it works in isolation. \
+               Example: a new `api.anthropic.com` HTTP client in a repo that \
+               already has five hand-rolled Anthropic clients is a \
+               duplication finding regardless of how well the new one is \
+               written. A justified exception (duplication that really is \
+               necessary) must be explicitly explained in the PR \
+               description; its absence there is itself grounds for the \
+               finding. (`category: \"duplication\"`) Any confirmed \
+               duplication finding forces a revision regardless of the \
+               severity you assign it — the same treatment as a regression \
+               finding, not an advisory suggestion.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
              - **Test coverage gaps** — untested new behaviour, missing \
@@ -1139,6 +1180,56 @@ mod tests {
         assert!(prompt.contains("tests"));
     }
 
+    /// The reuse/duplication rubric dimension (P1690 incident: a sixth
+    /// hand-rolled Anthropic Messages API client landed unflagged) must be
+    /// present with the search-then-compare behaviour and the
+    /// revision-forcing note — a vague one-liner would not satisfy the
+    /// acceptance criterion.
+    #[test]
+    fn code_scope_prompt_contains_reuse_duplication_dimension() {
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/1690",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Reuse/duplication"),
+            "code rubric must contain an explicit reuse/duplication dimension"
+        );
+        assert!(
+            prompt.contains("search the WHOLE repo"),
+            "rubric must instruct searching the whole repo, not just changed files"
+        );
+        assert!(
+            prompt.contains("grep for distinctive strings"),
+            "rubric must instruct grepping for distinctive strings (endpoint/header/const)"
+        );
+        assert!(
+            prompt.contains("api.anthropic.com"),
+            "rubric must include the concrete acceptance-example anchor"
+        );
+        assert!(
+            prompt.contains("\"duplication\""),
+            "rubric must name the duplication category"
+        );
+        assert!(
+            prompt.contains("forces a revision regardless of the severity"),
+            "rubric must state duplication findings are revision-required, not advisory"
+        );
+        let revision_warranted_offset = prompt
+            .find("`revision_warranted`: set to `true`")
+            .expect("prompt must state the revision_warranted rule");
+        let rule_text = &prompt[revision_warranted_offset..revision_warranted_offset + 400];
+        assert!(
+            rule_text.contains("category: \"regression\"") && rule_text.contains("category: \"duplication\""),
+            "revision_warranted rule must cover both regression and duplication categories: {rule_text}"
+        );
+    }
+
     #[test]
     fn docs_only_scope_prompt_contains_docs_rubric_and_no_code_rubric() {
         let prompt = render_reviewer_initial_prompt(
@@ -1289,6 +1380,7 @@ mod tests {
             (ReviewFindingCategory::Readability, "\"readability\""),
             (ReviewFindingCategory::Tests, "\"tests\""),
             (ReviewFindingCategory::EdgeCase, "\"edgecase\""),
+            (ReviewFindingCategory::Duplication, "\"duplication\""),
         ] {
             let json = serde_json::to_string(&cat).unwrap();
             assert_eq!(json, expected);
@@ -1803,6 +1895,31 @@ mod tests {
         assert!(passes_severity_gate(&result));
     }
 
+    /// Confirmed infrastructure-duplication findings must force a revision
+    /// exactly like regression findings, regardless of assigned severity
+    /// (operator directive: "revision required", not advisory).
+    #[test]
+    fn severity_gate_passes_on_duplication_regardless_of_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Low,
+                ReviewFindingCategory::Duplication,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(
+            passes_severity_gate(&result),
+            "a duplication finding must force a revision even at low severity"
+        );
+    }
+
     #[test]
     fn severity_gate_blocked_on_medium_non_regression() {
         let result = ReviewResult {
@@ -1951,6 +2068,100 @@ mod tests {
         assert!(
             instructions.contains("EXPLICITLY SURFACE"),
             "instructions must require explicit surfacing when a finding cannot be fixed: {instructions}"
+        );
+    }
+
+    /// Acceptance fixture (chore scope, incident PR #1690): a reviewer that
+    /// finds a SIXTH hand-rolled Anthropic Messages API client — reusing an
+    /// existing client would have avoided it — must produce a finding whose
+    /// category ("duplication") forces a revision via `passes_severity_gate`,
+    /// and the rendered revision instructions must surface it with the
+    /// "duplication" category label and the existing modules to reuse.
+    #[test]
+    fn duplication_finding_forces_revision_pr_1690_fixture() {
+        let result = ReviewResult::from_json(
+            &serde_json::json!({
+                "pr_url": "https://github.com/spinyfin/mono/pull/1690",
+                "head_sha": "deadbeef1690",
+                "summary": "The PR adds a new Anthropic Messages API client for the widget \
+                    detector, but the repo already has five other hand-rolled clients \
+                    (planner.rs, magic_wand.rs, attentions_detector.rs, live_status.rs, \
+                    pane_summary.rs) that construct the same api.anthropic.com endpoint, \
+                    x-api-key header, and anthropic-version constant.",
+                "revision_warranted": true,
+                "findings": [
+                    {
+                        "severity": "medium",
+                        "category": "duplication",
+                        "file": "tools/boss/engine/core/src/widget_detector.rs",
+                        "location": "fn call_anthropic, ~L40",
+                        "title": "Sixth hand-rolled Anthropic Messages API client",
+                        "detail": "This constructs a new reqwest client against \
+                            https://api.anthropic.com/v1/messages with its own x-api-key \
+                            and anthropic-version wiring. The repo already has five \
+                            equivalents: planner.rs, magic_wand.rs, attentions_detector.rs, \
+                            live_status.rs, and pane_summary.rs. Reuse one of those or \
+                            extract a shared anthropic_client module instead of adding a sixth.",
+                        "confidence": "high"
+                    }
+                ],
+                "regression_check": {"performed": true, "suspected_deletions": []}
+            })
+            .to_string(),
+        )
+        .expect("fixture ReviewResult must parse");
+
+        assert!(
+            passes_severity_gate(&result),
+            "a confirmed duplication finding must force a revision (revision-required, not advisory)"
+        );
+
+        let instructions = render_revision_instructions(&result);
+        assert!(
+            instructions.contains("duplication"),
+            "instructions must label the duplication category"
+        );
+        assert!(
+            instructions.contains("Sixth hand-rolled Anthropic Messages API client"),
+            "instructions must include the finding title"
+        );
+        assert!(
+            instructions.contains("planner.rs") && instructions.contains("magic_wand.rs"),
+            "instructions must name the existing modules to reuse"
+        );
+    }
+
+    /// Companion to [`duplication_finding_forces_revision_pr_1690_fixture`]:
+    /// an innocent PR with no duplicated infrastructure (only a low-severity
+    /// readability nit) must NOT trip the severity gate.
+    #[test]
+    fn innocent_pr_without_duplication_does_not_force_revision() {
+        let result = ReviewResult::from_json(
+            &serde_json::json!({
+                "pr_url": "https://github.com/spinyfin/mono/pull/1691",
+                "head_sha": "cafef00d",
+                "summary": "Small, clean change reusing the existing planner.rs Anthropic \
+                    client for a new prompt variant. No duplicated infrastructure found.",
+                "revision_warranted": false,
+                "findings": [
+                    {
+                        "severity": "low",
+                        "category": "readability",
+                        "file": "tools/boss/engine/core/src/planner.rs",
+                        "title": "Minor naming nit",
+                        "detail": "Consider renaming `tmp` to `draft_prompt` for clarity.",
+                        "confidence": "low"
+                    }
+                ],
+                "regression_check": {"performed": true, "suspected_deletions": []}
+            })
+            .to_string(),
+        )
+        .expect("fixture ReviewResult must parse");
+
+        assert!(
+            !passes_severity_gate(&result),
+            "an innocent PR with no duplication/regression/critical findings must not force a revision"
         );
     }
 }
