@@ -3491,11 +3491,13 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             .await?;
             let tasks = apply_task_list_filters(
                 tasks,
-                &args.status,
-                &args.priority,
-                args.match_term.as_deref(),
-                &args.id,
-                args.limit,
+                TaskListCriteria {
+                    statuses: &args.status,
+                    priorities: &args.priority,
+                    match_term: args.match_term.as_deref(),
+                    ids: &args.id,
+                    limit: args.limit,
+                },
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
@@ -3595,11 +3597,13 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let chores = list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
             let chores = apply_task_list_filters(
                 chores,
-                &args.status,
-                &args.priority,
-                args.match_term.as_deref(),
-                &args.id,
-                args.limit,
+                TaskListCriteria {
+                    statuses: &args.status,
+                    priorities: &args.priority,
+                    match_term: args.match_term.as_deref(),
+                    ids: &args.id,
+                    limit: args.limit,
+                },
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
@@ -6482,11 +6486,13 @@ async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: Rev
     let revisions = list_revisions(client, &product.id, dep_filter, args.include_deleted, parent_id).await?;
     let revisions = apply_task_list_filters(
         revisions,
-        &args.status,
-        &args.priority,
-        args.match_term.as_deref(),
-        &args.id,
-        args.limit,
+        TaskListCriteria {
+            statuses: &args.status,
+            priorities: &args.priority,
+            match_term: args.match_term.as_deref(),
+            ids: &args.id,
+            limit: args.limit,
+        },
         None,
         product.repo_remote_url.as_deref(),
     );
@@ -8083,20 +8089,26 @@ fn resolved_repo_for_task<'a>(task: &'a Task, product_repo: Option<&'a str>) -> 
     task.repo_remote_url.as_deref().or(product_repo)
 }
 
+/// Criteria for `apply_task_list_filters`, bundled to keep the function's
+/// argument count under clippy's `too_many_arguments` threshold.
+struct TaskListCriteria<'a> {
+    statuses: &'a [TaskStatusArg],
+    priorities: &'a [TaskPriority],
+    match_term: Option<&'a str>,
+    ids: &'a [String],
+    limit: Option<usize>,
+}
+
 fn apply_task_list_filters(
     items: Vec<Task>,
-    statuses: &[TaskStatusArg],
-    priorities: &[TaskPriority],
-    match_term: Option<&str>,
-    ids: &[String],
-    limit: Option<usize>,
+    criteria: TaskListCriteria<'_>,
     repo: Option<&RepoSelector>,
     product_repo: Option<&str>,
 ) -> Vec<Task> {
-    let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
-    let allowed_priorities: Vec<&str> = priorities.iter().map(|p| p.as_str()).collect();
-    let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let lc_term = match_term.map(str::to_lowercase);
+    let allowed_statuses: Vec<&str> = criteria.statuses.iter().map(|s| s.as_str()).collect();
+    let allowed_priorities: Vec<&str> = criteria.priorities.iter().map(|p| p.as_str()).collect();
+    let id_set: std::collections::HashSet<&str> = criteria.ids.iter().map(String::as_str).collect();
+    let lc_term = criteria.match_term.map(str::to_lowercase);
     items
         .into_iter()
         .filter(|task| {
@@ -8123,7 +8135,7 @@ fn apply_task_list_filters(
             }
             true
         })
-        .take(limit.unwrap_or(usize::MAX))
+        .take(criteria.limit.unwrap_or(usize::MAX))
         .collect()
 }
 
