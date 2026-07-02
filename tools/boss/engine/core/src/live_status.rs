@@ -39,18 +39,12 @@
 //! empties on every transient API hiccup is worse than a label
 //! that's two minutes old.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::claude_client::{self, CallConfig, ClaudeError, Message, MessagesRequest};
 use crate::live_status_redact;
-
-/// Anthropic Messages API endpoint. Hard-coded; matches
-/// [`crate::pane_summary`].
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Haiku 4.5 is the right shape for a one-sentence cheap summary —
 /// see Q3 in the design doc.
@@ -188,7 +182,7 @@ pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Val
             tracing::warn!("live_status: post-filter dropped the model reply",);
             SummarizerOutcome::PostFilterDropped
         }
-        Err(SummarizerCallError::Api { status, body }) => {
+        Err(ClaudeError::Api { status, body }) => {
             // Redact the body before logging so an error response
             // containing the key (some Anthropic 401 bodies echo
             // headers) can't leak into engine stderr.
@@ -200,13 +194,11 @@ pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Val
             );
             SummarizerOutcome::ApiError { status, snippet }
         }
-        Err(SummarizerCallError::Transport(err)) => {
-            let msg = err.to_string();
+        Err(ClaudeError::Transport(msg)) => {
             tracing::error!(err = %msg, "live_status: transport error");
             SummarizerOutcome::Transport(msg)
         }
-        Err(SummarizerCallError::Decode(err)) => {
-            let msg = err.to_string();
+        Err(ClaudeError::Decode(msg)) => {
             tracing::error!(err = %msg, "live_status: failed to decode anthropic response");
             SummarizerOutcome::Transport(msg)
         }
@@ -389,47 +381,6 @@ strings that look like secrets.\n\
 \"working\".\
 ";
 
-#[derive(Debug, Serialize)]
-struct ClaudeRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    system: &'a str,
-    messages: Vec<ClaudeMessage<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct ClaudeMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeResponse {
-    content: Vec<ClaudeContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    #[serde(default)]
-    text: String,
-}
-
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // Mirror `pane_summary::http_client` — install the rustls
-        // ring provider lazily so the first TLS handshake doesn't
-        // panic.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(SUMMARY_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
 /// Internal reply shape from [`claude_one_sentence`]. Success carries
 /// the cleaned summary; `PostFilterDropped` distinguishes "Anthropic
 /// returned a response but the post-filter rejected it" from any
@@ -439,65 +390,23 @@ pub enum ClaudeReply {
     PostFilterDropped,
 }
 
-/// Structured error variants for [`claude_one_sentence`]. The caller
-/// (`summarize_transcript`) maps each into the matching
-/// [`SummarizerOutcome`] for logging + the debug verb. We avoid
-/// `anyhow::Error` here because the surface needs to distinguish
-/// "model 429" from "TLS handshake failed" — the chore explicitly
-/// asks for these to be distinct outcomes.
-#[derive(Debug, thiserror::Error)]
-pub enum SummarizerCallError {
-    #[error("anthropic returned {status}: {body}")]
-    Api { status: u16, body: String },
-    #[error(transparent)]
-    Transport(#[from] reqwest::Error),
-    #[error("failed to decode anthropic response: {0}")]
-    Decode(String),
-}
-
-/// Hit Anthropic with a one-sentence ask. Returns a structured outcome
-/// so the caller can bucket success vs. API error vs. transport error
-/// vs. post-filter-dropped; the previous `anyhow::Result<String>` shape
-/// erased the distinction the live-status debug verb needs.
-pub async fn claude_one_sentence(
-    api_key: &str,
-    transcript: &str,
-) -> std::result::Result<ClaudeReply, SummarizerCallError> {
-    let client = http_client();
+/// Hit Anthropic with a one-sentence ask via the shared
+/// [`crate::claude_client`] pipeline. Returns `ClaudeReply` (success vs.
+/// post-filter-dropped) on a successful round trip, or the shared
+/// [`ClaudeError`] which `summarize_transcript` maps into the matching
+/// [`SummarizerOutcome`] — the surface needs to distinguish "model 429" from
+/// "TLS handshake failed", which a bare `anyhow::Result<String>` would erase.
+pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<ClaudeReply, ClaudeError> {
     let (system, user) = build_messages(transcript);
-    let body = ClaudeRequest {
-        model: SUMMARY_MODEL,
-        max_tokens: SUMMARY_MAX_TOKENS,
-        system: &system,
-        messages: vec![ClaudeMessage {
-            role: "user",
-            content: user,
-        }],
-    };
-    let resp = client
-        .post(ANTHROPIC_MESSAGES_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SummarizerCallError::Api { status, body });
-    }
-    let parsed: ClaudeResponse = resp
-        .json()
-        .await
-        .map_err(|err| SummarizerCallError::Decode(err.to_string()))?;
-    let raw = parsed
-        .content
-        .into_iter()
-        .find(|b| b.block_type == "text")
-        .map(|b| b.text)
-        .unwrap_or_default();
-    let cleaned = clean_summary(&raw);
+    let request = MessagesRequest::builder()
+        .model(SUMMARY_MODEL)
+        .max_tokens(SUMMARY_MAX_TOKENS)
+        .system(system)
+        .messages(vec![Message::user(user)])
+        .build();
+    let config = CallConfig::new(SUMMARY_TIMEOUT);
+    let response = claude_client::send_messages(api_key, &request, &config).await?;
+    let cleaned = clean_summary(response.first_text().unwrap_or_default());
     if cleaned.is_empty() {
         return Ok(ClaudeReply::PostFilterDropped);
     }
@@ -711,15 +620,16 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_summarize_with_wiremock() {
-        // wiremock pretends to be Anthropic. We exercise the request
-        // shape and the response parsing via `claude_one_sentence`
-        // directly — the global http_client points at production and
-        // is not overridable, mirroring pane_summary's test layout.
+        // live_status now shares the engine-wide `claude_client` pipeline. Drive
+        // a realistic Anthropic response through it with the exact request
+        // `claude_one_sentence` builds (system guardrails + redacted transcript),
+        // and confirm the shared client sets the auth/version headers and that
+        // `clean_summary` post-processes the first text block.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "test-key"))
-            .and(header("anthropic-version", ANTHROPIC_API_VERSION))
+            .and(header("anthropic-version", claude_client::ANTHROPIC_API_VERSION))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{
                     "type": "text",
@@ -728,36 +638,22 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
+
         let (system, user) = build_messages("assistant: investigating the bug");
-        let body = ClaudeRequest {
-            model: SUMMARY_MODEL,
-            max_tokens: SUMMARY_MAX_TOKENS,
-            system: &system,
-            messages: vec![ClaudeMessage {
-                role: "user",
-                content: user,
-            }],
-        };
-        let resp = client
-            .post(format!("{}/v1/messages", server.uri()))
-            .header("x-api-key", "test-key")
-            .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
+        let request = MessagesRequest::builder()
+            .model(SUMMARY_MODEL)
+            .max_tokens(SUMMARY_MAX_TOKENS)
+            .system(system)
+            .messages(vec![Message::user(user)])
+            .build();
+        let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(format!("{}/v1/messages", server.uri()));
+        let response = claude_client::send_messages("test-key", &request, &config)
             .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let parsed: ClaudeResponse = resp.json().await.unwrap();
-        let text = parsed
-            .content
-            .into_iter()
-            .find(|b| b.block_type == "text")
-            .unwrap()
-            .text;
-        assert_eq!(clean_summary(&text), "running tests after the redactor lands",);
+            .expect("mock success");
+        assert_eq!(
+            clean_summary(response.first_text().unwrap()),
+            "running tests after the redactor lands",
+        );
     }
 
     #[tokio::test]

@@ -195,6 +195,7 @@ rust_library(
     ],
     deps = [
         "//lib/rust/git_utils",
+        "//tools/boss/claude_client",
         "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/feature-flags",

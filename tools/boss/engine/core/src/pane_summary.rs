@@ -32,21 +32,14 @@
 //! Anthropic is down. The fallback is *not* cached so a later spawn
 //! can still call the API and store a real summary.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 use crate::work::{WorkDb, WorkItem};
 
-/// Anthropic Messages API endpoint. Hard-coded; not configurable
-/// because nothing in this codebase points at a non-prod Anthropic
-/// instance and a typo in an env override would silently lose
-/// summaries.
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// Sonnet 4.6: latest released Sonnet at the time of writing — the
 /// design doc explicitly calls it out as the right speed/cost
 /// balance for this kind of micro-prompt.
@@ -205,32 +198,6 @@ pub async fn get_or_generate(db: &WorkDb, api_key: Option<&str>, work_item: &Wor
     None
 }
 
-#[derive(Debug, Serialize)]
-struct ClaudeRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    messages: Vec<ClaudeMessage<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct ClaudeMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeResponse {
-    content: Vec<ClaudeContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    #[serde(default)]
-    text: String,
-}
-
 /// Build the prompt for Claude. Pulled out as a free function so
 /// tests can pin the exact wording — drift here changes summary
 /// style across all panes.
@@ -284,64 +251,19 @@ fn build_prompt(name: &str, description: &str) -> String {
     prompt
 }
 
-/// Lazy, process-wide reqwest client. Re-using a single client lets
-/// the connection pool kick in across spawns; we don't expect this
-/// to need per-call configuration.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // The workspace pins reqwest to `rustls-no-provider`, so
-        // every binary that uses it has to install a default crypto
-        // provider before the first TLS handshake or `Client::build`
-        // panics. The engine doesn't otherwise touch rustls, so we
-        // do it lazily here. `install_default()` errors if a
-        // provider is already set — that's fine, we ignore it.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(SUMMARY_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
-/// POST to the Anthropic Messages API and pull the first text block
-/// out of the response. Errors are bucketed into `anyhow` because
-/// the caller (`get_or_generate`) only logs them.
+/// Ask Claude for a short gerund summary via the shared [`crate::claude_client`]
+/// pipeline and pull the first text block out of the response. Errors are
+/// bucketed into `anyhow` because the caller (`get_or_generate`) only logs them.
 pub async fn claude_short_summary(api_key: &str, name: &str, description: &str) -> Result<String> {
-    let client = http_client();
-    let prompt = build_prompt(name, description);
-    let body = ClaudeRequest {
-        model: SUMMARY_MODEL,
-        max_tokens: SUMMARY_MAX_TOKENS,
-        messages: vec![ClaudeMessage {
-            role: "user",
-            content: prompt,
-        }],
-    };
-    let resp = client
-        .post(ANTHROPIC_MESSAGES_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let request = MessagesRequest::builder()
+        .model(SUMMARY_MODEL)
+        .max_tokens(SUMMARY_MAX_TOKENS)
+        .messages(vec![Message::user(build_prompt(name, description))])
+        .build();
+    let config = CallConfig::new(SUMMARY_TIMEOUT);
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("anthropic returned {}: {}", status, text);
-    }
-
-    let parsed: ClaudeResponse = resp.json().await?;
-    let text = parsed
-        .content
-        .into_iter()
-        .find(|b| b.block_type == "text")
-        .map(|b| b.text)
-        .unwrap_or_default();
-
-    let cleaned = clean_summary(&text);
+    let response = claude_client::send_messages(api_key, &request, &config).await?;
+    let cleaned = clean_summary(response.first_text().unwrap_or_default());
     if cleaned.is_empty() {
         anyhow::bail!("anthropic returned an empty summary");
     }
@@ -604,49 +526,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_response_overrides_local_fallback_and_caches() {
-        // Spin up a wiremock that pretends to be Anthropic. We
-        // can't override the URL on the global client, so this
-        // test exercises `claude_short_summary` directly to prove
-        // the request-shaping and response-parsing path. The
-        // caching half is covered by `cache_hit_returns_stored_summary_*`.
+    async fn api_response_flows_through_the_shared_pipeline() {
+        // pane_summary now shares the engine-wide `claude_client` pipeline.
+        // Drive a realistic Anthropic response through it with the exact
+        // request `claude_short_summary` builds (model, max_tokens, prompt),
+        // and confirm the shared client sets the auth/version headers and that
+        // `clean_summary` post-processes the first text block. The caching half
+        // is covered by `cache_hit_returns_stored_summary_*`.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "test-key"))
-            .and(header("anthropic-version", ANTHROPIC_API_VERSION))
+            .and(header("anthropic-version", claude_client::ANTHROPIC_API_VERSION))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type": "text", "text": "fixing the pane titlebar"}],
             })))
             .mount(&server)
             .await;
 
-        // wiremock serves http://, so no TLS handshake actually runs,
-        // but reqwest's rustls-no-provider build still wants a default
-        // crypto provider installed before `Client::new()` is called.
-        // Mirror what the prod path does in `http_client()`.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
-        let body = ClaudeRequest {
-            model: SUMMARY_MODEL,
-            max_tokens: SUMMARY_MAX_TOKENS,
-            messages: vec![ClaudeMessage {
-                role: "user",
-                content: build_prompt("name", "desc"),
-            }],
-        };
-        let resp = client
-            .post(format!("{}/v1/messages", server.uri()))
-            .header("x-api-key", "test-key")
-            .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
+        let request = MessagesRequest::builder()
+            .model(SUMMARY_MODEL)
+            .max_tokens(SUMMARY_MAX_TOKENS)
+            .messages(vec![Message::user(build_prompt("name", "desc"))])
+            .build();
+        let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(format!("{}/v1/messages", server.uri()));
+        let response = claude_client::send_messages("test-key", &request, &config)
             .await
-            .unwrap();
-        assert!(resp.status().is_success());
-        let parsed: ClaudeResponse = resp.json().await.unwrap();
-        assert_eq!(parsed.content.len(), 1);
-        assert_eq!(clean_summary(&parsed.content[0].text), "fixing the pane titlebar");
+            .expect("mock success");
+        assert_eq!(response.first_text(), Some("fixing the pane titlebar"));
+        assert_eq!(
+            clean_summary(response.first_text().unwrap()),
+            "fixing the pane titlebar"
+        );
     }
 }

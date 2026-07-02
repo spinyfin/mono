@@ -11,6 +11,7 @@ pub mod blocking_signal;
 pub mod build_info;
 pub mod ci_log_reader;
 pub mod ci_watch;
+pub use boss_claude_client as claude_client;
 pub mod cli;
 pub mod comment_classifier;
 pub mod comments_anchor;

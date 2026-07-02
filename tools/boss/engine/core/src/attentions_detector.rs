@@ -26,22 +26,21 @@
 //! [`extract_followups_backstop`] — disabled by default.
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use boss_protocol::{Attention, AttentionGroup, CreateAttentionInput};
 use boss_transcript_markdown::{TranscriptEventKind, parse_transcript};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
+use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 use crate::design_detector;
 use crate::work::WorkDb;
 
 // ── Backstop: Anthropic API constants ────────────────────────────────────────
 
+/// Per-feature key env var; routes billing to a separate spend bucket. Falls
+/// back to `ANTHROPIC_API_KEY` via [`claude_client::resolve_api_key`].
 const BACKSTOP_API_KEY_ENV: &str = "BOSS_BACKSTOP_API_KEY";
-const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const BACKSTOP_MODEL: &str = "claude-haiku-4-5-20251001";
 const BACKSTOP_MAX_TOKENS: u32 = 2048;
 const BACKSTOP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -50,47 +49,10 @@ const BACKSTOP_TRANSCRIPT_TAIL_CHARS: usize = 8_000;
 /// Maximum number of questions the backstop will emit from one doc.
 const BACKSTOP_MAX_QUESTIONS: usize = 20;
 
-fn backstop_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(BACKSTOP_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
+/// Resolve the backstop key: `BOSS_BACKSTOP_API_KEY` then `ANTHROPIC_API_KEY`,
+/// via the shared pipeline's resolver.
 fn resolve_backstop_api_key() -> Option<String> {
-    std::env::var(BACKSTOP_API_KEY_ENV)
-        .ok()
-        .or_else(|| std::env::var(ANTHROPIC_API_KEY_ENV).ok())
-}
-
-#[derive(Serialize)]
-struct BackstopApiRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    messages: Vec<BackstopApiMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct BackstopApiMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct BackstopApiResponse {
-    content: Vec<BackstopApiContentBlock>,
-}
-
-#[derive(Deserialize)]
-struct BackstopApiContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    #[serde(default)]
-    text: String,
+    claude_client::resolve_api_key(Some(BACKSTOP_API_KEY_ENV))
 }
 
 /// One entry of a `<slug>.attentions.json` questions manifest.
@@ -826,63 +788,27 @@ pub async fn extract_followups_backstop(
     };
 
     let prompt = build_followups_supervisor_prompt(tail);
-    let body = BackstopApiRequest {
-        model: BACKSTOP_MODEL,
-        max_tokens: BACKSTOP_MAX_TOKENS,
-        messages: vec![BackstopApiMessage {
-            role: "user",
-            content: prompt,
-        }],
-    };
+    let request = MessagesRequest::builder()
+        .model(BACKSTOP_MODEL)
+        .max_tokens(BACKSTOP_MAX_TOKENS)
+        .messages(vec![Message::user(prompt)])
+        .build();
+    let config = CallConfig::new(BACKSTOP_TIMEOUT);
 
-    let resp = match backstop_http_client()
-        .post(ANTHROPIC_MESSAGES_URL)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(execution_id, ?err, "attentions backstop (followups): HTTP send failed");
-            return None;
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!(
-            execution_id,
-            %status,
-            text,
-            "attentions backstop (followups): Anthropic API error"
-        );
-        return None;
-    }
-
-    let parsed: BackstopApiResponse = match resp.json().await {
-        Ok(r) => r,
+    let response = match claude_client::send_messages(&api_key, &request, &config).await {
+        Ok(response) => response,
         Err(err) => {
             tracing::warn!(
                 execution_id,
-                ?err,
-                "attentions backstop (followups): failed to parse Anthropic response"
+                %err,
+                "attentions backstop (followups): Claude call failed"
             );
             return None;
         }
     };
 
-    let response_text = parsed
-        .content
-        .into_iter()
-        .find(|b| b.block_type == "text")
-        .map(|b| b.text)
-        .unwrap_or_default();
-
-    let entries = parse_followups_block(&response_text);
+    let response_text = response.first_text().unwrap_or_default();
+    let entries = parse_followups_block(response_text);
     if entries.is_empty() {
         return None;
     }

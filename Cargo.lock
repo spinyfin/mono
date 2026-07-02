@@ -260,6 +260,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-claude-client"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "boss-client"
 version = "0.1.0"
 dependencies = [
@@ -297,6 +312,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-claude-client",
  "boss-client",
  "boss-conflict-diagnosis",
  "boss-editorial",
