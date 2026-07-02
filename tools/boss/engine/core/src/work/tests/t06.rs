@@ -1493,11 +1493,14 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
-    // The revision must now be archived.
-    let rev_after = match db.get_work_item(&revision.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => t,
-        other => panic!("unexpected variant: {other:?}"),
-    };
+    // The revision must now be archived (and tombstoned — see below), so
+    // fetch it by raw SQL rather than `get_work_item`, which deliberately
+    // excludes tombstoned rows (same contract as any other soft-deleted task).
+    let conn = db.connect().unwrap();
+    let rev_after = query_task(&conn, &revision.id)
+        .unwrap()
+        .expect("revision row must still exist");
+    drop(conn);
     assert_eq!(
         rev_after.status,
         TaskStatus::Archived,
@@ -1506,6 +1509,10 @@ fn mark_chore_pr_merged_converts_todo_revision_to_chore() {
     assert_eq!(
         rev_after.blocked_reason, None,
         "archived revision must have no blocked_reason"
+    );
+    assert!(
+        rev_after.deleted_at.is_some(),
+        "archived revision must be tombstoned so it disappears from get_work_tree"
     );
 
     // A new standalone chore must carry the revision's name/description.
@@ -1625,6 +1632,23 @@ fn mark_chore_pr_merged_retires_moot_merge_conflict_revision() {
         !chores.iter().any(|c| c.id != parent_id),
         "no new chore must be created for a moot revision; chores: {chores:?}",
     );
+
+    // Regression (moot-revision kanban visibility): archiving must also
+    // tombstone the row — `get_work_tree` (the kanban's data source) only
+    // filters on `deleted_at`, not `status`, so an archived-but-live row
+    // would otherwise keep rendering (misclassified into Backlog, since
+    // `WorkTask.boardColumn` has no case for `archived`).
+    let conn = db.connect().unwrap();
+    let deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&rev_id], |r| r.get(0))
+        .unwrap();
+    assert!(deleted_at.is_some(), "archived moot revision must be tombstoned");
+    drop(conn);
+    let tree = db.get_work_tree(&product_id).unwrap();
+    assert!(
+        !tree.tasks.iter().any(|t| t.id == rev_id),
+        "archived moot revision must not appear in get_work_tree output (kanban board data)",
+    );
 }
 
 /// A CI-fix revision is moot by construction — the PR cannot merge while CI
@@ -1651,6 +1675,15 @@ fn mark_chore_pr_merged_retires_moot_ci_fix_revision() {
     assert!(
         !chores.iter().any(|c| c.id != parent_id),
         "no new chore must be created for a moot CI-fix revision; chores: {chores:?}",
+    );
+
+    // Regression (operator report: T2111 — "Fix failing CI" on an
+    // already-merged PR lingering on the kanban): the archived CI-fix
+    // revision must vanish from get_work_tree, not just flip status.
+    let tree = db.get_work_tree(&product_id).unwrap();
+    assert!(
+        !tree.tasks.iter().any(|t| t.id == rev_id),
+        "archived moot CI-fix revision must not appear in get_work_tree output",
     );
 }
 
@@ -1700,6 +1733,14 @@ fn mark_chore_pr_merged_converts_active_revision_to_autostart_chore() {
         "WIP-converted revision must yield an autostart chore (restart immediately)",
     );
     assert_eq!(new_chore.status, TaskStatus::Todo, "converted chore must start as todo");
+
+    // The archived original revision must vanish from the board; only the
+    // new standalone chore should render.
+    let tree = db.get_work_tree(&product_id).unwrap();
+    assert!(
+        !tree.tasks.iter().any(|t| t.id == revision.id),
+        "archived WIP revision must not appear in get_work_tree output",
+    );
 }
 
 /// `list_active_revision_executions_for_chain` returns executions with a
@@ -1763,6 +1804,71 @@ fn list_active_revision_executions_for_chain_empty_for_no_revisions() {
 
     let active = db.list_active_revision_executions_for_chain(&parent_id).unwrap();
     assert!(active.is_empty(), "chain with no revisions must yield empty vec");
+}
+
+/// Regression: `mark_chore_pr_merged` archives (and now tombstones — see
+/// `block_pending_revisions_on_parent_close`) a WIP revision in the same
+/// transaction that flips the chain root to `done`. The merge poller's
+/// `stop_active_revision_executions` runs immediately afterward, in a
+/// separate step, to force-release the WIP revision's cube lease —
+/// `list_active_revision_executions_for_chain` must still find that
+/// execution even though its task row is now tombstoned, or the lease
+/// leaks forever.
+#[test]
+fn list_active_revision_executions_for_chain_finds_execution_after_revision_archived_and_tombstoned() {
+    let db = WorkDb::open(temp_db_path("rev-list-exec-after-archive")).unwrap();
+    let product_id = make_revision_product(&db, "lare-archived");
+    let pr_url = "https://github.com/spinyfin/mono/pull/810";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    // Simulate the revision being dispatched (worker running with a leased
+    // cube workspace), mirroring `mark_chore_pr_merged_converts_active_revision_to_autostart_chore`.
+    let exec_id = next_id("exec");
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![revision.id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO work_executions
+                 (id, work_item_id, kind, status, repo_remote_url, cube_lease_id,
+                  cube_workspace_id, workspace_path, priority, prefer_is_soft,
+                  created_at, started_at)
+             VALUES (?1, ?2, 'revision_implementation', 'running',
+                     'git@github.com:spinyfin/mono.git', 'lease-wip',
+                     'mono-agent-001', '/tmp/ws', 0, 0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')",
+        rusqlite::params![exec_id, revision.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Parent PR merges — archives (and tombstones) the WIP revision.
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+    assert_eq!(task_status(&db, &revision.id), "archived");
+    let conn = db.connect().unwrap();
+    let deleted_at: Option<String> = conn
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&revision.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(deleted_at.is_some(), "archived revision must be tombstoned");
+    drop(conn);
+
+    // The merge poller's follow-up step must still find the WIP execution
+    // to force-release its lease, even though the task row is now
+    // tombstoned.
+    let active = db.list_active_revision_executions_for_chain(&parent_id).unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "the WIP revision's live execution must still be found for lease release after archival"
+    );
+    assert_eq!(active[0].id, exec_id);
 }
 
 // ── Revision dispatch via request_execution ───────────────────────────

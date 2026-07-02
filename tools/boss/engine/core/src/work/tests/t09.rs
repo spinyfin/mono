@@ -38,15 +38,21 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
-    // Revision must be archived.
-    let rev_after = match db.get_work_item(&revision.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => t,
-        other => panic!("unexpected variant: {other:?}"),
-    };
+    // Revision must be archived (and tombstoned, so `get_work_item` — which
+    // excludes soft-deleted rows — is not the right lookup here anymore).
+    let conn = db.connect().unwrap();
+    let rev_after = query_task(&conn, &revision.id)
+        .unwrap()
+        .expect("revision row must still exist");
+    drop(conn);
     assert_eq!(
         rev_after.status,
         TaskStatus::Archived,
         "pr_review revision must be archived after parent merges"
+    );
+    assert!(
+        rev_after.deleted_at.is_some(),
+        "archived pr_review revision must be tombstoned so it disappears from get_work_tree"
     );
 
     // A followup must be created (not a plain chore).
