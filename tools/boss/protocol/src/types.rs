@@ -1362,6 +1362,17 @@ pub struct CreateRevisionInput {
     /// each new commit was for.
     pub description: String,
 
+    /// Canonical ids of work items this revision must wait on, in addition
+    /// to the automatic chain-tail gate. See [`CreateChoreInput::depends_on`]
+    /// — same atomic-gate semantics: each id becomes a `blocks` prerequisite
+    /// edge declared in the same transaction as the row insert, so the
+    /// revision is born `blocked` (and never dispatched) while any
+    /// prerequisite is unsatisfied. The caller (CLI) resolves selectors
+    /// (`T42`) to canonical ids before sending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub depends_on: Vec<String>,
+
     /// Bypass the recent-duplicate guard. See
     /// [`CreateTaskInput::force_duplicate`].
     #[serde(default)]

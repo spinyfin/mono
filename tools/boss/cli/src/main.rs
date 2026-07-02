@@ -2035,6 +2035,17 @@ struct RevisionCreateArgs {
 
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
+
+    /// Gate this revision on one or more prerequisites, in addition to
+    /// the automatic chain-tail gate, declared atomically with creation.
+    /// See `boss task create --depends-on` for the full description —
+    /// selectors accept `T<n>` short ids or full `task_…` ids and are
+    /// resolved without needing a `--product` flag (short ids are
+    /// globally unique). The revision is created `blocked` and never
+    /// dispatched until every prerequisite is satisfied, then
+    /// auto-dispatches on its own once the gate clears.
+    #[arg(long = "depends-on", value_delimiter = ',')]
+    depends_on: Vec<String>,
 }
 
 /// Args for `boss task list-revisions`.
@@ -6732,7 +6743,7 @@ async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: Rev
     })
 }
 
-/// Resolve a `--parent` selector for `create-revision` to a primary task id.
+/// Resolve a work-item selector to a primary id without a product context.
 ///
 /// Unlike the generic [`resolve_selector_to_primary_id`], this variant does
 /// not require a product context: `T<n>` short ids are globally unique, so
@@ -6740,6 +6751,9 @@ async fn run_list_revisions(client: &mut BossClient, ctx: &RunContext, args: Rev
 /// (via `get_work_item_resolving_short_id` in the engine). This is the only
 /// product-free resolution we allow here; `#42` / `42` bare forms still need
 /// a product and are rejected with a helpful message.
+///
+/// Used by `create-revision`'s `--parent` and `--depends-on` (neither of
+/// which accepts a `--product` flag) and `list-revisions`' `--parent`.
 async fn resolve_create_revision_parent(client: &mut BossClient, selector: &str) -> Result<String, CliError> {
     match parse_work_item_selector(selector) {
         // T-form short ids are globally unique — pass the friendly form
@@ -6784,6 +6798,7 @@ async fn run_create_revision(
     let model_override = normalize_non_empty(args.model);
     let driver = normalize_non_empty(args.driver);
     validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
+    let depends_on = resolve_revision_depends_on(client, &args.depends_on).await?;
     let task = create_revision_rpc(
         client,
         CreateRevisionInput::builder()
@@ -6795,6 +6810,7 @@ async fn run_create_revision(
             .maybe_model_override(model_override)
             .maybe_driver(driver)
             .force_duplicate(args.force_duplicate)
+            .depends_on(depends_on)
             .created_via(boss_protocol::CREATED_VIA_CLI)
             .autostart(!ctx.no_autostart)
             .build(),
@@ -7868,6 +7884,22 @@ async fn resolve_depends_on(
             continue;
         }
         resolved.push(resolve_selector_to_primary_id(client, ctx, trimmed, Some(product.to_owned())).await?);
+    }
+    Ok(resolved)
+}
+
+/// Resolve `create-revision`'s `--depends-on` selectors to canonical ids
+/// without a product context, mirroring `resolve_depends_on` but reusing
+/// [`resolve_create_revision_parent`]'s product-free resolution since
+/// `create-revision` takes no `--product` flag.
+async fn resolve_revision_depends_on(client: &mut BossClient, selectors: &[String]) -> Result<Vec<String>, CliError> {
+    let mut resolved = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        let trimmed = selector.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        resolved.push(resolve_create_revision_parent(client, trimmed).await?);
     }
     Ok(resolved)
 }
@@ -9684,6 +9716,34 @@ mod tests {
                 assert_eq!(args.depends_on, vec!["T1908"]);
             }
             _ => panic!("expected chore create command"),
+        }
+    }
+
+    /// Same flag on `task create-revision`, added so revisions can gate on
+    /// an arbitrary prerequisite (not just the automatic chain-tail gate)
+    /// atomically at create time.
+    #[test]
+    fn parses_task_create_revision_depends_on() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "create-revision",
+            "--parent",
+            "T651",
+            "--description",
+            "fix the thing",
+            "--depends-on",
+            "T1908",
+            "--depends-on",
+            "task_abc,task_def",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::CreateRevision(args),
+            } => {
+                assert_eq!(args.depends_on, vec!["T1908", "task_abc", "task_def"]);
+            }
+            _ => panic!("expected task create-revision command"),
         }
     }
 
