@@ -427,6 +427,12 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a second click while the engine is still leasing.
     private var openingReviewTerminalIDs: Set<String> = []
 
+    /// Work item IDs for which `open_live_workspace_terminal` has been
+    /// sent but `live_workspace_terminal_ready` (or `work_error`) has not
+    /// yet arrived. Guards against a second click while the engine looks
+    /// up the live execution's workspace.
+    private var openingLiveWorkspaceTerminalIDs: Set<String> = []
+
     /// Work item IDs for which `merge_when_ready` has been sent but
     /// `merge_when_ready_accepted` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap while the engine is running the merge.
@@ -466,6 +472,25 @@ final class ChatViewModel: ObservableObject {
     /// `ReviewTerminalView.onDisappear` handler.
     func releaseReviewTerminal(leaseID: String) {
         engine.sendReleaseReviewTerminal(leaseID: leaseID)
+    }
+
+    /// Ask the engine for a terminal into a Doing-column task's already-
+    /// live execution workspace — no new lease, just the path the running
+    /// worker is already using. Opens the same window as
+    /// `openReviewTerminal` with a loading spinner; becomes live once the
+    /// engine sends back `LiveWorkspaceTerminalReady`. Unlike the review
+    /// flow, the window's `onDisappear` never releases a lease, since the
+    /// worker owns it for the lifetime of its run.
+    func openLiveWorkspaceTerminal(for task: WorkTask) {
+        guard !openingLiveWorkspaceTerminalIDs.contains(task.id) else {
+            // Same task still loading — just re-focus the window.
+            reviewTerminalOpener?()
+            return
+        }
+        reviewTerminalVM.state = .loading(taskName: task.name)
+        reviewTerminalOpener?()
+        openingLiveWorkspaceTerminalIDs.insert(task.id)
+        engine.sendOpenLiveWorkspaceTerminal(workItemID: task.id)
     }
 
     /// Fetch the execution history for `taskId` from the engine.
@@ -2011,6 +2036,7 @@ final class ChatViewModel: ObservableObject {
                 editorialEvaluationState = .failed(message)
             }
             openingReviewTerminalIDs.removeAll()
+            openingLiveWorkspaceTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
@@ -2242,6 +2268,22 @@ final class ChatViewModel: ObservableObject {
                 // Window was closed while the engine was still setting up.
                 // Release the lease immediately since nobody will consume it.
                 engine.sendReleaseReviewTerminal(leaseID: leaseID)
+            }
+        case .liveWorkspaceTerminalReady(let workItemID, let workspacePath):
+            openingLiveWorkspaceTerminalIDs.remove(workItemID)
+            let resolved = task(withID: workItemID)
+            let content = ReviewTerminalContent(
+                workItemID: workItemID,
+                workspacePath: workspacePath,
+                leaseID: nil,
+                taskName: resolved?.name,
+                taskShortID: resolved?.shortID
+            )
+            // No lease was created for this path, so unlike the review-
+            // terminal case above there is nothing to release if the
+            // window already closed — just drop the content.
+            if reviewTerminalVM.windowIsOpen {
+                reviewTerminalVM.state = .ready(content)
             }
         case .mergeWhenReadyAccepted(let workItemID, _, _):
             // Engine successfully initiated the merge. Clear the in-flight

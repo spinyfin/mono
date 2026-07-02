@@ -1089,6 +1089,19 @@ pub enum FrontendRequest {
         name: String,
     },
 
+    /// App asks the engine for a terminal into the workspace of a work
+    /// item's already-live execution (Doing-column debugging affordance).
+    /// Unlike [`Self::OpenReviewTerminal`], this does NOT lease a new
+    /// workspace — it reads the `workspace_path` already held by the
+    /// running worker's execution row, so the terminal opens alongside
+    /// the worker without disturbing its session. The engine replies with
+    /// [`FrontendEvent::LiveWorkspaceTerminalReady`] on success or
+    /// [`FrontendEvent::WorkError`] if the work item has no live
+    /// execution / leased workspace.
+    OpenLiveWorkspaceTerminal {
+        work_item_id: String,
+    },
+
     /// App asks the engine to lease a workspace for the given Review-
     /// column work item, fetch the PR branch, and create a fresh jj
     /// commit off `<branch>@origin`. The engine replies with
@@ -2520,6 +2533,16 @@ pub enum FrontendEvent {
         work_item_id: String,
         workspace_path: String,
         lease_id: String,
+    },
+    /// Response to [`FrontendRequest::OpenLiveWorkspaceTerminal`]: the
+    /// work item has a live execution with an already-leased cube
+    /// workspace at `workspace_path`. The app should open a Ghostty
+    /// terminal window rooted there. There is no matching "release"
+    /// request — the lease belongs to the running worker, not to this
+    /// terminal window, so it is left untouched when the window closes.
+    LiveWorkspaceTerminalReady {
+        work_item_id: String,
+        workspace_path: String,
     },
     /// Response to [`FrontendRequest::MergeWhenReady`]: the engine has
     /// successfully initiated the merge process for the PR. `action`

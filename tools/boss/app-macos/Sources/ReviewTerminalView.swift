@@ -7,7 +7,11 @@ import SwiftUI
 struct ReviewTerminalContent: Codable, Hashable, Identifiable {
     let workItemID: String
     let workspacePath: String
-    let leaseID: String
+    /// `Some` for a fresh PR-branch workspace leased just for this window
+    /// (the Review/Done-lane flow) — released when the window closes.
+    /// `nil` for a Doing-lane live-execution workspace, whose lease is
+    /// owned by the running worker and must be left untouched.
+    let leaseID: String?
     /// Human-readable task name, e.g. "Fix the fencer scraper".
     var taskName: String?
     /// Per-product short id, e.g. 808. Displayed as "T808".
@@ -87,8 +91,8 @@ struct ReviewTerminalView: View {
         }
         .onDisappear {
             vm.windowIsOpen = false
-            if case .ready(let content) = vm.state {
-                chatModel.releaseReviewTerminal(leaseID: content.leaseID)
+            if case .ready(let content) = vm.state, let leaseID = content.leaseID {
+                chatModel.releaseReviewTerminal(leaseID: leaseID)
             }
             vm.state = .idle
         }

@@ -2444,6 +2444,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::MetricsListLive => metrics::handle_metrics_list_live(ctx, r).await,
             r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
             r @ FrontendRequest::MetricsShowLive { .. } => metrics::handle_metrics_show_live(ctx, r).await,
+            r @ FrontendRequest::OpenLiveWorkspaceTerminal { .. } => {
+                review::handle_open_live_workspace_terminal(ctx, r).await
+            }
             r @ FrontendRequest::OpenReviewTerminal { .. } => review::handle_open_review_terminal(ctx, r).await,
             r @ FrontendRequest::PlanProject { .. } => planner_ops::handle_plan_project(ctx, r).await,
             r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,

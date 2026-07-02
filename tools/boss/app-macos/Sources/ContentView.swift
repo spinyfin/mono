@@ -1692,9 +1692,14 @@ private struct WorkBoardCardItem: View {
                     onRevisionBadgeHover: { hovering in
                         model.setRevisionBadgeHover(hovering ? task.id : nil)
                     },
-                    onOpenReviewTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
+                    onOpenTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
                         ? { model.openReviewTerminal(for: task) }
-                        : nil,
+                        : (liveState != nil)
+                            ? { model.openLiveWorkspaceTerminal(for: task) }
+                            : nil,
+                    terminalTooltip: (column == .review || column == .done)
+                        ? "Open terminal on PR branch"
+                        : "Open terminal in workspace",
                     onMergeWhenReady: (column == .review &&
                                        task.status == "in_review" &&
                                        task.prURL != nil &&
@@ -2103,10 +2108,16 @@ struct WorkBoardCardView: View {
     /// Called with `true` when the pointer enters the "In revision" badge;
     /// `false` on exit. Same hover-highlight protocol as `onDepBadgeHover`.
     var onRevisionBadgeHover: ((Bool) -> Void)? = nil
-    /// Invoked when the user taps the terminal icon on a Review-column
-    /// card. `nil` hides the button — callers only pass a closure when
-    /// `column == .review && task.prURL != nil`.
-    var onOpenReviewTerminal: (() -> Void)? = nil
+    /// Invoked when the user taps the terminal icon. `nil` hides the
+    /// button. Callers pass a closure either for a Review/Done-column
+    /// card with a PR URL (opens a fresh workspace on the PR branch) or
+    /// for a Doing-column card whose work item has a live execution
+    /// (opens a terminal in the execution's already-leased workspace) —
+    /// gated on data availability, not the column itself.
+    var onOpenTerminal: (() -> Void)? = nil
+    /// Tooltip/accessibility text for the terminal button; varies by
+    /// which of the two flows above `onOpenTerminal` was wired to.
+    var terminalTooltip: String = "Open terminal on PR branch"
     /// Invoked after the user confirms the "Merge When Ready" button on a
     /// Review-column card. `nil` hides the button — callers only pass a
     /// closure when the card is in the Review lane, has a PR URL, and the
@@ -2292,17 +2303,17 @@ struct WorkBoardCardView: View {
                         .buttonStyle(.plain)
                         .help(presentation.tooltip)
                     }
-                    if let openTerminal = onOpenReviewTerminal {
+                    if let openTerminal = onOpenTerminal {
                         Button {
                             openTerminal()
                         } label: {
                             Image(systemName: "terminal")
                                 .font(.caption)
                                 .foregroundStyle(Color.secondary)
-                                .accessibilityLabel("Open terminal on PR branch")
+                                .accessibilityLabel(terminalTooltip)
                         }
                         .buttonStyle(.plain)
-                        .help("Open terminal on PR branch")
+                        .help(terminalTooltip)
                     }
                     if onMergeWhenReady != nil {
                         Button {
