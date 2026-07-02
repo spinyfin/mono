@@ -33,6 +33,15 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
                     "comment_created",
                 )
                 .await;
+
+                // Classifier is NOT on the create request's critical path
+                // (comment-triggered-document-revisions.md § "The classifier
+                // (P1 — foundation)"): spawn it detached, mirroring the
+                // magic-wand dispatch pattern. The comment starts with
+                // `intent` NULL — the transient `classifying` state — until
+                // this completes and publishes on `comment_topic`.
+                spawn_comment_classifier(&server_state, &work_db, &session_id, &request_id, &comment);
+
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
             Err(err) => send_response(
@@ -44,6 +53,67 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
             ),
         }
     }
+}
+
+/// Spawn the detached classifier call for a freshly created top-level
+/// comment. Failures (no API key, transport, malformed reply) are logged
+/// and swallowed — the comment simply stays in the `classifying` state
+/// (`intent IS NULL`) with no retry in this phase.
+fn spawn_comment_classifier(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+) {
+    let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
+        tracing::debug!(
+            comment_id = %comment.id,
+            "comment intent classifier: no API key configured; comment stays in classifying state",
+        );
+        return;
+    };
+    let server_state = server_state.clone();
+    let work_db = work_db.clone();
+    let session_id = session_id.to_owned();
+    let request_id = request_id.to_owned();
+    let comment_id = comment.id.clone();
+    let body = comment.body.clone();
+    let anchor = comment.anchor.clone();
+    let artifact_kind = comment.artifact_kind.clone();
+    let artifact_id = comment.artifact_id.clone();
+
+    tokio::spawn(async move {
+        match crate::comment_classifier::classify(&api_key, &body, &anchor).await {
+            Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
+                Ok(_) => {
+                    publish_comment_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        &artifact_kind,
+                        &artifact_id,
+                        "comment_intent_classified",
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        comment_id = %comment_id,
+                        err = %err,
+                        "comment intent classifier: failed to persist classification",
+                    );
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    comment_id = %comment_id,
+                    err = %err,
+                    "comment intent classifier: classification call failed; comment stays in classifying state",
+                );
+            }
+        }
+    });
 }
 
 pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {

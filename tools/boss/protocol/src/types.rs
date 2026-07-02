@@ -875,6 +875,15 @@ pub const RESOLVED_WITH_EXACT: &str = "exact";
 pub const RESOLVED_WITH_FUZZY: &str = "fuzzy";
 pub const RESOLVED_WITH_ORPHAN: &str = "orphan";
 
+/// Comment intent-classification values (`work_comments.intent`). A
+/// `directive`/`larger_change` classification routes to the revision/
+/// update-task path; `question` routes to the read-only answer agent. Both
+/// routing paths are later phases — see
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
+pub const INTENT_DIRECTIVE: &str = "directive";
+pub const INTENT_QUESTION: &str = "question";
+pub const INTENT_LARGER_CHANGE: &str = "larger_change";
+
 pub fn default_comment_status() -> String {
     COMMENT_STATUS_ACTIVE.to_owned()
 }
@@ -3143,9 +3152,12 @@ pub struct WorkAttentionItem {
 
 /// An engine-persisted comment row (`work_comments` table). Anchored to an
 /// artifact (`work_item:<id>` or `pr_doc:<repo>:<branch>:<path>`) via a
-/// [`CommentAnchor`]. 13 fields → uses the builder pattern per the project's
+/// [`CommentAnchor`]. 17 fields → uses the builder pattern per the project's
 /// `boss-protocol` convention.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+///
+/// `Eq` is deliberately not derived (only `PartialEq`) — `intent_confidence`
+/// is an `Option<f64>`, and `f64` has no total order / `Eq` impl.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkComment {
     pub id: String,
@@ -3194,6 +3206,29 @@ pub struct WorkComment {
     /// Who flipped status last (`user:<email>`, `engine_design_detector`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_actor: Option<String>,
+
+    /// `directive` | `question` | `larger_change` — the async classifier's
+    /// output. `NULL` while classification is in flight; this doubles as
+    /// the transient `classifying` state (no separate `status` value).
+    /// Comment-intent-classification design § "The classifier".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+
+    /// 0.0–1.0 engine-reported confidence for `intent`. `NULL` until
+    /// classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_confidence: Option<f64>,
+
+    /// When the classifier call completed (or a manual override was
+    /// applied). `NULL` while `intent` is `NULL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_classified_at: Option<String>,
+
+    /// `NULL` for an engine classification; `"user"` once a human manually
+    /// reclassifies via the (later-phase) `CommentsSetIntent` RPC —
+    /// preserved permanently as an audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_overridden_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

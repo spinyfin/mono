@@ -366,8 +366,13 @@ impl WorkDb {
         // that batch. Purely additive nullable column; NULL for every
         // non-planner task.
         migrate_tasks_planner_run_id(&conn)?;
+        // Comment intent classification (P1a): the four intent-classifier
+        // columns on `work_comments`. Purely additive, `NULL` for every
+        // existing row (classifier never ran on them).
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_work_comments_intent_columns(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '21')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '22')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
