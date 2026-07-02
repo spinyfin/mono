@@ -377,12 +377,17 @@ impl WorkDb {
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_answer_agent_runs_table(&conn)?;
+        // Buckets 1&3 unification (P2a): `work_comments.revise_task_id`, the
+        // soft FK a `CommentsReviseDoc` batch stamps on every comment it
+        // addresses. Purely additive, `NULL` for every existing row.
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_work_comments_revise_task_id_column(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker
         // rather than bumping it. Left at '22'.
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '22')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '23')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
