@@ -22,6 +22,16 @@ pub const DEFAULT_MIN_REVIEW_CHANGED_LINES: u64 = 0;
 /// cost-sensitive deployments or raise it to cover larger PRs.
 pub const DEFAULT_MAX_EMBED_DIFF_LINES: u64 = 500;
 
+/// Default value for [`WorkConfig::enable_revision_triggered_reviews`]. ON:
+/// a `revision` task (CI-fix, conflict-resolution, operator-filed, or
+/// reviewer-spawned) that pushes new commits to its parent PR triggers
+/// another automated `pr_review` pass, same as the PR's first push does.
+/// This is a 2026-07-01 experiment (gap: revisions previously landed
+/// post-review commits with zero re-review) — operators can flip it off via
+/// `BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS=false` without a code revert if
+/// the extra review cycles prove too slow or costly.
+pub const DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS: bool = true;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -77,6 +87,15 @@ pub struct WorkConfig {
     /// [`DEFAULT_MAX_EMBED_DIFF_LINES`] (500).
     #[builder(default = DEFAULT_MAX_EMBED_DIFF_LINES)]
     pub max_review_embed_diff_lines: u64,
+    /// Whether a completed `revision` task that pushed new commits to its
+    /// parent PR triggers another automated reviewer pass. ON by default.
+    /// Configured via `BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS`; defaults to
+    /// [`DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS`] (`true`). Kill-switch
+    /// for the revision-triggered-review experiment — flip off to fall back
+    /// to the legacy "revisions are never re-reviewed" behaviour without a
+    /// revert.
+    #[builder(default = DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS)]
+    pub enable_revision_triggered_reviews: bool,
 }
 
 impl WorkConfig {
@@ -106,6 +125,8 @@ impl WorkConfig {
             lookup_u64(&lookup, "BOSS_MIN_REVIEW_CHANGED_LINES")?.unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
         let max_review_embed_diff_lines =
             lookup_u64(&lookup, "BOSS_MAX_EMBED_DIFF_LINES")?.unwrap_or(DEFAULT_MAX_EMBED_DIFF_LINES);
+        let enable_revision_triggered_reviews = lookup_bool(&lookup, "BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS")?
+            .unwrap_or(DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
@@ -115,6 +136,7 @@ impl WorkConfig {
             .max_review_cycles(max_review_cycles)
             .min_review_changed_lines(min_review_changed_lines)
             .max_review_embed_diff_lines(max_review_embed_diff_lines)
+            .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
             .build())
     }
 }
@@ -139,6 +161,20 @@ fn lookup_u64(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<O
             raw.parse::<u64>()
                 .with_context(|| format!("could not parse {name}: {raw}"))
                 .map(Some)
+        }
+    }
+}
+
+fn lookup_bool(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Result<Option<bool>> {
+    match lookup(name) {
+        None => Ok(None),
+        Some(val) => {
+            let raw = val.to_string_lossy().into_owned();
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(Some(true)),
+                "0" | "false" | "no" | "off" => Ok(Some(false)),
+                _ => bail!("could not parse {name}: {raw} (expected true/false)"),
+            }
         }
     }
 }
@@ -282,8 +318,9 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES,
-        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
+        DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
+        DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+        WorkConfig,
     };
     use std::ffi::OsString;
 
@@ -433,5 +470,55 @@ mod tests {
         })
         .expect("config loads");
         assert_eq!(config.max_review_embed_diff_lines, 200);
+    }
+
+    #[test]
+    fn enable_revision_triggered_reviews_defaults_on_and_reads_from_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → defaults ON.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(
+            config.enable_revision_triggered_reviews,
+            DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS
+        );
+        assert!(config.enable_revision_triggered_reviews, "kill-switch defaults ON");
+
+        // Explicit "false" → the kill-switch flips off.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS" => Some(OsString::from("false")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(!config.enable_revision_triggered_reviews);
+
+        // Explicit "1" → also accepted as true.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS" => Some(OsString::from("1")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(config.enable_revision_triggered_reviews);
+    }
+
+    #[test]
+    fn enable_revision_triggered_reviews_rejects_unparseable_value() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        let err = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS" => Some(OsString::from("maybe")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect_err("unparseable bool must error");
+        assert!(err.to_string().contains("BOSS_ENABLE_REVISION_TRIGGERED_REVIEWS"));
     }
 }

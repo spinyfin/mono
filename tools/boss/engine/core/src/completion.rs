@@ -873,6 +873,20 @@ pub struct WorkerCompletionHandler {
     /// no file-content changes). Production wires in the value from
     /// `WorkConfig` via [`Self::with_min_review_changed_lines`].
     min_review_changed_lines: u64,
+    /// Kill-switch for the revision-triggered-review experiment
+    /// (2026-07-01): when `true`, a `revision_implementation` execution that
+    /// pushes new commits to its parent PR re-triggers a `pr_review` pass,
+    /// same as the first push does — closing the gap where CI-fix,
+    /// conflict-resolution, and operator-filed revisions landed unreviewed.
+    /// Production wires in `WorkConfig.enable_revision_triggered_reviews`
+    /// (default `true`) via [`Self::with_enable_revision_triggered_reviews`].
+    /// Defaults to `false` here (not `true`, unlike the other review knobs
+    /// above) so the large body of revision-completion tests written before
+    /// this feature existed — which assert the legacy "revision advances
+    /// straight to in_review with no reviewer" behaviour — keep passing
+    /// without being individually updated; tests exercising the new
+    /// behaviour opt in explicitly.
+    enable_revision_triggered_reviews: bool,
     /// PR state checker passed to `create_revision` in
     /// `finalize_pr_review_pass`. Defaults to [`GhPrStateChecker`] (shells
     /// out to `gh pr view`); tests inject `FakePrStateChecker::always(Open)`
@@ -956,6 +970,7 @@ impl WorkerCompletionHandler {
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
+            enable_revision_triggered_reviews: false,
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
         }
@@ -990,6 +1005,15 @@ impl WorkerCompletionHandler {
     /// tests that need to exercise the cycle-bound path set it low.
     pub fn with_max_review_cycles(mut self, max: usize) -> Self {
         self.max_review_cycles = max;
+        self
+    }
+
+    /// Turn revision-triggered reviewer passes on (2026-07-01 experiment).
+    /// Production wires in `WorkConfig.enable_revision_triggered_reviews`
+    /// (default `true`) via `app.rs`; tests that exercise the new behaviour
+    /// opt in explicitly since the bare handler defaults to `false`.
+    pub fn with_enable_revision_triggered_reviews(mut self, enabled: bool) -> Self {
+        self.enable_revision_triggered_reviews = enabled;
         self
     }
 
@@ -2195,6 +2219,15 @@ must not be asked to open one",
     async fn finalize_pr_review_pass(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let producing_task_id = &execution.work_item_id;
 
+        // Trace marker distinguishing a re-review triggered by a revision's
+        // push from the original first-push review (2026-07-01 revision-
+        // review experiment) — lets the engine surfaces count cycles and
+        // time spent per trigger kind without a schema change.
+        let trigger = match self.work_db.get_work_item(producing_task_id) {
+            Ok(WorkItem::Task(ref t)) if t.kind == TaskKind::Revision => "revision_push",
+            _ => "primary_push",
+        };
+
         // Look up the producing task to retrieve its pr_url (stamped during
         // the PendingReview write when the reviewer was enqueued).
         let pr_url = match self.work_db.get_work_item(producing_task_id) {
@@ -2388,18 +2421,42 @@ must not be asked to open one",
         // last_reviewed_sha. This happens regardless of whether a revision
         // was warranted — the cycle ticks on every completed reviewer pass.
         // A failure here is non-fatal (the task is already in in_review).
+        //
+        // Tracked on the review-cycle root (chain root for a revision-
+        // triggered pass, the task itself otherwise) so the counter
+        // accumulates across the whole revision chain instead of resetting
+        // to zero on every fresh revision task row — see
+        // `WorkDb::review_cycle_root_id`.
+        let cycle_root_id = self.work_db.review_cycle_root_id(producing_task_id);
         if let Err(err) = self
             .work_db
-            .increment_task_review_cycle(producing_task_id, head_sha_for_cycle.as_deref())
+            .increment_task_review_cycle(&cycle_root_id, head_sha_for_cycle.as_deref())
         {
             tracing::warn!(
                 execution_id = %execution.id,
                 producing_task_id,
+                cycle_root_id,
                 ?err,
                 "pr_review finalize: failed to increment review_cycle; \
                  cycle-bound enforcement may be off by one",
             );
         }
+
+        // 2026-07-01 revision-review experiment: log the trigger kind and
+        // wall-clock duration of this pass so the engine surfaces can count
+        // cycles and time spent by trigger without a schema change.
+        let duration_secs = execution
+            .started_at
+            .as_deref()
+            .or(Some(execution.created_at.as_str()))
+            .and_then(elapsed_secs_since);
+        tracing::info!(
+            execution_id = %execution.id,
+            producing_task_id,
+            trigger,
+            duration_secs,
+            "pr_review pass duration",
+        );
 
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
@@ -2441,6 +2498,7 @@ must not be asked to open one",
                         revision_task_id = %revision.id,
                         pr_url = %pr_url,
                         findings = result.findings.len(),
+                        trigger,
                         "pr_review pass finalised; revision created for qualifying findings",
                     );
                     self.publisher
@@ -2485,6 +2543,7 @@ must not be asked to open one",
             execution_id = %execution.id,
             producing_task_id,
             pr_url = %pr_url,
+            trigger,
             "pr_review pass finalised; producing task advanced to in_review",
         );
         StopOutcome::ReviewPassCompleted { pr_url }
@@ -2695,13 +2754,28 @@ must not be asked to open one",
                 Ok(ref producing)
                     if should_enqueue_reviewer_for_primary(&producing.kind)
                         || (producing.kind == ExecutionKind::RevisionImplementation
-                            && should_enqueue_reviewer_for_revision(&producing.work_item_id, &self.work_db)) =>
+                            && self.enable_revision_triggered_reviews) =>
                 {
+                    // 2026-07-01 revision-review experiment: distinguish the
+                    // trigger for logging/observability (kill-switch gates
+                    // only the revision arm above; a primary push is always
+                    // reviewed).
+                    let trigger = if producing.kind == ExecutionKind::RevisionImplementation {
+                        "revision_push"
+                    } else {
+                        "primary_push"
+                    };
                     // P992 tasks 9 & 10: read cycle state once — used by both
                     // the no-op gate (task 10) and the cycle-bound check (task 9).
+                    // Tracked on the review-cycle root (chain root for a
+                    // revision, the task itself otherwise) so cycle-bound and
+                    // no-op-skip state accumulates across the whole revision
+                    // chain instead of resetting on every fresh revision task
+                    // row — see `WorkDb::review_cycle_root_id`.
                     let max_cycles = self.max_review_cycles;
+                    let cycle_root_id = self.work_db.review_cycle_root_id(&producing.work_item_id);
                     let (review_cycle, last_reviewed_sha) =
-                        match self.work_db.get_task_review_cycle_state(&producing.work_item_id) {
+                        match self.work_db.get_task_review_cycle_state(&cycle_root_id) {
                             Ok(state) => state,
                             Err(err) => {
                                 // Fail open: treat as cycle=0, no prior SHA so both
@@ -2709,6 +2783,7 @@ must not be asked to open one",
                                 tracing::warn!(
                                     execution_id,
                                     work_item_id = %producing.work_item_id,
+                                    cycle_root_id,
                                     ?err,
                                     "could not read review_cycle; assuming bound not reached",
                                 );
@@ -2728,6 +2803,7 @@ must not be asked to open one",
                             execution_id,
                             work_item_id = %producing.work_item_id,
                             skip_reason,
+                            trigger,
                             "pr_review noop skip: advancing to in_review without reviewer pass",
                         );
                         false
@@ -2740,6 +2816,7 @@ must not be asked to open one",
                                 execution_id,
                                 work_item_id = %producing.work_item_id,
                                 max_review_cycles = max_cycles,
+                                trigger,
                                 "pr_review cycle bound reached; skipping reviewer \
                                  and advancing to in_review",
                             );
@@ -2776,6 +2853,7 @@ must not be asked to open one",
                                         review_execution_id = %review_exec.id,
                                         pr_url = %pr_url,
                                         producing_kind = %producing.kind,
+                                        trigger,
                                         "pr_review execution enqueued; \
                                          holding producing task for reviewer pass",
                                     );
@@ -5008,6 +5086,20 @@ fn tail_snippet(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Elapsed whole seconds since `timestamp`, a unix-seconds string as stored
+/// by `now_string()` (used for `WorkExecution::started_at`/`created_at`).
+/// Returns `None` if `timestamp` is unparseable. Used to log how long a
+/// `pr_review` pass took (2026-07-01 revision-review experiment) so the
+/// engine surfaces can track cost without a schema change.
+fn elapsed_secs_since(timestamp: &str) -> Option<i64> {
+    let then: i64 = timestamp.parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((now - then).max(0))
+}
+
 fn work_item_id(item: &WorkItem) -> String {
     match item {
         WorkItem::Product(product) => product.id.clone(),
@@ -5029,33 +5121,19 @@ fn work_item_product_id(item: &WorkItem) -> String {
 /// returns true, the producing task's column transition is held in
 /// `PendingReview`/Doing until the reviewer finalises.
 ///
-/// `RevisionImplementation` is handled separately: only revisions that were
-/// created by the automated reviewer itself (`created_via` starts with
-/// [`CREATED_VIA_PR_REVIEW_PREFIX`]) feed back into the review loop. CI-fix,
-/// conflict-resolution, and human-initiated revisions do NOT re-trigger a
-/// reviewer pass; they advance directly to human Review. That distinction is
-/// applied in [`should_enqueue_reviewer_for_revision`].
+/// `RevisionImplementation` is handled separately, at the call site in
+/// [`WorkerCompletionHandler::finalize_pr_transition`]: every revision kind
+/// (reviewer-spawned, CI-fix, conflict-resolution, and human/operator-
+/// initiated) that pushes new commits to its parent PR re-triggers a
+/// reviewer pass, gated only by the
+/// [`WorkerCompletionHandler::enable_revision_triggered_reviews`] kill-switch
+/// (2026-07-01 revision-review experiment — closes the gap where only the
+/// first push on a PR was ever reviewed).
 fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
     matches!(
         kind,
         ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
     )
-}
-
-/// Whether a `RevisionImplementation` execution should re-trigger a reviewer
-/// pass (P992 design §7). Returns `true` when the revision task's `created_via`
-/// field carries the [`CREATED_VIA_PR_REVIEW_PREFIX`] prefix, meaning it was
-/// spawned by the automated reviewer. Returns `false` for CI-fix, conflict-
-/// resolution, and human-initiated revisions (those advance directly to
-/// human Review without another automated pass).
-fn should_enqueue_reviewer_for_revision(task_id: &str, work_db: &crate::work::WorkDb) -> bool {
-    use boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX;
-    match work_db.get_work_item(task_id) {
-        Ok(crate::work::WorkItem::Task(t)) | Ok(crate::work::WorkItem::Chore(t)) => {
-            t.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -12373,7 +12451,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         )
         .with_staged_pr_urls(rev_staged)
         .with_branch_verifier(rev_verifier)
-        .with_pr_state_checker(open_pr_checker());
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
 
         let outcome3 = handler3.on_stop(&rev_exec.id).await;
         assert!(
@@ -12439,6 +12518,278 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             rev_task.status,
             TaskStatus::InReview,
             "step 4: revision task must be in_review after clean reviewer pass",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Revision-triggered review (2026-07-01 experiment, gap: revisions of
+    // ANY kind — CI-fix, conflict-resolution, operator-filed — previously
+    // pushed post-review commits with zero re-review). Tests below cover
+    // the verification scenarios called out in scope:
+    //   (a) a revision push triggers exactly one review;
+    //   (b) the motivating whole-PR duplication case produces a finding
+    //       and a follow-up revision;
+    //   (c) a no-op revision (no SHA delta) does not spin a review.
+    // -----------------------------------------------------------
+
+    /// A `ReviewResult` JSON with a single `duplication`-category finding —
+    /// the T192/rec_engine motivating incident (a crate extraction left two
+    /// complete copies of the same module in the PR). Severity is
+    /// deliberately `medium`: duplication forces a revision regardless of
+    /// severity (see `passes_severity_gate`), so this also proves the
+    /// forcing rule fires on a revision-triggered pass, not just a
+    /// first-push pass.
+    fn duplication_finding_review_result_json(pr_url: &str) -> String {
+        serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_1941pdt",
+            "summary": "The crate extraction left the original module in place alongside the new crate.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "medium",
+                    "category": "duplication",
+                    "file": "crates/rec_engine/src/lib.rs",
+                    "location": "whole file",
+                    "title": "rec_engine duplicated across blob/ and the new crate",
+                    "detail": "The extraction copied rec_engine into its own crate but never removed \
+                               the original copy under blob/ — the PR now ships two complete copies \
+                               of the same code. Delete the blob/ copy and repoint its callers at the \
+                               new crate.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                "suspected_deletions": []
+            }
+        })
+        .to_string()
+    }
+
+    /// (a) A revision that pushes new commits to its parent PR (SHA-delta
+    /// gate: `Contributed`) triggers exactly one `pr_review` execution when
+    /// the kill-switch is on — the completion-path trigger, not a poller.
+    #[tokio::test]
+    async fn revision_push_triggers_exactly_one_review() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        verifier.set_diff_line_count(Ok(40)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url } if pr_url == parent_pr_url),
+            "revision push must enqueue a reviewer; got {outcome:?}",
+        );
+
+        let ready = db.list_ready_executions().unwrap();
+        let reviews: Vec<_> = ready
+            .iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .collect();
+        assert_eq!(
+            reviews.len(),
+            1,
+            "exactly one pr_review execution must be created for the revision's push; got {reviews:?}",
+        );
+
+        // The kill-switch off (bare handler default) must preserve the
+        // legacy no-reviewer behaviour — belt-and-suspenders check that the
+        // ON case above is actually the flag doing the work.
+        let (db2, _product_id2, revision_id2, execution_id2) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        let verifier2 = StubBranchVerifier::ok("boss/exec_parent");
+        verifier2
+            .set_head_oid(Ok("cccccccccccccccccccccccccccccccccccccccc".into()))
+            .await;
+        let handler_off = WorkerCompletionHandler::new(
+            db2.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_branch_verifier(verifier2)
+        .with_pr_state_checker(open_pr_checker());
+        let outcome_off = handler_off.on_stop(&execution_id2).await;
+        assert!(
+            !matches!(outcome_off, StopOutcome::ReviewerEnqueued { .. }),
+            "kill-switch off must not enqueue a reviewer; got {outcome_off:?}",
+        );
+        assert!(
+            db2.list_ready_executions()
+                .unwrap()
+                .iter()
+                .all(|e| !(e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id2)),
+            "kill-switch off must not create any pr_review execution for the revision",
+        );
+    }
+
+    /// (b) The motivating T192/rec_engine incident: a revision (CI-fix,
+    /// conflict-resolution, or operator-filed — this fixture uses a
+    /// generic, non-reviewer-spawned `created_via`) pushes a commit that
+    /// leaves two complete copies of the same module. The revision-
+    /// triggered review must produce a duplication finding and — because
+    /// duplication forces a revision regardless of severity — spawn a
+    /// follow-up revision with the finding in its instructions.
+    #[tokio::test]
+    async fn revision_triggered_review_catches_motivating_duplication_case() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        verifier.set_diff_line_count(Ok(40)).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "revision push must enqueue a reviewer; got {outcome:?}",
+        );
+
+        let ready = db.list_ready_executions().unwrap();
+        let pr_review_exec = ready
+            .iter()
+            .find(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .cloned()
+            .expect("a pr_review execution must exist for the revision");
+
+        let (pr_review_exec, run) = db
+            .start_execution_run(
+                &pr_review_exec.id,
+                "review-worker-dup",
+                "mono",
+                "lease-review-dup",
+                "mono-agent-review-dup",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &pr_review_exec.id,
+                &run.id,
+                ExecutionStatus::WaitingHuman,
+                "completed",
+                Some("reviewer spawned"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let dup_json = duplication_finding_review_result_json(parent_pr_url);
+        let transcript = workspace.path().join(format!("transcript-{}.jsonl", pr_review_exec.id));
+        std::fs::write(&transcript, make_review_transcript_jsonl(&dup_json).as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(&pr_review_exec.id, transcript.to_str().unwrap())
+            .unwrap();
+
+        let review_outcome = handler.on_stop(&pr_review_exec.id).await;
+        let followup_revision_id = match &review_outcome {
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => revision_task_id.clone(),
+            other => panic!(
+                "duplication finding must force a follow-up revision (category-forced, \
+                 regardless of severity); got {other:?}"
+            ),
+        };
+
+        let followup = db.get_work_item(&followup_revision_id).unwrap();
+        let followup_task = match followup {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected task, got {other:?}"),
+        };
+        assert!(
+            followup_task.description.contains("duplication") || followup_task.description.contains("blob/"),
+            "follow-up revision instructions must carry the duplication finding: {}",
+            followup_task.description,
+        );
+        assert_eq!(
+            followup_task.parent_task_id.as_deref(),
+            Some(revision_id.as_str()),
+            "follow-up revision must chain off the reviewed revision task",
+        );
+    }
+
+    /// (c) A no-op revision push — the SHA-delta gate reports
+    /// `NoContribution` because the parent PR's head did not move — must
+    /// not enqueue a reviewer at all. This is the structural guarantee
+    /// upstream of `finalize_pr_transition`: an empty/whitespace-only
+    /// revision never reaches the reviewer-enqueue check in the first
+    /// place, so no pr_review execution (and no wasted review cycle) is
+    /// ever created for it.
+    #[tokio::test]
+    async fn noop_revision_push_does_not_enqueue_a_review() {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/737";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+        // Head SHA unchanged — the revision worker stopped without pushing
+        // anything (e.g. an empty/whitespace-only change it declined to land).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head_before.to_owned())).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "a no-op (no SHA delta) revision push must not enqueue a reviewer; got {outcome:?}",
+        );
+        assert!(
+            db.list_ready_executions()
+                .unwrap()
+                .iter()
+                .all(|e| !(e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)),
+            "no pr_review execution may be created for a no-op revision push",
         );
     }
 

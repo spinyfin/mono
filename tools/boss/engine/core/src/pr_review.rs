@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 /// orientation context the reviewer receives before touching any files.
 /// The reviewer workspace is already checked out to the PR head, so file
 /// reads go directly against the working tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PrReviewContext {
     /// GitHub PR number (the integer, e.g. `42` for `.../pull/42`).
     pub pr_number: u64,
@@ -56,6 +57,15 @@ pub struct PrReviewContext {
     /// not be fetched. When `Some`, the reviewer prompt embeds it directly
     /// so the reviewer skips the `gh pr diff` tool call.
     pub diff_content: Option<String>,
+    /// HEAD SHA this PR was at the end of the most recent completed
+    /// reviewer pass, or `None` on a PR's first review (2026-07-01
+    /// revision-review experiment). Lets the reviewer prioritise the delta
+    /// since that pass — content it already accepted doesn't need
+    /// re-litigating — while still reviewing the PR as a whole; see the
+    /// prompt's "Reviewing a revision" section, which explicitly overrides
+    /// diff-only scoping for whole-PR-state defects (e.g. a duplicated
+    /// module tree spread across a diff's unchanged and changed hunks).
+    pub last_reviewed_sha: Option<String>,
 }
 
 /// Which review rubric to apply to a PR.
@@ -730,6 +740,38 @@ pub fn render_reviewer_initial_prompt(
         None => String::new(),
     };
 
+    // 2026-07-01 revision-review experiment: when this pass was triggered by
+    // a revision's push (not the PR's first review), tell the reviewer what
+    // was already reviewed so it can prioritise the delta — while explicitly
+    // overriding diff-only scoping for whole-PR-state defects a delta view
+    // would miss (the motivating incident: a crate extraction left two
+    // complete copies of the same module in the PR).
+    let revision_context_block = match ctx.and_then(|c| c.last_reviewed_sha.as_deref()) {
+        Some(last_sha) if !last_sha.is_empty() => format!(
+            "## Reviewing a revision\n\
+             \n\
+             This PR was already reviewed up to commit `{last_sha}`. Since then, a \
+             revision (CI-fix, conflict-resolution, operator-filed, or a prior \
+             automated-reviewer revision) pushed new commits. **Prioritise the \
+             delta since `{last_sha}`** — content already reviewed and accepted \
+             does not need re-litigating unless the new commits touch it.\n\
+             \n\
+             **Do not scope your review to a diff-only view, however.** Some \
+             defects are only visible from the PR's whole current state, not \
+             from the new commits' diff alone. Concretely: a revision might \
+             extract a module into its own crate but leave the original copy in \
+             place, so the PR now ships two complete copies of the same code \
+             (e.g. one under `blob/`, one in the new crate) — a delta-only \
+             reviewer sees only \"new crate added\" and \"nothing removed\" as \
+             two unremarkable hunks and misses the duplication entirely. Before \
+             concluding the PR is clean, cross-check the full changed-file list \
+             and the current workspace contents (not just the new commits) for \
+             this class of whole-PR-state defect.\n\
+             \n"
+        ),
+        _ => String::new(),
+    };
+
     format!(
         "# PR review\n\
          \n\
@@ -759,6 +801,7 @@ pub fn render_reviewer_initial_prompt(
          \n\
          **PR:** {pr_url}\n\
          {pr_metadata_block}\n\
+         {revision_context_block}\
          ## Review steps\n\
          \n\
          1. Your workspace is already checked out to the PR head — read \
@@ -853,6 +896,7 @@ pub fn render_reviewer_initial_prompt(
         pr_url = pr_url,
         output_path = output_path,
         pr_metadata_block = pr_metadata_block,
+        revision_context_block = revision_context_block,
         pr_ref = pr_ref,
         diff_step = diff_step,
         embedded_diff_section = embedded_diff_section,
@@ -1063,6 +1107,7 @@ mod tests {
             head_sha: "head999".to_owned(),
             changed_files: vec!["src/main.rs".to_owned(), "tests/test.rs".to_owned()],
             diff_content: None,
+            last_reviewed_sha: None,
         };
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",
@@ -1103,6 +1148,7 @@ mod tests {
             head_sha: "head222".to_owned(),
             changed_files: vec!["src/lib.rs".to_owned()],
             diff_content: Some("diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}".to_owned()),
+            last_reviewed_sha: None,
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1139,6 +1185,7 @@ mod tests {
             head_sha: "head222".to_owned(),
             changed_files: vec!["src/lib.rs".to_owned()],
             diff_content: None,
+            last_reviewed_sha: None,
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1227,6 +1274,81 @@ mod tests {
         assert!(
             rule_text.contains("category: \"regression\"") && rule_text.contains("category: \"duplication\""),
             "revision_warranted rule must cover both regression and duplication categories: {rule_text}"
+        );
+    }
+
+    // --- revision-triggered review context (2026-07-01 experiment) ---
+
+    /// When `last_reviewed_sha` is set (a revision pushed after a prior
+    /// review pass), the prompt must tell the reviewer to prioritise the
+    /// delta AND explicitly override diff-only scoping for whole-PR-state
+    /// defects — the motivating T192/rec_engine duplication incident.
+    #[test]
+    fn revision_triggered_prompt_includes_delta_and_whole_pr_guidance() {
+        let ctx = PrReviewContext {
+            pr_number: 737,
+            base_sha: "base000".to_owned(),
+            head_sha: "head999".to_owned(),
+            changed_files: vec!["crates/rec_engine/src/lib.rs".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: Some("sha_reviewed_at_1843".to_owned()),
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Extract rec_engine into its own crate",
+            "Follow-up revision after the first review pass.",
+            "https://github.com/org/repo/pull/737",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(
+            prompt.contains("Reviewing a revision"),
+            "prompt must call out that this is a revision-triggered re-review"
+        );
+        assert!(
+            prompt.contains("sha_reviewed_at_1843"),
+            "prompt must embed the previously-reviewed head SHA"
+        );
+        assert!(
+            prompt.contains("Prioritise the delta"),
+            "prompt must instruct the reviewer to prioritise the delta since the last review"
+        );
+        assert!(
+            prompt.contains("Do not scope your review to a diff-only view"),
+            "prompt must explicitly override diff-only scoping for whole-PR-state defects"
+        );
+        assert!(
+            prompt.contains("two complete copies"),
+            "prompt must state the whole-PR duplication consideration (motivating incident)"
+        );
+    }
+
+    /// A first review (no prior pass) must NOT show the revision-context
+    /// section — it would be misleading noise on a PR that has never been
+    /// reviewed before.
+    #[test]
+    fn first_review_prompt_omits_revision_context_section() {
+        let ctx = PrReviewContext {
+            pr_number: 42,
+            base_sha: "base000".to_owned(),
+            head_sha: "head111".to_owned(),
+            changed_files: vec!["src/lib.rs".to_owned()],
+            diff_content: None,
+            last_reviewed_sha: None,
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Add a feature",
+            "Implement the new feature.",
+            "https://github.com/org/repo/pull/42",
+            "/tmp/bwo/exec.json",
+            ReviewScope::Code,
+            Some(&ctx),
+            "org/repo",
+        );
+        assert!(
+            !prompt.contains("Reviewing a revision"),
+            "first review must not carry revision-context framing"
         );
     }
 
