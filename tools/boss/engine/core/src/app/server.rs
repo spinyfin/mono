@@ -619,6 +619,19 @@ pub async fn serve(
         crate::database_backup::retention_count(),
     );
 
+    // Install the auto-populate capability (P783 task 7) before the merge
+    // poller starts, so the first design-PR merge it detects can enqueue a
+    // populate. Held in a process-wide OnceLock so the merge-trigger hook —
+    // deep in the poller's call chain with only a `&WorkDb` — can spawn the
+    // background pass without threading the api key through every signature.
+    // The api key is the same `ANTHROPIC_API_KEY`-sourced value the
+    // live-status summarizer uses; a `None` key degrades auto-populate to
+    // "pointer set, tasks not auto-created" with an attention item.
+    crate::populator::install(crate::populator::PopulatorConfig {
+        api_key: server_state.anthropic_api_key.clone(),
+        max_tasks: crate::populator::DEFAULT_MAX_TASKS,
+    });
+
     // Spawn the merge-detection poller. Workers can land their PRs
     // long after their Stop event has fired (and lease has been
     // released), so the on-Stop completion path can't catch every
