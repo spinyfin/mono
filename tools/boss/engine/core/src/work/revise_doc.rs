@@ -70,11 +70,18 @@ impl WorkDb {
                         .description(directive.clone())
                         .name(name.clone())
                         .created_via(created_via.clone())
+                        // Two racing CommentsReviseDoc calls on the same
+                        // artifact produce identical task names; the
+                        // guarded UPDATE in `claim_revisable_comments` is
+                        // the single source of race arbitration
+                        // (AlreadyInFlight), so the recent-duplicate guard
+                        // must not preempt it here.
+                        .force_duplicate(true)
                         .build(),
                     pr_checker,
                 ) {
                     Ok(task) => (task.id, "revision".to_owned(), owner.pr_url.clone()),
-                    Err(err) => {
+                    Err(err) if err.downcast_ref::<RevisionGateError>().is_some() => {
                         // Raced merge/close between render and click:
                         // `assert_parent_revisable` is the backstop — fall
                         // through to the chore branch (design §"Edge cases").
@@ -87,6 +94,7 @@ impl WorkDb {
                         let task = self.create_doc_comment_chore(&owner, &directive, &name, &created_via)?;
                         (task.id, "chore".to_owned(), None)
                     }
+                    Err(err) => return Err(err),
                 }
             }
             DocOwnerPrLifecycle::Merged | DocOwnerPrLifecycle::NoPr => {
@@ -130,6 +138,12 @@ impl WorkDb {
                 .name(name.to_owned())
                 .description(directive.to_owned())
                 .created_via(created_via.to_owned())
+                // See the matching comment on the revision path in
+                // `revise_doc`: the guarded UPDATE in
+                // `claim_revisable_comments` is the single source of race
+                // arbitration, so the recent-duplicate guard must not
+                // preempt it here either.
+                .force_duplicate(true)
                 .build(),
         )
     }
@@ -160,8 +174,16 @@ impl WorkDb {
         let affected = conn.execute(&update_sql, update_params.as_slice())?;
 
         if affected == 0 {
+            // Only a genuinely in-flight claim counts as a winner here.
+            // `revise_task_id` is intentionally left un-cleared when a
+            // comment transitions out of `in_revision` (see its doc
+            // comment), so without the status filter a comment carrying a
+            // stale id from a prior, already-completed batch would be
+            // misreported as `AlreadyInFlight`.
             let winner_sql = format!(
-                "SELECT revise_task_id FROM work_comments WHERE id IN ({placeholders}) AND revise_task_id IS NOT NULL LIMIT 1"
+                "SELECT revise_task_id FROM work_comments
+                 WHERE id IN ({placeholders}) AND revise_task_id IS NOT NULL
+                   AND status = '{COMMENT_STATUS_IN_REVISION}' LIMIT 1"
             );
             let winner_params: Vec<&dyn rusqlite::ToSql> =
                 candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
@@ -510,5 +532,103 @@ mod tests {
         // c2 was never a candidate for this batch, so it's still active.
         let reloaded2 = db.get_comment(&c2.id).unwrap().unwrap();
         assert_eq!(reloaded2.status, "active");
+    }
+
+    #[test]
+    fn falls_through_to_chore_when_gate_refuses_at_click_time() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        // DB lifecycle still reads Open (in_review + pr_url set)...
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        // ...but the live checker reports the PR merged, so the gate
+        // refuses at click time and this must fall through to a chore
+        // rather than propagating the RevisionGateError.
+        let checker = FakePrStateChecker::always(PrOpenState::Merged);
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_kind, pr_url, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(task_kind, "chore");
+        assert!(pr_url.is_none());
+    }
+
+    #[test]
+    fn already_in_flight_when_comment_claimed_by_concurrent_call() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        // Exercise `claim_revisable_comments` directly with a candidate
+        // list captured while the comment was still `active` (as
+        // `revise_doc` would read it), then simulate the loser of a
+        // concurrent `CommentsReviseDoc` race: the comment is claimed
+        // (still `in_revision`) for some other task's batch before this
+        // call's guarded UPDATE runs.
+        let candidate = db.get_comment(&c1.id).unwrap().unwrap();
+        let winner_task_id = "task_winner".to_owned();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'in_revision', revise_task_id = ? WHERE id = ?",
+                rusqlite::params![winner_task_id, c1.id],
+            )
+            .unwrap();
+        }
+
+        let outcome = db.claim_revisable_comments(&[candidate], "task_loser").unwrap();
+        assert!(matches!(
+            outcome,
+            ClaimOutcome::AlreadyInFlight(task_id) if task_id == winner_task_id
+        ));
+    }
+
+    #[test]
+    fn stale_revise_task_id_does_not_report_already_in_flight() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        // Exercise `claim_revisable_comments` directly with a candidate
+        // list captured (as `revise_doc` would) while the comment was
+        // still `active`, but the row has since gone non-active out of
+        // band, carrying a `revise_task_id` from a prior, already
+        // completed batch. The guarded UPDATE therefore affects 0 rows,
+        // and the stale id must not be mistaken for a genuinely
+        // in-flight claim.
+        let candidate = db.get_comment(&c1.id).unwrap().unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'resolved', revise_task_id = 'task_old' WHERE id = ?",
+                rusqlite::params![c1.id],
+            )
+            .unwrap();
+        }
+
+        let outcome = db.claim_revisable_comments(&[candidate], "task_new").unwrap();
+        assert!(matches!(outcome, ClaimOutcome::NoneLeft));
     }
 }
