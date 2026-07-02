@@ -94,7 +94,7 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 /// `id, artifact_kind, artifact_id, doc_version, anchor_json, body, author,
 ///  status, status_actor, last_resolved_with, plain_text_projection_version,
 ///  created_at, updated_at, dismissed_at, intent, intent_confidence,
-///  intent_classified_at, intent_overridden_by`.
+///  intent_classified_at, intent_overridden_by, revise_task_id`.
 /// A corrupt `anchor_json` degrades to an empty anchor (the comment still
 /// lists; it simply orphans on the next resolve) rather than failing the
 /// whole list query.
@@ -120,6 +120,7 @@ pub(crate) fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
         intent_confidence: row.get(15)?,
         intent_classified_at: row.get::<_, Option<String>>(16)?.filter(|s| !s.is_empty()),
         intent_overridden_by: row.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
+        revise_task_id: row.get::<_, Option<String>>(18)?.filter(|s| !s.is_empty()),
     })
 }
 

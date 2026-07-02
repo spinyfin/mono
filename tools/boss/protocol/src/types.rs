@@ -880,6 +880,13 @@ pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
 /// a Boss chore worker. Transitions `active` → `dispatched` at chore creation,
 /// then `dispatched` → `resolved` when the chore's PR merges.
 pub const COMMENT_STATUS_DISPATCHED: &str = "dispatched";
+/// Phase 2 (buckets 1&3, `comment-triggered-document-revisions.md`): a
+/// `directive`/`larger_change` comment addressed by a `CommentsReviseDoc`
+/// batch. `revise_task_id` is set for the duration of this status.
+/// Transitions `active` → `in_revision` on the guarded batch UPDATE;
+/// `in_revision` → `resolved` (task done) or `active` (task
+/// abandoned/reopened) via reconciliation.
+pub const COMMENT_STATUS_IN_REVISION: &str = "in_revision";
 
 /// How the comment's anchor last resolved against the doc's plain-text
 /// projection: `exact`, `fuzzy` (drives the ⚠ sidebar glyph), or `orphan`.
@@ -2603,6 +2610,56 @@ pub enum DocOwnerPrLifecycle {
     NoPr,
 }
 
+/// Input to the `CommentsReviseDoc` RPC: batch-address every unaddressed
+/// `directive`/`larger_change` comment on a `pr_doc` artifact. Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"Engine RPC surface".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviseDocInput {
+    /// `"pr_doc"` (v1). Any other value resolves to `NotApplicable` —
+    /// `resolve_doc_owner`'s scope guard returns `None` for it.
+    pub artifact_kind: String,
+    /// `pr_doc:<repo_remote_url>:<branch>:<path>`.
+    pub artifact_id: String,
+    /// `None` (v1 default) addresses every `active` comment on the artifact
+    /// classified `directive`/`larger_change`. Reserved for a future subset
+    /// selection (design §"Batch scope"); a caller-supplied id outside that
+    /// set is silently excluded, never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_ids: Option<Vec<String>>,
+}
+
+/// Outcome of `CommentsReviseDoc`. Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"Engine RPC surface".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviseDocOutcome {
+    /// A revision (open PR) or chore (merged/closed/no-PR) was created and
+    /// the addressed comments were flipped to `in_revision`.
+    Created {
+        /// The revision or chore that now owns the addressed comments.
+        task_id: String,
+        /// `"revision"` | `"chore"`.
+        task_kind: String,
+        addressed_comment_ids: Vec<String>,
+        /// The chain root's PR (revision path), or `None` for a fresh
+        /// chore that has not opened a PR yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_url: Option<String>,
+    },
+    /// No `active` comment on the artifact carries a `directive`/
+    /// `larger_change` intent — idempotent no-op.
+    NoUnresolvedComments,
+    /// A prior `CommentsReviseDoc` call already claimed every candidate
+    /// comment between this call's read and its guarded update.
+    AlreadyInFlight { task_id: String },
+    /// `resolve_doc_owner` found no design/investigation-owned task for
+    /// this artifact — not eligible for classification/routing at all.
+    NotApplicable { reason: String },
+}
+
 /// Role/origin of a rendered transcript segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2679,6 +2736,11 @@ pub const CREATED_VIA_PR_REVIEW_PREFIX: &str = "pr_review:";
 /// question group, or the batch of tasks/chores produced from a followup
 /// group. Design: `tools/boss/docs/designs/attentions.md`.
 pub const CREATED_VIA_ATTENTION: &str = "attention";
+/// Prefix for the revision/chore spawned by `CommentsReviseDoc`:
+/// `doc-comment:<artifact_kind>:<artifact_id>`. Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"Association model".
+pub const CREATED_VIA_DOC_COMMENT_PREFIX: &str = "doc-comment:";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -2702,6 +2764,7 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
         || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
+        || value.starts_with(CREATED_VIA_DOC_COMMENT_PREFIX)
         || value.starts_with("pr-comment:")
 }
 
@@ -3315,6 +3378,15 @@ pub struct WorkComment {
     /// preserved permanently as an audit trail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_overridden_by: Option<String>,
+
+    /// Soft FK → `tasks.id`: the revision or chore that this comment's
+    /// `[Revise]` batch was dispatched to. `NULL` unless `status =
+    /// 'in_revision'` (or a resolved/reopened comment whose last batch we
+    /// still want to trace). Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"Association model".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
