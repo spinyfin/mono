@@ -356,9 +356,16 @@ impl WorkDb {
     /// the merge poller to find in-flight revision workers to stop after
     /// the parent PR merges.  Only executions that hold a cube workspace
     /// lease are returned (same predicate as `list_in_flight_executions`).
+    ///
+    /// Walks with [`collect_chain_revision_ids_including_deleted`] rather
+    /// than the tombstone-filtered variant: by the time this runs, the
+    /// merge poller has already called `block_pending_revisions_on_parent_close`
+    /// in the same sweep, which archives *and tombstones* WIP revisions —
+    /// a tombstone-filtered walk would no longer see the row whose lease
+    /// still needs releasing.
     pub fn list_active_revision_executions_for_chain(&self, chain_root_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
+        let revision_ids = collect_chain_revision_ids_including_deleted(&conn, chain_root_id)?;
         if revision_ids.is_empty() {
             return Ok(Vec::new());
         }

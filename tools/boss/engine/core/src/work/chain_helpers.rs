@@ -132,6 +132,45 @@ pub(crate) fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str)
     Ok(ids)
 }
 
+/// Same BFS as [`collect_chain_revision_ids`] but does not filter on
+/// `deleted_at` — it also walks through revisions that are already
+/// tombstoned.
+///
+/// Needed by callers that must still find a revision immediately after
+/// [`block_pending_revisions_on_parent_close`] archived-and-tombstoned it
+/// in the same reconciliation pass — e.g. the merge poller's
+/// `stop_active_revision_executions`, which force-releases the cube lease
+/// of a WIP revision's in-flight execution right after that revision was
+/// just archived. Using the tombstone-filtered walk there would silently
+/// stop finding the row and leak the lease.
+pub(crate) fn collect_chain_revision_ids_including_deleted(
+    conn: &Connection,
+    chain_root_id: &str,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut frontier = vec![chain_root_id.to_owned()];
+    for _ in 0..64 {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next_frontier = Vec::new();
+        for parent_id in &frontier {
+            let mut stmt =
+                conn.prepare_cached("SELECT id FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision'")?;
+            let children: Vec<String> = stmt
+                .query_map([parent_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for child in children {
+                ids.push(child.clone());
+                next_frontier.push(child);
+            }
+        }
+        frontier = next_frontier;
+    }
+    Ok(ids)
+}
+
 /// Reconcile every pending revision in the chain when the parent PR merges
 /// or closes externally.  The three cases handled here mirror the design doc:
 ///
@@ -154,6 +193,19 @@ pub(crate) fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str)
 /// (their commit rode the PR to merge).  Terminal revisions (`done`,
 /// `archived`, `cancelled`) and revisions already blocked with
 /// `parent_pr_closed` are skipped.
+///
+/// Archiving a revision here also tombstones it (`deleted_at`): the kanban
+/// / `get_work_tree` contract is that `archived` rows are hidden by the
+/// `deleted_at` filter (see `WorkTask.boardColumn` in the macOS client),
+/// not by their `status` value — `archived` is otherwise a legitimate,
+/// query-visible terminal status (dependency-satisfaction checks, `boss
+/// task get`, etc.). A revision archived without a tombstone would
+/// linger, misclassified, on the board. Because the tombstone lands in
+/// the same UPDATE as the archive, [`collect_chain_revision_ids`]'s
+/// `deleted_at IS NULL` filter can no longer find these rows after this
+/// function returns — callers that must still locate a just-archived
+/// revision (e.g. the merge poller stopping its in-flight execution) use
+/// [`collect_chain_revision_ids_including_deleted`] instead.
 pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_root_id: &str, now: &str) -> Result<()> {
     let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
     if revision_ids.is_empty() {
@@ -179,7 +231,8 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                  SET status            = 'archived',
                      last_status_actor = 'engine',
                      updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2)
+                     completed_at      = COALESCE(completed_at, ?2),
+                     deleted_at        = ?2
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -239,7 +292,8 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                  SET status            = 'archived',
                      last_status_actor = 'engine',
                      updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2)
+                     completed_at      = COALESCE(completed_at, ?2),
+                     deleted_at        = ?2
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",

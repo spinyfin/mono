@@ -540,7 +540,8 @@ pub(crate) fn reconcile_revision_execution(
                  SET status            = 'archived',
                      last_status_actor = 'engine',
                      updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2)
+                     completed_at      = COALESCE(completed_at, ?2),
+                     deleted_at        = ?2
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -577,7 +578,8 @@ pub(crate) fn reconcile_revision_execution(
                  SET status            = 'archived',
                      last_status_actor = 'engine',
                      updated_at        = ?2,
-                     completed_at      = COALESCE(completed_at, ?2)
+                     completed_at      = COALESCE(completed_at, ?2),
+                     deleted_at        = ?2
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -1503,6 +1505,74 @@ mod tests {
             Some("https://github.com/spinyfin/mono/pull/55"),
             "reconcile_revision_execution must back-fill pr_url on an existing execution \
              that was created without it"
+        );
+    }
+
+    // ── dispatch-time catch-up gate: moot revision archived + tombstoned ────
+
+    /// When a revision "slips through" (e.g. engine restart, or the revision
+    /// was created after the parent PR had already merged) and the chain
+    /// root is found `done`/`archived` at dispatch time, a moot revision
+    /// (merge-conflict / CI-fix) must be archived silently — mirroring
+    /// `block_pending_revisions_on_parent_close` — and, like that path, the
+    /// archive must also tombstone the row so it disappears from
+    /// `get_work_tree` (the kanban's data source), not just flip status.
+    #[test]
+    fn reconcile_revision_execution_archives_and_tombstones_moot_revision_at_dispatch_time_catch_up() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+
+        // Parent chore already merged before this reconcile tick observed it.
+        let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', pr_url = 'https://github.com/spinyfin/mono/pull/56' WHERE id = ?1",
+                params![chore_id],
+            )
+            .unwrap();
+
+        // A CI-fix revision that slipped through, still sitting in `todo`.
+        let revision_id = next_id("task");
+        let now = now_string();
+        let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}rem_slipped");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+                 created_at, updated_at, parent_task_id, autostart, priority, created_via) \
+                 VALUES (?1, ?2, 'revision', 'Rev', '', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
+                params![revision_id, product, now, chore_id, created_via],
+            )
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let revision_task = query_task(&conn, &revision_id)
+            .unwrap()
+            .expect("revision task must exist");
+        let mut result = ExecutionReconcileResult::default();
+        {
+            let mut conn2 = db.connect().unwrap();
+            let tx = conn2.transaction().unwrap();
+            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let (status, deleted_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, deleted_at FROM tasks WHERE id = ?1",
+                params![revision_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "archived",
+            "moot revision slipped past the merge poller must be archived at dispatch-time catch-up"
+        );
+        assert!(
+            deleted_at.is_some(),
+            "dispatch-time catch-up archive must also tombstone the row, matching \
+             block_pending_revisions_on_parent_close"
         );
     }
 }

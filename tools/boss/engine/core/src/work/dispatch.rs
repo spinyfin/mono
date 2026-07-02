@@ -638,7 +638,14 @@ impl WorkDb {
         let root_id = chain_root(&conn, work_item_id)?;
         let mut member_ids = Vec::with_capacity(4);
         member_ids.push(root_id.clone());
-        member_ids.extend(collect_chain_revision_ids(&conn, &root_id)?);
+        // Tombstone-inclusive: `block_pending_revisions_on_parent_close`
+        // archives *and* tombstones a WIP revision in the same transaction
+        // that the merge poller detects the merge, but its execution isn't
+        // force-released until the poller's next step. A tombstone-filtered
+        // walk could miss that still-live execution during this window and
+        // let a second worker start on the same PR branch (the T1577/T1815
+        // hazard this guard exists to prevent).
+        member_ids.extend(collect_chain_revision_ids_including_deleted(&conn, &root_id)?);
         for member_id in &member_ids {
             if member_id == work_item_id {
                 continue;
