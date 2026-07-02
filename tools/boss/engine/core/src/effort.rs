@@ -54,7 +54,16 @@ impl SpawnConfig {
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
     /// need to construct a driver instance directly.
     pub fn claude_invocation(&self, non_opus_auto_mode: bool, settings_path: Option<&Path>) -> String {
-        crate::driver::ClaudeDriver.spawn_invocation(&self.model, self.claude_effort, settings_path, non_opus_auto_mode)
+        // No permission-mode override on this convenience wrapper: the
+        // capability-restricted answer-agent path spawns via
+        // `ClaudeDriver::spawn_invocation` directly (see `runner.rs`).
+        crate::driver::ClaudeDriver.spawn_invocation(
+            &self.model,
+            self.claude_effort,
+            settings_path,
+            non_opus_auto_mode,
+            None,
+        )
     }
 }
 

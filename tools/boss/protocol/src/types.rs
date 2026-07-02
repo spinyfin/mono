@@ -348,6 +348,16 @@ pub const AUTOMATION_OUTCOME_TRIAGE_RUNNING: &str = "triage_running";
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionKind {
+    /// Read-only "mini-coordinator" answer agent (P3a of
+    /// `comment-triggered-document-revisions.md`). Spawned to answer a
+    /// `question`-classified doc comment in its thread. Distinct from every
+    /// implementation/design kind: it runs under a **capability-restricted
+    /// dispatch surface** (allowlist, not blocklist) — read-only DB queries,
+    /// a read-only workspace checkout, and the post-thread-reply command
+    /// only; every mutating tool/RPC is omitted. See
+    /// [`crate::MagicWandDispatch`]-adjacent `answer_agent_runs` tracking and
+    /// the engine's `answer_agent` module for the enforced tool table.
+    AnswerAgent,
     AutomationTriage,
     ChoreImplementation,
     CiRemediation,
@@ -363,6 +373,7 @@ pub enum ExecutionKind {
 impl ExecutionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::AnswerAgent => "answer_agent",
             Self::AutomationTriage => "automation_triage",
             Self::ChoreImplementation => "chore_implementation",
             Self::CiRemediation => "ci_remediation",
@@ -387,6 +398,7 @@ impl std::str::FromStr for ExecutionKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "answer_agent" => Ok(Self::AnswerAgent),
             "automation_triage" => Ok(Self::AutomationTriage),
             "chore_implementation" => Ok(Self::ChoreImplementation),
             "ci_remediation" => Ok(Self::CiRemediation),
@@ -399,7 +411,7 @@ impl std::str::FromStr for ExecutionKind {
             "task_implementation" => Ok(Self::TaskImplementation),
             other => Err(format!(
                 "unknown execution kind: `{other}`; expected one of: \
-                 automation_triage, chore_implementation, ci_remediation, \
+                 answer_agent, automation_triage, chore_implementation, ci_remediation, \
                  conflict_resolution, investigation_implementation, pr_review, \
                  product_design, project_design, revision_implementation, task_implementation"
             )),
@@ -2129,6 +2141,61 @@ pub struct MagicWandDispatch {
     pub result_md: Option<String>,
 }
 
+/// An engine-persisted answer-agent run row (`answer_agent_runs` table).
+///
+/// Tracks one ephemeral, read-only "mini-coordinator" answer-agent execution
+/// against a `question`-classified doc comment (P3a of
+/// `comment-triggered-document-revisions.md`). Deliberately mirrors the shape
+/// of [`MagicWandDispatch`] — comment-keyed, per-run row, status + result —
+/// because it solves the analogous problem (track one ephemeral LLM run against
+/// a comment) with a different capability profile: the answer agent runs under
+/// the capability-restricted `answer_agent` execution kind and produces a
+/// thread reply instead of an apply/discard result.
+///
+/// No `tasks` row backs an answer-agent run (no kanban card); it is tracked
+/// purely as an agent run here. 12 fields → builder pattern per project
+/// convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AnswerAgentRun {
+    pub id: String,
+    pub comment_id: String,
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    /// The `doc_version` (plain-text-projection SHA) the comment was anchored
+    /// to when the agent was dispatched — snapshots the doc state the answer
+    /// reasoned about.
+    pub doc_version: String,
+    /// Thread turn this run answers: `0` for the first answer, `1+` for
+    /// re-entered follow-ups (each accumulates the prior thread as context).
+    #[serde(default)]
+    #[builder(default)]
+    pub thread_turn: i64,
+
+    /// `running` | `replied` | `failed`
+    /// (see [`ANSWER_AGENT_RUN_STATUS_RUNNING`] et al.).
+    pub status: String,
+
+    pub created_at: String,
+
+    /// The cube workspace lease the run holds while it checks out code to read.
+    /// `None` when the run answered without leasing. Released on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_lease_id: Option<String>,
+
+    /// The agent's comprehensive reply (may embed proposed edits as prose, but
+    /// never a patch the engine applies). `None` until the run replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_body: Option<String>,
+
+    /// Short error classification when `status = 'failed'`. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 /// Sub-state of `GitHubAuthStateDto::Authorized` that reflects whether the
 /// stored token can actually reach private org resources. A valid user token
 /// may still be blocked by org approval or SAML SSO requirements.
@@ -2442,6 +2509,14 @@ pub const MAGIC_WAND_STATUS_FAILED: &str = "failed";
 /// comment on a PR-backed doc. The `chore_id` column carries the spawned
 /// chore's id for audit linkage. There is no further engine-side Claude call.
 pub const MAGIC_WAND_STATUS_CHORE_CREATED: &str = "chore_created";
+
+// --- Answer-agent runs (P3a: read-only mini-coordinator answer agent) ---
+
+/// `answer_agent_runs.status` values. The run is created `running`, then flips
+/// exactly once to a terminal `replied` (posted its thread reply) or `failed`.
+pub const ANSWER_AGENT_RUN_STATUS_RUNNING: &str = "running";
+pub const ANSWER_AGENT_RUN_STATUS_REPLIED: &str = "replied";
+pub const ANSWER_AGENT_RUN_STATUS_FAILED: &str = "failed";
 
 /// Result of resolving a project's design-doc pointer. Carries the
 /// concrete `(repo, branch, path)` triple plus a discriminator that
@@ -4754,6 +4829,7 @@ mod tests {
     #[test]
     fn execution_kind_display_and_parse_are_inverses() {
         let all = [
+            ExecutionKind::AnswerAgent,
             ExecutionKind::AutomationTriage,
             ExecutionKind::ChoreImplementation,
             ExecutionKind::CiRemediation,
@@ -4776,6 +4852,10 @@ mod tests {
 
     #[test]
     fn execution_kind_serde_uses_wire_strings() {
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::AnswerAgent).unwrap(),
+            r#""answer_agent""#
+        );
         assert_eq!(
             serde_json::to_string(&ExecutionKind::ChoreImplementation).unwrap(),
             r#""chore_implementation""#

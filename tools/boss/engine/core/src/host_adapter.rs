@@ -42,8 +42,8 @@ use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
 };
 use crate::ssh_transport::SshTransport;
-use crate::work::{WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::{WorkerKind, WorkerSetupInput, render_remote_settings_json};
+use crate::work::{ExecutionKind, WorkDb, WorkExecution, WorkItem};
+use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
@@ -552,6 +552,10 @@ impl HostAdapter for SshHostAdapter {
     ) -> Result<RunOutcome> {
         let host = self.transport.host_id.clone();
 
+        // 0. Fail closed for the capability-restricted answer agent (see
+        //    `reject_remote_answer_agent`).
+        reject_remote_answer_agent(&execution.kind, &host)?;
+
         // 1. Verify the wrapper before any other work — drifted versions
         //    turn into `host_wrapper_push_failed` early so we don't try
         //    to invoke a stale wrapper contract.
@@ -617,7 +621,10 @@ impl HostAdapter for SshHostAdapter {
             draft_pr_mode: false,
             execution_kind: execution.kind.as_str().to_owned(),
             task_kind: work_item_task_kind(work_item).map(str::to_owned),
-            worker_kind: WorkerKind::Standard,
+            // Derive the restricted posture the same way the local path does,
+            // so a reviewer/triage/answer-agent dispatched remotely still gets
+            // its reduced surface instead of silently becoming Standard.
+            worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
         };
         let settings_json = render_remote_settings_json(&settings_input);
 
@@ -862,9 +869,49 @@ impl HostAdapterProvider for SshHostAdapterProvider {
     }
 }
 
+/// Fail closed for the capability-restricted answer agent on the REMOTE spawn
+/// path. Its read-only sandbox is enforced by the local spawn path forcing
+/// `--permission-mode dontAsk` (see `runner.rs`), but the remote worker wrapper
+/// (`remote/boss-remote-run.sh`) launches every worker with
+/// `--dangerously-skip-permissions`, which bypasses the settings allow/deny
+/// rules entirely. Rather than silently run an answer agent unsandboxed, refuse
+/// remote dispatch — answer agents are local-only until the remote wrapper
+/// learns to honour a restricted permission mode.
+///
+/// No path dispatches answer agents remotely today (the spawn trigger ships in
+/// P3b); this is a defensive backstop so the security property holds regardless
+/// of how dispatch/scheduling evolves.
+fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
+    if *kind == ExecutionKind::AnswerAgent {
+        bail!(
+            "answer_agent executions are local-only: the remote worker wrapper runs \
+             with --dangerously-skip-permissions, which would bypass the read-only \
+             dontAsk allowlist. Refusing to spawn an unsandboxed answer agent on host {host}."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_remote_answer_agent_blocks_answer_agent_allows_others() {
+        // The security-critical decision: an answer agent must never spawn on
+        // the remote (unsandboxed) path.
+        assert!(reject_remote_answer_agent(&ExecutionKind::AnswerAgent, "host-1").is_err());
+        // Every other kind is unaffected — remote dispatch proceeds.
+        for kind in [
+            ExecutionKind::TaskImplementation,
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::RevisionImplementation,
+            ExecutionKind::PrReview,
+            ExecutionKind::CiRemediation,
+        ] {
+            assert!(reject_remote_answer_agent(&kind, "host-1").is_ok(), "kind {kind:?}");
+        }
+    }
 
     // ── Pure helpers ─────────────────────────────────────────────────────────
 

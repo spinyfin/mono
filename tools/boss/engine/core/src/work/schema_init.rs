@@ -371,6 +371,16 @@ impl WorkDb {
         // existing row (classifier never ran on them).
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_work_comments_intent_columns(&conn)?;
+        // Comment intent handling (P3a): `answer_agent_runs` tracks each
+        // ephemeral read-only answer-agent run against a question-classified
+        // comment. Independent of every other table; `CREATE TABLE IF NOT
+        // EXISTS` so order is irrelevant.
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_answer_agent_runs_table(&conn)?;
+        // `schema_version` is a coarse bookkeeping marker, not a per-migration
+        // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
+        // this one and the P1a intent columns above) ride the current marker
+        // rather than bumping it. Left at '22'.
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '22')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

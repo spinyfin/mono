@@ -60,6 +60,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json;
 
+use boss_protocol::ExecutionKind;
+
 use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
 
 // Re-export guard command constants so the test module (which uses `use
@@ -98,6 +100,68 @@ pub enum WorkerKind {
     /// [`triage_deny_rules`] enforce the no-work posture; `boss task create`
     /// is intentionally left allowed.
     Triage,
+    /// Read-only "mini-coordinator" answer agent (P3a of
+    /// `comment-triggered-document-revisions.md`). Answers one reviewer
+    /// question in a doc-comment thread. Unlike every other kind it is
+    /// enforced with an **allowlist, not a blocklist**: it is spawned in
+    /// deny-by-default `dontAsk` permission mode with an explicit
+    /// [`answer_agent_allow_rules`] allowlist (read-only tools + the single
+    /// thread-reply command), plus a comprehensive [`answer_agent_deny_rules`]
+    /// belt. It reads anything the coordinator can see and reads code in a
+    /// read-only checkout, but MUST NOT edit, push, open/modify a PR, mutate
+    /// task/comment/cube state, or take any action other than posting its one
+    /// reply. See [`crate::answer_agent`] for the worker-facing surface.
+    AnswerAgent,
+}
+
+impl WorkerKind {
+    /// The permission mode that MUST be forced at spawn (`--permission-mode
+    /// <mode>`) for this kind, overriding the model-derived default, if any.
+    ///
+    /// `Some("dontAsk")` for the capability-restricted answer agent so its
+    /// deny-by-default allowlist is authoritative and cannot be silently
+    /// downgraded to `auto` (allow-by-default) or `--dangerously-skip-permissions`
+    /// (bypasses settings entirely). `None` lets the model-derived default
+    /// apply.
+    ///
+    /// Deriving BOTH the settings posture (via [`worker_kind_for_execution`])
+    /// and the forced CLI mode from the same exhaustive `WorkerKind` closes the
+    /// divergence footgun where a restricted kind gets a `dontAsk` settings
+    /// file but a downgradable CLI flag: the match here is exhaustive, so a new
+    /// restricted kind must decide its mode rather than inheriting the
+    /// downgradable default.
+    pub fn forced_permission_mode(&self) -> Option<&'static str> {
+        match self {
+            WorkerKind::AnswerAgent => Some("dontAsk"),
+            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+        }
+    }
+}
+
+/// Map a dispatched [`ExecutionKind`] to the [`WorkerKind`] whose permission
+/// posture it must run under. The single source of truth shared by the local
+/// spawn path ([`crate::runner`]) and the remote spawn path
+/// ([`crate::host_adapter`]) so the two can never diverge — a new execution
+/// kind that needs a restricted surface is wired here once.
+///
+/// Security-critical, so the match is **exhaustive** (no `_` arm): adding a new
+/// [`ExecutionKind`] forces a compile error here, making every new kind decide
+/// its permission posture explicitly rather than silently inheriting
+/// [`WorkerKind::Standard`] (full write/push access).
+pub fn worker_kind_for_execution(kind: &ExecutionKind) -> WorkerKind {
+    match kind {
+        ExecutionKind::PrReview => WorkerKind::Reviewer,
+        ExecutionKind::AutomationTriage => WorkerKind::Triage,
+        ExecutionKind::AnswerAgent => WorkerKind::AnswerAgent,
+        ExecutionKind::ChoreImplementation
+        | ExecutionKind::CiRemediation
+        | ExecutionKind::ConflictResolution
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::ProductDesign
+        | ExecutionKind::ProjectDesign
+        | ExecutionKind::RevisionImplementation
+        | ExecutionKind::TaskImplementation => WorkerKind::Standard,
+    }
 }
 
 /// All the inputs a worker-config render needs. The shape is
@@ -174,6 +238,12 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     }
     if input.worker_kind == WorkerKind::Triage {
         return crate::automation_triage::render_triage_claude_md(&input.lease_id);
+    }
+    if input.worker_kind == WorkerKind::AnswerAgent {
+        return crate::answer_agent::render_answer_agent_claude_md(
+            &input.lease_id,
+            &input.workspace_path.display().to_string(),
+        );
     }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
@@ -429,35 +499,7 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     pre_tool_use_hooks.extend(interception_wiring.pre_tool_use_hooks);
 
     let mut value = serde_json::json!({
-        // Auto mode for the worker pane. The engine's worker prompt
-        // already instructs claude not to ask for human permission,
-        // but that instruction is soft and cannot stop claude from
-        // blocking on a tool-use prompt if the harness permission
-        // mode is interactive. `auto` runs the session
-        // autonomously while still respecting the user's permission
-        // `allow`/`deny` rules — unlike `bypassPermissions`, which
-        // the user's environment policy disallows. Project-local
-        // settings override user-global per key, so this wins even
-        // when the human's `~/.claude/settings.json` defaults to
-        // interactive.
-        //
-        // The `deny` rules fence the worker off from Boss's runtime
-        // state. Workers operate on source code in their leased
-        // workspace; the engine's `state.db`, dispatch events,
-        // engine-audit log and the events socket all live under the
-        // Boss support dir and are coordinator-only. A worker that
-        // reads `state.db` directly can see ground truth the
-        // coordinator hasn't shown it (breaks reproducibility);
-        // writing to those files is catastrophic. Same logic for
-        // `bossctl`: that's the coordinator's CLI, not the worker's.
-        // The deny rules are belt; the engine-side audit in
-        // `audit_worker_sandbox_attempt` is suspenders that logs
-        // every attempt even if a future harness change lets a tool
-        // call through.
-        "permissions": {
-            "defaultMode": "auto",
-            "deny": deny_rules(input, sandbox),
-        },
+        "permissions": permissions_value(input, sandbox),
     });
     // `hooks` is the driver-produced map (all seven lifecycle events wired to
     // the forwarder), with the interception guards layered onto `PreToolUse`
@@ -473,6 +515,45 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     }
 
     value
+}
+
+/// Build the `permissions` object for the worker settings file.
+///
+/// Two postures, selected by [`WorkerKind`]:
+///
+/// - **Standard / Reviewer / Triage → blocklist.** `defaultMode: "auto"` runs
+///   the session autonomously (the worker prompt tells claude not to ask for
+///   human permission, but that is soft — `auto` makes it real without the
+///   env-policy-disallowed `bypassPermissions`), and the `deny` rules fence the
+///   worker off from Boss's runtime state and (per kind) from writing/pushing.
+///   Project-local settings override user-global per key, so this wins even
+///   when the human's `~/.claude/settings.json` defaults to interactive. The
+///   `deny` rules are belt; the engine-side audit in
+///   `audit_worker_sandbox_attempt` is suspenders.
+///
+/// - **AnswerAgent → allowlist.** `defaultMode: "dontAsk"` auto-denies every
+///   tool call except those matching `permissions.allow` and built-in
+///   read-only Bash commands — a true deny-by-default allowlist (design § Risks
+///   open question, resolved in favour of a hard-coded reduced tool table).
+///   The same `deny` rules still apply as a defense-in-depth belt (deny always
+///   wins over allow). The dispatch layer additionally forces
+///   `--permission-mode dontAsk` at launch (see
+///   [`crate::driver::ClaudeDriver::spawn_invocation`]) so the mode cannot be
+///   downgraded to `auto`/`--dangerously-skip-permissions`, which would defeat
+///   the allowlist.
+fn permissions_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
+    if input.worker_kind == WorkerKind::AnswerAgent {
+        serde_json::json!({
+            "defaultMode": "dontAsk",
+            "allow": answer_agent_allow_rules(),
+            "deny": deny_rules(input, sandbox),
+        })
+    } else {
+        serde_json::json!({
+            "defaultMode": "auto",
+            "deny": deny_rules(input, sandbox),
+        })
+    }
 }
 
 /// Build the permission deny list. Returns a JSON array of strings in
@@ -532,6 +613,7 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
     match input.worker_kind {
         WorkerKind::Reviewer => rules.extend(reviewer_deny_rules(&input.workspace_path)),
         WorkerKind::Triage => rules.extend(triage_deny_rules()),
+        WorkerKind::AnswerAgent => rules.extend(answer_agent_deny_rules()),
         WorkerKind::Standard => {}
     }
 
@@ -613,6 +695,68 @@ pub fn triage_deny_rules() -> Vec<String> {
         "Write(**)".to_owned(),
     ];
     rules.extend(publish_deny_rules());
+    rules
+}
+
+/// The `permissions.allow` allowlist for [`WorkerKind::AnswerAgent`] — the
+/// hard-coded reduced tool table (design § Risks open question, resolved).
+///
+/// Under the forced `dontAsk` permission mode this is the ENTIRE set of
+/// non-read-only actions the answer agent can take; everything not listed here
+/// (and not a built-in read-only Bash command, which `dontAsk` auto-approves)
+/// is denied. So it deliberately holds only:
+///
+/// - the read-only inspection tools (`Read`/`Grep`/`Glob`), which must be
+///   listed explicitly because `dontAsk` only auto-approves read-only *Bash*,
+///   and
+/// - the single state-mutating command the agent may run: posting its thread
+///   reply ([`crate::answer_agent::THREAD_REPLY_COMMAND`]).
+///
+/// Reading code via read-only shell (`cat`, `grep`, `jj log`, `jj show`,
+/// `jj diff`, …) needs no entry — `dontAsk` auto-approves those. The read-only
+/// engine-query commands the agent uses (`boss …` reads) are added here in P3b
+/// alongside the query layer that ships with the spawn path; until then the
+/// allowlist is intentionally minimal (P3a builds the enforcement mechanism,
+/// not the agent that exercises it).
+///
+/// Every entry MUST be read-only or the single reply command. Adding a
+/// mutating entry here is a capability escalation and must be reviewed as such.
+pub fn answer_agent_allow_rules() -> Vec<String> {
+    vec![
+        "Read".to_owned(),
+        "Grep".to_owned(),
+        "Glob".to_owned(),
+        format!("Bash({}:*)", crate::answer_agent::THREAD_REPLY_COMMAND),
+    ]
+}
+
+/// Defense-in-depth `permissions.deny` belt for [`WorkerKind::AnswerAgent`],
+/// layered on top of the static all-worker rules in [`deny_rules`].
+///
+/// The PRIMARY enforcement is the deny-by-default `dontAsk` allowlist
+/// ([`answer_agent_allow_rules`]); these denies are belt (deny always wins over
+/// allow, and they still bite under any other permission mode). They cover the
+/// known-catastrophic mutating surfaces:
+///
+/// - File writes — blanket `Edit`/`Write`/`NotebookEdit`. Unlike the reviewer,
+///   the answer agent writes NO out-of-tree artifact (its reply is posted via
+///   the allowlisted [`crate::answer_agent::THREAD_REPLY_COMMAND`], not a
+///   `Write`), so the deny is unscoped.
+/// - Branch push / PR / GitHub-write / `cube pr` — via [`publish_deny_rules`].
+/// - All of `cube` — the engine hands the agent an already-leased read-only
+///   checkout; it must not lease, release, or otherwise mutate cube state
+///   itself (design capability table: "Release/mutate cube lease state … No").
+pub fn answer_agent_deny_rules() -> Vec<String> {
+    let mut rules = vec![
+        "Edit(**)".to_owned(),
+        "Write(**)".to_owned(),
+        "NotebookEdit(**)".to_owned(),
+    ];
+    rules.extend(publish_deny_rules());
+    // `publish_deny_rules` already denies `cube pr`; deny the rest of `cube`
+    // (workspace lease/release, config, …) so the agent cannot touch cube state.
+    rules.push("Bash(cube)".to_owned());
+    rules.push("Bash(cube:*)".to_owned());
     rules
 }
 

@@ -70,24 +70,25 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_DISPATCHED,
-    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution, ConflictResolution, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner,
-    DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION,
-    ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED, MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT,
-    MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
-    MagicWandDispatch, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT,
-    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput,
-    Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
-    WorkTree, is_known_created_via,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING,
+    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
+    AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
+    COMMENT_STATUS_DISPATCHED, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION,
+    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX,
+    CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor,
+    CommentResolution, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
+    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyDirection,
+    DependencyEdge, DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
+    EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, INTENT_DIRECTIVE,
+    INTENT_LARGER_CHANGE, INTENT_QUESTION, ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED,
+    MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED,
+    MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED, MagicWandDispatch, PrWorkItemMatch, Product, Project,
+    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -187,6 +188,7 @@ impl Clone for WorkDb {
 }
 
 // ---- module tree (see PR description for the split rationale) ----
+mod answer_agent_runs;
 mod attentions;
 mod audit_misc;
 mod automations;
