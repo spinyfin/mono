@@ -15,7 +15,6 @@ use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::WorkerKind;
 #[cfg(test)]
 use boss_protocol::TaskStatus;
 use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TaskKind, TemplatePolicy, WorkItemBinding};
@@ -478,6 +477,18 @@ impl ExecutionRunner for PaneSpawnRunner {
         // `cube`/`boss` subshell it spawns — inherits the bundled-first
         // PATH. The `[ -n "$BOSS_BIN_DIR" ]` guard is a no-op in dev /
         // bazel-run mode where BOSS_BIN_DIR is unset.
+        // The answer agent is capability-restricted: force deny-by-default
+        // `dontAsk` so its `permissions.allow` allowlist is authoritative and
+        // cannot be downgraded to `auto` / `--dangerously-skip-permissions`
+        // (which would bypass the settings rules). Every other kind keeps the
+        // model-derived permission mode.
+        //
+        // Derive the worker kind ONCE and use it for BOTH the settings posture
+        // (StartWorkerInput.worker_kind below) and the forced CLI mode, so the
+        // two switches can never diverge — the exhaustive `WorkerKind` matches
+        // force a new restricted kind to decide both.
+        let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
+        let permission_mode_override = worker_kind.forced_permission_mode();
         let initial_input = format!(
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
             crate::driver::ClaudeDriver.spawn_invocation(
@@ -485,6 +496,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 spawn_config.claude_effort,
                 Some(&worker_settings_path),
                 spawner.non_opus_auto_mode(),
+                permission_mode_override,
             ),
         );
 
@@ -527,16 +539,12 @@ impl ExecutionRunner for PaneSpawnRunner {
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.as_str().to_owned(),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
-                // A triage worker's deliverable is a decision marker, not a
-                // PR — it must NOT get the Standard "PR is the deliverable"
-                // CLAUDE.md, which otherwise overrides the marker contract and
-                // leaves runs ending without a decision marker. A reviewer is
-                // read-only. Everything else is a Standard implementer.
-                worker_kind: match execution.kind {
-                    ExecutionKind::PrReview => WorkerKind::Reviewer,
-                    ExecutionKind::AutomationTriage => WorkerKind::Triage,
-                    _ => WorkerKind::Standard,
-                },
+                // Per-kind worker posture (reviewer/triage/answer-agent are
+                // restricted; everything else is a Standard implementer),
+                // derived once above via the shared `worker_kind_for_execution`
+                // so the settings posture and the forced CLI permission mode
+                // are driven by one value and cannot diverge.
+                worker_kind,
             },
             StdDuration::from_secs(30),
         )
@@ -1287,6 +1295,15 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
             );
             prompt.push_str(check_bypass_prohibition_text());
+        }
+        ExecutionKind::AnswerAgent => {
+            // Read-only answer agent: it never touches the workspace or opens a
+            // PR — its whole mandate is to answer the question and post one
+            // thread reply. (The full answer-agent prompt is composed by P3b;
+            // this arm keeps the generic composer sane and PR-free if reached.)
+            prompt.push_str(
+                "Expected outcome for this run:\n- read what you need to answer the question accurately,\n- post exactly one comprehensive reply to the comment thread,\n- take no other action — you are read-only.\n",
+            );
         }
         ExecutionKind::AutomationTriage
         | ExecutionKind::CiRemediation

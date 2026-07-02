@@ -541,12 +541,19 @@ pub trait AgentDriver: Send + Sync {
     /// Build the worker invocation string written into the pane as the
     /// spawn command. Replaces [`crate::effort::SpawnConfig::claude_invocation`]
     /// for the Claude driver.
+    ///
+    /// `permission_mode_override`, when `Some`, forces `--permission-mode
+    /// <mode>` and suppresses the model-derived `auto` /
+    /// `--dangerously-skip-permissions` choice. Used by the capability-restricted
+    /// answer agent to guarantee `dontAsk` (deny-by-default allowlist), which
+    /// must not be downgradable. `None` keeps the default per-model behaviour.
     fn spawn_invocation(
         &self,
         model: &str,
         effort: Option<&str>,
         settings_path: Option<&Path>,
         non_opus_auto_mode: bool,
+        permission_mode_override: Option<&str>,
     ) -> String;
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────
@@ -901,7 +908,7 @@ mod tests {
         fn capabilities(&self) -> CapabilitySet {
             self.caps.clone()
         }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool) -> String {
+        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
             unimplemented!()
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {

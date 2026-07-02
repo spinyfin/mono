@@ -299,13 +299,22 @@ impl AgentDriver for ClaudeDriver {
         effort: Option<&str>,
         settings_path: Option<&Path>,
         non_opus_auto_mode: bool,
+        permission_mode_override: Option<&str>,
     ) -> String {
         let mut cmd = format!("claude --model {model}");
         if let Some(e) = effort {
             cmd.push_str(" --effort ");
             cmd.push_str(e);
         }
-        if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
+        if let Some(mode) = permission_mode_override {
+            // Forced mode (e.g. `dontAsk` for the capability-restricted answer
+            // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
+            // branches — the latter would bypass the settings allow/deny rules
+            // entirely, defeating the allowlist. The CLI flag wins over the
+            // settings-file `defaultMode`, so this is the authoritative mode.
+            cmd.push_str(" --permission-mode ");
+            cmd.push_str(mode);
+        } else if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");
@@ -949,7 +958,7 @@ mod tests {
 
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
-        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false);
+        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
         let expected_cat = format!(
             "\"$(cat {}/{})\"\n",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
@@ -957,6 +966,34 @@ mod tests {
         assert!(
             cmd.contains(&expected_cat),
             "spawn invocation must read from descriptor paths; got: {cmd}",
+        );
+    }
+
+    #[test]
+    fn permission_mode_override_forces_mode_and_suppresses_skip_permissions() {
+        // A non-auto model + non_opus_auto_mode=false would normally spawn with
+        // `--dangerously-skip-permissions` (which bypasses the settings
+        // allow/deny rules). The override must win and suppress that entirely,
+        // so the capability-restricted answer agent always runs deny-by-default.
+        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, Some("dontAsk"));
+        assert!(
+            cmd.contains("--permission-mode dontAsk"),
+            "expected forced dontAsk; got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--dangerously-skip-permissions"),
+            "override must suppress --dangerously-skip-permissions; got: {cmd}",
+        );
+        assert!(
+            !cmd.contains("--permission-mode auto"),
+            "override must suppress auto; got: {cmd}"
+        );
+
+        // Without an override, the default per-model behaviour is unchanged.
+        let default_cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
+        assert!(
+            default_cmd.contains("--dangerously-skip-permissions"),
+            "got: {default_cmd}"
         );
     }
 }

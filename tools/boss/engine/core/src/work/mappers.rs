@@ -147,6 +147,28 @@ pub(crate) fn map_magic_wand_dispatch(row: &Row<'_>) -> rusqlite::Result<MagicWa
     })
 }
 
+/// Maps an `answer_agent_runs` row. Column order must match the SELECT in
+/// `work/answer_agent_runs.rs`:
+/// `id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn,
+///  status, workspace_lease_id, reply_body, error_kind, created_at,
+///  completed_at`.
+pub(crate) fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgentRun> {
+    Ok(AnswerAgentRun {
+        id: row.get(0)?,
+        comment_id: row.get(1)?,
+        artifact_kind: row.get(2)?,
+        artifact_id: row.get(3)?,
+        doc_version: row.get(4)?,
+        thread_turn: row.get(5)?,
+        status: row.get(6)?,
+        workspace_lease_id: row.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
+        reply_body: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+        error_kind: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+        created_at: row.get(10)?,
+        completed_at: row.get::<_, Option<String>>(11)?.filter(|s| !s.is_empty()),
+    })
+}
+
 pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {

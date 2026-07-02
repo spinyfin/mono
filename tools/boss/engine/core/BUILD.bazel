@@ -5,6 +5,7 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 rust_library(
     name = "engine_lib",
     srcs = [
+        "src/answer_agent.rs",
         "src/app.rs",
         "src/app/attentions.rs",
         "src/app/automations.rs",
@@ -122,6 +123,7 @@ rust_library(
         "src/transient_error.rs",
         "src/transient_recovery.rs",
         "src/work.rs",
+        "src/work/answer_agent_runs.rs",
         "src/work/attentions.rs",
         "src/work/audit_misc.rs",
         "src/work/automations.rs",
