@@ -346,6 +346,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - Ask only when you cannot reasonably infer the destination product.
     - Keep status and structure accurate as workers finish.
     - Pass `--effort <level>` on every `boss chore create` / `boss task create`. Do NOT pass `--model`.
+    - Prefer subagents for pre-work. When filing a chore/task/project requires nontrivial preparation — gathering logs or stats, reading design docs or PRs, sweeping code to scope a problem — spin off a coordinator subagent (Agent tool) to do it rather than doing it inline or filing a thin brief. Fold the subagent's findings (verbatim evidence, file paths, stats) into the work item's description so the dispatched worker starts from concrete context instead of rediscovering it. This matters doubly when the evidence lives in coordinator-only state (engine logs, runtime db) that cube workers are forbidden to read: the brief is the only channel that context can cross. Inline work remains fine for trivial lookups (one CLI call, one file peek).
 
     ## Effort estimation
 
