@@ -283,8 +283,26 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// lost (the zombie-Riker/Garak-pane incident, 2026-07-01/02).
     ///
     /// Returns the vacated slot ids, purely for caller-side logging.
+    ///
+    /// Guard: an EMPTY `liveRunIds` snapshot is treated as "unknown",
+    /// never as "everything is dead", and the sweep is skipped entirely.
+    /// The engine's in-memory live-worker registry is rebuilt from
+    /// scratch on every engine restart (crash/upgrade/manual restart);
+    /// engine-startup reattach only re-populates REMOTE runs
+    /// (`remote_reattach.rs`), so a restarted engine reports an empty
+    /// local live set even while this app's local worker/reviewer
+    /// panes are still running real, unfinished work. Without this
+    /// guard the very first post-restart reconnect would read as "no
+    /// runs are live" and `releaseWorkerPane` would SIGKILL every
+    /// locally-hosted pane's process tree — turning a routine engine
+    /// restart into a mass kill of in-progress work. A genuinely idle
+    /// app (zero locally-hosted panes) is unaffected either way, since
+    /// the loop below is then a no-op regardless of this guard.
     @discardableResult
     func reconcilePanes(liveRunIds: Set<String>) -> [Int] {
+        guard !liveRunIds.isEmpty else {
+            return []
+        }
         var vacatedSlotIDs: [Int] = []
         for pool in [slots, automationSlots, reviewSlots] {
             for slot in pool {

@@ -401,4 +401,23 @@ final class WorkersWorkspaceModelReconcilePanesTests: XCTestCase {
         let model = WorkersWorkspaceModel()
         XCTAssertTrue(model.reconcilePanes(liveRunIds: []).isEmpty)
     }
+
+    func testSkipsTheSweepWhenTheLiveSnapshotIsEmptyEvenWithHostedPanes() {
+        // An empty snapshot must read as "unknown", not "everything is
+        // dead": the engine's in-memory live-worker registry is empty
+        // on every fresh engine start (crash/upgrade/manual restart),
+        // while this app's local worker/reviewer panes keep running
+        // real, unfinished work across that restart. Treating "absent
+        // from an empty registry" as death would SIGKILL every hosted
+        // pane on the very first reconnect after a routine engine
+        // restart. Reconciliation must wait for a snapshot that
+        // actually reflects live runs before closing anything.
+        let model = WorkersWorkspaceModel()
+        _ = model.spawnWorkerPane(makeSpawn(slot: 1, runId: "run-still-working"))
+
+        let vacatedSlotIDs = model.reconcilePanes(liveRunIds: [])
+
+        XCTAssertTrue(vacatedSlotIDs.isEmpty, "an empty live snapshot must not be treated as a kill signal")
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session, "hosted pane must survive an empty snapshot")
+    }
 }

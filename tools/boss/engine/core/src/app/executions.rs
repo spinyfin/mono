@@ -475,7 +475,17 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
         // loudly if the app cannot be reached, not silently leave the
         // pane." A stopped process with a still-rendered pane is exactly
         // the state that left no working verb to recover from.
-        server_state.completion_handler.force_stop_execution(&run_id).await;
+        let app_confirmed = server_state.completion_handler.force_stop_execution(&run_id).await;
+        if app_confirmed {
+            // The slot-keyed release above already reached the app and
+            // positively confirmed the pane close — `force_vacate_run`'s
+            // run-id-keyed fallback exists to recover a pane whose slot
+            // mapping is already gone, and that mapping was just
+            // consumed here, so a second app round trip would always
+            // resolve to `NothingToVacate`. Skip it.
+            send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
+            return;
+        }
         match server_state.force_vacate_run(&run_id).await {
             ForceVacateOutcome::Vacated | ForceVacateOutcome::NothingToVacate => {
                 send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });

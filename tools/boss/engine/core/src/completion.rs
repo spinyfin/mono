@@ -145,6 +145,21 @@ pub enum PaneReleaseOutcome {
     NoLiveWorker,
 }
 
+/// Result of [`WorkerPaneReleaser::release_pane_detailed`]. `outcome`
+/// tells the caller whether a live worker slot was reaped (as with plain
+/// `release_pane`); `app_confirmed` additionally tells the caller whether
+/// the app session was actually reached and positively confirmed the
+/// pane close, as opposed to only the engine-side backstop having run.
+/// Exists so callers that must guarantee end-to-end pane teardown (e.g.
+/// `bossctl agents stop`, via [`crate::app::ServerState::force_vacate_run`])
+/// can skip a redundant, always-empty run-id-keyed fallback round trip
+/// when the slot-keyed release already confirmed the close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneVacateReport {
+    pub outcome: PaneReleaseOutcome,
+    pub app_confirmed: bool,
+}
+
 /// Asks the registered app session to tear down the libghostty pane
 /// hosting `run_id`. Implementations must be idempotent: a duplicate
 /// call after the slot has been released is a no-op, not an error.
@@ -156,6 +171,21 @@ pub enum PaneReleaseOutcome {
 #[async_trait]
 pub trait WorkerPaneReleaser: Send + Sync {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome;
+
+    /// Like [`Self::release_pane`], but also reports whether the app
+    /// positively confirmed the pane close rather than just "the
+    /// engine-side backstop ran". Default implementation treats a
+    /// `Reaped` outcome as confirmed — accurate for releasers with no
+    /// closer visibility into the app round-trip (tests, no-op
+    /// backends). `ServerStatePaneReleaser` overrides this with the real
+    /// signal from `ServerState::release_worker_pane_detailed`.
+    async fn release_pane_detailed(&self, run_id: &str) -> PaneVacateReport {
+        let outcome = self.release_pane(run_id).await;
+        PaneVacateReport {
+            app_confirmed: matches!(outcome, PaneReleaseOutcome::Reaped),
+            outcome,
+        }
+    }
 }
 
 /// `WorkerPaneReleaser` that does nothing — used when no app session
@@ -3672,9 +3702,23 @@ must not be asked to open one",
     /// the row that triggered it, rather than requiring a post-mortem
     /// to cross-reference this function's own log lines by execution id.
     pub async fn force_release(&self, execution_id: &str) -> ForceReleaseOutcome {
-        // Pane release first. Idempotent on the registry side; the
-        // implementation logs and skips when no slot is mapped.
-        //
+        let pane_outcome = self.pane_releaser.release_pane(execution_id).await;
+        self.release_lease_after_pane_teardown(execution_id, pane_outcome).await
+    }
+
+    /// The cube-lease half of [`Self::force_release`], given a pane
+    /// release outcome the caller already obtained. Split out so
+    /// [`Self::force_stop_execution`] can call the app exactly once via
+    /// [`WorkerPaneReleaser::release_pane_detailed`] and reuse its
+    /// outcome here, instead of `force_release` making its own,
+    /// redundant `release_pane` call on top — the second call is always
+    /// a no-op (the slot mapping was already consumed by the first) but
+    /// still pays a round trip to the app when one is registered.
+    async fn release_lease_after_pane_teardown(
+        &self,
+        execution_id: &str,
+        pane_outcome: PaneReleaseOutcome,
+    ) -> ForceReleaseOutcome {
         // The outcome gates the cube release below: only a worker whose
         // pane was actually found and reaped frees its lease. A worker
         // still mid-spawn (no slot mapped yet, no pid to reap) reports
@@ -3683,10 +3727,7 @@ must not be asked to open one",
         // it into a same-workspace collision (T981). In that case the
         // lease stays held; the in-flight `run_execution` reaps the
         // worker once its spawn settles and releases the lease then.
-        if matches!(
-            self.pane_releaser.release_pane(execution_id).await,
-            PaneReleaseOutcome::NoLiveWorker
-        ) {
+        if matches!(pane_outcome, PaneReleaseOutcome::NoLiveWorker) {
             tracing::info!(
                 execution_id,
                 "force_release: no live worker pane mapped (mid-spawn or already released); \
@@ -3786,12 +3827,22 @@ must not be asked to open one",
     ///    in Doing with no live worker.
     /// 3. Publishes a `work_item_changed` event so the UI and
     ///    downstream subscribers see the status transition.
-    /// 4. Then calls `force_release` to kill the pane and free
-    ///    the cube workspace.
+    /// 4. Then calls the pane releaser and cube-lease teardown directly
+    ///    (the same work `force_release` does, but via a single
+    ///    `release_pane_detailed` call so the caller also learns whether
+    ///    the app positively confirmed the pane close).
     ///
     /// Idempotent: a second call for the same execution is a no-op
     /// at both the DB and the cube-release layers.
-    pub async fn force_stop_execution(&self, execution_id: &str) {
+    ///
+    /// Returns whether the app confirmed the pane close
+    /// (`PaneVacateReport::app_confirmed`). Callers that must guarantee
+    /// end-to-end teardown (`bossctl agents stop`, via `handle_stop_run`)
+    /// use this to skip `ServerState::force_vacate_run`'s run-id-keyed
+    /// fallback round trip when it would just find nothing — the slot
+    /// mapping consumed here is exactly what that fallback would have
+    /// gone looking for.
+    pub async fn force_stop_execution(&self, execution_id: &str) -> bool {
         let (exec_cancelled, task_demoted) = match self.work_db.cancel_running_execution_and_demote_task(execution_id) {
             Ok(result) => result,
             Err(err) => {
@@ -3824,7 +3875,10 @@ must not be asked to open one",
             }
         }
 
-        self.force_release(execution_id).await;
+        let report = self.pane_releaser.release_pane_detailed(execution_id).await;
+        self.release_lease_after_pane_teardown(execution_id, report.outcome)
+            .await;
+        report.app_confirmed
     }
 
     /// Publish the more specific "stopped without a PR" signal so the

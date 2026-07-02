@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
-    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
+    CommandPrDetector, PaneReleaseOutcome, PaneVacateReport, PrDetector, ProbeQueuer, WorkerCompletionHandler,
+    WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
@@ -290,18 +291,35 @@ impl ServerStatePaneReleaser {
 #[async_trait]
 impl WorkerPaneReleaser for ServerStatePaneReleaser {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_pane_detailed(run_id).await.outcome
+    }
+
+    // Overrides the default (which infers `app_confirmed` purely from
+    // `outcome`) with the real signal from
+    // `ServerState::release_worker_pane_detailed` — this is the
+    // implementation `force_stop_execution` relies on to learn whether
+    // the app actually confirmed the pane close, so
+    // `ServerState::force_vacate_run`'s run-id-keyed fallback can be
+    // skipped when it would just be a redundant no-op round trip.
+    async fn release_pane_detailed(&self, run_id: &str) -> PaneVacateReport {
         let Some(weak) = self.server.get() else {
             tracing::warn!(run_id, "pane releaser called before server state was bound");
             // No server bound: nothing could be reaped. Treat as
             // "no live worker" so the caller does not free a lease on
             // the strength of a release that never happened.
-            return PaneReleaseOutcome::NoLiveWorker;
+            return PaneVacateReport {
+                outcome: PaneReleaseOutcome::NoLiveWorker,
+                app_confirmed: false,
+            };
         };
         let Some(server) = weak.upgrade() else {
             tracing::debug!(run_id, "pane releaser: server state already dropped");
-            return PaneReleaseOutcome::NoLiveWorker;
+            return PaneVacateReport {
+                outcome: PaneReleaseOutcome::NoLiveWorker,
+                app_confirmed: false,
+            };
         };
-        server.release_worker_pane(run_id).await
+        server.release_worker_pane_detailed(run_id).await
     }
 }
 
@@ -674,15 +692,6 @@ pub enum SendToAppError {
     Timeout,
     #[error("app responded with unexpected response kind for request kind {0}")]
     ResponseKindMismatch(&'static str),
-}
-
-/// Result of [`ServerState::release_worker_pane_detailed`]. See that
-/// method's docs for why `app_confirmed` exists separately from
-/// `outcome`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaneVacateReport {
-    pub outcome: PaneReleaseOutcome,
-    pub app_confirmed: bool,
 }
 
 /// Result of [`ServerState::force_vacate_run`]. Surfaced to `bossctl
