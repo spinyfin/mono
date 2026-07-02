@@ -8023,6 +8023,136 @@ mod tests {
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
     }
 
+    /// Root-cause regression (T2130, 2026-07-01): pool exhaustion is a
+    /// transient capacity wait, not a failure. A chore that repeatedly loses
+    /// the pool-claim race (`worker_claimed/skipped reason=pool_exhausted`,
+    /// cycle after cycle across drain passes) must stay untouched — no
+    /// execution ever marked `failed`, `autostart` never flipped — and must
+    /// dispatch on its own the instant a slot frees, via the ordinary
+    /// `release_worker_and_kick` re-scan. No `force_dispatch` / manual
+    /// `bossctl work start` should ever be required to recover it.
+    #[tokio::test]
+    async fn pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_intervention() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let winner = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Winner")
+                    .build(),
+            )
+            .unwrap();
+        let waiter = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Waiter")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+
+        // Settle: one chore claims the sole slot; the other is left `ready`
+        // behind the exhausted pool.
+        for _ in 0..200 {
+            let running = db.list_executions(Some(&winner.id)).unwrap();
+            let waiting = db.list_executions(Some(&waiter.id)).unwrap();
+            if running.iter().any(|e| e.status == ExecutionStatus::Running)
+                && waiting.len() == 1
+                && waiting[0].status == ExecutionStatus::Ready
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // Reproduce "repeated cycles" from the incident report: several more
+        // drain passes while the pool stays full. None of these may touch
+        // the waiting row.
+        for _ in 0..5 {
+            coordinator.kick();
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let waiter_task = match db.get_work_item(&waiter.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            waiter_task.status.as_str(),
+            "todo",
+            "pool-exhausted chore must stay queued in Backlog, not be demoted or archived",
+        );
+        assert!(
+            waiter_task.autostart,
+            "pool exhaustion is a transient wait, not a failure — autostart must never be flipped off",
+        );
+        let waiter_executions = db.list_executions(Some(&waiter.id)).unwrap();
+        assert_eq!(
+            waiter_executions.len(),
+            1,
+            "no duplicate/extra execution should be created while waiting on the pool",
+        );
+        assert_eq!(
+            waiter_executions[0].status,
+            ExecutionStatus::Ready,
+            "the waiting execution must stay `ready`, never `failed`, across pool_exhausted cycles",
+        );
+
+        // Free the slot exactly like a real completion would: every
+        // completion path funnels through `release_worker_and_kick`.
+        let winner_execution = db.list_executions(Some(&winner.id)).unwrap().remove(0);
+        let claimed_worker_id = coordinator
+            .worker_pool()
+            .claims()
+            .await
+            .into_iter()
+            .find(|claim| claim.execution_id == winner_execution.id)
+            .map(|claim| claim.worker_id)
+            .expect("winner's execution should hold a claimed worker slot");
+        coordinator.release_worker_and_kick(&claimed_worker_id, None).await;
+
+        // No manual intervention: the waiter must pick up the freed slot on
+        // its own, driven purely by the release's kick.
+        let mut waiter_running = false;
+        for _ in 0..200 {
+            let executions = db.list_executions(Some(&waiter.id)).unwrap();
+            if executions.iter().any(|e| e.status == ExecutionStatus::Running) {
+                waiter_running = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            waiter_running,
+            "pool-exhausted chore must auto-dispatch the instant a slot frees — no manual work-start needed",
+        );
+    }
+
     /// Boot-time heal: a `tasks.status = 'active'` row whose
     /// executions never produced a `work_runs` entry (e.g. previous
     /// engine crashed between the kanban drag and the dispatch claim,
