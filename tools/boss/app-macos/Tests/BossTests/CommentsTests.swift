@@ -88,6 +88,62 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.pendingQuotedText, "")
     }
 
+    // MARK: - Intent classification badge (Phase 1d)
+
+    func testNewCommentHasNoIntentUntilClassified() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        XCTAssertNil(layer.comments[0].intent)
+        XCTAssertFalse(layer.comments[0].intentOverriddenByUser)
+    }
+
+    func testSetIntentUpdatesCommentAndMarksOverridden() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        let comment = layer.comments[0]
+        layer.setIntent(.directive, for: comment)
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
+    }
+
+    func testSetIntentCanReclassify() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        let comment = layer.comments[0]
+        layer.setIntent(.question, for: comment)
+        layer.setIntent(.largerChange, for: comment)
+        XCTAssertEqual(layer.comments[0].intent, .largerChange)
+    }
+
+    func testSetIntentIgnoresUnknownComment() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        let stray = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: Date())
+        layer.setIntent(.directive, for: stray)
+        XCTAssertNil(layer.comments[0].intent)
+    }
+
+    func testCommentSidebarRendersClassifyingBadge() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        let view = CommentSidebar(layer: layer)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    func testCommentSidebarRendersClassifiedBadge() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        let view = CommentSidebar(layer: layer)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
     // MARK: - View: no comments state
 
     func testMarkdownViewerWithCommentsRendersWhenEmpty() {

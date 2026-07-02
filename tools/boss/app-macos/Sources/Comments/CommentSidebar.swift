@@ -65,6 +65,51 @@ struct CommentSidebar: View {
     }
 }
 
+/// Classification badge for a single comment: shows "classifying…" while
+/// `comment.intent` is nil, or the classified intent's icon + label once set.
+/// Always clickable — opens a menu the operator uses to manually (re)classify
+/// the comment, mirroring the engine's `CommentsSetIntent` override RPC.
+private struct IntentBadge: View {
+    let comment: Comment
+    @ObservedObject var layer: CommentLayer
+
+    var body: some View {
+        Menu {
+            ForEach(CommentIntent.allCases, id: \.self) { intent in
+                Button {
+                    layer.setIntent(intent, for: comment)
+                } label: {
+                    if comment.intent == intent {
+                        Label(intent.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(intent.displayName)
+                    }
+                }
+            }
+        } label: {
+            badgeLabel
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(comment.intentOverriddenByUser
+            ? "Manually classified as \(comment.intent?.displayName ?? "?") — click to reclassify"
+            : "Click to classify this comment")
+    }
+
+    @ViewBuilder
+    private var badgeLabel: some View {
+        if let intent = comment.intent {
+            Label(intent.displayName, systemImage: intent.symbolName)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else {
+            Label("classifying…", systemImage: "ellipsis.circle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+}
+
 private struct CommentRow: View {
     let comment: Comment
     @ObservedObject var layer: CommentLayer
@@ -108,9 +153,12 @@ private struct CommentRow: View {
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(comment.createdAt, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 8) {
+                    IntentBadge(comment: comment, layer: layer)
+                    Text(comment.createdAt, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
