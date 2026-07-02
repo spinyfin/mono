@@ -1803,10 +1803,33 @@ final class ChatViewModel: ObservableObject {
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
+    /// Handles `vacate_pane_by_run_id`: close whichever pane (if any)
+    /// is hosting the given run id, independent of the engine's own
+    /// slot bookkeeping. Backs the `bossctl agents stop` / `bossctl
+    /// agents reap` guaranteed-vacate fallback (zombie-Riker/Garak-pane
+    /// incident, 2026-07-01/02).
+    var paneVacateByRunIdHandler: ((String, UInt32) -> EngineVacateResult)?
     /// Invoked when the engine pushes `engine_pool_config`: forwards pool sizes to
     /// `WorkersWorkspaceModel` and coordinator model to `BossPaneModel`.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
+    /// Reconciliation sweep: given the engine's current live-run-id
+    /// snapshot, close any locally-hosted pane whose run is no longer
+    /// live. Wired to `WorkersWorkspaceModel.reconcilePanes(liveRunIds:)`.
+    /// Runs on every (re)connect — see `pendingLiveStatesReconcile`
+    /// below — which is the "at minimum on app launch and on engine
+    /// reconnect" requirement from the zombie-Riker/Garak-pane incident
+    /// (2026-07-01/02): a lost pane-teardown message (e.g. during a
+    /// connectivity outage) must not leave a stale pane rendered
+    /// indefinitely just because that one RPC never arrived.
+    var paneReconcileHandler: ((Set<String>) -> [Int])?
+    /// Set right before `sendListWorkerLiveStates()` on every
+    /// `.connected` transition; consumed by the next
+    /// `workerLiveStatesList` reply so the reconciliation sweep runs
+    /// exactly once per (re)connect, keyed to a snapshot that is
+    /// guaranteed to be current as of THIS connection (not a stale
+    /// push that raced a reconnect).
+    private var pendingLiveStatesReconcile = false
 
     /// Whether the engine has confirmed this client is the registered app session.
     /// Reset on disconnect; set when `appSessionRegistered` is received.
@@ -1824,6 +1847,12 @@ final class ChatViewModel: ObservableObject {
             engine.sendRegisterAppSession()
             refreshWorkSubscriptions()
             engine.sendListProducts()
+            // Arm the reconciliation sweep so the NEXT worker-live-states
+            // reply (the direct response to the request below, since
+            // this is a fresh connection with no prior subscription
+            // racing it) closes any pane that survived from before this
+            // (re)connect but is no longer in the engine's live set.
+            pendingLiveStatesReconcile = true
             engine.sendListWorkerLiveStates()
             engine.sendListLiveStatusDisabledSlots()
             // Pull the engine's configuration health on every (re)connect
@@ -1911,6 +1940,16 @@ final class ChatViewModel: ObservableObject {
                         result: .failure(.internalFailure(reason))
                     )
                 }
+            case .vacatePaneByRunId(let runId, let killGrace):
+                let result: EngineVacateResult
+                if let handler = paneVacateByRunIdHandler {
+                    result = handler(runId, killGrace)
+                } else {
+                    result = .failure(.internalFailure(
+                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
+                    ))
+                }
+                engine.sendVacatePaneByRunIdResponse(requestId: requestId, result: result)
             }
         case .disconnected:
             isConnected = false
@@ -2093,6 +2132,16 @@ final class ChatViewModel: ObservableObject {
             workErrorMessage = message
         case .workerLiveStatesList(let states):
             liveWorkerStates.update(states: states)
+            if pendingLiveStatesReconcile {
+                pendingLiveStatesReconcile = false
+                let liveRunIds = Set(states.map(\.runId))
+                let vacatedSlotIDs = paneReconcileHandler?(liveRunIds) ?? []
+                if !vacatedSlotIDs.isEmpty {
+                    appendSystemMessage(
+                        "Reconciliation: closed \(vacatedSlotIDs.count) stale pane(s) not present in the engine's live-run snapshot (slots \(vacatedSlotIDs.sorted().map(String.init).joined(separator: ",")))."
+                    )
+                }
+            }
         case .liveStatusDisabledSlotsList(let slotIds):
             liveStatusDisabledSlotIDs = Set(slotIds)
         case .liveStatusEnabledSet(let slotId, let enabled):

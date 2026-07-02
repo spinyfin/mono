@@ -149,6 +149,20 @@ struct ContentView: View {
             model.paneInterruptHandler = { [workspace = workersWorkspace] slotId in
                 workspace.interruptWorkerPane(slotId: slotId)
             }
+            // Run-id-keyed pane vacate — the `bossctl agents stop` /
+            // `bossctl agents reap` guaranteed-vacate fallback for when
+            // the engine's own slot bookkeeping no longer resolves the
+            // run (zombie-Riker/Garak-pane incident, 2026-07-01/02).
+            model.paneVacateByRunIdHandler = { [workspace = workersWorkspace] runId, killGrace in
+                .success(vacated: workspace.vacatePaneByRunId(runId, killGraceSeconds: killGrace))
+            }
+            // Reconciliation sweep: close any pane left over from before
+            // this (re)connect whose run is no longer in the engine's
+            // live snapshot. Runs once per `.connected` transition, so
+            // this covers both app launch and every engine reconnect.
+            model.paneReconcileHandler = { [workspace = workersWorkspace] liveRunIds in
+                workspace.reconcilePanes(liveRunIds: liveRunIds)
+            }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.
