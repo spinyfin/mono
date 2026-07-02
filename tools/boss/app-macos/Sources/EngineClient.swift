@@ -558,7 +558,13 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
-    func sendGetWorkTree(productId: String) {
+    /// `flow` tags the population-timing log so cold-start and
+    /// product-switch breakdowns can be grepped apart, and lets
+    /// [[PopulationTiming]] record the send timestamp for the
+    /// request→reply segment plus the per-product session issue count
+    /// (which surfaces the cold-start double-fetch — see T2101 R1).
+    func sendGetWorkTree(productId: String, flow: PopulationFlow) {
+        PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
         sendLine([
             "type": "get_work_tree",
             "product_id": productId,
@@ -1339,6 +1345,16 @@ final class EngineClient: @unchecked Sendable {
                 continue
             }
 
+            // Reply-received timestamp for the population-timing path: the
+            // instant a complete line was pulled off the socket buffer,
+            // before any JSON parse. Ends the request→reply segment and
+            // starts the decode segment (which includes the envelope parse
+            // below — the dominant cost for a large work_tree payload).
+            // One cheap clock read per engine message; nothing else here
+            // depends on it, so non-work_tree lines pay only that read.
+            let lineRecvNanos = PopulationTiming.now()
+            let lineByteCount = lineData.count
+
             guard let envelope = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
                 let payload = envelope["payload"] as? [String: Any],
                 let type = payload["type"] as? String
@@ -1381,6 +1397,29 @@ final class EngineClient: @unchecked Sendable {
                     .compactMap(parseTaskRuntime)
                 let dependencies = (payload["dependencies"] as? [[String: Any]] ?? [])
                     .compactMap(parseWorkItemDependency)
+                // Population-timing: this decode runs on the EngineClient
+                // serial queue (off main). Record request→reply + decode
+                // duration, payload size, and item cardinalities so timing
+                // correlates with the ~1,908-item real population. The
+                // decoded context is stashed FIFO per product for the
+                // upcoming @MainActor apply.
+                let decodeEndNanos = PopulationTiming.now()
+                PopulationTiming.shared.workTreeDecoded(
+                    productId: product.id,
+                    lineRecvNanos: lineRecvNanos,
+                    decodeEndNanos: decodeEndNanos,
+                    payloadBytes: lineByteCount,
+                    projects: projects.count,
+                    tasks: tasks.count,
+                    revisions: tasks.filter { $0.kind == "revision" }.count,
+                    chores: chores.count,
+                    taskRuntimes: taskRuntimes.count,
+                    dependencies: dependencies.count
+                )
+                PopulationSignpost.signposter.emitEvent(
+                    PopulationSignpost.Name.decode,
+                    "product=\(product.id) items=\(tasks.count + chores.count) bytes=\(lineByteCount)"
+                )
                 emit(.workTree(
                     product: product,
                     projects: projects,

@@ -950,7 +950,7 @@ final class ChatViewModel: ObservableObject {
         persistProjectFilterIDs()
         refreshWorkSubscriptions()
         if isConnected {
-            engine.sendGetWorkTree(productId: productID)
+            engine.sendGetWorkTree(productId: productID, flow: .productSwitch)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
             engine.sendListAttentionGroups(productId: productID)
         }
@@ -1530,7 +1530,7 @@ final class ChatViewModel: ObservableObject {
         guard isConnected else { return }
         engine.sendListProducts()
         if let productID = currentSelectedProductID {
-            engine.sendGetWorkTree(productId: productID)
+            engine.sendGetWorkTree(productId: productID, flow: .manualRefresh)
         }
     }
 
@@ -1791,7 +1791,11 @@ final class ChatViewModel: ObservableObject {
             // boot) without waiting for a device-flow transition.
             engine.sendGitHubAuthStatus()
             if let productID = currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productID)
+                // Cold-start population of the restored product. NOTE: the
+                // `.productsList` handler below fetches this same product a
+                // SECOND time (the confirmed cold-start double-fetch, T2101
+                // R2) — the per-product fetch counter makes both visible.
+                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
         case .appSessionRegistered:
@@ -1872,12 +1876,12 @@ final class ChatViewModel: ObservableObject {
             if let selectedProductID = currentSelectedProductID,
                topic == workTopic(forProductID: selectedProductID)
             {
-                engine.sendGetWorkTree(productId: selectedProductID)
+                engine.sendGetWorkTree(productId: selectedProductID, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
                 engine.sendListAttentionGroups(productId: selectedProductID)
             } else if let productId,
                       productId == currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productId)
+                engine.sendGetWorkTree(productId: productId, flow: .invalidationRefetch)
                 engine.sendListAttentionItemsForWorkItem(workItemID: productId)
                 engine.sendListAttentionGroups(productId: productId)
             }
@@ -1899,19 +1903,30 @@ final class ChatViewModel: ObservableObject {
             if currentSelectedProductID == nil, let first = activeProducts.first {
                 self.selectedWorkProductID = first.id
                 defaults.set(first.id, forKey: selectedWorkProductDefaultsKey)
-                engine.sendGetWorkTree(productId: first.id)
+                engine.sendGetWorkTree(productId: first.id, flow: .coldStart)
             } else if let productID = currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productID)
+                // On cold start this is the redundant SECOND fetch of the
+                // already-restored product (see `.connected` above); it also
+                // fires on later `products_list` refreshes. Tagged cold_start
+                // because the double-fetch is the case worth spotting; the
+                // per-product fetch counter disambiguates either way.
+                engine.sendGetWorkTree(productId: productID, flow: .coldStart)
             }
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
         case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies):
+            // Population-timing (T2101 R1): time this @MainActor apply burst
+            // and its two hot sub-steps. `popCtx` carries the flow/seq tag
+            // decoded off-main so every segment of one fetch reads together.
+            let popCtx = PopulationTiming.shared.takeContextForApply(productId: product.id)
+            let popApplyStartNanos = PopulationTiming.now()
             upsertProduct(product)
             if currentSelectedProductID == nil {
                 selectedWorkProductID = product.id
             }
             projectsByProductID[product.id] = projects.sorted(by: projectSort)
+            let popBucketStartNanos = PopulationTiming.now()
             tasksByProjectID = tasksByProjectID.filter { _, existingTasks in
                 existingTasks.first?.productID != product.id
             }
@@ -1936,6 +1951,7 @@ final class ChatViewModel: ObservableObject {
                 }
                 tasksByProjectID[projectID, default: []].append(task)
             }
+            let popBucketEndNanos = PopulationTiming.now()
             for (projectID, projectTasks) in tasksByProjectID where
                 projectTasks.first?.productID == product.id {
                 tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
@@ -1943,6 +1959,7 @@ final class ChatViewModel: ObservableObject {
             choresByProductID[product.id] = chores.sorted(by: taskSort)
             productLevelRevisionsByProductID[product.id] = productLevelRevisions.sorted(by: taskSort)
             productLevelTasksByProductID[product.id] = productLevelTasks.sorted(by: taskSort)
+            let popSortEndNanos = PopulationTiming.now()
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             dependenciesByProductID[product.id] = dependencies
             seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
@@ -1964,13 +1981,20 @@ final class ChatViewModel: ObservableObject {
                     triggerRevealScroll(pending)
                 }
             }
+            recordPopulationApplyBurst(
+                context: popCtx,
+                applyStartNanos: popApplyStartNanos,
+                bucketStartNanos: popBucketStartNanos,
+                bucketEndNanos: popBucketEndNanos,
+                sortEndNanos: popSortEndNanos
+            )
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
         case .workItemUpdated(let item):
             handleUpdatedWorkItem(item)
         case .projectTasksReordered(let projectId, _):
             if let productID = productID(forProjectID: projectId) {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .workItemDeleted(let id):
             let deletedTask = task(withID: id)
@@ -1978,7 +2002,7 @@ final class ChatViewModel: ObservableObject {
                 selectedWorkCardID = nil
             }
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .workError(let message):
             // Allow the user to retry any in-flight review terminal or
@@ -2180,13 +2204,13 @@ final class ChatViewModel: ObservableObject {
             plannerActionInFlightProjectIDs.remove(projectID)
             engine.sendListPlannerRuns(projectId: projectID)
             if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .unpopulateProjectResult(let projectID, _, _, _):
             plannerActionInFlightProjectIDs.remove(projectID)
             engine.sendListPlannerRuns(projectId: projectID)
             if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .attentionGroupsList(let productID, let groups, let members):
             applyAttentionGroupsList(productID: productID, groups: groups, members: members)
@@ -2578,14 +2602,14 @@ final class ChatViewModel: ObservableObject {
             selectedWorkCardID = nil
             defaults.set(product.id, forKey: selectedWorkProductDefaultsKey)
             persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: product.id)
+            engine.sendGetWorkTree(productId: product.id, flow: .itemRefetch)
         case .project(let project):
             selectedWorkProductID = project.productID
             selectedProjectFilterIDs = [project.id]
             selectedWorkCardID = nil
             defaults.set(project.productID, forKey: selectedWorkProductDefaultsKey)
             persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: project.productID)
+            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
         case .task(let task):
             selectedWorkProductID = task.productID
             if let projectID = task.projectID {
@@ -2596,14 +2620,14 @@ final class ChatViewModel: ObservableObject {
             selectedWorkCardID = task.id
             defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
             persistProjectFilterIDs()
-            engine.sendGetWorkTree(productId: task.productID)
+            engine.sendGetWorkTree(productId: task.productID, flow: .itemRefetch)
         case .chore(let task):
             selectedWorkProductID = task.productID
             selectedWorkCardID = task.id
             includeChores = true
             defaults.set(task.productID, forKey: selectedWorkProductDefaultsKey)
             defaults.set(true, forKey: includeChoresDefaultsKey)
-            engine.sendGetWorkTree(productId: task.productID)
+            engine.sendGetWorkTree(productId: task.productID, flow: .itemRefetch)
         }
         refreshWorkSubscriptions()
     }
@@ -2617,13 +2641,13 @@ final class ChatViewModel: ObservableObject {
                 workErrorMessage = "Product \"\(product.name)\" was archived; switching to the next active product."
                 reconcileWorkSelection()
                 if let nextID = selectedWorkProductID {
-                    engine.sendGetWorkTree(productId: nextID)
+                    engine.sendGetWorkTree(productId: nextID, flow: .productSwitch)
                 }
                 refreshWorkSubscriptions()
                 return
             }
         case .project(let project):
-            engine.sendGetWorkTree(productId: project.productID)
+            engine.sendGetWorkTree(productId: project.productID, flow: .itemRefetch)
         case .task(let updatedTask), .chore(let updatedTask):
             // When the engine confirms an optimistic move, drop the origin record
             // so a subsequent work_error from an unrelated operation won't bounce
