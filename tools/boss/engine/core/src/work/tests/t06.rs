@@ -700,6 +700,48 @@ fn create_revision_succeeds_for_open_pr() {
 }
 
 #[test]
+fn create_revision_with_depends_on_is_born_blocked() {
+    let db = WorkDb::open(temp_db_path("revision-create-depends-on")).unwrap();
+    let product_id = make_revision_product(&db, "depends-on");
+    let pr_url = "https://github.com/spinyfin/mono/pull/43";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let prereq_id = make_chore_root(&db, &product_id, "prereq");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let input = CreateRevisionInput::builder()
+        .parent_task_id(parent_id.clone())
+        .description("test revision ask")
+        .depends_on(vec![prereq_id.clone()])
+        .build();
+    let revision = db.create_revision(input, &checker).unwrap();
+
+    assert_eq!(revision.kind, TaskKind::Revision);
+    assert_eq!(revision.status, TaskStatus::Blocked);
+    assert_eq!(revision.blocked_reason.as_deref(), Some("dependency"));
+    let gating = db.gating_prereqs_for(&revision.id).unwrap();
+    assert!(
+        gating.contains(&prereq_id),
+        "expected {prereq_id} in gating prereqs, got {gating:?}"
+    );
+
+    // Once the prerequisite completes, the revision auto-unblocks like any
+    // other create-time `--depends-on` gate.
+    db.update_work_item(
+        &prereq_id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.try_unblock_dependency_if_resolved(&revision.id).unwrap();
+    let WorkItem::Task(revision) = db.get_work_item(&revision.id).unwrap() else {
+        panic!("expected task");
+    };
+    assert_eq!(revision.status, TaskStatus::Todo);
+}
+
+#[test]
 fn create_revision_errors_when_parent_has_no_pr() {
     let db = WorkDb::open(temp_db_path("revision-create-no-pr")).unwrap();
     let product_id = make_revision_product(&db, "nopr");

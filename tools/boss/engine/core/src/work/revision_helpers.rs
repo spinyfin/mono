@@ -117,15 +117,26 @@ pub(crate) fn assert_parent_revisable_and_insert(
 
     // ── 6. Insert revision ──────────────────────────────────────────────────
     let now = now_string();
+    let depends_on = input.depends_on.clone();
     let new_revision = insert_revision_in_tx(conn, input, &parent_id, &root)?;
 
-    // ── 7. Auto-gate: block new revision on chain tail ───────────────────────
+    // ── 7. Caller-supplied `--depends-on` gate ──────────────────────────────
+    // Declared atomically with the row insert, same as `task create` /
+    // `chore create` — this also performs the engine auto-block, so a
+    // caller-supplied prerequisite gates the revision immediately.
+    apply_create_time_dependencies(conn, &new_revision.id, &depends_on, &now)?;
+
+    // ── 8. Auto-gate: block new revision on chain tail ───────────────────────
     // When a prior unfinished revision exists, the new one must wait for it
     // before the dispatcher can run it.  This prevents two workers from
     // committing to the same PR branch simultaneously.
+    let has_chain_tail_gate = chain_tail_id.is_some();
     if let Some(tail_id) = chain_tail_id {
         deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
         maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
+    }
+
+    if has_chain_tail_gate || !depends_on.is_empty() {
         // Re-read the row so the caller sees the updated status.
         return query_task(conn, &new_revision.id)?
             .with_context(|| format!("missing revision after auto-block: {}", new_revision.id));
