@@ -331,7 +331,25 @@ private struct WorkerSlotView: View {
     /// `slotTaskLine` and intentionally not duplicated here.
     @ViewBuilder
     private var slotSubtitle: some View {
-        if let live = liveState?.liveStatus,
+        if let recovering = liveState?.recoveryStatus,
+           !recovering.isEmpty
+        {
+            // Transient-recovery banner wins outright: it means the
+            // worker looks idle but is actually being auto-resumed
+            // after a Claude API error, which is exactly the case a
+            // stale/generic "idle" subtitle would hide.
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                Text(recovering)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .help(slot.runId ?? "")
+                    .accessibilityLabel("Recovering: \(recovering)")
+            }
+        } else if let live = liveState?.liveStatus,
            !live.isEmpty
         {
             HStack(alignment: .firstTextBaseline, spacing: 4) {

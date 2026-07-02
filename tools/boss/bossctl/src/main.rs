@@ -1784,6 +1784,9 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     println!("  model:         {}", state.model);
     println!("  activity:      {}", state.activity.as_str());
     println!("  shell_pid:     {}", state.shell_pid);
+    if let Some(recovery) = &state.recovery_status {
+        println!("  recovery:      {recovery}");
+    }
     if let Some(id) = &state.work_item_id {
         println!("  work_item:     {id}");
     }
@@ -1808,7 +1811,7 @@ fn print_live_state_short(state: &LiveWorkerState) {
     let tool = state.current_tool.as_deref().unwrap_or("-");
     let work_item = state.work_item_id.as_deref().unwrap_or("-");
     let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
-    println!(
+    print!(
         "slot {}  name={}  run={}  model={}  activity={}  tool={}  work_item={}  work_item_name=\"{}\"",
         state.slot_id,
         state.name,
@@ -1819,6 +1822,13 @@ fn print_live_state_short(state: &LiveWorkerState) {
         work_item,
         work_item_name,
     );
+    // Surfaced whenever the transient-recovery sweep is actively nudging
+    // this slot — without this an auto-recovering worker prints as plain
+    // `activity=idle`, indistinguishable from a normally-finished turn.
+    if let Some(recovery) = &state.recovery_status {
+        print!("  recovery=\"{recovery}\"");
+    }
+    println!();
 }
 
 fn print_execution(json: bool, execution: &WorkExecution) {
@@ -2595,6 +2605,7 @@ mod tests {
             execution_id: None,
             live_status: None,
             live_status_at: None,
+            recovery_status: None,
         }
     }
 

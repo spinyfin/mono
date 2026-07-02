@@ -1790,6 +1790,14 @@ struct WorkerLiveState: Hashable {
     /// ISO-8601 timestamp of the most recent successful update to
     /// `liveStatus`. Used by the UI to dim stale values.
     let liveStatusAt: String?
+    /// Set by the engine's transient-recovery sweep while this slot is
+    /// being auto-resumed after a transient Claude API error (529/5xx/
+    /// network), e.g. "recovering from API error (attempt 2/5)". Takes
+    /// display priority over `liveStatus` — see `AgentActivityState`
+    /// and the Doing-card / pane-titlebar subtitle. `nil` once the
+    /// worker's next hook event proves it resumed, or once the slot is
+    /// released.
+    let recoveryStatus: String?
 }
 
 enum WorkerActivity: String, Hashable {
@@ -1875,7 +1883,11 @@ enum AgentActivityState {
             case .waitingForInput:
                 self = .waiting(reason: "Waiting on user input")
             case .idle:
-                self = .waiting(reason: "Worker idle between turns")
+                if let recovering = liveState.recoveryStatus, !recovering.isEmpty {
+                    self = .waiting(reason: recovering)
+                } else {
+                    self = .waiting(reason: "Worker idle between turns")
+                }
             case .spawning:
                 self = .waiting(reason: "Worker spawning")
             case .errored:

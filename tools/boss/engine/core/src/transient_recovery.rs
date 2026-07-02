@@ -113,6 +113,16 @@ const ERROR_CLIP_BYTES: usize = 240;
 #[async_trait]
 pub trait WorkerNudger: Send + Sync {
     async fn nudge_worker(&self, run_id: &str, text: String) -> Result<(), String>;
+
+    /// Push the current `LiveWorkerState` snapshot to UI subscribers
+    /// (the macOS app's Agents tab, `bossctl agents list --json` topic
+    /// subscribers, …). Called after a direct registry write — e.g.
+    /// [`LiveWorkerStateRegistry::set_recovery_status`] — that bypasses
+    /// the normal hook-driven `apply_event` + broadcast path, so the
+    /// recovery banner shows up promptly instead of waiting for the
+    /// next unrelated broadcast. Default no-op keeps
+    /// [`NoopWorkerNudger`] and other test doubles trivial.
+    async fn broadcast_live_states(&self) {}
 }
 
 /// No-op nudger used in tests and contexts without an app session.
@@ -283,6 +293,23 @@ pub async fn run_one_pass(
                     match nudger.nudge_worker(&execution_id, msg).await {
                         Ok(()) => {
                             nudged_executions.insert(execution_id.clone());
+                            // Visibility (not just the transcript-tail signal):
+                            // write a recovery banner directly onto the live
+                            // slot so `bossctl agents list` / the Agents-tab
+                            // subtitle read "recovering from API error
+                            // (attempt N/M)" instead of a bare `idle` that
+                            // reads as "worker finished, waiting on nothing in
+                            // particular". apply_event clears this the moment
+                            // the worker's next hook event proves it resumed.
+                            if live_states.set_recovery_status(
+                                state.slot_id,
+                                Some(format!(
+                                    "recovering from API error (attempt {attempt}/{max})",
+                                    max = policy.max_attempts(),
+                                )),
+                            ) {
+                                nudger.broadcast_live_states().await;
+                            }
                             tracing::info!(
                                 execution_id,
                                 work_item_id = %work_item_id,
@@ -843,6 +870,14 @@ mod tests {
 
         // Execution is still running (not orphaned).
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
+
+        // Visibility: the live slot carries a recovery banner naming the
+        // attempt so `bossctl agents list` / the Agents-tab subtitle don't
+        // read as a plain, unremarkable "idle".
+        assert_eq!(
+            live.get(slot_id).unwrap().recovery_status.as_deref(),
+            Some("recovering from API error (attempt 1/3)"),
+        );
 
         // One transient_recovery_nudge dispatch event.
         let events = sink.events().await;
