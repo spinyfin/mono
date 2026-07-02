@@ -305,6 +305,17 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha\n\
          ```\n\
          \n\
+         ## Reuse before you build\n\
+         \n\
+         Before implementing any cross-cutting capability (an API/HTTP client,\n\
+         config loading, caching, logging wiring, retry/backoff, or similar\n\
+         infrastructure), search the repo for an existing implementation\n\
+         first. If one exists, reuse or extend it instead of writing a new\n\
+         one. If duplication is genuinely necessary, say so explicitly in the\n\
+         PR description with the reason — a justified, operator-visible\n\
+         exception is the only way to avoid a \"revision required\"\n\
+         reuse/duplication finding from the automated reviewer.\n\
+         \n\
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
