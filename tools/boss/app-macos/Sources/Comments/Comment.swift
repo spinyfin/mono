@@ -1,5 +1,32 @@
 import Foundation
 
+/// Mirrors the engine's `INTENT_DIRECTIVE` / `INTENT_QUESTION` /
+/// `INTENT_LARGER_CHANGE` constants (`boss-protocol/src/types.rs`). A
+/// `directive`/`largerChange` classification routes to the revision/
+/// update-task path; `question` routes to the read-only answer agent.
+/// See `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
+enum CommentIntent: String, CaseIterable, Equatable {
+    case directive
+    case question
+    case largerChange = "larger_change"
+
+    var displayName: String {
+        switch self {
+        case .directive: return "Directive"
+        case .question: return "Question"
+        case .largerChange: return "Larger Change"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .directive: return "arrow.right.circle"
+        case .question: return "questionmark.circle"
+        case .largerChange: return "shippingbox.circle"
+        }
+    }
+}
+
 /// Identifies the exact occurrence of a quoted-text span a comment is anchored to.
 ///
 /// Two comments on two different occurrences of the same word have the same
@@ -28,6 +55,16 @@ struct Comment: Identifiable, Equatable {
     /// The comment body the user typed.
     let body: String
     let createdAt: Date
+    /// `nil` while classification is pending (or, in this Phase 1 thin client,
+    /// indefinitely — no engine RPC classifies comments yet; the badge shows
+    /// "classifying…" and the operator can set this directly via the override
+    /// control). Set by `CommentsClassify` once engine connectivity lands, or
+    /// by a manual override (`CommentsSetIntent`) either way.
+    var intent: CommentIntent? = nil
+    /// `true` once the operator has manually reclassified this comment via the
+    /// badge's override control, mirroring the engine's `intent_overridden_by`
+    /// audit trail.
+    var intentOverriddenByUser: Bool = false
 
     var anchor: CommentAnchor {
         CommentAnchor(quotedText: quotedText, occurrenceIndex: occurrenceIndex)

@@ -258,6 +258,20 @@ final class CommentLayer: NSObject, ObservableObject {
         comments.removeAll { $0.id == comment.id }
     }
 
+    // MARK: - Intent classification badge (Phase 1d)
+
+    /// Manually (re)classifies a comment, mirroring the engine's
+    /// `CommentsSetIntent` RPC (`intent_overridden_by='user'`). Phase 1/2
+    /// stub: the engine RPC and re-routing are wired up once the macOS app
+    /// has Phase 2 engine connectivity in place; for now this only updates
+    /// local state so the badge reflects the override immediately.
+    func setIntent(_ intent: CommentIntent, for comment: Comment) {
+        guard let index = comments.firstIndex(where: { $0.id == comment.id }) else { return }
+        comments[index].intent = intent
+        comments[index].intentOverriddenByUser = true
+        print("[CommentsSetIntent] comment=\(comment.id) intent=\(intent.rawValue)")
+    }
+
     // MARK: - Magic wand (Phase 3)
 
     /// Dispatch the magic-wand: sends `CommentsDispatchMagicWand` to the engine
