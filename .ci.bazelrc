@@ -26,4 +26,21 @@ build:ci-darwin --config=ci
 build:ci-darwin --repository_cache=/Volumes/ssd/bazel/repo_cache
 build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
 
+# Pin the Xcode toolchain on the darwin CI fleet. Two incidents in one week
+# without this: (1) the App Store updated Xcode in place on the CI macs and
+# bazel half-built against the wrong version with confusing errors; (2)
+# during the repair, apple_support's repository rule snapshotted a
+# temporarily-present bundle path (/Applications/Xcode-26.6.0-autoupdated.app)
+# as DEVELOPER_DIR into cached toolchain configs, which kept failing with
+# "xcrun: error: missing DEVELOPER_DIR path" long after that bundle was
+# deleted -- repo rules don't re-run when a directory just vanishes.
+# --repo_env IS tracked in repo-rule marker files (unlike ambient filesystem
+# state), so apple_support's toolchain config now re-runs whenever this value
+# changes. With both flags set, host drift or a stale snapshot fails loudly
+# at analysis/toolchain-config time instead of half-building.
+#
+# When the fleet's Xcode is upgraded, bump BOTH flags together.
+build:ci-darwin --xcode_version=26.5.0.17F42
+common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-26.5.0.app/Contents/Developer
+
 
