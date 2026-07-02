@@ -10,16 +10,15 @@
 //! separate spend bucket; falls back to `ANTHROPIC_API_KEY` when unset.
 //! Design § "Billing and observability" and § "Constraint compliance".
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
+use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
+
+/// Per-feature key env var; routes billing to a separate spend bucket. Falls
+/// back to `ANTHROPIC_API_KEY` via [`claude_client::resolve_api_key`].
 const MAGIC_WAND_API_KEY_ENV: &str = "BOSS_MAGIC_WAND_API_KEY";
-const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Model used for magic-wand dispatch. Sonnet balances quality and latency
 /// for the doc-editing task; the user-visible latency target is ~30 s.
@@ -49,26 +48,12 @@ pub const ERROR_KIND_DIFF_SANITY: &str = "diff_sanity";
 pub const ERROR_KIND_API: &str = "api_error";
 pub const ERROR_KIND_EMPTY: &str = "empty_response";
 
-// ── HTTP helpers ─────────────────────────────────────────────────────────────
+// ── API key ────────────────────────────────────────────────────────────────
 
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        // The workspace pins reqwest to `rustls-no-provider`; install a default
-        // crypto provider before the first TLS handshake (same pattern as
-        // `pane_summary.rs`).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(MAGIC_WAND_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
+/// Resolve the magic-wand key: `BOSS_MAGIC_WAND_API_KEY` then
+/// `ANTHROPIC_API_KEY`, via the shared pipeline's resolver.
 pub fn resolve_api_key() -> Option<String> {
-    std::env::var(MAGIC_WAND_API_KEY_ENV)
-        .ok()
-        .or_else(|| std::env::var(ANTHROPIC_API_KEY_ENV).ok())
+    claude_client::resolve_api_key(Some(MAGIC_WAND_API_KEY_ENV))
 }
 
 // ── Prompt construction ───────────────────────────────────────────────────────
@@ -93,41 +78,6 @@ Comment:\n\
 Respond with only the updated markdown. Do not include any \
 explanation, header, or trailing prose."
     )
-}
-
-// ── Anthropic API types ───────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ApiRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    messages: Vec<ApiMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct ApiMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    content: Vec<ApiContentBlock>,
-    usage: ApiUsage,
-}
-
-#[derive(Deserialize)]
-struct ApiContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct ApiUsage {
-    input_tokens: i64,
-    output_tokens: i64,
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -236,44 +186,18 @@ pub async fn dispatch(
     };
 
     let prompt = build_prompt(doc_text, anchor_exact, comment_body);
-    let body = ApiRequest {
-        model: MAGIC_WAND_MODEL,
-        max_tokens: MAGIC_WAND_MAX_TOKENS,
-        messages: vec![ApiMessage {
-            role: "user",
-            content: prompt,
-        }],
-    };
+    let request = MessagesRequest::builder()
+        .model(MAGIC_WAND_MODEL)
+        .max_tokens(MAGIC_WAND_MAX_TOKENS)
+        .messages(vec![Message::user(prompt)])
+        .build();
+    let config = CallConfig::new(MAGIC_WAND_TIMEOUT);
 
-    let resp = http_client()
-        .post(ANTHROPIC_MESSAGES_URL)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
+    let response = claude_client::send_messages(&api_key, &request, &config)
         .await
-        .map_err(|e| (format!("HTTP send failed: {e}"), ERROR_KIND_API))?;
+        .map_err(|e| (format!("Anthropic API call failed: {e}"), ERROR_KIND_API))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err((format!("Anthropic API returned {status}: {text}"), ERROR_KIND_API));
-    }
-
-    let parsed: ApiResponse = resp
-        .json()
-        .await
-        .map_err(|e| (format!("failed to parse Anthropic response: {e}"), ERROR_KIND_API))?;
-
-    let result_text = parsed
-        .content
-        .into_iter()
-        .find(|b| b.block_type == "text")
-        .map(|b| b.text)
-        .unwrap_or_default();
-
-    let result_text = result_text.trim().to_owned();
+    let result_text = response.first_text().unwrap_or_default().trim().to_owned();
     if result_text.is_empty() {
         return Err(("Anthropic returned an empty response".to_owned(), ERROR_KIND_EMPTY));
     }
@@ -288,10 +212,11 @@ pub async fn dispatch(
 
     let warn = anchor_warning(doc_text, &result_text, anchor_exact);
 
+    let usage = response.usage();
     Ok(MagicWandResult {
         result_md: result_text,
-        input_tokens: parsed.usage.input_tokens,
-        output_tokens: parsed.usage.output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
         anchor_warning: warn,
     })
 }

@@ -19,19 +19,20 @@
 //! writes rows. Keeping the Planner a pure prose-to-typed-graph transform
 //! is what makes the auto-populate feature testable, idempotent, and safe.
 //!
-//! ## Reuses the `live_status` Anthropic substrate
+//! ## Rides the shared `claude_client` pipeline
 //!
-//! The engine already POSTs to `https://api.anthropic.com/v1/messages` via
-//! a shared `reqwest` client in [`crate::live_status`], returning a *typed
-//! outcome* so callers can distinguish "no API key" from "model 429" from
-//! "succeeded". The Planner reuses that exact shape: a process-wide client,
-//! the pinned API version, and a typed [`PlannerOutcome`] rather than an
-//! `anyhow::Result` that would erase the distinction the caller (the
-//! Populator, a sibling task) needs to record the right `planner_runs`
-//! outcome. The design names the entry point `Planner::plan(PlannerInput)
-//! -> Result<PlannerOutput>`; we return the richer [`PlannerOutcome`] enum
-//! to honour the design's adjacent requirement to "return typed outcomes
-//! (`NoApiKey`, `ApiError`, success)".
+//! All Anthropic transport goes through [`crate::claude_client`] — the single
+//! engine-wide Messages API pipeline (process-wide client, pinned API version,
+//! retry/backoff). The Planner owns only its prompt and schema: it builds the
+//! forced-tool-call body, sends it via
+//! [`claude_client::send_messages_raw`](crate::claude_client::send_messages_raw),
+//! and maps the shared [`ClaudeError`](crate::claude_client::ClaudeError) into a
+//! typed [`PlannerOutcome`] rather than an `anyhow::Result` that would erase the
+//! distinction the caller (the Populator, a sibling task) needs to record the
+//! right `planner_runs` outcome. The design names the entry point
+//! `Planner::plan(PlannerInput) -> Result<PlannerOutput>`; we return the richer
+//! [`PlannerOutcome`] enum to honour the design's adjacent requirement to
+//! "return typed outcomes (`NoApiKey`, `ApiError`, success)".
 //!
 //! ## Structured output is enforced, not requested
 //!
@@ -50,17 +51,13 @@
 //! `max_tokens`, timeout, and retry count are all single constants, tunable
 //! without a schema change (design R5).
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use boss_protocol::{PlannerInput, PlannerOutput, planner_output_schema};
 
-/// Anthropic Messages API endpoint. Hard-coded; matches
-/// [`crate::live_status`] and [`crate::pane_summary`].
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+use crate::claude_client::{self, CallConfig, ClaudeError, MessagesResponse, RetryPolicy};
 
 /// The model the Planner runs on. A direct API call needs a concrete model
 /// id (the `--model` family aliases used for worker dispatch are resolved by
@@ -89,8 +86,13 @@ pub const PLANNER_MAX_TOKENS: u32 = 16_384;
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Total attempts per [`Planner::plan`] call: the design says "retry once,
-/// then fail safe", i.e. two attempts.
-pub const PLANNER_ATTEMPTS: usize = 2;
+/// then fail safe", i.e. two attempts. Only transient failures (429/5xx/
+/// overloaded/transport) are retried — see [`ClaudeError::is_retryable`].
+pub const PLANNER_ATTEMPTS: u32 = 2;
+
+/// Backoff before the planning retry. A single retry of an infrequent,
+/// high-effort call can afford a real pause before hammering the API again.
+pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
 /// The model must call exactly this tool; its `input` is the structured
@@ -179,41 +181,36 @@ impl Planner {
     /// [`crate::live_status::summarize_transcript`]. A `None` key short-
     /// circuits to [`PlannerOutcome::NoApiKey`] without a network call.
     ///
-    /// On a transient failure (transport, decode, non-2xx, or output that
-    /// fails schema validation) the call is retried once before failing
-    /// safe with the *last* error mapped into a [`PlannerOutcome`].
+    /// The shared [`crate::claude_client`] pipeline retries transient failures
+    /// (transport errors and HTTP 429/5xx/overloaded) once before failing safe;
+    /// a non-retryable 4xx, a decode failure, or output that fails schema
+    /// validation is surfaced immediately, mapped into a [`PlannerOutcome`].
     pub async fn plan(api_key: Option<&str>, input: &PlannerInput) -> PlannerOutcome {
         match api_key {
             None => {
                 tracing::error!("planner: skipped — ANTHROPIC_API_KEY not configured",);
                 PlannerOutcome::NoApiKey
             }
-            Some(key) => plan_with_url(ANTHROPIC_MESSAGES_URL, key, input).await,
+            Some(key) => plan_with_url(claude_client::ANTHROPIC_MESSAGES_URL, key, input).await,
         }
     }
 }
 
 /// Core of [`Planner::plan`] with the endpoint URL injected so tests can
-/// drive it against a mock server. Builds the request once and runs up to
-/// [`PLANNER_ATTEMPTS`] attempts.
+/// drive it against a mock server. Builds the request once and hands it to the
+/// shared [`crate::claude_client`] pipeline, which owns retry/backoff.
 async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> PlannerOutcome {
     let body = build_request_body(input);
-    let mut last: Option<PlannerCallError> = None;
-    for attempt in 1..=PLANNER_ATTEMPTS {
-        match call_anthropic(url, api_key, &body).await {
-            Ok(output) => return PlannerOutcome::Success(output),
-            Err(err) => {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = PLANNER_ATTEMPTS,
-                    err = %err,
-                    "planner: attempt failed",
-                );
-                last = Some(err);
-            }
-        }
+    let config = CallConfig::new(PLANNER_TIMEOUT)
+        .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF))
+        .with_endpoint(url);
+    match claude_client::send_messages_raw(api_key, &body, &config).await {
+        Ok(response) => match planner_output_from_response(&response) {
+            Ok(output) => PlannerOutcome::Success(output),
+            Err(msg) => PlannerOutcome::InvalidOutput(msg),
+        },
+        Err(err) => outcome_from_error(err),
     }
-    PlannerOutcome::from(last.expect("loop runs at least once"))
 }
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
@@ -292,95 +289,30 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
     out
 }
 
-/// Shared HTTP client. Mirrors [`crate::live_status::http_client`] — install
-/// the rustls ring provider lazily so the first TLS handshake doesn't panic,
-/// and apply the planning wall-clock timeout.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(PLANNER_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::build should not fail with default config")
-    })
-}
-
-/// Structured error from a single Anthropic call. Mapped into the matching
-/// [`PlannerOutcome`] by [`plan_with_url`]. Mirrors
-/// [`crate::live_status::SummarizerCallError`] so the surface distinguishes
-/// "model 429" from "TLS handshake failed" from "schema mismatch".
-#[derive(Debug, thiserror::Error)]
-enum PlannerCallError {
-    #[error("anthropic returned {status}: {body}")]
-    Api { status: u16, body: String },
-    #[error("transport error: {0}")]
-    Transport(String),
-    #[error("failed to decode anthropic response: {0}")]
-    Decode(String),
-    #[error("invalid planner output: {0}")]
-    InvalidOutput(String),
-}
-
-impl From<PlannerCallError> for PlannerOutcome {
-    fn from(err: PlannerCallError) -> Self {
-        match err {
-            PlannerCallError::Api { status, body } => PlannerOutcome::ApiError {
-                status,
-                snippet: clip(&body, 200),
-            },
-            // Both Transport and Decode are "we couldn't get usable bytes
-            // back" — bucket them together, matching live_status.
-            PlannerCallError::Transport(msg) | PlannerCallError::Decode(msg) => PlannerOutcome::Transport(msg),
-            PlannerCallError::InvalidOutput(msg) => PlannerOutcome::InvalidOutput(msg),
-        }
+/// Map a shared [`ClaudeError`] into the matching [`PlannerOutcome`]. Transport
+/// and decode failures are both "we couldn't get usable bytes back", so they
+/// bucket together.
+fn outcome_from_error(err: ClaudeError) -> PlannerOutcome {
+    match err {
+        ClaudeError::Api { status, body } => PlannerOutcome::ApiError {
+            status,
+            snippet: clip(&body, 200),
+        },
+        ClaudeError::Transport(msg) | ClaudeError::Decode(msg) => PlannerOutcome::Transport(msg),
     }
 }
 
-/// One round trip: POST the request and extract the forced tool call's input
-/// as a [`PlannerOutput`].
-async fn call_anthropic(url: &str, api_key: &str, body: &Value) -> Result<PlannerOutput, PlannerCallError> {
-    let client = http_client();
-    let resp = client
-        .post(url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_API_VERSION)
-        .header("content-type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|err| PlannerCallError::Transport(err.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(PlannerCallError::Api { status, body });
-    }
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|err| PlannerCallError::Decode(err.to_string()))?;
-    planner_output_from_response_json(&value)
-}
-
-/// Walk an Anthropic Messages response and pull the forced tool call's
-/// `input` out as a [`PlannerOutput`]. Pure and testable: takes the parsed
-/// response JSON, so unit tests can exercise it with a `json!` literal.
-fn planner_output_from_response_json(body: &Value) -> Result<PlannerOutput, PlannerCallError> {
-    let content = body
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| PlannerCallError::InvalidOutput("response had no content array".to_owned()))?;
-    let input = content
-        .iter()
-        .find(|block| {
-            block.get("type").and_then(Value::as_str) == Some("tool_use")
-                && block.get("name").and_then(Value::as_str) == Some(TOOL_NAME)
-        })
-        .and_then(|block| block.get("input"))
-        .ok_or_else(|| PlannerCallError::InvalidOutput(format!("model did not call the {TOOL_NAME} tool")))?;
-    serde_json::from_value::<PlannerOutput>(input.clone()).map_err(|err| {
-        PlannerCallError::InvalidOutput(format!("tool input did not match the PlannerOutput schema: {err}"))
-    })
+/// Pull the forced tool call's `input` out of the response and deserialise it
+/// into a [`PlannerOutput`]. Uses the shared
+/// [`MessagesResponse::tool_use_input`] extractor; a missing tool call or a
+/// schema mismatch is a validation failure (`Err`), which the caller records as
+/// [`PlannerOutcome::InvalidOutput`].
+fn planner_output_from_response(response: &MessagesResponse) -> Result<PlannerOutput, String> {
+    let input = response
+        .tool_use_input(TOOL_NAME)
+        .ok_or_else(|| format!("model did not call the {TOOL_NAME} tool"))?;
+    serde_json::from_value::<PlannerOutput>(input.clone())
+        .map_err(|err| format!("tool input did not match the PlannerOutput schema: {err}"))
 }
 
 /// Clip a string to `max` bytes on a char boundary, appending an ellipsis if
@@ -663,9 +595,14 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("DAG"));
     }
 
+    fn response_from(value: Value) -> MessagesResponse {
+        serde_json::from_value(value).expect("valid MessagesResponse")
+    }
+
     #[test]
     fn parses_a_well_formed_tool_use_response() {
-        let out = planner_output_from_response_json(&tool_use_response()).expect("valid tool_use response parses");
+        let out =
+            planner_output_from_response(&response_from(tool_use_response())).expect("valid tool_use response parses");
         assert_eq!(out.tasks.len(), 2);
         assert_eq!(out.tasks[0].handle, "protocol-types");
         assert_eq!(out.tasks[0].effort, boss_protocol::EffortLevel::Small);
@@ -680,17 +617,19 @@ mod tests {
 
     #[test]
     fn rejects_response_with_no_tool_call() {
-        let body = json!({
+        let response = response_from(json!({
             "content": [{ "type": "text", "text": "I could not find a breakdown." }]
-        });
-        let err = planner_output_from_response_json(&body).unwrap_err();
-        assert!(matches!(err, PlannerCallError::InvalidOutput(_)), "got {err:?}");
+        }));
+        assert!(
+            planner_output_from_response(&response).is_err(),
+            "a response with no tool call must be rejected",
+        );
     }
 
     #[test]
     fn rejects_tool_input_that_violates_the_schema() {
         // Missing the required `confidence` field.
-        let body = json!({
+        let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
                 "name": TOOL_NAME,
@@ -702,14 +641,16 @@ mod tests {
                     "effort_audit": []
                 }
             }]
-        });
-        let err = planner_output_from_response_json(&body).unwrap_err();
-        assert!(matches!(err, PlannerCallError::InvalidOutput(_)), "got {err:?}");
+        }));
+        assert!(
+            planner_output_from_response(&response).is_err(),
+            "tool input missing a required field must be rejected",
+        );
     }
 
     #[test]
     fn no_breakdown_response_is_a_valid_empty_plan() {
-        let body = json!({
+        let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
                 "name": TOOL_NAME,
@@ -722,8 +663,8 @@ mod tests {
                     "effort_audit": []
                 }
             }]
-        });
-        let out = planner_output_from_response_json(&body).expect("empty plan is valid");
+        }));
+        let out = planner_output_from_response(&response).expect("empty plan is valid");
         assert!(out.tasks.is_empty());
         assert!(!out.breakdown_found);
     }
@@ -741,7 +682,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "test-key"))
-            .and(header("anthropic-version", ANTHROPIC_API_VERSION))
+            .and(header("anthropic-version", claude_client::ANTHROPIC_API_VERSION))
             .respond_with(ResponseTemplate::new(200).set_body_json(tool_use_response()))
             .mount(&server)
             .await;
@@ -784,8 +725,8 @@ mod tests {
     #[tokio::test]
     async fn api_error_after_exhausting_retries() {
         let server = MockServer::start().await;
-        // Always 401 — not retryable in practice, but we still attempt twice
-        // and then fail safe with the typed ApiError outcome.
+        // 401 is a non-retryable client error: the pipeline fails fast (no
+        // retry) and we map it to the typed ApiError outcome.
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
