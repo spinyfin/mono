@@ -250,6 +250,11 @@ enum EngineEvent {
     /// atop `<branch>@origin`. The app should open a Ghostty terminal
     /// window rooted at `workspacePath`.
     case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String)
+    /// Response to `open_live_workspace_terminal` — the work item's live
+    /// execution already holds a leased cube workspace at `workspacePath`.
+    /// The app should open a Ghostty terminal window rooted there; there
+    /// is no lease to release when the window closes.
+    case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
     /// Response to `merge_when_ready` — the engine has successfully
     /// initiated the merge process for the PR. `action` is one of:
     /// `"enqueued"` (merge queue), `"auto_merge_enabled"` (will merge
@@ -680,6 +685,17 @@ final class EngineClient: @unchecked Sendable {
     func sendOpenReviewTerminal(workItemID: String) {
         sendLine([
             "type": "open_review_terminal",
+            "work_item_id": workItemID,
+        ])
+    }
+
+    /// Ask the engine for a terminal into a Doing-column work item's
+    /// already-live execution workspace — no new lease, just the path.
+    /// The engine replies with `live_workspace_terminal_ready` or
+    /// `work_error`.
+    func sendOpenLiveWorkspaceTerminal(workItemID: String) {
+        sendLine([
+            "type": "open_live_workspace_terminal",
             "work_item_id": workItemID,
         ])
     }
@@ -1793,6 +1809,15 @@ final class EngineClient: @unchecked Sendable {
                         workItemID: workItemID,
                         workspacePath: workspacePath,
                         leaseID: leaseID
+                    ))
+                }
+            case "live_workspace_terminal_ready":
+                let workItemID = payload["work_item_id"] as? String ?? ""
+                let workspacePath = payload["workspace_path"] as? String ?? ""
+                if !workItemID.isEmpty && !workspacePath.isEmpty {
+                    emit(.liveWorkspaceTerminalReady(
+                        workItemID: workItemID,
+                        workspacePath: workspacePath
                     ))
                 }
             case "merge_when_ready_accepted":

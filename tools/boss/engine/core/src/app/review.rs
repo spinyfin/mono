@@ -222,6 +222,69 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
     }
 }
 
+/// Open a terminal into a work item's already-live execution workspace
+/// (Doing-column debugging affordance). Unlike `handle_open_review_terminal`,
+/// this never leases a new workspace — it reads `workspace_path` off the
+/// existing `running`/`waiting_human` execution row, which the worker's
+/// own pane is already using. Sending back the path is enough; there is
+/// no matching release handler because the lease belongs to the worker,
+/// not to this terminal window.
+pub(super) async fn handle_open_live_workspace_terminal(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::OpenLiveWorkspaceTerminal { work_item_id } = req else {
+        unreachable!()
+    };
+    let execution = match work_db.get_live_execution_for_work_item(&work_item_id, "") {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: "open_live_workspace_terminal: work item has no live execution".to_owned(),
+                },
+            );
+            return;
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("open_live_workspace_terminal: {err}"),
+                },
+            );
+            return;
+        }
+    };
+    let workspace_path = match execution.workspace_path.filter(|s| !s.is_empty()) {
+        Some(path) => path,
+        None => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: "open_live_workspace_terminal: live execution has no leased workspace".to_owned(),
+                },
+            );
+            return;
+        }
+    };
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::LiveWorkspaceTerminalReady {
+            work_item_id,
+            workspace_path,
+        },
+    );
+}
+
 pub(super) async fn handle_release_review_terminal(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch { server_state, .. } = ctx;
     let FrontendRequest::ReleaseReviewTerminal { lease_id } = req else {
