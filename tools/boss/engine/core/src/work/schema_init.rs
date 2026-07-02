@@ -377,6 +377,10 @@ impl WorkDb {
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_answer_agent_runs_table(&conn)?;
+        // Archival provenance: tasks.archived_reason surfaces why the
+        // engine auto-archived a revision (parent PR merged/closed) so
+        // `boss task show` doesn't leave the operator guessing.
+        migrate_tasks_archived_reason(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker

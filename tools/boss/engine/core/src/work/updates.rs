@@ -168,9 +168,16 @@ impl WorkDb {
             task.blocked_reason = None;
             task.blocked_attempt_id = None;
         }
+        // Mirror invariant for archived_reason: it only ever documents why
+        // the row is *currently* archived, so it must not linger once the
+        // row leaves that status.
+        if task.status != TaskStatus::Archived {
+            task.archived_reason = None;
+        }
 
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
+            refuse_manual_move_off_archived_moot_revision(&tx, id, &task.kind, &previous_status, &task.status)?;
         }
         let actor_stamp = if status_changed && previous_status != task.status {
             actor
@@ -186,6 +193,7 @@ impl WorkDb {
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
+                 archived_reason = ?17,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -209,6 +217,7 @@ impl WorkDb {
                 task.blocked_reason,
                 task.blocked_attempt_id,
                 task.driver,
+                task.archived_reason,
             ],
         )?;
 

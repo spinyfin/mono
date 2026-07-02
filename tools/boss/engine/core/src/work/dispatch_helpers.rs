@@ -534,10 +534,27 @@ pub(crate) fn reconcile_revision_execution(
         }
 
         let now = now_string();
+        // Drop any not-yet-live execution row before archiving the task:
+        // without this, a `ready` row created earlier (e.g. by the
+        // dependency-unblock cascade, which is not chain-root-aware) is
+        // stranded on a now-archived work item — it can never be dispatched
+        // and `bossctl work start` on the row just mints another orphan.
+        // A live (`running`/`waiting_human`) execution is left alone; it
+        // self-retires when its worker stops.
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency')",
+            params![task.id, now],
+        )?;
         if is_moot_revision_kind(&task.created_via) {
+            let archived_reason = format!("parent PR merged: revision moot (created_via={})", task.created_via);
             let rows_changed = conn.execute(
                 "UPDATE tasks
                  SET status            = 'archived',
+                     archived_reason   = ?3,
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
@@ -545,7 +562,7 @@ pub(crate) fn reconcile_revision_execution(
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
-                params![task.id, now],
+                params![task.id, now, archived_reason],
             )?;
             if rows_changed > 0 {
                 tracing::info!(
@@ -555,6 +572,18 @@ pub(crate) fn reconcile_revision_execution(
                     "reconcile_revision: moot revision archived at dispatch-time \
                      (merge-conflict/CI-fix; parent PR merged)",
                 );
+                record_revision_archived_attention(
+                    conn,
+                    &task.id,
+                    "parent PR merged, revision moot",
+                    &format!(
+                        "The parent PR for chain root `{}` merged or closed. This revision \
+                         (`created_via={}`) could not have merged unresolved (a conflicting/CI-failing \
+                         PR can't merge), so the engine archived it silently rather than leaving a \
+                         dangling task. No action needed unless the underlying work is still outstanding.",
+                        chain_root_task.id, task.created_via,
+                    ),
+                )?;
             }
         } else {
             let is_wip = task.status == TaskStatus::Active;
@@ -573,9 +602,11 @@ pub(crate) fn reconcile_revision_execution(
                     .maybe_repo_remote_url(task.repo_remote_url.clone())
                     .build(),
             )?;
+            let archived_reason = format!("parent PR merged: superseded by chore {}", new_chore.id);
             conn.execute(
                 "UPDATE tasks
                  SET status            = 'archived',
+                     archived_reason   = ?3,
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
@@ -583,7 +614,7 @@ pub(crate) fn reconcile_revision_execution(
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
-                params![task.id, now],
+                params![task.id, now, archived_reason],
             )?;
             tracing::info!(
                 task_id = %task.id,
@@ -733,6 +764,35 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    // Refuse explicit dispatch against a terminal (done/archived/cancelled)
+    // work item instead of silently creating a `ready` execution that can
+    // never run — the row is closed, so nothing will ever pick it up, and
+    // the next reconcile tick that revisits a terminal revision archives it
+    // straight back out from under the stranded execution (see
+    // proj_18be59fc8d8b2440_363's incident writeup: `bossctl work start` on
+    // an auto-archived revision minted exactly such an orphan). Only tasks
+    // carry executions; projects are exempt.
+    if work_item_id.starts_with("task_") {
+        let terminal_state: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status, archived_reason FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((status, archived_reason)) = terminal_state {
+            let parsed: TaskStatus = status.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            if parsed.is_terminal() {
+                let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+                bail!(
+                    "cannot start {work_item_id}: item is `{status}`{reason_suffix} — terminal work \
+                     items cannot be dispatched; if this was archived by mistake, reopen it first \
+                     with `boss task move {work_item_id} --to todo`"
+                );
+            }
+        }
+    }
 
     // Q8: explicit `RequestExecution` against a gated work item is
     // refused with a clear error rather than silently overridden. A

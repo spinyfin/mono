@@ -153,6 +153,56 @@ impl WorkDb {
         Ok(healed)
     }
 
+    /// Reconciliation sweep: abandon any `queued` / `ready` /
+    /// `waiting_dependency` execution whose work item is a task in a
+    /// terminal status (`done` / `archived` / `cancelled`) or soft-deleted.
+    /// A dispatchable execution has no business existing against a closed
+    /// row — it can never be picked up (the dispatcher only surfaces
+    /// non-terminal work items) and just confuses `bossctl agents list` /
+    /// `boss chore show` with a phantom pending run.
+    ///
+    /// This is the startup-time backstop for the create-time guards in
+    /// `reconcile_revision_execution`, `block_pending_revisions_on_parent_close`,
+    /// and `request_execution_in_tx_with_live_check`: those stop *new*
+    /// stranded executions from being created, this cleans up any that
+    /// slipped through before the fix shipped (or from a future regression).
+    /// Run alongside [`Self::heal_ghost_active_chores`] at engine startup.
+    pub fn abandon_stranded_executions_on_closed_work_items(&self) -> Result<Vec<AbandonedStrandedExecution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT we.id, we.work_item_id
+                 FROM work_executions we
+                 JOIN tasks t ON t.id = we.work_item_id
+                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency')
+                   AND (t.status IN ('done', 'archived', 'cancelled') OR t.deleted_at IS NOT NULL)",
+            )?;
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = now_string();
+        let mut abandoned = Vec::new();
+        for (execution_id, work_item_id) in candidates {
+            let updated = tx.execute(
+                "UPDATE work_executions
+                 SET status = 'abandoned',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1
+                   AND status IN ('queued', 'ready', 'waiting_dependency')",
+                params![execution_id, now],
+            )?;
+            if updated > 0 {
+                abandoned.push(AbandonedStrandedExecution {
+                    execution_id,
+                    work_item_id,
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(abandoned)
+    }
+
     /// Demote a single `active` work item back to `todo` after its
     /// dispatch failed before a worker ever came up (e.g. the worker
     /// pane could not be spawned because no app session was registered,

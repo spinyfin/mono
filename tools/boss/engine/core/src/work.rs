@@ -139,6 +139,16 @@ pub struct HealedGhostActive {
     pub product_id: String,
 }
 
+/// One execution row abandoned by
+/// [`WorkDb::abandon_stranded_executions_on_closed_work_items`] — a
+/// `queued`/`ready`/`waiting_dependency` execution that pointed at a
+/// work item already in a terminal status or soft-deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedStrandedExecution {
+    pub execution_id: String,
+    pub work_item_id: String,
+}
+
 /// A task returned by
 /// [`WorkDb::list_in_review_tasks_for_doc_branch_backfill`] — an
 /// `in_review` task whose doc-branch pointer is `NULL` and that has a

@@ -201,6 +201,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_via: row.get(15)?,
         blocked_reason: row.get(16)?,
         blocked_attempt_id: row.get(17)?,
+        // Not part of the base 31-column SELECT; populated only by
+        // map_task_with_parent_provenance_and_archived_reason when the
+        // caller's query appends the trailing `archived_reason` column.
+        archived_reason: None,
         repo_remote_url: row.get(18)?,
         effort_level,
         model_override: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
@@ -293,6 +297,16 @@ pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Re
     task.origin_task_short_id = row.get(32)?;
     task.origin_pr_number = row.get(33)?;
     task.completed_at = row.get::<_, Option<String>>(34)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
+/// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
+/// `archived_reason` column (index 35). Used by `query_task` and
+/// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
+/// `get_work_item`) surface why the engine auto-archived a row.
+pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_parent_and_provenance(row)?;
+    task.archived_reason = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 

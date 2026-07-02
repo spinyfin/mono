@@ -2905,6 +2905,20 @@ pub struct Task {
 
     pub status: TaskStatus,
     pub updated_at: String,
+
+    /// Human-readable reason the *engine* (never a human) transitioned this
+    /// row to `status = 'archived'`, e.g. `"parent PR merged: revision moot
+    /// (created_via=merge-conflict:crz_123)"` or `"parent PR merged:
+    /// superseded by chore task_456"`. Set only by the revision-chain
+    /// reconciliation paths (`block_pending_revisions_on_parent_close`,
+    /// `reconcile_revision_execution`'s dispatch-time catch-up gate) so an
+    /// operator running `boss task show` can see *why* a row disappeared
+    /// from the board instead of reconstructing it from engine logs.
+    /// `None` for manually archived rows and for every non-archived status;
+    /// cleared whenever the row leaves `archived` via any path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_reason: Option<String>,
+
     /// Soft FK to the attempt row currently trying to clear the block —
     /// `conflict_resolutions.id` when `blocked_reason = 'merge_conflict'`,
     /// the review-iteration table's id when `blocked_reason = 'review_feedback'`,

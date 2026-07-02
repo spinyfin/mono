@@ -1588,3 +1588,19 @@ pub(crate) fn migrate_work_comments_intent_columns(conn: &Connection) -> Result<
     }
     Ok(())
 }
+
+/// Add `tasks.archived_reason` — a human-readable explanation of *why* the
+/// engine (never a human) auto-archived a row, so `boss task show` can
+/// surface it instead of leaving the operator to reconstruct the reason
+/// from engine logs. Set by the revision-chain reconciliation paths
+/// (`block_pending_revisions_on_parent_close`,
+/// `reconcile_revision_execution`'s dispatch-time catch-up gate) when a
+/// revision's chain-root PR merges/closes and the revision is archived as
+/// moot or superseded. `NULL` for manually archived rows and every
+/// pre-existing row.
+pub(crate) fn migrate_tasks_archived_reason(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "archived_reason")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN archived_reason TEXT", [])?;
+    }
+    Ok(())
+}

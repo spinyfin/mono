@@ -9173,6 +9173,9 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status.display_label());
+    if let Some(reason) = task.archived_reason.as_deref() {
+        println!("Archived reason: {reason}");
+    }
     if let Some(product) = parent_product {
         println!("Repo: {}", format_repo_line(task.repo_remote_url.as_deref(), product),);
     }
