@@ -1404,6 +1404,10 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
         prompt.push_str(&ci_monitoring_directive(execution));
+        // Incident 2026-07-02 (exec_18b5243e65ff188_2d / T2085): teach the
+        // full escalation/blocker marker syntax so a well-formed marker is
+        // the default, not a lucky accident — see the function doc for why.
+        prompt.push_str(&worker_escalation_protocol_directive());
         // T1868: give a fresh-PR chore/task implementation worker a SANCTIONED
         // way to terminate as "the work was already done". Without it, a worker
         // that correctly finds an empty diff stops and explains — and the
@@ -1487,7 +1491,7 @@ pub(crate) fn bazel_prepush_gate_text() -> String {
          \n\
          Run the build gate in the FOREGROUND and read its exit code directly. Do NOT background bazel (no `&`, no `run_in_background`, no redirecting to a log file you then poll) and then idle in a self-paced wait-loop \"until the gate is green\". If the bazel server wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
          \n\
-         If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+         If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
         .to_string()
 }
 
@@ -1533,7 +1537,7 @@ pub(crate) fn bazel_conflict_resolution_gate_text() -> String {
          \n\
          After pushing you MAY run `bazel test` on the affected targets as a courtesy and report what you saw, but the push must not wait on it.\n\
          \n\
-         If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit an `[effort-escalation]` marker and stop.\n"
+         If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
         .to_string()
 }
 
@@ -1672,6 +1676,57 @@ fn pr_terminal_directive() -> String {
     out
 }
 
+/// Worker Stop-boundary escalation/blocker protocol directive. Documents
+/// the two sanctioned markers a worker emits on its Stop boundary when it
+/// cannot proceed unassisted: `[effort-escalation]` (the work is bigger
+/// than estimated) and `[blocked]` (a human/coordinator decision is needed).
+///
+/// Before this directive, workers were only ever told to "emit an
+/// `[effort-escalation]` marker" (the bazel pre-push gate text) without
+/// being taught the required fields. Incident 2026-07-02
+/// (`exec_18b5243e65ff188_2d`, T2085): a worker hit a bazel blocker it
+/// could not resolve, did the right thing by stopping instead of pushing
+/// broken code, and emitted a bare `[effort-escalation]` line with neither
+/// `requested_level` nor `reason` — which the coordinator's documented
+/// parser treats as malformed. This block states the full syntax so a
+/// well-formed marker is the default. It also introduces `[blocked]`: prior
+/// prompt text only ever said "if you are blocked, say what you need" with
+/// no concrete mechanism, so a worker with no PR to push and nothing to
+/// escalate the *effort* on had no sanctioned way to ask for help.
+///
+/// See [`crate::worker_escalation`] for the parser and
+/// [`crate::completion::WorkerCompletionHandler::detect_and_file_worker_signals`]
+/// for what the engine does with either marker: files a coordinator-visible
+/// attention item and pauses the "produce a PR" auto-nudge until it is
+/// resolved (a coordinator probe on this run resolves it — see
+/// [`crate::work::WorkDb::resolve_worker_signal_attentions_for_execution`]).
+fn worker_escalation_protocol_directive() -> String {
+    "\n## If you are blocked or the work is bigger than estimated\n\n\
+     Two sanctioned markers, each on its own line in your final response, tell the coordinator \
+     you need help. Emitting one is always the right move over pushing broken/unvalidated work \
+     or idling silently:\n\n\
+     - **`[effort-escalation] requested_level=<level> reason=\"<why>\"`** — the assigned work \
+     needs more effort than it was classified at. `<level>` is one bareword, one of \
+     `trivial|small|medium|large|max`. `<why>` is a double-quoted, one-line reason. Both fields \
+     are required. Example:\n\n\
+     ```\n\
+     [effort-escalation] requested_level=large reason=\"ran into a multi-subsystem race; description didn't mention the engine/app boundary\"\n\
+     ```\n\n\
+     - **`[blocked] reason=\"<why>\"`** — you cannot proceed without a human/coordinator \
+     decision: a build failure you can't resolve, an ambiguous requirement, conflicting \
+     instructions, a missing credential. `<why>` is a double-quoted, one-line reason. Example:\n\n\
+     ```\n\
+     [blocked] reason=\"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
+     ```\n\n\
+     A marker missing `requested_level=`/`reason=\"...\"` is still detected but flagged \
+     malformed to the coordinator — include both fields so it's processed automatically instead \
+     of by hand. Do NOT stop silently or push code you know is broken to work around a blocker: \
+     emit the marker instead. The engine files it as an attention item for the coordinator and \
+     pauses the auto-nudge loop for this run until it acks, so you will not be re-prompted to \
+     \"produce a PR\" while a marker is pending.\n"
+        .to_string()
+}
+
 /// Sanctioned no-op completion directive (T1868). A `chore_implementation`
 /// / `task_implementation` worker sometimes investigates and finds the work
 /// is *already done* — the change is already on `main`, so `jj diff -r @` is
@@ -1711,7 +1766,9 @@ fn no_op_completion_directive() -> String {
         "This replaces the generic \"stop and explain what went wrong\" for the already-done case: \
          an empty diff because the work is done is a success terminal, not an error. Do NOT emit \
          `{marker}` to abandon work you simply found hard or are blocked on — if you are blocked, \
-         say what you need instead, and the engine will help you proceed.\n"
+         emit `[blocked] reason=\"...\"` instead (see \"If you are blocked or the work is bigger \
+         than estimated\" above), and the engine will route it to the coordinator without nudging \
+         you to produce a PR.\n"
     ));
     out
 }

@@ -340,6 +340,7 @@ pub(super) async fn handle_get_run(ctx: Dispatch, req: FrontendRequest) {
 pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
+        work_db,
         sink,
         request_id,
         peer_pid,
@@ -375,6 +376,30 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         }
         let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
         tracing::info!(run_id = %run_id, probe_id = %probe_id, urgent, "probe queued");
+        // A human/coordinator probe on this run IS the documented ack
+        // gesture for a worker-declared escalation/blocker (e.g.
+        // `bossctl probe <agent> "[effort-escalation-ack] …"`) — resolve any
+        // open worker-signal attention items so the completion handler's
+        // suppressed "produce a PR" auto-nudge resumes on the run's next
+        // Stop. Best-effort: a DB failure here must never block the probe
+        // itself.
+        match work_db.resolve_worker_signal_attentions_for_execution(&run_id) {
+            Ok(0) => {}
+            Ok(resolved) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    resolved,
+                    "probe_run: resolved unresolved worker-escalation/blocker attention item(s)",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    ?err,
+                    "probe_run: failed to resolve worker-escalation attention items",
+                );
+            }
+        }
         // Immediately deliver the probe if the worker is already idle
         // (between turns). An idle worker has no Stop boundary coming
         // — `dispatch_probe_on_stop` would never fire — so we push the
