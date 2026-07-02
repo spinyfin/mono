@@ -66,6 +66,7 @@ use crate::work::TaskStatus;
 use crate::work::{
     CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget,
 };
+use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_github::pr_url::pr_number_from_url;
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -1327,6 +1328,16 @@ impl WorkerCompletionHandler {
             );
             return StopOutcome::RunningNoStagedPr;
         }
+
+        // Worker escalation/blocker detection (incident 2026-07-02,
+        // exec_18b5243e65ff188_2d / T2085): a worker that emitted an
+        // `[effort-escalation]` or `[blocked]` marker on this genuinely-
+        // terminal Stop gets an attention item filed for the coordinator
+        // *before* any nudge decision below is made — `nudge_or_park`
+        // consults the same store and suppresses the "produce a PR" loop
+        // while the item is unresolved. Best-effort: filing failures are
+        // logged and swallowed, never block completion.
+        self.detect_and_file_worker_signals(&execution).await;
 
         // Resume-bounce SHA-delta gate: when the chore already has a
         // PR bound to it (`task.pr_url` populated by an earlier run's
@@ -3381,6 +3392,10 @@ must not be asked to open one",
             // Breaker parked the execution for a human; don't mark the
             // attempt failed (that risks a retrigger that re-loops).
             StopOutcome::NudgeBreakerParked { .. } => false,
+            // Worker declared an unresolved escalation/blocker; the
+            // auto-nudge is suppressed, not the attempt marked failed —
+            // mirrors NudgeBreakerParked.
+            StopOutcome::EscalationPending { .. } => false,
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,
@@ -3697,7 +3712,13 @@ must not be asked to open one",
     ///
     /// This is the single choke point for the nudge loop: bounding it
     /// here makes the breaker generic to *every* auto-nudge, not just
-    /// the "produce a PR" one.
+    /// the "produce a PR" one. It is also the suppression point for
+    /// worker-declared escalations/blockers (below): before touching the
+    /// circuit breaker at all, refuse to nudge an execution that has an
+    /// unresolved `[effort-escalation]`/`[blocked]` attention item —
+    /// dogging a worker that just told the coordinator it's stuck awaiting
+    /// direction is exactly the failure this exists to prevent (incident
+    /// 2026-07-02, exec_18b5243e65ff188_2d / T2085).
     async fn nudge_or_park(
         &self,
         execution: &crate::work::WorkExecution,
@@ -3706,6 +3727,23 @@ must not be asked to open one",
         bound_pr_url: Option<&str>,
         proceed_outcome: StopOutcome,
     ) -> StopOutcome {
+        if let Some(reason) = self.unresolved_worker_signal_reason(execution) {
+            tracing::info!(
+                execution_id = %execution.id,
+                %reason,
+                "auto-nudge: suppressed — worker has an unresolved escalation/blocker awaiting \
+                 coordinator action",
+            );
+            self.publisher
+                .publish(
+                    &execution.id,
+                    &execution.work_item_id,
+                    execution.status.as_str(),
+                    "worker_escalation_pending",
+                )
+                .await;
+            return StopOutcome::EscalationPending { reason };
+        }
         match self
             .nudge_breaker
             .record(&execution.id, fingerprint, self.max_unproductive_nudges)
@@ -3816,6 +3854,140 @@ must not be asked to open one",
             "auto-nudge circuit breaker tripped — parked execution, no further nudges"
         );
         StopOutcome::NudgeBreakerParked { reason }
+    }
+
+    /// Scan `execution`'s Stop-boundary transcript for `[effort-escalation]`
+    /// / `[blocked]` markers and file a (content-deduplicated) attention
+    /// item for each one found. Called once per genuinely-terminal Stop,
+    /// before any nudge decision — `nudge_or_park` reads the same store to
+    /// decide whether to suppress the "produce a PR" loop.
+    ///
+    /// A malformed marker is still filed (with a parse warning) rather than
+    /// dropped: a garbled escalation the coordinator can read by hand beats
+    /// the engine silently pretending nothing happened, which is the
+    /// incident this exists to fix. `heuristic_blocker_detection` (DEFAULT
+    /// OFF) additionally scans for guidance-ask prose when no explicit
+    /// marker was found — the documented marker is the contract; the
+    /// heuristic is a best-effort net under it.
+    async fn detect_and_file_worker_signals(&self, execution: &crate::work::WorkExecution) {
+        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+            return;
+        };
+        let mut signals = worker_escalation::detect_worker_signals(&text);
+        if signals.is_empty()
+            && self.feature_flags.is_enabled("heuristic_blocker_detection")
+            && let Some(signal) = worker_escalation::detect_heuristic_blocker(&text)
+        {
+            signals.push(signal);
+        }
+        for signal in &signals {
+            self.file_worker_signal_attention(execution, signal).await;
+        }
+    }
+
+    /// File one [`WorkerSignal`] as a `work_attention_items` row, unless an
+    /// item already exists (open or resolved) for this execution carrying
+    /// the exact same marker line. Content-keying on the marker line — not
+    /// just the kind — keeps this idempotent across the many Stops a single
+    /// execution's cumulative transcript survives (the marker line never
+    /// disappears from the transcript once emitted) while still letting a
+    /// *new*, distinct marker from the same worker surface as its own item,
+    /// and letting the coordinator's resolution
+    /// ([`WorkDb::resolve_worker_signal_attentions_for_execution`]) actually
+    /// stick instead of being immediately re-filed from the same stale line.
+    async fn file_worker_signal_attention(&self, execution: &crate::work::WorkExecution, signal: &WorkerSignal) {
+        let kind = signal.kind.attention_kind();
+        let already_seen = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|i| i.kind == kind && i.body_markdown.contains(&signal.marker_line))
+            })
+            .unwrap_or(false);
+        if already_seen {
+            return;
+        }
+
+        let (title, label) = match signal.kind {
+            WorkerSignalKind::EffortEscalation => {
+                ("Worker requested an effort escalation", "an [effort-escalation] marker")
+            }
+            WorkerSignalKind::Blocked => ("Worker reported a blocker", "a [blocked] marker"),
+        };
+        let mut body = format!(
+            "Worker emitted {label} on its Stop boundary.\n\n\
+             - execution: `{execution_id}`\n\
+             - work item: `{work_item_id}`\n\n\
+             Marker (verbatim):\n\n```\n{marker_line}\n```",
+            execution_id = execution.id,
+            work_item_id = execution.work_item_id,
+            marker_line = signal.marker_line,
+        );
+        if let Some(warning) = signal.parse_warning.as_deref() {
+            body.push_str(&format!(
+                "\n\n**Parse warning:** {warning} — the marker is malformed; process it by hand \
+                 per the escalation protocol rather than trusting an automated field extraction."
+            ));
+        }
+        body.push_str(
+            "\n\nThe auto-nudge \"produce a PR\" loop is paused for this execution while this item \
+             is unresolved. Acking the worker (e.g. `bossctl probe`) resolves it and resumes normal \
+             nudging.",
+        );
+
+        match self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: kind.to_owned(),
+            status: None,
+            title: title.to_owned(),
+            body_markdown: body,
+            resolved_at: None,
+        }) {
+            Ok(item) => {
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = work_item_product_id(&work_item);
+                    self.publisher
+                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "worker escalation: failed to file attention item; signal will not block nudges",
+                );
+            }
+        }
+    }
+
+    /// `Some(reason)` when `execution` has at least one *unresolved*
+    /// (`status != "resolved"`) worker-escalation/blocker attention item —
+    /// the condition [`Self::nudge_or_park`] uses to suppress the
+    /// "produce a PR" auto-nudge loop. `None` when there is none (never
+    /// filed, or filed-and-resolved).
+    fn unresolved_worker_signal_reason(&self, execution: &crate::work::WorkExecution) -> Option<String> {
+        let items = self.work_db.list_attention_items(&execution.id).ok()?;
+        let open: Vec<&str> = items
+            .iter()
+            .filter(|i| {
+                (i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND
+                    || i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                    && i.status != "resolved"
+            })
+            .map(|i| i.kind.as_str())
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} unresolved worker signal(s) pending coordinator action ({})",
+            open.len(),
+            open.join(", ")
+        ))
     }
 
     /// Whether the worker emitted the sanctioned [`NO_CHANGES_NEEDED`
@@ -4941,6 +5113,16 @@ pub enum StopOutcome {
     /// instead of being nudged again. `reason` is the human-readable
     /// explanation recorded on the attention item.
     NudgeBreakerParked { reason: String },
+    /// The worker emitted an `[effort-escalation]` or `[blocked]` marker on
+    /// a prior Stop and the filed attention item is still unresolved: the
+    /// "produce a PR" auto-nudge is suppressed for this execution (never
+    /// queued via `nudge_or_park`) instead of dogging a worker that already
+    /// declared itself stuck awaiting coordinator direction (incident
+    /// 2026-07-02, exec_18b5243e65ff188_2d / T2085). `reason` names the
+    /// pending signal kind(s). The execution stays `waiting_human`; no
+    /// probe is sent. Resolving the attention item (coordinator ack)
+    /// resumes normal nudging on the next Stop.
+    EscalationPending { reason: String },
     /// The worker is a conflict-resolution or CI-failure revision that
     /// stopped without pushing, but the blocking signal was already
     /// cleared (conflict: PR `mergeable`; CI: required checks green)
@@ -8775,6 +8957,221 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
             other => panic!("expected chore, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------
+    // Worker escalation/blocker detection (incident 2026-07-02,
+    // exec_18b5243e65ff188_2d / T2085): a worker that emits an
+    // `[effort-escalation]` or `[blocked]` marker on its Stop boundary must
+    // get an attention item filed for the coordinator, and the "produce a
+    // PR" auto-nudge must be suppressed while it is unresolved. A
+    // coordinator probe on the run resolves it and resumes normal nudging.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn well_formed_effort_escalation_files_attention_and_suppresses_nudge() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "Hit a bazel toolchain error I can't resolve.\n\n\
+             [effort-escalation] requested_level=large reason=\"multi-subsystem race; rule-3 missed\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "an unresolved escalation must suppress the auto-nudge; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "the produce-a-PR nudge must NOT fire while the escalation is unresolved; got {:?}",
+            probes.snapshot(),
+        );
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+                .count(),
+            1,
+            "exactly one worker_escalation attention item must be filed; got {items:?}",
+        );
+        let item = items
+            .iter()
+            .find(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+            .unwrap();
+        assert_eq!(item.status, "open");
+        assert!(
+            item.body_markdown.contains("requested_level=large"),
+            "attention body must carry the marker verbatim; got: {}",
+            item.body_markdown,
+        );
+        assert!(
+            !item.body_markdown.contains("Parse warning"),
+            "a well-formed marker must not carry a parse warning; got: {}",
+            item.body_markdown,
+        );
+        // Task stays untouched — this is not a completion, just a pause.
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_effort_escalation_is_still_filed_with_a_parse_warning() {
+        // O'Brien's incident marker: bare, no requested_level, no reason.
+        // Malformed markers must still be surfaced, not silently dropped.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "I need guidance before proceeding.\n\n[effort-escalation]\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+            .expect("malformed marker must still file an attention item");
+        assert!(
+            item.body_markdown.contains("Parse warning"),
+            "a malformed marker must be flagged with a parse warning; got: {}",
+            item.body_markdown,
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_marker_files_attention_and_suppresses_nudge() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[blocked] reason=\"bazel E0583, survives clean --expunge; need explicit direction\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "got {outcome:?}"
+        );
+        assert!(probes.snapshot().is_empty());
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "exactly one worker_blocked attention item must be filed; got {items:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_resolution_resumes_normal_nudging() {
+        // Fixture: a worker declares [blocked], suppressing the nudge. The
+        // coordinator's ack (a probe on the run — mirrors
+        // `bossctl probe <agent> "..."`, wired through
+        // `resolve_worker_signal_attentions_for_execution` in the ProbeRun
+        // RPC handler) resolves the attention item; the next Stop must
+        // resume the normal produce-a-PR nudge even though the marker line
+        // is still present in the cumulative transcript.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[blocked] reason=\"need a decision on approach A vs B\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane, probes.clone());
+
+        let outcome1 = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome1, StopOutcome::EscalationPending { .. }),
+            "got {outcome1:?}"
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "nudge must be suppressed before resolution"
+        );
+
+        // Coordinator acks — resolve the attention item(s) for this execution.
+        let resolved = db
+            .resolve_worker_signal_attentions_for_execution(&execution_id)
+            .unwrap();
+        assert_eq!(resolved, 1, "exactly one open item should have been resolved");
+
+        // Next Stop: the SAME cumulative transcript still contains the old
+        // marker line, but it must not re-block the nudge — resolution
+        // stuck.
+        let outcome2 = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome2, StopOutcome::AwaitingInput),
+            "resolution must resume the normal produce-a-PR nudge; got {outcome2:?}",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "the produce-a-PR nudge must fire exactly once after resolution"
+        );
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+
+        // And no NEW attention item was re-filed for the stale marker line.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "the stale marker line must not be re-filed as a fresh attention item; got {items:?}",
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .unwrap()
+                .status,
+            "resolved",
+        );
     }
 
     // -----------------------------------------------------------
