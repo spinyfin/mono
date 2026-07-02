@@ -1,6 +1,6 @@
-//! The single Claude (Anthropic Messages API) pipeline for the engine.
+//! The single Claude (Anthropic Messages API) transport + protocol pipeline.
 //!
-//! # Every Claude call MUST go through this module
+//! # Every Claude call MUST go through this crate
 //!
 //! Any feature that talks to the Anthropic Messages API — planning,
 //! pane summaries, live-status one-liners, the magic-wand doc editor, the
@@ -9,8 +9,17 @@
 //! JSON body, for structured-output/forced-tool-call requests). Do NOT stand
 //! up a private `reqwest::Client`, re-declare the endpoint / `anthropic-version`
 //! constants, hand-roll key resolution, or re-implement retry. The engine used
-//! to carry five independent copies of that wiring; this module is the one
-//! place it lives.
+//! to carry five independent copies of that wiring; `boss-claude-client` is
+//! the one place it lives.
+//!
+//! # Crate boundary
+//!
+//! This crate owns Claude API transport + protocol ONLY: client
+//! construction, endpoint/version constants, key resolution, request/response
+//! types, the error taxonomy, and retry/backoff. It must NEVER import from
+//! the engine — that edge is one-way, engine → `boss-claude-client`. If
+//! engine-trace logging or usage accounting is wanted later, it comes in via
+//! a callback/trait parameter supplied by the caller, not an engine import.
 //!
 //! ## What the pipeline owns vs. what the caller owns
 //!
