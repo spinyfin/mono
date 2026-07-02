@@ -149,6 +149,41 @@ pub struct RevealWorkItemInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevealWorkItemResult {}
 
+/// Engine asks the app to close whatever pane is hosting `run_id`,
+/// wherever it lives — main worker pool, automation pool, or review
+/// pool. Unlike [`ReleaseWorkerPaneInput`] this is keyed by run id, not
+/// slot id, so it works even when the engine's own `slot_id ↔ run_id`
+/// bookkeeping has already been discarded (e.g. a prior
+/// `ReleaseWorkerPane` attempt "succeeded" engine-side — the pool slot
+/// and live-state entry were freed — but the app never got the message
+/// because no app session was registered at the time). The app is the
+/// only party that still knows which physical pane, if any, is showing
+/// `run_id`; this RPC asks it to settle that authoritatively instead of
+/// relying on the engine's possibly-stale slot mapping.
+///
+/// This is the "escape hatch" `bossctl agents stop` / `bossctl agents
+/// reap` fall back to when the normal slot-keyed release finds nothing
+/// to do — see the zombie-pane incident (2026-07-01/02): neither verb
+/// could clear a corpse pane whose slot mapping the engine had already
+/// forgotten, because both were keyed on `slot_id` resolution that had
+/// nothing left to resolve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VacatePaneByRunIdInput {
+    pub run_id: String,
+    /// SIGTERM, then SIGKILL after this many seconds, mirroring
+    /// [`ReleaseWorkerPaneInput::kill_grace_seconds`].
+    pub kill_grace_seconds: u32,
+}
+
+/// App's reply. `vacated` is `true` when a pane hosting `run_id` was
+/// found and torn down; `false` is not an error — it means the app's
+/// own pane inventory already has nothing under that run id (the
+/// idempotent "nothing to do" case).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VacatePaneByRunIdResult {
+    pub vacated: bool,
+}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -159,6 +194,7 @@ pub enum EngineToAppRequest {
     FocusWorkerPane(FocusWorkerPaneInput),
     InterruptWorkerPane(InterruptWorkerPaneInput),
     RevealWorkItem(RevealWorkItemInput),
+    VacatePaneByRunId(VacatePaneByRunIdInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -188,6 +224,9 @@ pub enum EngineToAppResponse {
     },
     RevealWorkItem {
         result: Result<RevealWorkItemResult, EngineToAppError>,
+    },
+    VacatePaneByRunId {
+        result: Result<VacatePaneByRunIdResult, EngineToAppError>,
     },
 }
 
@@ -399,6 +438,38 @@ mod tests {
     fn interrupt_response_err_round_trips() {
         let original = EngineToAppResponse::InterruptWorkerPane {
             result: Err(EngineToAppError::UnknownSlot),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn vacate_pane_by_run_id_request_round_trips() {
+        let original = EngineToAppRequest::VacatePaneByRunId(VacatePaneByRunIdInput {
+            run_id: "exec_abc123".into(),
+            kill_grace_seconds: 5,
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("vacate_pane_by_run_id"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn vacate_pane_by_run_id_response_found_round_trips() {
+        let original = EngineToAppResponse::VacatePaneByRunId {
+            result: Ok(VacatePaneByRunIdResult { vacated: true }),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn vacate_pane_by_run_id_response_not_found_is_not_an_error() {
+        let original = EngineToAppResponse::VacatePaneByRunId {
+            result: Ok(VacatePaneByRunIdResult { vacated: false }),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();

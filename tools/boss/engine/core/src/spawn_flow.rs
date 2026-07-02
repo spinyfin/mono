@@ -337,7 +337,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         | EngineToAppResponse::SendToPane { .. }
         | EngineToAppResponse::FocusWorkerPane { .. }
         | EngineToAppResponse::InterruptWorkerPane { .. }
-        | EngineToAppResponse::RevealWorkItem { .. } => {
+        | EngineToAppResponse::RevealWorkItem { .. }
+        | EngineToAppResponse::VacatePaneByRunId { .. } => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
     };
