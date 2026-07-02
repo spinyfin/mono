@@ -2279,7 +2279,8 @@ final class EngineClient: @unchecked Sendable {
             lastToolEndedAt: payload["last_tool_ended_at"] as? String,
             activity: activity,
             liveStatus: payload["live_status"] as? String,
-            liveStatusAt: payload["live_status_at"] as? String
+            liveStatusAt: payload["live_status_at"] as? String,
+            recoveryStatus: payload["recovery_status"] as? String
         )
     }
 

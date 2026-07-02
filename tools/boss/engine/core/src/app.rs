@@ -1751,6 +1751,10 @@ impl crate::transient_recovery::WorkerNudger for ServerState {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    async fn broadcast_live_states(&self) {
+        ServerState::broadcast_live_worker_states(self).await;
+    }
 }
 
 struct BrokerExecutionPublisher {

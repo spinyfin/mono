@@ -1584,6 +1584,13 @@ private struct WorkBoardCardItem: View {
             if isResolvingConflicts { return nil }
             if isRemediatingCI { return nil }
             if isAIReviewing { return nil }
+            // Transient-recovery banner wins outright — a worker being
+            // auto-resumed after a Claude API error looks idle to every
+            // other signal, so without this the card would silently show
+            // stale/no text instead of "recovering from API error …".
+            if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
+                return recovering
+            }
             return liveState?.liveStatus
         }()
 

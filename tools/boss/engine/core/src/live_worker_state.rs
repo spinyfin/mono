@@ -179,6 +179,11 @@ impl LiveWorkerStateRegistry {
         let before = state.clone();
 
         state.last_event_at = Some(now);
+        // Any hook event is proof the worker's session is responsive
+        // again — clear a stale recovery banner regardless of which
+        // event arrived, so real progress after a nudge is never
+        // shadowed by "recovering from API error …".
+        state.recovery_status = None;
 
         match event {
             WorkerEvent::SessionStart { source, .. } => {
@@ -284,6 +289,31 @@ impl LiveWorkerStateRegistry {
                 true
             }
         }
+    }
+
+    /// Replace the `recovery_status` banner for `slot_id` — set by
+    /// [`crate::transient_recovery`] while a slot is being auto-recovered
+    /// from a transient Claude API error. Returns `true` iff the entry
+    /// actually changed.
+    ///
+    /// Deliberately independent of [`Self::set_live_status`]: that
+    /// field's owner (the live-status summarizer loop) clears it after
+    /// ~30s of continuous `Idle`, which is shorter than the
+    /// transient-recovery grace period — coupling the two would have
+    /// the recovery banner wiped before a human ever saw it. This field
+    /// is instead cleared by [`Self::apply_event`] the moment any hook
+    /// event arrives (proof the worker resumed) or by [`Self::release_slot`]
+    /// when the slot is torn down.
+    pub fn set_recovery_status(&self, slot_id: u8, status: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(state) = guard.by_slot.get_mut(&slot_id) else {
+            return false;
+        };
+        if state.recovery_status == status {
+            return false;
+        }
+        state.recovery_status = status;
+        true
     }
 
     /// Mark a slot as errored. Used when the events socket fails to
@@ -734,6 +764,62 @@ mod tests {
         let state = reg.get(1).unwrap();
         assert!(state.live_status.is_none());
         assert!(state.live_status_at.is_none());
+    }
+
+    #[test]
+    fn set_recovery_status_writes_and_clears() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        let changed = reg.set_recovery_status(1, Some("recovering from API error (attempt 1/3)".into()));
+        assert!(changed);
+        assert_eq!(
+            reg.get(1).unwrap().recovery_status.as_deref(),
+            Some("recovering from API error (attempt 1/3)")
+        );
+
+        let changed = reg.set_recovery_status(1, None);
+        assert!(changed);
+        assert!(reg.get(1).unwrap().recovery_status.is_none());
+    }
+
+    #[test]
+    fn set_recovery_status_returns_false_when_slot_unknown_or_unchanged() {
+        let reg = LiveWorkerStateRegistry::new();
+        assert!(!reg.set_recovery_status(7, Some("recovering".into())));
+
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        assert!(reg.set_recovery_status(1, Some("recovering".into())));
+        // Setting the identical value again is a no-op.
+        assert!(!reg.set_recovery_status(1, Some("recovering".into())));
+    }
+
+    #[test]
+    fn apply_event_clears_recovery_status_on_any_hook() {
+        // Proof the worker's session is responsive again — any hook
+        // event, not just one that flips activity to Working, must
+        // clear a stale recovery banner so it never shadows real
+        // progress or a normal idle-between-turns state.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_recovery_status(1, Some("recovering from API error (attempt 1/3)".into()));
+        assert!(reg.get(1).unwrap().recovery_status.is_some());
+
+        reg.apply_event(1, &stop_event());
+        assert!(
+            reg.get(1).unwrap().recovery_status.is_none(),
+            "recovery_status must clear on the next hook event"
+        );
+    }
+
+    #[test]
+    fn release_slot_clears_recovery_status() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_recovery_status(1, Some("recovering from API error (attempt 1/3)".into()));
+        reg.release_slot(1);
+        assert!(reg.get(1).is_none());
+        reg.register_spawn(1, "run-2", "claude-opus-4-7", 1, None);
+        assert!(reg.get(1).unwrap().recovery_status.is_none());
     }
 
     #[test]

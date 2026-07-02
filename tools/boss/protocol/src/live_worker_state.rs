@@ -149,6 +149,19 @@ pub struct LiveWorkerState {
     /// unset) — see `live_status` for why.
     #[serde(default)]
     pub live_status_at: Option<String>,
+    /// Set by the engine's transient-recovery sweep
+    /// (`engine/src/transient_recovery.rs`) while this slot is being
+    /// auto-recovered from a transient Claude API error (529/5xx/network),
+    /// e.g. `"recovering from API error (attempt 2/5)"`. Distinct from
+    /// [`Self::live_status`] — that field is owned by the summarizer loop,
+    /// which clears it after `IDLE_CLEAR_AFTER` of continuous `Idle`
+    /// activity; a wedged-on-error worker is idle for far longer than
+    /// that grace period, so coupling the recovery banner to the same
+    /// field would have it wiped before a human ever saw it. Cleared as
+    /// soon as any hook event arrives for the slot (proof the worker
+    /// picked the nudge back up), or when the slot is released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_status: Option<String>,
     /// Work item this run was dispatched against. `None` for spawns
     /// that happen outside the work-item dispatch path (today: tests
     /// and any future direct-launch flow that bypasses the work
@@ -191,6 +204,7 @@ impl LiveWorkerState {
             activity: WorkerActivity::Spawning,
             live_status: None,
             live_status_at: None,
+            recovery_status: None,
             work_item_id,
             work_item_name,
             execution_id,
@@ -246,6 +260,7 @@ mod tests {
         assert!(state.execution_id.is_none());
         assert!(state.live_status.is_none());
         assert!(state.live_status_at.is_none());
+        assert!(state.recovery_status.is_none());
     }
 
     #[test]
@@ -290,6 +305,7 @@ mod tests {
             activity: WorkerActivity::Working,
             live_status: Some("investigating why the scroll handler doesn't fire".into()),
             live_status_at: Some("2026-05-06T12:00:01Z".into()),
+            recovery_status: None,
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
@@ -337,6 +353,7 @@ mod tests {
             activity: WorkerActivity::Working,
             live_status: Some("running tests after the layout fix".into()),
             live_status_at: Some("2026-05-06T12:00:30Z".into()),
+            recovery_status: None,
             work_item_id: None,
             work_item_name: None,
             execution_id: None,
