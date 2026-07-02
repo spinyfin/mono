@@ -680,15 +680,24 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
 }
 
 /// Immediately dispatch a queued probe to `run_id`'s worker pane if
-/// the worker is currently idle (i.e. between turns, waiting for
-/// input). Called from the `ProbeRun` frontend handler so that
-/// `bossctl probe` delivers the text without waiting for the next Stop
-/// boundary — a Stop never arrives for a worker that is already idle,
-/// so the on-Stop path alone would silently stall these probes.
+/// the worker is currently parked (i.e. between turns, sitting at its
+/// prompt with no further Stop/PostToolUse coming on its own). Called
+/// from the `ProbeRun` frontend handler so that `bossctl probe`
+/// delivers the text without waiting for a boundary that will never
+/// arrive for a worker that is already parked.
 ///
-/// If the worker is actively running (Working/WaitingForInput/Spawning)
-/// this function is a no-op: the probe stays in `pending_probes` and
+/// If the worker is actively running (Working/Spawning) this function
+/// is a no-op: the probe stays in `pending_probes` and
 /// `dispatch_probe_on_stop` picks it up at the next Stop boundary.
+///
+/// "Parked" covers both `Idle` (Stop with no pending notification) and
+/// `WaitingForInput` (Stop while a notification was pending, e.g. a
+/// permission prompt the human already dismissed, or any other
+/// post-Stop state where claude is sitting at its prompt). Both are
+/// terminal until something — a human keystroke or this very probe —
+/// gives the worker a new turn; neither produces another Stop or
+/// PostToolUse on its own, so without this immediate-dispatch path a
+/// probe queued against either state would wait forever.
 ///
 /// Uses the same `SendToPane` path as `dispatch_probe_on_stop` and
 /// records an in-flight entry so `dispatch_probe_reply_on_stop` can
@@ -702,16 +711,16 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
         tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
         return;
     };
-    let is_idle = server_state
+    let is_parked = server_state
         .live_worker_states
         .get(slot_id)
-        .map(|s| s.activity == WorkerActivity::Idle)
+        .map(|s| matches!(s.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput))
         .unwrap_or(false);
-    if !is_idle {
+    if !is_parked {
         tracing::debug!(
             run_id,
             slot_id,
-            "probe-if-idle: worker not idle; probe will fire at next Stop",
+            "probe-if-idle: worker not parked; probe will fire at next Stop",
         );
         return;
     }

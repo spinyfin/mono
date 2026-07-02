@@ -62,8 +62,10 @@ enum Command {
         action: AgentsAction,
     },
     /// Inject a probe prompt into a worker. If the worker is currently
-    /// idle (between turns) the text lands immediately; if the worker is
-    /// active it is queued and delivered at the next Stop boundary. With
+    /// parked (idle between turns, or sitting at its prompt after a
+    /// Stop that followed a notification/permission prompt) the text
+    /// lands immediately; if the worker is actively running it is
+    /// queued and delivered at the next Stop boundary. With
     /// `--urgent`, the probe is delivered at the next tool-call
     /// boundary (PostToolUse) instead of the next Stop boundary, so
     /// the coordinator can redirect a mid-task worker without waiting
