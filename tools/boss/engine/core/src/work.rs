@@ -79,14 +79,15 @@ pub use boss_protocol::{
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner,
     DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus, ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED,
-    MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED,
-    MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED, MagicWandDispatch, PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    ExecutionReconcileResult, ExecutionStatus, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION,
+    ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED, MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT,
+    MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
+    MagicWandDispatch, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT,
+    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput,
+    Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
+    WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses

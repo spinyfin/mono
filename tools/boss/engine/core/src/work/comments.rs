@@ -18,7 +18,8 @@ const ANCHOR_CONTEXT_CHARS: usize = 64;
 /// [`map_comment`].
 const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anchor_json, body, \
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
-     created_at, updated_at, dismissed_at";
+     created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
+     intent_overridden_by";
 
 const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
      (id, artifact_kind, artifact_id, doc_version, anchor_json, body, author, status, \
@@ -116,6 +117,33 @@ impl WorkDb {
     /// `set_comment_status(.., "active", ..)`.
     pub fn dismiss_comment(&self, comment_id: &str, actor: Option<&str>) -> Result<WorkComment> {
         self.set_comment_status(comment_id, COMMENT_STATUS_RESOLVED, actor)
+    }
+
+    /// Persist the async classifier's output onto a comment's intent
+    /// columns — called from the detached task spawned off `CommentsCreate`
+    /// (comment-intent-classification design § "The classifier"). Guarded
+    /// on `intent_classified_at IS NULL` so a comment is only ever
+    /// engine-classified once; re-firing (a raced/duplicate completion) is
+    /// a no-op error the caller logs and discards. A later manual override
+    /// (`CommentsSetIntent`, a subsequent phase) bypasses this guard by
+    /// design — that RPC will use its own update, not this method.
+    pub fn set_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
+        match intent {
+            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            other => bail!("invalid comment intent: {other}"),
+        }
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4
+             WHERE id = ?1 AND intent_classified_at IS NULL",
+            params![comment_id, intent, confidence, now],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or already classified");
+        }
+        query_comment(&conn, comment_id)?.with_context(|| format!("missing comment after intent update: {comment_id}"))
     }
 
     /// Persist a renderer-supplied re-anchor (the `comments_update_anchor`
@@ -833,6 +861,51 @@ mod tests {
         let absent = pr.iter().find(|c| c.anchor.exact == "absent span zzqq").unwrap();
         assert_eq!(absent.status, "orphaned");
         assert_eq!(absent.last_resolved_with.as_deref(), Some("orphan"));
+    }
+
+    // --- Intent classification (P1a) ---
+
+    #[test]
+    fn new_comment_starts_unclassified() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(c.intent.is_none());
+        assert!(c.intent_confidence.is_none());
+        assert!(c.intent_classified_at.is_none());
+        assert!(c.intent_overridden_by.is_none());
+    }
+
+    #[test]
+    fn set_comment_intent_persists_and_round_trips() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        let classified = db.set_comment_intent(&c.id, "question", 0.87).unwrap();
+        assert_eq!(classified.intent.as_deref(), Some("question"));
+        assert_eq!(classified.intent_confidence, Some(0.87));
+        assert!(classified.intent_classified_at.is_some());
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("question"));
+        assert_eq!(reloaded.intent_confidence, Some(0.87));
+    }
+
+    #[test]
+    fn set_comment_intent_rejects_unknown_intent() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(db.set_comment_intent(&c.id, "bogus", 0.5).is_err());
+    }
+
+    #[test]
+    fn set_comment_intent_is_guarded_against_double_classification() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        // A second call finds intent_classified_at already set, so it's a
+        // no-op error rather than silently overwriting the classification.
+        assert!(db.set_comment_intent(&c.id, "question", 0.5).is_err());
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
     }
 
     #[test]

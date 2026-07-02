@@ -1519,3 +1519,38 @@ pub(crate) fn migrate_tasks_planner_run_id(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// Add the intent-classification columns to `work_comments` — Phase 1 task
+/// 1a of `comment-triggered-document-revisions.md` (the three-intent
+/// comment classification model). Mirrors `migrate_work_comments_table`'s
+/// idempotent `ALTER TABLE ADD COLUMN` pattern.
+///
+/// `intent` is `NULL` while the detached async classifier call is in
+/// flight — this doubles as the transient `classifying` state (design §
+/// "The classifier (P1 — foundation)"); no new `work_comments.status` value
+/// is introduced for it. `intent_overridden_by` stays `NULL` until a human
+/// manually reclassifies via the (later-phase) `CommentsSetIntent` RPC;
+/// once set it is a permanent audit trail distinguishing engine calls from
+/// human corrections.
+pub(crate) fn migrate_work_comments_intent_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("intent", "ALTER TABLE work_comments ADD COLUMN intent TEXT"),
+        (
+            "intent_confidence",
+            "ALTER TABLE work_comments ADD COLUMN intent_confidence REAL",
+        ),
+        (
+            "intent_classified_at",
+            "ALTER TABLE work_comments ADD COLUMN intent_classified_at TEXT",
+        ),
+        (
+            "intent_overridden_by",
+            "ALTER TABLE work_comments ADD COLUMN intent_overridden_by TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "work_comments", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
