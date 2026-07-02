@@ -1422,35 +1422,67 @@ impl WorkerCompletionHandler {
                     .await;
             }
             ShaDeltaGateOutcome::Inapplicable => {
-                // `revision_implementation` executions with a captured
-                // `pr_head_before` snapshot: the gate returned Inapplicable
-                // because the GitHub API fetch failed transiently, not because
-                // no baseline exists. The cold-path branch-keyed detector
-                // always returns None for revisions (they push commits to the
-                // parent PR's branch and never open their own PR), so the only
-                // cold-path outcome is: bound PR found via
-                // resolve_bound_pr_url → nudge "push to existing PR". That
-                // nudge loops: each Stop re-triggers the same probe (T939
-                // regression: Crusher was stuck in waiting_for_input). Return
-                // AwaitingInput silently instead; the merge poller's
-                // recheck_for_pr will finalize via the SHA-delta gate once the
-                // API recovers.
+                // A `revision_implementation` execution with a resolvable
+                // bound PR (via `execution.pr_url` / chain-root lookup) but
+                // an inconclusive SHA-delta gate. This covers two distinct
+                // causes that must be handled the same way:
+                //   (a) `pr_head_before` WAS captured but today's fetch of
+                //       the current head failed transiently, or
+                //   (b) `pr_head_before` was NEVER captured at all — the
+                //       dispatch-time snapshot in `on_execution_started`
+                //       failed (or the execution predates reliable
+                //       snapshotting) — so there is no baseline to compare
+                //       against, ever, for the lifetime of this execution.
+                // Either way we cannot tell via SHA comparison whether this
+                // run contributed a new commit. The cold-path branch-keyed
+                // detector always returns None for revisions (they push to
+                // the parent PR's branch and never open their own), so
+                // falling through to it lands on `resolve_bound_pr_url` →
+                // nudge "push to existing PR". For case (b) that nudge is a
+                // dead end: if the worker already pushed, there is nothing
+                // new to push, so the same nudge fires on every Stop until
+                // the circuit breaker trips and stamps the revision
+                // permanently stuck in `waiting_human` — never reaching a
+                // terminal status even though the commit landed (the
+                // stuck-revision incident this branch exists to close; see
+                // T939 for the sibling fix that covered only case (a)).
+                //
+                // Instead, fall back to the CI-state-based satisfied-
+                // deliverable gate: if the bound PR is currently open with
+                // clean CI and no conflict (or already merged), that is
+                // direct, SHA-independent evidence the deliverable is
+                // satisfied — finalize now. Safe to run from the on-Stop
+                // boundary for the same reason
+                // `try_finalize_satisfied_deliverable_on_stop` is safe
+                // elsewhere: a Stop event only fires on real worker
+                // activity, never a crash. When the PR isn't satisfied yet
+                // (CI in flight/failing, or a conflict), return
+                // AwaitingInput quietly — no nudge — and let the next
+                // natural Stop (or a human/coordinator prompt) retry.
+                // `recheck_for_pr` (the periodic merge-poller sweep) does
+                // NOT run this check — it can't rule out a crashed worker —
+                // so it stays gated to the on-Stop path here.
                 if execution.kind == ExecutionKind::RevisionImplementation
-                    && execution.pr_head_before.as_deref().filter(|s| !s.is_empty()).is_some()
                     && let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution)
                 {
+                    if let Some(outcome) = self
+                        .try_finalize_satisfied_deliverable_on_stop(execution_id, &execution, &bound_pr_url)
+                        .await
+                    {
+                        return outcome;
+                    }
                     tracing::info!(
                         execution_id,
                         %bound_pr_url,
-                        "stop event: revision_implementation with pr_head_before set but \
-                         SHA-delta fetch failed — skipping cold-path nudge to avoid \
-                         probe loop; recheck_for_pr will finalize when API recovers"
+                        pr_head_before_captured = execution.pr_head_before.is_some(),
+                        "stop event: revision_implementation with inconclusive SHA-delta gate and \
+                         deliverable not yet satisfied — skipping cold-path nudge to avoid a \
+                         push-to-existing-PR probe loop; will retry on the next Stop"
                     );
                     return StopOutcome::AwaitingInput;
                 }
-                // No bound `chore.pr_url`, or the snapshot/fetch was
-                // unavailable. Fall through to the existing
-                // branch-keyed cold-path detector (new-PR flow).
+                // No bound `chore.pr_url` resolvable. Fall through to the
+                // existing branch-keyed cold-path detector (new-PR flow).
             }
         }
 
@@ -8784,8 +8816,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     // `gh pr create` — the revision's job is to push a new commit to
     // the parent task's EXISTING PR branch.  Two sub-cases pinned:
     //   1. execution.pr_url was not stamped (older exec) but chain root
-    //      has a pr_url: chain-root lookup finds the bound PR → worker
-    //      gets probe_push_to_existing_pr, never PROBE_NO_PR.
+    //      has a pr_url: chain-root lookup finds the bound PR. The
+    //      SHA-delta gate is Inapplicable (no `pr_head_before` snapshot
+    //      either), so the stuck-revision fix (T2130) routes this
+    //      through the satisfied-deliverable gate instead of the old
+    //      "push to existing PR" nudge — see
+    //      `revision_on_stop_no_pr_head_before_snapshot_*` above for the
+    //      finalize/await coverage. This test pins the still-load-bearing
+    //      half of the original fix: PROBE_NO_PR must never fire.
     //   2. No bound PR resolvable at all (anomalous data): park instead
     //      of contradicting the worker with PROBE_NO_PR.
     // -----------------------------------------------------------
@@ -8910,22 +8948,20 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(
             outcome,
             StopOutcome::AwaitingInput,
-            "revision with no execution.pr_url must nudge (not PROBE_NO_PR)",
+            "revision with no execution.pr_url and no SHA-delta baseline must await quietly",
         );
+        // T2130 fix: with no `pr_head_before` snapshot to compare against and
+        // no wired merge probe (satisfied-deliverable check is inconclusive),
+        // the revision must NOT be nudged at all — in particular it must
+        // never receive PROBE_NO_PR (there is a chain-root PR; `gh pr create`
+        // would be wrong), and it must not receive the old "push to existing
+        // PR" nudge either, since that nudge can never be satisfied once the
+        // worker has already pushed (the stuck-revision dead end this fix
+        // closes).
         let queued = probes.snapshot();
-        assert_eq!(queued.len(), 1, "exactly one nudge queued");
-        assert_eq!(
-            queued[0].1,
-            probe_push_to_existing_pr(parent_pr_url),
-            "must use chain-root pr_url, never PROBE_NO_PR",
-        );
-        assert_ne!(
-            queued[0].1, PROBE_NO_PR,
-            "revision must NEVER receive the produce-a-PR nudge",
-        );
         assert!(
-            !queued[0].1.contains("gh pr create"),
-            "revision nudge must not mention `gh pr create`",
+            queued.is_empty(),
+            "revision with an inconclusive SHA-delta gate must not be nudged at all; got {queued:?}",
         );
     }
 
@@ -10062,6 +10098,191 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     // -----------------------------------------------------------
+    // Stuck-revision-on-Stop regression (T2130 / exec_18b5d1ea40c1380_45b):
+    // a revision worker pushes its fix commit to the parent PR and stops
+    // cleanly, but `pr_head_before` was NEVER captured for this execution
+    // (the dispatch-time `on_execution_started` snapshot failed, or the
+    // execution predates reliable snapshotting). Before this fix, that
+    // permanently-missing baseline made `evaluate_sha_delta_gate` return
+    // `Inapplicable` on every single Stop, forever — with no way to ever
+    // observe "Contributed" via SHA comparison. `on_stop_inner` fell
+    // through to the branch-keyed cold-path detector (always empty for
+    // revisions) and then to `resolve_bound_pr_url`'s "push to existing
+    // PR" nudge — a dead end once the commit already landed, since there
+    // is nothing left to push. The nudge repeats on every Stop until the
+    // circuit breaker trips, stranding the execution in `waiting_human`
+    // forever even though the worker did everything right.
+    //
+    // The fix: when the SHA-delta gate is Inapplicable for a revision with
+    // a resolvable bound PR, fall back to the CI-state-based
+    // satisfied-deliverable gate (no SHA baseline required) before ever
+    // reaching the cold-path nudge.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn revision_on_stop_no_pr_head_before_snapshot_finalizes_via_satisfied_deliverable() {
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
+        let (db, product_id, revision_id, execution_id) = revision_fixture(
+            workspace.path(),
+            parent_pr_url,
+            "0000000000000000000000000000000000000000",
+        );
+        // Simulate a dispatch-time snapshot that never landed: no baseline
+        // exists for this execution's whole lifetime, unlike the T939
+        // fixtures above which all carry a valid `pr_head_before`.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET pr_head_before = NULL WHERE id = ?1",
+                rusqlite::params![execution_id],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.get_execution(&execution_id).unwrap().pr_head_before.is_none(),
+            "fixture must have no SHA-delta baseline",
+        );
+        // Cold-path branch-keyed detector always finds nothing for revisions.
+        let detector = StubPrDetector::ok(None);
+        // The parent PR is open, CI clean, no conflict — the worker's push
+        // landed and the deliverable is satisfied even though we can't prove
+        // it via SHA comparison.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+            "on_stop must finalize a revision with no SHA-delta baseline once the bound PR is \
+             satisfied (CI clean, no conflict); got {outcome:?}",
+        );
+        // No nudge — the T939-class probe loop must not fire for this case either.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must fire when the revision finalises via the satisfied-deliverable gate; \
+             got {:?}",
+            probes.snapshot(),
+        );
+        // Revision task must reach in_review; pr_url stays NULL (parent owns it).
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
+                assert!(t.pr_url.is_none(), "revision task.pr_url must stay NULL");
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // Execution must be terminal and the lease released — the actual bug
+        // symptom (execution stuck in waiting_human forever) must be fixed.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert!(execution.finished_at.is_some());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released — the slot must not be stranded",
+        );
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events
+                .iter()
+                .any(|(p, w, _)| p == &product_id && w == &revision_id),
+            "work-item invalidation must fire for the revision, got {work_events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_on_stop_no_pr_head_before_snapshot_and_ci_not_ready_awaits_without_nudge() {
+        // Same missing-baseline scenario, but the bound PR's CI has not gone
+        // green yet. The gate must NOT finalize prematurely, and — this is
+        // the load-bearing assertion — it must NOT fall through to the
+        // cold-path "push to existing PR" nudge either, since we have no
+        // evidence the worker failed to contribute. Silence and a later
+        // retry (a subsequent Stop, or the merge poller once a SHA
+        // baseline becomes available some other way) is the only safe move.
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState, RequiredCheckFailure};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1710";
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(
+            workspace.path(),
+            parent_pr_url,
+            "0000000000000000000000000000000000000000",
+        );
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET pr_head_before = NULL WHERE id = ?1",
+                rusqlite::params![execution_id],
+            )
+            .unwrap();
+        }
+        let detector = StubPrDetector::ok(None);
+        let failures = vec![RequiredCheckFailure {
+            name: "build".into(),
+            conclusion: "IN_PROGRESS".into(),
+            target_url: String::new(),
+            provider: crate::merge_poller::CiProvider::GithubActions,
+            provider_job_id: None,
+        }];
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::ci_failing(
+            failures,
+        ))));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "no baseline + CI not ready must await quietly, not finalize; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no baseline + inconclusive PR state must NOT fall through to the \
+             push-to-existing-PR nudge (the stuck-revision failure mode); got {:?}",
+            probes.snapshot(),
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+            "execution stays live so a later Stop can retry",
+        );
+        assert!(cube.release_calls.lock().await.is_empty());
+    }
+
+    // -----------------------------------------------------------
     // Signal-already-cleared gate tests
     //
     // The gate fires in the NoContribution arm: conflict/CI revision worker
@@ -10303,6 +10524,109 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     )
             }),
             "ConflictResolutionSucceeded must be published; typed events: {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_on_stop_no_baseline_finalizes_without_false_failure() {
+        // Second manifestation of the T2130 incident class (operator note,
+        // 2026-07-02): two conflict-resolution revision workers resolved
+        // their conflicts, pushed the merge commit, posted a resolution
+        // comment, and stopped cleanly — then the engine marked BOTH
+        // executions `failed` and left their panes lingering
+        // ("Claude Not Detected").
+        //
+        // Mechanism: before this fix, a revision with an inconclusive
+        // SHA-delta gate (here: no `pr_head_before` baseline was ever
+        // captured) fell through to the cold-path "push to existing PR"
+        // nudge. The worker — having already pushed — has nothing new to
+        // push, so the SAME nudge fires on every subsequent Stop until the
+        // auto-nudge circuit breaker trips (`NudgeBreakerParked`).
+        // `on_stop`'s wrapper unconditionally routes any
+        // `revision_implementation` Stop through
+        // `finalize_conflict_resolution_attempt`, which — ONLY on
+        // `NudgeBreakerParked` — marks the bound `conflict_resolutions`
+        // ledger row `failed` (a false classification: the worker DID
+        // push). `park_for_unproductive_nudges` never releases the cube
+        // lease or the pane, so the execution stays `waiting_human`
+        // forever with a stranded, unresponsive pane — exactly "lingering
+        // Claude Not Detected panes."
+        //
+        // With the fix, the missing-baseline case never reaches the nudge
+        // at all: it tries the satisfied-deliverable gate first. Here the
+        // conflict is resolved and CI is clean, so it finalizes cleanly —
+        // no nudge, no breaker trip, no false failure, no lingering pane.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1710";
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+        // Simulate the dispatch-time snapshot never landing (the actual
+        // trigger observed in production): no SHA-delta baseline exists.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET pr_head_before = NULL WHERE id = ?1",
+                rusqlite::params![execution_id],
+            )
+            .unwrap();
+        }
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // The merge commit resolving the conflict landed and CI is clean —
+        // direct, SHA-independent evidence the deliverable is satisfied.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(crate::merge_poller::PrLifecycleState::Open(
+            crate::merge_poller::OpenPrStatus::clean(),
+        )));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            !matches!(outcome, StopOutcome::NudgeBreakerParked { .. }),
+            "a revision with no SHA-delta baseline must never be routed into the nudge-breaker \
+             dead end; got {outcome:?}",
+        );
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+            "on_stop must finalize via the satisfied-deliverable gate; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no push-to-existing-PR nudge must fire; got {:?}",
+            probes.snapshot(),
+        );
+        // The conflict_resolutions ledger row must NOT be falsely marked
+        // failed — the worker's push was real.
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_ne!(
+            attempt.status, "failed",
+            "a successful conflict-resolution push must never be recorded as a failed attempt",
+        );
+        // The execution must reach a terminal status with the lease
+        // released — no lingering pane.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Completed,
+            "execution must not be stranded in waiting_human",
+        );
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released — no lingering pane",
         );
     }
 
