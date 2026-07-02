@@ -351,6 +351,37 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Return every non-terminal `work_executions` row that recorded a
+    /// `workspace_path` — the candidate set for the lost-workspace
+    /// reconciler ([`crate::lost_workspace_sweep`]).
+    ///
+    /// A worker parked in `running` / `waiting_human` keeps a live cube
+    /// workspace checkout at `workspace_path` for the lifetime of its pane;
+    /// pre-dispatch statuses (`queued` / `ready` / `waiting_dependency`)
+    /// never have a `workspace_path` because it is only stamped at
+    /// lease time. Filtering on `workspace_path IS NOT NULL AND != ''`
+    /// therefore selects exactly the rows whose liveness can be judged by
+    /// whether that directory still exists on disk. Unlike
+    /// [`Self::list_in_flight_executions`] this does NOT require
+    /// `cube_lease_id IS NOT NULL` — a row whose lease was already released
+    /// but whose `workspace_path` lingers is still a valid candidate.
+    pub fn list_non_terminal_executions_with_workspace(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+             FROM work_executions
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND workspace_path IS NOT NULL
+               AND workspace_path != ''
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
     /// Return every non-terminal `revision_implementation` execution whose
     /// task is a revision in the chain rooted at `chain_root_id`.  Used by
     /// the merge poller to find in-flight revision workers to stop after

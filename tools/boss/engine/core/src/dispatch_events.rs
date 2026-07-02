@@ -232,6 +232,18 @@ pub enum Stage {
     /// for one lease means cube and the engine have desynced for that
     /// workspace; see `crate::cube_lease_heartbeat`.
     CubeLeaseHeartbeat,
+    /// The lost-workspace reconciler finalized a non-terminal execution
+    /// (`running` / `waiting_human` / …) whose recorded local cube
+    /// workspace directory no longer exists on disk. That directory is a
+    /// live worker's cwd for the lifetime of its pane; if it has vanished
+    /// (e.g. the 2026-06-14 cube workspace-root migration relocated the
+    /// pool out from under running triage panes), the worker is gone and
+    /// the row must not keep counting as "live" — otherwise the
+    /// redundant-spawn guard blocks every future spawn for that work item.
+    /// The `details` object carries `prior_status`, the missing
+    /// `workspace_path`, and the reap `reason` so the strand is diagnosable
+    /// from `bossctl dispatch tail`; see `crate::lost_workspace_sweep`.
+    LostWorkspaceReconcile,
 }
 
 impl Stage {
@@ -262,6 +274,7 @@ impl Stage {
             Stage::PoolClaimReconcile => "pool_claim_reconcile",
             Stage::TerminalWorkReconcile => "terminal_work_reconcile",
             Stage::CubeLeaseHeartbeat => "cube_lease_heartbeat",
+            Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
         }
     }
 }
@@ -759,6 +772,7 @@ mod tests {
         assert_eq!(Stage::PoolClaimReconcile.as_str(), "pool_claim_reconcile");
         assert_eq!(Stage::TerminalWorkReconcile.as_str(), "terminal_work_reconcile");
         assert_eq!(Stage::CubeLeaseHeartbeat.as_str(), "cube_lease_heartbeat");
+        assert_eq!(Stage::LostWorkspaceReconcile.as_str(), "lost_workspace_reconcile");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
