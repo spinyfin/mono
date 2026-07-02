@@ -419,6 +419,31 @@ rust_test(
     ),
 )
 
+# End-to-end auto-populate fixtures (design task 11). Drives the deterministic
+# Populator -> validate -> Materializer pipeline over real design-doc breakdowns
+# checked in under tests/fixtures/planner/ (embedded via include_str!, hence the
+# compile_data glob).
+rust_test(
+    name = "planner_e2e_fixtures_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/planner_e2e_fixtures.rs"],
+    compile_data = glob(["tests/fixtures/planner/**"]),
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "editorial_pretooluse_test",
     size = "small",
