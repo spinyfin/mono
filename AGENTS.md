@@ -2,6 +2,12 @@
 - Documentation-only changes (markdown files, design docs, plans, READMEs) should be pushed directly to `main` instead of opening a PR.
 - Prefer `bazel test` / `bazel build` over `cargo test` / `cargo build`. Bazel's test cache reuses results across runs when sources are unchanged, which cargo cannot. For the engine specifically, run `bazel test //tools/boss/engine/...` instead of `cargo test -p boss-engine`. `cargo` is fine for quick local iteration on a single file, but PR-validation runs and "is this still passing?" sanity checks should go through bazel so the cache earns its keep.
 
+## Prefer crates over modules for distinct units of functionality (Rust)
+
+We generally keep distinct units in their own crates rather than as modules inside a larger crate: bazel incrementality is per-crate, so smaller crates mean smaller rebuild and retest scopes. When adding or extracting such a unit, it is OK to do light dependency/interface refactoring to support the split — e.g. introduce a small trait or plain context type at the boundary, or move shared types down into a lower-level crate. Keep each crate's dependency list minimal and the edges one-directional: a transport/utility/pipeline crate must never import from the higher-level crate that consumes it; if a cycle threatens, the shared types belong in a lower crate, not in the consumer. "Generally" means use judgment: a tiny glue module doesn't need a crate; a unit with its own vocabulary, tests, and multiple consumers does.
+
+Precedent: the `claude_client` extraction (PR #1702) pulled the Claude API transport out of `engine/core` into `tools/boss/claude_client`, with a one-way `engine` → `claude_client` edge.
+
 ## Hard constraint: fix failing checks at the root cause; never bypass them
 
 When a CI check or repository check (checkleft, file-size, lint, test) is failing, fix the underlying problem. The following are forbidden bypasses — do NOT do any of them:
