@@ -1635,6 +1635,131 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
     );
 }
 
+/// Regression: `dispatch_probe_if_idle` must also deliver a probe
+/// immediately to a worker whose activity is `WaitingForInput` — the
+/// state a session lands in when a `Stop` follows a `Notification`
+/// (e.g. a worker parked at its prompt after the coordinator or a
+/// permission dialog already resolved). Before the fix, a probe
+/// queued against such a session stalled forever: it has already
+/// produced its terminal `Stop` for this turn, so `dispatch_probe_on_stop`
+/// never fires again on its own, and `dispatch_probe_if_idle` only
+/// recognized `WorkerActivity::Idle`. Meanwhile `bossctl agents send`
+/// (raw pane input, no activity check) reached the same session
+/// immediately — this test locks in that probe delivery now matches.
+#[tokio::test]
+async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
+    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
+
+    let server_state = test_server_state();
+
+    let product = server_state
+        .work_db
+        .create_product(CreateProductInput {
+            name: "p".into(),
+            description: None,
+            repo_remote_url: Some("git@example.com:p.git".into()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = server_state
+        .work_db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+
+    // Register slot and drive activity to WaitingForInput: a
+    // Notification (permission prompt) immediately followed by a Stop.
+    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+    server_state
+        .live_worker_states
+        .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
+    server_state.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Notification {
+            session_id: "sess-1".into(),
+            message: "permission prompt".into(),
+        },
+    );
+    server_state.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(1).unwrap().activity,
+        WorkerActivity::WaitingForInput,
+        "precondition: worker must be parked in WaitingForInput",
+    );
+
+    // Register a fake app session to receive the SendToPane.
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must arrive for waiting-for-input worker");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    // Queue the probe and call dispatch_probe_if_idle directly.
+    server_state.queue_probe(run.id.clone(), "coordinator nudge".into(), false);
+    dispatch_probe_if_idle(&server_state, &run.id).await;
+
+    tokio::time::timeout(Duration::from_secs(2), app_responder)
+        .await
+        .expect("timed out waiting for SendToPane round-trip")
+        .expect("app_responder panicked");
+
+    assert!(
+        server_state.pop_pending_probe(&run.id).is_none(),
+        "probe must be consumed, not left in pending_probes",
+    );
+}
+
 /// Regression: probes queued by the completion handler during a Stop
 /// event must be dispatched on the SAME Stop, not stalled until the
 /// next one. The event-loop order change (completion before probe
