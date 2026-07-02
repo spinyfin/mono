@@ -108,6 +108,13 @@ enum Commands {
         #[command(subcommand)]
         command: ChoreCommand,
     },
+    /// Manage markdown-viewer comment threads. Currently just the one
+    /// write action a read-only answer-agent worker is permitted: posting
+    /// its reply.
+    Comment {
+        #[command(subcommand)]
+        command: CommentCommand,
+    },
     /// Manage automations: standing, scheduled maintenance instructions that
     /// periodically triage and spawn work outside the normal backlog.
     ///
@@ -488,6 +495,28 @@ enum ChoreCommand {
     /// Alias for `boss task unlink-external`. Accepts any leaf work item id.
     #[command(name = "unlink-external")]
     UnlinkExternal(TaskIdArg),
+}
+
+#[derive(Debug, Subcommand)]
+enum CommentCommand {
+    /// Post the answer agent's reply to the comment thread this run was
+    /// spawned for. The target thread is derived from the caller's own
+    /// `BOSS_RUN_ID` — there is no `--comment-id` (or similar) flag, by
+    /// design: this is the one write action a read-only answer-agent
+    /// session is permitted, and it must not be able to target any other
+    /// comment. Post exactly one reply; a second call fails (the tracking
+    /// run row is no longer `running`).
+    Reply(CommentReplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct CommentReplyArgs {
+    /// The comprehensive answer to post. Pass the full text inline —
+    /// there is deliberately no `--body-file` (a file-reading flag on this
+    /// command would let a read-only session exfiltrate arbitrary file
+    /// contents into the thread).
+    #[arg(long)]
+    body: String,
 }
 
 /// Shared subcommands for dependency CRUD. The engine doesn't care
@@ -2773,6 +2802,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_chore_command(command, &ctx).await
         }
+        Commands::Comment { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_comment_command(command, &ctx).await
+        }
         Commands::Automation { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_automation_command(command, &ctx).await
@@ -3754,6 +3787,51 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
         ChoreCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         ChoreCommand::CreateMany(args) => run_chore_create_many(&mut client, ctx, args).await,
+    }
+}
+
+async fn run_comment_command(command: CommentCommand, ctx: &RunContext) -> Result<(), CliError> {
+    match command {
+        CommentCommand::Reply(args) => run_comment_reply(ctx, args).await,
+    }
+}
+
+/// `boss comment reply --body <TEXT>` — the answer agent's sole write
+/// action (P3b of `comment-triggered-document-revisions.md`). Reads the
+/// target run from the process's own `BOSS_RUN_ID` env var (set by the
+/// engine for the whole worker session, inherited by every Bash child,
+/// including this one) rather than any CLI-supplied id — see
+/// `CommentCommand::Reply`'s doc comment for why.
+async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) -> Result<(), CliError> {
+    let run_id = std::env::var("BOSS_RUN_ID").map_err(|_| {
+        CliError::usage(
+            "BOSS_RUN_ID is not set — `boss comment reply` only works inside a Boss \
+             answer-agent worker session.",
+        )
+    })?;
+    if args.body.trim().is_empty() {
+        return Err(CliError::usage("--body may not be empty"));
+    }
+    let mut client = connect_for_work(ctx).await?;
+    match client
+        .send_request(&FrontendRequest::CommentsPostAnswer {
+            run_id,
+            body: args.body,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::CommentResult { comment } => {
+            print_entity(ctx, &serde_json::json!({ "comment": comment }), || {
+                if !ctx.quiet {
+                    println!("Reply posted; comment {} is now '{}'.", comment.id, comment.status);
+                }
+            })
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("comment reply", &other)),
     }
 }
 

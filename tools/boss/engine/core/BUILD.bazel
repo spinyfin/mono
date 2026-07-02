@@ -131,6 +131,7 @@ rust_library(
         "src/work/automations.rs",
         "src/work/blocking.rs",
         "src/work/chain_helpers.rs",
+        "src/work/comment_thread_entries.rs",
         "src/work/comments.rs",
         "src/work/conflict_res.rs",
         "src/work/create_entities.rs",

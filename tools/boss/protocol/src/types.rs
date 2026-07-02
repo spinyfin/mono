@@ -601,6 +601,12 @@ pub const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
 /// alias; prefer `ExecutionKind::PrReview` in new code.
 pub const EXECUTION_KIND_PR_REVIEW: &str = "pr_review";
 
+/// `work_executions.kind` discriminator for a read-only answer-agent run
+/// (P3b of `comment-triggered-document-revisions.md`). Kept as a constant
+/// alias, mirroring [`EXECUTION_KIND_AUTOMATION_TRIAGE`]; prefer
+/// `ExecutionKind::AnswerAgent` in new code.
+pub const EXECUTION_KIND_ANSWER_AGENT: &str = "answer_agent";
+
 /// `task_blocked_signals.reason` literal stamped when a CI-remediation worker
 /// classifies a failure as flaky/infra and re-triggers the failing job rather
 /// than pushing a code change (`boss engine ci mark-retriggered`). Unlike the
@@ -880,6 +886,18 @@ pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
 /// a Boss chore worker. Transitions `active` → `dispatched` at chore creation,
 /// then `dispatched` → `resolved` when the chore's PR merges.
 pub const COMMENT_STATUS_DISPATCHED: &str = "dispatched";
+/// Bucket-2 track (P3b): a `question`-classified comment has spawned a
+/// read-only answer-agent run that is still in flight. Entered from `active`
+/// when the classifier resolves `intent = question`; exits to
+/// [`COMMENT_STATUS_ANSWERED`] when the run posts its reply (or fails without
+/// one — see `finalize_answer_agent`). Mutually exclusive with the
+/// bucket-1&3 track (`active`/`in_revision`/`resolved`) at any instant.
+pub const COMMENT_STATUS_ANSWERING: &str = "answering";
+/// Bucket-2 track (P3b): the answer agent posted its reply (or the run ended
+/// without one). Awaits an operator follow-up (phase 3c reclassifies it back
+/// into `answering` for another question, or into `active` for a
+/// directive/larger-change bridge into the revision path).
+pub const COMMENT_STATUS_ANSWERED: &str = "answered";
 
 /// How the comment's anchor last resolved against the doc's plain-text
 /// projection: `exact`, `fuzzy` (drives the ⚠ sidebar glyph), or `orphan`.
@@ -2195,6 +2213,46 @@ pub struct AnswerAgentRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
 }
+
+/// An engine-authored (or operator-authored) turn in a comment's thread —
+/// `comment_thread_entries` table. Shared by both the bucket-1&3 nudge and
+/// the bucket-2 answer/follow-up paths (comment-triggered-document-revisions.md
+/// §"Reply/link mechanics"): the base comment model is single-level (P529
+/// non-goal), so this table is the minimal "conversation" shape layered on
+/// top of one `work_comments` row — every entry is a child of exactly one
+/// comment, never a sibling top-level comment.
+///
+/// P3b wires only [`THREAD_ENTRY_KIND_ANSWER`] (the answer-agent's reply).
+/// `nudge` (bucket 1&3, phase 2b) and `operator_followup` (phase 3c) are
+/// declared here because the table is shared, but nothing yet writes them.
+///
+/// 8 fields → builder pattern per project convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CommentThreadEntry {
+    pub id: String,
+    pub comment_id: String,
+    /// `nudge` | `answer` | `operator_followup` — see the `THREAD_ENTRY_KIND_*`
+    /// constants.
+    pub entry_kind: String,
+    /// `engine` for an engine-authored entry (nudge, answer, or the
+    /// no-reply-posted apology), or the operator's identity for a follow-up.
+    pub author: String,
+    pub body: String,
+    /// Set on a `nudge` entry once a `[Revise]` batch actually claims the
+    /// comment (phase 2). Always `None` for `answer` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_task_id: Option<String>,
+    /// Set on an `answer` entry — the [`AnswerAgentRun`] that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_agent_run_id: Option<String>,
+    pub created_at: String,
+}
+
+/// `comment_thread_entries.entry_kind` values.
+pub const THREAD_ENTRY_KIND_NUDGE: &str = "nudge";
+pub const THREAD_ENTRY_KIND_ANSWER: &str = "answer";
+pub const THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP: &str = "operator_followup";
 
 /// Sub-state of `GitHubAuthStateDto::Authorized` that reflects whether the
 /// stored token can actually reach private org resources. A valid user token

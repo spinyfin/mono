@@ -377,6 +377,12 @@ impl WorkDb {
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_answer_agent_runs_table(&conn)?;
+        // Comment intent handling (P3b): `comment_thread_entries` tracks
+        // engine-authored replies (nudge / answer) in a comment's thread.
+        // Independent of every other table; `CREATE TABLE IF NOT EXISTS` so
+        // order is irrelevant.
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_comment_thread_entries_table(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker

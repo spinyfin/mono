@@ -86,7 +86,7 @@ fn spawn_comment_classifier(
     tokio::spawn(async move {
         match crate::comment_classifier::classify(&api_key, &body, &anchor).await {
             Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
-                Ok(_) => {
+                Ok(classified) => {
                     publish_comment_invalidation(
                         &server_state,
                         &session_id,
@@ -96,6 +96,13 @@ fn spawn_comment_classifier(
                         "comment_intent_classified",
                     )
                     .await;
+
+                    // Bucket 2 (P3b): a `question`-classified comment spawns the
+                    // read-only answer agent. Buckets 1&3 (directive/larger_change)
+                    // are a later phase — the comment just stays `active` for now.
+                    if classified.intent.as_deref() == Some(INTENT_QUESTION) {
+                        spawn_answer_agent(&server_state, &work_db, &session_id, &request_id, &classified).await;
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -114,6 +121,135 @@ fn spawn_comment_classifier(
             }
         }
     });
+}
+
+/// Spawn a read-only answer-agent run for a freshly `question`-classified
+/// comment (P3b of `comment-triggered-document-revisions.md`). Transitions
+/// the comment `active → answering`, creates the tracking
+/// `answer_agent_runs` row, then creates the `answer_agent` execution and
+/// kicks the coordinator so the normal dispatch pipeline (cube lease → spawn)
+/// picks it up. The comment's `answering` status + the `running` run row
+/// together drive the thinking indicator, pushed here via the same
+/// `comment_topic` invalidation every other comment mutation uses — no
+/// separate indicator channel.
+///
+/// Scope guard: only artifacts that `resolve_doc_owner` resolves to a
+/// `Design`/`Investigation` task are eligible (design §"Scope guard" — the
+/// classifier itself runs unconditionally today, so this is the point where
+/// bucket 2 enforces the doc-owner gate before spawning anything). A comment
+/// that doesn't resolve — e.g. `artifact_kind = 'work_item'`, or a `pr_doc`
+/// whose owning task the resolver can't find — is intentionally left
+/// `active` with `intent = question` and no bucket-2 affordance: the same
+/// "no comment-driven affordance" outcome the migration section already
+/// accepts for `work_item` comments post-magic-wand.
+async fn spawn_answer_agent(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+) {
+    let doc_owner = match work_db.resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            tracing::debug!(
+                comment_id = %comment.id,
+                artifact_kind = %comment.artifact_kind,
+                artifact_id = %comment.artifact_id,
+                "answer-agent spawn: comment's artifact has no design/investigation doc owner; skipping (out of bucket-2 scope)",
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: resolve_doc_owner failed; leaving comment active",
+            );
+            return;
+        }
+    };
+
+    let repo_remote_url = match work_db.get_work_item(&doc_owner.task_id) {
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => match task.repo_remote_url {
+            Some(url) if !url.is_empty() => url,
+            _ => {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    task_id = %doc_owner.task_id,
+                    "answer-agent spawn: doc owner task has no repo_remote_url; skipping",
+                );
+                return;
+            }
+        },
+        Ok(_) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                task_id = %doc_owner.task_id,
+                "answer-agent spawn: doc owner did not resolve to a task; skipping",
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                task_id = %doc_owner.task_id,
+                err = %err,
+                "answer-agent spawn: failed to load doc owner task; skipping",
+            );
+            return;
+        }
+    };
+
+    // Guarded status flip first (cheapest failure mode, no side effects to
+    // unwind): only proceed to create tracking rows once we know this
+    // comment is actually eligible to enter the `answering` state.
+    if let Err(err) = work_db.transition_comment_to_answering(&comment.id) {
+        tracing::warn!(
+            comment_id = %comment.id,
+            err = %err,
+            "answer-agent spawn: comment was not 'active'; skipping spawn",
+        );
+        return;
+    }
+
+    if let Err(err) = work_db.create_answer_agent_run(
+        &comment.id,
+        &comment.artifact_kind,
+        &comment.artifact_id,
+        &comment.doc_version,
+        0,
+    ) {
+        tracing::error!(
+            comment_id = %comment.id,
+            err = %err,
+            "answer-agent spawn: comment flipped to 'answering' but failed to create the tracking run row",
+        );
+        return;
+    }
+
+    if let Err(err) = work_db.create_answer_agent_execution(&comment.id, &repo_remote_url) {
+        tracing::error!(
+            comment_id = %comment.id,
+            err = %err,
+            "answer-agent spawn: comment flipped to 'answering' and run row created, but execution creation failed",
+        );
+        return;
+    }
+
+    server_state.execution_coordinator.kick();
+
+    // Publish over `comment_topic` so the sidebar sees `status = 'answering'`
+    // and renders the thinking indicator — no separate indicator channel.
+    publish_comment_invalidation(
+        server_state,
+        session_id,
+        request_id,
+        &comment.artifact_kind,
+        &comment.artifact_id,
+        "comment_answer_agent_spawned",
+    )
+    .await;
 }
 
 pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
@@ -316,6 +452,152 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
                 message: err.to_string(),
             },
         ),
+    }
+}
+
+/// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
+/// caller's own `BOSS_RUN_ID` — resolved to its bound `answer_agent`
+/// execution, then to that execution's comment, then to the comment's
+/// currently-`running` `answer_agent_runs` row. The caller cannot target any
+/// other comment or run: nothing in the request names one directly (see
+/// `boss comment reply`'s security note in `crate::answer_agent`).
+///
+/// On success: completes the run (`replied`), appends an
+/// `entry_kind = 'answer'` thread entry, and transitions the comment
+/// `answering → answered`. No `authorize_rpc` gate — worker-callable RPCs
+/// (like `CreateAutomationTask`) run without a special tier, matching that
+/// precedent.
+pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsPostAnswer { run_id, body } = req else {
+        unreachable!()
+    };
+    if body.trim().is_empty() {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: "reply body may not be empty".to_owned(),
+            },
+        );
+        return;
+    }
+
+    let execution = match work_db.get_execution(&run_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!("unknown run '{run_id}': {err}"),
+                },
+            );
+            return;
+        }
+    };
+    if execution.kind != ExecutionKind::AnswerAgent {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: format!("run '{run_id}' is not an answer-agent execution"),
+            },
+        );
+        return;
+    }
+    let comment_id = execution.work_item_id.clone();
+
+    let run = match work_db.running_answer_agent_run_for_comment(&comment_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: "no running answer-agent run found for this comment (already replied?)".to_owned(),
+                },
+            );
+            return;
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(&body), None) {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: err.to_string(),
+            },
+        );
+        return;
+    }
+
+    if let Err(err) = work_db.create_comment_thread_entry(
+        &comment_id,
+        THREAD_ENTRY_KIND_ANSWER,
+        "engine",
+        &body,
+        None,
+        Some(&run.id),
+    ) {
+        // The run is already `replied` — surfacing this as a hard error would
+        // tempt the agent into a (now-guarded, hence failing) retry. Log
+        // loudly and continue to the status transition; the thread entry is
+        // an audit/UI artifact, not load-bearing for `answering → answered`.
+        tracing::error!(
+            comment_id = %comment_id,
+            run_id = %run.id,
+            err = %err,
+            "CommentsPostAnswer: run completed but failed to create the thread entry",
+        );
+    }
+
+    match work_db.transition_comment_to_answered(&comment_id) {
+        Ok(comment) => {
+            let revision = publish_comment_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                "comment_answered",
+            )
+            .await;
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
+        }
+        Err(err) => {
+            tracing::error!(
+                comment_id = %comment_id,
+                err = %err,
+                "CommentsPostAnswer: run completed and thread entry posted, but failed to \
+                 transition the comment to 'answered'",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+        }
     }
 }
 
