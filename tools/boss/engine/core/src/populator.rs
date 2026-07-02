@@ -46,17 +46,18 @@
 //! network. This mirrors the process-wide `OnceLock` client pattern already
 //! used by [`crate::planner`] and [`crate::live_status`].
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 
 use boss_protocol::{
-    CreateAttentionItemInput, DocRef, PLANNER_OUTCOME_DOC_MISSING, PLANNER_OUTCOME_FETCH_FAILED,
+    CreateAttentionItemInput, DocRef, FrontendEvent, PLANNER_OUTCOME_DOC_MISSING, PLANNER_OUTCOME_FETCH_FAILED,
     PLANNER_OUTCOME_NO_BREAKDOWN, PLANNER_OUTCOME_PLANNER_FAILED, PLANNER_OUTCOME_REJECTED_CYCLE,
     PLANNER_OUTCOME_REJECTED_TOO_MANY, PLANNER_OUTCOME_SKIPPED_PRE_SEEDED, PLANNER_OUTCOME_STAGED, PlannerInput,
-    PlannerOutput, ProductContext, ProjectContext, TaskBrief, TaskKind,
+    PlannerOutput, ProductContext, ProjectContext, TaskBrief, TaskKind, WorkItem,
 };
 
+use crate::coordinator::ExecutionPublisher;
 use crate::doc_fetcher::{DocFetchOutcome, fetch_design_doc};
 use crate::materializer::Materializer;
 use crate::planner::{PLANNER_MODEL, Planner, PlannerOutcome};
@@ -233,6 +234,7 @@ impl Populator {
         steps: &dyn PopulatorSteps,
         ctx: &PopulateContext,
         max_tasks: usize,
+        publisher: &dyn ExecutionPublisher,
     ) -> PopulateOutcome {
         // 1. Idempotency claim. The UNIQUE-per-project partial index makes
         //    this the circuit breaker: at most one live row per project.
@@ -261,7 +263,7 @@ impl Populator {
         // From here every early return records a terminal outcome on the
         // claimed row (releasing the idempotency gate for a later re-plan)
         // and surfaces an attention item.
-        match Self::run_claimed(db, steps, ctx, &run_id, max_tasks).await {
+        match Self::run_claimed(db, steps, ctx, &run_id, max_tasks, publisher).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Internal DB error after the claim. Record it so the row is
@@ -287,6 +289,7 @@ impl Populator {
         ctx: &PopulateContext,
         run_id: &str,
         max_tasks: usize,
+        publisher: &dyn ExecutionPublisher,
     ) -> anyhow::Result<PopulateOutcome> {
         // 2. Pre-seeded refusal. Belt-and-suspenders beyond the claim gate:
         //    if the operator already put implementation tasks here, the
@@ -322,7 +325,9 @@ impl Populator {
                      `boss project plan <project> --force` to add the planner's tasks anyway \
                      (existing tasks are preserved by name dedup)."
                 ),
-            );
+                publisher,
+            )
+            .await;
             return Ok(PopulateOutcome::SkippedPreSeeded { existing: n });
         }
 
@@ -345,7 +350,9 @@ impl Populator {
                 "The design PR merged but no design-doc path was recorded for this project, so the \
                  planner has nothing to read. Set the pointer and re-run `boss project plan <project>`."
                     .to_owned(),
-            );
+                publisher,
+            )
+            .await;
             return Ok(PopulateOutcome::DocMissing);
         };
 
@@ -369,7 +376,9 @@ impl Populator {
                 "The design PR merged but neither the project's design-doc pointer nor its product \
                  resolves to a repository URL, so the planner cannot fetch the doc."
                     .to_owned(),
-            );
+                publisher,
+            )
+            .await;
             return Ok(PopulateOutcome::DocMissing);
         };
         let git_ref = project
@@ -404,7 +413,9 @@ impl Populator {
                          tried to read it (it may have moved after merge). No tasks were created. \
                          Re-run `boss project plan <project>` once the path is correct."
                     ),
-                );
+                    publisher,
+                )
+                .await;
                 return Ok(PopulateOutcome::DocMissing);
             }
             DocFetchOutcome::FetchFailed { reason } => {
@@ -424,7 +435,9 @@ impl Populator {
                          ({reason}). No tasks were created. Re-run `boss project plan <project>` \
                          once GitHub is reachable."
                     ),
-                );
+                    publisher,
+                )
+                .await;
                 return Ok(PopulateOutcome::FetchFailed);
             }
         };
@@ -501,7 +514,9 @@ impl Populator {
                          created. Re-run `boss project plan <project>` (configure ANTHROPIC_API_KEY \
                          first if that is the cause)."
                     ),
-                );
+                    publisher,
+                )
+                .await;
                 return Ok(PopulateOutcome::PlannerFailed);
             }
         };
@@ -535,7 +550,9 @@ impl Populator {
                      so no tasks were created. Plan manually, or add a breakdown and re-run \
                      `boss project plan <project>`."
                         .to_owned(),
-                );
+                    publisher,
+                )
+                .await;
                 Ok(PopulateOutcome::NoBreakdown)
             }
             ValidationResult::EmptyBreakdown => {
@@ -551,7 +568,9 @@ impl Populator {
                     "The planner found a task-breakdown section but extracted no tasks from it. \
                      No tasks were created. Re-run `boss project plan <project>` or plan manually."
                         .to_owned(),
-                );
+                    publisher,
+                )
+                .await;
                 Ok(PopulateOutcome::EmptyBreakdown)
             }
             ValidationResult::RejectedTooMany { count, max } => {
@@ -570,23 +589,39 @@ impl Populator {
                          created. Split the project, or re-run `boss project plan <project>` with a \
                          higher cap."
                     ),
-                );
+                    publisher,
+                )
+                .await;
                 Ok(PopulateOutcome::RejectedTooMany { count, max })
             }
             ValidationResult::RejectedDuplicateHandle { handle } => {
-                Self::reject_bad_graph(db, ctx, run_id, format!("duplicate task handle: {handle}"));
+                Self::reject_bad_graph(db, ctx, run_id, format!("duplicate task handle: {handle}"), publisher).await;
                 Ok(PopulateOutcome::RejectedBadGraph)
             }
             ValidationResult::RejectedUnknownHandle { handle } => {
-                Self::reject_bad_graph(db, ctx, run_id, format!("edge references unknown handle: {handle}"));
+                Self::reject_bad_graph(
+                    db,
+                    ctx,
+                    run_id,
+                    format!("edge references unknown handle: {handle}"),
+                    publisher,
+                )
+                .await;
                 Ok(PopulateOutcome::RejectedBadGraph)
             }
             ValidationResult::RejectedCycle { cycle } => {
-                Self::reject_bad_graph(db, ctx, run_id, format!("dependency cycle: {}", cycle.join(" → ")));
+                Self::reject_bad_graph(
+                    db,
+                    ctx,
+                    run_id,
+                    format!("dependency cycle: {}", cycle.join(" → ")),
+                    publisher,
+                )
+                .await;
                 Ok(PopulateOutcome::RejectedBadGraph)
             }
             ValidationResult::Valid { low_confidence } => {
-                Self::apply_and_stage(db, ctx, run_id, &output, low_confidence)
+                Self::apply_and_stage(db, ctx, run_id, &output, low_confidence, publisher).await
             }
         }
     }
@@ -594,12 +629,17 @@ impl Populator {
     /// 7 + 8. Materialize a valid proposal (the single write transaction),
     /// then audit and surface. The tasks are created staged
     /// (`autostart = false`); an operator releases them to begin dispatch.
-    fn apply_and_stage(
+    /// On success, also publishes a `WorkItemsCreated` batch event on the
+    /// project's product topic (design §"Surfacing": "a `work_items_created`
+    /// batch event lets it refresh in one round-trip") so the kanban picks up
+    /// the newly staged tasks immediately, without waiting on a poll.
+    async fn apply_and_stage(
         db: &WorkDb,
         ctx: &PopulateContext,
         run_id: &str,
         output: &PlannerOutput,
         low_confidence: bool,
+        publisher: &dyn ExecutionPublisher,
     ) -> anyhow::Result<PopulateOutcome> {
         let result = match Materializer::apply(db, &ctx.project_id, run_id, output) {
             Ok(result) => result,
@@ -628,7 +668,9 @@ impl Populator {
                          ({err}). No tasks were created (the apply is transactional). Re-run \
                          `boss project plan <project>`."
                     ),
-                );
+                    publisher,
+                )
+                .await;
                 return Ok(PopulateOutcome::PlannerFailed);
             }
         };
@@ -646,6 +688,39 @@ impl Populator {
             low_confidence,
             "populator: staged tasks",
         );
+
+        // Kanban refresh signal: load the freshly created rows and push one
+        // `WorkItemsCreated` event on the product topic, mirroring the shape
+        // `handler_helpers::handle_create_many` replies with for the
+        // `CreateManyTasks` RPC — but as a topic push rather than a
+        // request/response, since this pass has no originating session to
+        // reply to. Best-effort per row: a lookup failure must not abort the
+        // pass — the attention item below remains the durable, primary
+        // signal regardless of whether this live refresh lands.
+        if !result.created.is_empty() {
+            let items: Vec<WorkItem> = result
+                .created
+                .iter()
+                .filter_map(|id| match db.get_work_item(id) {
+                    Ok(item) => Some(item),
+                    Err(err) => {
+                        tracing::warn!(
+                            project_id = %ctx.project_id,
+                            run_id,
+                            task_id = %id,
+                            ?err,
+                            "populator: failed to load newly created task for kanban event",
+                        );
+                        None
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                publisher
+                    .publish_frontend_event_on_product(&ctx.product_id, FrontendEvent::WorkItemsCreated { items })
+                    .await;
+            }
+        }
 
         let (title, body) = if low_confidence {
             (
@@ -679,7 +754,9 @@ impl Populator {
                 .build(),
             title,
             body,
-        );
+            publisher,
+        )
+        .await;
 
         Ok(PopulateOutcome::Staged {
             created,
@@ -691,7 +768,13 @@ impl Populator {
     /// Record a rejected-graph outcome (`rejected_cycle` bucket covers cyclic,
     /// unknown-handle, and duplicate-handle proposals per the design) plus an
     /// attention item. Nothing was written.
-    fn reject_bad_graph(db: &WorkDb, ctx: &PopulateContext, run_id: &str, reason: String) {
+    async fn reject_bad_graph(
+        db: &WorkDb,
+        ctx: &PopulateContext,
+        run_id: &str,
+        reason: String,
+        publisher: &dyn ExecutionPublisher,
+    ) {
         tracing::warn!(project_id = %ctx.project_id, run_id, reason, "populator: rejected malformed task graph");
         Self::finish(
             db,
@@ -706,18 +789,32 @@ impl Populator {
                 "The planner's proposed task graph was rejected as malformed ({reason}). No tasks \
                  were created. Re-run `boss project plan <project>` or plan manually."
             ),
-        );
+            publisher,
+        )
+        .await;
     }
 
     /// Update the claimed `planner_runs` row with the terminal patch and raise
-    /// the operator-facing attention item. Both are best-effort: a failure to
-    /// surface must not itself panic or fail the pass (the pass already did
-    /// the right thing to the DB / is no-op).
-    fn finish(db: &WorkDb, ctx: &PopulateContext, run_id: &str, patch: PlannerRunPatch, title: &str, body: String) {
+    /// the operator-facing attention item, publishing `AttentionItemCreated` on
+    /// the project's product topic so the operator sees the outcome-specific
+    /// text live rather than only on next poll (design §"Surfacing": "the
+    /// operator learns it happened without watching"). Both the DB write and
+    /// the publish are best-effort: a failure to surface must not itself
+    /// panic or fail the pass (the pass already did the right thing to the
+    /// DB / is no-op).
+    async fn finish(
+        db: &WorkDb,
+        ctx: &PopulateContext,
+        run_id: &str,
+        patch: PlannerRunPatch,
+        title: &str,
+        body: String,
+        publisher: &dyn ExecutionPublisher,
+    ) {
         if let Err(err) = db.update_planner_run(run_id, patch) {
             tracing::warn!(project_id = %ctx.project_id, run_id, ?err, "populator: failed to update planner run");
         }
-        if let Err(err) = db.create_attention_item(
+        match db.create_attention_item(
             CreateAttentionItemInput::builder()
                 .kind(ATTENTION_KIND)
                 .title(title)
@@ -726,7 +823,14 @@ impl Populator {
                 .status("open")
                 .build(),
         ) {
-            tracing::warn!(project_id = %ctx.project_id, ?err, "populator: failed to raise attention item");
+            Ok(item) => {
+                publisher
+                    .publish_frontend_event_on_product(&ctx.product_id, FrontendEvent::AttentionItemCreated { item })
+                    .await;
+            }
+            Err(err) => {
+                tracing::warn!(project_id = %ctx.project_id, ?err, "populator: failed to raise attention item");
+            }
         }
     }
 }
@@ -738,8 +842,8 @@ impl Populator {
 /// Startup-installed configuration for the auto-populate feature. Held in a
 /// process-wide [`OnceLock`] so the merge-trigger hook (deep in the poller's
 /// call chain, which only has a `&WorkDb`) can enqueue a populate without
-/// threading the api key and cap through every poller signature. Contexts
-/// that never [`install`] it — the merge-poller unit tests, non-server
+/// threading the api key, cap, and publisher through every poller signature.
+/// Contexts that never [`install`] it — the merge-poller unit tests, non-server
 /// callers — make [`enqueue_from_merge`] a no-op, so no test reaches the
 /// network.
 pub struct PopulatorConfig {
@@ -747,6 +851,12 @@ pub struct PopulatorConfig {
     pub api_key: Option<String>,
     /// Hard cap on tasks per populate.
     pub max_tasks: usize,
+    /// The engine's shared event publisher (the same `Arc` handed to the
+    /// merge poller and execution coordinator). Held as an `Arc` rather than
+    /// threaded as `&dyn` because [`enqueue_from_merge`] spawns a `'static`
+    /// background task — an owned, cloneable handle is required to outlive
+    /// the merge-poller call that triggered the enqueue.
+    pub publisher: Arc<dyn ExecutionPublisher>,
 }
 
 static POPULATOR: OnceLock<PopulatorConfig> = OnceLock::new();
@@ -775,9 +885,10 @@ pub fn enqueue_from_merge(work_db: &WorkDb, ctx: PopulateContext) {
         api_key: config.api_key.clone(),
     };
     let max_tasks = config.max_tasks;
+    let publisher = config.publisher.clone();
     tracing::info!(project_id = %ctx.project_id, pr_url = %ctx.pr_url, "populator: enqueuing auto-populate");
     tokio::spawn(async move {
-        let outcome = Populator::run(&db, &steps, &ctx, max_tasks).await;
+        let outcome = Populator::run(&db, &steps, &ctx, max_tasks, publisher.as_ref()).await;
         tracing::info!(
             project_id = %ctx.project_id,
             outcome = outcome.tag(),
@@ -797,6 +908,7 @@ mod tests {
     use boss_protocol::{
         Confidence, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel, ProposedEdge, ProposedTask,
     };
+    use tokio::sync::Mutex;
 
     use crate::work::WorkDb;
 
@@ -893,6 +1005,45 @@ mod tests {
         }
     }
 
+    /// A recording [`ExecutionPublisher`] fake — captures every typed event
+    /// pushed via `publish_frontend_event_on_product` so tests can assert the
+    /// Populator surfaces `AttentionItemCreated` and `WorkItemsCreated` (this
+    /// module's task 8: attention-item + event surfacing) without a live
+    /// topic broker.
+    #[derive(Default)]
+    struct RecordingPublisher {
+        events: Mutex<Vec<(String, FrontendEvent)>>,
+    }
+
+    #[async_trait]
+    impl ExecutionPublisher for RecordingPublisher {
+        async fn publish(&self, _execution_id: &str, _work_item_id: &str, _status: &str, _reason: &str) {}
+        async fn publish_work_item_changed(&self, _product_id: &str, _work_item_id: &str, _reason: &str) {}
+        async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
+            self.events.lock().await.push((product_id.to_owned(), event));
+        }
+    }
+
+    impl RecordingPublisher {
+        async fn attention_items_created(&self) -> usize {
+            self.events
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, e)| matches!(e, FrontendEvent::AttentionItemCreated { .. }))
+                .count()
+        }
+
+        /// `Some(n)` — a `WorkItemsCreated` event was published carrying `n`
+        /// items. `None` if no such event was published.
+        async fn work_items_created_len(&self) -> Option<usize> {
+            self.events.lock().await.iter().find_map(|(_, e)| match e {
+                FrontendEvent::WorkItemsCreated { items } => Some(items.len()),
+                _ => None,
+            })
+        }
+    }
+
     fn ptask(handle: &str, name: &str) -> ProposedTask {
         ProposedTask {
             handle: handle.to_owned(),
@@ -962,11 +1113,13 @@ mod tests {
             PlannerOutcomeKind::Success(output),
         );
 
+        let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
             &db,
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &publisher,
         )
         .await;
         assert_eq!(
@@ -987,6 +1140,11 @@ mod tests {
         assert_eq!(run.model.as_deref(), Some(PLANNER_MODEL));
         // An attention item was raised.
         assert_eq!(open_attention_count(&db, &design_id), 1);
+        // ... and published live on the product topic, alongside a
+        // `WorkItemsCreated` batch event carrying both new tasks so the
+        // kanban refreshes in one round-trip (design §"Surfacing").
+        assert_eq!(publisher.attention_items_created().await, 1);
+        assert_eq!(publisher.work_items_created_len().await, Some(2));
     }
 
     #[tokio::test]
@@ -998,11 +1156,13 @@ mod tests {
             DocFetchOutcomeKind::Content("# doc".to_owned()),
             PlannerOutcomeKind::Success(output),
         );
+        let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
             &db,
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &publisher,
         )
         .await;
         assert_eq!(
@@ -1031,6 +1191,7 @@ mod tests {
             ),
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert!(matches!(first, PopulateOutcome::Staged { .. }));
@@ -1045,6 +1206,7 @@ mod tests {
             ),
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(second, PopulateOutcome::SkippedAlreadyPopulated);
@@ -1072,11 +1234,13 @@ mod tests {
             DocFetchOutcomeKind::Content("# doc".to_owned()),
             PlannerOutcomeKind::Success(plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true)),
         );
+        let publisher = RecordingPublisher::default();
         let outcome = Populator::run(
             &db,
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &publisher,
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::SkippedPreSeeded { existing: 1 });
@@ -1085,6 +1249,10 @@ mod tests {
         assert_eq!(open_attention_count(&db, &design_id), 1);
         // The claimed row went terminal (gate released for a `--force` replan).
         assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
+        // Refusal still surfaces an attention item live; no tasks were
+        // created, so no `WorkItemsCreated` event should have been published.
+        assert_eq!(publisher.attention_items_created().await, 1);
+        assert_eq!(publisher.work_items_created_len().await, None);
     }
 
     // ---- fetch / plan failures leave nothing behind ------------------------
@@ -1099,6 +1267,7 @@ mod tests {
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::DocMissing);
@@ -1116,6 +1285,7 @@ mod tests {
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::FetchFailed);
@@ -1135,6 +1305,7 @@ mod tests {
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::PlannerFailed);
@@ -1158,6 +1329,7 @@ mod tests {
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::NoBreakdown);
@@ -1177,7 +1349,14 @@ mod tests {
             PlannerOutcomeKind::Success(output),
         );
         // Cap of 2, proposal of 3.
-        let outcome = Populator::run(&db, &steps, &ctx(&product_id, &project_id, &design_id), 2).await;
+        let outcome = Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            2,
+            &RecordingPublisher::default(),
+        )
+        .await;
         assert_eq!(outcome, PopulateOutcome::RejectedTooMany { count: 3, max: 2 });
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
         assert_eq!(open_attention_count(&db, &design_id), 1);
@@ -1211,6 +1390,7 @@ mod tests {
             &steps,
             &ctx(&product_id, &project_id, &design_id),
             DEFAULT_MAX_TASKS,
+            &RecordingPublisher::default(),
         )
         .await;
         assert_eq!(outcome, PopulateOutcome::RejectedBadGraph);

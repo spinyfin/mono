@@ -630,6 +630,7 @@ pub async fn serve(
     crate::populator::install(crate::populator::PopulatorConfig {
         api_key: server_state.anthropic_api_key.clone(),
         max_tasks: crate::populator::DEFAULT_MAX_TASKS,
+        publisher: server_state.publisher.clone(),
     });
 
     // Spawn the merge-detection poller. Workers can land their PRs
