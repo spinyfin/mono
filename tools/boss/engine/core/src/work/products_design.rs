@@ -566,6 +566,69 @@ impl WorkDb {
         Ok(path)
     }
 
+    /// Reverse-resolve a `pr_doc:*` comment artifact to the task that owns
+    /// it and that task's current PR lifecycle. This is the missing reverse
+    /// of [`Self::resolve_project_design_doc`] / [`resolve_task_doc_pointer`]
+    /// — those go task → doc, this goes doc → task — and is the one
+    /// authoritative gate for both classifier eligibility (only
+    /// `Design`/`Investigation`-owned docs get classified at all) and the
+    /// directive/larger-change revision-vs-chore routing decision. Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"The revision-vs-general-task decision".
+    ///
+    /// `None` for any `artifact_kind` other than `"pr_doc"` (per the design,
+    /// `work_item` comments — engine-owned task descriptions — are never
+    /// design/investigation docs and get no comment-driven affordance at
+    /// all), for an artifact id that doesn't parse, or when the matched
+    /// task's `kind` is not `Design`/`Investigation` — the scope guard.
+    ///
+    /// Resolution order:
+    /// 1. If `<branch>` is the engine-supplied `expected_branch` of a live
+    ///    execution (`exec_*` under the default `BossExecPrefix` naming),
+    ///    map branch → execution → task directly. This is the exact,
+    ///    unambiguous case, and it can never land on a `kind = 'revision'`
+    ///    task: a revision commits onto its chain root's *existing* PR
+    ///    branch rather than opening its own, so no revision ever owns an
+    ///    `exec_*` branch of its own (see `runner.rs`'s
+    ///    `RevisionImplementation` guard on the "expected branch name"
+    ///    prompt line).
+    /// 2. Otherwise (e.g. `<branch> = "main"` once the doc's PR has merged),
+    ///    match the project's `design_doc_repo_remote_url` /
+    ///    `design_doc_branch` / `design_doc_path` triple to its
+    ///    `kind = 'design'`, `ordinal = 0` task, or else a project-less
+    ///    task's own `doc_repo_remote_url` / `doc_branch` / `doc_path`
+    ///    triple.
+    ///
+    /// Per the design's mitigation for "the reverse resolver is a new trust
+    /// path": an unresolved or ambiguous match returns `None` rather than
+    /// guessing — prefer the exact execution-branch mapping over the path
+    /// match, and never fall back from one to the other.
+    pub fn resolve_doc_owner(&self, artifact_kind: &str, artifact_id: &str) -> Result<Option<DocOwner>> {
+        if artifact_kind != "pr_doc" {
+            return Ok(None);
+        }
+        let Some((repo, branch, path)) = parse_pr_doc_artifact_id(artifact_id) else {
+            return Ok(None);
+        };
+        let conn = self.connect()?;
+
+        let branch_suffix = branch.rsplit('/').next().unwrap_or(branch.as_str());
+        if branch_suffix.starts_with("exec_") {
+            return match query_execution(&conn, branch_suffix)? {
+                Some(execution) => build_doc_owner(&conn, &execution.work_item_id),
+                None => Ok(None),
+            };
+        }
+
+        if let Some(task_id) = find_design_task_by_project_doc_pointer(&conn, &repo, &branch, &path)? {
+            return build_doc_owner(&conn, &task_id);
+        }
+        if let Some(task_id) = find_task_by_doc_pointer(&conn, &repo, &branch, &path)? {
+            return build_doc_owner(&conn, &task_id);
+        }
+        Ok(None)
+    }
+
     /// List `in_review` tasks whose doc-branch pointer is `NULL` and whose
     /// PR is still open (unmerged), so a startup sweep can backfill the
     /// branch without waiting for the next PR event.
@@ -704,4 +767,157 @@ pub(crate) fn resolve_task_doc_pointer(
         web_url,
         raw_content_url,
     }))
+}
+
+/// Split a `pr_doc:<repo_remote_url>:<branch>:<path>` artifact id (see
+/// `comments-in-markdown-viewer.md`) into its three components. Repo remote
+/// URLs routinely contain a colon of their own (`git@host:owner/repo.git`,
+/// or the `://` in an `https://` URL), so a naive `split(':')` can't tell
+/// repo from branch. Git ref names cannot contain `:` (git's own
+/// ref-format rule) and `validate_design_doc_path` never admits one either,
+/// so splitting from the right for exactly the last two colon-delimited
+/// fields (path, then branch) leaves everything else — however many colons
+/// it has — as the repo. Returns `None` for anything missing the `pr_doc:`
+/// prefix or a field.
+fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, String, String)> {
+    let rest = artifact_id.strip_prefix("pr_doc:")?;
+    let mut parts = rest.rsplitn(3, ':');
+    let path = parts.next()?;
+    let branch = parts.next()?;
+    let repo = parts.next()?;
+    if repo.is_empty() || branch.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((repo.to_owned(), branch.to_owned(), path.to_owned()))
+}
+
+/// Build a [`DocOwner`] for `task_id`, applying the scope guard: `None`
+/// unless the task exists, is not soft-deleted, and is `kind ∈ {Design,
+/// Investigation}`.
+fn build_doc_owner(conn: &Connection, task_id: &str) -> Result<Option<DocOwner>> {
+    let Some(task) = query_task(conn, task_id)? else {
+        return Ok(None);
+    };
+    if task.deleted_at.is_some() {
+        return Ok(None);
+    }
+    if !matches!(task.kind, TaskKind::Design | TaskKind::Investigation) {
+        return Ok(None);
+    }
+
+    let chain_root_id = chain_root(conn, &task.id)?;
+    let pr_lifecycle = if task.pr_url.is_none() {
+        DocOwnerPrLifecycle::NoPr
+    } else if task.status == TaskStatus::Done {
+        DocOwnerPrLifecycle::Merged
+    } else {
+        DocOwnerPrLifecycle::Open
+    };
+
+    Ok(Some(DocOwner {
+        task_id: task.id,
+        task_kind: task.kind,
+        chain_root_id,
+        pr_url: task.pr_url,
+        pr_lifecycle,
+    }))
+}
+
+/// Match `projects.design_doc_repo_remote_url` / `design_doc_branch` /
+/// `design_doc_path` against `(repo, branch, path)` and return the id of
+/// that project's `kind = 'design'`, `ordinal = 0` task. Exact column
+/// equality only — no product-repo / `"main"`-branch fallback — mirroring
+/// the design's literal recipe; a project whose pointer columns are `NULL`
+/// (and would resolve only via the forward resolver's fallback) does not
+/// match here.
+fn find_design_task_by_project_doc_pointer(
+    conn: &Connection,
+    repo: &str,
+    branch: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT t.id FROM tasks t
+         JOIN projects p ON t.project_id = p.id
+         WHERE p.design_doc_repo_remote_url = ?1
+           AND p.design_doc_branch = ?2
+           AND p.design_doc_path = ?3
+           AND t.kind = 'design'
+           AND t.ordinal = 0
+           AND t.deleted_at IS NULL
+         ORDER BY t.created_at ASC, t.id ASC
+         LIMIT 1",
+        params![repo, branch, path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Match a project-less task's own `doc_repo_remote_url` / `doc_branch` /
+/// `doc_path` columns against `(repo, branch, path)` — the task-level
+/// analogue of [`find_design_task_by_project_doc_pointer`], covering
+/// investigations and project-less design tasks.
+fn find_task_by_doc_pointer(conn: &Connection, repo: &str, branch: &str, path: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM tasks
+         WHERE doc_repo_remote_url = ?1
+           AND doc_branch = ?2
+           AND doc_path = ?3
+           AND deleted_at IS NULL
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1",
+        params![repo, branch, path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_pr_doc_artifact_id ────────────────────────────────────────────
+
+    #[test]
+    fn parse_pr_doc_artifact_id_splits_https_repo() {
+        let parsed = parse_pr_doc_artifact_id("pr_doc:https://github.com/o/r.git:main:docs/foo.md");
+        assert_eq!(
+            parsed,
+            Some((
+                "https://github.com/o/r.git".to_owned(),
+                "main".to_owned(),
+                "docs/foo.md".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_splits_ssh_repo_despite_its_own_colon() {
+        // `git@github.com:o/r.git` carries a colon of its own; rsplitn from
+        // the right (path, then branch) must leave the whole repo intact
+        // rather than truncating it at that colon.
+        let parsed = parse_pr_doc_artifact_id("pr_doc:git@github.com:o/r.git:boss/exec_x:doc.md");
+        assert_eq!(
+            parsed,
+            Some((
+                "git@github.com:o/r.git".to_owned(),
+                "boss/exec_x".to_owned(),
+                "doc.md".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_rejects_missing_prefix() {
+        assert_eq!(parse_pr_doc_artifact_id("work_item:task-123"), None);
+    }
+
+    #[test]
+    fn parse_pr_doc_artifact_id_rejects_missing_fields() {
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc:r:b"), None);
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc:"), None);
+        assert_eq!(parse_pr_doc_artifact_id("pr_doc::b:p.md"), None);
+    }
 }

@@ -2461,6 +2461,53 @@ pub struct ResolveProjectDesignDocOutput {
     pub state: ProjectDesignDocState,
 }
 
+/// The task that owns a `pr_doc:*` comment artifact, and that task's current
+/// PR lifecycle. Returned by the engine's `resolve_doc_owner` reverse
+/// resolver (`tools/boss/engine/core`), which gates both classifier
+/// eligibility (only `Design`/`Investigation`-owned docs are classified) and
+/// the directive/larger-change revision-vs-chore routing decision. Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"The revision-vs-general-task decision".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocOwner {
+    /// The task the resolver matched. Always `kind ∈ {Design, Investigation}`
+    /// — the resolver returns `None` for any other kind (the scope guard).
+    pub task_id: String,
+    pub task_kind: TaskKind,
+    /// The root of `task_id`'s revision chain. In practice this always
+    /// equals `task_id`: a revision task never owns its own PR branch (it
+    /// commits onto its chain root's existing branch), so `resolve_doc_owner`
+    /// never matches a `Revision`-kind task. Carried anyway so callers have
+    /// the id `create_revision`'s `parent` argument expects without
+    /// re-deriving it.
+    pub chain_root_id: String,
+    pub pr_url: Option<String>,
+    pub pr_lifecycle: DocOwnerPrLifecycle,
+}
+
+/// A coarse, DB-only summary of a doc-owning task's PR lifecycle — derived
+/// from `tasks.pr_url` and `tasks.status` alone, no GitHub round trip.
+/// `resolve_doc_owner` must stay cheap enough to run on every comment
+/// create, so it reads only what the row already has cached; contrast with
+/// the engine's live merge-poller `PrLifecycleState`, which comes from a
+/// `gh pr view` probe. `ClosedUnmerged` has no stored terminal signal yet
+/// (`chore-lifecycle-pr-closed-unmerged` is unimplemented) and is not
+/// distinguishable from `Open` here — a present `pr_url` with no terminal
+/// marker reads as `Open`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DocOwnerPrLifecycle {
+    /// `pr_url` is set and the task has not reached the terminal `Done`
+    /// status — covers genuinely-open PRs and (today, indistinguishably)
+    /// closed-unmerged ones.
+    Open,
+    /// The task reached `Done`, which the engine only sets via
+    /// `mark_chore_pr_merged` — the PR merged.
+    Merged,
+    /// `pr_url` is `NULL` — the doc's owning task never opened a PR.
+    NoPr,
+}
+
 /// Role/origin of a rendered transcript segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

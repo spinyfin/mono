@@ -159,6 +159,7 @@ rust_library(
         "src/work/tests/t08.rs",
         "src/work/tests/t09.rs",
         "src/work/tests/t10.rs",
+        "src/work/tests/t11.rs",
         "src/work/updates.rs",
         "src/work/workitems.rs",
         "src/work_dependencies.rs",
