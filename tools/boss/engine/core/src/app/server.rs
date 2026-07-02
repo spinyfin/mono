@@ -731,6 +731,27 @@ pub async fn serve(
         crate::terminal_work_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic lost-workspace reconciler: finalizes non-terminal executions
+    // (`running` / `waiting_human` / …) whose recorded LOCAL cube workspace
+    // directory has vanished from disk — the 2026-06-14 "waiting_human
+    // zombie". A worker's workspace is its cwd for the life of its pane, so a
+    // missing directory means the worker is gone; but such a row keeps
+    // counting as `is_live()`, which every other sweep skips and the
+    // redundant-spawn guard treats as a permanent blocker (it wedged all
+    // automations for 17 days). This sweep is DB-driven, so unlike the
+    // registry-driven `dead_pid_sweep` it sees zombies left by a PREVIOUS
+    // engine instance — clearing them on upgrade/restart with no hand-editing
+    // of the DB. Runs every 60s and fires on boot. Host-safe: it only judges
+    // executions whose latest run ran on `host_id == 'local'`, so a remote
+    // worker is never reaped by a local filesystem probe.
+    let _lost_workspace_sweep_handle = crate::lost_workspace_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.cube_client.clone(),
+        server_state.dispatch_events.clone(),
+        crate::lost_workspace_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic stale-worker liveness backstop: detects worker slots whose
     // `claude` process is still alive but has made no transcript progress
     // (no hook event) for longer than the staleness threshold while

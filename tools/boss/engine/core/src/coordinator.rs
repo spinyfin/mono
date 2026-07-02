@@ -1994,41 +1994,94 @@ impl ExecutionCoordinator {
             .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
         {
             Ok(Some(live)) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    live_execution_id = %live.id,
-                    work_item_id = %execution.work_item_id,
-                    "spawn_attempt: redundant — another execution is already live; deferring to that one",
-                );
-                if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
-                    tracing::error!(
+                // Liveness gate (waiting_human-zombie fix, 2026-06-14 incident):
+                // `get_live_execution_for_work_item` returns any row in
+                // `status IN ('running','waiting_human')`, but that is a *paper*
+                // liveness signal. A row can sit `waiting_human` forever after
+                // its worker died without a `Stop` hook — e.g. the cube
+                // workspace-root migration relocated the pool out from under
+                // three running triage panes, so their rows stayed `waiting_human`
+                // and every subsequent fire died right here with `redundant_spawn`.
+                // Before treating this execution as a redundant duplicate, verify
+                // the blocker is *actually* live: a local execution whose recorded
+                // workspace directory has vanished is a zombie — reconcile it to a
+                // terminal status and proceed with this spawn instead of blocking.
+                if crate::lost_workspace_sweep::reconcile_if_workspace_lost(
+                    self.work_db.as_ref(),
+                    self.dispatch_events.as_ref(),
+                    &live,
+                )
+                .await
+                {
+                    tracing::warn!(
                         execution_id = %execution.id,
-                        ?err,
-                        "spawn_attempt: failed to mark redundant execution abandoned",
+                        reconciled_execution_id = %live.id,
+                        work_item_id = %execution.work_item_id,
+                        "spawn_attempt: prior 'live' execution had a lost workspace (pane gone); \
+                         reconciled it and proceeding with this spawn",
                     );
+                    // Not redundant after all — fall through to the rest of dispatch.
+                } else {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        live_execution_id = %live.id,
+                        work_item_id = %execution.work_item_id,
+                        "spawn_attempt: redundant — another execution is already live; deferring to that one",
+                    );
+                    if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
+                        tracing::error!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "spawn_attempt: failed to mark redundant execution abandoned",
+                        );
+                    }
+                    // Honest automation bookkeeping: an `automation_triage` fire
+                    // that dies here pre-spawn must record the real reason on its
+                    // `automation_runs` row, overwriting the pessimistic
+                    // "dispatched; awaiting triage worker decision" placeholder the
+                    // scheduler stamps at fire time (which is a lie once dispatch
+                    // failed before the worker ever ran).
+                    if execution.kind == ExecutionKind::AutomationTriage
+                        && let Err(err) = self.work_db.finalize_automation_triage_run(
+                            &execution.id,
+                            boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                            None,
+                            Some(&format!(
+                                "dispatch aborted pre-spawn at host_selected: redundant_spawn \
+                                 (superseded by live execution {})",
+                                live.id
+                            )),
+                        )
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "spawn_attempt: failed to record redundant_spawn outcome on automation_runs row",
+                        );
+                    }
+                    // Emit a terminal event so the dispatch timeline doesn't
+                    // silently stall at `worker_claimed/ok` for 30s until the
+                    // watchdog fires. The execution is already marked redundant
+                    // (terminal DB state), so `host_selected:error` is the
+                    // correct closer — no `record_start_failure` needed.
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_details(serde_json::json!({
+                                    "reason": "redundant_spawn",
+                                    "live_execution_id": live.id,
+                                })),
+                        )
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "redundant spawn: execution {} for work_item {} superseded by live execution {}",
+                        execution.id,
+                        execution.work_item_id,
+                        live.id,
+                    ));
                 }
-                // Emit a terminal event so the dispatch timeline doesn't
-                // silently stall at `worker_claimed/ok` for 30s until the
-                // watchdog fires. The execution is already marked redundant
-                // (terminal DB state), so `host_selected:error` is the
-                // correct closer — no `record_start_failure` needed.
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_details(serde_json::json!({
-                                "reason": "redundant_spawn",
-                                "live_execution_id": live.id,
-                            })),
-                    )
-                    .await;
-                return Err(anyhow::anyhow!(
-                    "redundant spawn: execution {} for work_item {} superseded by live execution {}",
-                    execution.id,
-                    execution.work_item_id,
-                    live.id,
-                ));
             }
             Ok(None) => {}
             Err(err) => {
@@ -10262,6 +10315,146 @@ mod tests {
         assert!(
             cube.lease_calls.lock().await.is_empty(),
             "no cube workspace may be leased for a redundant spawn",
+        );
+    }
+
+    /// Liveness gate (2026-06-14 waiting_human-zombie fix): when the "live"
+    /// blocker the redundant-spawn guard finds is actually a zombie — a local
+    /// execution whose recorded cube workspace directory has vanished (its
+    /// pane is gone) — the guard must reconcile it to a terminal status and
+    /// let the new spawn PROCEED, rather than rejecting it forever as
+    /// redundant. This is the exact wedge that broke all automations for 17
+    /// days: three triage rows stuck `waiting_human` after their workspaces
+    /// were migrated away blocked every subsequent fire with `redundant_spawn`.
+    #[tokio::test]
+    async fn redundant_spawn_guard_reconciles_lost_workspace_zombie_and_proceeds() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Zombie-blocked chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+
+        // The "live" blocker: a running execution with a real run on the local
+        // host, but whose workspace directory no longer exists on disk — a
+        // dead pane the engine never reaped (no Stop hook).
+        let zombie = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.start_execution_run(
+            &zombie.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "mono-agent-028",
+            "/nonexistent/old-root/mono-agent-028",
+        )
+        .unwrap();
+        // Park it in waiting_human, exactly like a just-spawned worker.
+        let zrun = db
+            .active_run_ids_for_execution(&zombie.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("zombie has a run");
+        db.finish_execution_run(
+            &zombie.id,
+            &zrun,
+            ExecutionStatus::WaitingHuman,
+            "completed",
+            None,
+            None,
+            /* clear_workspace_lease */ false,
+            None,
+        )
+        .unwrap();
+
+        // The new execution the scheduler wants to spawn.
+        let fresh = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&fresh.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let _ = coordinator.schedule_execution(&fresh, &worker_id).await;
+
+        // The zombie was reconciled to a terminal status (orphaned) with a
+        // lost_workspace_reconcile trace event naming its prior status.
+        let zombie_after = db.get_execution(&zombie.id).unwrap();
+        assert_eq!(
+            zombie_after.status,
+            ExecutionStatus::Orphaned,
+            "the lost-workspace zombie must be finalized; got {:?}",
+            zombie_after.status,
+        );
+        let zombie_events = recording.events_for(&zombie.id).await;
+        let reconcile = zombie_events
+            .iter()
+            .find(|e| e.stage == "lost_workspace_reconcile")
+            .unwrap_or_else(|| panic!("expected lost_workspace_reconcile event; got {zombie_events:#?}"));
+        assert_eq!(
+            reconcile.details.get("prior_status").and_then(|v| v.as_str()),
+            Some("waiting_human"),
+            "the trace must record the prior status; got {:?}",
+            reconcile.details,
+        );
+
+        // The fresh execution was NOT rejected as redundant.
+        let fresh_after = db.get_execution(&fresh.id).unwrap();
+        assert_ne!(
+            fresh_after.status,
+            ExecutionStatus::Abandoned,
+            "the new spawn must not be abandoned as redundant once the zombie is cleared",
+        );
+        let fresh_events = recording.events_for(&fresh.id).await;
+        assert!(
+            !fresh_events.iter().any(|e| e.stage == "host_selected"
+                && e.details.get("reason").and_then(|v| v.as_str()) == Some("redundant_spawn")),
+            "the new spawn must not emit a redundant_spawn host_selected:error; got {fresh_events:#?}",
         );
     }
 
