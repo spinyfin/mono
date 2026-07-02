@@ -24,6 +24,12 @@ build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache
 # Darwin cache configuration
 build:ci-darwin --config=ci
 build:ci-darwin --repository_cache=/Volumes/ssd/bazel/repo_cache
-build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
+# NOTE: --disk_cache for Darwin is set dynamically in .buildkite/steps/ci-env.sh,
+# partitioned by the Swift compiler build id (e.g. .../disk_cache/swiftlang-6.3.3.1.3),
+# so a `.swiftmodule` built by one swiftc is never served as a cache hit to a
+# build running a different swiftc. `bazel clean --expunge` clears the output
+# base but NOT --disk_cache, so a single static disk cache persists cross-version
+# modules across Xcode upgrades and across heterogeneous agents. Do not add a
+# static build:ci-darwin --disk_cache here — it would reintroduce that skew.
 
 
