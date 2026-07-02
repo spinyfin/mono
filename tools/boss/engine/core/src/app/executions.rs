@@ -437,19 +437,49 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
             return;
         }
         tracing::info!(run_id = %run_id, "stop_run requested");
-        let handler = server_state.completion_handler.clone();
-        let run_id_for_release = run_id.clone();
-        tokio::spawn(async move {
-            // Use `force_stop_execution` instead of plain
-            // `force_release`: this additionally cancels the
-            // execution row and demotes the task from `active`
-            // back to `todo` so the orphan sweep and
-            // `reconcile_active_dispatch` cannot immediately
-            // re-dispatch the work item the moment the worker
-            // pool slot is freed.
-            handler.force_stop_execution(&run_id_for_release).await;
-        });
-        send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
+        // Use `force_stop_execution` instead of plain `force_release`:
+        // this additionally cancels the execution row and demotes the
+        // task from `active` back to `todo` so the orphan sweep and
+        // `reconcile_active_dispatch` cannot immediately re-dispatch the
+        // work item the moment the worker pool slot is freed.
+        //
+        // Awaited (not fire-and-forget) so the response below can report
+        // the *actual* pane-vacate outcome instead of always claiming
+        // success — the operator directive from the zombie-Riker-pane
+        // incident (2026-07-01/02) is explicit: "the verb should fail
+        // loudly if the app cannot be reached, not silently leave the
+        // pane." A stopped process with a still-rendered pane is exactly
+        // the state that left no working verb to recover from.
+        let app_confirmed = server_state.completion_handler.force_stop_execution(&run_id).await;
+        if app_confirmed {
+            // The slot-keyed release above already reached the app and
+            // positively confirmed the pane close — `force_vacate_run`'s
+            // run-id-keyed fallback exists to recover a pane whose slot
+            // mapping is already gone, and that mapping was just
+            // consumed here, so a second app round trip would always
+            // resolve to `NothingToVacate`. Skip it.
+            send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
+            return;
+        }
+        match server_state.force_vacate_run(&run_id).await {
+            ForceVacateOutcome::Vacated | ForceVacateOutcome::NothingToVacate => {
+                send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
+            }
+            ForceVacateOutcome::AppUnreachable(err) => {
+                tracing::warn!(run_id = %run_id, %err, "stop_run: process/lease stopped but pane vacate unconfirmed");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "run {run_id} was stopped (process killed, lease released), but the app \
+                             pane could not be confirmed vacated: {err}. Reconnect or restart the app \
+                             — the reconciliation sweep clears it automatically on reconnect."
+                        ),
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -556,7 +586,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
             return;
         }
         let reason = "manual reap via bossctl agents reap";
-        match server_state.work_db.mark_execution_orphaned(&run_id, reason) {
+        let execution = match server_state.work_db.mark_execution_orphaned(&run_id, reason) {
             Ok(execution) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -564,14 +594,65 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "reap_run: marked execution orphaned (workspace preserved)",
                 );
-                send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });
+                execution
             }
             Err(err) => {
+                // Idempotent escape hatch: an execution already in a
+                // terminal status is not a reason to refuse the whole
+                // verb — it is exactly the state `agents reap` exists to
+                // recover from. The zombie-Riker-pane incident
+                // (2026-07-01/02) hit precisely this dead end: the
+                // engine considered the execution fully terminal, `reap`
+                // refused with "already terminal", `stop` refused with
+                // "no live worker" (its slot mapping was already gone),
+                // and the app kept rendering a corpse pane with no verb
+                // able to clear it. Skip the status mutation (nothing to
+                // change) but still fall through to the pane vacate below.
+                match server_state.work_db.get_execution(&run_id) {
+                    Ok(existing) if existing.status.is_terminal() => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            status = %existing.status,
+                            "reap_run: execution already terminal; skipping status mutation, \
+                             still attempting pane vacate",
+                        );
+                        existing
+                    }
+                    _ => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        // Unlike the historical DB-only reap, always attempt to vacate
+        // the pane too — `mark_execution_orphaned` deliberately never
+        // touched the pane or process, which is why a reaped execution
+        // could still leave a pane rendered indefinitely. Fail loudly
+        // (matching `bossctl agents stop`) instead of reporting `reaped`
+        // while the pane may still be on screen.
+        match server_state.force_vacate_run(&run_id).await {
+            ForceVacateOutcome::Vacated | ForceVacateOutcome::NothingToVacate => {
+                send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });
+            }
+            ForceVacateOutcome::AppUnreachable(err) => {
+                tracing::warn!(run_id = %run_id, %err, "reap_run: execution reaped but pane vacate unconfirmed");
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: err.to_string(),
+                        message: format!(
+                            "execution {} reaped in the database, but the app pane could not be \
+                             confirmed vacated: {err}. Reconnect or restart the app — the \
+                             reconciliation sweep clears it automatically on reconnect.",
+                            execution.id
+                        ),
                     },
                 );
             }

@@ -301,3 +301,123 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
         )
     }
 }
+
+@MainActor
+final class WorkersWorkspaceModelVacateByRunIdTests: XCTestCase {
+    private func makeSpawn(slot: Int, runId: String) -> EngineSpawnRequest {
+        EngineSpawnRequest(
+            runId: runId,
+            workspacePath: "/tmp/ws",
+            slotId: slot,
+            initialInput: "claude\n",
+            env: [],
+            summary: nil,
+            taskTitle: nil
+        )
+    }
+
+    func testVacatesTheSlotHostingTheGivenRunId() {
+        // The engine's own slot bookkeeping is irrelevant here — the
+        // whole point of `vacatePaneByRunId` is to resolve purely from
+        // this model's own inventory, which is what recovers a pane
+        // whose slot mapping the engine already forgot (the
+        // zombie-Riker/Garak-pane incident, 2026-07-01/02).
+        let model = WorkersWorkspaceModel()
+        _ = model.spawnWorkerPane(makeSpawn(slot: 6, runId: "run-corpse"))
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 6 })?.session)
+
+        let vacated = model.vacatePaneByRunId("run-corpse", killGraceSeconds: 0)
+        XCTAssertTrue(vacated, "a pane hosting the run id was found and must be reported as vacated")
+        XCTAssertNil(
+            model.slots.first(where: { $0.slotId == 6 })?.session,
+            "the matching slot's session must be cleared"
+        )
+    }
+
+    func testReturnsFalseWithoutErrorWhenNoPaneMatches() {
+        // Idempotent no-op: a run id this model has never heard of
+        // (already closed through the ordinary path, or never spawned
+        // in this app instance) must not be treated as a failure.
+        let model = WorkersWorkspaceModel()
+        XCTAssertFalse(model.vacatePaneByRunId("run-never-existed", killGraceSeconds: 0))
+    }
+
+    func testMatchesAcrossAutomationAndReviewPoolsNotJustMainWorkers() {
+        // Second zombie species from the same incident night: a
+        // pr_review pane survived finalization. `vacatePaneByRunId`
+        // must scan the review pool too, not just the main worker grid.
+        let model = WorkersWorkspaceModel()
+        let reviewSlotId = WorkersWorkspaceModel.reviewSlotBase
+        _ = model.spawnWorkerPane(makeSpawn(slot: reviewSlotId, runId: "run-reviewer-corpse"))
+        XCTAssertNotNil(model.reviewSlots.first(where: { $0.slotId == reviewSlotId })?.session)
+
+        XCTAssertTrue(model.vacatePaneByRunId("run-reviewer-corpse", killGraceSeconds: 0))
+        XCTAssertNil(model.reviewSlots.first(where: { $0.slotId == reviewSlotId })?.session)
+    }
+}
+
+@MainActor
+final class WorkersWorkspaceModelReconcilePanesTests: XCTestCase {
+    private func makeSpawn(slot: Int, runId: String) -> EngineSpawnRequest {
+        EngineSpawnRequest(
+            runId: runId,
+            workspacePath: "/tmp/ws",
+            slotId: slot,
+            initialInput: "claude\n",
+            env: [],
+            summary: nil,
+            taskTitle: nil
+        )
+    }
+
+    func testClosesPanesMissingFromTheLiveSetAndKeepsTheRest() {
+        // The reconciliation sweep run at minimum on app launch and on
+        // engine reconnect (zombie-Riker/Garak-pane incident,
+        // 2026-07-01/02): a pane whose run id is absent from the
+        // engine's live snapshot is stale and must close; a pane whose
+        // run id IS present must be left alone.
+        let model = WorkersWorkspaceModel()
+        _ = model.spawnWorkerPane(makeSpawn(slot: 1, runId: "run-stale"))
+        _ = model.spawnWorkerPane(makeSpawn(slot: 2, runId: "run-live"))
+
+        let vacatedSlotIDs = model.reconcilePanes(liveRunIds: ["run-live"])
+
+        XCTAssertEqual(vacatedSlotIDs, [1], "only the pane missing from the live set should be vacated")
+        XCTAssertNil(model.slots.first(where: { $0.slotId == 1 })?.session, "stale pane must be closed")
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 2 })?.session, "live pane must be left alone")
+    }
+
+    func testNoOpWhenEveryHostedPaneIsInTheLiveSet() {
+        let model = WorkersWorkspaceModel()
+        _ = model.spawnWorkerPane(makeSpawn(slot: 1, runId: "run-live"))
+
+        let vacatedSlotIDs = model.reconcilePanes(liveRunIds: ["run-live", "run-elsewhere"])
+
+        XCTAssertTrue(vacatedSlotIDs.isEmpty)
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+    }
+
+    func testNoOpWhenNoPanesAreHosted() {
+        let model = WorkersWorkspaceModel()
+        XCTAssertTrue(model.reconcilePanes(liveRunIds: []).isEmpty)
+    }
+
+    func testSkipsTheSweepWhenTheLiveSnapshotIsEmptyEvenWithHostedPanes() {
+        // An empty snapshot must read as "unknown", not "everything is
+        // dead": the engine's in-memory live-worker registry is empty
+        // on every fresh engine start (crash/upgrade/manual restart),
+        // while this app's local worker/reviewer panes keep running
+        // real, unfinished work across that restart. Treating "absent
+        // from an empty registry" as death would SIGKILL every hosted
+        // pane on the very first reconnect after a routine engine
+        // restart. Reconciliation must wait for a snapshot that
+        // actually reflects live runs before closing anything.
+        let model = WorkersWorkspaceModel()
+        _ = model.spawnWorkerPane(makeSpawn(slot: 1, runId: "run-still-working"))
+
+        let vacatedSlotIDs = model.reconcilePanes(liveRunIds: [])
+
+        XCTAssertTrue(vacatedSlotIDs.isEmpty, "an empty live snapshot must not be treated as a kill signal")
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session, "hosted pane must survive an empty snapshot")
+    }
+}

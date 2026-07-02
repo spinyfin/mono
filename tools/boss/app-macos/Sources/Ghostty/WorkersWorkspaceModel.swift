@@ -232,6 +232,91 @@ final class WorkersWorkspaceModel: ObservableObject {
         return .success
     }
 
+    /// Close whichever pane (if any) is hosting `runId`, wherever it
+    /// lives — main worker, automation, or review pool. Unlike
+    /// `releaseWorkerPane(slotId:)`, this does not require the caller
+    /// to already know the slot id: it scans this model's OWN pane
+    /// inventory by run id, which is authoritative for what is actually
+    /// on screen regardless of what the engine's slot bookkeeping
+    /// currently believes.
+    ///
+    /// This is the run-id-keyed escape hatch `bossctl agents stop` /
+    /// `bossctl agents reap` fall back to when the engine's normal
+    /// slot-keyed teardown finds nothing to release — the exact gap
+    /// behind the zombie-Riker/Garak-pane incident (2026-07-01/02): a
+    /// prior teardown attempt had already consumed the engine's
+    /// slot↔run-id mapping while the app was unreachable, leaving no
+    /// way for a later verb to resolve which slot to close.
+    ///
+    /// Returns `true` when a pane was found and closed; `false` is not
+    /// a failure — it means this model has no pane under that run id,
+    /// which is the idempotent "nothing to do" case (e.g. the pane
+    /// already closed through the ordinary path).
+    func vacatePaneByRunId(_ runId: String, killGraceSeconds: UInt32) -> Bool {
+        let allPools = [slots, automationSlots, reviewSlots]
+        guard let slot = allPools.lazy.flatMap({ $0 }).first(where: { $0.runId == runId && $0.session != nil }) else {
+            return false
+        }
+        if case .success = releaseWorkerPane(slotId: slot.slotId, killGraceSeconds: killGraceSeconds) {
+            return true
+        }
+        return false
+    }
+
+    /// Close every locally-hosted pane whose run id is NOT present in
+    /// `liveRunIds` — the engine's current live-worker snapshot
+    /// (fetched via `list_worker_live_states` on every connect/reconnect,
+    /// and pushed on the `worker.live_states` topic thereafter).
+    ///
+    /// This is the automatic recovery for a lost pane-teardown message:
+    /// when the engine tears down a run, it drops that run from its own
+    /// live-state registry UNCONDITIONALLY — independent of whether the
+    /// app was reachable to confirm the pane close (see
+    /// `ServerState.release_worker_pane_detailed` on the engine side).
+    /// So "missing from the live set" is a sound and sufficient signal
+    /// that any locally-rendered pane under that run id is stale, even
+    /// with zero information about what specifically happened to it.
+    ///
+    /// Must run at minimum on app launch and on every engine reconnect
+    /// — see `ChatViewModel`'s `.connected` handler — so a stale pane
+    /// never survives indefinitely just because one teardown event was
+    /// lost (the zombie-Riker/Garak-pane incident, 2026-07-01/02).
+    ///
+    /// Returns the vacated slot ids, purely for caller-side logging.
+    ///
+    /// Guard: an EMPTY `liveRunIds` snapshot is treated as "unknown",
+    /// never as "everything is dead", and the sweep is skipped entirely.
+    /// The engine's in-memory live-worker registry is rebuilt from
+    /// scratch on every engine restart (crash/upgrade/manual restart);
+    /// engine-startup reattach only re-populates REMOTE runs
+    /// (`remote_reattach.rs`), so a restarted engine reports an empty
+    /// local live set even while this app's local worker/reviewer
+    /// panes are still running real, unfinished work. Without this
+    /// guard the very first post-restart reconnect would read as "no
+    /// runs are live" and `releaseWorkerPane` would SIGKILL every
+    /// locally-hosted pane's process tree — turning a routine engine
+    /// restart into a mass kill of in-progress work. A genuinely idle
+    /// app (zero locally-hosted panes) is unaffected either way, since
+    /// the loop below is then a no-op regardless of this guard.
+    @discardableResult
+    func reconcilePanes(liveRunIds: Set<String>) -> [Int] {
+        guard !liveRunIds.isEmpty else {
+            return []
+        }
+        var vacatedSlotIDs: [Int] = []
+        for pool in [slots, automationSlots, reviewSlots] {
+            for slot in pool {
+                guard slot.session != nil, let runId = slot.runId, !liveRunIds.contains(runId) else {
+                    continue
+                }
+                if case .success = releaseWorkerPane(slotId: slot.slotId, killGraceSeconds: 5) {
+                    vacatedSlotIDs.append(slot.slotId)
+                }
+            }
+        }
+        return vacatedSlotIDs
+    }
+
     /// Resolve the foreground pid of the pty hosting `session`, or
     /// `nil` if the session never reached the point of having one
     /// (surface not yet attached, or the child already exited). Reads

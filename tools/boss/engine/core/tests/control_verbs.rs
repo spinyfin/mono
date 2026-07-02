@@ -24,15 +24,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest,
-    RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
+    CreateChoreInput, CreateProductInput, CreateRunInput, EngineToAppRequest, EngineToAppResponse, ExecutionStatus,
+    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, ReleaseWorkerPaneResult,
+    RequestExecutionInput, TaskStatus, VacatePaneByRunIdResult, WorkItem, WorkItemPatch,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 // linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
 // concurrent test load the first batch of tests blocks on the
@@ -88,6 +92,101 @@ impl TestEngine {
 impl Drop for TestEngine {
     fn drop(&mut self) {
         self.join.abort();
+    }
+}
+
+/// A second connection to the engine that registers as the macOS app
+/// session and auto-acknowledges whatever `EngineRequest` pane-teardown
+/// pushes arrive (`ReleaseWorkerPane` / `VacatePaneByRunId`) with a
+/// canned success. Exists to prove the end-to-end contract added for
+/// the zombie-Riker-pane incident (2026-07-01/02): `bossctl agents
+/// reap` on an already-terminal execution must actually vacate the
+/// pane when an app session CAN confirm it, not just when the DB
+/// bookkeeping allows a status flip. `BossClient::send_request` cannot
+/// be reused here — it silently discards any line that isn't the
+/// response to the request it just sent, which would drop every
+/// pushed `EngineRequest` frame before this harness ever saw it.
+struct FakeAppSession {
+    reader: Lines<BufReader<OwnedReadHalf>>,
+    writer: OwnedWriteHalf,
+}
+
+impl FakeAppSession {
+    async fn connect(socket_path: &str) -> Result<Self> {
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("fake app session: connect to {socket_path}"))?;
+        let (read_half, write_half) = stream.into_split();
+        let mut session = Self {
+            reader: BufReader::new(read_half).lines(),
+            writer: write_half,
+        };
+        session
+            .send_raw("fake-app-register", &FrontendRequest::RegisterAppSession)
+            .await?;
+        loop {
+            let envelope = session.next_envelope().await?;
+            match envelope.payload {
+                FrontendEvent::AppSessionRegistered => break,
+                // EnginePoolConfig is pushed unprompted right after
+                // registration; skip it and keep waiting for the ack.
+                _ => continue,
+            }
+        }
+        Ok(session)
+    }
+
+    async fn send_raw(&mut self, request_id: &str, request: &FrontendRequest) -> Result<()> {
+        let payload = serde_json::to_string(&FrontendRequestEnvelope {
+            request_id: request_id.to_owned(),
+            payload: request.clone(),
+        })?;
+        self.writer.write_all(payload.as_bytes()).await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    async fn next_envelope(&mut self) -> Result<FrontendEventEnvelope> {
+        loop {
+            let line = self
+                .reader
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow!("fake app session: engine closed the socket"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            return serde_json::from_str(&line)
+                .with_context(|| format!("fake app session: failed to decode engine event: {line}"));
+        }
+    }
+
+    /// Wait for the next `EngineRequest` push and reply with a canned
+    /// success for whichever pane-teardown request it carries. Returns
+    /// the request that was answered so the caller can assert on it.
+    async fn auto_ack_next_pane_teardown(&mut self) -> Result<EngineToAppRequest> {
+        loop {
+            let envelope = self.next_envelope().await?;
+            let FrontendEvent::EngineRequest { request_id, request } = envelope.payload else {
+                continue;
+            };
+            let response = match &request {
+                EngineToAppRequest::ReleaseWorkerPane(_) => EngineToAppResponse::ReleaseWorkerPane {
+                    result: Ok(ReleaseWorkerPaneResult {}),
+                },
+                EngineToAppRequest::VacatePaneByRunId(_) => EngineToAppResponse::VacatePaneByRunId {
+                    result: Ok(VacatePaneByRunIdResult { vacated: true }),
+                },
+                other => panic!("fake app session: unexpected EngineRequest in test: {other:?}"),
+            };
+            self.send_raw(
+                "fake-app-ack",
+                &FrontendRequest::EngineResponse { request_id, response },
+            )
+            .await?;
+            return Ok(request);
+        }
     }
 }
 
@@ -525,6 +624,68 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
 }
 
 #[tokio::test]
+async fn agents_stop_vacates_pane_via_fallback_when_app_confirms() -> Result<()> {
+    // Operator directive from the zombie-Riker-pane incident
+    // (2026-07-01/02): "the verb should fail loudly if the app cannot
+    // be reached, not silently leave the pane" — the positive half of
+    // that contract. `bossctl agents stop` on a real (but never
+    // actually spawned in this test) execution must round-trip through
+    // the app before reporting success, using the run-id-keyed
+    // `VacatePaneByRunId` fallback since no slot was ever mapped.
+    let engine = TestEngine::spawn().await?;
+    let mut app_session = FakeAppSession::connect(engine.socket_str()).await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let stop_request = FrontendRequest::StopRun {
+        run_id: execution_id.clone(),
+    };
+    let (response, acked) = tokio::join!(
+        client.send_request(&stop_request),
+        app_session.auto_ack_next_pane_teardown(),
+    );
+    assert!(matches!(acked?, EngineToAppRequest::VacatePaneByRunId(_)));
+    match response? {
+        FrontendEvent::RunStopped { run_id } => assert_eq!(run_id, execution_id),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_stop_fails_loudly_when_app_unreachable_for_existing_execution() -> Result<()> {
+    // The negative half of the same contract: when the target
+    // execution genuinely exists (so there is real reason to believe a
+    // pane might still be up) but no app session is registered at all,
+    // `stop` must surface a hard error instead of the old
+    // fire-and-forget `RunStopped` that could report success while a
+    // pane stayed rendered forever.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let response = client
+        .send_request(&FrontendRequest::StopRun {
+            run_id: execution_id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("pane") || message.contains("app"),
+                "expected an app/pane-vacate-confirmation error, got: {message}"
+            );
+        }
+        other => {
+            return Err(anyhow!(
+                "expected WorkError when the app cannot confirm the vacate, got: {other:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // Same regression class as `agents_stop` (PR #218): the BossOnly
     // gate rejected `bossctl probe` calls from worker-pane shells
@@ -723,11 +884,21 @@ async fn agents_interrupt_does_not_reject_local_caller_as_boss_only() -> Result<
 async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
     // Drive a seeded chore from `ready` → `running` (so it has the
     // workspace columns the orphan path needs to preserve), then send
-    // a `ReapRun` and verify:
-    //   - the engine returns `RunReaped` with status='orphaned',
-    //   - cube workspace columns are preserved on the row,
-    //   - a second reap on the now-terminal row errors cleanly.
+    // a `ReapRun` and verify the engine returns `RunReaped` with
+    // status='orphaned' and cube workspace columns preserved.
+    //
+    // `reap` now always attempts a pane vacate alongside the status
+    // mutation (see `ForceVacateOutcome` in `app.rs`), so a fake app
+    // session must be attached for the request to succeed at all —
+    // without one, `WorkError` is the correct outcome (see
+    // `agents_reap_fails_loudly_when_app_unreachable_for_existing_execution`).
+    // Idempotency on an already-terminal row (the zombie-Riker-pane
+    // incident's core fix, 2026-07-01/02: `reap` used to hard-refuse
+    // with "already terminal" and leave no verb able to clear a corpse
+    // pane) is covered by
+    // `agents_reap_is_idempotent_on_terminal_execution_when_app_confirms`.
     let engine = TestEngine::spawn().await?;
+    let mut app_session = FakeAppSession::connect(engine.socket_str()).await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
@@ -744,12 +915,15 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
         "/tmp/mono-agent-007",
     )?;
 
-    let response = client
-        .send_request(&FrontendRequest::ReapRun {
-            run_id: execution_id.clone(),
-        })
-        .await?;
-    let reaped = match response {
+    let reap_request = FrontendRequest::ReapRun {
+        run_id: execution_id.clone(),
+    };
+    let (response, acked) = tokio::join!(
+        client.send_request(&reap_request),
+        app_session.auto_ack_next_pane_teardown(),
+    );
+    assert!(matches!(acked?, EngineToAppRequest::VacatePaneByRunId(_)));
+    let reaped = match response? {
         FrontendEvent::RunReaped { run_id, execution } => {
             assert_eq!(run_id, execution_id);
             execution
@@ -763,20 +937,108 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
     assert_eq!(reaped.cube_lease_id.as_deref(), Some("lease-REAP"));
     assert_eq!(reaped.cube_workspace_id.as_deref(), Some("mono-agent-007"));
     assert_eq!(reaped.workspace_path.as_deref(), Some("/tmp/mono-agent-007"));
+    Ok(())
+}
 
-    // Second reap on the now-terminal row must error rather than
-    // silently no-op — same contract as `cancel_execution`.
+#[tokio::test]
+async fn agents_reap_fails_loudly_when_app_unreachable_for_existing_execution() -> Result<()> {
+    // Mirrors `agents_stop_fails_loudly_when_app_unreachable_for_existing_execution`:
+    // reap on a real execution with no app session registered must not
+    // silently report `RunReaped` while the pane may still be
+    // rendered — the exact failure mode the incident's DB-only reap
+    // used to hide.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
     let response = client
-        .send_request(&FrontendRequest::ReapRun { run_id: execution_id })
+        .send_request(&FrontendRequest::ReapRun {
+            run_id: execution_id.clone(),
+        })
         .await?;
     match response {
         FrontendEvent::WorkError { message } => {
             assert!(
-                message.contains("terminal"),
-                "expected terminal-status error, got: {message}"
+                !message.contains("terminal"),
+                "an unreachable app is a different failure than the old status refusal; got: {message}"
+            );
+            assert!(
+                message.contains("pane") || message.contains("app"),
+                "expected an app/pane-vacate-confirmation error, got: {message}"
             );
         }
         other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_reap_is_idempotent_on_terminal_execution_when_app_confirms() -> Result<()> {
+    // The literal acceptance test for the zombie-Riker/Garak-pane
+    // incident (2026-07-01/02): an execution that is already terminal
+    // (no live engine object, no slot mapping — the seed path here
+    // never spawns a real worker, so there is nothing for the normal
+    // slot-keyed release to find) plus an app session that DOES have a
+    // pane under this run id. `bossctl agents reap` must clear it —
+    // both on the reap that transitions the execution to `orphaned`
+    // AND on a second, purely idempotent reap of the same
+    // already-terminal row. Each reap is driven concurrently with the
+    // fake app session so the engine's `VacatePaneByRunId` fallback
+    // request can be observed and acknowledged.
+    let engine = TestEngine::spawn().await?;
+    let mut app_session = FakeAppSession::connect(engine.socket_str()).await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.start_execution_run(
+        &execution_id,
+        "test-agent",
+        "mono",
+        "lease-IDEMPOTENT",
+        "mono-agent-idempotent",
+        "/tmp/mono-agent-idempotent",
+    )?;
+
+    let first_reap_request = FrontendRequest::ReapRun {
+        run_id: execution_id.clone(),
+    };
+    let (first_response, first_acked) = tokio::join!(
+        client.send_request(&first_reap_request),
+        app_session.auto_ack_next_pane_teardown(),
+    );
+    assert!(
+        matches!(first_acked?, EngineToAppRequest::VacatePaneByRunId(_)),
+        "expected the run-id-keyed fallback (no slot was ever mapped for this execution)",
+    );
+    match first_response? {
+        FrontendEvent::RunReaped { run_id, execution } => {
+            assert_eq!(run_id, execution_id);
+            assert_eq!(execution.status, ExecutionStatus::Orphaned);
+        }
+        other => return Err(anyhow!("unexpected response to first reap: {other:?}")),
+    }
+
+    // Second reap on the now-terminal row: idempotent on the DB side,
+    // and still vacates (acknowledges) the pane rather than refusing.
+    let second_reap_request = FrontendRequest::ReapRun {
+        run_id: execution_id.clone(),
+    };
+    let (second_response, second_acked) = tokio::join!(
+        client.send_request(&second_reap_request),
+        app_session.auto_ack_next_pane_teardown(),
+    );
+    assert!(matches!(second_acked?, EngineToAppRequest::VacatePaneByRunId(_)));
+    match second_response? {
+        FrontendEvent::RunReaped { run_id, execution } => {
+            assert_eq!(run_id, execution_id);
+            assert_eq!(
+                execution.status,
+                ExecutionStatus::Orphaned,
+                "idempotent reap must report the still-terminal status, not error",
+            );
+        }
+        other => return Err(anyhow!("unexpected response to second (idempotent) reap: {other:?}")),
     }
     Ok(())
 }
