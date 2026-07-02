@@ -1906,9 +1906,19 @@ impl ExecutionCoordinator {
     /// the runner branches on `kind` to render the triage preamble and the
     /// completion handler branches on `kind` to run the outcome detector, so
     /// the synthetic fields never drive real task work.
+    ///
+    /// An `answer_agent` execution (P3b) binds to a `work_comments.id` for
+    /// the same reason — see [`crate::work::WorkDb::create_answer_agent_execution`]
+    /// — so it gets the same synthetic-item treatment via
+    /// [`Self::synthetic_answer_agent_work_item`].
     fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
         if execution.kind == ExecutionKind::AutomationTriage
             && let Some(item) = self.synthetic_triage_work_item(execution)
+        {
+            return Ok(item);
+        }
+        if execution.kind == ExecutionKind::AnswerAgent
+            && let Some(item) = self.synthetic_answer_agent_work_item(execution)
         {
             return Ok(item);
         }
@@ -1931,6 +1941,48 @@ impl ExecutionCoordinator {
             .repo_remote_url(execution.repo_remote_url.clone())
             .created_at(automation.created_at.clone())
             .updated_at(automation.updated_at.clone())
+            .build();
+        Some(WorkItem::Chore(task))
+    }
+
+    /// Build the synthetic `Chore` work item for an `answer_agent`
+    /// execution (P3b) from the bound comment and its resolved doc owner.
+    /// `None` when the comment is gone, or its doc owner no longer resolves
+    /// (both are the same "engine state raced under us mid-flight"
+    /// tolerance `synthetic_triage_work_item` already applies — the caller
+    /// falls back to the normal `get_work_item`, which fails cleanly).
+    ///
+    /// `product_id` is the doc owner task's product — needed for host
+    /// capability resolution ([`Self::select_host_for_execution`]); `name`/
+    /// `description` surface the question in cube's task label / change
+    /// title. Like the triage synthetic item, these fields only feed spawn
+    /// plumbing: the runner (P3b) composes the real answer-agent prompt
+    /// separately, and the completion handler branches on `kind` to
+    /// finalise the run instead of doing PR detection.
+    fn synthetic_answer_agent_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {
+        let comment = self.work_db.get_comment(&execution.work_item_id).ok().flatten()?;
+        let doc_owner = self
+            .work_db
+            .resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id)
+            .ok()
+            .flatten()?;
+        let owner_item = self.work_db.get_work_item(&doc_owner.task_id).ok()?;
+        let product_id = work_item_product_id(&owner_item);
+        let short_quote = if comment.body.chars().count() > 60 {
+            format!("{}…", comment.body.chars().take(60).collect::<String>())
+        } else {
+            comment.body.clone()
+        };
+        let task = boss_protocol::Task::builder()
+            .id(comment.id.clone())
+            .product_id(product_id)
+            .kind(TaskKind::Chore)
+            .name(format!("Answer comment: {short_quote}"))
+            .description(comment.body.clone())
+            .status(TaskStatus::Active)
+            .repo_remote_url(execution.repo_remote_url.clone())
+            .created_at(comment.created_at.clone())
+            .updated_at(comment.updated_at.clone())
             .build();
         Some(WorkItem::Chore(task))
     }

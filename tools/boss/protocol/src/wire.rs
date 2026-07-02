@@ -283,6 +283,23 @@ pub enum FrontendRequest {
         include_resolved: bool,
     },
 
+    /// Worker-callable: post the read-only answer agent's reply (P3b of
+    /// `comment-triggered-document-revisions.md`). The engine resolves
+    /// `run_id` (the caller's own `BOSS_RUN_ID`, i.e. `work_executions.id`) to
+    /// its bound comment and the comment's `running` `answer_agent_runs`
+    /// row — the caller cannot target any other comment or run, by
+    /// construction (see `boss comment reply`'s security note). On success:
+    /// completes the run (`replied`), appends an `entry_kind = 'answer'`
+    /// `comment_thread_entries` row, and transitions the comment
+    /// `answering → answered`. Errors (unknown run, run not
+    /// `answer_agent`-kind, no `running` row for its comment, or a duplicate
+    /// call after the run already completed) surface as `WorkError` so the
+    /// agent sees it failed rather than silently no-op-ing.
+    CommentsPostAnswer {
+        run_id: String,
+        body: String,
+    },
+
     /// Resolve every active comment on an artifact against the renderer's
     /// current plain-text projection. The engine runs the
     /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting
@@ -2495,7 +2512,7 @@ pub enum FrontendEvent {
 
     // --- Comments in the markdown viewer (Phase 2) replies. ---
     /// Reply to `comments_create` / `comments_dismiss` /
-    /// `comments_set_status` / `comments_update_anchor`.
+    /// `comments_set_status` / `comments_update_anchor` / `comments_post_answer`.
     CommentResult {
         comment: WorkComment,
     },

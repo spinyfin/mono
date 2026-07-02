@@ -1736,6 +1736,9 @@ async fn sweep_pending_pr(handler: &WorkerCompletionHandler, execution_id: &str,
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
+        // P3b: an answer_agent outcome only comes from the on-Stop
+        // finalizer, never from a PR-detection recheck.
+        | StopOutcome::AnswerAgent { .. }
         // P992 task 7: ReviewerEnqueued is handled in its own arm above.
         // ReviewPassCompleted/ReviewPassRevisionCreated/ReviewPassAwaitingResult
         // only come from on-Stop (reviewer finalisation).
@@ -1802,6 +1805,9 @@ async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCand
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
+        // P3b: an answer_agent outcome only comes from the on-Stop
+        // finalizer, never from a late-PR recheck.
+        | StopOutcome::AnswerAgent { .. }
         // P992 task 7/8: reviewer-related outcomes are handled on the on-Stop
         // path; covered here for exhaustiveness.
         | StopOutcome::ReviewerEnqueued { .. }

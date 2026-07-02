@@ -37,8 +37,9 @@ use crate::protocol::{
 };
 use crate::repo_slug;
 use crate::work::{
-    ActionedAttentionGroup, DuplicateTaskError, ExecutionStatus, GhPrStateChecker, ReviseDocOutcome,
-    SetRunTranscriptPathOutcome, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, CreateChoreInput, DuplicateTaskError, ExecutionKind,
+    ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ReviseDocOutcome, SetRunTranscriptPathOutcome,
+    THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -2390,6 +2391,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
             r @ FrontendRequest::CommentsDismiss { .. } => comments::handle_comments_dismiss(ctx, r).await,
             r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
+            r @ FrontendRequest::CommentsPostAnswer { .. } => comments::handle_comments_post_answer(ctx, r).await,
             r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
             r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,
             r @ FrontendRequest::CommentsSetIntent { .. } => comments::handle_comments_set_intent(ctx, r).await,

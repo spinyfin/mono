@@ -128,6 +128,73 @@ impl WorkDb {
             .optional()
             .map_err(Into::into)
     }
+
+    /// Create a `ready` `answer_agent` work_execution bound to a comment
+    /// (P3b of `comment-triggered-document-revisions.md`).
+    ///
+    /// An answer-agent execution's `work_item_id` is the `work_comments.id`,
+    /// not a task — so, exactly like
+    /// [`Self::create_automation_triage_execution`], it cannot go through
+    /// the task-centric `insert_execution` resolvers. We insert the row
+    /// directly. This choice also gives the per-comment concurrency guard
+    /// the design requires "for free": `get_live_execution_for_work_item`
+    /// (keyed on `work_item_id`) already refuses a second live execution for
+    /// the same `work_item_id`, so at most one answer-agent execution can be
+    /// live per comment at a time. Downstream: the dispatcher routes it to
+    /// the main pool (its `work_item_id` never resolves via
+    /// `source_automation_id_for_work_item`, so it falls through to
+    /// `worker_pool`), the coordinator resolves a synthetic work item from
+    /// the comment for the task-centric spawn plumbing, the runner renders
+    /// the answer-agent prompt, and the completion handler branches on
+    /// `kind` to finalise the run instead of doing PR detection. The row
+    /// starts `ready` so the coordinator's normal drain picks it up.
+    pub fn create_answer_agent_execution(&self, comment_id: &str, repo_remote_url: &str) -> Result<WorkExecution> {
+        let conn = self.connect()?;
+        let id = next_id("exec");
+        let now = now_string();
+        let branch_naming_json = serde_json::to_string(&boss_protocol::BranchNaming::default()).unwrap_or_default();
+        // Column list mirrors `create_automation_triage_execution` /
+        // `insert_execution`; every column it omits has a schema DEFAULT
+        // (pre_start_failure_count=0, dispatch_not_before=NULL,
+        // transient_failure_count=0, host_id='local', …).
+        conn.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
+                allow_dirty, branch_naming
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, NULL, NULL, NULL, NULL, 0, NULL, ?5, NULL, NULL, 0, NULL, NULL, 0, ?6)",
+            params![
+                id,
+                comment_id,
+                boss_protocol::EXECUTION_KIND_ANSWER_AGENT,
+                repo_remote_url,
+                now,
+                branch_naming_json,
+            ],
+        )?;
+        query_execution(&conn, &id)?.with_context(|| format!("missing answer-agent execution after insert: {id}"))
+    }
+
+    /// The comment's currently-`running` answer-agent run, if any. Used by
+    /// `CommentsPostAnswer` (P3b) to resolve "the run this reply belongs to"
+    /// once the caller's `BOSS_RUN_ID` has been resolved to a comment via its
+    /// bound `work_executions` row, and by `finalize_answer_agent` to detect
+    /// a Stop that arrived without a reply ever having been posted. At most
+    /// one row can match by construction: a fresh run is only ever created
+    /// once the prior run for the same comment has left `running`.
+    pub fn running_answer_agent_run_for_comment(&self, comment_id: &str) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        let cols = Self::answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE comment_id = ?1 AND status = ?2 LIMIT 1");
+        conn.query_row(
+            &sql,
+            params![comment_id, ANSWER_AGENT_RUN_STATUS_RUNNING],
+            map_answer_agent_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +345,22 @@ mod tests {
         // A comment with no runs returns None.
         let other = make_comment(&db, "t2");
         assert!(db.latest_answer_agent_run_for_comment(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn running_run_lookup_finds_only_the_running_row() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        assert!(db.running_answer_agent_run_for_comment(&comment).unwrap().is_none());
+
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let running = db.running_answer_agent_run_for_comment(&comment).unwrap().unwrap();
+        assert_eq!(running.id, run.id);
+
+        db.complete_answer_agent_run(&run.id, "replied", Some("done"), None)
+            .unwrap();
+        assert!(db.running_answer_agent_run_for_comment(&comment).unwrap().is_none());
     }
 }

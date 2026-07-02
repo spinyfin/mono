@@ -152,6 +152,54 @@ impl WorkDb {
         self.set_comment_status(comment_id, COMMENT_STATUS_RESOLVED, actor)
     }
 
+    /// Bucket-2 track (P3b): `active → answering`, fired once the classifier
+    /// resolves `intent = question` and the engine has spawned an
+    /// answer-agent run for the comment. Guarded on `status = 'active'` — the
+    /// state machine's "classifying → answering" row (design §"Comment/thread
+    /// state machine"); a comment isn't classified with a `status` of its
+    /// own (`intent IS NULL` *is* "classifying" — see 1a), so every comment
+    /// sits `active` throughout classification and this is the first status
+    /// transition bucket 2 makes. Not exposed via the general
+    /// [`Self::set_comment_status`] / `CommentsSetStatus` RPC — this is an
+    /// engine-internal transition.
+    pub fn transition_comment_to_answering(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![comment_id, COMMENT_STATUS_ANSWERING, now, COMMENT_STATUS_ACTIVE],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'active' (expected active → answering)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after answering transition: {comment_id}"))
+    }
+
+    /// Bucket-2 track (P3b): `answering → answered`, fired when the answer
+    /// agent posts its reply (`CommentsPostAnswer`) or when its run ends
+    /// without one (`finalize_answer_agent`'s no-reply-posted path — an
+    /// apology thread entry stands in for the missing answer so the thread
+    /// isn't left silently stuck). Guarded on `status = 'answering'`,
+    /// mirroring the design's idempotency table.
+    pub fn transition_comment_to_answered(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![comment_id, COMMENT_STATUS_ANSWERED, now, COMMENT_STATUS_ANSWERING],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'answering' (expected answering → answered)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after answered transition: {comment_id}"))
+    }
+
     /// Persist the async classifier's output onto a comment's intent
     /// columns — called from the detached task spawned off `CommentsCreate`
     /// (comment-intent-classification design § "The classifier"). Guarded
@@ -926,5 +974,45 @@ mod tests {
             .migrate_work_item_comments_to_pr_doc("task-empty", "pr_doc:r:b:p.md", None, 0, &cfg())
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // --- Bucket-2 status transitions (P3b) ---
+
+    #[test]
+    fn transition_to_answering_from_active_succeeds() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert_eq!(comment.status, "active");
+
+        let answering = db.transition_comment_to_answering(&comment.id).unwrap();
+        assert_eq!(answering.status, "answering");
+        assert_eq!(answering.status_actor.as_deref(), Some("engine"));
+    }
+
+    #[test]
+    fn transition_to_answering_rejects_non_active_source() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        // Already 'answering' — a second call must not silently re-fire.
+        assert!(db.transition_comment_to_answering(&comment.id).is_err());
+    }
+
+    #[test]
+    fn transition_to_answered_from_answering_succeeds() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        let answered = db.transition_comment_to_answered(&comment.id).unwrap();
+        assert_eq!(answered.status, "answered");
+    }
+
+    #[test]
+    fn transition_to_answered_rejects_non_answering_source() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        // Still 'active' — never entered 'answering'.
+        assert!(db.transition_comment_to_answered(&comment.id).is_err());
     }
 }
