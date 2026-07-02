@@ -46,6 +46,7 @@ use boss_protocol::{
     ProposedEdge, ProposedTask, SetProjectDesignDocInput, TaskBrief, TaskKind,
 };
 
+use boss_engine::coordinator::NoopExecutionPublisher;
 use boss_engine::doc_fetcher::DocFetchOutcome;
 use boss_engine::materializer::Materializer;
 use boss_engine::planner::{PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
@@ -563,6 +564,7 @@ async fn run_fixture_and_assert(fixture: &Fixture) {
         &steps_for(fixture.doc, fixture.output()),
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -630,6 +632,7 @@ async fn fan_out_roots_have_no_prerequisites() {
         &steps_for(fixture.doc, fixture.output()),
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -691,7 +694,14 @@ async fn double_fire_is_idempotent_for_every_fixture() {
         let (product_id, project_id, design_id) = seed(&db);
         let ctx = ctx(&product_id, &project_id, &design_id);
 
-        let first = Populator::run(&db, &steps_for(fixture.doc, fixture.output()), &ctx, DEFAULT_MAX_TASKS).await;
+        let first = Populator::run(
+            &db,
+            &steps_for(fixture.doc, fixture.output()),
+            &ctx,
+            DEFAULT_MAX_TASKS,
+            &NoopExecutionPublisher,
+        )
+        .await;
         assert!(
             matches!(first, PopulateOutcome::Staged { .. }),
             "[{}] first fire stages",
@@ -703,7 +713,14 @@ async fn double_fire_is_idempotent_for_every_fixture() {
 
         // Second trigger for the same project (poller restart / concurrent
         // merge / manual retry). The live `planner_runs` row is the gate.
-        let second = Populator::run(&db, &steps_for(fixture.doc, fixture.output()), &ctx, DEFAULT_MAX_TASKS).await;
+        let second = Populator::run(
+            &db,
+            &steps_for(fixture.doc, fixture.output()),
+            &ctx,
+            DEFAULT_MAX_TASKS,
+            &NoopExecutionPublisher,
+        )
+        .await;
         assert_eq!(
             second,
             PopulateOutcome::SkippedAlreadyPopulated,
@@ -756,6 +773,7 @@ async fn no_breakdown_is_clean_no_op() {
         &steps_for(DOC_NO_BREAKDOWN, output),
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -790,6 +808,7 @@ async fn cyclic_proposal_on_real_graph_is_rejected() {
         &steps_for(fixture.doc, output),
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -814,6 +833,7 @@ async fn over_cap_rejects_whole_real_graph() {
         &steps_for(fixture.doc, fixture.output()),
         &ctx(&product_id, &project_id, &design_id),
         5, // cap below the fixture's task count
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -853,6 +873,7 @@ async fn pre_seeded_project_is_refused() {
         &steps_for(fixture.doc, fixture.output()),
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -883,6 +904,7 @@ async fn fetch_failure_is_recorded_no_op() {
         &steps,
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -906,6 +928,7 @@ async fn doc_missing_is_recorded_no_op() {
         &steps,
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
@@ -931,6 +954,7 @@ async fn planner_no_api_key_is_recorded_no_op() {
         &steps,
         &ctx(&product_id, &project_id, &design_id),
         DEFAULT_MAX_TASKS,
+        &NoopExecutionPublisher,
     )
     .await;
 
