@@ -689,6 +689,9 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
         head_sha: response.head_ref_oid,
         changed_files: response.files.into_iter().map(|f| f.path).collect(),
         diff_content: None,
+        // Filled in by the caller, which has the `WorkDb` handle needed to
+        // resolve the review-cycle root for a revision-triggered pass.
+        last_reviewed_sha: None,
     })
 }
 
@@ -952,6 +955,20 @@ pub(crate) async fn compose_worker_spawn(
             // it turn-by-turn. Fail open on error — the URL-only prompt is
             // still functional.
             let mut pr_review_context = fetch_pr_review_context(pr_url).await;
+            // 2026-07-01 revision-review experiment: tell the reviewer what
+            // head SHA the PR was already reviewed up to, so a revision-
+            // triggered pass can prioritise the delta. Resolved via the
+            // review-cycle root (chain root for a revision, the task itself
+            // otherwise) so the value reflects the PR's actual review
+            // history rather than resetting for every fresh revision task
+            // row — see `WorkDb::review_cycle_root_id`.
+            if let Some(ref mut ctx) = pr_review_context {
+                let cycle_root_id = work_db.review_cycle_root_id(&execution.work_item_id);
+                ctx.last_reviewed_sha = work_db
+                    .get_task_review_cycle_state(&cycle_root_id)
+                    .ok()
+                    .and_then(|(_, sha)| sha);
+            }
             if let Some(ref ctx) = pr_review_context {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -959,6 +976,7 @@ pub(crate) async fn compose_worker_spawn(
                     pr_number = ctx.pr_number,
                     head_sha = %ctx.head_sha,
                     changed_files = ctx.changed_files.len(),
+                    last_reviewed_sha = ?ctx.last_reviewed_sha,
                     "pr_review execution: pre-fetched PR metadata for reviewer context",
                 );
             } else {

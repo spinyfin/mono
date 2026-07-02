@@ -686,4 +686,35 @@ impl WorkDb {
         }
         Ok(())
     }
+
+    /// Resolve the task id whose `review_cycle` / `last_reviewed_sha`
+    /// columns should record a completed reviewer pass triggered by
+    /// `task_id`'s completion.
+    ///
+    /// For a `revision` task, walks to the chain root (the task that owns
+    /// the PR the revision pushes commits onto) and returns *its* id
+    /// instead. Each revision is a brand-new task row, so tracking cycle
+    /// state on the revision itself would silently reset the cycle-bound
+    /// (`max_review_cycles`) and no-op-skip gates to zero on every single
+    /// revision — defeating both once revisions can trigger reviews of
+    /// their own. Bookkeeping instead accumulates on one persistent row
+    /// across the whole chain, mirroring how the chain root is already the
+    /// source of truth for `pr_url` (see [`Self::get_revision_chain_root_pr_url`]).
+    ///
+    /// Returns `task_id` unchanged for a non-revision task, or when the
+    /// chain root can't be resolved (broken parent link — fails open so a
+    /// data anomaly degrades to "count from zero" rather than an error).
+    pub(crate) fn review_cycle_root_id(&self, task_id: &str) -> String {
+        let Ok(conn) = self.connect() else {
+            return task_id.to_owned();
+        };
+        match query_task(&conn, task_id) {
+            Ok(Some(t)) if t.kind == TaskKind::Revision => get_chain_root_task(&conn, task_id)
+                .ok()
+                .flatten()
+                .map(|root| root.id)
+                .unwrap_or_else(|| task_id.to_owned()),
+            _ => task_id.to_owned(),
+        }
+    }
 }

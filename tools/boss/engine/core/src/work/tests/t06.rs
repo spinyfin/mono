@@ -630,6 +630,92 @@ fn chain_root_walks_multi_link_chain() {
     }
 }
 
+// ── review_cycle_root_id (2026-07-01 revision-review experiment) ─────────
+
+#[test]
+fn review_cycle_root_id_returns_self_for_non_revision_task() {
+    let db = WorkDb::open(temp_db_path("cycle-root-self")).unwrap();
+    let product_id = make_revision_product(&db, "cycle-root-self");
+    let chore_id = make_chore_root(&db, &product_id, "self");
+    assert_eq!(
+        db.review_cycle_root_id(&chore_id),
+        chore_id,
+        "a non-revision task must be its own review-cycle root"
+    );
+}
+
+#[test]
+fn review_cycle_root_id_walks_revision_chain_to_chore() {
+    let db = WorkDb::open(temp_db_path("cycle-root-single")).unwrap();
+    let product_id = make_revision_product(&db, "cycle-root-single");
+    let chore_id = make_chore_root(&db, &product_id, "root");
+    let revision_id = insert_revision_row(&db, &product_id, &chore_id);
+    assert_eq!(
+        db.review_cycle_root_id(&revision_id),
+        chore_id,
+        "a revision's review-cycle root must be its chain-root chore"
+    );
+}
+
+/// A stack of revisions (R1 → chore, R2 → R1, R3 → R2 — e.g. a CI-fix
+/// pushed after a conflict-resolution fix) must all resolve to the SAME
+/// review-cycle root. Otherwise `review_cycle`/`last_reviewed_sha` would
+/// reset to zero on every fresh revision task row, defeating the
+/// cycle-bound and no-op-skip gates once revisions can trigger reviews.
+#[test]
+fn review_cycle_root_id_is_stable_across_a_revision_stack() {
+    let db = WorkDb::open(temp_db_path("cycle-root-stack")).unwrap();
+    let product_id = make_revision_product(&db, "cycle-root-stack");
+    let chore_id = make_chore_root(&db, &product_id, "root");
+    let r1_id = insert_revision_row(&db, &product_id, &chore_id);
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    let r3_id = insert_revision_row(&db, &product_id, &r2_id);
+
+    for (label, id) in [("R1", &r1_id), ("R2", &r2_id), ("R3", &r3_id)] {
+        assert_eq!(
+            db.review_cycle_root_id(id),
+            chore_id,
+            "{label}: review-cycle root must be the chain-root chore, not the revision itself"
+        );
+    }
+
+    // And bookkeeping actually accumulates on that one row: incrementing
+    // via R1's resolved root, then R3's resolved root, must land on the
+    // same counter rather than two independent zero-based counters.
+    let root_via_r1 = db.review_cycle_root_id(&r1_id);
+    db.increment_task_review_cycle(&root_via_r1, Some("sha_after_r1"))
+        .unwrap();
+    let root_via_r3 = db.review_cycle_root_id(&r3_id);
+    db.increment_task_review_cycle(&root_via_r3, Some("sha_after_r3"))
+        .unwrap();
+    let (cycle, last_sha) = db.get_task_review_cycle_state(&chore_id).unwrap();
+    assert_eq!(cycle, 2, "both increments must land on the chore's shared counter");
+    assert_eq!(last_sha.as_deref(), Some("sha_after_r3"));
+}
+
+#[test]
+fn review_cycle_root_id_falls_back_to_self_on_broken_chain() {
+    let db = WorkDb::open(temp_db_path("cycle-root-broken")).unwrap();
+    let product_id = make_revision_product(&db, "cycle-root-broken");
+    // R2 points at a parent id that does not exist (broken link).
+    let conn = db.connect().unwrap();
+    let r2_id = next_id("task");
+    let now = now_string();
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+             VALUES (?1, ?2, 'revision', 'Test revision', '', 'todo', ?3, ?3, 'task_does_not_exist')",
+        rusqlite::params![r2_id, product_id, now],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        db.review_cycle_root_id(&r2_id),
+        r2_id,
+        "an unresolvable chain must fail open to the task's own id, not error"
+    );
+}
+
 #[test]
 fn chain_root_handles_broken_parent_gracefully() {
     let db = WorkDb::open(temp_db_path("chain-root-broken")).unwrap();
