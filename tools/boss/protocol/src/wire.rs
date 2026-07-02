@@ -12,9 +12,9 @@ use crate::types::{
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
     LinkExternalRefInput, ListDependenciesInput, MagicWandDispatch, PrWorkItemMatch, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
@@ -323,6 +323,18 @@ pub enum FrontendRequest {
         plain_text: String,
         #[serde(default)]
         plain_text_projection_version: i64,
+    },
+
+    /// Batch-address every unaddressed `directive`/`larger_change` comment
+    /// on a design/investigation-owned `pr_doc` artifact: creates a
+    /// revision (open PR) or chore (merged/closed/no-PR) — the
+    /// `[Revise]`-banner action. App-or-Boss tier. Replies with
+    /// [`FrontendEvent::CommentsReviseDocResult`]. Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"Buckets 1 & 3".
+    CommentsReviseDoc {
+        #[serde(flatten)]
+        input: ReviseDocInput,
     },
 
     /// Manually reclassify a comment's intent (sidebar intent badge).
@@ -2500,6 +2512,10 @@ pub enum FrontendEvent {
         artifact_kind: String,
         artifact_id: String,
         comments: Vec<ResolvedComment>,
+    },
+    /// Reply to `CommentsReviseDoc`.
+    CommentsReviseDocResult {
+        outcome: ReviseDocOutcome,
     },
     // --- Magic wand (Phase 3) replies / pushes. ---
     /// Reply to `CommentsDispatchMagicWand`: the dispatch row was created

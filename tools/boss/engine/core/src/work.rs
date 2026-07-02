@@ -73,20 +73,21 @@ pub use boss_protocol::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING,
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
     AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
-    COMMENT_STATUS_DISPATCHED, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION,
-    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor,
-    CommentResolution, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
-    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyDirection,
-    DependencyEdge, DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
-    EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, INTENT_DIRECTIVE,
-    INTENT_LARGER_CHANGE, INTENT_QUESTION, ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED,
-    MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED,
-    MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED, MagicWandDispatch, PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem,
+    COMMENT_STATUS_DISPATCHED, COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED,
+    CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
+    CiRemediation, CommentAnchor, CommentResolution, ConflictResolution, CreateAttentionInput,
+    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner,
+    DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
+    ExecutionReconcileResult, ExecutionStatus, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION,
+    ListDependenciesInput, MAGIC_WAND_STATUS_APPLIED, MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT,
+    MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
+    MagicWandDispatch, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT,
+    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput,
+    ReviseDocOutcome, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem,
     WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
     WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
 };
@@ -226,6 +227,7 @@ mod pr_flow;
 mod pr_state;
 mod products_design;
 mod query_ensure;
+mod revise_doc;
 mod revision_helpers;
 mod schema_init;
 #[cfg(test)]

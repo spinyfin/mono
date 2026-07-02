@@ -19,7 +19,7 @@ const ANCHOR_CONTEXT_CHARS: usize = 64;
 const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anchor_json, body, \
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
      created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
-     intent_overridden_by";
+     intent_overridden_by, revise_task_id";
 
 const COMMENT_INSERT_SQL: &str = "INSERT INTO work_comments \
      (id, artifact_kind, artifact_id, doc_version, anchor_json, body, author, status, \
@@ -663,6 +663,39 @@ pub(crate) fn query_comments(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![artifact_kind, artifact_id], map_comment)?;
+    collect_rows(rows)
+}
+
+/// Comments eligible for a `[Revise]` batch (`CommentsReviseDoc`): `active`
+/// status, classified `directive`/`larger_change`. `comment_ids` narrows to
+/// that id set when supplied — v1 always passes `None` (reserved for a
+/// future subset-selection UI, design §"Batch scope").
+pub(crate) fn query_revisable_comments(
+    conn: &Connection,
+    artifact_kind: &str,
+    artifact_id: &str,
+    comment_ids: Option<&[String]>,
+) -> Result<Vec<WorkComment>> {
+    if matches!(comment_ids, Some(ids) if ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let mut sql = format!(
+        "SELECT {COMMENT_COLUMNS} FROM work_comments
+         WHERE artifact_kind = ? AND artifact_id = ?
+           AND status = '{COMMENT_STATUS_ACTIVE}'
+           AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+    );
+    let mut bind_params: Vec<&dyn rusqlite::ToSql> = vec![&artifact_kind, &artifact_id];
+    if let Some(ids) = comment_ids {
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        sql.push_str(&format!(" AND id IN ({placeholders})"));
+        for id in ids {
+            bind_params.push(id);
+        }
+    }
+    sql.push_str(" ORDER BY created_at ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(bind_params.as_slice(), map_comment)?;
     collect_rows(rows)
 }
 

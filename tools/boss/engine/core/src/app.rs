@@ -38,7 +38,7 @@ use crate::protocol::{
 use crate::repo_slug;
 use crate::work::{
     ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError, ExecutionStatus,
-    GhPrStateChecker, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    GhPrStateChecker, ReviseDocOutcome, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -2327,6 +2327,7 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
             r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
+            r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,
             r @ FrontendRequest::CommentsSetIntent { .. } => comments::handle_comments_set_intent(ctx, r).await,
             r @ FrontendRequest::CommentsSetStatus { .. } => comments::handle_comments_set_status(ctx, r).await,
             r @ FrontendRequest::CommentsUpdateAnchor { .. } => comments::handle_comments_update_anchor(ctx, r).await,
