@@ -573,6 +573,7 @@ async fn run_fixture_and_assert(fixture: &Fixture) {
         PopulateOutcome::Staged {
             created: fixture.tasks.len(),
             edges: fixture.edges.len(),
+            skipped: 0,
             low_confidence: false,
         },
         "[{}] outcome",
