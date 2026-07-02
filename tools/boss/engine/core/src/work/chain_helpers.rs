@@ -225,10 +225,27 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
             continue;
         }
 
+        // Drop any not-yet-live execution row before archiving the task:
+        // without this a `ready`/`queued`/`waiting_dependency` row (e.g.
+        // minted by the dependency-unblock cascade, which is not
+        // chain-root-aware) is stranded on a now-archived work item — it
+        // can never be dispatched. A live (`running`/`waiting_human`)
+        // execution is left alone; it self-retires when its worker stops.
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency')",
+            params![rev_id, now],
+        )?;
+
         if is_moot_revision_kind(&rev.created_via) {
+            let archived_reason = format!("parent PR merged: revision moot (created_via={})", rev.created_via);
             let rows_changed = conn.execute(
                 "UPDATE tasks
                  SET status            = 'archived',
+                     archived_reason   = ?3,
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
@@ -236,7 +253,7 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
-                params![rev_id, now],
+                params![rev_id, now, archived_reason],
             )?;
             if rows_changed > 0 {
                 tracing::info!(
@@ -246,6 +263,19 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                     "block_pending_revisions: moot revision archived \
                      (merge-conflict/CI-fix; parent PR merged)",
                 );
+                record_revision_archived_attention(
+                    conn,
+                    rev_id,
+                    "parent PR merged, revision moot",
+                    &format!(
+                        "The parent PR for chain root `{chain_root_id}` merged or closed. \
+                         This revision (`created_via={}`) could not have merged unresolved \
+                         (a conflicting/CI-failing PR can't merge), so the engine archived it \
+                         silently rather than leaving a dangling task. No action needed unless \
+                         the underlying work is still outstanding.",
+                        rev.created_via,
+                    ),
+                )?;
             }
         } else {
             let is_wip = rev.status == TaskStatus::Active;
@@ -287,9 +317,15 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                     .build(),
             )?;
 
+            let archived_reason = format!(
+                "parent PR merged: superseded by {} {}",
+                if is_pr_review { "followup" } else { "chore" },
+                new_chore.id,
+            );
             conn.execute(
                 "UPDATE tasks
                  SET status            = 'archived',
+                     archived_reason   = ?3,
                      last_status_actor = 'engine',
                      updated_at        = ?2,
                      completed_at      = COALESCE(completed_at, ?2),
@@ -297,7 +333,7 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
-                params![rev_id, now],
+                params![rev_id, now, archived_reason],
             )?;
             tracing::info!(
                 revision_id = %rev_id,
@@ -312,6 +348,83 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                 if is_wip { "auto-dispatch" } else { "stay in backlog" },
             );
         }
+    }
+    Ok(())
+}
+
+/// Raise (or reuse, if one is already open) an attention item flagging
+/// that the engine auto-archived `revision_id` as moot rather than
+/// leaving the operator to discover the silent state change on their own.
+/// Idempotent per open item: a revision is only archived once per chain
+/// event, so this simply avoids piling up duplicates if the archival path
+/// is re-entered (e.g. a retried transaction after a crash).
+pub(crate) fn record_revision_archived_attention(
+    conn: &Connection,
+    revision_id: &str,
+    title_suffix: &str,
+    body: &str,
+) -> Result<()> {
+    let already_open: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_attention_items
+             WHERE work_item_id = ?1
+               AND kind = 'revision_archived'
+               AND status = 'open'
+         )",
+        [revision_id],
+        |row| row.get(0),
+    )?;
+    if already_open != 0 {
+        return Ok(());
+    }
+    let id = next_id("attn");
+    let now = now_string();
+    let title = format!("Revision {revision_id} auto-archived: {title_suffix}");
+    conn.execute(
+        "INSERT INTO work_attention_items (
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+         ) VALUES (?1, NULL, ?2, 'revision_archived', 'open', ?3, ?4, ?5, NULL)",
+        params![id, revision_id, title, body, now],
+    )?;
+    Ok(())
+}
+
+/// Refuse a manual status change that the engine would immediately revert:
+/// moving a `revision` task off `archived` when its chain root's PR has
+/// already merged or closed. `reconcile_revision_execution`'s dispatch-time
+/// catch-up gate re-evaluates every non-terminal revision against its chain
+/// root on the very next reconcile tick and snaps a moot one straight back
+/// to `archived` — so accepting the move here would report "Moved task"
+/// success and then silently undo it (see proj_18be59fc8d8b2440_363's
+/// incident writeup). Refusing up front makes the futility visible instead
+/// of discoverable only after the fact.
+///
+/// Scoped to `revision` tasks only: chores/tasks archived by a human (or by
+/// any path other than the chain-root reconciler) do not have this
+/// "the engine will re-decide the status on the next tick" property, so a
+/// manual reopen of those rows sticks and must not be blocked here.
+pub(crate) fn refuse_manual_move_off_archived_moot_revision(
+    conn: &Connection,
+    task_id: &str,
+    kind: &TaskKind,
+    previous_status: &TaskStatus,
+    new_status: &TaskStatus,
+) -> Result<()> {
+    if *kind != TaskKind::Revision || *previous_status != TaskStatus::Archived || *new_status == TaskStatus::Archived {
+        return Ok(());
+    }
+    let Some(chain_root) = get_chain_root_task(conn, task_id)? else {
+        return Ok(());
+    };
+    if matches!(chain_root.status, TaskStatus::Done | TaskStatus::Archived) {
+        bail!(
+            "cannot move {task_id} to {}: its parent PR (chain root {}, now `{}`) already merged or \
+             closed, which makes this revision moot — the engine will archive it again on the next \
+             reconcile tick. Create a new chore for the outstanding work instead.",
+            new_status.as_str(),
+            chain_root.id,
+            chain_root.status.as_str(),
+        );
     }
     Ok(())
 }

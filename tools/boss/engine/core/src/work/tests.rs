@@ -424,6 +424,52 @@ fn revision_input(parent_id: &str) -> CreateRevisionInput {
         .build()
 }
 
+/// Insert a `kind=revision` task linked to a CI-fix attempt. Mirrors what
+/// `ci_watch` produces for a CI remediation: `created_via =
+/// "ci-fix:<ci_remediations.id>"`, parent = the chore, and (as in the
+/// steady-state loop) the row already flipped to `active`.
+fn insert_ci_fix_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str, rem_id: &str) -> String {
+    let conn = db.connect().unwrap();
+    let id = next_id("task");
+    let now = now_string();
+    let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{rem_id}");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Fix failing CI on PR', '', 'active', ?3, ?3, 0, ?4, ?5)",
+        rusqlite::params![id, product_id, now, created_via, parent_task_id],
+    )
+    .unwrap();
+    id
+}
+
+/// (id, status) of every execution bound to `work_item_id`, oldest first.
+fn executions_for(db: &WorkDb, work_item_id: &str) -> Vec<(String, String)> {
+    let conn = db.connect().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status FROM work_executions
+             WHERE work_item_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![work_item_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn task_status(db: &WorkDb, task_id: &str) -> String {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
 // ── attach_revision_projections ─────────────────────────────────────────
 
 /// Build a minimal Task with enough fields for `attach_revision_projections`.
@@ -447,6 +493,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         priority: "medium".to_owned(),
         created_via: "cli".to_owned(),
         repo_remote_url: None,
+        archived_reason: None,
         blocked_reason: None,
         blocked_attempt_id: None,
         blocked_signals: vec![],
@@ -488,3 +535,4 @@ mod t08;
 mod t09;
 mod t10;
 mod t11;
+mod t12;

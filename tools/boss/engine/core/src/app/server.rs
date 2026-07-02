@@ -331,6 +331,29 @@ pub async fn serve(
         }
     }
 
+    // Second, sweep any `queued`/`ready`/`waiting_dependency` execution
+    // stranded against a work item that is already terminal (done/archived/
+    // cancelled) or soft-deleted. These can only exist from a race the
+    // create-time guards missed (or a prior build that predates them) —
+    // left alone they show up as phantom pending runs in `bossctl agents
+    // list` / `boss chore show` for a row that will never dispatch.
+    match server_state.work_db.abandon_stranded_executions_on_closed_work_items() {
+        Ok(abandoned) if !abandoned.is_empty() => {
+            let ids: Vec<&str> = abandoned.iter().map(|a| a.execution_id.as_str()).collect();
+            tracing::warn!(
+                count = abandoned.len(),
+                execution_ids = ?ids,
+                "abandoned stranded executions on closed work items at startup",
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("no stranded executions on closed work items at startup");
+        }
+        Err(err) => {
+            tracing::error!(?err, "stranded-execution sweep failed; continuing");
+        }
+    }
+
     // Install boss-event to a stable location and heal existing worker
     // settings.json files. This ensures that hook paths baked into worker
     // settings.json survive a `bazel clean` or workspace re-lease.

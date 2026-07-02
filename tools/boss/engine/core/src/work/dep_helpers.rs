@@ -421,7 +421,22 @@ pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &s
         if live.is_none() {
             let kind = execution_kind_for_work_item(conn, dependent_id)?;
             let mut reconcile_result = ExecutionReconcileResult::default();
-            reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
+            if kind == ExecutionKind::RevisionImplementation {
+                // Route through the revision-aware reconciler instead of
+                // blindly minting a `ready` row: a revision whose chain
+                // root's PR already merged/closed while this dependency
+                // gate was still blocking it is moot, and
+                // `reconcile_revision_execution`'s dispatch-time catch-up
+                // gate is what catches that and archives the revision
+                // (with a stray-execution cleanup of its own) instead of
+                // leaving a `ready` execution stranded on a row that's
+                // about to be archived out from under it.
+                if let Some(task) = query_task(conn, dependent_id)? {
+                    reconcile_revision_execution(conn, &mut reconcile_result, &task)?;
+                }
+            } else {
+                reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
+            }
         } else {
             tracing::info!(
                 dependent_id,

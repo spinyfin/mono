@@ -96,6 +96,29 @@ pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) ->
     }
 }
 
+/// Same existence check as [`product_id_for_work_item`], but does not
+/// filter out tombstoned (`deleted_at`-set) tasks.
+///
+/// Needed by read-only, post-hoc surfaces that must still resolve a work
+/// item after it has been archived-and-tombstoned (e.g.
+/// `block_pending_revisions_on_parent_close` tombstones moot revisions in
+/// the same transaction it raises their `revision_archived` attention
+/// item) — callers that only need to validate the id and are not about to
+/// mutate or dispatch against the row should use this instead.
+pub(crate) fn product_id_for_work_item_including_deleted(conn: &Connection, work_item_id: &str) -> Result<String> {
+    match classify_id(work_item_id)? {
+        ItemKind::Product => query_product(conn, work_item_id)?
+            .map(|product| product.id)
+            .with_context(|| format!("unknown product: {work_item_id}")),
+        ItemKind::Project => query_project(conn, work_item_id)?
+            .map(|project| project.product_id)
+            .with_context(|| format!("unknown project: {work_item_id}")),
+        ItemKind::Task => query_task(conn, work_item_id)?
+            .map(|task| task.product_id)
+            .with_context(|| format!("unknown task: {work_item_id}")),
+    }
+}
+
 /// Resolve the canonical repo URL for a work item. Reads
 /// `tasks.repo_remote_url` first — when set and non-empty, it wins as
 /// the per-row override — and otherwise falls back to the parent

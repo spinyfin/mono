@@ -52,10 +52,13 @@ impl WorkDb {
     /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
     /// `repo_unresolved` surface and any future work-item-scoped
     /// attention flows. Errors if the work item id is unknown so
-    /// callers can't accidentally silently no-op on a typo.
+    /// callers can't accidentally silently no-op on a typo. Deliberately
+    /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
+    /// moot revision) so the `revision_archived` attention item raised at
+    /// archival time stays reachable afterwards.
     pub fn list_attention_items_for_work_item(&self, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
-        let _ = product_id_for_work_item(&conn, work_item_id)?;
+        let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
              FROM work_attention_items
@@ -478,11 +481,11 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
-                map_task_with_parent_and_provenance,
+                map_task_with_parent_provenance_and_archived_reason,
             )
             .optional()?
         {
