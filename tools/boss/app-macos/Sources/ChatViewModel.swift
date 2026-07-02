@@ -2599,30 +2599,20 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// The column that `task` renders into, overriding `task.boardColumn`
-    /// when a merge-resolution worker is actively running against it. A
-    /// `blocked: merge_conflict` task with a `pending` or `running`
-    /// conflict resolution routes to `.doing` so the kanban invariant
-    /// holds: Doing = a worker is touching this right now.
+    /// only for an in-flight optimistic drag. Doing is reserved for rows
+    /// whose OWN primary execution is active — a parent task blocked on a
+    /// review-phase reason (`merge_conflict`, `ci_failure`,
+    /// `ci_failure_exhausted`, `review_feedback`) stays in Review for the
+    /// full revision lifecycle, whether the active worker is an operator-
+    /// filed revision, an auto CI-fix, or an auto conflict-resolution
+    /// attempt. That activity surfaces via `hasInProgressRevision` (the "in
+    /// revision" badge) and the reason badge, not via column movement — see
+    /// `activeConflictResolution(for:)` / `activeCiRemediation(for:)` for the
+    /// badge-facing lookups.
     func effectiveBoardColumn(for task: WorkTask) -> WorkBoardColumnKey {
         // Optimistic override wins while a drag is in-flight.
         if let override = optimisticColumnByTaskID[task.id] {
             return override
-        }
-        if task.status == "blocked",
-           task.blockedReason == "merge_conflict",
-           let attemptID = task.blockedAttemptID,
-           conflictResolutions.contains(where: {
-               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
-           }) {
-            return .doing
-        }
-        if task.status == "blocked",
-           task.blockedReason == "ci_failure",
-           let attemptID = task.blockedAttemptID,
-           ciRemediations.contains(where: {
-               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
-           }) {
-            return .doing
         }
         return task.boardColumn
     }
@@ -2631,23 +2621,7 @@ final class ChatViewModel: ObservableObject {
     /// in-flight optimistic override. Used during work-tree reconciliation to
     /// compare actual task state against the optimistic position.
     func realEffectiveBoardColumn(for task: WorkTask) -> WorkBoardColumnKey {
-        if task.status == "blocked",
-           task.blockedReason == "merge_conflict",
-           let attemptID = task.blockedAttemptID,
-           conflictResolutions.contains(where: {
-               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
-           }) {
-            return .doing
-        }
-        if task.status == "blocked",
-           task.blockedReason == "ci_failure",
-           let attemptID = task.blockedAttemptID,
-           ciRemediations.contains(where: {
-               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
-           }) {
-            return .doing
-        }
-        return task.boardColumn
+        task.boardColumn
     }
 
     /// The active conflict resolution for `taskID`, if any. A resolution

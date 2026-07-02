@@ -6,8 +6,13 @@ import XCTest
 /// • `blocked: merge_conflict` / `ci_failure` / `ci_failure_exhausted` /
 ///   `review_feedback` → **Review** column (task has an open PR; block is
 ///   transient). Card shows the reason badge so the state is legible.
-/// • When an active resolution/remediation worker is running → **Doing**
-///   (the engine is actively touching it right now).
+/// • Review-phase blocked tasks stay in **Review** through the full
+///   revision lifecycle — whether the active worker behind the block is an
+///   auto conflict-resolution attempt, an auto CI-fix remediation, or an
+///   operator-filed revision. Doing is reserved for rows whose OWN primary
+///   execution is active; the revision-in-progress activity surfaces via
+///   the reason badge and the "in revision" indicator, not via column
+///   movement.
 /// • `blocked: dependency` or `blocked` with no reason → **Backlog**.
 ///
 /// Tests exercise both the `effectiveBoardColumn(for:)` routing helper and
@@ -16,20 +21,34 @@ import XCTest
 @MainActor
 final class ConflictResolutionKanbanTests: XCTestCase {
 
-    // MARK: effectiveBoardColumn routing — active worker → Doing
+    // MARK: effectiveBoardColumn routing — active revision worker stays in Review
 
-    func testBlockedMergeConflictWithPendingResolutionRoutesToDoing() {
+    func testBlockedMergeConflictWithPendingResolutionStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "pending")]
-        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
-    func testBlockedMergeConflictWithRunningResolutionRoutesToDoing() {
+    func testBlockedMergeConflictWithRunningResolutionStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")]
-        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+    }
+
+    func testBlockedCIFailureWithPendingRemediationStaysInReview() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "pending")]
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+    }
+
+    func testBlockedCIFailureWithRunningRemediationStaysInReview() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")]
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
     // MARK: effectiveBoardColumn routing — no active worker → Review
@@ -67,6 +86,10 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
+    // Operator-filed revisions don't carry a conflict-resolution/CI-remediation
+    // attempt row — the block itself (`review_feedback`) is the signal that an
+    // operator revision is in flight, and it routes to Review like the other
+    // review-phase reasons.
     func testBlockedReviewFeedbackRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "review_feedback", attemptID: nil)
@@ -88,7 +111,11 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
     }
 
-    // MARK: activeConflictResolution lookup
+    // MARK: activeConflictResolution / activeCiRemediation lookup
+    //
+    // These lookups still exist and stay accurate — they back the reason
+    // badge and the "in revision" indicator — even though they no longer
+    // drive column placement.
 
     func testActiveConflictResolutionReturnsPendingAttempt() {
         let model = makeModel()
@@ -118,21 +145,54 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         XCTAssertNil(model.activeConflictResolution(for: "task_1"))
     }
 
+    func testActiveCiRemediationReturnsPendingAttempt() {
+        let model = makeModel()
+        let remediation = makeRemediation(id: "cir_42", workItemID: "task_1", status: "pending")
+        model.ciRemediations = [remediation]
+        XCTAssertEqual(model.activeCiRemediation(for: "task_1")?.id, "cir_42")
+    }
+
+    func testActiveCiRemediationNilForFinishedAttempt() {
+        let model = makeModel()
+        let remediation = makeRemediation(id: "cir_7", workItemID: "task_1", status: "succeeded")
+        model.ciRemediations = [remediation]
+        XCTAssertNil(model.activeCiRemediation(for: "task_1"))
+    }
+
     // MARK: workItems(in:) integration
 
-    func testTaskWithActiveResolutionAppearsInDoingColumn() {
+    func testTaskWithActiveResolutionStaysInReviewColumn() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.choresByProductID = ["prod_test": [task]]
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "running")]
 
+        let reviewItems = model.workItems(in: .review)
+        XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),
+                      "task with active resolution should stay in Review")
+
         let doingItems = model.workItems(in: .doing)
-        XCTAssertTrue(doingItems.contains(where: { $0.id == task.id }),
-                      "task with active resolution should appear in Doing")
+        XCTAssertFalse(doingItems.contains(where: { $0.id == task.id }),
+                       "task with active resolution must NOT appear in Doing — Doing is for the row's own execution")
 
         let backlogItems = model.workItems(in: .backlog)
         XCTAssertFalse(backlogItems.contains(where: { $0.id == task.id }),
                        "task with active resolution must NOT appear in Backlog")
+    }
+
+    func testTaskWithActiveCiRemediationStaysInReviewColumn() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "ci_failure", attemptID: "cir_1")
+        model.choresByProductID = ["prod_test": [task]]
+        model.ciRemediations = [makeRemediation(id: "cir_1", workItemID: task.id, status: "running")]
+
+        let reviewItems = model.workItems(in: .review)
+        XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),
+                      "task with active CI remediation should stay in Review")
+
+        let doingItems = model.workItems(in: .doing)
+        XCTAssertFalse(doingItems.contains(where: { $0.id == task.id }),
+                       "task with active CI remediation must NOT appear in Doing")
     }
 
     func testTaskWithFinishedResolutionStaysInReview() {
@@ -198,6 +258,32 @@ final class ConflictResolutionKanbanTests: XCTestCase {
             cubeWorkspaceID: nil,
             workerID: nil,
             conflictDiagnosis: nil,
+            createdAt: "2026-05-13T00:00:00Z",
+            startedAt: nil,
+            finishedAt: nil
+        )
+    }
+
+    private func makeRemediation(id: String, workItemID: String, status: String) -> WorkCiRemediation {
+        WorkCiRemediation(
+            id: id,
+            productID: "prod_test",
+            workItemID: workItemID,
+            prURL: "https://github.com/x/y/pull/42",
+            prNumber: 42,
+            headBranch: "feature/test",
+            headSHAAtTrigger: "abc123",
+            headSHAAfter: nil,
+            attemptKind: "fix",
+            consumesBudget: 1,
+            failedChecks: "[]",
+            triageClass: nil,
+            logExcerpt: nil,
+            status: status,
+            failureReason: nil,
+            cubeLeaseID: nil,
+            cubeWorkspaceID: nil,
+            workerID: nil,
             createdAt: "2026-05-13T00:00:00Z",
             startedAt: nil,
             finishedAt: nil
