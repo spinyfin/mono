@@ -887,6 +887,45 @@ pub struct WorkerCompletionHandler {
     structured_output_dir: std::path::PathBuf,
 }
 
+/// What [`WorkerCompletionHandler::force_release`] actually did. Surfaced
+/// (rather than swallowed as `()`) so a caller tearing down a specific
+/// row — e.g. a deleted work item's live execution — can log one line
+/// that ties the row id to the concrete outcome instead of leaving a
+/// future zombie report to reconstruct it from execution-id-only lines
+/// scattered across this function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceReleaseOutcome {
+    /// No live worker pane was mapped (mid-spawn or already released).
+    /// The cube lease is deliberately left held for the in-flight
+    /// `run_execution` to reap and release once its spawn settles (T981).
+    HeldForInFlightSpawn,
+    /// The pane was reaped but the execution held no lease columns —
+    /// already released by a prior call, or never leased.
+    NoLeaseHeld,
+    /// The pane was reaped and the cube lease released.
+    Released { lease_id: String },
+    /// The pane was reaped, but clearing the execution's workspace
+    /// columns in the DB failed before a cube release was attempted.
+    WorkspaceColumnClearFailed,
+    /// The pane was reaped and workspace columns cleared, but the cube
+    /// CLI call to release the lease failed.
+    LeaseReleaseFailed { lease_id: String },
+}
+
+impl ForceReleaseOutcome {
+    /// Short label for structured logging — stable across variant field
+    /// changes so log queries filtering on it don't need updating.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::HeldForInFlightSpawn => "held_for_in_flight_spawn",
+            Self::NoLeaseHeld => "no_lease_held",
+            Self::Released { .. } => "released",
+            Self::WorkspaceColumnClearFailed => "workspace_column_clear_failed",
+            Self::LeaseReleaseFailed { .. } => "lease_release_failed",
+        }
+    }
+}
+
 impl WorkerCompletionHandler {
     pub fn new(
         work_db: Arc<WorkDb>,
@@ -3353,7 +3392,13 @@ must not be asked to open one",
     /// Does NOT change the execution's status field. Callers that need
     /// the execution marked `completed` / `failed` should drive that
     /// transition through the appropriate `WorkDb` method.
-    pub async fn force_release(&self, execution_id: &str) {
+    ///
+    /// Returns what actually happened so callers that need cascade
+    /// diagnosability (e.g. `cancel_and_release` tearing down a deleted
+    /// work item's worker) can log a single line tying the outcome to
+    /// the row that triggered it, rather than requiring a post-mortem
+    /// to cross-reference this function's own log lines by execution id.
+    pub async fn force_release(&self, execution_id: &str) -> ForceReleaseOutcome {
         // Pane release first. Idempotent on the registry side; the
         // implementation logs and skips when no slot is mapped.
         //
@@ -3375,7 +3420,7 @@ must not be asked to open one",
                  leaving the cube lease held — the in-flight run releases it after reaping, \
                  so an occupied workspace is never re-leased",
             );
-            return;
+            return ForceReleaseOutcome::HeldForInFlightSpawn;
         }
 
         // Cube release: claim ownership of the lease id atomically by
@@ -3383,14 +3428,14 @@ must not be asked to open one",
         // A concurrent caller will see `None` and skip.
         let lease_id = match self.work_db.clear_execution_workspace(execution_id) {
             Ok(Some(lease_id)) => lease_id,
-            Ok(None) => return,
+            Ok(None) => return ForceReleaseOutcome::NoLeaseHeld,
             Err(err) => {
                 tracing::warn!(
                     execution_id,
                     ?err,
                     "force_release: failed to clear execution workspace columns",
                 );
-                return;
+                return ForceReleaseOutcome::WorkspaceColumnClearFailed;
             }
         };
         if let Err(err) = self.cube_client.release_workspace(&lease_id).await {
@@ -3400,7 +3445,9 @@ must not be asked to open one",
                 ?err,
                 "force_release: cube workspace release failed",
             );
+            return ForceReleaseOutcome::LeaseReleaseFailed { lease_id };
         }
+        ForceReleaseOutcome::Released { lease_id }
     }
 
     /// Stop a worker whose task was dragged back to Backlog by the user.
@@ -3410,33 +3457,46 @@ must not be asked to open one",
     /// the `UpdateWorkItem` handler already applied the user's `todo`
     /// patch before this is called.
     ///
-    /// `reason` names what triggered the cancel (e.g. the kanban
-    /// `active → todo` drag). It is stamped on the trace record so a
-    /// post-mortem can attribute *what* cancelled an execution — the
-    /// gap that blocked attribution of the T981 mid-spawn cancel, where
-    /// the record carried no initiator at all.
-    pub async fn cancel_and_release(&self, execution_id: &str, reason: &str) {
-        match self.work_db.cancel_running_execution(execution_id) {
-            Ok(true) => {
-                tracing::info!(execution_id, reason, "cancel_and_release: execution cancelled",);
-            }
-            Ok(false) => {
-                tracing::debug!(
-                    execution_id,
-                    reason,
-                    "cancel_and_release: execution already terminal; proceeding to release",
-                );
-            }
+    /// `work_item_id` is the row (task/chore) whose deletion or status
+    /// change triggered this teardown. `reason` names what triggered the
+    /// cancel (e.g. the kanban `active → todo` drag, or a row delete).
+    /// Both are stamped on a single cascade trace line once the release
+    /// completes so a post-mortem can grep `engine-trace.jsonl` for the
+    /// row id and see the whole story — what triggered it, which
+    /// execution it hit, and what the teardown actually did — without
+    /// cross-referencing separate execution-id-only log lines. This
+    /// closes the diagnosability gap behind the zombie-worker report
+    /// where two deleted tasks kept running until `bossctl agents stop`
+    /// was run by hand because nothing in the trace tied the row id to
+    /// the executions that outlived it.
+    pub async fn cancel_and_release(&self, work_item_id: &str, execution_id: &str, reason: &str) {
+        let cancelled = match self.work_db.cancel_running_execution(execution_id) {
+            Ok(cancelled) => cancelled,
             Err(err) => {
                 tracing::warn!(
+                    work_item_id,
                     execution_id,
                     reason,
                     ?err,
                     "cancel_and_release: failed to cancel execution; proceeding to release",
                 );
+                false
             }
-        }
-        self.force_release(execution_id).await;
+        };
+        let outcome = self.force_release(execution_id).await;
+        tracing::info!(
+            work_item_id,
+            execution_id,
+            reason,
+            cancelled,
+            outcome = outcome.label(),
+            lease_id = match &outcome {
+                ForceReleaseOutcome::Released { lease_id } | ForceReleaseOutcome::LeaseReleaseFailed { lease_id } =>
+                    Some(lease_id.as_str()),
+                _ => None,
+            },
+            "cancel_and_release: teardown cascade complete",
+        );
     }
 
     /// Explicit human-initiated stop (`bossctl agents stop`). Unlike
@@ -6256,7 +6316,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_release_mid_spawn_cancels_row_but_holds_lease() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (db, _, chore_id, execution_id) = fixture(workspace.path());
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
@@ -6272,7 +6332,7 @@ mod tests {
         );
 
         handler
-            .cancel_and_release(&execution_id, "test: mid-spawn cancel")
+            .cancel_and_release(&chore_id, &execution_id, "test: mid-spawn cancel")
             .await;
 
         let execution = db.get_execution(&execution_id).unwrap();
@@ -6298,7 +6358,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_release_with_live_worker_releases_lease() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture(workspace.path());
+        let (db, _, chore_id, execution_id) = fixture(workspace.path());
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
@@ -6314,7 +6374,7 @@ mod tests {
         );
 
         handler
-            .cancel_and_release(&execution_id, "test: live worker cancel")
+            .cancel_and_release(&chore_id, &execution_id, "test: live worker cancel")
             .await;
 
         let execution = db.get_execution(&execution_id).unwrap();
@@ -6345,7 +6405,7 @@ mod tests {
     #[tokio::test]
     async fn delete_while_doing_teardown_releases_pane_frees_lease_and_cancels_execution() {
         let workspace = tempdir().unwrap();
-        let (db, _, _, execution_id) = fixture_running(workspace.path());
+        let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default()); // defaults to Reaped
@@ -6363,7 +6423,7 @@ mod tests {
         // This is the call that handle_delete_work_item spawns when it detects
         // a live execution for a work item being deleted.
         handler
-            .cancel_and_release(&execution_id, "work item deleted while a worker was active")
+            .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
             .await;
 
         // 1. Pane releaser was invoked — the production implementation
@@ -6395,6 +6455,77 @@ mod tests {
         assert!(
             execution.cube_lease_id.is_none(),
             "cube_lease_id must be cleared from the execution row after the lease is released",
+        );
+    }
+
+    /// Regression guard for the "delete-while-dispatching" lifecycle bug:
+    /// a delete that lands while the row's execution is still mid-dispatch
+    /// (workspace leased, worker pane not yet up) must not let that dispatch
+    /// complete into a zombie. `handle_delete_work_item` still spawns
+    /// `cancel_and_release` here exactly as it does for the delete-while-doing
+    /// case above; the pane releaser reports `NoLiveWorker` because no slot
+    /// is mapped yet, which is the T981 gate: releasing the cube lease now
+    /// would hand a workspace the in-flight spawn is about to occupy back to
+    /// cube, causing a same-workspace collision the moment it lands. So the
+    /// execution row is cancelled immediately (the reconciler will never
+    /// re-dispatch it) while the lease is deliberately left held for the
+    /// in-flight `run_execution` to reap and release once its spawn settles
+    /// — proven end-to-end by
+    /// `runner::tests::run_execution_reaps_and_signals_when_cancelled_mid_spawn`,
+    /// which shows that same cancelled row's spawn coming back reaped with
+    /// its pool slot freed, and by the coordinator's `CancelledDuringSpawn`
+    /// branch, which releases the lease this test leaves held. Together the
+    /// three cover the full delete-while-dispatching path ending with no
+    /// live process, no held lease, and no held slot.
+    #[tokio::test]
+    async fn delete_while_dispatching_cancels_row_but_holds_lease_for_inflight_spawn() {
+        let workspace = tempdir().unwrap();
+        let (db, _, chore_id, execution_id) = fixture_running(workspace.path());
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes,
+        );
+
+        // This is the call that handle_delete_work_item spawns when it
+        // detects a live (here: mid-dispatch) execution for a work item
+        // being deleted.
+        handler
+            .cancel_and_release(&chore_id, &execution_id, "work item deleted while a worker was active")
+            .await;
+
+        // The row is terminal immediately — the orphan sweep and
+        // reconciler will not re-dispatch the deleted work item no matter
+        // how long the in-flight spawn takes to settle.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Cancelled,
+            "execution must be marked Cancelled so the reconciler never re-dispatches the deleted item",
+        );
+
+        // Pane release was attempted (it is what would reap a worker that
+        // had already come up)...
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        // ...but with no live worker found yet, the cube lease must stay
+        // held rather than being handed back to the pool out from under
+        // the in-flight spawn.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "a delete landing mid-dispatch must not release the lease before the in-flight spawn settles",
+        );
+        assert_eq!(
+            execution.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "lease columns must remain so the in-flight run can reap the worker and release the lease itself",
         );
     }
 

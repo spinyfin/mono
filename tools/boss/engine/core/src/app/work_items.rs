@@ -527,9 +527,14 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 // entered Doing, so it will not be re-dispatched.
                 if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
                     let handler = server_state.completion_handler.clone();
+                    let id_for_cancel = id.clone();
                     tokio::spawn(async move {
                         handler
-                            .cancel_and_release(&execution_id, "kanban drag: active → todo (dragged back to Backlog)")
+                            .cancel_and_release(
+                                &id_for_cancel,
+                                &execution_id,
+                                "kanban drag: active → todo (dragged back to Backlog)",
+                            )
                             .await;
                     });
                 }
@@ -726,9 +731,14 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                 // executions return `None` and never reach this branch.
                 if let Some(execution_id) = live_execution_for_deleted_item(&work_db, &item) {
                     let handler = server_state.completion_handler.clone();
+                    let id_for_cancel = id.clone();
                     tokio::spawn(async move {
                         handler
-                            .cancel_and_release(&execution_id, "work item deleted while a worker was active")
+                            .cancel_and_release(
+                                &id_for_cancel,
+                                &execution_id,
+                                "work item deleted while a worker was active",
+                            )
                             .await;
                     });
                 }
