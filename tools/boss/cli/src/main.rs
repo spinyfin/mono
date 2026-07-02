@@ -12,11 +12,11 @@ use boss_protocol::{
     CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
     CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
     EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
-    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PrWorkItemMatch,
-    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch,
+    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
+    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -313,6 +313,24 @@ enum ProjectCommand {
     /// found so the verb is usable from CI.
     #[command(name = "lint-design-docs")]
     LintDesignDocs(ProjectLintDesignDocsArgs),
+    /// Run the auto-populate Planner/Materializer for a project — the same
+    /// pipeline the design-PR-merge trigger runs, invoked by hand.
+    /// `--dry-run` previews the proposal without creating anything.
+    /// `--force` bypasses the refusal when the project already has
+    /// implementation tasks (existing tasks are preserved by name dedup).
+    Plan(ProjectPlanArgs),
+    /// Release a project's staged auto-populate batch: flips `autostart =
+    /// true` on every task from its most recent `staged` planner run so the
+    /// dispatcher picks them up.
+    Release(ProjectSelectorArgs),
+    /// Undo an auto-populate batch. Soft-deletes every task from `--run`
+    /// that has no execution yet; tasks that were already released and
+    /// dispatched are preserved and reported, not deleted.
+    Unpopulate(ProjectUnpopulateArgs),
+    /// List the `planner_runs` audit trail for a project — every
+    /// auto-populate invocation, newest first.
+    #[command(name = "plan-runs")]
+    PlanRuns(ProjectSelectorArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
         #[command(subcommand)]
@@ -1441,6 +1459,38 @@ struct ProjectSelectorArgs {
     product: Option<String>,
 
     selector: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProjectPlanArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    selector: String,
+
+    /// Bypass the refusal when the project already has implementation
+    /// tasks. The Materializer's name dedup makes this additive, never
+    /// destructive.
+    #[arg(long)]
+    force: bool,
+
+    /// Preview the proposal (infer + validate) without creating anything
+    /// or claiming the project's planner-run idempotency gate.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProjectUnpopulateArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    selector: String,
+
+    /// The `planner_runs.id` (`run_…`) to undo. Find it with
+    /// `boss project plan-runs <project>`.
+    #[arg(long)]
+    run: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -3404,6 +3454,75 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             } else {
                 Ok(())
             }
+        }
+        ProjectCommand::Plan(args) => {
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let result = plan_project(&mut client, &project.id, args.force, args.dry_run).await?;
+            print_entity(ctx, &result, || print_plan_project_result(&result))
+        }
+        ProjectCommand::Release(args) => {
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let (run_id, released) = release_project(&mut client, &project.id).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "project_id": project.id,
+                    "run_id": run_id,
+                    "released": released,
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Released {released} staged task(s) from planner run {run_id} — dispatch begins on \
+                             the next reconcile pass."
+                        );
+                    }
+                },
+            )
+        }
+        ProjectCommand::Unpopulate(args) => {
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let (deleted, preserved) = unpopulate_project(&mut client, &project.id, &args.run).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "project_id": project.id,
+                    "run_id": args.run,
+                    "deleted": deleted,
+                    "preserved": preserved,
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Deleted {} staged task(s) from planner run {}.",
+                            deleted.len(),
+                            args.run
+                        );
+                        if !preserved.is_empty() {
+                            println!(
+                                "Preserved {} task(s) already released and dispatched (not deleted):",
+                                preserved.len()
+                            );
+                            for task in &preserved {
+                                println!("  {} ({})", task.name, task.id);
+                            }
+                        }
+                    }
+                },
+            )
+        }
+        ProjectCommand::PlanRuns(args) => {
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let runs = list_planner_runs(&mut client, &project.id).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "project_id": project.id, "runs": runs }),
+                || print_planner_runs_table(&runs),
+            )
         }
         ProjectCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
@@ -6321,6 +6440,117 @@ async fn resolve_project_design_doc(
     }
 }
 
+/// Response shape for `boss project plan` (both the real run and the
+/// `--dry-run` preview) — a thin CLI-side mirror of
+/// [`FrontendEvent::PlanProjectResult`], flattened for `print_entity`.
+#[derive(Debug, Clone, Serialize)]
+struct PlanProjectResult {
+    project_id: String,
+    outcome: String,
+    message: String,
+    created: usize,
+    edges: usize,
+    skipped: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposal: Option<PlannerOutput>,
+}
+
+async fn plan_project(
+    client: &mut BossClient,
+    project_id: &str,
+    force: bool,
+    dry_run: bool,
+) -> Result<PlanProjectResult, CliError> {
+    match client
+        .send_request(&FrontendRequest::PlanProject {
+            project_id: project_id.to_owned(),
+            force,
+            dry_run,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::PlanProjectResult {
+            project_id,
+            outcome,
+            message,
+            created,
+            edges,
+            skipped,
+            run_id,
+            proposal,
+        } => Ok(PlanProjectResult {
+            project_id,
+            outcome,
+            message,
+            created,
+            edges,
+            skipped,
+            run_id,
+            proposal,
+        }),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("plan project", &other)),
+    }
+}
+
+async fn release_project(client: &mut BossClient, project_id: &str) -> Result<(String, usize), CliError> {
+    match client
+        .send_request(&FrontendRequest::ReleaseProject {
+            project_id: project_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::ReleaseProjectResult { run_id, released, .. } => Ok((run_id, released)),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("release project", &other)),
+    }
+}
+
+async fn unpopulate_project(
+    client: &mut BossClient,
+    project_id: &str,
+    run_id: &str,
+) -> Result<(Vec<String>, Vec<UnpopulatePreservedTask>), CliError> {
+    match client
+        .send_request(&FrontendRequest::UnpopulateProject {
+            project_id: project_id.to_owned(),
+            run_id: run_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::UnpopulateProjectResult { deleted, preserved, .. } => Ok((deleted, preserved)),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("unpopulate project", &other)),
+    }
+}
+
+async fn list_planner_runs(client: &mut BossClient, project_id: &str) -> Result<Vec<PlannerRun>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListPlannerRuns {
+            project_id: project_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::PlannerRunsList { runs, .. } => Ok(runs),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("list planner runs", &other)),
+    }
+}
+
 async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<Task, CliError> {
     match client
         .send_request(&FrontendRequest::CreateTask { input })
@@ -8665,6 +8895,66 @@ fn print_lint_design_docs_table(entries: &[LintDesignDocEntry]) {
     }
     println!();
     println!("{}", lint_summary_line(entries));
+}
+
+fn print_plan_project_result(result: &PlanProjectResult) {
+    println!("{}: {}", result.outcome, result.message);
+    if let Some(run_id) = &result.run_id {
+        println!("Planner run: {run_id}");
+    }
+    if let Some(proposal) = &result.proposal {
+        print_planner_proposal(proposal);
+    }
+}
+
+fn print_planner_proposal(proposal: &PlannerOutput) {
+    if proposal.tasks.is_empty() {
+        return;
+    }
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["HANDLE", "NAME", "KIND", "EFFORT"]);
+    for task in &proposal.tasks {
+        table.add_row(vec![
+            task.handle.clone(),
+            task.name.clone(),
+            task.kind.as_str().to_owned(),
+            task.effort.as_str().to_owned(),
+        ]);
+    }
+    println!("{table}");
+    if !proposal.edges.is_empty() {
+        println!("Dependency edges:");
+        for edge in &proposal.edges {
+            println!("  {} depends on {}", edge.dependent, edge.prerequisite);
+        }
+    }
+    println!("Confidence: {}", proposal.confidence);
+    if !proposal.notes.is_empty() {
+        println!("Notes: {}", proposal.notes);
+    }
+}
+
+fn print_planner_runs_table(runs: &[PlannerRun]) {
+    if runs.is_empty() {
+        println!("No planner runs recorded for this project.");
+        return;
+    }
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["ID", "CALLER", "OUTCOME", "RESULT", "CREATED_AT"]);
+    for run in runs {
+        table.add_row(vec![
+            run.id.clone(),
+            run.caller.clone(),
+            run.outcome.clone(),
+            run.result_summary.clone().unwrap_or_default(),
+            run.created_at.clone(),
+        ]);
+    }
+    println!("{table}");
 }
 
 fn lint_severity_label(severity: LintSeverity) -> &'static str {
