@@ -1,0 +1,45 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When the classifier reports low confidence in its intent call, should v1 show a distinguishable 'uncertain' state instead of silently picking the higher-probability bucket?",
+    "choices": [
+      "No — pick the higher-probability bucket and rely on the manual-override badge (v1 default)",
+      "Yes — surface an 'uncertain, please confirm' state below some confidence threshold"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the read-only answer agent's no-writes boundary be enforced?",
+    "choices": [
+      "A distinct execution-kind dispatch path with a hard-coded reduced tool/RPC table (recommended, matches the existing PreToolUse-hook pattern)",
+      "A runtime capability-token check on every RPC call (more defense-in-depth, new machinery)"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Does bucket-2 need a global concurrency cap on simultaneous answer-agent runs across comments/docs, or is v1's per-comment-only guard acceptable to start?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Retiring the magic wand drops all comment-driven affordance for work-item description comments (classification/banner/answer-agent are all scoped to design/investigation docs only). Is this coverage regression acceptable for v1?",
+    "anchor": "migration-retiring-the-magic-wand"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Reopen-on-abandon (1&3 path) still needs a closed/abandoned terminal signal the poller doesn't emit today (ClosedUnmerged arm is a no-op). How should v1 get it?",
+    "choices": [
+      "Depend on the chore-lifecycle-pr-closed-unmerged work landing and hook its transition",
+      "Add a minimal comment-only reopen hook in the poller's ClosedUnmerged arm now (stopgap)",
+      "Ship v1 with resolve-on-merge only; reopen-on-abandon is a fast-follow"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should one [Revise] click address ALL currently-unaddressed directive/larger-change comments as a single batch (yes), or should v1 let the reviewer select a subset (no)?",
+    "anchor": "buckets-1--3--unified-directive--larger-change"
+  }
+]
