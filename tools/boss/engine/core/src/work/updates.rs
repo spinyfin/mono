@@ -106,10 +106,20 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut task = query_task(&tx, id).require("task", id)?;
+        let previous_status = task.status.clone();
+        // Check this before the generic tombstone bail below: an
+        // archived-and-tombstoned moot revision (see
+        // `block_pending_revisions_on_parent_close`) is also a deleted
+        // task, so without this ordering every attempt to reopen one would
+        // surface the generic "cannot update a deleted task" message
+        // instead of the specific, actionable explanation.
+        if let Some(status_str) = patch.status.as_deref() {
+            let requested_status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;
+            refuse_manual_move_off_archived_moot_revision(&tx, id, &task.kind, &previous_status, &requested_status)?;
+        }
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
         }
-        let previous_status = task.status.clone();
         let previous_blocked_reason = task.blocked_reason.clone();
         let status_changed = patch.status.is_some();
 
@@ -177,7 +187,6 @@ impl WorkDb {
 
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
-            refuse_manual_move_off_archived_moot_revision(&tx, id, &task.kind, &previous_status, &task.status)?;
         }
         let actor_stamp = if status_changed && previous_status != task.status {
             actor

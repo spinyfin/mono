@@ -52,10 +52,13 @@ impl WorkDb {
     /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
     /// `repo_unresolved` surface and any future work-item-scoped
     /// attention flows. Errors if the work item id is unknown so
-    /// callers can't accidentally silently no-op on a typo.
+    /// callers can't accidentally silently no-op on a typo. Deliberately
+    /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
+    /// moot revision) so the `revision_archived` attention item raised at
+    /// archival time stays reachable afterwards.
     pub fn list_attention_items_for_work_item(&self, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
-        let _ = product_id_for_work_item(&conn, work_item_id)?;
+        let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
              FROM work_attention_items
