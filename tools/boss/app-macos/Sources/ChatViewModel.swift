@@ -2204,13 +2204,13 @@ final class ChatViewModel: ObservableObject {
             plannerActionInFlightProjectIDs.remove(projectID)
             engine.sendListPlannerRuns(projectId: projectID)
             if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .unpopulateProjectResult(let projectID, _, _, _):
             plannerActionInFlightProjectIDs.remove(projectID)
             engine.sendListPlannerRuns(projectId: projectID)
             if let productID = project(withID: projectID)?.productID {
-                engine.sendGetWorkTree(productId: productID)
+                engine.sendGetWorkTree(productId: productID, flow: .itemRefetch)
             }
         case .attentionGroupsList(let productID, let groups, let members):
             applyAttentionGroupsList(productID: productID, groups: groups, members: members)
