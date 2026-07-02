@@ -2326,6 +2326,7 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
             r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
+            r @ FrontendRequest::CommentsSetIntent { .. } => comments::handle_comments_set_intent(ctx, r).await,
             r @ FrontendRequest::CommentsSetStatus { .. } => comments::handle_comments_set_status(ctx, r).await,
             r @ FrontendRequest::CommentsUpdateAnchor { .. } => comments::handle_comments_update_anchor(ctx, r).await,
             r @ FrontendRequest::CreateAttention { .. } => attentions::handle_create_attention(ctx, r).await,
