@@ -325,6 +325,17 @@ pub enum FrontendRequest {
         plain_text_projection_version: i64,
     },
 
+    /// Manually reclassify a comment's intent (sidebar intent badge).
+    /// Sets `intent_overridden_by = 'user'` and re-runs routing from the new
+    /// intent's entry point — the override doubles as the classification,
+    /// so no re-classification LLM call is triggered. Comment-intent-
+    /// classification design § "Misclassification / override".
+    CommentsSetIntent {
+        comment_id: String,
+        /// `directive` | `question` | `larger_change`.
+        intent: String,
+    },
+
     /// General status transition (`active` / `resolved` / `orphaned`).
     /// Re-activation is accepted; hard delete is not exposed.
     CommentsSetStatus {

@@ -277,6 +277,48 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
     }
 }
 
+/// Manually reclassify a comment's intent (the sidebar badge's override
+/// control). `intent_overridden_by = 'user'` is stamped by
+/// `override_comment_intent` itself; publishing the comment invalidation is
+/// what "re-runs routing from the new intent's entry point" means today —
+/// there is no bucket-1&3/bucket-2 routing yet (later phases of
+/// comment-triggered-document-revisions.md), so a fresh load of the comment
+/// (with its new `intent`) is the whole of "routing" until those land.
+pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsSetIntent { comment_id, intent } = req else {
+        unreachable!()
+    };
+    match work_db.override_comment_intent(&comment_id, &intent) {
+        Ok(comment) => {
+            let revision = publish_comment_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                "comment_intent_overridden",
+            )
+            .await;
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
+        }
+        Err(err) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: err.to_string(),
+            },
+        ),
+    }
+}
+
 pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

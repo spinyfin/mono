@@ -124,9 +124,9 @@ impl WorkDb {
     /// (comment-intent-classification design § "The classifier"). Guarded
     /// on `intent_classified_at IS NULL` so a comment is only ever
     /// engine-classified once; re-firing (a raced/duplicate completion) is
-    /// a no-op error the caller logs and discards. A later manual override
-    /// (`CommentsSetIntent`, a subsequent phase) bypasses this guard by
-    /// design — that RPC will use its own update, not this method.
+    /// a no-op error the caller logs and discards. A manual override
+    /// (`CommentsSetIntent`) bypasses this guard by design — see
+    /// [`Self::override_comment_intent`], which that RPC uses instead.
     pub fn set_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
         match intent {
             INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
@@ -144,6 +144,36 @@ impl WorkDb {
             bail!("comment {comment_id} not found, or already classified");
         }
         query_comment(&conn, comment_id)?.with_context(|| format!("missing comment after intent update: {comment_id}"))
+    }
+
+    /// Manually reclassify a comment's intent (`CommentsSetIntent` RPC —
+    /// comment-intent-classification design § "Misclassification /
+    /// override"). Unlike [`Self::set_comment_intent`], this has no
+    /// `intent_classified_at IS NULL` guard: it overwrites any prior engine
+    /// classification (or lack thereof) and always stamps
+    /// `intent_overridden_by = 'user'`, which is preserved permanently as an
+    /// audit trail distinguishing engine calls from human corrections.
+    /// `intent_confidence` is cleared (`NULL`) — a manual override has no
+    /// numeric confidence, and the override itself doubles as the
+    /// classification, so no re-classification LLM call is triggered.
+    pub fn override_comment_intent(&self, comment_id: &str, intent: &str) -> Result<WorkComment> {
+        match intent {
+            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            other => bail!("invalid comment intent: {other}"),
+        }
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user'
+             WHERE id = ?1",
+            params![comment_id, intent, now],
+        )?;
+        if n == 0 {
+            bail!("unknown comment: {comment_id}");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after intent override: {comment_id}"))
     }
 
     /// Persist a renderer-supplied re-anchor (the `comments_update_anchor`
@@ -906,6 +936,47 @@ mod tests {
         assert!(db.set_comment_intent(&c.id, "question", 0.5).is_err());
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
         assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+    }
+
+    #[test]
+    fn override_comment_intent_reclassifies_and_stamps_actor() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "question", 0.6).unwrap();
+
+        let overridden = db.override_comment_intent(&c.id, "directive").unwrap();
+        assert_eq!(overridden.intent.as_deref(), Some("directive"));
+        assert!(overridden.intent_confidence.is_none());
+        assert!(overridden.intent_classified_at.is_some());
+        assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert_eq!(reloaded.intent_overridden_by.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn override_comment_intent_works_even_when_unclassified() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(c.intent.is_none());
+
+        let overridden = db.override_comment_intent(&c.id, "larger_change").unwrap();
+        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+        assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn override_comment_intent_rejects_unknown_intent() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(db.override_comment_intent(&c.id, "bogus").is_err());
+    }
+
+    #[test]
+    fn override_comment_intent_rejects_unknown_comment() {
+        let db = mem_db();
+        assert!(db.override_comment_intent("cmt_missing", "directive").is_err());
     }
 
     #[test]
