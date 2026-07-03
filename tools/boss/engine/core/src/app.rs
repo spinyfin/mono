@@ -1622,7 +1622,10 @@ impl ServerState {
     /// consumer or the spawn flow mutates the registry.
     pub async fn broadcast_live_worker_states(&self) {
         let states = self.live_worker_states.snapshot();
-        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList {
+            states,
+            engine_process_started_at: crate::build_info::process_started_at().to_owned(),
+        });
         self.topic_broker.publish(TOPIC_WORKER_LIVE_STATES, envelope).await;
     }
 

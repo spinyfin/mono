@@ -141,7 +141,11 @@ enum EngineEvent {
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
-    case workerLiveStatesList(states: [WorkerLiveState])
+    ///
+    /// `engineProcessStartedAt` identifies the engine process that
+    /// produced this snapshot — see `ChatViewModel`'s boot-id gate on
+    /// the reconciliation sweep.
+    case workerLiveStatesList(states: [WorkerLiveState], engineProcessStartedAt: String)
     /// Snapshot of slot ids whose live-status summarizer has been
     /// manually disabled by the human. Sourced from a one-shot reply
     /// to `list_live_status_disabled_slots`.
@@ -1642,7 +1646,8 @@ final class EngineClient: @unchecked Sendable {
             case "worker_live_states_list":
                 let raw = payload["states"] as? [[String: Any]] ?? []
                 let states = raw.compactMap(parseWorkerLiveState)
-                emit(.workerLiveStatesList(states: states))
+                let engineProcessStartedAt = payload["engine_process_started_at"] as? String ?? ""
+                emit(.workerLiveStatesList(states: states, engineProcessStartedAt: engineProcessStartedAt))
             case "live_status_disabled_slots_list":
                 let raw = payload["slot_ids"] as? [Any] ?? []
                 let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }
