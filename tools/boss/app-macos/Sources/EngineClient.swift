@@ -569,10 +569,15 @@ final class EngineClient: @unchecked Sendable {
     /// request→reply segment plus the per-product session issue count
     /// (which surfaces the cold-start double-fetch — see T2101 R1).
     func sendGetWorkTree(productId: String, flow: PopulationFlow) {
-        PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
+        // Propagate the app-side `fetch_seq` on the wire so the engine can
+        // stamp it on its `engine-population-timing-*.jsonl` segments and the
+        // two sides join on `(product_id, fetch_seq)` (T2101 engine-side
+        // instrumentation follow-up).
+        let fetchSeq = PopulationTiming.shared.fetchIssued(productId: productId, flow: flow)
         sendLine([
             "type": "get_work_tree",
             "product_id": productId,
+            "fetch_seq": fetchSeq,
         ])
     }
 

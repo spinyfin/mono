@@ -2847,3 +2847,91 @@ fn reviewer_fallback_advances_with_only_live_reviewer() {
     let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::InReview);
 }
+
+/// End-to-end proof that `get_work_tree_instrumented` captures the
+/// per-item runtime N+1: for `N` items that each have a live execution and
+/// a run, the `db.task_runtimes` segment must report `rows == N` and
+/// `db_queries == 2 * N` (one latest-execution lookup + one latest-run
+/// lookup per item). This is the segment expected to dominate the ~7s live
+/// trace, and the reason the app-side `request` duration scales
+/// super-linearly with item count.
+#[test]
+fn get_work_tree_instrumented_reports_task_runtime_nplus1() {
+    use crate::population_timing::{PopulationTrace, segment};
+    use std::time::Instant;
+
+    let db = WorkDb::open(temp_db_path("pop-timing-nplus1")).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+
+    const N: usize = 5;
+    for i in 0..N {
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(format!("Chore {i}"))
+                    .build(),
+            )
+            .unwrap();
+        // A live (running) execution keeps `query_task_runtime` on its
+        // 2-query path: latest-execution is itself live, so no live-fallback
+        // lookup, then one latest-run lookup.
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        db.create_run(CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent_1".to_owned(),
+            status: Some("active".to_owned()),
+            error_text: None,
+            result_summary: None,
+            transcript_path: None,
+            artifacts_path: None,
+            started_at: Some("100".to_owned()),
+            finished_at: None,
+        })
+        .unwrap();
+    }
+
+    let mut trace = PopulationTrace::new(product.id.clone(), "req-nplus1", Some(1), Instant::now());
+    let tree = db.get_work_tree_instrumented(&product.id, &mut trace).unwrap();
+    assert_eq!(tree.chores.len(), N);
+    assert_eq!(tree.task_runtimes.len(), N);
+
+    let (_dur, rows, db_queries) = trace
+        .segment_counts(segment::DB_TASK_RUNTIMES)
+        .expect("db.task_runtimes segment must be recorded");
+    assert_eq!(rows, Some(N as i64), "one runtime row per item");
+    assert_eq!(
+        db_queries,
+        Some(2 * N as i64),
+        "N+1 fan-out: 2 point queries per item (latest execution + latest run)"
+    );
+
+    // The bulk chores query, by contrast, is a single statement — no
+    // per-row count is attributed to it.
+    let (_dur, chore_rows, chore_queries) = trace
+        .segment_counts(segment::DB_CHORES)
+        .expect("db.chores segment must be recorded");
+    assert_eq!(chore_rows, Some(N as i64));
+    assert_eq!(chore_queries, None);
+
+    // The uninstrumented wrapper returns the identical tree with no trace.
+    let plain = db.get_work_tree(&product.id).unwrap();
+    assert_eq!(plain.chores.len(), N);
+}

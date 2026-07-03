@@ -1,5 +1,9 @@
 use super::*;
 
+use std::time::Instant;
+
+use crate::population_timing::{PopulationTrace, elapsed_ms, segment};
+
 impl WorkDb {
     pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
@@ -324,9 +328,25 @@ impl WorkDb {
     }
 
     pub fn get_work_tree(&self, product_id: &str) -> Result<WorkTree> {
-        let conn = self.connect()?;
-        let product = query_product(&conn, product_id).require("product", product_id)?;
+        // Uninstrumented path (tests, single-item callers): run the same
+        // body against a disabled trace that records and emits nothing.
+        let mut trace = PopulationTrace::disabled();
+        self.get_work_tree_instrumented(product_id, &mut trace)
+    }
 
+    /// Body of [`get_work_tree`] with per-segment wall-clock instrumentation
+    /// threaded through `trace`. The production `handle_get_work_tree` path
+    /// passes an enabled trace (see [`crate::population_timing`]); every
+    /// other caller goes through the wrapper above with a disabled trace, so
+    /// the timing is genuinely free off the RPC path.
+    pub fn get_work_tree_instrumented(&self, product_id: &str, trace: &mut PopulationTrace) -> Result<WorkTree> {
+        let conn = self.connect()?;
+
+        let t = Instant::now();
+        let product = query_product(&conn, product_id).require("product", product_id)?;
+        trace.record_query(segment::DB_PRODUCT, elapsed_ms(t), 1);
+
+        let t = Instant::now();
         let projects = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
@@ -338,7 +358,9 @@ impl WorkDb {
             let rows = stmt.query_map([product_id], map_project)?;
             collect_rows(rows)?
         };
+        trace.record_query(segment::DB_PROJECTS, elapsed_ms(t), projects.len());
 
+        let t = Instant::now();
         let tasks = {
             // `kind IN ('project_task', 'design')` — the design task
             // auto-created at project birth lives in the same lane as
@@ -355,7 +377,9 @@ impl WorkDb {
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
             collect_rows(rows)?
         };
+        trace.record_query(segment::DB_TASKS, elapsed_ms(t), tasks.len());
 
+        let t = Instant::now();
         let mut chores = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, driver, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at
@@ -366,24 +390,47 @@ impl WorkDb {
             let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_source_and_provenance)?;
             collect_rows(rows)?
         };
+        trace.record_query(segment::DB_CHORES, elapsed_ms(t), chores.len());
 
-        let task_runtimes = collect_task_runtimes(&conn, &tasks, &chores)?;
+        // Carry the total item count on every aggregate segment so cost
+        // correlates with cardinality (parity with the app-side `items`).
+        trace.set_items(tasks.len() + chores.len());
+
+        // Primary N+1: one runtime lookup per task and chore, each running
+        // 1-3 point queries. `runtime_queries` is the aggregate statement
+        // count, which makes the per-row fan-out visible in the log.
+        let t = Instant::now();
+        let (task_runtimes, runtime_queries) = collect_task_runtimes(&conn, &tasks, &chores)?;
+        trace.record_nplus1(
+            segment::DB_TASK_RUNTIMES,
+            elapsed_ms(t),
+            tasks.len() + chores.len(),
+            runtime_queries,
+        );
+
+        let t = Instant::now();
         let dependencies = collect_product_dependencies(&conn, product_id)?;
+        trace.record_query(segment::DB_DEPENDENCIES, elapsed_ms(t), dependencies.len());
 
         // Compute revision projections (revision_seq, revision_parent_pr_url)
         // for every `kind = 'revision'` task. These are derived fields —
         // not stored columns — so they are calculated fresh here.
+        let t = Instant::now();
         let mut tasks = attach_revision_projections(tasks, &chores);
         // Compute has_in_progress_revision for every chain-root task that
         // has at least one todo/active descendant revision.
         attach_in_progress_revision_flag(&mut tasks, &mut chores);
+        trace.record_plain(segment::ASSEMBLE, elapsed_ms(t));
+
         // Compute ai_reviewing for tasks held in Doing while a pr_review
         // execution is in flight. Surfaces the "Reviewing (AI)" badge on
         // the kanban card. Errors are non-fatal — log and continue with
-        // the field defaulting to false.
+        // the field defaulting to false. Single batched `IN (...)` query.
+        let t = Instant::now();
         if let Err(err) = attach_ai_reviewing_flag(&conn, &mut tasks, &mut chores) {
             tracing::warn!(?err, "get_work_tree: failed to attach ai_reviewing flag; ignoring");
         }
+        trace.record_plain(segment::DB_AI_REVIEWING, elapsed_ms(t));
 
         // Resolve the per-task doc-link state for project-less docs-backed
         // items (investigations / project-less designs) so their card renders
@@ -393,10 +440,17 @@ impl WorkDb {
         // get_work_tree, and the app prefers the GitHub raw-content URL for
         // in-review docs on the PR head branch anyway. Errors per task are
         // non-fatal — log and leave the field None (affordance hidden).
+        //
+        // Secondary, gated N+1: only the docs-backed subset enters
+        // `resolve_task_doc_pointer` (2-3 queries each). `resolved` is the
+        // number of items that did, i.e. the rows this loop touched.
+        let t = Instant::now();
+        let mut resolved = 0usize;
         for task in &mut tasks {
             if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
                 continue;
             }
+            resolved += 1;
             match resolve_task_doc_pointer(&conn, &task.id, |_| None) {
                 Ok(state) => task.doc_link_state = state,
                 Err(err) => tracing::warn!(
@@ -406,6 +460,7 @@ impl WorkDb {
                 ),
             }
         }
+        trace.record_query(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved);
 
         Ok(WorkTree {
             product,
@@ -496,7 +551,10 @@ impl WorkDb {
     pub fn get_task_runtime(&self, work_item_id: &str) -> Result<TaskRuntime> {
         let conn = self.connect()?;
         let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
-        query_task_runtime(&conn, &resolved)
+        // Single-item lookup; the per-item subquery tally is only meaningful
+        // for the `get_work_tree` N+1, so discard it here.
+        let mut queries = 0u64;
+        query_task_runtime(&conn, &resolved, &mut queries)
     }
 
     /// Look up a work item by its per-product short_id. Searches both

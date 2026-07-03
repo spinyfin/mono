@@ -60,6 +60,7 @@ pub mod pane_summary;
 pub mod planner;
 pub mod planner_validation;
 pub mod pool_claim_sweep;
+pub mod population_timing;
 pub mod populator;
 pub use boss_pr_template as pr_template;
 pub mod pr_review;

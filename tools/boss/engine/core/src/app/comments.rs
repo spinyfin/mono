@@ -269,6 +269,7 @@ pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendReque
         session_id,
         request_id,
         peer_pid,
+        ..
     } = ctx;
     let FrontendRequest::CommentsReviseDoc { input } = req else {
         unreachable!()

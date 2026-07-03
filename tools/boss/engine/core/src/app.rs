@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -115,6 +116,13 @@ struct Dispatch {
     session_id: String,
     request_id: String,
     peer_pid: Option<libc::pid_t>,
+    /// When this request's line was received off the socket, before decode.
+    /// Seeds the population-timing `total` window and, with `decode_ms`, the
+    /// `decode` segment. Cheap to carry on every request; only the
+    /// `get_work_tree` handler reads it.
+    recv_instant: Instant,
+    /// Wall-clock ms spent deserializing this request's envelope.
+    decode_ms: f64,
 }
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
@@ -1937,6 +1945,14 @@ struct SessionSink {
     queue: StdMutex<SessionQueue>,
     notify: Notify,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
+    /// In-flight population-timing traces for this session, keyed by the
+    /// envelope `request_id`. The `get_work_tree` handler stashes a partial
+    /// trace here (decode + DB + assemble segments) right before enqueueing
+    /// its response; the writer task removes it when it pops that response,
+    /// appends the `serialize` / `socket_write` / `total` segments, and
+    /// flushes. Empty for every non-population request. See
+    /// [`crate::population_timing`].
+    pop_traces: StdMutex<HashMap<String, crate::population_timing::PopulationTrace>>,
 }
 
 impl SessionSink {
@@ -1945,7 +1961,26 @@ impl SessionSink {
             queue: StdMutex::new(SessionQueue::new()),
             notify: Notify::new(),
             shutdown: StdMutex::new(Some(shutdown_tx)),
+            pop_traces: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Stash a partial population-timing trace to be completed by the writer
+    /// task when it sends the response with this `request_id`.
+    fn stash_population_trace(&self, request_id: &str, trace: crate::population_timing::PopulationTrace) {
+        self.pop_traces
+            .lock()
+            .expect("pop_traces lock poisoned")
+            .insert(request_id.to_owned(), trace);
+    }
+
+    /// Remove the population-timing trace for `request_id`, if any. Called
+    /// by the writer task as it serializes the response.
+    fn take_population_trace(&self, request_id: &str) -> Option<crate::population_timing::PopulationTrace> {
+        self.pop_traces
+            .lock()
+            .expect("pop_traces lock poisoned")
+            .remove(request_id)
     }
 
     fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
@@ -2231,6 +2266,15 @@ async fn handle_frontend_connection(
     let writer_sink = sink.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(event) = writer_sink.next().await {
+            // If this response has a stashed population-timing trace, complete
+            // it here: the serialize and socket-write costs live on this task,
+            // not the handler's. `None` for every non-population event.
+            let mut trace = event
+                .request_id
+                .as_deref()
+                .and_then(|rid| writer_sink.take_population_trace(rid));
+
+            let serialize_start = Instant::now();
             let line = match serde_json::to_string(&event) {
                 Ok(line) => line,
                 Err(err) => {
@@ -2238,17 +2282,36 @@ async fn handle_frontend_connection(
                     continue;
                 }
             };
+            if let Some(t) = trace.as_mut() {
+                t.record_serialize(crate::population_timing::elapsed_ms(serialize_start), line.len());
+            }
 
+            let write_start = Instant::now();
+            let mut write_failed = false;
             if let Err(err) = write_half.write_all(line.as_bytes()).await {
                 tracing::error!(?err, "failed to write event to frontend socket");
-                break;
-            }
-            if let Err(err) = write_half.write_all(b"\n").await {
+                write_failed = true;
+            } else if let Err(err) = write_half.write_all(b"\n").await {
                 tracing::error!(?err, "failed to delimit frontend event line");
-                break;
-            }
-            if let Err(err) = write_half.flush().await {
+                write_failed = true;
+            } else if let Err(err) = write_half.flush().await {
                 tracing::error!(?err, "failed to flush frontend socket");
+                write_failed = true;
+            }
+
+            if let Some(mut t) = trace {
+                t.record_plain(
+                    crate::population_timing::segment::SOCKET_WRITE,
+                    crate::population_timing::elapsed_ms(write_start),
+                );
+                let total_ms = t.elapsed_ms();
+                t.record_plain(crate::population_timing::segment::TOTAL, total_ms);
+                if let Some(log) = crate::population_timing::global() {
+                    t.flush(log);
+                }
+            }
+
+            if write_failed {
                 break;
             }
         }
@@ -2269,10 +2332,14 @@ async fn handle_frontend_connection(
         let Some(line) = line_result.context("socket read failed")? else {
             break;
         };
+        // Population-timing window opens at line receipt, before decode, so
+        // engine-side segments sum to ~the app-observed request duration.
+        let recv_instant = Instant::now();
         if line.trim().is_empty() {
             continue;
         }
 
+        let decode_start = Instant::now();
         let envelope: FrontendRequestEnvelope = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(err) => {
@@ -2285,6 +2352,7 @@ async fn handle_frontend_connection(
                 continue;
             }
         };
+        let decode_ms = crate::population_timing::elapsed_ms(decode_start);
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
 
@@ -2295,6 +2363,8 @@ async fn handle_frontend_connection(
             .session_id(session_id.clone())
             .request_id(request_id.clone())
             .maybe_peer_pid(peer_pid)
+            .recv_instant(recv_instant)
+            .decode_ms(decode_ms)
             .build();
         match request {
             r @ FrontendRequest::AbandonCiRemediation { .. } => {
