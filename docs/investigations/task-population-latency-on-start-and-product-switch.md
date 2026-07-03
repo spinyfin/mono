@@ -1,14 +1,16 @@
 # Investigation: multi-second task-population delay on app start / product switch
 
-**Status:** investigation complete — no code changed. Deliverable is this writeup plus ranked follow-up chores.
-**Date:** 2026-07-01 (revised 2026-07-01 — real-data validation, see §9)
-**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-data revision)
+**Status:** investigation complete — no code changed. Deliverable is this writeup plus ranked follow-up chores. **R1 (end-to-end per-segment timing) has since shipped and produced live diagnostics; §10 reports the results and supersedes the speculative attribution in §6–§8 with measured numbers.**
+**Date:** 2026-07-01 (revised 2026-07-01 — real-data DB validation, see §9; revised 2026-07-03 — live production timing diagnostics, see §10)
+**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-DB-snapshot revision); `exec_18bee836b1025060_33` (live-diagnostics revision)
 **Scope:** measure and attribute the wall-clock of populating the kanban board (lanes, nav, counts) on (a) cold app start and (b) product switch, then propose remediations grounded in the measurements.
-**Real-data validation:** all DB-dependent numbers below (§3, §5) were re-measured against a read-only `.backup` snapshot of the live engine database (`boss-real.db`, taken 2026-07-01 19:18 PDT) and updated in place; §9 is the delta report. The original synthetic-DB numbers are struck through/replaced inline rather than kept as a separate stale table, so this document reads as current. See §9 for what survived and what changed.
+**Real-data validation:** all DB-dependent numbers in §3/§5 were re-measured against a read-only `.backup` snapshot of the live engine database (§9). **Live validation (§10):** with R1's instrumentation now running in production, the full engine→wire→decode→apply→render path has been measured directly on the live dataset (1,949-item Boss product) instead of reconstructed from a DB snapshot plus structural reasoning about the unmeasured app/engine segments. §10 is the authoritative attribution; read it first, then §3–§9 for how the investigation got there.
 
 ---
 
 ## TL;DR
+
+**Superseded by live measurement (§10, 2026-07-03):** production diagnostics from R1's instrumentation now show directly, on the real 1,949-item Boss product, that **the engine-side RPC round trip (`request` segment) is 92–99% of wall clock — p50 ~7.1 s** — and that **all client-side cost (decode + apply + render combined) is ~0.6 s**. This confirms and sharpens, rather than contradicts, the structural reasoning below: the DB N+1 this pass measured on a snapshot (§5, ~38 ms) is not what's running on the live engine at live cardinality; something in the engine-side request path costs ~7 s per full-population fetch, scaling super-linearly with item count (182 items → ~0.1 s; 1,949 items → ~7.1 s, i.e. 10.7× the items costs ~70× the time). **Client-side remediations (R4/R5 as originally framed around render cost) are deprioritized — the measured client-side budget is too small to matter.** The engine-side per-item cost is now the unambiguous #1 priority. See §10 for the full data and re-ranked remediations; §6–§9 below are retained as the investigation's original reasoning trail but should be read through the §10 correction.
 
 - Populating the whole board for a product is **one RPC**: `GetWorkTree { product_id }` → one `WorkTree` reply. There is **no app-issued per-task N+1**.
 - Inside that one RPC there **is a database N+1**: `get_work_tree` fans out to individual SQLite queries via `collect_task_runtimes`. **The real Boss-product population this loop runs over is 1,908 items (933 tasks incl. revisions + 975 chores), not the 395 "board tasks" the original pass counted** — the RPC's `tasks` query pulls in `kind = 'revision'` alongside `project_task`/`design`/`investigation`, and a separate `chores` query (975 rows) feeds the same loop; the original workload characterization (§3) counted only the 395 project_task/design/investigation rows and missed both. That undercounts the real fan-out by **4.9×** (1,131 → **5,593 queries**, measured on the real snapshot).
@@ -211,6 +213,8 @@ You cannot currently read the cold-start/switch breakdown off any log — which 
 
 ## 7. Ranked remediations
 
+**Superseded ranking:** this table reflects the original (DB-snapshot + structural-reasoning) pass, before live production diagnostics existed. §10.4 has the current, live-data-validated ranking — read it first. R1 (below) has since shipped and is what produced the §10 data.
+
 Each is tied to the measurement that justifies it. "Win" is relative to the _measured_ dominant cost; where the dominant cost is unmeasured (render/boot), the remediation is ranked by expected leverage and flagged as gated on R1.
 
 | #      | Remediation                                                                                                                                                                                                                                                                                                                                                                          | Expected win                                                                                                                                                                                                                                                                                                                                                                       | Complexity            | Measured basis                                                                                                                           |
@@ -278,6 +282,66 @@ Because the synthetic DB was hand-seeded to a fixed size, the original pass had 
 | R1 (instrumentation) is the highest-leverage first step                        | **Survives, unchanged** — real data narrowed the warm-path/multi-second gap but didn't close it; instrumentation is still the only way to confirm boot vs. render dominance.                             |
 
 No remediation's win reversed direction or dropped below "worth doing." The main practical changes are: **R4's expected win is bigger than modeled**, **R3's absolute win is smaller than modeled but its growth-risk argument is new and real**, and **the overall "warm path is negligible" framing needs updating to "warm path is still short of multi-second but no longer a rounding error, and will keep growing without R3/R4/R5."**
+
+---
+
+## 10. Live diagnostics validation (2026-07-03 revision)
+
+R1 (§7) has shipped: the running Boss build now writes per-segment population timing to `population-timing-*.jsonl` in the application-support diagnostics directory. This section reports the first live capture — 180 events across 15 complete fetch cycles, taken 2026-07-03 ~15:19–15:28 PDT from the live dataset (Boss product = 1,949 items, a second product = 182 items) — and uses it to replace the speculative attribution in §6–§8 with measured numbers. The raw file is coordinator/engine-owned diagnostic state and was not read directly by this pass; the aggregates below were computed from it and handed to this investigation.
+
+### 10.1 Aggregated timings (p50 / max ms, per flow + segment)
+
+| flow                             | segment                | n   | p50      | max      | items |
+| -------------------------------- | ---------------------- | --- | -------- | -------- | ----- |
+| cold_start                       | request                | 3   | 13,842.7 | 14,470.5 | 1,949 |
+| cold_start                       | render                 | 3   | 256.3    | 456.9    | 1,949 |
+| cold_start                       | apply                  | 3   | 249.3    | 250.9    | 1,949 |
+| cold_start                       | decode                 | 3   | 64.8     | 67.0     | 1,949 |
+| cold_start                       | apply.bucket_rebuild   | 3   | 35.5     | 36.4     | 1,949 |
+| cold_start                       | apply.sort             | 3   | 3.8      | 4.0      | 1,949 |
+| cold_start                       | render.column_build    | 12  | 1.1      | 4.0      | 1,949 |
+| cold_start                       | render.compute_visible | 3   | 0.8      | 0.9      | 1,949 |
+| invalidation_refetch             | request                | 10  | 7,063.5  | 7,814.3  | 1,949 |
+| invalidation_refetch             | render                 | 10  | 268.7    | 364.4    | 1,949 |
+| invalidation_refetch             | apply                  | 10  | 247.9    | 252.7    | 1,949 |
+| invalidation_refetch             | decode                 | 10  | 62.7     | 65.7     | 1,949 |
+| manual_refresh                   | request                | 1   | 7,030.8  | 7,030.8  | 1,949 |
+| product_switch (182 items)       | request                | 1   | 91.6     | 91.6     | 182   |
+| product_switch (182 items)       | render                 | 1   | 143.0    | 143.0    | 182   |
+| invalidation_refetch (182 items) | request                | 3   | 98–162   | 162      | 182   |
+
+Note the honest limits of this sample: n=3 cold starts, n=1 manual refresh, single-day capture (§10.5).
+
+### 10.2 Chronological fetch trace (request segment)
+
+- **Cold start issues `GetWorkTree` twice, concurrently.** `fetch_issued` seq=1 at t=0, seq=2 at t=+85 ms — a duplicate concurrent fetch. seq=1's request completed in 7,478 ms; seq=2, serialized behind it, completed in 14,471 ms. This is exactly the "redundant double `GetWorkTree`" amplifier flagged structurally in §6/R2 — now directly observed: **the duplicate fetch doubles perceived cold-start latency (~7.5 s → ~14.5 s), not because the second fetch is slow on its own, but because it queues behind the first** on the engine's serial per-connection dispatch loop (§6, `app.rs:2256`).
+- The same duplicate-fetch pattern reproduced independently a second time: a `manual_refresh`-tagged fetch at 15:24:48.366 was followed 401 ms later by a `cold_start`-tagged fetch on the same product, completing in 7,031 ms and 13,843 ms respectively — same doubling shape, different trigger pairing.
+- **Every invalidation triggers a full 1,949-item refetch**, each ~6.9–7.8 s: 10 such refetches were captured, several firing back-to-back roughly 8 s apart (seq 4→5, 6→7, 7→8, 8→9) — i.e., a new refetch was issued almost immediately after the previous one completed, consistent with the "refetch storm" risk flagged in §6/R7 (invalidation-only subscription, no delta, no coalescing).
+- The 182-item second product shows the same flows costing 92–162 ms end to end — two orders of magnitude cheaper, at roughly 1/10.7 the item count.
+
+### 10.3 What the live data proves, replacing speculation in §6–§8
+
+1. **The engine-side RPC (`request`: issue → response received) is 92–99% of wall clock.** At 1,949 items: request p50 ≈ 7.06–7.06 s vs. total client-side (decode + apply + render) ≈ 65 + 250 + 270 ≈ **0.6 s**. This directly resolves the question §6/§8 could not answer structurally ("is it render, or is it the request?") — **it is overwhelmingly the request.** The app-side main-thread apply+render candidate ranked #1 in §6 is not supported by live data: it is real (~0.5 s) but roughly 12–14× smaller than the request segment, not the dominant cost.
+2. **Item-count scaling is super-linear, not linear.** 182 items → ~0.1 s; 1,949 items → ~7.1 s. 10.7× the items costs **~70×** the time. This is inconsistent with the §5 DB-snapshot N+1 model (which showed near-linear query-count growth and only ~1.5× warm-cache wall-clock growth for a 4.9× item-count increase) and inconsistent with payload/transport cost (decode of the full 1,949-item payload is only 65 ms — bytes-on-the-wire is not the bottleneck). Super-linear scaling of this shape is the signature of **per-row work inside the engine handler or DB layer that itself scales badly** (e.g. an N+1 pattern with per-item overhead that grows with table size — repeated full/partial scans, cache eviction as row count exceeds a fixed buffer, or similar) — not a fixed per-request cost multiplied by a bigger N. **This reopens §5's DB-snapshot N+1 as insufficient explanation**: whatever the live engine binary is actually doing differs from the schema/query-shape model used in §5, or the live table sizes have grown past a threshold the 1,908-row snapshot (§9) didn't cross. The engine-side handler and DB layer need to be profiled directly against the live database (`EXPLAIN QUERY PLAN` against the real live `state.db`, not the July 1 `.backup` snapshot) to find the actual per-item hot loop — this is now the single highest-priority action.
+3. **Cold start's concurrent duplicate fetch is confirmed live and costs ~7 s of perceived latency**, reproduced twice in a 180-event, 15-cycle capture — this is not a rare edge case.
+4. **Invalidation triggers full 7 s refetches**, with evidence of storms. This doesn't change the per-fetch cost but multiplies how often users pay it.
+5. **Minor, unresolved:** `apply` p50 is ~250 ms but its instrumented children (`bucket_rebuild` 36 ms + `sort` 4 ms) sum to only ~40 ms — roughly 210 ms of `apply` is unattributed to any instrumented sub-segment. Noted as an instrumentation gap, not a priority (it's ~3% of total wall clock at live cardinality).
+
+### 10.4 Re-ranked remediations (supersedes §7's ranking)
+
+The §7 table remains as the investigation's original reasoning, but with live data in hand, the ranking changes as follows:
+
+1. **Root-cause and fix the engine-side per-item cost in the list handler (new #1, was R3/R6 in §7).** This is now the dominant, measured cost: ~7 s per full-population fetch, target sub-second. Profile the live handler and DB with `EXPLAIN QUERY PLAN` as originally scoped in R1/R3 — but now knowing definitively _where_ the time goes (the request segment, not render), the next step is to decompose _within_ that segment (handler vs. DB query vs. serialization vs. transport — none of which today's instrumentation separates, §10.5) rather than re-guess from the July 1 snapshot. The §5 snapshot-based N+1 estimate (~38 ms warm) is not what's running live and should not be relied on for magnitude; only the qualitative conclusion (it's a per-row DB pattern) plausibly still holds.
+2. **Dedupe concurrent identical fetches on cold start (was R2 in §7, unchanged priority, now with live magnitude).** Confirmed live: this alone roughly halves perceived cold-start latency (~14.5 s → ~7.5 s) for the cost of a client-side guard (`.productsList` should not refetch a product already in flight from `.connected`). Cheap, safe, and does not depend on the engine-side fix landing first.
+3. **Invalidation coalescing / delta updates (was R7 in §7, unchanged priority).** Reduces how often the ~7 s unit cost is paid (refetch storms observed live, §10.2) — it does not fix the 7 s cost itself, so it is properly ranked below the engine fix, not above it.
+4. **Client-side work (decode/apply/render, was R4/R5 in §7) is explicitly deprioritized.** Measured live cost is ~0.6 s total against a ~7.1 s request — even a 100% reduction in client-side cost would cut total wall clock by well under 10%. Payload slimming (R4) and lane virtualization (R5) may still be worth doing for other reasons (memory, payload size), but they should not be pitched as latency fixes and should not be scheduled ahead of the engine-side fix.
+
+### 10.5 Honest gaps in the live-diagnostics revision
+
+- **Single-day sample.** All 180 events were captured in one ~9-minute window (15:19–15:28 PDT, 2026-07-03). No day-to-day or load-condition variance is captured; p50/max here are not a distribution, they're one session's worth of cycles.
+- **n=3 cold starts, n=1 manual refresh.** Both flows have small samples; the max/p50 spread for `cold_start.request` (13.8 s p50 vs. 14.5 s max, n=3) is consistent with the duplicate-fetch mechanism (§10.2) rather than noise, but a larger sample would help confirm the duplicate-fetch pattern is the sole driver of cold-start variance and not one of several contributing factors.
+- **`apply`'s ~210 ms unattributed remainder (§10.3 item 5)** is not decomposed by current instrumentation — a gap in the instrumentation, not a mystery worth chasing given its size relative to the request segment.
+- **The `request` segment itself is not yet decomposed engine-side.** Today's diagnostics time issue→response-received as one span. It's now confirmed to be the dominant cost, but _within_ that ~7 s, handler-side compute, DB query time, serialization, and transport are still lumped together — exactly the further instrumentation needed to safely start the engine-side fix (#1 above) without guessing.
 
 ---
 
