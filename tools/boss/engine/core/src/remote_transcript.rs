@@ -17,6 +17,7 @@
 use anyhow::{Result, anyhow};
 
 use crate::ssh_spawn::SshExec;
+use crate::ssh_transport::shell_quote;
 
 /// Compose the remote command that reads the last `max_bytes` of the
 /// transcript at `path`.
@@ -25,28 +26,12 @@ use crate::ssh_spawn::SshExec;
 /// evaluates one well-formed command — the same convention
 /// `SshHostAdapter::append_remote_bazel_gate` uses. `tail -c` reads a
 /// byte suffix; `--` ends option parsing so a path that begins with `-`
-/// is treated as a filename; and the path is single-quoted + escaped so
-/// spaces or shell metacharacters in a cube/claude-produced path can
-/// neither break the parse nor inject a command.
+/// is treated as a filename; and the path is quoted via the shared
+/// [`shell_quote`] (also used by `SshTransport::run`) so spaces or
+/// shell metacharacters in a cube/claude-produced path can neither
+/// break the parse nor inject a command.
 pub fn remote_tail_command(path: &str, max_bytes: u64) -> String {
-    format!("tail -c {max_bytes} -- {}", shell_single_quote(path))
-}
-
-/// Single-quote `s` for a POSIX shell, escaping embedded single quotes
-/// via the standard `'\''` idiom. The result is always safe to splice
-/// into a command string as one argument.
-fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+    format!("tail -c {max_bytes} -- {}", shell_quote(path))
 }
 
 /// Read up to `max_bytes` from the tail of the transcript at `path` on
