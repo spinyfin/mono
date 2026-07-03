@@ -24,6 +24,20 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// the engine reports a pool size change on reconnect.
     @Published private(set) var reviewSlotCount: Int = 8
 
+    /// The most recently observed `engine_process_started_at` boot id,
+    /// updated by `ChatViewModel` (via a wired closure — see
+    /// `ContentView`) every time a `worker_live_states_list` snapshot
+    /// arrives, BEFORE that snapshot is reconciled. Every pane spawned
+    /// from here on stamps its `WorkerSlot.spawnEngineBootId` with this
+    /// value, and `reconcilePanes` refuses to sweep any slot whose
+    /// `spawnEngineBootId` disagrees with the snapshot's boot id — a
+    /// pane spawned under an older engine boot is never reconciled
+    /// against a snapshot from a newer one, on the first reconnect
+    /// after a restart OR any later one, since local runs are never
+    /// re-registered with a restarted engine (see the doc comment on
+    /// `ChatViewModel.lastKnownEngineProcessStartedAt`).
+    var currentEngineBootId: String?
+
     var reviewSlotRange: ClosedRange<Int> {
         WorkersWorkspaceModel.reviewSlotBase...(WorkersWorkspaceModel.reviewSlotBase + reviewSlotCount - 1)
     }
@@ -126,16 +140,19 @@ final class WorkersWorkspaceModel: ObservableObject {
             reviewSlots[index].runId = request.runId
             reviewSlots[index].summary = request.summary
             reviewSlots[index].taskTitle = request.taskTitle
+            reviewSlots[index].spawnEngineBootId = currentEngineBootId
         } else if isAutomation {
             automationSlots[index].session = session
             automationSlots[index].runId = request.runId
             automationSlots[index].summary = request.summary
             automationSlots[index].taskTitle = request.taskTitle
+            automationSlots[index].spawnEngineBootId = currentEngineBootId
         } else {
             slots[index].session = session
             slots[index].runId = request.runId
             slots[index].summary = request.summary
             slots[index].taskTitle = request.taskTitle
+            slots[index].spawnEngineBootId = currentEngineBootId
         }
 
         // Return shell_pid 0 now — the libghostty surface is created
@@ -209,6 +226,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         targetSlots[index].runId = nil
         targetSlots[index].summary = nil
         targetSlots[index].taskTitle = nil
+        targetSlots[index].spawnEngineBootId = nil
         // Re-roll the idle flavor so consecutive idle bouts on the same
         // slot don't show the same line — fresh recreation each time
         // the crew member clocks out.
@@ -307,6 +325,19 @@ final class WorkersWorkspaceModel: ObservableObject {
         for pool in [slots, automationSlots, reviewSlots] {
             for slot in pool {
                 guard slot.session != nil, let runId = slot.runId, !liveRunIds.contains(runId) else {
+                    continue
+                }
+                // Refuse to sweep a pane whose owning boot id disagrees
+                // with the boot id this snapshot came from: local runs
+                // are never re-registered with a restarted engine, so a
+                // pane spawned under an earlier boot is permanently
+                // absent from every subsequent snapshot — not just the
+                // first one after the restart. Comparing per-pane (not
+                // just gating the whole sweep once at the ChatViewModel
+                // layer) means a SECOND reconnect to the same restarted
+                // engine still can't mass-kill it. See
+                // `currentEngineBootId` / `WorkerSlot.spawnEngineBootId`.
+                guard slot.spawnEngineBootId == currentEngineBootId else {
                     continue
                 }
                 if case .success = releaseWorkerPane(slotId: slot.slotId, killGraceSeconds: 5) {
@@ -433,6 +464,15 @@ struct WorkerSlot: Identifiable, Equatable {
     /// changes between idle bouts; kept stable for the lifetime of a
     /// single bout so renders don't flicker.
     var idleFlavorCycle: Int = 0
+    /// The engine's `engine_process_started_at` boot id that was
+    /// current (per `WorkersWorkspaceModel.currentEngineBootId`) at the
+    /// moment this slot's pane was spawned. `nil` if spawned before any
+    /// boot id was ever known. Used by `reconcilePanes` to refuse to
+    /// sweep a pane against a snapshot from a DIFFERENT engine boot
+    /// than the one that was live when the pane was created — see
+    /// `WorkersWorkspaceModel.currentEngineBootId` for why this must
+    /// persist across reconnects, not just the first one.
+    var spawnEngineBootId: String?
 
     var id: Int { slotId }
 
@@ -443,5 +483,6 @@ struct WorkerSlot: Identifiable, Equatable {
             && lhs.taskTitle == rhs.taskTitle
             && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
+            && lhs.spawnEngineBootId == rhs.spawnEngineBootId
     }
 }

@@ -163,6 +163,14 @@ struct ContentView: View {
             model.paneReconcileHandler = { [workspace = workersWorkspace] liveRunIds in
                 workspace.reconcilePanes(liveRunIds: liveRunIds)
             }
+            // Keep the pane allocator's notion of "current engine boot"
+            // in sync with every worker-live-states snapshot, so
+            // `reconcilePanes` can refuse to sweep panes spawned under
+            // an earlier engine boot than the one a given snapshot came
+            // from (see `WorkersWorkspaceModel.currentEngineBootId`).
+            model.engineBootIdDidUpdate = { [workspace = workersWorkspace] bootId in
+                workspace.currentEngineBootId = bootId
+            }
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.

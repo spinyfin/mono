@@ -1823,6 +1823,24 @@ final class ChatViewModel: ObservableObject {
     /// connectivity outage) must not leave a stale pane rendered
     /// indefinitely just because that one RPC never arrived.
     var paneReconcileHandler: ((Set<String>) -> [Int])?
+    /// Invoked on every `workerLiveStatesList` snapshot with the
+    /// engine's `engine_process_started_at` boot id, BEFORE the
+    /// reconciliation sweep (if any) runs for that snapshot. Wired to
+    /// set `WorkersWorkspaceModel.currentEngineBootId`, which
+    /// `reconcilePanes` compares per-pane against each pane's
+    /// `spawnEngineBootId` — a pane spawned under an earlier engine
+    /// boot is never swept against a snapshot from a newer boot, on
+    /// the first reconnect after a restart OR any later one. This
+    /// matters because the engine's in-memory live-worker registry is
+    /// rebuilt from scratch on every boot, and reattach only
+    /// re-populates *remote* runs: a restarted engine's snapshot is
+    /// permanently missing every locally-hosted run, not just on the
+    /// first post-restart snapshot. Per-pane gating (rather than
+    /// skipping the whole sweep once at this layer) is what prevents a
+    /// SECOND reconnect to the same restarted engine from mass-killing
+    /// live local panes (the zombie-Riker/Garak-pane incident's
+    /// mirror-image failure mode).
+    var engineBootIdDidUpdate: ((String) -> Void)?
     /// Set right before `sendListWorkerLiveStates()` on every
     /// `.connected` transition; consumed by the next
     /// `workerLiveStatesList` reply so the reconciliation sweep runs
@@ -1830,23 +1848,6 @@ final class ChatViewModel: ObservableObject {
     /// guaranteed to be current as of THIS connection (not a stale
     /// push that raced a reconnect).
     private var pendingLiveStatesReconcile = false
-    /// The `engine_process_started_at` seen on the most recent
-    /// `workerLiveStatesList` snapshot, `nil` until the first one
-    /// arrives. Used to detect an engine restart across a reconnect:
-    /// the engine's in-memory live-worker registry (and hence its
-    /// snapshot) is rebuilt from scratch on every boot, and reattach
-    /// only re-populates *remote* runs, so a restarted engine can
-    /// report a non-empty snapshot that is nonetheless missing every
-    /// locally-hosted run. `reconcilePanes` must never treat that as
-    /// "those local runs are dead" (the zombie-Riker/Garak-pane
-    /// incident's mirror-image failure mode: mass-killing live local
-    /// panes on the reconnect right after a routine engine restart).
-    /// When the boot id changes from one connect to the next, the
-    /// sweep for that snapshot is skipped entirely — regardless of
-    /// whether the snapshot is empty — and this is updated to the new
-    /// value so the NEXT snapshot (now genuinely from the new engine's
-    /// steady state) is compared against the right baseline.
-    private var lastKnownEngineProcessStartedAt: String?
 
     /// Whether the engine has confirmed this client is the registered app session.
     /// Reset on disconnect; set when `appSessionRegistered` is received.
@@ -2149,27 +2150,19 @@ final class ChatViewModel: ObservableObject {
             workErrorMessage = message
         case .workerLiveStatesList(let states, let engineProcessStartedAt):
             liveWorkerStates.update(states: states)
+            // Update the pane allocator's notion of "current engine
+            // boot" before the sweep below runs, so `reconcilePanes`
+            // compares this snapshot against the right per-pane
+            // baseline — see `engineBootIdDidUpdate`.
+            engineBootIdDidUpdate?(engineProcessStartedAt)
             if pendingLiveStatesReconcile {
                 pendingLiveStatesReconcile = false
-                let priorEngineProcessStartedAt = lastKnownEngineProcessStartedAt
-                lastKnownEngineProcessStartedAt = engineProcessStartedAt
-                // Skip the sweep entirely across a detected engine
-                // restart (prior boot id known and different from this
-                // one) — see `lastKnownEngineProcessStartedAt`. A `nil`
-                // prior value means this is the first snapshot this app
-                // process has ever seen, which is safe to sweep against
-                // (no pane could have survived from a "before" this app
-                // process didn't experience).
-                let engineRestarted = priorEngineProcessStartedAt != nil
-                    && priorEngineProcessStartedAt != engineProcessStartedAt
-                if !engineRestarted {
-                    let liveRunIds = Set(states.map(\.runId))
-                    let vacatedSlotIDs = paneReconcileHandler?(liveRunIds) ?? []
-                    if !vacatedSlotIDs.isEmpty {
-                        appendSystemMessage(
-                            "Reconciliation: closed \(vacatedSlotIDs.count) stale pane(s) not present in the engine's live-run snapshot (slots \(vacatedSlotIDs.sorted().map(String.init).joined(separator: ",")))."
-                        )
-                    }
+                let liveRunIds = Set(states.map(\.runId))
+                let vacatedSlotIDs = paneReconcileHandler?(liveRunIds) ?? []
+                if !vacatedSlotIDs.isEmpty {
+                    appendSystemMessage(
+                        "Reconciliation: closed \(vacatedSlotIDs.count) stale pane(s) not present in the engine's live-run snapshot (slots \(vacatedSlotIDs.sorted().map(String.init).joined(separator: ",")))."
+                    )
                 }
             }
         case .liveStatusDisabledSlotsList(let slotIds):

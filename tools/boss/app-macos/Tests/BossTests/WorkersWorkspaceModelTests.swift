@@ -420,4 +420,45 @@ final class WorkersWorkspaceModelReconcilePanesTests: XCTestCase {
         XCTAssertTrue(vacatedSlotIDs.isEmpty, "an empty live snapshot must not be treated as a kill signal")
         XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session, "hosted pane must survive an empty snapshot")
     }
+
+    /// Regression test for the mass-kill-on-second-reconnect bug: local
+    /// runs are never re-registered with a restarted engine, so EVERY
+    /// snapshot from the new boot omits them, not just the first one.
+    /// A prior fix that only skipped the sweep once (keyed to "boot id
+    /// just changed") left a still-live local pane exposed on any
+    /// SECOND same-boot snapshot. The fix compares each pane's
+    /// `spawnEngineBootId` against `currentEngineBootId` on every
+    /// sweep, so a pane spawned under the OLD boot is never swept
+    /// against a snapshot from the NEW boot — first reconnect or
+    /// fifth.
+    func testNeverSweepsAPaneAcrossASecondReconnectToTheSameRestartedEngineBoot() {
+        let model = WorkersWorkspaceModel()
+
+        // Pane spawned while the engine's old boot was current.
+        model.currentEngineBootId = "boot-A"
+        _ = model.spawnWorkerPane(makeSpawn(slot: 1, runId: "run-local-still-working"))
+
+        // Engine restarts. First post-restart snapshot updates the
+        // baseline boot id (mirrors what `ChatViewModel.engineBootIdDidUpdate`
+        // does before invoking the sweep) and lists only the reattached
+        // remote run — the local run is (and remains) absent.
+        model.currentEngineBootId = "boot-B"
+        let firstSweep = model.reconcilePanes(liveRunIds: ["remote-run"])
+        XCTAssertTrue(firstSweep.isEmpty, "first post-restart snapshot must not kill the still-live local pane")
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+
+        // A SECOND reconnect to the SAME restarted engine boot (boot id
+        // unchanged) must ALSO not kill it — this is the exact gap the
+        // one-shot gate left open.
+        let secondSweep = model.reconcilePanes(liveRunIds: ["remote-run"])
+        XCTAssertTrue(secondSweep.isEmpty, "a second reconnect to the same restarted engine boot must not kill the still-live local pane")
+        XCTAssertNotNil(model.slots.first(where: { $0.slotId == 1 })?.session, "local pane must still be hosted")
+
+        // A pane spawned AFTER the new boot is current is a normal
+        // member of that boot's live set and must still be reconciled
+        // as usual.
+        _ = model.spawnWorkerPane(makeSpawn(slot: 2, runId: "run-new-under-boot-b"))
+        let thirdSweep = model.reconcilePanes(liveRunIds: ["remote-run"])
+        XCTAssertEqual(thirdSweep, [2], "a pane spawned under the current boot must still be swept normally")
+    }
 }
