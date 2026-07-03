@@ -309,19 +309,56 @@ impl WorkDb {
         Ok(map)
     }
 
+    /// Ready executions the dispatcher's `drain_ready_queue` picks from, in
+    /// dispatch order — the *only* place that order is decided, since all
+    /// three worker pools (main / automation / review) share this single
+    /// queue and split by per-row pool classification downstream (see
+    /// `ExecutionCoordinator::pool_for_execution`).
+    ///
+    /// Sort key (operator directive: revisions before tasks/chores, ordered
+    /// by revision kind — highest priority first):
+    ///
+    /// ```text
+    /// (DispatchClass ASC, work_executions.priority DESC, created_at ASC, id ASC)
+    /// ```
+    ///
+    /// `DispatchClass` (see `dispatch_class.rs`) ranks 1=merge-conflict-fixing
+    /// revision, 2=CI-fixing revision, 3=automated-PR-review-finding
+    /// revision, 4=any other revision, 5=any other task/chore. The `CASE`
+    /// below is the SQL mirror of `DispatchClass::classify` — GLOB (not
+    /// LIKE) is used deliberately because `created_via` prefixes like
+    /// `pr_review:` contain a literal underscore that LIKE's `_` wildcard
+    /// would otherwise treat as "any one character". Within a class, the
+    /// existing `priority` column (still respected) then plain FIFO by
+    /// `created_at`/`id` break ties, exactly as before this change.
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
-             FROM work_executions
-             WHERE status = 'ready'
-               AND (dispatch_not_before IS NULL
-                    OR CAST(dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER))
-             ORDER BY priority DESC, created_at ASC, id ASC",
-        )?;
+        let class_case = format!(
+            "CASE \
+               WHEN t.kind = 'revision' AND t.created_via GLOB '{merge_conflict}*' THEN 1 \
+               WHEN t.kind = 'revision' AND t.created_via GLOB '{ci_fix}*' THEN 2 \
+               WHEN t.kind = 'revision' AND t.created_via GLOB '{pr_review}*' THEN 3 \
+               WHEN t.kind = 'revision' THEN 4 \
+               ELSE 5 \
+             END",
+            merge_conflict = CREATED_VIA_MERGE_CONFLICT_PREFIX,
+            ci_fix = CREATED_VIA_CI_FIX_PREFIX,
+            pr_review = CREATED_VIA_PR_REVIEW_PREFIX,
+        );
+        let sql = format!(
+            "SELECT we.id, we.work_item_id, we.kind, we.status, we.repo_remote_url, we.cube_repo_id, we.cube_lease_id, \
+                    we.cube_workspace_id, we.workspace_path, we.priority, we.preferred_workspace_id, \
+                    we.created_at, we.started_at, we.finished_at, \
+                    we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
+                    we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming \
+             FROM work_executions we \
+             LEFT JOIN tasks t ON t.id = we.work_item_id \
+             WHERE we.status = 'ready' \
+               AND (we.dispatch_not_before IS NULL \
+                    OR CAST(we.dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER)) \
+             ORDER BY {class_case} ASC, we.priority DESC, we.created_at ASC, we.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
     }
