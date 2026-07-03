@@ -367,6 +367,19 @@ enum AgentsAction {
         /// workspace summary` or `boss chore show`.
         run_id: String,
     },
+    /// Show each worker pool's (main, automation, review) capacity,
+    /// idle count, and every currently-claimed slot with its holding
+    /// execution id and whether a live worker still backs it.
+    ///
+    /// A claim with `live=false` and a terminal `execution_status` has
+    /// outlived its execution — either the periodic pool-claim
+    /// reconciler hasn't gotten to it yet (claims past their grace
+    /// period self-heal within ~60-120s) or the path that terminated
+    /// the execution has a bug. This is the tool for diagnosing
+    /// "pool reports N/M busy but `agents list` shows fewer live
+    /// workers" without manually diffing `agents list` against
+    /// `dispatch.jsonl` rejections.
+    Pools,
 }
 
 #[derive(Subcommand, Debug)]
@@ -603,6 +616,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Reap { run_id },
         } => agents_reap(&cli.socket_path, cli.json, run_id).await,
+        Command::Agents {
+            action: AgentsAction::Pools,
+        } => agents_pools(&cli.socket_path, cli.json).await,
         Command::Agents {
             action:
                 AgentsAction::Launch {
@@ -1698,6 +1714,45 @@ async fn agents_reap(socket_path: &Option<String>, json: bool, run_id: String) -
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected reap: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn agents_pools(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::WorkerPoolSummary)
+        .await
+        .context("sending WorkerPoolSummary")?;
+    match response {
+        FrontendEvent::WorkerPoolSummaryResult { pools } => {
+            if json {
+                println!("{}", serde_json::json!({ "pools": pools }));
+            } else {
+                for pool in &pools {
+                    println!(
+                        "{}: {}/{} claimed ({} idle)",
+                        pool.name,
+                        pool.claims.len(),
+                        pool.capacity,
+                        pool.idle,
+                    );
+                    for claim in &pool.claims {
+                        let status = claim.execution_status.as_deref().unwrap_or("?");
+                        let work_item = claim.work_item_id.as_deref().unwrap_or("-");
+                        let flag = if claim.live { "" } else { "  <-- LEAKED?" };
+                        println!(
+                            "  {}  execution={}  status={}  work_item={}{}",
+                            claim.worker_id, claim.execution_id, status, work_item, flag,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected pool summary: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

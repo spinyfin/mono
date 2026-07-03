@@ -589,6 +589,28 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "reap_run: marked execution orphaned (workspace preserved)",
                 );
+                // The execution row is now terminal, but marking it so
+                // does nothing to the worker-pool claim or the
+                // `LiveWorkerStateRegistry` entry a live pane may still
+                // hold — unlike every other teardown path (`agents
+                // stop`, completion, dead-pid/stale-worker sweeps),
+                // which all route through `release_worker_pane`. Without
+                // this, the claim leaks forever: `pool_claim_sweep`'s
+                // live-state cross-check treats a still-present live
+                // entry as "owned by a live pane's teardown path" and
+                // skips it, so the one backstop designed to catch
+                // leaked claims never fires for a reaped run. Route
+                // through the same release path everything else uses —
+                // it only tears down the pane/pool/live-state and never
+                // touches the cube lease, so the workspace stays
+                // preserved for re-lease exactly as documented above.
+                // Backgrounded (mirrors `handle_stop_run`) so the app
+                // round-trip and process-tree signal don't add latency
+                // to the RPC response.
+                let run_id_for_release = run_id.clone();
+                tokio::spawn(async move {
+                    server_state.release_worker_pane(&run_id_for_release).await;
+                });
                 send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });
             }
             Err(err) => {
