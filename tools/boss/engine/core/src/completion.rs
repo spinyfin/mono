@@ -3730,6 +3730,26 @@ must not be asked to open one",
         }
     }
 
+    /// True when `execution` is a `revision_implementation` execution whose
+    /// task was spawned specifically to fix a merge conflict (`created_via`
+    /// starts with [`CREATED_VIA_MERGE_CONFLICT_PREFIX`]). Used to relax the
+    /// deliverable-satisfied gate: such a revision's job is done once the
+    /// bound PR's mergeability clears — CI passing is a separate concern it
+    /// was never asked to fix, and gating completion on it as well produces
+    /// the "already resolved but still nudged" loop this check exists to
+    /// close.
+    fn is_merge_conflict_revision(&self, execution: &crate::work::WorkExecution) -> bool {
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return false;
+        }
+        matches!(
+            self.work_db.get_work_item(&execution.work_item_id),
+            Ok(WorkItem::Task(ref task))
+                if task.kind == TaskKind::Revision
+                    && task.created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        )
+    }
+
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
     /// encode the work state so an unchanged state counts as
@@ -4762,6 +4782,16 @@ must not be asked to open one",
             }
         };
 
+        // A merge-conflict-provenance revision's entire job is clearing the
+        // conflict — CI passing is a separate concern it was never asked to
+        // fix. Requiring CI clean here as well means a revision whose
+        // conflict already cleared (independently, e.g. via the periodic
+        // merge-poller sweep retiring the `conflict_resolutions` ledger row
+        // before this Stop) sits nudging forever whenever CI happens to be
+        // in-flight or unrelated-failing at that moment. For this kind,
+        // mergeability alone is the completion signal.
+        let merge_conflict_revision = self.is_merge_conflict_revision(execution);
+
         let inner = match probe.state {
             PrLifecycleState::Merged => {
                 tracing::info!(
@@ -4778,13 +4808,17 @@ must not be asked to open one",
                 .await
             }
             PrLifecycleState::Open(ref open)
-                if open.mergeability != OpenPrMergeability::Conflict && matches!(open.ci, OpenPrCiStatus::Clean) =>
+                if open.mergeability != OpenPrMergeability::Conflict
+                    && (matches!(open.ci, OpenPrCiStatus::Clean) || merge_conflict_revision) =>
             {
                 tracing::info!(
                     execution_id,
                     bound_pr_url,
                     kind = %execution.kind,
-                    "satisfied-deliverable gate: PR open with CI clean and no conflict — finalizing without nudge"
+                    merge_conflict_revision,
+                    ci_status = ?open.ci,
+                    "satisfied-deliverable gate: PR open with no conflict (CI clean, or CI \
+                     irrelevant for a merge-conflict revision) — finalizing without nudge"
                 );
                 self.finalize_pr_transition(
                     execution_id,
@@ -11101,6 +11135,90 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             queued.len(),
             1,
             "exactly one nudge probe must be queued; got {queued:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_finalizes_on_mergeability_alone_even_when_ci_not_clean() {
+        // 2026-07-03 incident (exec_18be836b10baae8_35 / T2154): the periodic
+        // merge-poller sweep (`conflict_watch::on_resolved`) can retire the
+        // `conflict_resolutions` ledger row to `succeeded` and snap the
+        // parent chore back to `in_review` on its own schedule, independent
+        // of this worker's Stop events. Once that has happened,
+        // `try_retire_cleared_blocking_signal` finds no *active* attempt and
+        // bails, so completion falls through to the generic
+        // deliverable-satisfied gate — which historically also required CI
+        // to be clean. A merge-conflict revision's job is only to clear the
+        // conflict; CI is a separate concern it was never asked to fix, so
+        // requiring it as well left this exact worker being nudged forever
+        // while CI was merely in-flight. Mergeability alone must be enough.
+        use crate::merge_poller::{OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, parent_chore_id, revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        // Simulate the merge-poller's `on_resolved` having already retired
+        // the ledger and unblocked the parent BEFORE this Stop — the race
+        // that strands the ledger check in `try_retire_cleared_blocking_signal`.
+        db.mark_conflict_resolution_succeeded(&attempt_id, None).unwrap();
+        db.clear_chore_blocked_merge_conflict_for_attempt(&parent_chore_id, parent_pr_url, &attempt_id)
+            .unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // SHA-delta gate: head unchanged → NoContribution (worker didn't
+        // push this run — the conflict was already gone before it started).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // PR is mergeable, but CI is still in-flight — must NOT block
+        // finalization for a merge-conflict-provenance revision.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::InFlight,
+        })));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+            "a merge-conflict revision must finalize on mergeability alone, CI-in-flight \
+             notwithstanding; got {outcome:?}",
+        );
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Completed,
+            "execution must be finalized, not left nudging",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::InReview, "revision must advance to in_review")
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert!(
+            probes.snapshot().is_empty(),
+            "no nudge probe must fire once mergeability alone confirms the deliverable; got {:?}",
+            probes.snapshot(),
         );
     }
 

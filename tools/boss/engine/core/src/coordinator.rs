@@ -2320,6 +2320,89 @@ impl ExecutionCoordinator {
         };
         let task = execution_task_summary(execution, &work_item);
 
+        // Merge-conflict revision already-resolved guard: a revision
+        // spawned to fix a merge conflict can sit `ready` for a while
+        // (worker-pool contention) before a slot frees up. In that window
+        // the periodic merge-poller sweep may independently notice the
+        // bound PR is mergeable again and retire the linked
+        // `conflict_resolutions` ledger row to `succeeded`
+        // (`conflict_watch::on_resolved`) without ever touching this
+        // now-unnecessary revision task/execution. Dispatching a worker
+        // here would just have it discover "nothing to do" and become the
+        // produce-a-PR nudge loop described in the `nudge_breaker` module
+        // doc. Check the ledger (already kept fresh by that sweep) before
+        // ever leasing a workspace.
+        if execution.kind == ExecutionKind::RevisionImplementation
+            && let WorkItem::Task(ref revision_task) = work_item
+            && revision_task.kind == TaskKind::Revision
+            && let Some(crz_id) = revision_task
+                .created_via
+                .strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        {
+            match self.work_db.get_conflict_resolution(crz_id) {
+                Ok(Some(ref attempt)) if attempt.status == "succeeded" => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        attempt_id = %attempt.id,
+                        "spawn_attempt: merge-conflict revision's bound PR was already resolved \
+                         before dispatch — retiring without spawning a worker",
+                    );
+                    match self
+                        .work_db
+                        .retire_stale_revision_before_dispatch(&execution.id, &revision_task.id)
+                    {
+                        Ok(task_transitioned) => {
+                            if task_transitioned {
+                                self.publisher
+                                    .publish_work_item_changed(
+                                        &revision_task.product_id,
+                                        &revision_task.id,
+                                        "merge_conflict_already_resolved",
+                                    )
+                                    .await;
+                            }
+                            self.dispatch_events
+                                .emit(
+                                    DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                                        .with_work_item(&execution.work_item_id)
+                                        .with_worker(worker_id)
+                                        .with_details(serde_json::json!({
+                                            "reason": "merge_conflict_already_resolved",
+                                            "attempt_id": attempt.id,
+                                        })),
+                                )
+                                .await;
+                            return Err(anyhow::anyhow!(
+                                "skipped: execution {} for work_item {} not spawned — merge conflict \
+                                 already resolved before dispatch (attempt {})",
+                                execution.id,
+                                execution.work_item_id,
+                                attempt.id,
+                            ));
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "spawn_attempt: failed to retire stale already-resolved revision; \
+                                 proceeding with dispatch",
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        crz_id,
+                        ?err,
+                        "spawn_attempt: failed to look up linked conflict_resolution; proceeding with dispatch",
+                    );
+                }
+            }
+        }
+
         // Host selection (distributed-execution PR3): pick the host this
         // execution should run on, then build the matching adapter (local
         // vs SSH-remote) and route the whole dispatch through it. A
@@ -11069,6 +11152,158 @@ mod tests {
             cube.lease_calls.lock().await.is_empty(),
             "no cube workspace may be leased for a gated execution",
         );
+    }
+
+    /// 2026-07-03 incident (exec_18be836b10baae8_35 / T2154): a merge-conflict
+    /// revision can sit `ready` behind worker-pool contention while the
+    /// periodic merge-poller sweep (`conflict_watch::on_resolved`) notices the
+    /// bound PR is mergeable again and independently retires the linked
+    /// `conflict_resolutions` ledger row to `succeeded`. Dispatching a worker
+    /// for this now-unnecessary revision would just have it discover "nothing
+    /// to do" and churn the produce-a-PR nudge loop. The dispatch-time guard
+    /// must catch this before ever leasing a workspace: retire the execution
+    /// and advance the revision task to `in_review` without spawning anyone.
+    #[tokio::test]
+    async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
+        use crate::work::{ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1709";
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Parent chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![parent.id, parent_pr_url],
+            )
+            .unwrap();
+        }
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: parent.id.clone(),
+                pr_url: parent_pr_url.to_owned(),
+                pr_number: 1709,
+                head_branch: "my-feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base_sha_1".into()),
+                head_sha_before: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Resolve merge conflict against main")
+                    .created_via(format!("merge-conflict:{}", attempt.id))
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+        // The periodic merge-poller sweep already found the PR mergeable and
+        // retired the ledger row independent of any worker.
+        db.mark_conflict_resolution_succeeded(&attempt.id, None).unwrap();
+
+        let exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .pr_url(parent_pr_url)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&exec, &worker_id).await;
+        assert!(
+            result.is_err(),
+            "an already-resolved merge-conflict revision must not be dispatched: {result:?}"
+        );
+
+        let events = recording.events_for(&exec.id).await;
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .unwrap_or_else(|| panic!("expected host_selected event; got {events:#?}"));
+        assert_eq!(
+            host_selected.outcome, "error",
+            "already-resolved guard must surface as host_selected:error; got {host_selected:?}",
+        );
+        assert_eq!(
+            host_selected.details.get("reason").and_then(|v| v.as_str()),
+            Some("merge_conflict_already_resolved"),
+            "host_selected:error must name merge_conflict_already_resolved; got {:?}",
+            host_selected.details,
+        );
+
+        // Execution retired without ever leasing a workspace.
+        let after_exec = db.get_execution(&exec.id).unwrap();
+        assert_eq!(
+            after_exec.status,
+            ExecutionStatus::Abandoned,
+            "execution must be abandoned, not dispatched; got {:?}",
+            after_exec.status,
+        );
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased for an already-resolved revision",
+        );
+
+        // Revision task advances to in_review — same terminal state a normal
+        // completed revision reaches — instead of stranding in `active`.
+        match db.get_work_item(&revision.id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
+                t.status,
+                TaskStatus::InReview,
+                "revision task must leave `active` when the conflict resolved before dispatch",
+            ),
+            other => panic!("expected task, got {other:?}"),
+        }
     }
 
     /// Occupancy-guard livelock regression (T1769). When cube keeps handing
