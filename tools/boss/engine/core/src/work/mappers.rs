@@ -170,6 +170,23 @@ pub(crate) fn map_answer_agent_run(row: &Row<'_>) -> rusqlite::Result<AnswerAgen
     })
 }
 
+/// Maps a `comment_thread_entries` row. Column order must match the SELECT
+/// in `work/comment_thread_entries.rs`:
+/// `id, comment_id, entry_kind, author, body, revise_task_id,
+///  answer_agent_run_id, created_at`.
+pub(crate) fn map_comment_thread_entry(row: &Row<'_>) -> rusqlite::Result<CommentThreadEntry> {
+    Ok(CommentThreadEntry {
+        id: row.get(0)?,
+        comment_id: row.get(1)?,
+        entry_kind: row.get(2)?,
+        author: row.get(3)?,
+        body: row.get(4)?,
+        revise_task_id: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+        answer_agent_run_id: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+        created_at: row.get(7)?,
+    })
+}
+
 pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {
