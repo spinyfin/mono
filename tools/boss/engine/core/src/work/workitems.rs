@@ -128,6 +128,36 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Mark every open `worker_escalation` / `worker_blocked` attention item
+    /// for `execution_id` as resolved. Returns the count resolved (`0` when
+    /// none were open — a normal, non-error case).
+    ///
+    /// Called when the coordinator explicitly probes the worker
+    /// (`bossctl probe` / `FrontendRequest::ProbeRun`) — issuing a probe IS
+    /// the coordinator's documented ack gesture for both markers (e.g.
+    /// `[effort-escalation-ack] … next_dispatch=true`), so resolving here
+    /// resumes [`crate::completion::WorkerCompletionHandler`]'s suppressed
+    /// "produce a PR" auto-nudge on the run's next Stop without a separate
+    /// resolve RPC. See `crate::worker_escalation` for the marker contract.
+    pub fn resolve_worker_signal_attentions_for_execution(&self, execution_id: &str) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE work_attention_items
+             SET status = 'resolved', resolved_at = ?1
+             WHERE execution_id = ?2
+               AND kind IN (?3, ?4)
+               AND status = 'open'",
+            params![
+                now,
+                execution_id,
+                crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
+                crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
+            ],
+        )?;
+        Ok(rows)
+    }
+
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
         self.update_work_item_as_actor(id, patch, "human")
     }

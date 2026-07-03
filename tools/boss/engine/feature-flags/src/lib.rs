@@ -126,6 +126,17 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "heuristic_blocker_detection",
+        description: "Best-effort prose scan for worker guidance-asks ('I need explicit direction before \
+             proceeding') on Stop, used only when the worker emitted neither the documented \
+             `[effort-escalation]` nor `[blocked]` marker. Files a low-confidence attention item \
+             flagged for manual verification. DEFAULT OFF — narrow phrase match but still a \
+             heuristic; the marker is the contract, this is a net under it.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "toolbar_search_standard",
         description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
              of the custom WorkSearchToolbarItem. Requires the macOS app to be built with \

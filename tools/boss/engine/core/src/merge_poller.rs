@@ -1734,6 +1734,9 @@ async fn sweep_pending_pr(handler: &WorkerCompletionHandler, execution_id: &str,
         // (it reads the worker's transcript for the NO_CHANGES_NEEDED marker),
         // never from a PR-detection recheck.
         | StopOutcome::NoChangesNeeded { .. }
+        // EscalationPending is only reachable via `nudge_or_park` on the
+        // on-Stop path, never from a PR-detection recheck.
+        | StopOutcome::EscalationPending { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -1796,6 +1799,9 @@ async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCand
         // T1868: the no-op terminal is only reachable on the on-Stop path,
         // never from a late-PR recheck.
         | StopOutcome::NoChangesNeeded { .. }
+        // EscalationPending is only reachable via `nudge_or_park` on the
+        // on-Stop path, never from a late-PR recheck.
+        | StopOutcome::EscalationPending { .. }
         | StopOutcome::DbError => {}
     }
 }
