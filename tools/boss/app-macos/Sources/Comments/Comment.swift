@@ -27,6 +27,17 @@ enum CommentIntent: String, CaseIterable, Equatable {
     }
 }
 
+/// Mirrors the engine's `work_comments.status` values that matter to the
+/// `[Revise]`-track chip (`boss-protocol/src/types.rs`
+/// `COMMENT_STATUS_*`). `orphaned`/`dismissed` aren't rendered as a revision
+/// chip so they're left out of this thin-client enum; a dismissed comment is
+/// already removed from `CommentLayer.comments` entirely.
+enum CommentStatus: String, Equatable {
+    case active
+    case resolved
+    case inRevision = "in_revision"
+}
+
 /// Identifies the exact occurrence of a quoted-text span a comment is anchored to.
 ///
 /// Two comments on two different occurrences of the same word have the same
@@ -66,7 +77,71 @@ struct Comment: Identifiable, Equatable {
     /// audit trail.
     var intentOverriddenByUser: Bool = false
 
+    /// Mirrors `work_comments.status`. Defaults to `active`, same as the
+    /// engine's `default_comment_status`.
+    var status: CommentStatus = .active
+    /// Mirrors `work_comments.revise_task_id`: the revision/chore that this
+    /// comment's `[Revise]` batch was dispatched to. `nil` unless `status ==
+    /// .inRevision` (or a `.resolved` comment keeping it as provenance).
+    var reviseTaskId: String? = nil
+    /// Mirrors `work_comments.status_actor`. `"engine"` marks a transition
+    /// driven by (stubbed) reconciliation rather than a direct user action —
+    /// the signal `revisionChipState` uses to tell a freshly-reopened
+    /// comment apart from one that was never addressed.
+    var statusActor: String? = nil
+    /// Engine-authored nudge/answer/follow-up entries, oldest first. Mirrors
+    /// `comment_thread_entries` (design § "Reply/link mechanics").
+    var threadEntries: [CommentThreadEntry] = []
+
     var anchor: CommentAnchor {
         CommentAnchor(quotedText: quotedText, occurrenceIndex: occurrenceIndex)
     }
+
+    /// The `[Revise]`-track chip state, derived from `status` /
+    /// `reviseTaskId` / thread history — mirrors the engine's comment state
+    /// machine (design § "Comment/thread state machine"). `nil` when the
+    /// comment isn't on the directive/larger_change track at all (no nudge
+    /// posted yet).
+    var revisionChipState: RevisionChipState? {
+        switch status {
+        case .inRevision:
+            guard let taskId = reviseTaskId else { return nil }
+            return .inRevision(taskId: taskId)
+        case .resolved:
+            guard let taskId = reviseTaskId else { return nil }
+            return .resolved(taskId: taskId)
+        case .active:
+            // A comment only passes back through `.active` via engine-driven
+            // reconciliation after a nudge entry's `revise_task_id` was
+            // filled in by a `[Revise]` batch — that combination is what
+            // distinguishes "reopened" from "never addressed."
+            let wasInRevision = threadEntries.contains { $0.entryKind == .nudge && $0.reviseTaskId != nil }
+            if wasInRevision, statusActor == "engine" { return .reopened }
+            let hasNudge = threadEntries.contains { $0.entryKind == .nudge }
+            return hasNudge ? .nudged : nil
+        }
+    }
+}
+
+/// The four `[Revise]`-track chip states 2f renders, per the design's
+/// comment/thread state machine.
+enum RevisionChipState: Equatable {
+    /// Classified `directive`/`larger_change`; nudge posted, `[Revise]` not
+    /// yet clicked.
+    case nudged
+    case inRevision(taskId: String)
+    case resolved(taskId: String)
+    /// The claiming task was abandoned; the comment is back on the banner.
+    case reopened
+}
+
+/// Client mirror of the engine's `CommentsBannerState`
+/// (`boss-protocol/src/types.rs`) — a read-only summary driving the
+/// `[Revise]` banner. `docKind` is omitted: the client only ever renders
+/// this banner inside a design/investigation doc viewer, so the engine-side
+/// `resolve_doc_owner` scope guard has no thin-client equivalent to mirror.
+struct CommentsBannerState: Equatable {
+    let revisable: Bool
+    let unresolvedCount: Int
+    let inRevisionCount: Int
 }

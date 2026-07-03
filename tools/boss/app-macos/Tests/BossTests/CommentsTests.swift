@@ -144,6 +144,124 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    // MARK: - `[Revise]` banner + chips (Phase 2f)
+
+    func testFreshCommentHasNoBannerContribution() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        XCTAssertFalse(layer.bannerState.revisable)
+        XCTAssertEqual(layer.bannerState.unresolvedCount, 0)
+        XCTAssertEqual(layer.bannerState.inRevisionCount, 0)
+        XCTAssertNil(layer.comments[0].revisionChipState)
+    }
+
+    func testDirectiveClassificationPostsNudgeAndMakesBannerRevisable() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.directive, for: layer.comments[0])
+
+        XCTAssertTrue(layer.bannerState.revisable)
+        XCTAssertEqual(layer.bannerState.unresolvedCount, 1)
+        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
+        XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .nudge)
+        XCTAssertEqual(layer.comments[0].threadEntries[0].body, CommentLayer.nudgeBody)
+        XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
+    }
+
+    func testQuestionClassificationDoesNotPostNudge() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
+        XCTAssertFalse(layer.bannerState.revisable)
+    }
+
+    func testReclassifyingDirectiveTwiceOnlyPostsOneNudge() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.largerChange, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
+    }
+
+    func testReviseDocTransitionsMatchingCommentsToInRevision() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.addComment(quoted: "b", body: "second")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.question, for: layer.comments[1])
+
+        layer.reviseDoc()
+
+        XCTAssertEqual(layer.comments[0].status, .inRevision)
+        XCTAssertNotNil(layer.comments[0].reviseTaskId)
+        XCTAssertEqual(layer.comments[0].threadEntries[0].reviseTaskId, layer.comments[0].reviseTaskId)
+        if case .inRevision(let taskId) = layer.comments[0].revisionChipState {
+            XCTAssertEqual(taskId, layer.comments[0].reviseTaskId)
+        } else {
+            XCTFail("expected .inRevision chip state")
+        }
+
+        // The question-classified comment never joins the batch.
+        XCTAssertEqual(layer.comments[1].status, .active)
+        XCTAssertNil(layer.comments[1].reviseTaskId)
+
+        XCTAssertFalse(layer.bannerState.revisable)
+        XCTAssertEqual(layer.bannerState.inRevisionCount, 1)
+    }
+
+    func testReviseDocWithNoUnresolvedCommentsIsNoOp() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.reviseDoc()
+        XCTAssertEqual(layer.comments[0].status, .active)
+    }
+
+    func testResolveRevisionMarksAddressedCommentsResolved() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        let taskId = layer.comments[0].reviseTaskId!
+
+        layer.resolveRevision(taskId: taskId)
+
+        XCTAssertEqual(layer.comments[0].status, .resolved)
+        XCTAssertEqual(layer.comments[0].reviseTaskId, taskId)
+        if case .resolved(let resolvedTaskId) = layer.comments[0].revisionChipState {
+            XCTAssertEqual(resolvedTaskId, taskId)
+        } else {
+            XCTFail("expected .resolved chip state")
+        }
+    }
+
+    func testReopenRevisionClearsTaskAndShowsReopenedChip() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "a", body: "first")
+        layer.setIntent(.directive, for: layer.comments[0])
+        layer.reviseDoc()
+        let taskId = layer.comments[0].reviseTaskId!
+
+        layer.reopenRevision(taskId: taskId)
+
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].reviseTaskId)
+        XCTAssertEqual(layer.comments[0].revisionChipState, .reopened)
+        // Back on the banner.
+        XCTAssertTrue(layer.bannerState.revisable)
+    }
+
+    func testCommentSidebarRendersReviseBannerAndChips() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.directive, for: layer.comments[0])
+        let view = CommentSidebar(layer: layer)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
     // MARK: - View: no comments state
 
     func testMarkdownViewerWithCommentsRendersWhenEmpty() {
