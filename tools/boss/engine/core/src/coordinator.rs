@@ -23,7 +23,9 @@ use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::work::{CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun};
+use crate::work::{
+    CreateAttentionItemInput, DispatchClass, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
+};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 crate::register_counter!(
@@ -1645,6 +1647,31 @@ impl ExecutionCoordinator {
         let mut auto_pool_exhausted = false;
         let mut review_pool_exhausted = false;
 
+        // Per-pool candidate counts for this drain pass, computed up front
+        // so the `request_recorded` event below can report "how many other
+        // eligible rows this execution's dispatch class beat" without a
+        // second query per row. `executions` is already sorted by
+        // `(DispatchClass, priority, created_at, id)` (see
+        // `WorkDb::list_ready_executions`), so within a pool the row order
+        // below IS the priority order — a class=1 row that appears first is
+        // winning against every other row counted for its pool here.
+        let pool_ready_counts: HashMap<&'static str, usize> = {
+            let mut counts: HashMap<&'static str, usize> = HashMap::new();
+            for execution in &executions {
+                let is_review = self.execution_targets_review_pool(execution);
+                let is_automation = !is_review && self.execution_targets_automation_pool(execution);
+                let label = if is_review {
+                    "review"
+                } else if is_automation {
+                    "automation"
+                } else {
+                    "main"
+                };
+                *counts.entry(label).or_insert(0) += 1;
+            }
+            counts
+        };
+
         for execution in executions {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             // Classify the target pool. Review is checked first (and excludes
@@ -1673,6 +1700,17 @@ impl ExecutionCoordinator {
                 continue;
             }
 
+            // Dispatch-class + "why it won" bookkeeping (operator directive:
+            // revisions before tasks/chores, ordered by revision kind).
+            // Recomputed here (rather than threaded through from
+            // `list_ready_executions`) because it's only needed for the
+            // trace, not the hot dispatch path. See `DispatchClass`.
+            let dispatch_class = self
+                .work_db
+                .classify_work_item_for_dispatch(&execution.work_item_id)
+                .unwrap_or(DispatchClass::OtherWork);
+            let pool_ready_count = pool_ready_counts.get(pool_label).copied().unwrap_or(1);
+
             // Stage 1: request_recorded
             self.dispatch_events
                 .emit(
@@ -1681,6 +1719,10 @@ impl ExecutionCoordinator {
                         .with_details(serde_json::json!({
                             "preferred_workspace_id": preferred_workspace_id,
                             "pool": pool_label,
+                            "dispatch_class": dispatch_class.as_ordinal(),
+                            "dispatch_class_label": dispatch_class.label(),
+                            "pool_ready_count": pool_ready_count,
+                            "beaten_candidates": pool_ready_count.saturating_sub(1),
                         })),
                 )
                 .await;
@@ -1689,6 +1731,9 @@ impl ExecutionCoordinator {
                 work_item_id = %execution.work_item_id,
                 preferred_workspace_id = ?preferred_workspace_id,
                 pool = pool_label,
+                dispatch_class = dispatch_class.as_ordinal(),
+                dispatch_class_label = dispatch_class.label(),
+                beaten_candidates = pool_ready_count.saturating_sub(1),
                 "spawn_attempt status=ready -> picked_up"
             );
 
@@ -7660,6 +7705,197 @@ mod tests {
         // Old chore should still be queued (and was NOT picked).
         let early_execution = db.list_executions(Some(&early.id)).unwrap().pop().unwrap();
         assert_eq!(early_execution.status, ExecutionStatus::Ready);
+    }
+
+    /// Dispatch-class acceptance test (operator directive: revisions before
+    /// tasks/chores, ordered by revision kind): a merge-conflict-fixing
+    /// revision (class 1) must claim a single free slot before an ordinary
+    /// chore (class 5) that has been sitting in the ready queue longer —
+    /// the exact opposite of what plain FIFO-by-creation-time would pick.
+    #[tokio::test]
+    async fn merge_conflict_revision_outranks_older_ready_chore_for_a_single_free_slot() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        // Older, ordinary chore — created (and thus ready) first.
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Ordinary chore")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Newer merge-conflict-fixing revision — `created_at` is stamped
+        // far in the future so a plain FIFO queue would place it dead last;
+        // dispatch class must still put it first.
+        let revision_id = "task_merge_conflict_outranks_test";
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, created_via)
+                 VALUES (?1, ?2, 'revision', 'Fix merge conflict', '', 'todo', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z', 'merge-conflict:crz_1')",
+                rusqlite::params![revision_id, product.id],
+            )
+            .unwrap();
+        }
+        let revision_execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision_id)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        for _ in 0..100 {
+            let runs = runner.calls.lock().await;
+            if !runs.is_empty() {
+                break;
+            }
+            drop(runs);
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let calls = runner.calls.lock().await;
+        assert!(!calls.is_empty(), "scheduler did not start any run");
+        assert_eq!(
+            &calls[0].1, &revision_execution.id,
+            "the merge-conflict revision must dispatch before the older ordinary chore",
+        );
+        drop(calls);
+
+        let chore_execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(
+            chore_execution.status,
+            ExecutionStatus::Ready,
+            "the older chore must remain queued behind the higher-class revision",
+        );
+    }
+
+    /// Selection-time ordering only — a higher dispatch class must never
+    /// preempt a worker that already claimed the slot. Once a slot is
+    /// running, a newly-arrived class-1 revision simply queues behind it
+    /// like anything else and dispatches only when the slot frees.
+    #[tokio::test]
+    async fn running_worker_is_never_preempted_by_a_higher_dispatch_class_arrival() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let _chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Ordinary chore")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        // Wait for the chore to actually claim the single slot and go
+        // `running` before the higher-class revision even exists.
+        for _ in 0..200 {
+            let executions = db.list_executions(None).unwrap();
+            if executions.iter().any(|e| e.status == ExecutionStatus::Running) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let calls = runner.calls.lock().await;
+            assert_eq!(calls.len(), 1, "the chore must have claimed the single slot first");
+        }
+
+        // A class-1 merge-conflict revision arrives after the slot is gone.
+        let revision_id = "task_merge_conflict_arrives_after_slot_claimed";
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, created_via)
+                 VALUES (?1, ?2, 'revision', 'Fix merge conflict', '', 'todo', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 'merge-conflict:crz_2')",
+                rusqlite::params![revision_id, product.id],
+            )
+            .unwrap();
+        }
+        let revision_execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision_id)
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        coordinator.kick();
+        // Give the scheduler a window to (incorrectly) act, if it were
+        // going to. There is no positive event to wait on here — the
+        // assertion is that nothing changes.
+        sleep(Duration::from_millis(100)).await;
+
+        let calls = runner.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "the running worker must not be preempted by a newly-arrived higher-class execution",
+        );
+        drop(calls);
+
+        let revision_status = db.get_execution(&revision_execution.id).unwrap().status;
+        assert_eq!(
+            revision_status,
+            ExecutionStatus::Ready,
+            "the higher-class revision must queue behind the running slot, not preempt it",
+        );
     }
 
     #[tokio::test]
