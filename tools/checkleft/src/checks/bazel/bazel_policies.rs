@@ -272,6 +272,7 @@ fn collect_findings_forbidden_rule_calls(
 ) {
     if let Some((matched_symbol, location)) = forbidden_rule_call_match(node, source, &rule.symbols) {
         findings.push(Finding {
+            fixable: false,
             severity: rule.severity,
             message: rule
                 .message
@@ -319,6 +320,7 @@ fn collect_findings_forbidden_default_visibility(
 ) {
     if let Some((matched_value, location)) = forbidden_default_visibility_match(node, source, &rule.values) {
         findings.push(Finding {
+            fixable: false,
             severity: rule.severity,
             message: rule
                 .message

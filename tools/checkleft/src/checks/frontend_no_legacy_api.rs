@@ -87,6 +87,7 @@ impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
                 };
 
                 findings.push(Finding {
+                    fixable: false,
                     severity: self.severity,
                     message: format!("import from deprecated frontend API module `{legacy_match}`"),
                     location: Some(Location {

@@ -16,7 +16,7 @@ use crate::external::{
     ExternalCheckPackageImplementation, ExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
-use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use crate::source_tree::LocalSourceTree;
 
 use super::Runner;
@@ -226,6 +226,7 @@ impl ConfiguredCheck for EmitsFixedPathCheck {
         Ok(CheckResult {
             check_id: self.id().to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "violation on a path the check derived itself".to_owned(),
                 location: Some(Location {
@@ -238,6 +239,141 @@ impl ConfiguredCheck for EmitsFixedPathCheck {
             }],
         })
     }
+}
+
+/// A check that emits one finding carrying a `suggested_fix` and one plain
+/// finding, so the fixability marker can be proven per-finding rather than
+/// per-check.
+#[derive(Clone)]
+struct EmitsSuggestedFixCheck {
+    id: String,
+}
+
+#[async_trait]
+impl Check for EmitsSuggestedFixCheck {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn description(&self) -> &str {
+        "emits one finding with a suggested_fix and one without"
+    }
+
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for EmitsSuggestedFixCheck {
+    async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+        Ok(CheckResult {
+            check_id: self.id().to_owned(),
+            findings: vec![
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "needs formatting".to_owned(),
+                    location: Some(Location {
+                        path: PathBuf::from("src/main.rs"),
+                        line: Some(1),
+                        column: None,
+                    }),
+                    remediations: vec![],
+                    suggested_fix: Some(SuggestedFix {
+                        description: "reformat".to_owned(),
+                        edits: vec![],
+                    }),
+                },
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "unfixable violation".to_owned(),
+                    location: Some(Location {
+                        path: PathBuf::from("src/other.rs"),
+                        line: Some(1),
+                        column: None,
+                    }),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+            ],
+        })
+    }
+}
+
+/// Fixture run with a mix of fixable/unfixable findings from a built-in check:
+/// only the finding carrying a `suggested_fix` is marked fixable and gets the
+/// `checkleft fix` remediation bullet; the other finding is untouched.
+#[tokio::test]
+async fn runner_marks_finding_fixable_when_suggested_fix_present() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "emits-suggested-fix"
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(EmitsSuggestedFixCheck {
+            id: "emits-suggested-fix".to_owned(),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![
+            ChangedFile {
+                path: Path::new("src/main.rs").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: Path::new("src/other.rs").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    let findings = &results[0].findings;
+
+    let fixable = findings
+        .iter()
+        .find(|f| f.message == "needs formatting")
+        .expect("fixable finding present");
+    assert!(fixable.fixable, "finding with a suggested_fix must be marked fixable");
+    assert!(
+        fixable.remediations.iter().any(|r| r.contains("checkleft fix")),
+        "fixable finding must advertise `checkleft fix` as a remediation: {:?}",
+        fixable.remediations
+    );
+
+    let unfixable = findings
+        .iter()
+        .find(|f| f.message == "unfixable violation")
+        .expect("unfixable finding present");
+    assert!(
+        !unfixable.fixable,
+        "finding without a suggested_fix must not be marked fixable"
+    );
+    assert!(
+        !unfixable.remediations.iter().any(|r| r.contains("checkleft fix")),
+        "unfixable finding must not advertise `checkleft fix`: {:?}",
+        unfixable.remediations
+    );
 }
 
 #[tokio::test]
@@ -408,6 +544,7 @@ fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
         check_id: "demo".to_owned(),
         findings: vec![
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "on excluded path".to_owned(),
                 location: Some(Location {
@@ -419,6 +556,7 @@ fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
                 suggested_fix: None,
             },
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "on a normal path".to_owned(),
                 location: Some(Location {
@@ -430,6 +568,7 @@ fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
                 suggested_fix: None,
             },
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "check-level error, no location".to_owned(),
                 location: None,
@@ -1159,6 +1298,7 @@ fn scoped_changeset() -> ChangeSet {
 
 fn finding_at(path: Option<&str>) -> Finding {
     Finding {
+        fixable: false,
         severity: Severity::Warning,
         message: "msg".to_owned(),
         location: path.map(|p| Location {
@@ -1223,7 +1363,7 @@ fn scope_filter_is_noop_when_all_files_are_in_changeset() {
 
 // ── apply_suggested_fixes tests ───────────────────────────────────────────────
 
-use crate::output::{FileEdit, SuggestedFix};
+use crate::output::FileEdit;
 
 fn make_runner_for_tree(dir: &tempfile::TempDir) -> Runner {
     Runner::new(
@@ -1237,6 +1377,7 @@ fn make_result_with_fix(check_id: &str, file: &str, old_text: &str, new_text: &s
     CheckResult {
         check_id: check_id.to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: "needs fix".to_owned(),
             location: Some(Location {
@@ -1291,6 +1432,7 @@ fn apply_suggested_fixes_is_absent_when_no_suggested_fix_present() {
     let result = CheckResult {
         check_id: "my-check".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: "problem".to_owned(),
             location: Some(Location {
@@ -1322,6 +1464,7 @@ fn apply_suggested_fixes_ignores_edits_outside_fixable_set() {
     let result = CheckResult {
         check_id: "my-check".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: "needs fix".to_owned(),
             location: Some(Location {
@@ -1374,6 +1517,7 @@ fn apply_suggested_fixes_skips_info_severity_findings() {
     let result = CheckResult {
         check_id: "my-check".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Info, // Info → not fixed
             message: "advisory".to_owned(),
             location: Some(Location {

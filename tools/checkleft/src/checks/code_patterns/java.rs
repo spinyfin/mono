@@ -33,6 +33,7 @@ pub(super) fn analyze_java_file(path: &Path, contents: &str, rules: &[CompiledNo
     matches
         .into_iter()
         .map(|matched| Finding {
+            fixable: false,
             severity: matched.rule.severity,
             message: matched
                 .rule

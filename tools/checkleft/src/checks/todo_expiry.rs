@@ -65,6 +65,7 @@ impl ConfiguredCheck for CompiledTodoExpiryConfig {
                 }
 
                 findings.push(Finding {
+                    fixable: false,
                     severity: self.severity,
                     message: "TODO/FIXME must include `(@owner,YYYY-MM-DD)` metadata".to_owned(),
                     location: Some(Location {

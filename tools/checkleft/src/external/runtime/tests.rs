@@ -1092,6 +1092,7 @@ fn component_check_never_sees_excluded_files() {
 
 fn make_big_struct_finding(path: &str) -> Finding {
     Finding {
+        fixable: false,
         severity: Severity::Error,
         message: "struct `Big` has more than 5 named fields but lacks `#[derive(..)]`".to_owned(),
         location: Some(Location {

@@ -32,6 +32,7 @@ impl ConfiguredCheck for StaticFindingCheck {
         Ok(CheckResult {
             check_id: self.id().to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: self.severity,
                 message: "synthetic policy finding".to_owned(),
                 location: Some(Location {

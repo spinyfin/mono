@@ -22,6 +22,7 @@ fn human_output_includes_line_and_column() {
         &[CheckResult {
             check_id: "typo".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found typo `teh`; use `the` instead.".to_owned(),
                 location: Some(Location {
@@ -50,6 +51,7 @@ fn human_output_omits_ansi_when_color_is_disabled() {
         &[CheckResult {
             check_id: "file-size".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "File exceeds configured line count.".to_owned(),
                 location: Some(Location {
@@ -85,6 +87,7 @@ fn human_output_message_is_bold_when_color_enabled() {
         &[CheckResult {
             check_id: "typo".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
@@ -110,6 +113,7 @@ fn human_output_help_body_uses_256_gray_when_color256_enabled() {
         &[CheckResult {
             check_id: "typo".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
@@ -132,6 +136,7 @@ fn human_output_help_body_uses_truecolor_gray_when_truecolor_enabled() {
         &[CheckResult {
             check_id: "typo".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
@@ -154,6 +159,7 @@ fn human_output_multi_line_remediation_renders_as_bullets() {
         &[CheckResult {
             check_id: "check-id".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
@@ -184,6 +190,7 @@ fn human_output_multi_line_remediation_uses_circle_bullet_when_color_enabled() {
         &[CheckResult {
             check_id: "check-id".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
@@ -207,6 +214,7 @@ fn finding_with_multiple_remediations_renders_as_bullet_list() {
         &[CheckResult {
             check_id: "check-id".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
@@ -231,6 +239,7 @@ fn finding_with_multiple_remediations_uses_circle_bullet_when_color_enabled() {
         &[CheckResult {
             check_id: "check-id".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
@@ -254,6 +263,7 @@ fn finding_with_single_remediation_renders_inline() {
         &[CheckResult {
             check_id: "check-id".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
@@ -278,6 +288,7 @@ fn human_output_check_id_is_gray_when_color_enabled() {
         &[CheckResult {
             check_id: "no-debug-logging".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
@@ -301,6 +312,7 @@ fn human_output_check_id_is_plain_when_color_disabled() {
         &[CheckResult {
             check_id: "no-debug-logging".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
@@ -340,6 +352,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
         CheckResult {
             check_id: "alpha-warning".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
@@ -350,6 +363,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
         CheckResult {
             check_id: "zeta-error".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
@@ -371,6 +385,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
         check_id: "mixed".to_owned(),
         findings: vec![
             Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
@@ -378,6 +393,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 suggested_fix: None,
             },
             Finding {
+                fixable: false,
                 severity: Severity::Info,
                 message: "info finding".to_owned(),
                 location: None,
@@ -385,6 +401,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 suggested_fix: None,
             },
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
@@ -658,6 +675,7 @@ fn snapshot_results() -> Vec<CheckResult> {
     vec![CheckResult {
         check_id: "typo".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: "Found typo.".to_owned(),
             location: Some(Location {
@@ -868,6 +886,7 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
     let results = vec![CheckResult {
         check_id: "fmt".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: huge_message.clone(),
             location: None,
@@ -901,6 +920,7 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
 
 fn make_finding(severity: Severity, path: &str) -> Finding {
     Finding {
+        fixable: false,
         severity,
         message: "test finding".to_owned(),
         location: Some(Location {
@@ -915,6 +935,7 @@ fn make_finding(severity: Severity, path: &str) -> Finding {
 
 fn make_finding_no_location(severity: Severity) -> Finding {
     Finding {
+        fixable: false,
         severity,
         message: "no location".to_owned(),
         location: None,
@@ -1445,4 +1466,108 @@ fn render_fix_results_warning_residue_after_apply_shown_as_non_blocking() {
         output.contains("non-blocking"),
         "warning residue on an applied file must be marked non-blocking: {output}"
     );
+}
+
+// ── fixability advertising (per-finding marker + run-summary hint) ────────────
+
+fn make_fixable_finding(severity: Severity, path: &str) -> Finding {
+    Finding {
+        fixable: true,
+        severity,
+        message: "test finding".to_owned(),
+        location: Some(Location {
+            path: PathBuf::from(path),
+            line: None,
+            column: None,
+        }),
+        remediations: vec!["Run `checkleft fix` to apply this automatically.".to_owned()],
+        suggested_fix: None,
+    }
+}
+
+#[test]
+fn human_output_marks_fixable_finding_with_remediation_bullet() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_fixable_finding(Severity::Error, "src/main.rs")],
+    }];
+    let output = render_human_results(&results, make_plain_style(), Duration::from_secs(1));
+    assert!(
+        output.contains("checkleft fix"),
+        "fixable finding must carry a `checkleft fix` remediation bullet: {output}"
+    );
+}
+
+#[test]
+fn human_output_summary_hint_absent_when_no_findings_fixable() {
+    let results = vec![CheckResult {
+        check_id: "typo".to_owned(),
+        findings: vec![make_finding(Severity::Error, "docs/CHECKS.toml")],
+    }];
+    let output = render_human_results(&results, make_plain_style(), Duration::from_secs(1));
+    assert!(
+        !output.contains("auto-fixable"),
+        "no findings are fixable, so no fixability hint should appear: {output}"
+    );
+}
+
+#[test]
+fn human_output_summary_hint_reports_partial_fixability() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_fixable_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Error, "src/lib.rs"),
+        ],
+    }];
+    let output = render_human_results(&results, make_plain_style(), Duration::from_secs(1));
+    assert!(
+        output.contains("1 of 2 findings are auto-fixable — run `checkleft fix` to apply."),
+        "partial fixability must report an exact count: {output}"
+    );
+}
+
+#[test]
+fn human_output_summary_hint_reports_all_fixable() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_fixable_finding(Severity::Error, "src/main.rs"),
+            make_fixable_finding(Severity::Warning, "src/lib.rs"),
+        ],
+    }];
+    let output = render_human_results(&results, make_plain_style(), Duration::from_secs(1));
+    assert!(
+        output.contains("all findings auto-fixable — run `checkleft fix` to apply."),
+        "when every finding is fixable, the hint must say so without a count: {output}"
+    );
+}
+
+#[test]
+fn render_human_footer_matches_results_fixability_hint() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![make_fixable_finding(Severity::Error, "src/main.rs")],
+    }];
+    let footer = render_human_footer(&results, make_plain_style(), Duration::from_secs(1));
+    assert!(
+        footer.contains("all findings auto-fixable — run `checkleft fix` to apply."),
+        "the interactive footer must advertise fixability identically to the non-interactive path: {footer}"
+    );
+}
+
+#[test]
+fn json_output_serializes_fixable_field_per_finding() {
+    let results = vec![CheckResult {
+        check_id: "format/rust".to_owned(),
+        findings: vec![
+            make_fixable_finding(Severity::Error, "src/main.rs"),
+            make_finding(Severity::Error, "src/lib.rs"),
+        ],
+    }];
+    let json = serde_json::to_string(&results).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+    let findings = parsed[0]["findings"].as_array().expect("findings array");
+    assert_eq!(findings[0]["fixable"], serde_json::Value::Bool(true));
+    assert_eq!(findings[1]["fixable"], serde_json::Value::Bool(false));
 }

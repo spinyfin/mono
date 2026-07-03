@@ -71,6 +71,7 @@ impl ConfiguredCheck for RepoVisibilityCheck {
 
             for location in find_public_default_visibility_locations(contents) {
                 findings.push(Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: "package default_visibility must not be `//visibility:public`".to_owned(),
                     location: Some(Location {

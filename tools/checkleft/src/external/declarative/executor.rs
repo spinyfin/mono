@@ -408,6 +408,7 @@ fn run_tool_invocation(
                         // files' findings are not suppressed.
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         findings.push(Finding {
+                            fixable: false,
                             severity: Severity::Error,
                             message: format!(
                                 "declarative invocation `{}` failed for `{}` (exit {}): {}",

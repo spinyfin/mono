@@ -110,6 +110,23 @@ pub struct ExternalCheckPackage {
     pub implementation: ExternalCheckPackageImplementation,
 }
 
+impl ExternalCheckPackage {
+    /// Whether this package declares a fix capability that `checkleft fix` can
+    /// act on: a declarative package with at least one invocation carrying a
+    /// `fix` block. Component (WASM) packages report `false` — their
+    /// guest-declared `fix-check` entry point is not yet wired into the `fix`
+    /// pipeline (see [`crate::fix`]), so advertising them as fixable would be
+    /// inaccurate.
+    pub fn is_fixable(&self) -> bool {
+        match &self.implementation {
+            ExternalCheckPackageImplementation::Declarative(package) => {
+                package.invocations.iter().any(|invocation| invocation.fix.is_some())
+            }
+            ExternalCheckPackageImplementation::Component(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckPackageImplementation {
     /// The `component` tier: a WebAssembly Component Model artifact with

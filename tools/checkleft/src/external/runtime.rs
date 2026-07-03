@@ -1491,6 +1491,7 @@ fn lift_suggested_fix(fix: wit_types::SuggestedFix) -> SuggestedFix {
 
 fn lift_finding(f: wit_types::Finding) -> Finding {
     Finding {
+        fixable: false,
         severity: lift_severity(f.severity),
         message: f.message,
         location: f.location.map(lift_location),

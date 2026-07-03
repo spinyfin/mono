@@ -16,6 +16,12 @@ pub struct Finding {
     #[serde(default)]
     pub remediations: Vec<String>,
     pub suggested_fix: Option<SuggestedFix>,
+    /// Whether `checkleft fix` can resolve this finding automatically, derived
+    /// from the producing check's declared fix capability (a declarative
+    /// check's `fix` block, or a built-in check's `suggested_fix`). Machine-
+    /// readable mirror of the "run `checkleft fix`" remediation bullet.
+    #[serde(default)]
+    pub fixable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
