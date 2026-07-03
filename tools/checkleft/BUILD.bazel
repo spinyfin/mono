@@ -119,47 +119,90 @@ musl_binary(
     visibility = ["//visibility:public"],
 )
 
-rust_test(
-    name = "checkleft_lib_test",
-    size = "small",
+# `checkleft_lib_test` is split into shards along natural module boundaries
+# rather than one monolithic rust_test, because a handful of its ~805 tests
+# are inherently expensive even after the build-time `.cwasm` AOT fix (see
+# docs/investigations/checkleft-lib-test-wasm-compile-timeout.md):
+#   - external::declarative:: (180 tests) drives the real `buildifier` binary
+#     as a subprocess for parity_e2e.
+#   - external::runtime:: (64 tests) instantiates the wasmtime component-model
+#     host (deserializing the AOT `.cwasm` fixture) for every giant-structs
+#     check invocation.
+# Sharding parallelizes these across independent Bazel test actions instead of
+# serializing them inside one binary, mirroring the //tools/boss/engine/core
+# `engine_lib_test_*` shards (same `crate = ` + `args = [test-name-filter]`
+# mechanism). All three shards recompile the same full `checkleft_lib` crate
+# (rust_test's `crate` attribute always builds the whole crate root with
+# `--cfg test`), so they share identical compile_data/data/env/deps —
+# `args` only filters which compiled tests are *run*.
+#
+# All shards share size = "small" / timeout = "moderate" (300 s), matching
+# `engine_lib_test`'s rationale: Linux CI runners measure ~6-7x slower than
+# local macOS, so the 60 s default for size = "small" is too tight even after
+# sharding, while `size = "small"`'s scheduling/resource class (more
+# parallelism than "medium") is still the right fit for these shards. This is
+# distinct from — and not a reopening of — the investigation's explicitly
+# rejected "bump size to medium" band-aid: `size` and `timeout` are
+# independent Bazel attributes, and no shard's tests actually recompile the
+# wasm component at runtime anymore (see the `giant_structs_component_for_test`
+# fix in src/external/runtime/tests.rs, which was the real remaining root
+# cause — three tests were calling `compile_component` directly instead of
+# going through the AOT cache, each paying a ~35-45 s debug-mode JIT compile).
+_CHECKLEFT_LIB_TEST_COMPILE_DATA = [
     # The yaml files are the canonical first-party check definitions; the fixtures
     # back the hermetic parity test in src/external/declarative/parity_e2e.rs;
     # check.wit is the WIT contract consumed by wasmtime::component::bindgen! at
-    # compile time in component_bindings.rs. All are embedded/read at compile time.
-    compile_data = [
-        "checks/format/bazel.yaml",
-        "checks/format/biome.yaml",
-        "checks/format/oxc.yaml",
-        "checks/format/prettier.yaml",
-        "checks/format/rust.yaml",
-        "checks/lint/bazel.yaml",
-        "checks/lint/biome.yaml",
-        "checks/lint/js.yaml",
-        "checks/lint/oxc.yaml",
-        "checks/lint/rust.yaml",
-        "tests/fixtures/buildifier/malformed.bzl.fixture",
-        "tests/fixtures/buildifier/unformatted.bzl.fixture",
-        "//tools/checkleft/wit:check.wit",
-    ],
+    # compile time in component_bindings.rs. All are embedded/read at compile time,
+    # and are needed by every shard since they all compile the same crate root.
+    "checks/format/bazel.yaml",
+    "checks/format/biome.yaml",
+    "checks/format/oxc.yaml",
+    "checks/format/prettier.yaml",
+    "checks/format/rust.yaml",
+    "checks/lint/bazel.yaml",
+    "checks/lint/biome.yaml",
+    "checks/lint/js.yaml",
+    "checks/lint/oxc.yaml",
+    "checks/lint/rust.yaml",
+    "tests/fixtures/buildifier/malformed.bzl.fixture",
+    "tests/fixtures/buildifier/unformatted.bzl.fixture",
+    "//tools/checkleft/wit:check.wit",
+]
+
+# The real buildifier binary, staged into the test's runfiles so the
+# declarative pipeline can run hermetically (no nested bazel) and be compared
+# against the built-in BuildifierCheck. parity_e2e.rs resolves it from the
+# CHECKLEFT_E2E_BUILDIFIER runfiles path via @rules_rust//rust/runfiles.
+#
+# :precompiled_cwasm stages the build-time AOT `.cwasm` fixtures; the heavy
+# rust/giant-structs tests (both external::runtime:: and the exclusion-audit
+# tests in runner::tests::) point their executor cache at this directory
+# (resolved from CHECKLEFT_PRECOMPILED_CWASM_DIR via runfiles in
+# external::test_support) so they deserialize the component instead of
+# JIT-compiling it at runtime. Both fixtures are staged on every shard: which
+# tests exercise them is a shard/`args` concern, but the underlying crate
+# compile is identical across shards and `external::test_support` asserts
+# loudly (rather than silently falling back to a slow JIT compile) if a test
+# that needs the cache runs without it staged.
+_CHECKLEFT_LIB_TEST_DATA = [
+    ":precompiled_cwasm",
+    "@buildifier_prebuilt//:buildifier",
+]
+
+_CHECKLEFT_LIB_TEST_ENV = {
+    "CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
+    "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
+}
+
+rust_test(
+    name = "checkleft_lib_test_declarative",
+    size = "small",
+    timeout = "moderate",
+    args = ["external::declarative::"],
+    compile_data = _CHECKLEFT_LIB_TEST_COMPILE_DATA,
     crate = ":checkleft_lib",
-    # The real buildifier binary, staged into the test's runfiles so the
-    # declarative pipeline can run hermetically (no nested bazel) and be compared
-    # against the built-in BuildifierCheck. parity_e2e.rs resolves it from the
-    # CHECKLEFT_E2E_BUILDIFIER runfiles path via @rules_rust//rust/runfiles.
-    #
-    # :precompiled_cwasm stages the build-time AOT `.cwasm` fixtures; the heavy
-    # rust/giant-structs tests point their executor cache at this directory
-    # (resolved from CHECKLEFT_PRECOMPILED_CWASM_DIR via runfiles in
-    # external::test_support) so they deserialize the component instead of
-    # JIT-compiling it at runtime.
-    data = [
-        ":precompiled_cwasm",
-        "@buildifier_prebuilt//:buildifier",
-    ],
-    env = {
-        "CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
-        "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
-    },
+    data = _CHECKLEFT_LIB_TEST_DATA,
+    env = _CHECKLEFT_LIB_TEST_ENV,
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -168,6 +211,64 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + ["@rules_rust//rust/runfiles"],
+)
+
+rust_test(
+    name = "checkleft_lib_test_wasm",
+    size = "small",
+    timeout = "moderate",
+    args = ["external::runtime::"],
+    compile_data = _CHECKLEFT_LIB_TEST_COMPILE_DATA,
+    crate = ":checkleft_lib",
+    data = _CHECKLEFT_LIB_TEST_DATA,
+    env = _CHECKLEFT_LIB_TEST_ENV,
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + ["@rules_rust//rust/runfiles"],
+)
+
+# Everything else: runner::, config::, change_detection::, checks::, fix::,
+# and the many small single-module test files — none of which recompile or
+# instantiate the wasm component-model host, so this shard stays a couple of
+# seconds even unsharded further.
+rust_test(
+    name = "checkleft_lib_test_rest",
+    size = "small",
+    timeout = "moderate",
+    args = [
+        "--skip",
+        "external::declarative::",
+        "--skip",
+        "external::runtime::",
+    ],
+    compile_data = _CHECKLEFT_LIB_TEST_COMPILE_DATA,
+    crate = ":checkleft_lib",
+    data = _CHECKLEFT_LIB_TEST_DATA,
+    env = _CHECKLEFT_LIB_TEST_ENV,
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + ["@rules_rust//rust/runfiles"],
+)
+
+# Umbrella target: `bazel test //tools/checkleft:checkleft_lib_test` runs all
+# 3 shards (subject to --jobs), same as before the split.
+test_suite(
+    name = "checkleft_lib_test",
+    tests = [
+        ":checkleft_lib_test_declarative",
+        ":checkleft_lib_test_rest",
+        ":checkleft_lib_test_wasm",
+    ],
 )
 
 rust_test(

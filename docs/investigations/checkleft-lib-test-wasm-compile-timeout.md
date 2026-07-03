@@ -1,6 +1,21 @@
 # Why `checkleft_lib_test` approaches the 60 s small-test timeout — measured
 
-**Status:** investigation (measurements complete, no code changed)
+**Status:** resolved. The build-time `.cwasm` AOT fixture (direction 1 below)
+landed per this investigation. Re-profiling afterward (2026-07-03) found the
+fixture wasn't the whole story: three tests in
+`src/external/runtime/tests.rs` (`call_declared_exclusions_times_out_when_deadline_exhausted`,
+`call_evaluate_exclusion_times_out_when_deadline_exhausted`,
+`call_declared_exclusions_timeout_error_names_check_and_budget`) called
+`compile_component` directly instead of going through the AOT-cache-aware
+helper, so each still paid a full ~35-45 s debug-mode JIT compile — the
+dominant remaining cost. Fixed by routing them through a cached
+`giant_structs_component_for_test` helper (mirroring
+`external::test_support::executor_with_precompiled_cache`). `checkleft_lib_test`
+was also split into `checkleft_lib_test_{declarative,wasm,rest}` shards (see
+`//tools/checkleft:BUILD.bazel`) so the two genuinely test-heavy clusters
+(the declarative parity e2e and the wasm/component-model tests) run as
+independent, `timeout = "moderate"` Bazel actions instead of serializing
+inside one `size = "small"` binary.
 **Date:** 2026-06-14
 **Target:** `//tools/checkleft:checkleft_lib_test` (`rust_test`, `size = "small"` → hard 60 s Bazel timeout)
 **Context:** the target timed out on the wasm-consolidation work (PR #1502 / T1695, buildkite 3252), was clawed back to ~48 s by R1 (T1703), and ~48 s for a "small" unit-test target is suspect.
@@ -175,8 +190,9 @@ Bumping `checkleft_lib_test` to `size = "medium"` (300 s timeout) is **rejected 
 
 ---
 
-## Follow-up code work (out of scope here — file separately)
+## Follow-up code work
 
-- Implement the build-time `.cwasm` precompile Bazel rule + test fixture wiring (direction 1), or the optimized-wasmtime test build (direction 2).
-- Add a shared/prewarmed AOT cache (or shared executor) for the 7 heavy tests to remove concurrent-cold-miss redundancy (direction 3).
-- Evaluate moving `syn`-based parsing out of the `rust/giant-structs` wasm guest (direction 4).
+- ~~Implement the build-time `.cwasm` precompile Bazel rule + test fixture wiring (direction 1)~~ — done (`:precompiled_cwasm`, `external::test_support`).
+- ~~Add a shared/prewarmed AOT cache (or shared executor) for the heavy tests to remove concurrent-cold-miss redundancy (direction 3)~~ — done for all tests that resolve a check component; see the "Status" note above for the three stragglers that were still bypassing it.
+- ~~Split `checkleft_lib_test` into shards so the declarative-parity and wasm/component clusters run as independent Bazel test actions~~ — done, see `//tools/checkleft:BUILD.bazel`.
+- Evaluate moving `syn`-based parsing out of the `rust/giant-structs` wasm guest (direction 4) — still open; a longer-term reduction, not required to clear the timeout.
