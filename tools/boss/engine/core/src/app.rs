@@ -2317,6 +2317,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CommentsApplyMagicWand { .. } => {
                 comments::handle_comments_apply_magic_wand(ctx, r).await
             }
+            r @ FrontendRequest::CommentsBannerState { .. } => comments::handle_comments_banner_state(ctx, r).await,
             r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
             r @ FrontendRequest::CommentsDiscardMagicWand { .. } => {
                 comments::handle_comments_discard_magic_wand(ctx, r).await

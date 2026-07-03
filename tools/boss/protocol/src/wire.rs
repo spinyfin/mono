@@ -7,15 +7,15 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
-    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput, MagicWandDispatch, PrWorkItemMatch, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    CiRemediation, CommentAnchor, CommentsBannerState, ConflictResolution, CreateAttentionInput,
+    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
+    CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, MagicWandDispatch, PrWorkItemMatch, Product,
+    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -270,6 +270,17 @@ pub enum FrontendRequest {
         dispatch_id: String,
         /// SHA-256 of the doc's current plain-text projection (for CAS).
         current_doc_version: String,
+    },
+
+    /// Read-only summary of the `[Revise]` banner's state for an
+    /// artifact: `{ revisable, unresolved_count, in_revision_count,
+    /// doc_kind }`. A small companion read to `CommentsList` that lets a
+    /// client render the banner without loading every comment. Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"2d. Banner state on the comment read path".
+    CommentsBannerState {
+        artifact_kind: String,
+        artifact_id: String,
     },
 
     /// Create an `active` comment on an artifact. Returns the row.
@@ -2505,6 +2516,13 @@ pub enum FrontendEvent {
         artifact_kind: String,
         artifact_id: String,
         comments: Vec<WorkComment>,
+    },
+    /// Reply to `comments_banner_state`.
+    CommentsBannerState {
+        artifact_kind: String,
+        artifact_id: String,
+        #[serde(flatten)]
+        state: CommentsBannerState,
     },
     /// Reply to `comments_resolve`: each active comment paired with its
     /// resolution against the supplied plain text.

@@ -171,6 +171,44 @@ pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+/// Reply to `comments_banner_state` — a read-only `[Revise]`-banner summary,
+/// so a client can render the banner without loading every comment.
+pub(super) async fn handle_comments_banner_state(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsBannerState {
+        artifact_kind,
+        artifact_id,
+    } = req
+    else {
+        unreachable!()
+    };
+    match work_db.comments_banner_state(&artifact_kind, &artifact_id) {
+        Ok(state) => send_response_with_revision(
+            &sink,
+            &request_id,
+            server_state.current_work_revision(),
+            FrontendEvent::CommentsBannerState {
+                artifact_kind,
+                artifact_id,
+                state,
+            },
+        ),
+        Err(err) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: err.to_string(),
+            },
+        ),
+    }
+}
+
 pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

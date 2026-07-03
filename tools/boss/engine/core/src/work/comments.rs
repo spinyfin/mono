@@ -84,6 +84,43 @@ impl WorkDb {
         query_comment(&conn, comment_id)
     }
 
+    /// Read-only `[Revise]`-banner summary for an artifact: `revisable`,
+    /// `unresolved_count` (active `directive`/`larger_change` comments —
+    /// same candidate set as `query_revisable_comments`), `in_revision_count`,
+    /// and the doc owner's `TaskKind` (`None` when `resolve_doc_owner` finds
+    /// no design/investigation owner). Design:
+    /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+    /// §"2d. Banner state on the comment read path".
+    pub fn comments_banner_state(&self, artifact_kind: &str, artifact_id: &str) -> Result<CommentsBannerState> {
+        let owner = self.resolve_doc_owner(artifact_kind, artifact_id)?;
+        let conn = self.connect()?;
+        let unresolved_count: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM work_comments
+                 WHERE artifact_kind = ?1 AND artifact_id = ?2
+                   AND status = '{COMMENT_STATUS_ACTIVE}'
+                   AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+            ),
+            params![artifact_kind, artifact_id],
+            |row| row.get(0),
+        )?;
+        let in_revision_count: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM work_comments
+                 WHERE artifact_kind = ?1 AND artifact_id = ?2
+                   AND status = '{COMMENT_STATUS_IN_REVISION}'"
+            ),
+            params![artifact_kind, artifact_id],
+            |row| row.get(0),
+        )?;
+        Ok(CommentsBannerState {
+            revisable: owner.is_some() && unresolved_count > 0,
+            unresolved_count,
+            in_revision_count,
+            doc_kind: owner.map(|o| o.task_kind),
+        })
+    }
+
     /// Transition a comment's status. Accepts `active` / `resolved` /
     /// `orphaned` / `dismissed`; stamps `dismissed_at` when entering
     /// `resolved` / `dismissed` and clears it otherwise (re-activation).
@@ -745,6 +782,35 @@ mod tests {
         assert!(list.iter().any(|c| c.anchor.exact == "beta"));
         // Other artifacts are isolated.
         assert!(db.list_comments("work_item", "other", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn banner_state_never_revisable_without_a_doc_owner() {
+        let db = mem_db();
+        // No project/design task points at this artifact, so
+        // `resolve_doc_owner` returns `None`. `revisable` must be false even
+        // though there is an unresolved directive comment sitting on it —
+        // `doc_kind` being absent is the gate, not the comment count.
+        let artifact_id = "pr_doc:git@github.com:o/r.git:main:x.md";
+        let mut create_input = input(artifact_id, "alpha", "", "");
+        create_input.artifact_kind = "pr_doc".to_owned();
+        let c = db.create_comment(create_input).unwrap();
+        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        let state = db.comments_banner_state("pr_doc", artifact_id).unwrap();
+        assert!(!state.revisable);
+        assert_eq!(state.unresolved_count, 1);
+        assert_eq!(state.in_revision_count, 0);
+        assert!(state.doc_kind.is_none());
+    }
+
+    #[test]
+    fn banner_state_zero_for_untouched_artifact() {
+        let db = mem_db();
+        let state = db.comments_banner_state("work_item", "task_x").unwrap();
+        assert!(!state.revisable);
+        assert_eq!(state.unresolved_count, 0);
+        assert_eq!(state.in_revision_count, 0);
+        assert!(state.doc_kind.is_none());
     }
 
     #[test]
