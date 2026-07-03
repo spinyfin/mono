@@ -162,19 +162,17 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
             Ok(()) => {
                 // Warn the operator when a flag is enabled but its
                 // backing capability is absent from this build.
-                if enabled {
-                    if let Some(spec) = crate::feature_flags::REGISTRY.iter().find(|s| s.name == name) {
-                        if let Some(cap_id) = spec.capability_id {
-                            if !server_state.capability_registry.is_present(cap_id) {
-                                tracing::warn!(
-                                    flag = %name,
-                                    capability = %cap_id,
-                                    "feature-flags: flag enabled but its backing capability \
-                                     is absent from this build — the flag will have no effect",
-                                );
-                            }
-                        }
-                    }
+                if enabled
+                    && let Some(spec) = crate::feature_flags::REGISTRY.iter().find(|s| s.name == name)
+                    && let Some(cap_id) = spec.capability_id
+                    && !server_state.capability_registry.is_present(cap_id)
+                {
+                    tracing::warn!(
+                        flag = %name,
+                        capability = %cap_id,
+                        "feature-flags: flag enabled but its backing capability \
+                         is absent from this build — the flag will have no effect",
+                    );
                 }
                 tracing::info!(
                     flag = %name,
@@ -207,7 +205,7 @@ pub(super) async fn handle_register_capabilities(ctx: Dispatch, req: FrontendReq
     let FrontendRequest::RegisterCapabilities { capability_ids } = req else {
         unreachable!()
     };
-    server_state.capability_registry.replace_all(capability_ids.into_iter());
+    server_state.capability_registry.replace_all(capability_ids);
     let flags = feature_flags_snapshot_to_wire(&server_state);
     send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
 }

@@ -2243,8 +2243,8 @@ async fn dispatch_ci_axis(
     ci: &OpenPrCiStatus,
     outcome: &mut SweepOutcome,
 ) {
-    if let OpenPrCiStatus::Failing { failures } = ci {
-        if ci_watch::on_ci_failure_detected(
+    if let OpenPrCiStatus::Failing { failures } = ci
+        && ci_watch::on_ci_failure_detected(
             work_db,
             publisher,
             &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
@@ -2253,9 +2253,8 @@ async fn dispatch_ci_axis(
             failures,
         )
         .await
-        {
-            outcome.ci_flagged += 1;
-        }
+    {
+        outcome.ci_flagged += 1;
     }
     if matches!(ci, OpenPrCiStatus::InFlight) {
         if ci_watch::on_ci_in_flight_supersedes_failure(

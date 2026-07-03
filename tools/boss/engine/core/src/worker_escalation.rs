@@ -99,14 +99,12 @@ pub fn detect_worker_signals(text: &str) -> Vec<WorkerSignal> {
                     marker_line: line.to_owned(),
                     parse_warning: validate_effort_escalation_fields(rest),
                 })
-            } else if let Some(rest) = line.strip_prefix(BLOCKED_MARKER) {
-                Some(WorkerSignal {
+            } else {
+                line.strip_prefix(BLOCKED_MARKER).map(|rest| WorkerSignal {
                     kind: WorkerSignalKind::Blocked,
                     marker_line: line.to_owned(),
                     parse_warning: validate_blocked_fields(rest),
                 })
-            } else {
-                None
             }
         })
         .collect()
