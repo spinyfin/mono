@@ -178,6 +178,29 @@ impl WorkDb {
             .with_context(|| format!("missing comment after answering transition: {comment_id}"))
     }
 
+    /// Compensation for a spawn that flipped a comment to `answering` and
+    /// then failed to finish creating its tracking rows (a DB write error
+    /// creating the `answer_agent_runs` row or the bound execution) — see
+    /// `spawn_answer_agent`. Without this, the comment would sit `answering`
+    /// with no execution that will ever reach `finalize_answer_agent`, so no
+    /// `Stop` event would ever recover it. Guarded on `status = 'answering'`
+    /// so it's a no-op error if the state already moved on.
+    pub fn transition_comment_answering_to_active(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![comment_id, COMMENT_STATUS_ACTIVE, now, COMMENT_STATUS_ANSWERING],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'answering' (expected answering → active)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after answering->active transition: {comment_id}"))
+    }
+
     /// Bucket-2 track (P3b): `answering → answered`, fired when the answer
     /// agent posts its reply (`CommentsPostAnswer`) or when its run ends
     /// without one (`finalize_answer_agent`'s no-reply-posted path — an

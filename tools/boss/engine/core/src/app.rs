@@ -37,8 +37,8 @@ use crate::protocol::{
 };
 use crate::repo_slug;
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, CreateChoreInput, DuplicateTaskError, ExecutionKind,
-    ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ReviseDocOutcome, SetRunTranscriptPathOutcome,
+    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
+    ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ReviseDocOutcome, SetRunTranscriptPathOutcome,
     THREAD_ENTRY_KIND_ANSWER, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;

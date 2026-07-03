@@ -231,20 +231,30 @@ async fn spawn_answer_agent(
         return;
     }
 
-    if let Err(err) = work_db.create_answer_agent_run(
+    let run = match work_db.create_answer_agent_run(
         &comment.id,
         &comment.artifact_kind,
         &comment.artifact_id,
         &comment.doc_version,
         0,
     ) {
-        tracing::error!(
-            comment_id = %comment.id,
-            err = %err,
-            "answer-agent spawn: comment flipped to 'answering' but failed to create the tracking run row",
-        );
-        return;
-    }
+        Ok(run) => run,
+        Err(err) => {
+            tracing::error!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: comment flipped to 'answering' but failed to create the tracking run row",
+            );
+            if let Err(err) = work_db.transition_comment_answering_to_active(&comment.id) {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    err = %err,
+                    "answer-agent spawn: failed to compensate 'answering' back to 'active' after run-row creation failure",
+                );
+            }
+            return;
+        }
+    };
 
     if let Err(err) = work_db.create_answer_agent_execution(&comment.id, &repo_remote_url) {
         tracing::error!(
@@ -252,6 +262,26 @@ async fn spawn_answer_agent(
             err = %err,
             "answer-agent spawn: comment flipped to 'answering' and run row created, but execution creation failed",
         );
+        if let Err(err) = work_db.complete_answer_agent_run(
+            &run.id,
+            ANSWER_AGENT_RUN_STATUS_FAILED,
+            None,
+            Some("spawn_execution_create_failed"),
+        ) {
+            tracing::warn!(
+                comment_id = %comment.id,
+                run_id = %run.id,
+                err = %err,
+                "answer-agent spawn: failed to mark the orphaned run row 'failed' after execution creation failure",
+            );
+        }
+        if let Err(err) = work_db.transition_comment_answering_to_active(&comment.id) {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: failed to compensate 'answering' back to 'active' after execution creation failure",
+            );
+        }
         return;
     }
 
@@ -783,5 +813,237 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
                 message: err.to_string(),
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_server_state() -> Arc<ServerState> {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(temp.path().to_path_buf())
+                .db_path(temp.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        // Leak the temp dir for the lifetime of the test process; the
+        // ServerState's WorkDb keeps a handle to a path inside it.
+        std::mem::forget(temp);
+        ServerState::new_arc_with_app_pid(cfg, None, None).unwrap()
+    }
+
+    fn make_session_sink() -> Arc<SessionSink> {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        Arc::new(SessionSink::new(shutdown_tx))
+    }
+
+    /// Stand up a `question`-classified comment already `answering`, with
+    /// its tracking `answer_agent_runs` row (`running`) and its bound
+    /// `answer_agent` execution — the state `handle_comments_post_answer`
+    /// expects to resolve a reply against. Returns `(comment_id,
+    /// execution_id)`.
+    fn seed_answering_comment(work_db: &Arc<WorkDb>) -> (String, String) {
+        let product = work_db
+            .create_product(crate::work::CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "pr_doc".into(),
+                author: "human".into(),
+                body: "What does this mean?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
+        work_db.transition_comment_to_answering(&comment.id).unwrap();
+        work_db
+            .create_answer_agent_run(
+                &comment.id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                &comment.doc_version,
+                0,
+            )
+            .unwrap();
+        let execution = work_db
+            .create_answer_agent_execution(&comment.id, &product.repo_remote_url.unwrap())
+            .unwrap();
+        (comment.id, execution.id)
+    }
+
+    fn dispatch_ctx(server_state: &Arc<ServerState>, work_db: &Arc<WorkDb>, sink: &Arc<SessionSink>) -> Dispatch {
+        Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(work_db.clone())
+            .sink(sink.clone())
+            .session_id("session-1")
+            .request_id("req-1")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn post_answer_replies_and_transitions_comment_to_answered() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        let ctx = dispatch_ctx(&server_state, &work_db, &sink);
+        handle_comments_post_answer(
+            ctx,
+            FrontendRequest::CommentsPostAnswer {
+                run_id: execution_id.clone(),
+                body: "Here's the answer.".to_owned(),
+            },
+        )
+        .await;
+
+        let comment = work_db
+            .get_comment(&comment_id)
+            .unwrap()
+            .expect("comment should still exist");
+        assert_eq!(comment.status, "answered");
+        let entries = work_db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "Here's the answer.");
+        assert!(
+            work_db
+                .running_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .is_none(),
+            "the run must no longer be 'running' after a reply is posted",
+        );
+
+        // The success response should have been enqueued, not a WorkError.
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::CommentResult { .. }),
+            "expected CommentResult, got {:?}",
+            envelope.payload
+        );
+    }
+
+    #[tokio::test]
+    async fn post_answer_rejects_duplicate_reply_on_the_same_run() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        // First reply succeeds and completes the run.
+        handle_comments_post_answer(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostAnswer {
+                run_id: execution_id.clone(),
+                body: "First answer.".to_owned(),
+            },
+        )
+        .await;
+        let _ = sink.next().await;
+
+        // A second reply against the same (now-completed) run must be
+        // rejected rather than silently double-transitioning the comment.
+        handle_comments_post_answer(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostAnswer {
+                run_id: execution_id,
+                body: "Second answer.".to_owned(),
+            },
+        )
+        .await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::WorkError { .. }),
+            "expected WorkError for a duplicate reply, got {:?}",
+            envelope.payload
+        );
+        let entries = work_db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the duplicate call must not post a second thread entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_answer_rejects_a_non_answer_agent_execution() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (_comment_id, _execution_id) = seed_answering_comment(&work_db);
+
+        // A `run_id` pointing at some other kind of execution (e.g. a
+        // regular chore run) must be rejected up front — this RPC is only
+        // ever valid for an `answer_agent` execution.
+        let product = work_db
+            .create_product(crate::work::CreateProductInput {
+                name: "Other".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = work_db
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Unrelated chore")
+                    .build(),
+            )
+            .unwrap();
+        let other_execution = work_db
+            .create_execution(
+                crate::work::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(crate::work::ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        handle_comments_post_answer(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostAnswer {
+                run_id: other_execution.id,
+                body: "irrelevant".to_owned(),
+            },
+        )
+        .await;
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::WorkError { .. }),
+            "expected WorkError for a non-answer-agent run_id, got {:?}",
+            envelope.payload
+        );
     }
 }
