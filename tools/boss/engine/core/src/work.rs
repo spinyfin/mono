@@ -76,7 +76,7 @@ pub use boss_protocol::{
     COMMENT_STATUS_DISPATCHED, COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED,
     CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
     CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentResolution, ConflictResolution, CreateAttentionInput,
+    CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, ConflictResolution, CreateAttentionInput,
     CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner,
@@ -87,9 +87,10 @@ pub use boss_protocol::{
     MagicWandDispatch, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT,
     RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput,
-    ReviseDocOutcome, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    ReviseDocOutcome, SetProjectDesignDocInput, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
+    THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -205,6 +206,7 @@ mod audit_misc;
 mod automations;
 mod blocking;
 mod chain_helpers;
+mod comment_thread_entries;
 mod comments;
 mod conflict_res;
 mod create_entities;

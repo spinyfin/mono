@@ -386,6 +386,11 @@ impl WorkDb {
         // addresses. Purely additive, `NULL` for every existing row.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_work_comments_revise_task_id_column(&conn)?;
+        // Buckets 1&3 unification (P2b): `comment_thread_entries`, the shared
+        // engine-authored nudge/answer/follow-up table. Purely additive,
+        // `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_comment_thread_entries_table(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker

@@ -2203,6 +2203,48 @@ pub struct AnswerAgentRun {
     pub completed_at: Option<String>,
 }
 
+// --- Comment thread entries (P2/P3: engine-authored nudge/answer/follow-up) ---
+
+/// `comment_thread_entries.entry_kind` values (`comment-triggered-document-revisions.md`
+/// § "Reply/link mechanics"). `Nudge` is posted at `directive`/`larger_change`
+/// classification time (P2b); `Answer`/`OperatorFollowup` are later-phase (P3).
+pub const THREAD_ENTRY_KIND_NUDGE: &str = "nudge";
+pub const THREAD_ENTRY_KIND_ANSWER: &str = "answer";
+pub const THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP: &str = "operator_followup";
+
+/// `comment_thread_entries.author` for engine-authored entries (nudge, answer).
+pub const THREAD_ENTRY_AUTHOR_ENGINE: &str = "engine";
+
+/// An engine-authored (or operator-authored follow-up) thread entry on a
+/// `work_comments` row (`comment_thread_entries` table). This is the shared
+/// "conversation" shape both bucket 1&3's nudge and bucket 2's answer/follow-up
+/// use — always a child of exactly one comment, never an independent
+/// top-level comment. Design § "Reply/link mechanics".
+///
+/// 8 fields → builder pattern per project convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CommentThreadEntry {
+    pub id: String,
+    pub comment_id: String,
+    /// `nudge` | `answer` | `operator_followup`.
+    pub entry_kind: String,
+    /// `engine` for nudge/answer entries; operator identity for follow-ups.
+    pub author: String,
+    pub body: String,
+
+    /// Set on a `nudge` entry once a `[Revise]` batch actually claims the
+    /// comment — may postdate the entry itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_task_id: Option<String>,
+
+    /// Set on an `answer` entry: the `answer_agent_runs.id` that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_agent_run_id: Option<String>,
+
+    pub created_at: String,
+}
+
 /// Sub-state of `GitHubAuthStateDto::Authorized` that reflects whether the
 /// stored token can actually reach private org resources. A valid user token
 /// may still be blocked by org approval or SAML SSO requirements.
