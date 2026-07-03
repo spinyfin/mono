@@ -736,6 +736,75 @@ pub(crate) fn query_revisable_comments(
     collect_rows(rows)
 }
 
+/// Outcome driving [`reconcile_comments_for_task`] — whether the task that
+/// owns a batch of `in_revision` comments reached a terminal "shipped"
+/// state (`Resolved`) or a terminal "did not ship" state (`Reopened`).
+/// Comment-intent-classification design §"Reconciliation".
+pub(crate) enum CommentReconcileOutcome {
+    Resolved,
+    Reopened,
+}
+
+/// Reconcile every comment claimed by `task_id`'s `[Revise]` batch
+/// (`revise_task_id = task_id`, `status = 'in_revision'`) when that task
+/// reaches a terminal state. Design
+/// `comment-triggered-document-revisions.md` §"Reconciliation":
+///
+/// - `Resolved` (the task's PR merged): the requested change rode that
+///   PR, so mark the comment `resolved`. `revise_task_id` is deliberately
+///   left in place — it is the provenance trail of which batch addressed
+///   the comment (see [`WorkComment::revise_task_id`]'s doc comment).
+/// - `Reopened` (the task was abandoned / its PR closed unmerged): the
+///   requested change never shipped, so put the comment back on the
+///   `[Revise]` banner — `status='active'`, `revise_task_id` cleared.
+///
+/// Deliberately does **not** touch `last_resolved_with`: despite the
+/// design doc's SQL sketch proposing `last_resolved_with='revise:<task_id>'`,
+/// that column is already the anchor-resolution-mode field
+/// (`exact`/`fuzzy`/`orphan`, driving the sidebar's ⚠ glyph —
+/// `migrate_work_comments_table`) for every comment in production today;
+/// stomping it here would destroy that history for no benefit, since
+/// `revise_task_id` already carries the "which batch resolved this"
+/// provenance the design SQL was reaching for.
+///
+/// Both arms are guarded on `status = 'in_revision'`, so calling this on a
+/// task that never claimed any comments — or re-firing on an
+/// already-reconciled task — is a no-op. Returns the number of comment
+/// rows changed (tests / logging).
+pub(crate) fn reconcile_comments_for_task(
+    conn: &Connection,
+    task_id: &str,
+    outcome: CommentReconcileOutcome,
+    now: &str,
+) -> Result<usize> {
+    let affected = match outcome {
+        CommentReconcileOutcome::Resolved => conn.execute(
+            &format!(
+                "UPDATE work_comments
+                 SET status = '{COMMENT_STATUS_RESOLVED}',
+                     status_actor = 'engine',
+                     updated_at = ?2,
+                     dismissed_at = ?2
+                 WHERE revise_task_id = ?1 AND status = '{COMMENT_STATUS_IN_REVISION}'"
+            ),
+            params![task_id, now],
+        )?,
+        CommentReconcileOutcome::Reopened => conn.execute(
+            &format!(
+                "UPDATE work_comments
+                 SET status = '{COMMENT_STATUS_ACTIVE}',
+                     revise_task_id = NULL,
+                     status_actor = 'engine',
+                     updated_at = ?2,
+                     dismissed_at = NULL
+                 WHERE revise_task_id = ?1 AND status = '{COMMENT_STATUS_IN_REVISION}'"
+            ),
+            params![task_id, now],
+        )?,
+    };
+    Ok(affected)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::comments_anchor::CommentFuzzyConfig;

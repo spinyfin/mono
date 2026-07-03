@@ -682,4 +682,201 @@ mod tests {
         let outcome = db.claim_revisable_comments(&[candidate], "task_new").unwrap();
         assert!(matches!(outcome, ClaimOutcome::NoneLeft));
     }
+
+    // --- Completion reconciliation (design §"Reconciliation", task 2c) ---
+
+    #[test]
+    fn resolves_comment_when_chore_pr_merges() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        // No PR on the owner yet -> decision table picks the chore vehicle.
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, task_kind, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(task_kind, "chore");
+
+        db.mark_chore_pr_merged(&task_id, "https://github.com/o/r/pull/9")
+            .unwrap();
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "resolved");
+        assert_eq!(
+            reloaded.revise_task_id.as_deref(),
+            Some(task_id.as_str()),
+            "revise_task_id is provenance and must survive resolution"
+        );
+    }
+
+    #[test]
+    fn resolves_comment_when_revision_pr_merges() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, task_kind, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(task_kind, "revision");
+
+        // Simulate the revision having pushed its commit and moved to
+        // in_review, mirroring `mark_chore_pr_merged_keeps_in_review_revision_done_not_blocked`.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+        }
+
+        // The chain root's PR merges; `flip_in_review_revisions_to_done`
+        // must fan out reconciliation to the revision's comments (their
+        // `revise_task_id` is the revision, not the chain root).
+        db.mark_chore_pr_merged(&design.id, &pr_url).unwrap();
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "resolved");
+        assert_eq!(reloaded.revise_task_id.as_deref(), Some(task_id.as_str()));
+    }
+
+    #[test]
+    fn reopens_comment_when_chore_pr_closed_unmerged() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+
+        let reopened = db.reopen_comments_for_closed_unmerged_pr(&task_id).unwrap();
+        assert_eq!(reopened, 1);
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+        assert!(
+            reloaded.revise_task_id.is_none(),
+            "reopened comment must clear revise_task_id so a fresh [Revise] can re-claim it"
+        );
+    }
+
+    #[test]
+    fn reopens_comment_when_revision_chain_pr_closed_unmerged() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/o/r/pull/1".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, task_kind, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(task_kind, "revision");
+        let before = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(
+            before.revise_task_id.as_deref(),
+            Some(task_id.as_str()),
+            "comment must be claimed by the revision, not the chain root"
+        );
+
+        // The chain root's PR closed unmerged: the revision never had its
+        // own PR (its commit rides the chain root's), so the reopen hook
+        // must walk the chain to find the revision-owned comment.
+        let reopened = db.reopen_comments_for_closed_unmerged_pr(&design.id).unwrap();
+        assert_eq!(reopened, 1);
+
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+        assert!(reloaded.revise_task_id.is_none());
+    }
+
+    #[test]
+    fn reopen_is_noop_once_already_resolved() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        db.mark_chore_pr_merged(&task_id, "https://github.com/o/r/pull/9")
+            .unwrap();
+
+        // A late/duplicate close-unmerged sweep on an already-resolved
+        // task must not reopen it — reconciliation is guarded on
+        // `status = 'in_revision'`.
+        let reopened = db.reopen_comments_for_closed_unmerged_pr(&task_id).unwrap();
+        assert_eq!(reopened, 0);
+        let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "resolved");
+    }
 }
