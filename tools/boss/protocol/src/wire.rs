@@ -2753,6 +2753,9 @@ mod editorial_controls_tests;
 mod feature_flags_wire_tests;
 
 #[cfg(test)]
+mod topic_and_envelope_tests;
+
+#[cfg(test)]
 mod sorted_request_variants_test {
     /// Asserts that `FrontendRequest` variants are in alphabetical order.
     ///
