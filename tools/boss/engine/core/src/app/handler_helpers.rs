@@ -527,6 +527,29 @@ pub(super) async fn handle_create_many(
     }
 }
 
+/// Run a `jj` subcommand in `dir` with the standard stdio / kill-on-drop
+/// envelope and map its outcome to a `Result<()>`. `display` is a
+/// human-readable rendering of the command reused in both the
+/// spawn-failure and non-zero-exit error messages. Callers feed the
+/// returned error through `fail_with_release!`.
+async fn run_jj(dir: &std::path::Path, args: &[&str], display: &str) -> Result<()> {
+    let out = TokioCommand::new("jj")
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn {display}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{display} failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 /// Orchestrate the review-terminal workspace setup for
 /// [`FrontendRequest::OpenReviewTerminal`].
 ///
@@ -574,42 +597,14 @@ pub(super) async fn open_review_terminal_async(
     };
 
     // Step 4: jj git fetch
-    let fetch_out = TokioCommand::new("jj")
-        .args(["git", "fetch"])
-        .current_dir(&lease.workspace_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
-    match fetch_out {
-        Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj git fetch: {e}")),
-        Ok(o) if !o.status.success() => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            fail_with_release!(anyhow::anyhow!("jj git fetch failed: {}", stderr.trim()))
-        }
-        Ok(_) => {}
+    if let Err(e) = run_jj(&lease.workspace_path, &["git", "fetch"], "jj git fetch").await {
+        fail_with_release!(e);
     }
 
     // Step 5: jj new -r <branch>@origin
     let rev = format!("{head_branch}@origin");
-    let new_out = TokioCommand::new("jj")
-        .args(["new", "-r", &rev])
-        .current_dir(&lease.workspace_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await;
-    match new_out {
-        Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj new: {e}")),
-        Ok(o) if !o.status.success() => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            fail_with_release!(anyhow::anyhow!("jj new -r {rev} failed: {}", stderr.trim()))
-        }
-        Ok(_) => {}
+    if let Err(e) = run_jj(&lease.workspace_path, &["new", "-r", &rev], &format!("jj new -r {rev}")).await {
+        fail_with_release!(e);
     }
 
     Ok((lease.workspace_path.display().to_string(), lease.lease_id))
@@ -619,15 +614,10 @@ pub(super) async fn open_review_terminal_async(
 /// return the head branch name. Mirrors the approach in
 /// `design_detector::do_scan_pr` but requests only the one field we need.
 pub(super) async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
-    let output = TokioCommand::new("gh")
-        .args(["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
+    let output =
+        crate::gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
+            .await
+            .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
