@@ -3395,10 +3395,12 @@ pub struct WorkComment {
 
     /// Soft FK → `tasks.id`: the revision or chore that this comment's
     /// `[Revise]` batch was dispatched to. `NULL` unless `status =
-    /// 'in_revision'` (or a resolved/reopened comment whose last batch we
-    /// still want to trace). Design:
+    /// 'in_revision'`, with one exception: a `resolved` comment keeps it
+    /// as provenance of which batch addressed it (reconciliation on merge
+    /// leaves it in place). A `reopened` comment (its batch was abandoned)
+    /// clears it back to `NULL`. Design:
     /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
-    /// §"Association model".
+    /// §"Association model" / §"Reconciliation".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise_task_id: Option<String>,
 }

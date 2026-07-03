@@ -143,6 +143,11 @@ crate::register_counter!(
     "merge_poller.worker_stopped_on_review",
     "Live worker executions stopped because their task auto-transitioned to in_review (CI detected green) in one sweep."
 );
+crate::register_counter!(
+    COMMENTS_REOPENED,
+    "merge_poller.comments_reopened",
+    "in_revision comments reopened because their task's PR closed without merging in one sweep."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics::init_all`] at engine startup.
@@ -156,6 +161,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&LATE_PR_RECOVERED);
     registry.register_counter(&REVISION_INVALIDATED);
     registry.register_counter(&WORKER_STOPPED_ON_REVIEW);
+    registry.register_counter(&COMMENTS_REOPENED);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -1295,6 +1301,11 @@ pub struct SweepOutcome {
     /// or has been running past the stale threshold. Ensures the hold
     /// always resolves so no card is stranded in Doing forever.
     pub reviewer_fallback_advanced: usize,
+    /// Number of `in_revision` comments reopened (comment-intent-
+    /// classification design §"Reconciliation", task 2c) because the task
+    /// that was addressing them — or a revision in its chain — had its PR
+    /// closed without merging in this sweep.
+    pub comments_reopened: usize,
 }
 
 impl SweepOutcome {
@@ -1311,6 +1322,7 @@ impl SweepOutcome {
             + self.revision_invalidated
             + self.worker_stopped_on_review
             + self.stranded_blocked_recanonicalized
+            + self.comments_reopened
     }
 }
 
@@ -1988,10 +2000,39 @@ async fn sweep_one(
             }
         }
         PrLifecycleState::ClosedUnmerged => {
-            // Out-of-scope for this design — `chore-lifecycle-pr-closed-unmerged.md`
-            // owns the close-unmerged transition. The current sweep
-            // leaves the chore where it was, matching the prior
-            // poller's behaviour for a PR that has vanished.
+            // The task-status transition itself is out-of-scope here —
+            // `chore-lifecycle-pr-closed-unmerged.md` owns that (unimplemented;
+            // no `abandoned` status exists yet). The current sweep leaves the
+            // chore where it was, matching the prior poller's behaviour for a
+            // PR that has vanished.
+            //
+            // Comment reconciliation is a narrower, comment-only signal that
+            // doesn't need that lifecycle work to land first (comment-intent-
+            // classification design §"Reconciliation" / §Risks — the "reopen
+            // on abandon" half of task 2c): a comment whose `[Revise]` batch
+            // never shipped because this PR closed unmerged should not sit at
+            // `in_revision` forever, so reopen it onto the `[Revise]` banner.
+            match work_db.reopen_comments_for_closed_unmerged_pr(&candidate.work_item_id) {
+                Ok(reopened) if reopened > 0 => {
+                    outcome.comments_reopened += reopened;
+                    publisher
+                        .publish_work_item_changed(
+                            &candidate.product_id,
+                            &candidate.work_item_id,
+                            "comments_reopened_on_pr_closed_unmerged",
+                        )
+                        .await;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        ?err,
+                        "merge poller: failed to reopen comments for closed-unmerged PR",
+                    );
+                }
+            }
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
@@ -2729,6 +2770,7 @@ pub fn spawn_loop(
             LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
             REVISION_INVALIDATED.inc_by(&metrics, outcome.revision_invalidated as u64);
             WORKER_STOPPED_ON_REVIEW.inc_by(&metrics, outcome.worker_stopped_on_review as u64);
+            COMMENTS_REOPENED.inc_by(&metrics, outcome.comments_reopened as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -2742,6 +2784,7 @@ pub fn spawn_loop(
                     late_pr_recovered = outcome.late_pr_recovered,
                     revision_invalidated = outcome.revision_invalidated,
                     worker_stopped_on_review = outcome.worker_stopped_on_review,
+                    comments_reopened = outcome.comments_reopened,
                     "merge poller: sweep transitions",
                 );
             }
@@ -2797,8 +2840,9 @@ mod tests {
         ExecutionPublisher,
     };
     use crate::work::{
-        AddDependencyInput, ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
-        CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch,
+        AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateChoreInput, CreateCommentInput,
+        CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb,
+        WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -3093,6 +3137,71 @@ mod tests {
         }
         // Only poll-state housekeeping events are allowed; no lifecycle flip.
         assert!(publisher.lifecycle_reasons().await.is_empty());
+    }
+
+    /// Comment-intent-classification design §"Reconciliation" (task 2c):
+    /// a comment addressed by this chore's `[Revise]` batch must reopen
+    /// when the chore's PR closes without merging — the minimal
+    /// comment-only hook ahead of the full
+    /// `chore-lifecycle-pr-closed-unmerged` lifecycle (which is
+    /// unimplemented; the chore's own status is left untouched).
+    #[tokio::test]
+    async fn closed_unmerged_pr_reopens_addressed_comments() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/3";
+        let (product_id, chore_id) = make_chore_in_review(&db, "C3", pr);
+
+        let comment = db
+            .create_comment(CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: "pr_doc:git@github.com:foo/bar.git:branch:doc.md".to_owned(),
+                doc_version: "v0".to_owned(),
+                anchor: CommentAnchor {
+                    exact: "x".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "please change x".to_owned(),
+                author: "user:test@example.com".to_owned(),
+                plain_text_projection_version: 1,
+            })
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'in_revision', revise_task_id = ?1 WHERE id = ?2",
+                rusqlite::params![chore_id, comment.id],
+            )
+            .unwrap();
+        }
+
+        let probe = StubProbe::new();
+        probe.set(pr, PrLifecycleState::ClosedUnmerged);
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(outcome.comments_reopened, 1);
+        assert_eq!(outcome.merged, 0);
+
+        let reloaded = db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+        assert!(reloaded.revise_task_id.is_none());
+
+        // The chore's own lifecycle transition is out of scope for this
+        // hook — `chore-lifecycle-pr-closed-unmerged.md` owns that.
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let events = publisher.work_events.lock().await.clone();
+        assert!(
+            events
+                .iter()
+                .any(|(p, w, r)| p == &product_id && w == &chore_id && r == "comments_reopened_on_pr_closed_unmerged"),
+            "expected comments_reopened_on_pr_closed_unmerged event, got {events:?}",
+        );
     }
 
     #[tokio::test]

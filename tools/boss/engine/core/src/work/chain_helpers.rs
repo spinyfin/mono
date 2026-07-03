@@ -100,6 +100,15 @@ pub(crate) fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id:
                AND deleted_at IS NULL",
             params![rev_id, now],
         )?;
+        // Comment-intent-classification design §"Reconciliation" (task
+        // 2c): resolve any comments whose `[Revise]` batch was dispatched
+        // to this revision — the PR-open vehicle of the revision-vs-chore
+        // decision table, whose comments carry `revise_task_id = rev_id`,
+        // not the chain root's id. Guarded on `status = 'in_revision'`
+        // inside `reconcile_comments_for_task`, so calling this for every
+        // revision in the chain (not just ones this call just flipped) is
+        // a harmless no-op for the rest.
+        comments::reconcile_comments_for_task(conn, rev_id, comments::CommentReconcileOutcome::Resolved, now)?;
     }
     Ok(())
 }

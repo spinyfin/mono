@@ -541,10 +541,58 @@ impl WorkDb {
         // can never push to the merged PR.  Block them now so the
         // scheduler stops dispatching them and the kanban shows why.
         block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        // Comment-intent-classification design §"Reconciliation" (task
+        // 2c): resolve any comments whose `[Revise]` batch was dispatched
+        // directly to this task (the plain-chore vehicle of the
+        // revision-vs-chore decision table — a revision's comments are
+        // reconciled inside `flip_in_review_revisions_to_done` above,
+        // since `revise_task_id` there points at the revision, not the
+        // chain root).
+        comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
+    }
+
+    /// Reopen every `in_revision` comment addressed by `work_item_id`'s PR
+    /// closing without merging — the "reopen on abandon" half of
+    /// comment-intent-classification design §"Reconciliation" (task 2c).
+    ///
+    /// `chore-lifecycle-pr-closed-unmerged` (the design this reconciliation
+    /// soft-depends on) is not yet implemented, so there is no `abandoned`
+    /// task status to key off of; this is the minimal comment-only hook the
+    /// design's Risks section calls out as an accepted interim mitigation —
+    /// it reopens comments without changing any task's own status, matching
+    /// the merge poller's existing "leave the row in place" behaviour for a
+    /// `ClosedUnmerged` PR.
+    ///
+    /// Reconciles two cases, mirroring the resolve-side fan-out in
+    /// [`Self::mark_chore_pr_merged`] / [`flip_in_review_revisions_to_done`]:
+    ///   - `revise_task_id = work_item_id` directly — the plain-chore
+    ///     vehicle, whose own PR is exactly the one that just closed.
+    ///   - `revise_task_id` = a revision in `work_item_id`'s chain — the
+    ///     PR-open vehicle, whose commit rides the chain root's PR, so the
+    ///     chain root's close-unmerged event is the only terminal signal a
+    ///     revision-owned comment ever gets today.
+    ///
+    /// Returns the number of comment rows reopened (tests / logging).
+    pub fn reopen_comments_for_closed_unmerged_pr(&self, work_item_id: &str) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let mut affected = comments::reconcile_comments_for_task(
+            &tx,
+            work_item_id,
+            comments::CommentReconcileOutcome::Reopened,
+            &now,
+        )?;
+        for rev_id in collect_chain_revision_ids(&tx, work_item_id)? {
+            affected +=
+                comments::reconcile_comments_for_task(&tx, &rev_id, comments::CommentReconcileOutcome::Reopened, &now)?;
+        }
+        tx.commit()?;
+        Ok(affected)
     }
 
     /// Update the PR poll-state columns for a single task row after a
