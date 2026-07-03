@@ -76,7 +76,6 @@ while still allowing the `mono` version to diverge afterward.
 - [`ifchange-thenchange`](ifchange-thenchange.md)
 - [`forbidden-paths-evolution`](forbidden-paths-evolution.md)
 - [`code-patterns`](code-patterns.md)
-- [`bazel-external-checks`](bazel-external-checks.md)
 - [`bazel-repo-local-checks`](bazel-repo-local-checks.md)
 - [`bazel-policy-checks`](bazel-policy-checks.md)
 - [`bazel-central-checks`](bazel-central-checks.md)
