@@ -200,6 +200,94 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
     }
 }
 
+/// Batch-address every unaddressed `directive`/`larger_change` comment on a
+/// design/investigation-owned `pr_doc` artifact — the `[Revise]`-banner
+/// action. App-or-Boss tier, same authority class as
+/// `CommentsDispatchMagicWand` (the path this design replaces). Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"Buckets 1 & 3".
+pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        peer_pid,
+    } = ctx;
+    let FrontendRequest::CommentsReviseDoc { input } = req else {
+        unreachable!()
+    };
+    {
+        if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+            tracing::warn!(
+                peer_pid = ?peer_pid,
+                artifact_id = %input.artifact_id,
+                "comments_revise_doc rejected: caller not in app/Boss subtree",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "comments_revise_doc requires app or Boss authority".to_owned(),
+                },
+            );
+            return;
+        }
+
+        let artifact_kind = input.artifact_kind.clone();
+        let artifact_id = input.artifact_id.clone();
+        match work_db.revise_doc(input, &GhPrStateChecker) {
+            Ok(outcome) => {
+                let revision = if let ReviseDocOutcome::Created { ref task_id, .. } = outcome {
+                    let product_id = work_db
+                        .get_work_item(task_id)
+                        .ok()
+                        .map(|item| work_item_product_id(&item));
+                    let work_revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        product_id
+                            .as_deref()
+                            .map(|id| vec![work_product_topic(id)])
+                            .unwrap_or_default(),
+                        "doc_comment_revise_created",
+                        product_id.clone(),
+                        vec![task_id.clone()],
+                    )
+                    .await;
+                    let comment_revision = publish_comment_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        &artifact_kind,
+                        &artifact_id,
+                        "comment_revise_doc",
+                    )
+                    .await;
+                    comment_revision.max(work_revision)
+                } else {
+                    server_state.current_work_revision()
+                };
+                send_response_with_revision(
+                    &sink,
+                    &request_id,
+                    revision,
+                    FrontendEvent::CommentsReviseDocResult { outcome },
+                );
+            }
+            Err(err) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            ),
+        }
+    }
+}
+
 pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

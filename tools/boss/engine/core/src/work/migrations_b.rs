@@ -1604,3 +1604,21 @@ pub(crate) fn migrate_tasks_archived_reason(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// Add `work_comments.revise_task_id` — Phase 2 task 2a of
+/// `comment-triggered-document-revisions.md` (unify buckets 1 & 3). Soft FK
+/// → `tasks.id`: the revision or chore that a `CommentsReviseDoc` batch
+/// dispatched this comment to. `NULL` unless `status = 'in_revision'` (or a
+/// resolved/reopened comment whose last batch is still worth tracing).
+/// Mirrors `migrate_work_comments_intent_columns`'s idempotent
+/// `ALTER TABLE ADD COLUMN` pattern.
+pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_comments", "revise_task_id")? {
+        conn.execute("ALTER TABLE work_comments ADD COLUMN revise_task_id TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS work_comments_by_revise_task ON work_comments(revise_task_id)",
+        [],
+    )?;
+    Ok(())
+}
