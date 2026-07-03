@@ -2629,6 +2629,27 @@ pub struct DocOwner {
     pub pr_lifecycle: DocOwnerPrLifecycle,
 }
 
+/// Read-only `[Revise]`-banner summary for a `pr_doc` artifact, returned by
+/// `WorkDb::comments_banner_state`. A small companion read to `CommentsList`
+/// so a client can render the banner without loading every comment. Design:
+/// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
+/// §"2d. Banner state on the comment read path".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommentsBannerState {
+    /// True iff `doc_kind` is `Some` (a design/investigation-owned doc)
+    /// and `unresolved_count > 0`.
+    pub revisable: bool,
+    /// `active` comments with `intent ∈ {directive, larger_change}` —
+    /// the same candidate set `[Revise]` itself batches.
+    pub unresolved_count: i64,
+    /// Comments currently claimed by an in-flight revision/chore
+    /// (`status = 'in_revision'`).
+    pub in_revision_count: i64,
+    /// The doc owner's kind (always `Design`/`Investigation` when
+    /// present); `None` when `resolve_doc_owner` found no owner.
+    pub doc_kind: Option<TaskKind>,
+}
+
 /// A coarse, DB-only summary of a doc-owning task's PR lifecycle — derived
 /// from `tasks.pr_url` and `tasks.status` alone, no GitHub round trip.
 /// `resolve_doc_owner` must stay cheap enough to run on every comment

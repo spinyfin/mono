@@ -397,6 +397,57 @@ mod tests {
     }
 
     #[test]
+    fn banner_state_reflects_revise_doc_lifecycle() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // No comments yet: doc has an owner, but nothing unresolved.
+        let state = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
+        assert!(!state.revisable);
+        assert_eq!(state.unresolved_count, 0);
+        assert_eq!(state.in_revision_count, 0);
+        assert_eq!(state.doc_kind, Some(TaskKind::Design));
+
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "directive", 0.9).unwrap();
+        let c2 = make_comment(&db, &artifact_id, "beta");
+        db.set_comment_intent(&c2.id, "question", 0.9).unwrap();
+
+        // One directive comment: revisable, and the question-intent one
+        // must not count toward `unresolved_count`.
+        let state = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
+        assert!(state.revisable);
+        assert_eq!(state.unresolved_count, 1);
+        assert_eq!(state.in_revision_count, 0);
+
+        db.revise_doc(
+            ReviseDocInput::builder()
+                .artifact_kind("pr_doc")
+                .artifact_id(artifact_id.clone())
+                .build(),
+            &open_checker(),
+        )
+        .unwrap();
+
+        // Claimed by the revision: no longer unresolved, now in_revision.
+        let state = db.comments_banner_state("pr_doc", &artifact_id).unwrap();
+        assert!(!state.revisable);
+        assert_eq!(state.unresolved_count, 0);
+        assert_eq!(state.in_revision_count, 1);
+        assert_eq!(state.doc_kind, Some(TaskKind::Design));
+    }
+
+    #[test]
     fn creates_chore_when_pr_merged() {
         let db = mem_db();
         let (design, artifact_id) = seed_design_owned_artifact(&db);
