@@ -457,17 +457,17 @@ impl AgentDriver for ClaudeDriver {
         // 4. Checkleft push guard (local Standard workers only). Blocks jj/git push
         //    when the repo's checkleft reports errors. Remote workers skip it — the
         //    script is materialised locally and never shipped.
-        if config.is_standard_worker {
-            if let Some(checkleft_script) = &config.checkleft_guard_script {
-                let guard_command = format!(
-                    "python3 {script}",
-                    script = shell_escape(&checkleft_script.display().to_string()),
-                );
-                hooks.push(serde_json::json!({
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": guard_command}],
-                }));
-            }
+        if config.is_standard_worker
+            && let Some(checkleft_script) = &config.checkleft_guard_script
+        {
+            let guard_command = format!(
+                "python3 {script}",
+                script = shell_escape(&checkleft_script.display().to_string()),
+            );
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": guard_command}],
+            }));
         }
 
         // 5. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
@@ -909,11 +909,14 @@ mod tests {
 
     #[tokio::test]
     async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
-        use std::sync::Mutex;
+        use tokio::sync::Mutex;
         // HOME must be redirected so pre_trust_workspace doesn't write to the
-        // developer's real ~/.claude.json.
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // developer's real ~/.claude.json. A tokio Mutex is used (not std) so the
+        // guard can be held across the `.await` below without tripping clippy's
+        // `await_holding_lock` — we genuinely need HOME serialized for the whole
+        // async section, not just the synchronous parts.
+        static HOME_LOCK: Mutex<()> = Mutex::const_new(());
+        let _guard = HOME_LOCK.lock().await;
 
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();

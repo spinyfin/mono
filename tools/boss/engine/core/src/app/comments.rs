@@ -95,14 +95,14 @@ fn spawn_comment_classifier(
                     // Buckets 1&3 (P2b): nudge the operator toward a revision
                     // immediately on classification, before `[Revise]` is
                     // even clicked (design § "Buckets 1 & 3 — unified").
-                    if matches!(result.intent.as_str(), INTENT_DIRECTIVE | INTENT_LARGER_CHANGE) {
-                        if let Err(err) = work_db.create_nudge_thread_entry(&comment_id, NUDGE_BODY) {
-                            tracing::warn!(
-                                comment_id = %comment_id,
-                                err = %err,
-                                "comment intent classifier: failed to post nudge thread entry",
-                            );
-                        }
+                    if matches!(result.intent.as_str(), INTENT_DIRECTIVE | INTENT_LARGER_CHANGE)
+                        && let Err(err) = work_db.create_nudge_thread_entry(&comment_id, NUDGE_BODY)
+                    {
+                        tracing::warn!(
+                            comment_id = %comment_id,
+                            err = %err,
+                            "comment intent classifier: failed to post nudge thread entry",
+                        );
                     }
 
                     publish_comment_invalidation(

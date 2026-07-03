@@ -156,8 +156,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let now = now_string();
         let candidate_ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
-        let placeholders = std::iter::repeat("?")
-            .take(candidate_ids.len())
+        let placeholders = std::iter::repeat_n("?", candidate_ids.len())
             .collect::<Vec<_>>()
             .join(",");
 

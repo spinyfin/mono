@@ -687,7 +687,7 @@ pub(crate) fn query_revisable_comments(
     );
     let mut bind_params: Vec<&dyn rusqlite::ToSql> = vec![&artifact_kind, &artifact_id];
     if let Some(ids) = comment_ids {
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
         sql.push_str(&format!(" AND id IN ({placeholders})"));
         for id in ids {
             bind_params.push(id);
