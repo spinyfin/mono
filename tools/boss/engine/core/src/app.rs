@@ -32,13 +32,12 @@ use crate::protocol::{
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, InterruptWorkerPaneInput,
     OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
     TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload,
-    comment_topic, editorial_actions_topic, execution_topic, magic_wand_dispatch_topic, probe_topic,
-    work_product_topic,
+    comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
-    ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError, ExecutionStatus,
-    GhPrStateChecker, ReviseDocOutcome, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
+    ActionedAttentionGroup, DuplicateTaskError, ExecutionStatus, GhPrStateChecker, ReviseDocOutcome,
+    SetRunTranscriptPathOutcome, Task, TaskStatus, WorkComment, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -2314,18 +2313,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ClassifyCiRemediation { .. } => {
                 ci_remediation::handle_classify_ci_remediation(ctx, r).await
             }
-            r @ FrontendRequest::CommentsApplyMagicWand { .. } => {
-                comments::handle_comments_apply_magic_wand(ctx, r).await
-            }
             r @ FrontendRequest::CommentsBannerState { .. } => comments::handle_comments_banner_state(ctx, r).await,
             r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
-            r @ FrontendRequest::CommentsDiscardMagicWand { .. } => {
-                comments::handle_comments_discard_magic_wand(ctx, r).await
-            }
             r @ FrontendRequest::CommentsDismiss { .. } => comments::handle_comments_dismiss(ctx, r).await,
-            r @ FrontendRequest::CommentsDispatchMagicWand { .. } => {
-                comments::handle_comments_dispatch_magic_wand(ctx, r).await
-            }
             r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
             r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
             r @ FrontendRequest::CommentsReviseDoc { .. } => comments::handle_comments_revise_doc(ctx, r).await,

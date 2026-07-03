@@ -391,6 +391,12 @@ impl WorkDb {
         // `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_comment_thread_entries_table(&conn)?;
+        // Magic-wand removal (P2e): retire any `work_comments` row still
+        // sitting in the now-invalid `dispatched` status. Data-only, no
+        // schema change; the `magic_wand_dispatches` table itself is left
+        // in place, unread, as a historical record.
+        // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
+        migrate_retire_magic_wand_dispatched_comments(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker

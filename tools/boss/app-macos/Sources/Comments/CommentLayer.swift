@@ -272,18 +272,6 @@ final class CommentLayer: NSObject, ObservableObject {
         print("[CommentsSetIntent] comment=\(comment.id) intent=\(intent.rawValue)")
     }
 
-    // MARK: - Magic wand (Phase 3)
-
-    /// Dispatch the magic-wand: sends `CommentsDispatchMagicWand` to the engine
-    /// (Phase 3 stub — full engine integration wires up the RPC and result sheet
-    /// once Phase 2 persistence is active in the macOS app layer).
-    func dispatchMagicWand(_ comment: Comment) {
-        // Phase 1/2 stub: the engine RPC and result sheet presentation are
-        // wired up once the macOS app has Phase 2 engine connectivity in place.
-        // For now, log the intent so the button is visible and tappable.
-        print("[MagicWand] dispatch requested for comment: \(comment.id)")
-    }
-
     // MARK: - Click-to-jump
 
     func jumpTo(_ comment: Comment) {

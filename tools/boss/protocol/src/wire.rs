@@ -11,11 +11,11 @@ use crate::types::{
     CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
     CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, MagicWandDispatch, PrWorkItemMatch, Product,
-    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -57,14 +57,6 @@ pub fn probe_topic(run_id: &str) -> String {
 /// `comments.artifact.<artifact_kind>:<artifact_id>`.
 pub fn comment_topic(artifact_kind: &str, artifact_id: &str) -> String {
     format!("comments.artifact.{artifact_kind}:{artifact_id}")
-}
-
-/// Per-dispatch magic-wand topic. The engine pushes a [`FrontendEvent::MagicWandResult`]
-/// on this topic when the specialised Claude call completes (status flips to
-/// `returned` or `failed`). The macOS app subscribes after receiving
-/// `MagicWandDispatched` and unsubscribes once it has shown the preview sheet.
-pub fn magic_wand_dispatch_topic(dispatch_id: &str) -> String {
-    format!("magic_wand.dispatch.{dispatch_id}")
 }
 
 /// Per-product editorial-actions topic. The engine pushes a
@@ -258,20 +250,6 @@ pub enum FrontendRequest {
         triage_class: String,
     },
 
-    /// Apply the magic-wand result: overwrite the work-item description with
-    /// `result_md` after a doc-version CAS check. `current_doc_version` is the
-    /// SHA-256 of the doc's current plain-text projection, computed by the
-    /// macOS renderer. On match with the dispatch's stored `doc_version`, the
-    /// description is overwritten atomically and the dispatch transitions to
-    /// `applied`. On mismatch (the doc was edited between dispatch and apply)
-    /// the dispatch transitions to `conflict` and `conflict = true` is returned
-    /// so the UI can show a reload affordance. User-tier — workers may not call.
-    CommentsApplyMagicWand {
-        dispatch_id: String,
-        /// SHA-256 of the doc's current plain-text projection (for CAS).
-        current_doc_version: String,
-    },
-
     /// Read-only summary of the `[Revise]` banner's state for an
     /// artifact: `{ revisable, unresolved_count, in_revision_count,
     /// doc_kind }`. A small companion read to `CommentsList` that lets a
@@ -289,28 +267,11 @@ pub enum FrontendRequest {
         input: CreateCommentInput,
     },
 
-    /// Discard the magic-wand result without modifying the description.
-    /// Transitions the dispatch to `discarded`; the comment stays `active`.
-    CommentsDiscardMagicWand {
-        dispatch_id: String,
-    },
-
     /// Soft-dismiss: transition a comment to `resolved`.
     CommentsDismiss {
         comment_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,
-    },
-
-    /// App-or-Boss-session RPC: dispatch a specialised one-shot Claude call
-    /// against the comment's work-item description. The engine inserts an
-    /// `in_flight` dispatch row and spawns an async task; the caller receives
-    /// `MagicWandDispatched` immediately. The result arrives asynchronously on
-    /// the `magic_wand.dispatch.<dispatch_id>` topic as `MagicWandResult` when
-    /// the Claude call completes. Only valid for `artifact_kind = 'work_item'`
-    /// comments (Phase 4 handles `pr_doc`).
-    CommentsDispatchMagicWand {
-        comment_id: String,
     },
 
     /// List comments for an artifact. Excludes `resolved` / `dismissed`
@@ -2534,28 +2495,6 @@ pub enum FrontendEvent {
     /// Reply to `CommentsReviseDoc`.
     CommentsReviseDocResult {
         outcome: ReviseDocOutcome,
-    },
-    // --- Magic wand (Phase 3) replies / pushes. ---
-    /// Reply to `CommentsDispatchMagicWand`: the dispatch row was created
-    /// (status = `in_flight`). Subscribe to
-    /// `magic_wand.dispatch.<dispatch.id>` to receive the result.
-    MagicWandDispatched {
-        dispatch: MagicWandDispatch,
-    },
-    /// Push event on `magic_wand.dispatch.<id>` topic when the Claude call
-    /// completes. `dispatch.status` is `returned` (success) or `failed`.
-    /// `result_md` is included inline so the macOS app can show the preview
-    /// sheet without a further round-trip.
-    MagicWandResult {
-        dispatch: MagicWandDispatch,
-    },
-    /// Reply to `CommentsApplyMagicWand`. When `conflict = true` the doc was
-    /// edited between dispatch and apply; no overwrite occurred and
-    /// `dispatch.status` is `conflict`. When `conflict = false` the
-    /// description was updated and `dispatch.status` is `applied`.
-    MagicWandApplied {
-        dispatch: MagicWandDispatch,
-        conflict: bool,
     },
     /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
     /// has leased a workspace, fetched the PR branch, and created a new

@@ -337,26 +337,6 @@ rust_test(
 )
 
 rust_test(
-    name = "magic_wand_dispatch_test",
-    size = "small",
-    timeout = "moderate",
-    srcs = ["tests/magic_wand_dispatch.rs"],
-    edition = "2024",
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    deps = [
-        ":engine_lib",
-        "//tools/boss/client",
-        "//tools/boss/protocol",
-    ] + all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
-)
-
-rust_test(
     name = "control_verbs_test",
     size = "small",
     # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default

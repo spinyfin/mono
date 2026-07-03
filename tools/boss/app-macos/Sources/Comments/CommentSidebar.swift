@@ -163,19 +163,8 @@ private struct CommentRow: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
 
-            // Action buttons: magic wand + dismiss, stacked at top-right.
+            // Action buttons: dismiss, stacked at top-right.
             VStack(spacing: 4) {
-                Button {
-                    layer.dispatchMagicWand(comment)
-                } label: {
-                    Label("Magic Wand", systemImage: "wand.and.stars")
-                        .labelStyle(.iconOnly)
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.purple)
-                .help("Apply magic wand: dispatch a specialised Claude edit")
-
                 Button {
                     layer.dismiss(comment)
                 } label: {
