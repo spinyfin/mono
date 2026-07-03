@@ -4583,9 +4583,10 @@ mod pane_spawn_tests {
     use crate::protocol::{
         EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
     };
+    use crate::test_support::*;
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel,
-        Task, WorkExecution, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProjectInput, CreateTaskInput, EffortLevel, Task, WorkExecution,
+        WorkItem,
     };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -4861,16 +4862,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         if let Some(model) = product_default_model {
             work_db.set_product_default_model(&product.id, Some(model)).unwrap();
         }
@@ -5149,16 +5141,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = work_db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5222,16 +5205,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = work_db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5469,16 +5443,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let chore = work_db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5568,16 +5533,7 @@ mod pane_spawn_tests {
         // description/goal we want to assert on. `--no-autostart` on
         // the project keeps the auto-spawned design task parked so
         // it doesn't compete with our explicit run_execution call.
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let project = work_db
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),
@@ -5656,16 +5612,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let project = work_db
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),
@@ -5786,16 +5733,7 @@ mod pane_spawn_tests {
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
 
-        let product = work_db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
         let project = work_db
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),

@@ -1035,9 +1035,8 @@ pub fn enqueue_from_merge(work_db: &WorkDb, ctx: PopulateContext) {
 mod tests {
     use super::*;
 
-    use boss_protocol::{
-        Confidence, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel, ProposedEdge, ProposedTask,
-    };
+    use crate::test_support::*;
+    use boss_protocol::{Confidence, CreateProjectInput, CreateTaskInput, EffortLevel, ProposedEdge, ProposedTask};
     use tokio::sync::Mutex;
 
     use crate::work::WorkDb;
@@ -1052,14 +1051,7 @@ mod tests {
     /// design-doc pointer set (as `on_design_pr_merged` would leave it).
     /// Returns `(product_id, project_id, design_task_id)`.
     fn seed(db: &WorkDb) -> (String, String, String) {
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss")
-                    .repo_remote_url("git@github.com:owner/repo.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_with_repo(db, "Boss", Some("git@github.com:owner/repo.git"));
         let project = db
             .create_project(
                 CreateProjectInput::builder()

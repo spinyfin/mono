@@ -4443,6 +4443,7 @@ fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::*;
     use std::future::pending;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -4946,16 +4947,7 @@ mod tests {
     async fn schedules_ready_execution_into_running_run() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5030,16 +5022,7 @@ mod tests {
         // free-slots gate.
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5104,16 +5087,7 @@ mod tests {
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
         db.set_host_enabled("zakalwe", false).unwrap();
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5173,16 +5147,7 @@ mod tests {
         db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
         db.set_host_enabled("zakalwe", false).unwrap();
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5274,16 +5239,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let origin = "git@github.com:spinyfin/mono.git";
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some(origin.to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&db, "Boss", Some(origin));
         // Two chores → two executions against the same product/URL.
         let chore_a = db
             .create_chore(
@@ -5380,16 +5336,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let origin = "git@github.com:spinyfin/mono.git";
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some(origin.to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(&db, "Boss", Some(origin));
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5481,16 +5428,7 @@ mod tests {
         // dispatched run into the worker-pool placeholder.
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5533,16 +5471,7 @@ mod tests {
         // the slot claimed until `release_worker_pane` fires.
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5618,16 +5547,7 @@ mod tests {
         // placeholder set at run-create time stays.
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5654,16 +5574,7 @@ mod tests {
     async fn successful_run_moves_execution_to_waiting_human_and_releases_worker() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5695,16 +5606,7 @@ mod tests {
     async fn start_failure_marks_execution_failed_and_releases_worker() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5759,16 +5661,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5937,16 +5830,7 @@ mod tests {
     async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6064,16 +5948,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let automation = db
             .create_automation(CreateAutomationInput {
                 product_id: product.id.clone(),
@@ -6157,16 +6032,7 @@ mod tests {
     async fn pane_spawn_failure_for_pr_review_does_not_demote_work_item() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         // Create the chore with autostart=false so `rescan_active_dispatch`
         // never re-queues it after the PrReview execution fails. Only the
         // PrReview execution we inject below reaches the dispatcher.
@@ -6255,16 +6121,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let automation = db
             .create_automation(CreateAutomationInput {
                 product_id: product.id.clone(),
@@ -6360,16 +6217,7 @@ mod tests {
     async fn revision_implementation_execution_advances_past_worker_claimed_to_lease() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         // autostart=false so the reconcile sweep never enqueues a second
         // execution in parallel — only the one we inject reaches the dispatcher.
         let chore = db
@@ -6461,16 +6309,7 @@ mod tests {
     async fn pane_spawned_event_carries_spawn_config_details() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6528,16 +6367,7 @@ mod tests {
     async fn cube_lease_failure_raises_attention_item_and_dispatch_event() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6641,16 +6471,7 @@ mod tests {
     async fn pre_start_failure_retries_then_permanently_fails() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6723,16 +6544,7 @@ mod tests {
     async fn pre_start_failure_retries_and_succeeds_on_second_attempt() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6810,16 +6622,7 @@ mod tests {
     async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6928,14 +6731,7 @@ mod tests {
     async fn hard_prefer_resume_reclaims_stale_lease_then_leases() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7023,16 +6819,7 @@ mod tests {
     async fn hard_prefer_resume_does_not_reclaim_unowned_lease() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7092,16 +6879,7 @@ mod tests {
     async fn lease_falls_back_when_no_prefer_and_first_workspace_refused() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7220,16 +6998,7 @@ mod tests {
     async fn lease_fallback_failure_transitions_execution_to_failed() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7295,16 +7064,7 @@ mod tests {
     async fn change_creation_failure_marks_execution_failed_and_releases_workspace() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7359,16 +7119,7 @@ mod tests {
     async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7634,16 +7385,7 @@ mod tests {
     async fn higher_priority_executions_run_first() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let early = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7902,16 +7644,7 @@ mod tests {
     async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7959,16 +7692,7 @@ mod tests {
     async fn coordinator_publishes_execution_topic_events() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -8028,16 +7752,7 @@ mod tests {
     async fn coordinator_publishes_work_item_changed_on_execution_start() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -8094,16 +7809,7 @@ mod tests {
     async fn scheduler_respects_worker_pool_capacity() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let first_project = db
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),
@@ -8214,16 +7920,7 @@ mod tests {
     async fn pool_exhaustion_does_not_ghost_activate_chores() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let mut chore_ids = Vec::new();
         for index in 0..3 {
@@ -8324,16 +8021,7 @@ mod tests {
     async fn pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_intervention() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let winner = db
             .create_chore(
@@ -8453,16 +8141,7 @@ mod tests {
     async fn heal_ghost_active_demotes_chores_without_run_history() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // Ghost A: dragged to Doing but no execution exists at all.
         let ghost_a = db
@@ -8599,16 +8278,7 @@ mod tests {
     async fn default_pool_dispatches_five_concurrent_autostart_chores() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // Five autostart chores — the same shape `boss chore create`
         // produces when `--no-autostart` is omitted. Reconcile then
@@ -8674,16 +8344,7 @@ mod tests {
     async fn force_dispatch_bypasses_configured_pool_cap() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let busy = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -8788,16 +8449,7 @@ mod tests {
     async fn worker_release_redispatches_active_chore_with_terminal_execution() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // Warm-up chore: gets a normal `ready` execution so the
         // dispatcher has something to consume the single pool slot.
@@ -8879,16 +8531,7 @@ mod tests {
     async fn worker_release_skips_no_autostart_active_chore() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let warm = db
             .create_chore(
@@ -9029,16 +8672,7 @@ mod tests {
     async fn ready_row_added_during_active_window_still_dispatches() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -9168,16 +8802,7 @@ mod tests {
     async fn heartbeat_rekicks_when_ready_row_was_orphaned_by_a_dropped_kick() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -9230,16 +8855,7 @@ mod tests {
     async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -9286,16 +8902,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let automation = db
             .create_automation(CreateAutomationInput {
@@ -9412,16 +9019,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let automation = db
             .create_automation(CreateAutomationInput {
@@ -9506,16 +9104,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let automation = db
             .create_automation(CreateAutomationInput {
@@ -9715,16 +9304,7 @@ mod tests {
     async fn review_pool_exhaustion_does_not_block_main_pool() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // One regular chore — must still dispatch even when review is full.
         db.create_chore(
@@ -9815,16 +9395,7 @@ mod tests {
     /// `pr_url` is `Some`, the chore's `pr_url` field is also set so that
     /// `schedule_execution` picks it up for the reviewer positioning path.
     fn make_pr_review_fixture(db: &WorkDb, pr_url: Option<&str>) -> (String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: "TestProduct".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_named(db, "TestProduct");
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -10360,16 +9931,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // prereq: a separate chore that has not yet completed.
         let prereq = db
@@ -10577,16 +10139,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -10697,16 +10250,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -10954,16 +10498,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // prereq: a chore that has not yet completed.
         let prereq = db
@@ -11092,16 +10627,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -11115,16 +10641,7 @@ mod tests {
         // Create a second product and chore to serve as the "occupied" execution.
         // We need a separate DB row for exec-live so get_execution(exec_live.id)
         // returns cube_workspace_id = "mono-agent-037".
-        let other_product = db
-            .create_product(CreateProductInput {
-                name: "OtherProduct".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let other_product = create_test_product_named(&db, "OtherProduct");
         let other_chore = db
             .create_chore(
                 CreateChoreInput::builder()

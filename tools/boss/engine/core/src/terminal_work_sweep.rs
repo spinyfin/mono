@@ -319,7 +319,8 @@ mod tests {
     use super::*;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItemPatch};
+    use crate::test_support::*;
+    use crate::work::{CreateChoreInput, WorkDb, WorkItemPatch};
 
     // ─── reaper stub ─────────────────────────────────────────────────────────
 
@@ -372,16 +373,7 @@ mod tests {
     }
 
     fn create_product(db: &WorkDb) -> String {
-        db.create_product(CreateProductInput {
-            name: "test-product".to_owned(),
-            description: None,
-            repo_remote_url: Some("https://github.com/test/repo".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id
+        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
     }
 
     /// Create a chore in `active` status (the normal dispatched state).

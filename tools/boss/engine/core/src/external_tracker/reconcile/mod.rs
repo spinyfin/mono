@@ -1214,7 +1214,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use boss_protocol::CreateProductInput;
     use serde_json::json;
 
     use super::*;
@@ -1223,6 +1222,7 @@ mod tests {
         UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
     };
     use crate::metrics::Registry;
+    use crate::test_support::*;
     use crate::work::WorkDb;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
@@ -1518,32 +1518,14 @@ mod tests {
     }
 
     fn setup_product_with_tracker(db: &WorkDb) -> boss_protocol::Product {
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Test Product".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .expect("create product");
+        let product = create_test_product_named(db, "Test Product");
         db.set_product_external_tracker(&product.id, Some("spy"), Some(&spy_config()), false)
             .expect("set external tracker");
         product
     }
 
     fn setup_product_with_reverse_close(db: &WorkDb) -> boss_protocol::Product {
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Reverse Close Product".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .expect("create product");
+        let product = create_test_product_named(db, "Reverse Close Product");
         db.set_product_external_tracker(&product.id, Some("spy"), Some(&spy_config_reverse_close()), false)
             .expect("set external tracker with reverse_close");
         product
@@ -2332,16 +2314,7 @@ mod tests {
     #[tokio::test]
     async fn run_one_pass_for_product_returns_none_for_unbound_product() {
         let db = in_memory_db();
-        let product = db
-            .create_product(boss_protocol::CreateProductInput {
-                name: "Unbound".to_owned(),
-                description: None,
-                repo_remote_url: None,
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .expect("create product");
+        let product = create_test_product_with_repo(&db, "Unbound", None);
         let registry = TrackerRegistry::new();
         let metrics = Registry::new();
         register_metrics(&metrics);

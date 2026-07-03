@@ -325,16 +325,7 @@ fn concurrent_writes_do_not_return_database_locked() {
     let path = disk_db_path("concurrent-writes");
     let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
 
     // One chore per worker, so each write hits a distinct row —
     // matching the real-world reconcile pattern where a script
@@ -551,16 +542,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
 fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() {
     let path = disk_db_path("resolve-design-no-override");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -862,16 +844,7 @@ fn resolve_repo_errors_when_parent_product_is_missing() {
 fn effort_and_model_default_to_null_on_fresh_rows() {
     let path = temp_db_path("effort-fresh");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     assert!(product.default_model.is_none());
     let chore = db
         .create_chore(
@@ -893,16 +866,7 @@ fn effort_and_model_default_to_null_on_fresh_rows() {
 fn effort_and_model_roundtrip_through_create_and_query() {
     let path = temp_db_path("effort-roundtrip");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -925,16 +889,7 @@ fn effort_and_model_roundtrip_through_create_and_query() {
 fn update_chore_sets_and_clears_effort_and_model() {
     let path = temp_db_path("effort-update");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -989,16 +944,7 @@ fn update_chore_sets_and_clears_effort_and_model() {
 fn update_chore_rejects_invalid_effort_level() {
     let path = temp_db_path("effort-invalid");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1047,16 +993,7 @@ fn update_chore_rejects_invalid_effort_level() {
 fn product_default_model_set_and_clear() {
     let path = temp_db_path("default-model");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     assert!(product.default_model.is_none());
 
     let with_model = db.set_product_default_model(&product.id, Some("sonnet")).unwrap();
@@ -1088,16 +1025,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     // disk_db_path required: drops columns and re-opens the DB to trigger migration.
     let path = disk_db_path("effort-upgrade");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1182,16 +1110,7 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
     // schema; we just drop the new columns on a freshly-init'd DB
     // to simulate the upgrade path.
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1248,16 +1167,7 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
     let conn = db.connect().unwrap();
 
     // Product with repo_remote_url = "git@example.com:foo.git".
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Foo".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:foo.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Foo", Some("git@example.com:foo.git"));
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1360,16 +1270,7 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
     // SQLite's shared-cache in-memory mode.
     let path = disk_db_path("short-id-concurrent");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:concurrent.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:concurrent.git"));
 
     const N: usize = 16;
     let mut handles = Vec::with_capacity(N);
@@ -1432,26 +1333,8 @@ fn allocator_concurrent_inserts_produce_distinct_short_ids() {
 fn allocator_per_product_sequences_are_independent() {
     let path = temp_db_path("short-id-per-product");
     let db = WorkDb::open(path.clone()).unwrap();
-    let boss = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
-    let flunge = db
-        .create_product(CreateProductInput {
-            name: "Flunge".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:flunge.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let boss = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let flunge = create_test_product_with_repo(&db, "Flunge", Some("git@example.com:flunge.git"));
 
     let mk_chore = |product_id: &str, name: &str| {
         db.create_chore(
@@ -1583,16 +1466,7 @@ fn migrate_short_id_backfill_is_deterministic_and_merges_tasks_and_projects() {
 fn unique_short_id_index_rejects_manual_duplicate() {
     let path = temp_db_path("short-id-index-conflict");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1632,16 +1506,7 @@ fn unique_short_id_index_rejects_manual_duplicate() {
     // Same `short_id` on a DIFFERENT product is allowed — the
     // uniqueness invariant is `(product_id, short_id)`, not
     // global.
-    let other = db
-        .create_product(CreateProductInput {
-            name: "Flunge".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let other = create_test_product_with_repo(&db, "Flunge", None);
     let other_manual_id = next_id("task");
     conn.execute(
             "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
@@ -1661,16 +1526,7 @@ fn unique_short_id_index_rejects_manual_duplicate() {
 fn create_project_assigns_short_ids_to_project_and_design_task() {
     let path = temp_db_path("short-id-project-design");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1711,16 +1567,7 @@ fn create_project_assigns_short_ids_to_project_and_design_task() {
 fn create_chore_protocol_struct_carries_short_id() {
     let path = temp_db_path("short-id-wire-task");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
 
     let chore = db
         .create_chore(
@@ -1757,16 +1604,7 @@ fn create_chore_protocol_struct_carries_short_id() {
 fn create_project_protocol_struct_carries_short_id() {
     let path = temp_db_path("short-id-wire-project");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
 
     let project = db
         .create_project(CreateProjectInput {
@@ -1794,16 +1632,7 @@ fn create_project_protocol_struct_carries_short_id() {
 fn work_tree_tasks_carry_short_id() {
     let path = temp_db_path("short-id-wire-worktree");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
 
     db.create_chore(
         CreateChoreInput::builder()
@@ -1830,16 +1659,7 @@ fn work_tree_tasks_carry_short_id() {
 fn noop_status_patch_preserves_last_status_actor_for_task() {
     let path = temp_db_path("noop-status-actor-task");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:example/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1892,16 +1712,7 @@ fn noop_status_patch_preserves_last_status_actor_for_task() {
 fn noop_status_patch_preserves_last_status_actor_for_project() {
     let path = temp_db_path("noop-status-actor-project");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Prod".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Prod", None);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1955,16 +1766,7 @@ fn noop_status_patch_preserves_last_status_actor_for_project() {
 fn real_status_change_sets_last_status_actor_human_for_task() {
     let path = temp_db_path("real-status-actor-task");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:example/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2018,16 +1820,7 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
 fn list_ci_remediations_filters_and_orders_freshest_first() {
     let path = disk_db_path("list-ci-remediations-filters");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore_a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2143,16 +1936,7 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
 fn ci_budget_snapshot_combines_override_and_product_default() {
     let path = disk_db_path("ci-budget-snapshot");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2199,16 +1983,7 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
 fn migration_normalises_empty_effort_level_to_null() {
     let path = disk_db_path("effort-empty-to-null");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()

@@ -1322,9 +1322,9 @@ impl KeystoreBackend for FakeStore {
 mod tests {
     use super::*;
 
+    use crate::test_support::*;
     use std::path::PathBuf;
 
-    use boss_protocol::CreateProductInput;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2088,16 +2088,7 @@ mod tests {
 
     fn github_product_db(org: &str) -> (WorkDb, String) {
         let db = WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory WorkDb");
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Test Product".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .expect("create product");
+        let product = create_test_product_named(&db, "Test Product");
         let config = serde_json::json!({
             "org": org,
             "repo": "mono",

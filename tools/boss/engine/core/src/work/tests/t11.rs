@@ -165,16 +165,7 @@ fn resolve_doc_owner_execution_branch_reads_merged_when_task_done() {
 fn resolve_doc_owner_execution_branch_scope_guards_non_design_investigation_task() {
     let path = temp_db_path("doc-owner-exec-branch-scope-guard");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some(MONO_REPO.to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some(MONO_REPO));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()

@@ -7,16 +7,7 @@ use super::*;
 fn rescan_orders_candidates_by_updated_at_ascending() {
     let path = disk_db_path("rescan-fifo");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let mut chore_ids = Vec::new();
     for index in 0..3 {
         let chore = db
@@ -67,16 +58,7 @@ fn rescan_orders_candidates_by_updated_at_ascending() {
 fn rescan_skips_gated_active_chore_silently() {
     let path = disk_db_path("rescan-gated");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let prereq = db
         .create_chore(
             CreateChoreInput::builder()
@@ -130,16 +112,7 @@ fn records_failed_execution_start_attempt() {
     let path = temp_db_path("fail-run");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -178,16 +151,7 @@ fn finishes_active_run_into_waiting_human_with_attention() {
     let path = temp_db_path("finish-run-waiting");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -258,16 +222,7 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let path = temp_db_path("finish-run-failed");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -346,16 +301,7 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
     let path = disk_db_path("ts-migrate");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -396,16 +342,7 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
 fn dependency_add_list_and_remove_round_trip() {
     let path = temp_db_path("deps-crud");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -510,26 +447,8 @@ fn dependency_add_list_and_remove_round_trip() {
 fn dependency_add_refuses_cross_product_edges() {
     let path = temp_db_path("deps-cross-product");
     let db = WorkDb::open(path.clone()).unwrap();
-    let p1 = db
-        .create_product(CreateProductInput {
-            name: "Alpha".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/alpha.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
-    let p2 = db
-        .create_product(CreateProductInput {
-            name: "Beta".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/beta.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let p1 = create_test_product_with_repo(&db, "Alpha", Some("git@github.com:spinyfin/alpha.git"));
+    let p2 = create_test_product_with_repo(&db, "Beta", Some("git@github.com:spinyfin/beta.git"));
     let a = db
         .create_chore(CreateChoreInput::builder().product_id(p1.id).name("Alpha task").build())
         .unwrap();
@@ -557,16 +476,7 @@ fn dependency_add_refuses_cross_product_edges() {
 fn deleting_a_task_drops_its_dependency_edges() {
     let path = temp_db_path("deps-delete-cascade");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -612,16 +522,7 @@ fn deleting_a_task_drops_its_dependency_edges() {
 fn auto_block_and_unblock_follow_edge_lifecycle() {
     let path = temp_db_path("deps-auto-block");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -675,16 +576,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
 fn dependent_auto_unblocks_when_prereq_marked_done() {
     let path = temp_db_path("deps-cascade-done");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -733,16 +625,7 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
 fn auto_unblock_creates_ready_execution() {
     let path = temp_db_path("auto-unblock-creates-ready-exec");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let prereq = db
         .create_chore(
             CreateChoreInput::builder()
@@ -803,16 +686,7 @@ fn auto_unblock_creates_ready_execution() {
 fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     let path = temp_db_path("deps-cascade-multi-prereq");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let dependent = db
         .create_chore(
             CreateChoreInput::builder()
@@ -909,16 +783,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
 fn prereq_regression_does_not_re_block_dependents() {
     let path = temp_db_path("deps-cascade-regression");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let dependent = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1001,16 +866,7 @@ fn prereq_regression_does_not_re_block_dependents() {
 fn cyclic_edges_do_not_loop_the_cascade() {
     let path = temp_db_path("deps-cascade-cycle");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1070,17 +926,7 @@ fn cyclic_edges_do_not_loop_the_cascade() {
 #[test]
 fn revision_unblocks_when_prereq_reaches_in_review() {
     let db = WorkDb::open(temp_db_path("revision-unblock-in-review")).unwrap();
-    let product_id = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id;
+    let product_id = create_test_product(&db).id;
 
     // Parent chore — will transition to in_review.
     let parent = db
@@ -1214,16 +1060,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
 fn manual_block_is_not_auto_unblocked() {
     let path = temp_db_path("deps-manual-block");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1291,16 +1128,7 @@ fn manual_block_is_not_auto_unblocked() {
 fn refuses_manual_move_off_blocked_while_gated() {
     let path = temp_db_path("deps-refuse-move");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1344,16 +1172,7 @@ fn refuses_manual_move_off_blocked_while_gated() {
 fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
     let path = temp_db_path("deps-dispatcher");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1405,16 +1224,7 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
 fn request_execution_refuses_gated_work_item() {
     let path = temp_db_path("deps-req-gated");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let a = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1458,16 +1268,7 @@ fn request_execution_refuses_gated_work_item() {
 fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     let path = temp_db_path("deps-clear-stale-block");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
     let prereq = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1687,16 +1488,7 @@ fn migration_adds_project_design_doc_columns() {
 fn create_via_round_trip_per_source() {
     let path = temp_db_path("created-via");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:test/repo.git"));
 
     let cli_chore = db
         .create_chore(
@@ -2021,16 +1813,7 @@ fn redispatch_preserves_investigation_execution_kind() {
 fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
     let path = temp_db_path("investigation-doc-link-standard");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let investigation = db
         .create_investigation(
             boss_protocol::CreateInvestigationInput::builder()
@@ -2123,16 +1906,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
 fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
     let path = temp_db_path("investigation-doc-link-redispatch");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let investigation = db
         .create_investigation(
             boss_protocol::CreateInvestigationInput::builder()
@@ -2201,16 +1975,7 @@ fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
 fn cold_path_pr_detection_covers_investigations() {
     let path = temp_db_path("investigation-doc-link-coldpath");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let investigation = db
         .create_investigation(
             boss_protocol::CreateInvestigationInput::builder()
@@ -2352,16 +2117,7 @@ fn investigation_with_doc_pointer_exposes_resolved_doc_link_in_work_tree() {
 fn create_time_depends_on_gates_dispatch_atomically() {
     let path = temp_db_path("create-depends-on");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     // Prerequisite — left in `todo` (unsatisfied).
     let prereq = db
         .create_chore(
@@ -2449,16 +2205,7 @@ fn create_time_depends_on_gates_dispatch_atomically() {
 fn blocking_a_running_dependent_cancels_its_execution() {
     let path = temp_db_path("block-running-dependent");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let prereq = db
         .create_chore(
             CreateChoreInput::builder()

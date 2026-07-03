@@ -82,6 +82,8 @@ pub mod stale_worker_sweep;
 pub mod structured_output;
 pub mod syspolicyd_monitor;
 pub mod terminal_work_sweep;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;
 pub mod transient_error;

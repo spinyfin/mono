@@ -135,20 +135,12 @@ pub fn reconcile_blocked_parent_with_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkItem, WorkItemPatch};
+    use crate::test_support::*;
+    use crate::work::{CreateChoreInput, WorkItem, WorkItemPatch};
     use std::path::PathBuf;
 
     fn in_review_chore(db: &WorkDb, pr: &str) -> (String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: "P".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:foo/bar.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(db, "P", Some("git@github.com:foo/bar.git"));
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
