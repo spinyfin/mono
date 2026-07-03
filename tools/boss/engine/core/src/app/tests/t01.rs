@@ -790,6 +790,19 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         "precondition: live state registered",
     );
 
+    // `reap` now awaits `force_vacate_run` before responding, and
+    // requires the app to positively confirm the pane close (or
+    // report it as already gone) to report success — see
+    // `agents_reap_fails_loudly_when_app_unreachable_for_existing_execution`
+    // in `control_verbs.rs`. Register a fake app session and answer
+    // its `ReleaseWorkerPane` request so the slot-keyed tier confirms
+    // and `force_vacate_run` doesn't fall through to the run-id-keyed
+    // fallback.
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+
     let sink = make_session_sink();
     let ctx = Dispatch::builder()
         .server_state(server_state.clone())
@@ -800,13 +813,32 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .recv_instant(std::time::Instant::now())
         .decode_ms(0.0)
         .build();
-    executions::handle_reap_run(
+    let reap = tokio::spawn(executions::handle_reap_run(
         ctx,
         FrontendRequest::ReapRun {
             run_id: execution.id.clone(),
         },
-    )
-    .await;
+    ));
+
+    let envelope = app_sink
+        .next()
+        .await
+        .expect("an EngineRequest event should be enqueued for the pane release");
+    let request_id = match &envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ReleaseWorkerPane {
+                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            },
+        )
+        .await;
+
+    reap.await.expect("handle_reap_run task panicked");
 
     let response = sink.next().await.expect("reap response enqueued");
     match response.payload {
@@ -814,16 +846,6 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
             assert_eq!(reaped.status.to_string(), "orphaned");
         }
         other => panic!("expected RunReaped, got {other:?}"),
-    }
-
-    // The pane/pool/live-state cleanup happens on a background task
-    // (mirrors `handle_stop_run`) so the RPC response doesn't wait on
-    // it — poll for it to land.
-    for _ in 0..50 {
-        if server_state.live_worker_states.get(1).is_none() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(
