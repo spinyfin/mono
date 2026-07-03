@@ -355,7 +355,7 @@ impl SshHostAdapter {
             "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
             ws = workspace
         );
-        match self.transport.run(&[probe.as_str()]).await {
+        match self.transport.run_shell(probe.as_str()).await {
             Ok(out) if out.success() => {
                 let mut prompt_text = prompt_text;
                 prompt_text.push_str(&bazel_prepush_gate_text());
@@ -532,13 +532,15 @@ impl HostAdapter for SshHostAdapter {
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
         let mut cmd = format!("ssh {}", self.transport.ssh_target);
         cmd.push(' ');
-        cmd.push_str("cube");
+        cmd.push_str(&crate::ssh_transport::shell_quote("cube"));
         for a in args {
             cmd.push(' ');
-            cmd.push_str(a);
+            cmd.push_str(&crate::ssh_transport::shell_quote(a));
         }
         // The "cwd" of a remote command is opaque from the engine's
         // side; surface the ssh target so post-mortems are reproducible.
+        // Quoted the same way `SshTransport::run` quotes its argv, so
+        // pasting this string reproduces exactly what actually ran.
         Some((cmd, format!("(remote: {})", self.transport.host_id)))
     }
 

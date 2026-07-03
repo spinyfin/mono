@@ -196,6 +196,11 @@ pub trait SshExec: Send + Sync {
     fn host_id(&self) -> &str;
     /// Run a command on the remote over the master, capturing output.
     async fn run(&self, argv: &[&str]) -> Result<SshOutput>;
+    /// Run a pre-composed shell script on the remote over the master,
+    /// passed as a single un-quoted argument so the remote shell
+    /// evaluates its own `&&`/`|`/redirects/quoting. See
+    /// [`SshTransport::run_shell`] for the full quoting contract.
+    async fn run_shell(&self, script: &str) -> Result<SshOutput>;
     /// `ssh -O forward -R remote:local` over the master.
     async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput>;
     /// `ssh -O cancel -R remote:local` over the master.
@@ -209,6 +214,9 @@ impl SshExec for SshTransport {
     }
     async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
         SshTransport::run(self, argv).await
+    }
+    async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+        SshTransport::run_shell(self, script).await
     }
     async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
         SshTransport::add_reverse_unix_forward(self, remote_socket, local_socket).await
@@ -504,6 +512,14 @@ mod tests {
                     stderr: String::new(),
                 })
             }
+        }
+        async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+            self.calls.lock().unwrap().push(Call::Run(vec![script.to_owned()]));
+            Ok(SshOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         }
         async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::AddForward {

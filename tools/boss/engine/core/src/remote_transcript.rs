@@ -45,7 +45,7 @@ pub fn remote_tail_command(path: &str, max_bytes: u64) -> String {
 /// an empty transcript.
 pub async fn pull_remote_transcript_tail(exec: &dyn SshExec, path: &str, max_bytes: u64) -> Result<String> {
     let command = remote_tail_command(path, max_bytes);
-    let out = exec.run(&[command.as_str()]).await?;
+    let out = exec.run_shell(command.as_str()).await?;
     if out.success() {
         return Ok(out.stdout);
     }
@@ -76,8 +76,15 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
+    /// Records which `SshExec` method the caller invoked, not just the
+    /// command text — the whole point of `run_shell` vs. `run` is that
+    /// they take different paths through `SshTransport`'s quoting (one
+    /// quotes every argv element, the other passes the string through
+    /// un-quoted). A fake that only recorded the command text could not
+    /// have caught the original regression, where the caller migrated
+    /// to the wrong method but the composed string looked the same.
     struct FakeExec {
-        last_command: Mutex<Option<String>>,
+        last_shell_command: Mutex<Option<String>>,
         status: i32,
         stdout: String,
         stderr: String,
@@ -86,7 +93,7 @@ mod tests {
     impl FakeExec {
         fn ok(stdout: &str) -> Self {
             Self {
-                last_command: Mutex::new(None),
+                last_shell_command: Mutex::new(None),
                 status: 0,
                 stdout: stdout.to_owned(),
                 stderr: String::new(),
@@ -94,7 +101,7 @@ mod tests {
         }
         fn failing(status: i32, stderr: &str) -> Self {
             Self {
-                last_command: Mutex::new(None),
+                last_shell_command: Mutex::new(None),
                 status,
                 stdout: String::new(),
                 stderr: stderr.to_owned(),
@@ -107,8 +114,11 @@ mod tests {
         fn host_id(&self) -> &str {
             "zakalwe"
         }
-        async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
-            *self.last_command.lock().unwrap() = argv.first().map(|s| s.to_string());
+        async fn run(&self, _argv: &[&str]) -> Result<SshOutput> {
+            unreachable!("transcript pull must use run_shell, not run, for its composed shell string")
+        }
+        async fn run_shell(&self, script: &str) -> Result<SshOutput> {
+            *self.last_shell_command.lock().unwrap() = Some(script.to_owned());
             Ok(SshOutput {
                 status: self.status,
                 stdout: self.stdout.clone(),
@@ -144,8 +154,10 @@ mod tests {
         let exec = FakeExec::ok("{\"a\":1}\n{\"b\":2}\n");
         let out = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096).await.unwrap();
         assert_eq!(out, "{\"a\":1}\n{\"b\":2}\n");
+        // Must route through run_shell (un-quoted) — if this had gone
+        // through `run` instead, `FakeExec::run` would have panicked.
         assert_eq!(
-            exec.last_command.lock().unwrap().as_deref(),
+            exec.last_shell_command.lock().unwrap().as_deref(),
             Some("tail -c 4096 -- '/p.jsonl'"),
         );
     }
