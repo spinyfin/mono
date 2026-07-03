@@ -756,6 +756,59 @@ impl WorkDb {
         Ok(affected > 0)
     }
 
+    /// Retire a `revision_implementation` execution that turned out to be
+    /// unnecessary before it was ever dispatched: the merge-conflict fix
+    /// vehicle's linked `conflict_resolutions` ledger row already
+    /// transitioned to `succeeded` (the periodic merge-poller sweep found
+    /// the bound PR mergeable again — see `conflict_watch::on_resolved`) in
+    /// the window between this execution being queued and a worker slot
+    /// becoming available. Spawning a worker here would just have it
+    /// discover "nothing to do" and become the produce-a-PR nudge loop this
+    /// method exists to prevent (see the `nudge_breaker` module doc).
+    ///
+    /// Marks the execution `abandoned` (mirrors [`Self::mark_execution_redundant`])
+    /// and advances the revision task itself to `in_review` — the same
+    /// terminal state a normal successful revision completion reaches via
+    /// `record_worker_pr_completion` — so the task leaves the Doing/Backlog
+    /// column instead of stranding there with no live worker. A revision
+    /// this early in dispatch (never actually leased a workspace) is
+    /// typically still `todo` — it only flips to `active` once a worker
+    /// starts running — so the WHERE guard accepts either; a task a human
+    /// (or a concurrent path) already moved to `blocked`/`in_review`/a
+    /// terminal status is left alone. Returns `true` iff the task actually
+    /// transitioned; the execution abandon always applies (best-effort,
+    /// WHERE-guarded on `status = 'ready'` so a concurrent claim isn't
+    /// clobbered).
+    pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE id = ?1
+               AND status = 'ready'",
+            params![execution_id, now],
+        )?;
+        let task_rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'in_review',
+                    updated_at         = ?2,
+                    last_status_actor  = 'engine',
+                    blocked_reason     = NULL,
+                    blocked_attempt_id = NULL
+              WHERE id = ?1
+                AND status IN ('todo', 'active')",
+            params![task_id, now],
+        )?;
+        if task_rows > 0 {
+            cascade_dependents_after_prereq_status_change(&tx, task_id, "in_review", &now)?;
+        }
+        tx.commit()?;
+        Ok(task_rows > 0)
+    }
+
     /// Find a *stale* cube lease that the engine recorded against
     /// `workspace_id` and that is safe to force-release before a
     /// resume re-leases the same workspace.

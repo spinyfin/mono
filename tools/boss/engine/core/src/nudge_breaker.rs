@@ -33,6 +33,18 @@ use std::sync::Mutex;
 /// the engine parks the execution rather than nudging again.
 pub const DEFAULT_MAX_UNPRODUCTIVE_NUDGES: u32 = 3;
 
+/// Absolute, cross-fingerprint cap on nudges sent for a single execution.
+/// Unlike `max` in [`NudgeBreaker::record`] (which only bounds a run of
+/// *identical* fingerprints), this counts every nudge ever sent for the
+/// execution id and never resets on a fingerprint change. It exists as a
+/// backstop of last resort: whatever produces a fingerprint that keeps
+/// changing between nudges — a flapping state detector, a probe reading
+/// drifting values, a caller composing the fingerprint from something that
+/// varies without real progress — must still terminate. An unbounded nudge
+/// loop is never correct, regardless of what the per-fingerprint state
+/// detector concludes.
+pub const ABSOLUTE_MAX_NUDGES: u32 = 12;
+
 /// Decision returned by [`NudgeBreaker::record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NudgeDecision {
@@ -54,6 +66,10 @@ struct NudgeRecord {
     fingerprint: String,
     /// Number of consecutive nudges already sent at `fingerprint`.
     count: u32,
+    /// Total nudges ever sent for this execution id, across every
+    /// fingerprint seen. Never reset by a fingerprint change — only
+    /// `forget` clears it. Compared against [`ABSOLUTE_MAX_NUDGES`].
+    total_count: u32,
 }
 
 /// In-memory `execution_id -> (fingerprint, count)` tracker for the
@@ -90,16 +106,21 @@ impl NudgeBreaker {
         let entry = guard.entry(execution_id.to_owned()).or_insert_with(|| NudgeRecord {
             fingerprint: fingerprint.to_owned(),
             count: 0,
+            total_count: 0,
         });
         if entry.fingerprint != fingerprint {
-            // Progress since the last nudge — reset to a fresh cycle.
+            // Progress since the last nudge — reset the consecutive-run
+            // counter to a fresh cycle. `total_count` is deliberately left
+            // untouched: it is the absolute, cross-fingerprint backstop
+            // below and must not be resettable by a changing fingerprint.
             entry.fingerprint = fingerprint.to_owned();
             entry.count = 0;
         }
-        if entry.count >= max {
+        if entry.total_count >= ABSOLUTE_MAX_NUDGES || entry.count >= max {
             NudgeDecision::Trip { count: entry.count }
         } else {
             entry.count += 1;
+            entry.total_count += 1;
             NudgeDecision::Proceed { count: entry.count }
         }
     }
@@ -153,6 +174,38 @@ mod tests {
             breaker.record("exec_b", "stale:https://github.com/x/y/pull/1", 3),
             NudgeDecision::Proceed { count: 1 },
             "a different fingerprint must reset the counter",
+        );
+    }
+
+    #[test]
+    fn absolute_cap_trips_even_when_fingerprint_keeps_changing() {
+        // A per-fingerprint cap alone is not a real bound if whatever
+        // composes the fingerprint keeps drifting (flapping CI status, a
+        // probe that reads a slightly different value each time, etc.) —
+        // every call would look like "progress" and the consecutive-run
+        // counter would never reach `max`. The absolute, cross-fingerprint
+        // ceiling must still trip the breaker after ABSOLUTE_MAX_NUDGES
+        // nudges, whatever the fingerprints were.
+        let breaker = NudgeBreaker::new();
+        // A generous per-fingerprint cap that would never trip on its own
+        // for a sequence of all-distinct fingerprints.
+        let max = 1000;
+        for i in 0..ABSOLUTE_MAX_NUDGES {
+            let fp = format!("state:{i}");
+            assert_eq!(
+                breaker.record("exec_flapping", &fp, max),
+                NudgeDecision::Proceed { count: 1 },
+                "each distinct fingerprint proceeds as a fresh per-fingerprint cycle",
+            );
+        }
+        let fp = format!("state:{ABSOLUTE_MAX_NUDGES}");
+        assert_eq!(
+            breaker.record("exec_flapping", &fp, max),
+            // The fresh fingerprint resets the per-fingerprint `count` to 0
+            // before the absolute check runs, so the trip reports count: 0
+            // — the absolute ceiling fired independently of it.
+            NudgeDecision::Trip { count: 0 },
+            "absolute cap must trip the breaker even though the fingerprint never repeated",
         );
     }
 
