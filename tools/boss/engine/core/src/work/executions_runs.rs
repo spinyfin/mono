@@ -122,12 +122,26 @@ impl WorkDb {
     ///      finds it and directs the new worker to resume the prior
     ///      branch instead of starting from `main`.
     ///   2. Insert a fresh `ready` execution for the same work item that
-    ///      **prefers the same cube workspace** (so cube's `--prefer`
-    ///      re-leases it and in-progress work in the jj workspace is not
-    ///      lost), carries `transient_failure_count = new_count`, and is
-    ///      deferred until `dispatch_not_before_epoch` (the backoff
-    ///      window — same `dispatch_not_before` gate the pre-start retry
-    ///      path uses, honoured by [`Self::list_ready_executions`]).
+    ///      **prefers the same cube workspace with `allow_dirty = true`**
+    ///      (so cube's `--prefer --allow-dirty` re-leases the exact
+    ///      workspace *without* resetting it, and in-progress work in the
+    ///      jj workspace is not lost), carries `transient_failure_count =
+    ///      new_count`, and is deferred until `dispatch_not_before_epoch`
+    ///      (the backoff window — same `dispatch_not_before` gate the
+    ///      pre-start retry path uses, honoured by
+    ///      [`Self::list_ready_executions`]).
+    ///
+    ///      `allow_dirty` is always forced `true` here, regardless of
+    ///      what the dead execution carried: this function exists
+    ///      specifically to reclaim a workspace that has uncommitted
+    ///      in-flight work, so a plain carry-forward (which defaults to
+    ///      `false` for an ordinary first dispatch) would let cube's
+    ///      normal clean-reset silently discard that work even on a
+    ///      successful same-workspace lease. Forcing it `true` also
+    ///      hardens [`crate::coordinator`]'s `lease_workspace_with_fallback`:
+    ///      a failed lease on the preferred workspace becomes a hard
+    ///      failure instead of a silent fallback to a different, clean
+    ///      workspace.
     ///
     /// Returns the new `ready` execution. The caller releases the worker
     /// pool slot and emits the dispatch event. Because the work item now
@@ -195,7 +209,11 @@ impl WorkDb {
                 dead.prefer_is_soft as i64,
                 new_count,
                 dispatch_not_before,
-                dead.allow_dirty as i64,
+                // Always true: this row exists to reclaim a workspace
+                // with uncommitted in-flight work (see the doc comment
+                // above) — never carry forward the dead execution's
+                // (typically `false`) value.
+                true as i64,
                 branch_naming_json,
             ],
         )?;

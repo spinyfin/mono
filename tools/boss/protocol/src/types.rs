@@ -3476,10 +3476,12 @@ pub struct WorkExecution {
     /// When `true`, the cube lease call for this execution will include
     /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
     /// with its uncommitted working copy intact rather than resetting it.
-    /// Set only on the orphan recovery re-dispatch path (when the predecessor
-    /// execution was `orphaned`) so the recovering worker lands on the exact
-    /// dirty workspace its predecessor left behind. Normal and transient-retry
-    /// dispatches leave this `false`.
+    /// Set on the orphan recovery re-dispatch path (when the predecessor
+    /// execution was `orphaned`) and unconditionally by the
+    /// transient-recovery auto-resume path (`WorkDb::request_resume_execution`
+    /// in `boss-engine`) so the recovering worker lands on the exact dirty
+    /// workspace its predecessor left behind instead of cube silently
+    /// wiping it. Normal first-time dispatches leave this `false`.
     #[serde(default)]
     #[builder(default)]
     pub allow_dirty: bool,

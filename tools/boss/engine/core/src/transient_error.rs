@@ -231,6 +231,26 @@ fn entry_api_error_text(line: &Value) -> Option<String> {
     }
 }
 
+/// True when `lines` contains no evidence the worker ever did anything —
+/// no progress (assistant/tool/user activity) and no recognised API
+/// error either. Distinct from "no error" ([`extract_worker_error`]
+/// returning `None`), which is also true of a transcript that shows the
+/// worker recovered and kept working: this function only answers "is
+/// the transcript entirely inert."
+///
+/// Used to detect a resumed/nudged session that came up (a fresh claude
+/// process spawned, or a nudge was delivered) but never actually got a
+/// continuation prompt into the model — the worker parks at its REPL
+/// (often surfacing as `waiting_for_input` on a permission/notification
+/// hook) with an empty or bookkeeping-only transcript. A bare resume is
+/// not, by itself, proof of continuation; this is the verification half
+/// of that check.
+pub fn transcript_shows_no_activity(lines: &[Value]) -> bool {
+    lines
+        .iter()
+        .all(|line| entry_api_error_text(line).is_none() && !is_progress_entry(line))
+}
+
 /// True when `line` represents the worker doing real work — used to
 /// detect that it recovered after an error. Assistant entries that are
 /// themselves API errors are excluded by the caller (they're matched
@@ -536,6 +556,42 @@ mod tests {
     #[test]
     fn empty_transcript_yields_none() {
         assert_eq!(extract_worker_error(&[]), None);
+    }
+
+    // ─── transcript_shows_no_activity ──────────────────────────────────
+
+    #[test]
+    fn empty_transcript_shows_no_activity() {
+        assert!(transcript_shows_no_activity(&[]));
+    }
+
+    #[test]
+    fn transcript_with_only_bookkeeping_shows_no_activity() {
+        // A system entry (or one with empty content) carries no
+        // progress and no error text.
+        let lines = vec![json!({"type": "system", "message": {"content": ""}})];
+        assert!(transcript_shows_no_activity(&lines));
+    }
+
+    #[test]
+    fn transcript_with_assistant_text_shows_activity() {
+        let lines = vec![assistant_text("working on it")];
+        assert!(!transcript_shows_no_activity(&lines));
+    }
+
+    #[test]
+    fn transcript_with_tool_use_shows_activity() {
+        let lines = vec![tool_use_entry("Bash")];
+        assert!(!transcript_shows_no_activity(&lines));
+    }
+
+    #[test]
+    fn transcript_with_trailing_error_does_not_show_no_activity() {
+        // An API error is itself evidence something happened (the
+        // request was made); callers distinguish this case via
+        // extract_worker_error, not this function.
+        let lines = vec![api_error_entry("API Error: overloaded_error")];
+        assert!(!transcript_shows_no_activity(&lines));
     }
 
     // ─── RecoveryPolicy::decide ───────────────────────────────────────
