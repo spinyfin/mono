@@ -2081,7 +2081,8 @@ final class EngineClient: @unchecked Sendable {
             triageExecutionID: payload["triage_execution_id"] as? String,
             outcome: outcome,
             producedTaskID: payload["produced_task_id"] as? String,
-            detail: payload["detail"] as? String
+            detail: payload["detail"] as? String,
+            repeatCount: (payload["repeat_count"] as? Int) ?? 1
         )
     }
 

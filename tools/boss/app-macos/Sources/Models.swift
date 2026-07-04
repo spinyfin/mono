@@ -94,18 +94,23 @@ struct AppAutomationRun: Identifiable, Hashable {
     var outcome: String
     var producedTaskID: String?
     var detail: String?
+    /// How many consecutive same-outcome runs this row represents (engine-side
+    /// retry-chain collapsing). `1` for an ungrouped run.
+    var repeatCount: Int = 1
 
     var outcomeLabel: String {
+        let base: String
         switch outcome {
-        case "produced_task": return "Produced task"
-        case "skipped": return "Skipped"
-        case "suppressed_at_limit": return "At limit"
-        case "pool_throttled": return "Queued"
-        case "triage_running": return "Running"
-        case "failed_will_retry": return "Failed (retrying)"
-        case "failed_gave_up": return "Failed"
-        default: return outcome.replacingOccurrences(of: "_", with: " ").capitalized
+        case "produced_task": base = "Produced task"
+        case "skipped": base = "Skipped"
+        case "suppressed_at_limit": base = "At limit"
+        case "pool_throttled": base = "Queued"
+        case "triage_running": base = "Running"
+        case "failed_will_retry": base = "Failed (retrying)"
+        case "failed_gave_up": base = "Failed"
+        default: base = outcome.replacingOccurrences(of: "_", with: " ").capitalized
         }
+        return repeatCount > 1 ? "\(base), retried \(repeatCount)x" : base
     }
 }
 

@@ -216,6 +216,7 @@ mod dispatch_helpers;
 mod editorial;
 mod exec_status_helpers;
 mod exec_tail;
+mod execution_retention;
 mod executions_runs;
 mod insert_helpers;
 mod mappers;
@@ -259,6 +260,10 @@ pub use audit_misc::ProjectPropertyAuditEntry;
 pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
+pub use execution_retention::{
+    DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
+    ExecutionRetentionPolicy,
+};
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
