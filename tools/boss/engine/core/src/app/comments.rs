@@ -895,6 +895,8 @@ mod tests {
             .sink(sink.clone())
             .session_id("session-1")
             .request_id("req-1")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
             .build()
     }
 
