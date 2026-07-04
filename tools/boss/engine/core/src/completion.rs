@@ -2583,15 +2583,29 @@ must not be asked to open one",
             .as_ref()
             .is_some_and(crate::pr_review::passes_severity_gate);
 
-        // Atomically: advance the producing task from active → in_review +
+        // incident-002 P2: rationale-independent both-parents deletion
+        // tripwire. For a conflict-resolution review, diff the resolution
+        // against BOTH merge parents; if it removed a surface a merged parent
+        // added, halt auto-progression — the task is held in `blocked:
+        // deletion_signoff` pending explicit operator sign-off instead of
+        // advancing to human Review, regardless of the reviewer's verdict.
+        let deletion_signoff = self
+            .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
+            .await;
+        let completion_target = if deletion_signoff.is_empty() {
+            WorkerPrCompletionTarget::InReview
+        } else {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff
+        };
+
+        // Atomically: advance the producing task from active → in_review (or
+        // hold it in blocked:deletion_signoff when the tripwire fired) +
         // complete the reviewer execution + clear its cube columns. Same path
         // for both revision and no-revision cases.
-        let completion = match self.work_db.record_worker_pr_completion(
-            &execution.id,
-            &pr_url,
-            None,
-            WorkerPrCompletionTarget::InReview,
-        ) {
+        let completion = match self
+            .work_db
+            .record_worker_pr_completion(&execution.id, &pr_url, None, completion_target)
+        {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
             Err(err) => {
@@ -2660,6 +2674,58 @@ must not be asked to open one",
 
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
+
+        // incident-002 P2 gate: the deletion tripwire fired, so the task is now
+        // held in `blocked: deletion_signoff`. File the operator sign-off
+        // surface enumerating the removed merged-parent surfaces and stop — no
+        // revision is created (deletion of merged code is an operator decision,
+        // not an auto-remediation the pipeline should quietly attempt).
+        if !deletion_signoff.is_empty() {
+            let removed_list = deletion_signoff
+                .iter()
+                .map(|d| format!("- {d}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = self.work_db.create_attention_item(CreateAttentionItemInput {
+                work_item_id: Some(work_item_id.clone()),
+                kind: "merged_parent_deletion_signoff".to_owned(),
+                title: "Merge resolution removed a merged parent's surface — operator sign-off required".to_owned(),
+                body_markdown: format!(
+                    "This PR resolves a merge / forward-port. The engine diffed the \
+                     resolution against **both merge parents** and found it removes \
+                     {n} surface(s) a **merged** parent had already added — the \
+                     incident-002 failure class (a forward-port silently deleting a \
+                     just-merged feature). This is anchored on the fact of the \
+                     deletion, independent of any \"supersedes\" narrative.\n\n\
+                     Auto-progression is **halted**; the task is blocked pending your \
+                     sign-off. Removed merged-parent surfaces:\n\n{removed_list}\n\n\
+                     If the removal is genuinely correct (a design-doc-authorised \
+                     supersession), move this task back to Review to sign off. \
+                     Otherwise the resolution must be revised to restore the \
+                     surface (integrate both parents).\n\nPR: {pr_url}",
+                    n = deletion_signoff.len(),
+                ),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            });
+            tracing::warn!(
+                execution_id = %execution.id,
+                producing_task_id,
+                pr_url = %pr_url,
+                removed = deletion_signoff.len(),
+                trigger,
+                "pr_review finalize: merge-parent deletion tripwire fired; task held \
+                 in blocked:deletion_signoff pending operator sign-off",
+            );
+            self.publisher
+                .publish(&execution.id, &work_item_id, "completed", "pr_review_deletion_signoff")
+                .await;
+            self.publisher
+                .publish_work_item_changed(&product_id, &work_item_id, "pr_review_deletion_signoff")
+                .await;
+            return StopOutcome::ReviewPassCompleted { pr_url };
+        }
 
         // P992 task 8: if the severity gate passed, create a revision on the
         // producing task with the rendered findings as revision instructions.
@@ -2735,6 +2801,65 @@ must not be asked to open one",
             "pr_review pass finalised; producing task advanced to in_review",
         );
         StopOutcome::ReviewPassCompleted { pr_url }
+    }
+
+    /// incident-002 P2: compute the rationale-independent both-parents deletion
+    /// tripwire for a conflict-resolution review.
+    ///
+    /// Returns rendered description lines for each merged-parent surface the
+    /// resolution removed. Empty when the reviewed PR is not a conflict
+    /// resolution, the resolution has no recorded parents / did not succeed, the
+    /// repo slug is unresolvable, or the resolution preserved every
+    /// merged-parent surface. Fail-open on any GitHub error (see
+    /// [`crate::merge_parent_deletion::compute_merged_parent_deletions`]).
+    async fn compute_merge_parent_deletion_signoff(
+        &self,
+        producing_task_id: &str,
+        execution: &crate::work::WorkExecution,
+        reviewed_head: Option<&str>,
+    ) -> Vec<String> {
+        // The `conflict_resolutions` row is keyed on the review-cycle root (the
+        // original in-review task), not the revision that pushed the fix.
+        let root = self.work_db.review_cycle_root_id(producing_task_id);
+        let cr = match self.work_db.latest_conflict_resolution_for_work_item(&root) {
+            Ok(Some(cr)) => cr,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    producing_task_id,
+                    root,
+                    ?err,
+                    "pr_review finalize: conflict_resolution lookup failed; \
+                     skipping merge-parent deletion tripwire",
+                );
+                return Vec::new();
+            }
+        };
+        // Only gate a resolution whose worker actually pushed a fix. `pending`
+        // has not pushed; `failed`/`abandoned` bailed without a resolution.
+        // (`running`/`succeeded` bracket the push — the poller marks
+        // `succeeded` only on a later retirement sweep, which can race this
+        // review, so we accept `running` too.)
+        if !matches!(cr.status.as_str(), "running" | "succeeded") {
+            return Vec::new();
+        }
+        // The resolved head is the head the reviewer just reviewed; fall back to
+        // the recorded `head_sha_after` (set at retirement). The other two
+        // parents come from the attempt ledger.
+        let head_after = reviewed_head.filter(|s| !s.is_empty()).or(cr.head_sha_after.as_deref());
+        let (Some(head_before), Some(base_sha), Some(head_after)) = (
+            cr.head_sha_before.as_deref(),
+            cr.base_sha_at_trigger.as_deref(),
+            head_after,
+        ) else {
+            return Vec::new();
+        };
+        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(_) => return Vec::new(),
+        };
+        crate::merge_parent_deletion::compute_merged_parent_deletions(&repo_slug, head_before, base_sha, head_after)
+            .await
     }
 
     /// Read the final assistant text of `execution_id`'s transcript, if any.

@@ -60,14 +60,24 @@ impl WorkDb {
             WorkerPrCompletionTarget::Done => TaskStatus::Done,
             // P992: hold in current status while the reviewer runs.
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
+            // incident-002 P2: halt in `blocked` pending operator sign-off.
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => TaskStatus::Blocked,
         };
         // Revision tasks do not own a PR — their `pr_url` must stay NULL
         // (the chain root's `pr_url` is the source of truth), *except* for
-        // `PendingReview` where we must stamp it so the reviewer can find it.
+        // `PendingReview` / `BlockedDeletionSignoff` where we must stamp it so
+        // the reviewer / signing-off operator can find it.
         let pr_url_for_task: Option<&str> = match target {
-            WorkerPrCompletionTarget::PendingReview => Some(pr_url),
+            WorkerPrCompletionTarget::PendingReview | WorkerPrCompletionTarget::BlockedDeletionSignoff => Some(pr_url),
             _ if task.kind == TaskKind::Revision => task.pr_url.as_deref(),
             _ => Some(pr_url),
+        };
+        // Deletion-signoff halt stamps `blocked_reason` instead of clearing it;
+        // no attempt id (there is no auto-clearing signal — a human moves the
+        // task out of `blocked`). Every other target clears the blocked columns.
+        let blocked_reason_for_task: Option<&str> = match target {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff => Some("deletion_signoff"),
+            _ => None,
         };
         tx.execute(
             "UPDATE tasks
@@ -75,11 +85,11 @@ impl WorkDb {
                  pr_url             = ?3,
                  updated_at         = ?4,
                  last_status_actor  = 'engine',
-                 blocked_reason     = NULL,
+                 blocked_reason     = ?5,
                  blocked_attempt_id = NULL,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived','cancelled') THEN ?4 END)
              WHERE id = ?1",
-            params![task.id, new_status.as_str(), pr_url_for_task, now],
+            params![task.id, new_status.as_str(), pr_url_for_task, now, blocked_reason_for_task],
         )?;
 
         if new_status != task.status {

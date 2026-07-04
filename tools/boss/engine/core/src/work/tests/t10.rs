@@ -271,6 +271,40 @@ fn record_worker_pr_completion_done_sets_completed_at() {
     );
 }
 
+/// incident-002 P2: the `BlockedDeletionSignoff` target must hold the task in
+/// `blocked` with `blocked_reason='deletion_signoff'` and stamp `pr_url`, so a
+/// merge resolution that removed a merged-parent surface cannot auto-progress
+/// to human Review until an operator signs off. No auto-clearing signal is
+/// armed (the poller's clear paths only probe merge_conflict/ci_failure).
+#[test]
+fn record_worker_pr_completion_blocked_deletion_signoff_holds_task() {
+    let db = WorkDb::open(temp_db_path("rwpc-deletion-signoff")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-signoff");
+    let pr_url = "https://github.com/spinyfin/mono/pull/9020";
+
+    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::BlockedDeletionSignoff)
+        .unwrap();
+
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore");
+    };
+    assert_eq!(task.status, TaskStatus::Blocked, "task must be held in blocked");
+    assert_eq!(
+        task.blocked_reason.as_deref(),
+        Some("deletion_signoff"),
+        "blocked_reason must record the sign-off gate",
+    );
+    assert_eq!(
+        task.pr_url.as_deref(),
+        Some(pr_url),
+        "pr_url must be stamped for the operator"
+    );
+    assert!(
+        task.completed_at.is_none(),
+        "a held task is not complete — completed_at stays NULL",
+    );
+}
+
 /// A second record_worker_pr_completion call on an already-done task must NOT
 /// re-bump completed_at (COALESCE stability).
 #[test]
