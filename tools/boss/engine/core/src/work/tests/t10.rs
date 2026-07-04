@@ -350,6 +350,63 @@ fn record_worker_no_op_completion_coalesce_stability() {
     );
 }
 
+/// record_worker_idle_abandonment (the auto-nudge-breaker-gave-up path) must
+/// finalize the EXECUTION — freeing its cube lease/workspace so it stops
+/// holding a slot forever — but must NOT touch the task/chore at all: no
+/// status write, no `pr_url`, no `completed_at`. Unlike
+/// record_worker_no_op_completion, there is no positive evidence the work is
+/// done here, only that further nudging is unproductive.
+#[test]
+fn record_worker_idle_abandonment_finalizes_execution_leaves_task_untouched() {
+    let db = WorkDb::open(temp_db_path("rwia-finalize")).unwrap();
+    let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwia");
+
+    let completion = db
+        .record_worker_idle_abandonment(&exec_id, "breaker tripped: no PR after 3 nudges")
+        .unwrap()
+        .expect("a live execution must be finalized");
+
+    assert_eq!(completion.execution.status, ExecutionStatus::Abandoned);
+    assert!(completion.execution.cube_lease_id.is_none());
+    assert!(completion.execution.cube_workspace_id.is_none());
+    assert!(completion.execution.finished_at.is_some());
+    assert_eq!(completion.released_lease_id.as_deref(), Some("lease-1"));
+
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::Active,
+                "idle abandonment must not touch task status"
+            );
+            assert!(t.pr_url.is_none());
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+    assert!(
+        task_completed_at(&db, &chore_id).is_none(),
+        "completed_at must stay NULL — the task itself was never finalized",
+    );
+}
+
+/// A second record_worker_idle_abandonment call on an already-abandoned
+/// execution must be a no-op (Ok(None)) — idempotent against a repeated
+/// Stop-hook fire, mirroring record_worker_no_op_completion's contract.
+#[test]
+fn record_worker_idle_abandonment_is_idempotent() {
+    let db = WorkDb::open(temp_db_path("rwia-idempotent")).unwrap();
+    let (_product_id, _chore_id, exec_id) = make_waiting_human_chore(&db, "rwia-idem");
+
+    db.record_worker_idle_abandonment(&exec_id, "breaker tripped").unwrap();
+    let second = db
+        .record_worker_idle_abandonment(&exec_id, "breaker tripped again")
+        .unwrap();
+    assert!(
+        second.is_none(),
+        "a second call on an already-abandoned execution must be Ok(None)"
+    );
+}
+
 /// Idempotency: running migrate_tasks_completed_at a second time must not
 /// overwrite already-set completed_at values (the COALESCE/column-exists guard).
 #[test]

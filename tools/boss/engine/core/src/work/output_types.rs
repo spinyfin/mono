@@ -53,9 +53,12 @@ pub struct RemoteRunHandle {
     pub remote_pid: Option<i64>,
 }
 
-/// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
-/// Carries the cube lease/workspace ids that were attached to the
-/// execution so the caller can drive cube release out-of-band.
+/// Result of a successful [`WorkDb::record_worker_pr_completion`] call (also
+/// reused by [`WorkDb::record_worker_no_op_completion`] and
+/// [`WorkDb::record_worker_idle_abandonment`], which finalize an execution
+/// the same lease/pane-releasing way without a fresh PR). Carries the cube
+/// lease/workspace ids that were attached to the execution so the caller can
+/// drive cube release out-of-band.
 #[derive(Debug, Clone)]
 pub struct WorkerPrCompletion {
     pub execution: WorkExecution,
