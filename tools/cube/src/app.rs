@@ -6086,7 +6086,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cli::{Cli, Command};
-    use crate::command_runner::{CommandInvocation, CommandRunner};
+    use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
     use crate::lock::RepoLock;
 
     use super::{
@@ -6094,7 +6094,8 @@ mod tests {
         RebaseOpts, RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
         gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path, rebase_workspace_branch,
         render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
-        run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude, workspace_goto,
+        run_checkleft_gate_impl, run_jj_push, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        workspace_goto,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -11422,6 +11423,72 @@ mod tests {
             status: Some(1),
             stderr: "fatal: permission denied (publickey)".to_string(),
         }));
+    }
+
+    #[test]
+    fn run_jj_push_retries_once_on_transient_failure_then_succeeds() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let push_args = &[
+            "git",
+            "push",
+            "-b",
+            "my-feature",
+            "--remote",
+            "origin",
+            "--allow-new",
+            "--ignore-working-copy",
+        ];
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand {
+                cwd: cwd.clone(),
+                program: "jj".to_string(),
+                args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                result: Err(CubeError::CommandTimedOut {
+                    program: "jj".to_string(),
+                    args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                    timeout_secs: 300,
+                }),
+                creates_dir: None,
+            },
+            ExpectedCommand::ok(cwd.clone(), "jj", push_args, ""),
+        ]);
+
+        let out = run_jj_push(&runner, &RealCommandRunner::invocation(&cwd, "jj", push_args))
+            .expect("should succeed after exactly one retry");
+        runner.assert_exhausted();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn run_jj_push_returns_immediately_on_non_retryable_failure() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let push_args = &[
+            "git",
+            "push",
+            "-b",
+            "my-feature",
+            "--remote",
+            "origin",
+            "--allow-new",
+            "--ignore-working-copy",
+        ];
+        let runner = FakeRunner::new(vec![ExpectedCommand {
+            cwd: cwd.clone(),
+            program: "jj".to_string(),
+            args: push_args.iter().map(|a| (*a).to_string()).collect(),
+            result: Err(CubeError::CommandFailed {
+                program: "jj".to_string(),
+                args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                status: Some(1),
+                stderr: "fatal: permission denied (publickey)".to_string(),
+            }),
+            creates_dir: None,
+        }]);
+
+        let err = run_jj_push(&runner, &RealCommandRunner::invocation(&cwd, "jj", push_args))
+            .expect_err("non-retryable failure must surface immediately");
+        runner.assert_exhausted();
+        assert!(matches!(err, CubeError::CommandFailed { .. }));
     }
 
     #[test]
