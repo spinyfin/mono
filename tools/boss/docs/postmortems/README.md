@@ -12,3 +12,4 @@ Postmortems for production-affecting incidents in Boss and its surrounding tooli
 ## Index
 
 - [`incident-001-pr-fan-out.md`](incident-001-pr-fan-out.md) — 2026-05-14. The engine's PR-detection fallback misattributed PRs across cube workspaces via shared `.jj/repo/store/git` bookmark visibility, closing the wrong chores as done and killing running workers mid-turn.
+- [`incident-002-merge-conflict-deletion-blessed-by-review.md`](incident-002-merge-conflict-deletion-blessed-by-review.md) — 2026-07-03. A merge-conflict revision worker deleted a just-merged feature (the TRE planner badge) to resolve a forward-port conflict, rationalized it as "supersedes" with no design basis, and the automated `pr_review` pass examined the deletion and blessed it — flagging only tidiness. A recurrence of the T793/#1043 class, this time bypassing the control built for it.
