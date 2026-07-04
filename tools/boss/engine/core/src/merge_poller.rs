@@ -1955,14 +1955,10 @@ async fn sweep_one(
                     maybe_clear_blocked(
                         work_db,
                         publisher,
-                        cube_client,
-                        completion_handler,
+                        (cube_client, completion_handler),
                         candidate,
-                        &probe_result.labels,
-                        ci,
-                        false, // mergeability_clean=false: skip merge_conflict retire on UNKNOWN
-                        &probe_result.raw_mergeable,
-                        &probe_result.raw_merge_state_status,
+                        &probe_result,
+                        (ci, false), // mergeability_clean=false: skip merge_conflict retire on UNKNOWN
                         outcome,
                     )
                     .await;
@@ -1984,14 +1980,10 @@ async fn sweep_one(
                     maybe_clear_blocked(
                         work_db,
                         publisher,
-                        cube_client,
-                        completion_handler,
+                        (cube_client, completion_handler),
                         candidate,
-                        &probe_result.labels,
-                        ci,
-                        true, // mergeability_clean=true: merge_conflict retire is safe
-                        &probe_result.raw_mergeable,
-                        &probe_result.raw_merge_state_status,
+                        &probe_result,
+                        (ci, true), // mergeability_clean=true: merge_conflict retire is safe
                         outcome,
                     )
                     .await;
@@ -2314,16 +2306,22 @@ async fn dispatch_ci_axis(
 async fn maybe_clear_blocked(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    // (cube_client, completion_handler) — bundled to keep the parameter
+    // count under clippy::too_many_arguments.
+    handlers: (Option<&dyn CubeClient>, Option<&WorkerCompletionHandler>),
     candidate: &PendingMergeCheck,
-    labels: &[String],
-    ci: &OpenPrCiStatus,
-    mergeability_clean: bool,
-    raw_mergeable: &str,
-    raw_merge_state_status: &str,
+    // Supplies `labels`, `raw_mergeable`, `raw_merge_state_status`.
+    probe_result: &PrLifecycleProbe,
+    // (ci, mergeability_clean) — bundled to keep the parameter count
+    // under clippy::too_many_arguments.
+    ci_status: (&OpenPrCiStatus, bool),
     outcome: &mut SweepOutcome,
 ) {
+    let (cube_client, completion_handler) = handlers;
+    let labels = &probe_result.labels;
+    let raw_mergeable = probe_result.raw_mergeable.as_str();
+    let raw_merge_state_status = probe_result.raw_merge_state_status.as_str();
+    let (ci, mergeability_clean) = ci_status;
     let signals = match work_db.active_blocked_signals(&candidate.work_item_id) {
         Ok(rows) => rows,
         Err(err) => {
@@ -2748,12 +2746,14 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
     publisher: Arc<dyn ExecutionPublisher>,
-    cube_client: Arc<dyn CubeClient>,
-    completion_handler: Arc<WorkerCompletionHandler>,
+    // (cube_client, completion_handler) — bundled to keep the parameter
+    // count under clippy::too_many_arguments.
+    handlers: (Arc<dyn CubeClient>, Arc<WorkerCompletionHandler>),
     interval: Duration,
     metrics: Arc<Registry>,
     kick: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
+    let (cube_client, completion_handler) = handlers;
     tokio::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         loop {
@@ -4354,11 +4354,13 @@ mod tests {
         merged_at: &str,
         mergeable: &str,
         merge_state_status: &str,
-        base_ref_oid: &str,
-        head_ref_oid: &str,
+        // (base_ref_oid, head_ref_oid) — bundled to keep the parameter
+        // count under clippy::too_many_arguments.
+        ref_oids: (&str, &str),
         labels: &[&str],
         rollup: serde_json::Value,
     ) -> String {
+        let (base_ref_oid, head_ref_oid) = ref_oids;
         let labels_json: Vec<serde_json::Value> = labels.iter().map(|n| serde_json::json!({ "name": n })).collect();
         serde_json::json!({
             "state": state,
@@ -4498,8 +4500,7 @@ mod tests {
                 case.merged_at,
                 case.mergeable,
                 case.merge_state_status,
-                case.base_ref_oid,
-                "",
+                (case.base_ref_oid, ""),
                 &[],
                 serde_json::json!([]),
             );
@@ -4533,8 +4534,7 @@ mod tests {
             "",
             "MERGEABLE",
             "CLEAN",
-            "abc",
-            "",
+            ("abc", ""),
             &["needs-review", "boss/no-auto-rebase"],
             serde_json::json!([]),
         );
@@ -4544,7 +4544,15 @@ mod tests {
             vec!["needs-review".to_owned(), "boss/no-auto-rebase".to_owned()],
         );
 
-        let body_empty = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "abc", "", &[], serde_json::json!([]));
+        let body_empty = json_doc(
+            "OPEN",
+            "",
+            "MERGEABLE",
+            "CLEAN",
+            ("abc", ""),
+            &[],
+            serde_json::json!([]),
+        );
         let probe_empty = parse_probe_json("https://example.test/pr/3", &body_empty, None).unwrap();
         assert!(probe_empty.labels.is_empty());
     }
@@ -4956,8 +4964,7 @@ mod tests {
                 "",
                 "MERGEABLE",
                 "CLEAN",
-                "abc",
-                "head-1",
+                ("abc", "head-1"),
                 &[],
                 case.rollup.clone(),
             );
@@ -5026,8 +5033,7 @@ mod tests {
             "",
             "CONFLICTING",
             "DIRTY",
-            "base-1",
-            "head-1",
+            ("base-1", "head-1"),
             &[],
             serde_json::json!([{
                 "name": "ci/test",
@@ -5061,8 +5067,7 @@ mod tests {
                 "",
                 "MERGEABLE",
                 "CLEAN",
-                "",
-                "",
+                ("", ""),
                 &[],
                 serde_json::json!([]),
             ))
@@ -5083,8 +5088,7 @@ mod tests {
                 "",
                 "MERGEABLE",
                 "CLEAN",
-                "",
-                "",
+                ("", ""),
                 &[],
                 serde_json::json!([]),
             ))
@@ -5100,7 +5104,7 @@ mod tests {
 
         // PR not in merge queue — mergeQueueEntry field absent entirely
         // (older gh versions or repos without queue enabled).
-        let body_absent = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]));
+        let body_absent = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("", ""), &[], serde_json::json!([]));
         let probe_absent = parse_probe_json("https://example.test/pr/mq3", &body_absent, None).unwrap();
         assert!(
             !probe_absent.in_merge_queue,
@@ -5130,7 +5134,7 @@ mod tests {
             check_run("ci/build", "COMPLETED", "SUCCESS"),
             check_run("Owner Approval", "IN_PROGRESS", ""),
         ]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/1", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
@@ -5160,8 +5164,7 @@ mod tests {
             "",
             "MERGEABLE",
             "CLEAN",
-            "base-1",
-            "head-1",
+            ("base-1", "head-1"),
             &[],
             rollup,
         ))
@@ -5185,8 +5188,7 @@ mod tests {
             "",
             "MERGEABLE",
             "CLEAN",
-            "base-1",
-            "head-1",
+            ("base-1", "head-1"),
             &[],
             rollup,
         ))
@@ -5218,7 +5220,7 @@ mod tests {
             check_run("Owner Approval", "COMPLETED", "SUCCESS"),
             check_run("ci/build", "COMPLETED", "SUCCESS"),
         ]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/4", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
@@ -5235,7 +5237,7 @@ mod tests {
     #[test]
     fn owner_approval_failure_becomes_changes_requested() {
         let rollup = serde_json::json!([check_run("Owner Approval", "COMPLETED", "FAILURE"),]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/linkedin-eng/foo/pull/5", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
@@ -5256,7 +5258,7 @@ mod tests {
     #[test]
     fn owner_approval_in_other_org_stays_a_ci_check() {
         let rollup = serde_json::json!([check_run("Owner Approval", "IN_PROGRESS", ""),]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/spinyfin/mono/pull/6", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
@@ -5276,7 +5278,7 @@ mod tests {
     #[test]
     fn linkedin_org_match_is_case_insensitive() {
         let rollup = serde_json::json!([check_run("owner approval", "IN_PROGRESS", ""),]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/LinkedIn-Multiproduct/mono/pull/7", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
@@ -5292,7 +5294,7 @@ mod tests {
     #[test]
     fn linkedin_org_without_owner_approval_is_unchanged() {
         let rollup = serde_json::json!([check_run("ci/build", "COMPLETED", "SUCCESS"),]);
-        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", ("base-1", "head-1"), &[], rollup);
         let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/8", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,

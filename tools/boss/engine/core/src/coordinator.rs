@@ -2363,8 +2363,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     None,
-                    "work_item_unresolved",
-                    "Could not resolve work item for execution",
+                    ("work_item_unresolved", "Could not resolve work item for execution"),
                     &err,
                 )?;
                 return Err(err);
@@ -2483,8 +2482,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     None,
-                    "no_eligible_host",
-                    "No eligible host for execution",
+                    ("no_eligible_host", "No eligible host for execution"),
                     &err,
                 )?;
                 return Err(err);
@@ -2513,8 +2511,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     None,
-                    "host_adapter_unavailable",
-                    "Could not build host adapter",
+                    ("host_adapter_unavailable", "Could not build host adapter"),
                     &err,
                 )?;
                 return Err(err);
@@ -2583,8 +2580,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     None,
-                    "cube_repo_ensure_failed",
-                    "Cube `repo ensure` failed",
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
                     &err,
                 )?;
                 return Err(err);
@@ -2614,8 +2610,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     None,
-                    "cube_repo_ensure_failed",
-                    "Cube `repo ensure` timed out",
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
                     &err,
                 )?;
                 return Err(err);
@@ -2676,8 +2671,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
-                    "cube_workspace_lease_failed",
-                    "Cube `workspace lease` failed",
+                    ("cube_workspace_lease_failed", "Cube `workspace lease` failed"),
                     &err,
                 )?;
                 return Err(err);
@@ -2765,8 +2759,10 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
-                    "cube_workspace_occupied",
-                    "Cube leased a workspace occupied by a live worker",
+                    (
+                        "cube_workspace_occupied",
+                        "Cube leased a workspace occupied by a live worker",
+                    ),
                     &err,
                 )?;
                 return Err(err);
@@ -2936,8 +2932,10 @@ impl ExecutionCoordinator {
                         execution,
                         worker_id,
                         Some(repo.repo_id.as_str()),
-                        "cube_workspace_positioning_failed",
-                        "Cube `workspace goto` positioning failed",
+                        (
+                            "cube_workspace_positioning_failed",
+                            "Cube `workspace goto` positioning failed",
+                        ),
                         &err,
                     )?;
                     return Err(err);
@@ -3009,8 +3007,7 @@ impl ExecutionCoordinator {
                         execution,
                         worker_id,
                         Some(repo.repo_id.as_str()),
-                        "cube_change_create_failed",
-                        "Cube `change create` failed",
+                        ("cube_change_create_failed", "Cube `change create` failed"),
                         &err,
                     )?;
                     return Err(err);
@@ -3133,8 +3130,7 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
-                    "execution_run_start_failed",
-                    "`start_execution_run` failed",
+                    ("execution_run_start_failed", "`start_execution_run` failed"),
                     &err,
                 )?;
                 Err(err)
@@ -3452,8 +3448,7 @@ impl ExecutionCoordinator {
             .invoke_lease(
                 repo,
                 task,
-                prefer,
-                allow_dirty,
+                (prefer, allow_dirty),
                 CUBE_LEASE_TIMEOUT,
                 adapter,
                 &refused_refs,
@@ -3540,7 +3535,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, false, CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
+            .invoke_lease(repo, task, (None, false), CUBE_LEASE_TIMEOUT, adapter, &refused_refs)
             .await
         {
             Ok(lease) => {
@@ -3589,12 +3584,14 @@ impl ExecutionCoordinator {
         &self,
         repo: &CubeRepoHandle,
         task: &str,
-        prefer_workspace_id: Option<&str>,
-        allow_dirty: bool,
+        // (prefer_workspace_id, allow_dirty) — bundled to keep the
+        // parameter count under clippy::too_many_arguments.
+        lease_opts: (Option<&str>, bool),
         timeout: Duration,
         adapter: &Arc<dyn HostAdapter>,
         exclude_workspace_ids: &[&str],
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
+        let (prefer_workspace_id, allow_dirty) = lease_opts;
         match tokio::time::timeout(
             timeout,
             adapter.lease_workspace(
@@ -3631,10 +3628,12 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
         cube_repo_id: Option<&str>,
-        attention_kind: &str,
-        attention_title: &str,
+        // (attention_kind, attention_title) — bundled to keep the
+        // parameter count under clippy::too_many_arguments.
+        attention: (&str, &str),
         error: &anyhow::Error,
     ) -> Result<()> {
+        let (attention_kind, attention_title) = attention;
         let (execution, run, outcome) = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,

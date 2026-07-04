@@ -669,8 +669,10 @@ pub async fn serve(
         server_state.work_db.clone(),
         merge_probe,
         server_state.publisher.clone(),
-        server_state.cube_client.clone(),
-        server_state.completion_handler.clone(),
+        (
+            server_state.cube_client.clone(),
+            server_state.completion_handler.clone(),
+        ),
         Duration::from_secs(60),
         server_state.metrics.clone(),
         server_state.pr_reconciler_kick.clone(),

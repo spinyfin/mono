@@ -408,8 +408,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            editorial_enabled,
-            self.cfg.work.max_review_embed_diff_lines,
+            (editorial_enabled, self.cfg.work.max_review_embed_diff_lines),
         )
         .await?;
 
@@ -758,9 +757,11 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
-    editorial_enabled: bool,
-    max_embed_diff_lines: u64,
+    // (editorial_enabled, max_embed_diff_lines) — bundled to keep the
+    // parameter count under clippy::too_many_arguments.
+    editorial_opts: (bool, u64),
 ) -> anyhow::Result<ComposedWorkerSpawn> {
+    let (editorial_enabled, max_embed_diff_lines) = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
     // brief — what the project is for, what its goal is — lives
@@ -4584,8 +4585,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            false,
-            0,
+            (false, 0),
         )
         .await
         .unwrap();
@@ -4621,8 +4621,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            false,
-            0,
+            (false, 0),
         )
         .await
         .unwrap();
@@ -4661,8 +4660,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            false,
-            0,
+            (false, 0),
         )
         .await
         .unwrap();
@@ -4701,8 +4699,7 @@ mod compose_worker_spawn_tests {
             &work_item,
             workspace.path(),
             None,
-            false,
-            0,
+            (false, 0),
         )
         .await
         .unwrap();

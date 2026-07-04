@@ -656,8 +656,7 @@ impl HostAdapter for SshHostAdapter {
             // feature only ever gated the local PaneSpawnRunner path, so passing
             // `false` preserves the original behavior. Wire feature flags into
             // the remote path alongside the cross-host config work (PR3/PR4).
-            false,
-            self.cfg.work.max_review_embed_diff_lines,
+            (false, self.cfg.work.max_review_embed_diff_lines),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
