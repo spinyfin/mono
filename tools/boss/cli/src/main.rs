@@ -7432,27 +7432,12 @@ where
 /// trimmed canonical form on success.
 fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
     let trimmed = raw.trim();
-    let rest = trimmed
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| CliError::usage("PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>"))?;
-    let mut parts = rest.split('/');
-    let org = parts.next().unwrap_or("");
-    let repo = parts.next().unwrap_or("");
-    let pull = parts.next().unwrap_or("");
-    let number = parts.next().unwrap_or("");
-    let extra = parts.next();
-    let well_formed = !org.is_empty()
-        && !repo.is_empty()
-        && pull == "pull"
-        && !number.is_empty()
-        && number.chars().all(|c| c.is_ascii_digit())
-        && extra.is_none();
-    if !well_formed {
-        return Err(CliError::usage(format!(
+    match github_app::pr_url::parse_pr_url_parts(trimmed) {
+        Some(_) => Ok(trimmed),
+        None => Err(CliError::usage(format!(
             "PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>, got `{trimmed}`"
-        )));
+        ))),
     }
-    Ok(trimmed)
 }
 
 async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliError> {

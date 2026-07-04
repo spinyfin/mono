@@ -1,10 +1,11 @@
 use super::*;
 
 /// Extract the numeric PR number from a GitHub pull-request URL.
-/// Accepts the canonical form `https://github.com/<owner>/<repo>/pull/<n>`.
-/// Returns `None` for any URL that does not end with a parseable integer.
+/// Accepts only the canonical form `https://github.com/<owner>/<repo>/pull/<n>`,
+/// delegating to [`boss_github::pr_url::pr_number_from_url`] so every call site
+/// shares the same stricter validation. Returns `None` for any non-canonical URL.
 fn extract_pr_number_from_url(pr_url: &str) -> Option<i64> {
-    pr_url.rsplit('/').next().and_then(|s| s.parse::<i64>().ok())
+    boss_github::pr_url::pr_number_from_url(pr_url).map(|n| n as i64)
 }
 
 /// `true` when `created_via` identifies the revision as an engine-managed
@@ -457,17 +458,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_pr_number_accepts_bare_number() {
+    fn extract_pr_number_rejects_bare_number() {
+        // Canonical-only parsing: a bare integer is not a full PR URL.
         assert_eq!(
             extract_pr_number_from_url("42"),
-            Some(42),
-            "a bare integer is its own final path segment"
+            None,
+            "a bare integer is not a canonical PR URL"
         );
     }
 
     #[test]
     fn extract_pr_number_rejects_trailing_slash() {
-        // A trailing slash makes the last segment empty, which does not parse.
+        // A trailing slash adds an empty segment past the number, which is not
+        // canonical and does not parse.
         assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/42/"), None);
     }
 
