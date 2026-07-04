@@ -443,8 +443,6 @@ async fn evaluate_one(
 mod tests {
     use std::sync::Mutex;
 
-    use tempfile::TempDir;
-
     use super::*;
     use crate::automation_schedule::next_occurrence_after_str;
     use crate::test_support::*;
@@ -488,12 +486,6 @@ mod tests {
             self.calls.lock().unwrap().push((a.id.clone(), scheduled_for));
             self.verdict.clone()
         }
-    }
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
     }
 
     fn create_product(db: &WorkDb) -> String {

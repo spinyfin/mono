@@ -404,45 +404,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use anyhow::Result;
-    use async_trait::async_trait;
     use boss_protocol::WorkItemBinding;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-    use boss_protocol::WorkExecution;
-
-    // ─── stubs ───────────────────────────────────────────────────────────────
-
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
-        }
-    }
-
-    // ─── helpers ─────────────────────────────────────────────────────────────
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id

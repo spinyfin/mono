@@ -197,17 +197,9 @@ pub async fn run_one_pass(work_db: &WorkDb) -> DepUnblockSweepOutcome {
 mod tests {
     use std::sync::Arc;
 
-    use tempfile::TempDir;
-
     use super::*;
     use crate::test_support::*;
     use crate::work::{AddDependencyInput, CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id

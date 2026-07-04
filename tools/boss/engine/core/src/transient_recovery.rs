@@ -698,11 +698,9 @@ mod tests {
         ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::transient_error::RecoveryPolicy;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-    use boss_protocol::WorkExecution;
 
     // ─── stubs ────────────────────────────────────────────────────────
 
@@ -749,22 +747,6 @@ mod tests {
         }
     }
 
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
-        }
-    }
-
     /// Records which run_ids were nudged. Used to assert nudge behaviour
     /// without needing a real app session.
     struct RecordingNudger {
@@ -792,12 +774,6 @@ mod tests {
     }
 
     // ─── helpers ──────────────────────────────────────────────────────
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
