@@ -23,13 +23,7 @@ pub(super) async fn handle_create_attention_item(ctx: Dispatch, req: FrontendReq
                 send_response(&sink, &request_id, FrontendEvent::AttentionItemCreated { item });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -55,13 +49,7 @@ pub(super) async fn handle_list_attention_items(ctx: Dispatch, req: FrontendRequ
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -82,13 +70,7 @@ pub(super) async fn handle_get_attention_item(ctx: Dispatch, req: FrontendReques
             send_response(&sink, &request_id, FrontendEvent::AttentionItemResult { item });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -113,13 +95,7 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -148,13 +124,7 @@ pub(super) async fn handle_list_attention_merges(ctx: Dispatch, req: FrontendReq
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -209,13 +179,7 @@ pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendReq
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -245,13 +209,7 @@ pub(super) async fn handle_get_attention_group(ctx: Dispatch, req: FrontendReque
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -298,13 +256,7 @@ pub(super) async fn handle_create_attention(ctx: Dispatch, req: FrontendRequest)
                 send_response(&sink, &request_id, FrontendEvent::AttentionCreated { attention, group });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -439,13 +391,7 @@ pub(super) async fn handle_answer_attention(ctx: Dispatch, req: FrontendRequest)
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -482,13 +428,7 @@ pub(super) async fn handle_dismiss_attention(ctx: Dispatch, req: FrontendRequest
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -544,13 +484,7 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }

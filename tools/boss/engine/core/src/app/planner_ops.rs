@@ -26,13 +26,7 @@ pub(super) async fn handle_list_planner_runs(ctx: Dispatch, req: FrontendRequest
     };
     match work_db.list_planner_runs_for_project(&project_id) {
         Ok(runs) => send_response(&sink, &request_id, FrontendEvent::PlannerRunsList { project_id, runs }),
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -61,13 +55,7 @@ pub(super) async fn handle_plan_project(ctx: Dispatch, req: FrontendRequest) {
     if dry_run {
         match Populator::preview(&work_db, &steps, &project_id, DEFAULT_MAX_TASKS, force).await {
             Ok(preview) => send_response(&sink, &request_id, preview_to_event(project_id, preview)),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
         return;
     }
@@ -133,13 +121,7 @@ pub(super) async fn handle_plan_project(ctx: Dispatch, req: FrontendRequest) {
                 send_response(&sink, &request_id, event);
             }
         }
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -170,13 +152,7 @@ pub(super) async fn handle_release_project(ctx: Dispatch, req: FrontendRequest) 
             return;
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };
@@ -198,13 +174,7 @@ pub(super) async fn handle_release_project(ctx: Dispatch, req: FrontendRequest) 
     let task_ids = match work_db.list_task_ids_for_planner_run(&run.id) {
         Ok(ids) => ids,
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };
@@ -280,13 +250,7 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
             return;
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };
@@ -304,13 +268,7 @@ pub(super) async fn handle_unpopulate_project(ctx: Dispatch, req: FrontendReques
     let task_ids = match work_db.list_task_ids_for_planner_run(&run_id) {
         Ok(ids) => ids,
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };

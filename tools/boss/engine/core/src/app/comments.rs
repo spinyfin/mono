@@ -49,13 +49,7 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
 
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -449,13 +443,7 @@ pub(super) async fn handle_comments_post_followup(ctx: Dispatch, req: FrontendRe
     let comment = match work_db.transition_comment_to_awaiting_followup(&comment_id) {
         Ok(comment) => comment,
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };
@@ -638,13 +626,7 @@ pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
                 comments,
             },
         ),
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -676,13 +658,7 @@ pub(super) async fn handle_comments_banner_state(ctx: Dispatch, req: FrontendReq
                 state,
             },
         ),
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -722,13 +698,7 @@ pub(super) async fn handle_comments_resolve(ctx: Dispatch, req: FrontendRequest)
                     comments,
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -810,13 +780,7 @@ pub(super) async fn handle_comments_revise_doc(ctx: Dispatch, req: FrontendReque
                     FrontendEvent::CommentsReviseDocResult { outcome },
                 );
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -847,13 +811,7 @@ pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest)
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -888,13 +846,7 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
             .await;
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -930,13 +882,7 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
             .await;
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -1013,25 +959,13 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
             return;
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };
 
     if let Err(err) = work_db.complete_answer_agent_run(&run.id, ANSWER_AGENT_RUN_STATUS_REPLIED, Some(&body), None) {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        );
+        send_work_error(&sink, &request_id, &err);
         return;
     }
 
@@ -1075,13 +1009,7 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
                 "CommentsPostAnswer: run completed and thread entry posted, but failed to \
                  transition the comment to 'answered'",
             );
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -1117,13 +1045,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
             .await;
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 

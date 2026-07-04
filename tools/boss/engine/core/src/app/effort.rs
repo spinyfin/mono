@@ -30,13 +30,7 @@ pub(super) async fn handle_audit_product_effort(ctx: Dispatch, req: FrontendRequ
         let result = build_effort_audit_report(&work_db, &product_id, window_days);
         match result {
             Ok(report) => send_response(&sink, &request_id, FrontendEvent::EffortAuditReport { report }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -67,13 +61,7 @@ pub(super) async fn handle_record_effort_escalation(ctx: Dispatch, req: Frontend
         // report.
         match work_db.record_effort_escalation(&work_item_id, original_level, new_level, &markers, rule_id.as_deref()) {
             Ok(event) => send_response(&sink, &request_id, FrontendEvent::EffortEscalationRecorded { event }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

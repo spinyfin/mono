@@ -35,13 +35,7 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
                     message: format!("ci_remediation attempt {attempt_id:?} is unknown",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -89,13 +83,7 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
                     message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -173,21 +161,9 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
                         message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
                     },
                 ),
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
+                Err(err) => send_work_error(&sink, &request_id, &err),
             },
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -245,13 +221,7 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatc
                     message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -295,13 +265,7 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                 return;
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
                 return;
             }
         };
@@ -470,13 +434,7 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
                             },
                         ),
                     },
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
+                    Err(err) => send_work_error(&sink, &request_id, &err),
                 }
             }
             crate::ci_watch::NoopValidation::Rejected { head_sha, status } => {
@@ -528,13 +486,7 @@ pub(super) async fn handle_list_ci_remediations(ctx: Dispatch, req: FrontendRequ
         // `ListConflictResolutions`.
         match work_db.list_ci_remediations(product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
             Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::CiRemediationsList { attempts }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -559,13 +511,7 @@ pub(super) async fn handle_get_ci_remediation(ctx: Dispatch, req: FrontendReques
                     message: format!("ci_remediation attempt {attempt_id:?} is unknown",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -620,13 +566,7 @@ pub(super) async fn handle_retry_ci_remediation(ctx: Dispatch, req: FrontendRequ
                         message: format!("work item {work_item_id:?} is unknown",),
                     },
                 ),
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
+                Err(err) => send_work_error(&sink, &request_id, &err),
             },
             Ok(None) => send_response(
                 &sink,
@@ -635,13 +575,7 @@ pub(super) async fn handle_retry_ci_remediation(ctx: Dispatch, req: FrontendRequ
                     message: format!("ci_remediation attempt {selector:?} is unknown",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -693,13 +627,7 @@ pub(super) async fn handle_abandon_ci_remediation(ctx: Dispatch, req: FrontendRe
                     message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -724,13 +652,7 @@ pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
                     message: format!("work item {work_item_id:?} is unknown"),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -757,13 +679,7 @@ pub(super) async fn handle_set_ci_budget(ctx: Dispatch, req: FrontendRequest) {
                     message: format!("work item {work_item_id:?} is unknown"),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

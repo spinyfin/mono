@@ -38,13 +38,7 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -76,13 +70,7 @@ pub(super) async fn handle_list_revisions(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -113,13 +101,7 @@ pub(super) async fn handle_list_chores(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -152,13 +134,7 @@ pub(super) async fn handle_get_work_item(ctx: Dispatch, req: FrontendRequest) {
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -194,13 +170,7 @@ pub(super) async fn handle_get_work_item_by_short_id(ctx: Dispatch, req: Fronten
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -227,13 +197,7 @@ pub(super) async fn handle_find_work_items_by_pr(ctx: Dispatch, req: FrontendReq
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -472,13 +436,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                     .with_details(details),
                 )
                 .await;
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
         let actor = resolve_status_actor(&server_state, peer_pid);
@@ -692,13 +650,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -757,23 +709,11 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemDeleted { id });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         },
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -811,13 +751,7 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemRestored { item });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -869,13 +803,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         }
         Err(err) => {
             // Error path: drop the trace (no serialize/write to attribute).
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -963,13 +891,7 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -1003,13 +925,7 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

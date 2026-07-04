@@ -58,13 +58,7 @@ pub(super) async fn handle_set_product_external_tracker(ctx: Dispatch, req: Fron
                             FrontendEvent::WorkItemUpdated { item },
                         );
                     }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
+                    Err(err) => send_work_error(&sink, &request_id, &err),
                 }
             }
         }
@@ -167,13 +161,7 @@ pub(super) async fn handle_link_work_item_external_ref(ctx: Dispatch, req: Front
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -212,13 +200,7 @@ pub(super) async fn handle_unlink_work_item_external_ref(ctx: Dispatch, req: Fro
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

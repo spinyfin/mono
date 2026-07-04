@@ -24,13 +24,7 @@ pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest
                 server_state.automation_scheduler_kick.notify_one();
                 send_response(&sink, &request_id, FrontendEvent::AutomationCreated { automation });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -60,13 +54,7 @@ pub(super) async fn handle_list_automations(ctx: Dispatch, req: FrontendRequest)
                     },
                 );
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -91,13 +79,7 @@ pub(super) async fn handle_get_automation(ctx: Dispatch, req: FrontendRequest) {
                     message: format!("unknown automation: {id}"),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -119,13 +101,7 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
                 server_state.automation_scheduler_kick.notify_one();
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -147,13 +123,7 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
                 server_state.automation_scheduler_kick.notify_one();
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -175,13 +145,7 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
                 server_state.automation_scheduler_kick.notify_one();
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -207,13 +171,7 @@ pub(super) async fn handle_delete_automation(ctx: Dispatch, req: FrontendRequest
                     FrontendEvent::AutomationDeleted { automation_id: id },
                 )
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -235,13 +193,7 @@ pub(super) async fn handle_get_automation_open_task_count(ctx: Dispatch, req: Fr
                 &request_id,
                 FrontendEvent::AutomationOpenTaskCount { automation_id, count },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -263,13 +215,7 @@ pub(super) async fn handle_list_editorial_actions(ctx: Dispatch, req: FrontendRe
                 &request_id,
                 FrontendEvent::EditorialActionsList { product_id, actions },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -291,13 +237,7 @@ pub(super) async fn handle_list_automation_runs(ctx: Dispatch, req: FrontendRequ
                 &request_id,
                 FrontendEvent::AutomationRunsList { automation_id, runs },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -319,13 +259,7 @@ pub(super) async fn handle_list_automation_tasks(ctx: Dispatch, req: FrontendReq
                 &request_id,
                 FrontendEvent::AutomationTasksList { automation_id, tasks },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -361,13 +295,7 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
                 return;
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
                 return;
             }
         };
@@ -390,13 +318,7 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
+                    send_work_error(&sink, &request_id, &err);
                     return;
                 }
             }

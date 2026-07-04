@@ -74,13 +74,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::DependencyAdded { edge });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -135,13 +129,7 @@ pub(super) async fn handle_remove_dependency(ctx: Dispatch, req: FrontendRequest
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -159,13 +147,7 @@ pub(super) async fn handle_list_dependencies(ctx: Dispatch, req: FrontendRequest
     };
     match work_db.list_dependencies(input) {
         Ok(view) => send_response(&sink, &request_id, FrontendEvent::DependencyList { view }),
-        Err(err) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: err.to_string(),
-            },
-        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
     }
 }
 
@@ -182,13 +164,7 @@ pub(super) async fn handle_list_dependencies_detailed(ctx: Dispatch, req: Fronte
     {
         match work_db.list_dependencies_detailed(input) {
             Ok(detail) => send_response(&sink, &request_id, FrontendEvent::DependencyDetail { detail }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

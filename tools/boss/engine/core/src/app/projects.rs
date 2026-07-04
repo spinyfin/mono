@@ -29,13 +29,7 @@ pub(super) async fn handle_list_projects(ctx: Dispatch, req: FrontendRequest) {
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -70,13 +64,7 @@ pub(super) async fn handle_create_project(ctx: Dispatch, req: FrontendRequest) {
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -115,23 +103,11 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         },
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -165,13 +141,7 @@ pub(super) async fn handle_set_project_design_doc(ctx: Dispatch, req: FrontendRe
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -208,13 +178,7 @@ pub(super) async fn handle_resolve_project_design_doc(ctx: Dispatch, req: Fronte
             .unwrap_or_default();
         match work_db.resolve_project_design_doc(&project_id, |repo| leased_repo_paths.get(repo).cloned()) {
             Ok(output) => send_response(&sink, &request_id, FrontendEvent::ProjectDesignDocResolved { output }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
