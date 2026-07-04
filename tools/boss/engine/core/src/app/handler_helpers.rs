@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::iso8601::format_epoch_iso8601;
+
 /// Build the per-product effort-audit report. Handles the product
 /// lookup, window filter, and chore-corpus / event-log fan-in so
 /// the RPC handler stays a thin error-translation layer.
@@ -241,30 +243,6 @@ pub(super) fn build_live_status_debug_report(
         disabled_slot_count: disabled_set.len(),
         slots,
     }
-}
-
-pub(super) fn format_epoch_iso8601(epoch_secs: i64) -> String {
-    let days = epoch_secs.div_euclid(86_400);
-    let seconds_in_day = epoch_secs.rem_euclid(86_400);
-    let hour = seconds_in_day / 3_600;
-    let minute = (seconds_in_day % 3_600) / 60;
-    let second = seconds_in_day % 60;
-    let (year, month, day) = ymd_from_days_since_1970(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn ymd_from_days_since_1970(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 /// Read the persisted disabled-slot list from the metadata KV.
@@ -1134,54 +1112,6 @@ pub(super) fn tail_lines_from_content(contents: &str, lines: usize) -> (Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── format_epoch_iso8601 ────────────────────────────────────────────────
-    //
-    // Expected strings are taken from an independent epoch->UTC converter,
-    // NOT derived by re-reading the civil-date algorithm under test.
-
-    #[test]
-    fn format_epoch_unix_epoch_is_1970() {
-        assert_eq!(format_epoch_iso8601(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn format_epoch_known_modern_instant() {
-        // 1700000000 == 2023-11-14T22:13:20Z (a well-known round epoch).
-        assert_eq!(format_epoch_iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
-    }
-
-    #[test]
-    fn format_epoch_leap_day() {
-        // 2024 is a leap year; 1709164800 is exactly midnight of Feb 29.
-        // Also exercises the m <= 2 February year-adjustment branch.
-        assert_eq!(format_epoch_iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn format_epoch_year_month_boundary() {
-        // One second before 2024-01-01T00:00:00Z (1704067200) rolls the
-        // year, month, and day all back to the final second of 2023.
-        assert_eq!(format_epoch_iso8601(1_704_067_199), "2023-12-31T23:59:59Z");
-        assert_eq!(format_epoch_iso8601(1_704_067_200), "2024-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn format_epoch_january_year_adjust_branch() {
-        // A January instant exercises the m <= 2 branch with a non-zero
-        // time-of-day. 1736944245 == 2025-01-15T12:30:45Z.
-        assert_eq!(format_epoch_iso8601(1_736_944_245), "2025-01-15T12:30:45Z");
-    }
-
-    #[test]
-    fn format_epoch_negative_pre_1970_wraps_time_of_day() {
-        // Negative epochs must use Euclidean div/rem so the time-of-day
-        // wraps to a positive value rather than going negative. One second
-        // before the epoch is 1969-12-31T23:59:59Z.
-        assert_eq!(format_epoch_iso8601(-1), "1969-12-31T23:59:59Z");
-        // A full day before the epoch is exactly midnight of 1969-12-31.
-        assert_eq!(format_epoch_iso8601(-86_400), "1969-12-31T00:00:00Z");
-    }
 
     // ── validate_external_tracker_config ────────────────────────────────────
 

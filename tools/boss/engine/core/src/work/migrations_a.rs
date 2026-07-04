@@ -240,65 +240,13 @@ pub(crate) fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (rowid, value) in rows {
-            if let Some(epoch) = parse_iso8601_to_epoch(&value) {
+            if let Some(epoch) = crate::iso8601::parse_iso8601_to_epoch(&value) {
                 let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
                 conn.execute(&update_sql, params![epoch.to_string(), rowid])?;
             }
         }
     }
     Ok(())
-}
-
-/// Parse an ISO 8601 / RFC 3339 UTC timestamp like
-/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` into Unix epoch seconds. Returns
-/// `None` for any other shape (already-canonical numeric strings,
-/// non-UTC offsets, malformed values) so the caller can leave them
-/// alone.
-pub(crate) fn parse_iso8601_to_epoch(value: &str) -> Option<i64> {
-    let s = value.trim();
-    let bytes = s.as_bytes();
-    if bytes.len() < 20 {
-        return None;
-    }
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || (bytes[10] != b'T' && bytes[10] != b' ')
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    if !s.ends_with('Z') {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: u32 = s.get(5..7)?.parse().ok()?;
-    let day: u32 = s.get(8..10)?.parse().ok()?;
-    let hour: u32 = s.get(11..13)?.parse().ok()?;
-    let minute: u32 = s.get(14..16)?.parse().ok()?;
-    let second: u32 = s.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    if hour >= 24 || minute >= 60 || second >= 60 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64)
-}
-
-/// Days from the Unix epoch (1970-01-01) for a (year, month, day)
-/// triple. Howard Hinnant's `days_from_civil`; see
-/// https://howardhinnant.github.io/date_algorithms.html.
-pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let m = month as i64;
-    let y = if m <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + day as u64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe as i64 - 719_468
 }
 
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
