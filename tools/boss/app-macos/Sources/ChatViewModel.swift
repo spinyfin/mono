@@ -76,6 +76,10 @@ final class ChatViewModel: ObservableObject {
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
     @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
+    /// `attention_merges` provenance rows keyed by canonical `Attention.id`,
+    /// fetched on demand for the merge-provenance affordance (score badge
+    /// detail). Absent key means "not yet fetched", not "no merges".
+    @Published var attentionMergesByAttentionID: [String: [AttentionMerge]] = [:]
     /// Planner audit rows (`planner_runs`) keyed by project id, newest
     /// first — as returned by `list_planner_runs`. Backs the Planner
     /// review/release/undo surface (design auto-populate-project-tasks-on-
@@ -611,8 +615,19 @@ final class ChatViewModel: ObservableObject {
 
     /// Open (actionable) attention groups for the selected product — the
     /// Notifications window's primary list and the toolbar badge source.
+    /// Ordered max-item-score-desc, then created-at-desc, so cards holding
+    /// the most-corroborated items (design: notification-dedup-scoring.md
+    /// §8) rise to the top; groups with no scored items keep today's
+    /// newest-first order.
     var selectedProductOpenAttentionGroups: [AttentionGroup] {
-        selectedProductAttentionGroups.filter(\.isOpen)
+        selectedProductAttentionGroups
+            .filter(\.isOpen)
+            .sorted { lhs, rhs in
+                let lhsScore = maxItemScore(forGroup: lhs.id)
+                let rhsScore = maxItemScore(forGroup: rhs.id)
+                if lhsScore != rhsScore { return lhsScore > rhsScore }
+                return lhs.createdAt > rhs.createdAt
+            }
     }
 
     /// Count of open attention groups for the selected product. Drives the
@@ -624,6 +639,13 @@ final class ChatViewModel: ObservableObject {
     /// Members of a group, in display order.
     func attentionMembers(forGroup groupID: String) -> [Attention] {
         (attentionMembersByGroupID[groupID] ?? []).sorted { $0.ordinal < $1.ordinal }
+    }
+
+    /// Highest `score` among a group's members — the priority signal used to
+    /// badge and order cards. `1` (the default) for a group with no members
+    /// loaded yet or no folds recorded against any of them.
+    func maxItemScore(forGroup groupID: String) -> Int64 {
+        (attentionMembersByGroupID[groupID] ?? []).map(\.score).max() ?? 1
     }
 
     var selectedProject: WorkProject? {
@@ -2279,6 +2301,8 @@ final class ChatViewModel: ObservableObject {
         case .attentionGroupActioned(let group, let members):
             upsertAttentionGroup(group)
             attentionMembersByGroupID[group.id] = members
+        case .attentionMergesList(let attentionID, let merges):
+            attentionMergesByAttentionID[attentionID] = merges
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
             openingReviewTerminalIDs.remove(workItemID)
             let resolved = task(withID: workItemID)

@@ -1053,37 +1053,10 @@ impl WorkDb {
 }
 
 // ===========================================================================
-// attention_merges — provenance ledger (P1203 task 1)
+// attention_merges — provenance ledger (P1203 task 1). `AttentionMerge`
+// itself lives in `boss_protocol` so it can ride the wire (P1203 task 8 —
+// the Notifications UI reads it via `ListAttentionMerges`).
 // ===========================================================================
-
-/// One row of the `attention_merges` provenance ledger. Records every fold
-/// event: which candidate was reconciled into which canonical (or suppressed
-/// as a work-item dup / sensibility), the model that decided, the rationale,
-/// and any bounded edits applied to the canonical.
-#[derive(Debug, Clone, bon::Builder)]
-#[builder(on(String, into))]
-pub struct AttentionMerge {
-    pub id: String,
-    /// Set for `AttentionDup` folds; `None` for `WorkItemDup` / sensibility.
-    pub canonical_attention_id: Option<String>,
-    /// Set for `WorkItemDup` folds; `None` for `AttentionDup` / sensibility.
-    pub canonical_work_item_id: Option<String>,
-    pub product_id: String,
-    /// `"creation"` | `"sweep"` | `"sensibility"`.
-    pub trigger: String,
-    /// Set for sweep folds (retired loser row id); `None` for creation-time
-    /// folds (the candidate was never persisted).
-    pub duplicate_attention_id: Option<String>,
-    /// Rendered text of the candidate that was folded.
-    pub candidate_summary: String,
-    /// Source run / task id of the duplicate.
-    pub candidate_source: Option<String>,
-    pub model: String,
-    pub decision_rationale: Option<String>,
-    /// JSON `[{field, before, after}]` or `None` when no edit was applied.
-    pub edits_applied: Option<String>,
-    pub created_at: String,
-}
 
 /// Input for inserting one `attention_merges` row.
 #[derive(Debug, Clone, bon::Builder)]

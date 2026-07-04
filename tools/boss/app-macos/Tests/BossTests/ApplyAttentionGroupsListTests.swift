@@ -57,7 +57,8 @@ final class ApplyAttentionGroupsListTests: XCTestCase {
             proposedEffort: nil,
             proposedWorkKind: nil,
             rationale: nil,
-            confidenceSource: "structured"
+            confidenceSource: "structured",
+            score: 1
         )
     }
 

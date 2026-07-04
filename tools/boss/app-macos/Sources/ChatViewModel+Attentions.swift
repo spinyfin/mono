@@ -77,6 +77,21 @@ extension ChatViewModel {
         engine.sendDismissAttention(id: groupID, reason: nil)
     }
 
+    /// Load the `attention_merges` provenance rows for a canonical item the
+    /// first time it's needed (score badge tapped/shown) — subsequent calls
+    /// for the same id are a no-op since the reply is cached keyed by id.
+    /// Backs the Notifications window's merge-provenance affordance.
+    func loadAttentionMergesIfNeeded(forAttention attentionID: String) {
+        guard attentionMergesByAttentionID[attentionID] == nil else { return }
+        engine.sendListAttentionMerges(attentionID: attentionID)
+    }
+
+    /// Cached `attention_merges` rows for a canonical item, or `nil` if not
+    /// yet fetched (see [[loadAttentionMergesIfNeeded]]).
+    func attentionMerges(forAttention attentionID: String) -> [AttentionMerge]? {
+        attentionMergesByAttentionID[attentionID]
+    }
+
     /// Action a group — produce its downstream artifact (one revision /
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.

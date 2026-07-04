@@ -177,6 +177,44 @@ pub struct AttentionGroup {
     pub source_task_id: Option<String>,
 }
 
+/// One row of the `attention_merges` provenance ledger. Records every fold
+/// event: which candidate was reconciled into which canonical (or suppressed
+/// as a work-item dup / sensibility), the model that decided, the rationale,
+/// and any bounded edits applied to the canonical. Id prefix `merge`.
+///
+/// Design: `tools/boss/docs/designs/notification-dedup-scoring.md` §2, §8.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AttentionMerge {
+    pub id: String,
+    /// Rendered text of the candidate that was folded.
+    pub candidate_summary: String,
+    pub created_at: String,
+    /// Model slug used for the dedup decision.
+    pub model: String,
+    pub product_id: String,
+    /// `"creation"` | `"sweep"` | `"sensibility"`.
+    pub trigger: String,
+    /// Set for `AttentionDup` folds; `None` for `WorkItemDup` / sensibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_attention_id: Option<String>,
+    /// Set for `WorkItemDup` folds; `None` for `AttentionDup` / sensibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_work_item_id: Option<String>,
+    /// Source run / task id of the duplicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_rationale: Option<String>,
+    /// Set for sweep folds (retired loser row id); `None` for creation-time
+    /// folds (the candidate was never persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_attention_id: Option<String>,
+    /// JSON `[{field, before, after}]` or `None` when no edit was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits_applied: Option<String>,
+}
+
 /// A standing, triggered instruction that periodically asks whether a
 /// concrete maintenance task exists right now, and if so spawns one via
 /// a two-phase triage → execute flow. Automations live outside the normal

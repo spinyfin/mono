@@ -320,6 +320,9 @@ enum EngineEvent {
     /// Pushed after `action_attention_group` succeeds: the now-`actioned`
     /// group, its terminal members, and the produced-artifact ref.
     case attentionGroupActioned(group: AttentionGroup, members: [Attention])
+    /// Reply to `list_attention_merges` — the `attention_merges` provenance
+    /// rows folded into one canonical `Attention`, chronological.
+    case attentionMergesList(attentionID: String, merges: [AttentionMerge])
     // MARK: Editorial controls events
     /// Response to `evaluate_editorial_rules` — the outcome of running the
     /// product's rules against the supplied body + optional title.
@@ -689,6 +692,13 @@ final class EngineClient: @unchecked Sendable {
         var payload: [String: Any] = ["type": "dismiss_attention", "id": id]
         if let reason { payload["reason"] = reason }
         sendLine(payload)
+    }
+
+    /// Fetch the `attention_merges` provenance rows folded into one
+    /// canonical `Attention` (`atn_…`) — feeds the Notifications window's
+    /// merge-provenance affordance. Replies with `attention_merges_list`.
+    func sendListAttentionMerges(attentionID: String) {
+        sendLine(["type": "list_attention_merges", "attention_id": attentionID])
     }
 
     /// Ask the engine to lease a workspace for the given Review-column
@@ -1822,6 +1832,13 @@ final class EngineClient: @unchecked Sendable {
                 let members = (payload["members"] as? [[String: Any]] ?? [])
                     .compactMap(parseAttention)
                 emit(.attentionGroupActioned(group: group, members: members))
+            case "attention_merges_list":
+                let attentionID = payload["attention_id"] as? String ?? ""
+                let merges = (payload["merges"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttentionMerge)
+                if !attentionID.isEmpty {
+                    emit(.attentionMergesList(attentionID: attentionID, merges: merges))
+                }
             case "review_terminal_ready":
                 let workItemID = payload["work_item_id"] as? String ?? ""
                 let workspacePath = payload["workspace_path"] as? String ?? ""
@@ -2418,6 +2435,15 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
         return attention
+    }
+
+    private func parseAttentionMerge(_ payload: [String: Any]) -> AttentionMerge? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let merge = try? JSONDecoder().decode(AttentionMerge.self, from: data)
+        else {
+            return nil
+        }
+        return merge
     }
 
     private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
