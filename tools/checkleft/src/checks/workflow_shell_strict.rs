@@ -75,6 +75,7 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                 Ok(workflow) => workflow,
                 Err(error) => {
                     findings.push(Finding {
+                        fixable: false,
                         severity: Severity::Error,
                         message: format!("failed to parse workflow YAML while enforcing strict shell mode: {error}"),
                         location: Some(Location {
@@ -93,6 +94,7 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
 
             for violation in find_non_strict_run_scripts(&workflow) {
                 findings.push(Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: format!(
                         "GitHub Actions run script in job `{}` step {} must start with `set -euo pipefail`.",

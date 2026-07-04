@@ -86,6 +86,7 @@ pub fn bypass_failure_guidance(bypass_name: &str) -> String {
 
 pub fn bypass_applied_finding(bypass_name: &str, reason: &str, location: Option<Location>) -> Finding {
     Finding {
+        fixable: false,
         severity: Severity::Warning,
         message: format!("check was bypassed via `{bypass_name}`"),
         location,

@@ -59,6 +59,7 @@ impl ConfiguredCheck for RustTestRuleCoverageCheck {
             }
 
             findings.push(Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "new Rust test file is not covered by a package rust_test rule".to_owned(),
                 location: Some(Location {

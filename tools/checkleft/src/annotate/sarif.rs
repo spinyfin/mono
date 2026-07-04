@@ -121,6 +121,7 @@ mod tests {
 
     fn make_finding(severity: Severity, msg: &str, path: &str, line: Option<u32>, col: Option<u32>) -> Finding {
         Finding {
+            fixable: false,
             severity,
             message: msg.to_owned(),
             location: Some(Location {
@@ -135,6 +136,7 @@ mod tests {
 
     fn make_finding_no_location(severity: Severity, msg: &str) -> Finding {
         Finding {
+            fixable: false,
             severity,
             message: msg.to_owned(),
             location: None,

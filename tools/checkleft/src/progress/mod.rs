@@ -247,6 +247,7 @@ mod tests {
 
     fn finding(severity: Severity, path: Option<&str>) -> Finding {
         Finding {
+            fixable: false,
             severity,
             message: "m".to_owned(),
             location: path.map(|p| Location {

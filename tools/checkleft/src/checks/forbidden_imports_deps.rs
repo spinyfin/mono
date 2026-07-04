@@ -90,6 +90,7 @@ impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
                     }
 
                     findings.push(Finding {
+                        fixable: false,
                         severity: rule.severity,
                         message: rule.message.clone(),
                         location: Some(Location {

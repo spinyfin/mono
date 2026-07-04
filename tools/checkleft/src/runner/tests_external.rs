@@ -26,6 +26,179 @@ kind = "passthrough"
     parse_external_check_package_manifest(&manifest).expect("valid declarative manifest")
 }
 
+/// Same shape as [`declarative_package`] but with a `fix` block declared on the
+/// invocation, so [`ExternalCheckPackage::is_fixable`] reports `true`.
+fn declarative_package_with_fix(check_id: &str) -> ExternalCheckPackage {
+    let manifest = r#"
+id = "CHECK_ID"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[needs.tool.default]
+path = "rustfmt"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["--check", "{{files}}"]
+exit = { "0" = "ok", "1" = "findings", default = "error" }
+
+[invocations.transform]
+kind = "passthrough"
+
+[invocations.fix]
+args = ["--write", "{{files}}"]
+exit = { "0" = "ok", default = "error" }
+"#
+    .replace("CHECK_ID", check_id);
+    parse_external_check_package_manifest(&manifest).expect("valid declarative manifest with a fix block")
+}
+
+/// Fixture run with a mix of fixable/unfixable findings across two declarative
+/// checks: one whose package declares a `fix` block (all-fixable) and one that
+/// doesn't (none-fixable). Covers scope item 5's all-fixable and none-fixable
+/// variants alongside the per-finding built-in mix in `runner/tests.rs`.
+#[tokio::test]
+async fn runner_marks_findings_fixable_for_declarative_check_with_fix_block() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create dirs");
+    fs::write(temp.path().join("src/main.rs"), "fn main(){}\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/rust"
+check = "format/rust"
+implementation = "generated:format/rust"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(declarative_package_with_fix("format/rust")),
+    };
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "format/rust".to_owned(),
+            findings: vec![Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "file needs formatting".to_owned(),
+                location: Some(Location {
+                    path: std::path::PathBuf::from("src/main.rs"),
+                    line: None,
+                    column: None,
+                }),
+                remediations: vec![],
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("src/main.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    let finding = &results[0].findings[0];
+    assert!(
+        finding.fixable,
+        "a declarative check whose package declares a fix block must mark its findings fixable"
+    );
+    assert!(
+        finding.remediations.iter().any(|r| r.contains("checkleft fix")),
+        "fixable finding must advertise `checkleft fix` as a remediation: {:?}",
+        finding.remediations
+    );
+}
+
+#[tokio::test]
+async fn runner_leaves_findings_unfixable_for_declarative_check_without_fix_block() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "domain-typo"
+check = "domain-typo-check"
+implementation = "generated:domain-typo-check"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(declarative_package("domain-typo-check")),
+    };
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: vec![Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "typo found".to_owned(),
+                location: Some(Location {
+                    path: std::path::PathBuf::from("docs/file.md"),
+                    line: None,
+                    column: None,
+                }),
+                remediations: vec![],
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    let finding = &results[0].findings[0];
+    assert!(
+        !finding.fixable,
+        "a declarative check whose package declares no fix block must not mark findings fixable"
+    );
+    assert!(
+        !finding.remediations.iter().any(|r| r.contains("checkleft fix")),
+        "unfixable finding must not advertise `checkleft fix`: {:?}",
+        finding.remediations
+    );
+}
+
 #[tokio::test]
 async fn runner_reports_missing_external_package() {
     let temp = tempdir().expect("create temp dir");
@@ -167,6 +340,7 @@ allow_bypass = true
         result: Some(CheckResult {
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "external ran".to_owned(),
                 location: None,
@@ -230,6 +404,7 @@ implementation = "generated:domain-typo-check"
         result: Some(CheckResult {
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "local declarative ran".to_owned(),
                 location: None,
@@ -305,6 +480,7 @@ severity = "error"
         result: Some(CheckResult {
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "external warning".to_owned(),
                 location: None,
@@ -376,6 +552,7 @@ allow_bypass = true
         result: Some(CheckResult {
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "external error".to_owned(),
                 location: None,
@@ -603,6 +780,7 @@ checks:
         result: Some(CheckResult {
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Warning,
                 message: "external file declarative ran".to_owned(),
                 location: None,
@@ -755,6 +933,7 @@ config.config_file = "eslint.config.js"
             check_id: "lint/js".to_owned(),
             findings: vec![
                 Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: "no-unused-vars: 'x' is defined but never used.".to_owned(),
                     location: Some(Location {
@@ -766,6 +945,7 @@ config.config_file = "eslint.config.js"
                     suggested_fix: None,
                 },
                 Finding {
+                    fixable: false,
                     severity: Severity::Warning,
                     message: "no-console: Unexpected console statement.".to_owned(),
                     location: Some(Location {
@@ -848,6 +1028,7 @@ severity = "warning"
             check_id: "lint/js".to_owned(),
             findings: vec![
                 Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: "no-unused-vars: 'x' is defined but never used.".to_owned(),
                     location: Some(Location {
@@ -859,6 +1040,7 @@ severity = "warning"
                     suggested_fix: None,
                 },
                 Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: "no-console: Unexpected console statement.".to_owned(),
                     location: Some(Location {

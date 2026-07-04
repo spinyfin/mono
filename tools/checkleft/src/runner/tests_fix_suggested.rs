@@ -129,6 +129,7 @@ fn make_runner_with_files(dir: &tempfile::TempDir, files: &[(&str, &[u8])]) -> R
 
 fn finding_with_fix(file: &str, line: Option<u32>, old_text: &str, new_text: &str) -> Finding {
     Finding {
+        fixable: false,
         severity: Severity::Error,
         message: "test finding".to_owned(),
         location: Some(Location {
@@ -186,6 +187,7 @@ fn apply_suggested_fixes_refuses_non_unique_without_position() {
     let result = CheckResult {
         check_id: "my-check".to_owned(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: "test".to_owned(),
             location: Some(Location {
@@ -271,6 +273,7 @@ fn apply_suggested_fixes_refused_edit_does_not_block_other_files() {
         findings: vec![
             // Edit for a.txt: ambiguous (no position, 2 occurrences) — will be refused.
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "a".to_owned(),
                 location: Some(Location {
@@ -290,6 +293,7 @@ fn apply_suggested_fixes_refused_edit_does_not_block_other_files() {
             },
             // Edit for b.txt: unique — must succeed.
             Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "b".to_owned(),
                 location: Some(Location {

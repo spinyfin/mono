@@ -146,6 +146,7 @@ impl CompiledAllowedVersionPatternsRule {
         }
 
         Some(Finding {
+            fixable: false,
             severity: self.severity,
             message: self.message.clone().unwrap_or_else(|| {
                 format!(

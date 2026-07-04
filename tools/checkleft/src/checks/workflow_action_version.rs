@@ -74,6 +74,7 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                 Ok(workflow) => workflow,
                 Err(error) => {
                     findings.push(Finding {
+                        fixable: false,
                         severity: Severity::Error,
                         message: format!("failed to parse workflow YAML while enforcing action versions: {error}"),
                         location: Some(Location {
@@ -94,6 +95,7 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
 
             for violation in find_version_violations(&workflow, &self.rules) {
                 findings.push(Finding {
+                    fixable: false,
                     severity: self.severity,
                     message: format!(
                         "GitHub Action `{}` in job `{}` step {} must use `@{}` (found `@{}`).",

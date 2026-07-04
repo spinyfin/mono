@@ -78,6 +78,33 @@ struct ScheduledRuns {
     diagnostics: Vec<CheckResult>,
 }
 
+/// The remediation bullet injected for every fixable finding, advertising the
+/// one-command remedy so a human (or agent) never has to discover `checkleft
+/// fix` by hand-rolling the check's underlying tool.
+const FIX_REMEDIATION: &str = "Run `checkleft fix` to apply this automatically.";
+
+/// Mark each `Error`/`Warning` finding in `result` as fixable when either the
+/// producing check declares check-level fix capability (`check_level_fixable`,
+/// e.g. a declarative check's `fix` block) or the finding itself carries a
+/// `suggested_fix` (a built-in check's per-finding fix). `Info` findings are
+/// never marked fixable — they are advisory and `checkleft fix` does not act
+/// on them (mirrors `compute_fix_plan`'s eligibility filter in `main.rs`).
+///
+/// Every fixable finding gets a leading "run `checkleft fix`" remediation
+/// bullet (the lowest-effort resolution) through the existing remediation
+/// pipeline, so human output, JSON, and SARIF all advertise fixability the
+/// same way the `finding.fixable` field does.
+fn mark_fixability(result: &mut CheckResult, check_level_fixable: bool) {
+    for finding in &mut result.findings {
+        let eligible = matches!(finding.severity, Severity::Error | Severity::Warning);
+        let fixable = eligible && (check_level_fixable || finding.suggested_fix.is_some());
+        finding.fixable = fixable;
+        if fixable && !finding.remediations.iter().any(|r| r == FIX_REMEDIATION) {
+            finding.remediations.insert(0, FIX_REMEDIATION.to_owned());
+        }
+    }
+}
+
 /// The number of fix passes `dispatch_fix` applies when `--max-passes` is not
 /// supplied on the command line. Must be ≥ 2 so a formatter that requires two
 /// passes to reach a stable state converges in a single `checkleft fix --all`
@@ -205,8 +232,11 @@ impl Runner {
                                 let elapsed = check_start.elapsed();
                                 // Report findings under the configured instance id.
                                 result.check_id = configured_check_id.clone();
-                                let result =
+                                let mut result =
                                     apply_policy_to_result(result, &run_policy, &run_changeset, &exclusion_matcher);
+                                // Built-in checks declare fix capability per-finding via
+                                // `suggested_fix`, not at the check level.
+                                mark_fixability(&mut result, false);
                                 info!(
                                     check_id = %configured_check_id,
                                     elapsed_ms = elapsed.as_millis(),
@@ -230,6 +260,7 @@ impl Runner {
                     let result = CheckResult {
                         check_id: run.configured_check_id,
                         findings: vec![Finding {
+                            fixable: false,
                             severity: Severity::Error,
                             message: format!(
                                 "configured check references unknown implementation `{implementation_check_id}`"
@@ -275,6 +306,7 @@ impl Runner {
                         file_count,
                         "running external check"
                     );
+                    let package_fixable = package.is_fixable();
                     reporter.register(&configured_check_id, file_count);
                     let reporter = Arc::clone(&reporter);
 
@@ -307,8 +339,9 @@ impl Runner {
                                 Ok(mut result) => {
                                     let elapsed = check_start.elapsed();
                                     result.check_id = configured_check_id.clone();
-                                    let result =
+                                    let mut result =
                                         apply_policy_to_result(result, &run_policy, &run_changeset, &exclusion_matcher);
+                                    mark_fixability(&mut result, package_fixable);
                                     info!(
                                         check_id = %configured_check_id,
                                         elapsed_ms = elapsed.as_millis(),
@@ -336,6 +369,7 @@ impl Runner {
                     let result = CheckResult {
                         check_id: run.configured_check_id,
                         findings: vec![Finding {
+                            fixable: false,
                             severity: Severity::Error,
                             message,
                             location: Some(Location {
@@ -360,6 +394,7 @@ impl Runner {
                     let result = CheckResult {
                         check_id,
                         findings: vec![Finding {
+                            fixable: false,
                             severity: Severity::Error,
                             message: format!("check execution failed: {err:#}"),
                             location: Some(Location {
@@ -480,6 +515,7 @@ impl Runner {
                         let line =
                             self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
                         findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                            fixable: false,
                             severity,
                             message: format!(
                                 "exclusion `{}` is no longer needed: {reason}; remove this entry.",
@@ -580,6 +616,7 @@ impl Runner {
                         let line =
                             self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
                         findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                            fixable: false,
                             severity,
                             message: format!(
                                 "exclusion `{}` is no longer needed: {reason}; remove this entry.",
@@ -1239,6 +1276,7 @@ fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
     CheckResult {
         check_id: diagnostic.check_id.clone(),
         findings: vec![Finding {
+            fixable: false,
             severity: Severity::Error,
             message: diagnostic.message.clone(),
             location: Some(diagnostic.location.clone()),

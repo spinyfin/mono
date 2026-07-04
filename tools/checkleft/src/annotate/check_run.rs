@@ -350,6 +350,7 @@ mod tests {
 
     fn finding(severity: Severity, message: &str, file: &str, line: Option<u32>, column: Option<u32>) -> Finding {
         Finding {
+            fixable: false,
             severity,
             message: message.to_owned(),
             location: Some(Location {
@@ -364,6 +365,7 @@ mod tests {
 
     fn finding_no_location(severity: Severity, message: &str) -> Finding {
         Finding {
+            fixable: false,
             severity,
             message: message.to_owned(),
             location: None,

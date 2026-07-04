@@ -75,6 +75,7 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                 Ok(workflow) => workflow,
                 Err(error) => {
                     findings.push(Finding {
+                        fixable: false,
                         severity: Severity::Error,
                         message: format!("failed to parse workflow YAML while checking run patterns: {error}"),
                         location: Some(Location {
@@ -97,6 +98,7 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                         continue;
                     }
                     findings.push(Finding {
+                        fixable: false,
                         severity: rule.severity,
                         message: format!(
                             "GitHub Actions run script in job `{}` step {}: {}",

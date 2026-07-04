@@ -2088,10 +2088,34 @@ fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Dur
         }
     }
 
-    format!(
+    let mut out = format!(
         "{}: {errors} error(s), {warnings} warning(s), {infos} info finding(s)\n",
         style.paint_bold("summary")
-    )
+    );
+    if let Some(hint) = fixability_hint(results, total_findings, style) {
+        out.push_str(&hint);
+    }
+    out
+}
+
+/// Terse, copy-pasteable line advertising `checkleft fix` when at least one
+/// finding in `results` is auto-fixable. Returns `None` when nothing is
+/// fixable, so callers can skip the line entirely.
+fn fixability_hint(results: &[CheckResult], total_findings: usize, style: OutputStyle) -> Option<String> {
+    let fixable_findings = results
+        .iter()
+        .flat_map(|result| &result.findings)
+        .filter(|f| f.fixable)
+        .count();
+    if fixable_findings == 0 {
+        return None;
+    }
+    let body = if fixable_findings == total_findings {
+        "all findings auto-fixable — run `checkleft fix` to apply.".to_owned()
+    } else {
+        format!("{fixable_findings} of {total_findings} findings are auto-fixable — run `checkleft fix` to apply.")
+    };
+    Some(format!("{}: {body}\n", style.paint_info("fixable")))
 }
 
 fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {
@@ -2130,6 +2154,9 @@ fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Du
         "{}: {errors} error(s), {warnings} warning(s), {infos} info finding(s)\n",
         style.paint_bold("summary")
     ));
+    if let Some(hint) = fixability_hint(results, total_findings, style) {
+        output.push_str(&hint);
+    }
     output
 }
 

@@ -178,6 +178,7 @@ impl CompiledRequiredFlagRule {
         }
 
         vec![Finding {
+            fixable: false,
             severity: self.severity,
             message: self.message.clone().unwrap_or_else(|| match &self.value {
                 Some(value) => format!(
@@ -240,6 +241,7 @@ impl CompiledForbiddenFlagRule {
             .filter(|entry| self.matches(entry))
             .filter(|entry| changed_paths.contains(&entry.source_path))
             .map(|entry| Finding {
+                fixable: false,
                 severity: self.severity,
                 message: self.message.clone().unwrap_or_else(|| {
                     format!(

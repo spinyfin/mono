@@ -99,6 +99,7 @@ mod tests {
         let result = CheckResult {
             check_id: "spelling-typos".to_owned(),
             findings: vec![Finding {
+                fixable: false,
                 severity: Severity::Error,
                 message: "Found typo".to_owned(),
                 location: Some(Location {

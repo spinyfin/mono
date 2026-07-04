@@ -124,6 +124,7 @@ fn run_typo_check(
                 };
 
                 findings.push(Finding {
+                    fixable: false,
                     severity: Severity::Error,
                     message: format!(
                         "Found typo `{}`; use `{}` instead.",

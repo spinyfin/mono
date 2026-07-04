@@ -178,6 +178,7 @@ impl FindingTemplate {
             .map(|remediation| remediation.render(item, context))
             .collect::<Result<Vec<_>>>()?;
         Ok(Finding {
+            fixable: false,
             severity,
             message,
             location: Some(Location { path, line, column }),
@@ -262,6 +263,7 @@ impl LineListTransform {
                     .map(|r| r.render(NO_JSON_ITEM, context))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Finding {
+                    fixable: false,
                     severity: self.severity,
                     message,
                     location: Some(Location {
