@@ -49,16 +49,49 @@
 //!      increment the attempt counter and proceed to orphan+respawn.
 //!   4. **Resume** (transient, under the cap, not nudgeable): orphan the
 //!      dead execution and insert a fresh `ready` one that prefers the
-//!      same cube workspace (so `--prefer` re-leases it and the
-//!      in-progress jj branch is not lost), carrying an incremented
-//!      `transient_failure_count` and a `dispatch_not_before` backoff.
-//!      The runner's existing startup-recovery prompt then directs the
-//!      new worker to resume the prior branch.
+//!      same cube workspace with `allow_dirty = true` (so `--prefer
+//!      --allow-dirty` re-leases the exact workspace *without* cube
+//!      resetting it, and the in-progress jj branch is not lost),
+//!      carrying an incremented `transient_failure_count` and a
+//!      `dispatch_not_before` backoff. The runner's existing
+//!      startup-recovery prompt then directs the new worker to resume
+//!      the prior branch. `allow_dirty` also hardens the workspace-lease
+//!      fallback (`crate::coordinator`'s `lease_workspace_with_fallback`):
+//!      a failed lease on the preferred workspace fails the dispatch
+//!      outright instead of silently landing on a different, clean
+//!      workspace, which would strand the uncommitted work.
 //!   5. **Escalate** (permanent / unrecognised / retry cap reached):
 //!      raise a `WorkAttentionItem` and stop. The orphan-active sweep
 //!      excludes work items with an open recovery attention item
 //!      (`list_orphan_active_candidates`), so a non-retryable failure is
 //!      not blindly re-dispatched.
+//!
+//! ## Verifying continuation, not just dispatch
+//!
+//! A nudge or an orphan+respawn is a bare resume: the CLI comes up (or a
+//! runtime message is injected) but that alone is not proof the worker
+//! is actually doing anything — a resumed session can itself park with
+//! no activity (e.g. it hits a permission/notification prompt before
+//! ever processing a turn). Left undetected, that reads as `{resumed:
+//! 1}` "success" forever, because
+//! [`crate::transient_error::extract_worker_error`] only recognises a
+//! *trailing API error*; an empty, inert transcript matches neither
+//! "errored" nor "recovered," so the old logic just skipped it
+//! (`no_error_skipped`) on every later pass too.
+//!
+//! Every pass, executions with `transient_failure_count > 0` (i.e. this
+//! execution is itself the product of an earlier auto-resume) are also
+//! checked with [`crate::transient_error::transcript_shows_no_activity`].
+//! If the transcript is still empty of any progress or error entry past
+//! the grace period, the sweep treats that exactly like a fresh
+//! transient error: it re-runs the same nudge → orphan+respawn →
+//! escalate decision using the execution's *existing*
+//! `transient_failure_count` as `prior_attempts`. This closes two gaps
+//! at once: the attempt counter is consumed by a verified-failed
+//! recovery instead of being abandoned after one optimistic pass, and a
+//! resume that never actually continued eventually escalates for human
+//! attention instead of sitting `waiting_for_input` until an unrelated
+//! sweep reaps it.
 //!
 //! ## No infinite loop
 //!
@@ -84,7 +117,8 @@ use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::{
-    EscalateReason, RecoveryDecision, RecoveryPolicy, classify_claude_error, extract_worker_error,
+    ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, classify_claude_error, extract_worker_error,
+    transcript_shows_no_activity,
 };
 use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
 
@@ -260,15 +294,46 @@ pub async fn run_one_pass(
             continue;
         };
         let lines = read_transcript_tail(&transcript_path, TRANSCRIPT_TAIL_MAX_BYTES).await;
-        let Some(error_text) = extract_worker_error(&lines) else {
-            // No trailing API error: worker either finished cleanly or
-            // recovered on its own. Not ours to touch.
-            outcome.no_error_skipped += 1;
-            continue;
+        let prior_attempts = execution.transient_failure_count.max(0) as u32;
+
+        // Two shapes of "this worker is stalled" are worth acting on:
+        //
+        //  1. A trailing API-error transcript entry — the classic case
+        //     this module was built for.
+        //  2. Verification failure: `prior_attempts > 0` means this
+        //     execution IS ITSELF the product of an earlier auto-resume
+        //     (nudge or orphan+respawn), and its transcript shows no
+        //     activity whatsoever. A bare resume is not, by itself,
+        //     proof of continuation — the CLI parks at its prompt by
+        //     design, so a resumed session that never produced a single
+        //     hook-visible event never actually got the continuation
+        //     prompt into the model. Gating on `prior_attempts > 0` (and
+        //     not just "empty transcript") keeps this from misfiring on
+        //     an ordinary fresh execution that simply hasn't started
+        //     yet — the grace guard above already covers that case for
+        //     the common short delay, but a resume chain deserves this
+        //     extra check even past grace because leaving it silently
+        //     parked is exactly the bug this closes.
+        let (error_text, class, stall_reason) = match extract_worker_error(&lines) {
+            Some(text) => {
+                let class = classify_claude_error(&text);
+                (text, class, "api_error")
+            }
+            None if prior_attempts > 0 && transcript_shows_no_activity(&lines) => (
+                "auto-resume produced no worker activity: no continuation prompt reached the session".to_owned(),
+                ErrorClass::Transient,
+                "no_activity",
+            ),
+            None => {
+                // No trailing API error, and either this isn't a resume
+                // chain or the transcript shows real activity: worker
+                // either finished cleanly or recovered on its own. Not
+                // ours to touch.
+                outcome.no_error_skipped += 1;
+                continue;
+            }
         };
 
-        let class = classify_claude_error(&error_text);
-        let prior_attempts = execution.transient_failure_count.max(0) as u32;
         let decision = policy.decide(class, prior_attempts);
         let clipped = clip(&error_text, ERROR_CLIP_BYTES);
         let work_item_id = state
@@ -286,10 +351,18 @@ pub async fn run_one_pass(
                 let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
 
                 if try_nudge {
-                    let msg = format!(
-                        "Your previous turn ended on a transient Claude API error. \
-                         Please retry the last step.\n\nError: {clipped}\n"
-                    );
+                    let msg = if stall_reason == "no_activity" {
+                        "Your previous auto-resume did not reach the model: no continuation \
+                         prompt took effect and the session parked with no activity. Please \
+                         check for any in-progress work (e.g. `jj diff`) and continue the task \
+                         from where it left off.\n"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "Your previous turn ended on a transient Claude API error. \
+                             Please retry the last step.\n\nError: {clipped}\n"
+                        )
+                    };
                     match nudger.nudge_worker(&execution_id, msg).await {
                         Ok(()) => {
                             nudged_executions.insert(execution_id.clone());
@@ -322,7 +395,7 @@ pub async fn run_one_pass(
                                         .with_work_item(&work_item_id)
                                         .with_details(serde_json::json!({
                                             "error": clipped,
-                                            "class": "transient",
+                                            "class": stall_reason,
                                         })),
                                 )
                                 .await;
@@ -344,7 +417,7 @@ pub async fn run_one_pass(
                 // --- Orphan+respawn path ---
                 let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
                 let reason = format!(
-                    "transient Claude API error (auto-resume attempt {attempt}/{max}): {clipped}",
+                    "{stall_reason} (auto-resume attempt {attempt}/{max}): {clipped}",
                     max = policy.max_attempts(),
                 );
                 if let Err(err) =
@@ -364,14 +437,15 @@ pub async fn run_one_pass(
                     max_attempts = policy.max_attempts(),
                     backoff_secs = backoff.as_secs(),
                     error = %clipped,
-                    "transient-recovery: worker stalled on transient API error; auto-resuming on same workspace",
+                    stall_reason,
+                    "transient-recovery: worker stalled; auto-resuming on same workspace",
                 );
                 release_slot(&coordinator, state.slot_id).await;
                 append_recovery_audit(
                     work_db,
                     &work_item_id,
                     &format!(
-                        "transient API error; auto-resuming attempt {attempt}/{max} after {secs}s backoff",
+                        "{stall_reason}; auto-resuming attempt {attempt}/{max} after {secs}s backoff",
                         max = policy.max_attempts(),
                         secs = backoff.as_secs(),
                     ),
@@ -385,7 +459,7 @@ pub async fn run_one_pass(
                                 "attempt": attempt,
                                 "max_attempts": policy.max_attempts(),
                                 "backoff_secs": backoff.as_secs(),
-                                "class": "transient",
+                                "class": stall_reason,
                                 "error": clipped,
                             })),
                     )
@@ -927,6 +1001,10 @@ mod tests {
             .expect("expected a fresh ready execution");
         assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
         assert_eq!(fresh.transient_failure_count, 1);
+        assert!(
+            fresh.allow_dirty,
+            "resume execution must force allow_dirty so cube doesn't wipe the recovered workspace"
+        );
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
@@ -1112,6 +1190,154 @@ mod tests {
         assert_eq!(outcome.no_error_skipped, 1);
         assert_eq!(db.get_execution(&dead_id).unwrap().status, ExecutionStatus::Running);
         assert!(sink.events().await.is_empty());
+    }
+
+    // ─── verification: resumed-but-stalled-with-no-activity ───────────
+
+    /// The regression this module now closes: a resumed session (this
+    /// execution's `transient_failure_count > 0`, i.e. it is itself the
+    /// product of an earlier auto-resume) whose transcript shows no
+    /// activity at all must NOT be silently left alone — the sweep must
+    /// treat it exactly like a fresh transient error and retry it,
+    /// consuming the existing attempt count.
+    #[tokio::test]
+    async fn resumed_execution_with_no_activity_is_retried() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        // Empty transcript: the resumed session never produced a single
+        // hook-visible event.
+        let transcript = write_transcript(&dir, "t.jsonl", &[]);
+        let db = Arc::new(db);
+        // transient_failure_count = 1: this execution IS a resume.
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 1);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live,
+            coordinator.clone(),
+            sink.as_ref(),
+            &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
+            now(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.resumed, 1,
+            "a resumed session with zero activity must be retried, not silently ignored"
+        );
+        assert_eq!(outcome.no_error_skipped, 0);
+        assert_eq!(outcome.escalated, 0);
+
+        let execs = db.list_executions(Some(&work_item_id)).unwrap();
+        let dead = execs.iter().find(|e| e.id == exec_id).unwrap();
+        assert_eq!(dead.status, ExecutionStatus::Orphaned);
+        let fresh = execs
+            .iter()
+            .find(|e| e.id != exec_id && e.status == ExecutionStatus::Ready)
+            .expect("expected a fresh ready execution");
+        assert_eq!(
+            fresh.transient_failure_count, 2,
+            "the attempt counter must be consumed (1 prior + this verified-failed retry)"
+        );
+        assert!(fresh.allow_dirty);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "transient_recovery");
+        assert_eq!(events[0].details["class"], "no_activity");
+    }
+
+    /// A brand-new execution (`transient_failure_count == 0`, i.e. never
+    /// auto-resumed) with an empty transcript must NOT be mistaken for a
+    /// stalled resume — it may simply not have started yet. Only the
+    /// resume-chain signal (`transient_failure_count > 0`) triggers the
+    /// no-activity check; guards against false positives on ordinary
+    /// slow-starting workers.
+    #[tokio::test]
+    async fn fresh_execution_with_no_activity_is_left_alone() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let transcript = write_transcript(&dir, "t.jsonl", &[]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live,
+            coordinator.clone(),
+            sink.as_ref(),
+            &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
+            now(),
+        )
+        .await;
+
+        assert_eq!(outcome.resumed, 0);
+        assert_eq!(outcome.escalated, 0);
+        assert_eq!(outcome.no_error_skipped, 1);
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// A resumed session that keeps producing zero activity, pass after
+    /// pass, must eventually escalate once the retry cap is hit — the
+    /// same "no infinite loop" guarantee the transcript-error path
+    /// already has.
+    #[tokio::test]
+    async fn resumed_execution_with_no_activity_at_cap_escalates() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let transcript = write_transcript(&dir, "t.jsonl", &[]);
+        let db = Arc::new(db);
+        // Already at the cap (3 prior transient resumes).
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 3);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live,
+            coordinator.clone(),
+            sink.as_ref(),
+            &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
+            now(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.escalated, 1,
+            "at cap, a no-activity stall must escalate not resume"
+        );
+        assert_eq!(outcome.resumed, 0);
+        let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_EXHAUSTED);
     }
 
     #[tokio::test]
