@@ -6,8 +6,66 @@
 //! here means a new field on [`CreateProductInput`] touches one site
 //! instead of ~250, and keeps the setup readable at each call site.
 
+use anyhow::Result;
+use async_trait::async_trait;
+
+use crate::coordinator::{
+    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 use crate::work::WorkDb;
 use boss_protocol::{CreateProductInput, Product};
+
+/// A [`CubeClient`] test double that panics on every method the sweep
+/// tests don't exercise. `list_workspaces`/`list_repos` return empty
+/// vecs since the coordinator calls them incidentally.
+///
+/// The sweep test modules (`dead_pid_sweep`, `orphan_sweep`,
+/// `pool_claim_sweep`, `stale_worker_sweep`, `transient_recovery`) each
+/// hand-rolled a byte-identical copy of this stub; they now share this
+/// one. Tests that need cube calls to *succeed* rather than panic (e.g.
+/// `merge_poller`) keep their own bespoke stub.
+pub struct NoopCube;
+
+#[async_trait]
+impl CubeClient for NoopCube {
+    async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
+        unimplemented!()
+    }
+    async fn lease_workspace(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: bool,
+        _: &[&str],
+    ) -> Result<CubeWorkspaceLease> {
+        unimplemented!()
+    }
+    async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
+        unimplemented!()
+    }
+    async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
+        unimplemented!()
+    }
+    async fn release_workspace(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
+        unimplemented!()
+    }
+    async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
+        unimplemented!()
+    }
+    async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+        unimplemented!()
+    }
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        Ok(vec![])
+    }
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+        Ok(vec![])
+    }
+}
 
 /// The mono repo remote used by the overwhelming majority of tests.
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
