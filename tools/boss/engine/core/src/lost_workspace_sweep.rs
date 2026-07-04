@@ -81,9 +81,13 @@ pub struct LostWorkspaceSweepOutcome {
     pub reaped: usize,
 }
 
-impl LostWorkspaceSweepOutcome {
+impl crate::sweep_loop::SweepOutcome for LostWorkspaceSweepOutcome {
     fn has_activity(&self) -> bool {
         self.reaped > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(reaped = self.reaped, "lost-workspace sweep: pass complete");
     }
 }
 
@@ -96,19 +100,19 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let outcome = run_one_pass(
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let cube_client = Arc::clone(&cube_client);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        async move {
+            run_one_pass(
                 work_db.as_ref(),
                 Arc::clone(&coordinator),
                 cube_client.as_ref(),
                 dispatch_events.as_ref(),
             )
-            .await;
-            if outcome.has_activity() {
-                tracing::info!(reaped = outcome.reaped, "lost-workspace sweep: pass complete");
-            }
-            tokio::time::sleep(interval).await;
+            .await
         }
     })
 }

@@ -129,9 +129,19 @@ pub struct TerminalWorkSweepOutcome {
     pub lookup_failed_skipped: usize,
 }
 
-impl TerminalWorkSweepOutcome {
+impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
     fn has_activity(&self) -> bool {
         self.reaped > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            reaped = self.reaped,
+            pending_confirmation = self.pending_confirmation,
+            active_skipped = self.active_skipped,
+            lookup_failed_skipped = self.lookup_failed_skipped,
+            "terminal-work sweep: reaped stranded worker(s) whose work was already terminal",
+        );
     }
 }
 
@@ -145,30 +155,29 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Candidates observed terminal+live on the previous pass. A
-        // candidate is reaped only once it appears in two consecutive
-        // passes, so this set is the confirmation memory.
-        let mut seen_terminal: HashSet<String> = HashSet::new();
-        loop {
-            let outcome = run_one_pass(
+    // Candidates observed terminal+live on the previous pass. A candidate is
+    // reaped only once it appears in two consecutive passes, so this set is
+    // the confirmation memory that must survive across passes. The shared
+    // loop helper builds a fresh future per pass, so the set lives in an
+    // `Arc<Mutex>` it can borrow each iteration — a single task ever holds
+    // the lock, so there is no real contention.
+    let seen_terminal: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let live_states = Arc::clone(&live_states);
+        let reaper = Arc::clone(&reaper);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let seen_terminal = Arc::clone(&seen_terminal);
+        async move {
+            let mut seen_terminal = seen_terminal.lock().await;
+            run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 reaper.as_ref(),
                 dispatch_events.as_ref(),
                 &mut seen_terminal,
             )
-            .await;
-            if outcome.has_activity() {
-                tracing::info!(
-                    reaped = outcome.reaped,
-                    pending_confirmation = outcome.pending_confirmation,
-                    active_skipped = outcome.active_skipped,
-                    lookup_failed_skipped = outcome.lookup_failed_skipped,
-                    "terminal-work sweep: reaped stranded worker(s) whose work was already terminal",
-                );
-            }
-            tokio::time::sleep(interval).await;
+            .await
         }
     })
 }

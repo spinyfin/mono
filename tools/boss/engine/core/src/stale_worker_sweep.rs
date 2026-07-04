@@ -117,9 +117,19 @@ pub struct StaleWorkerSweepOutcome {
     pub pre_start_event_skipped: usize,
 }
 
-impl StaleWorkerSweepOutcome {
+impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
     fn has_activity(&self) -> bool {
         self.reaped > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            reaped = self.reaped,
+            fresh_skipped = self.fresh_skipped,
+            tool_in_flight_skipped = self.tool_in_flight_skipped,
+            grace_skipped = self.grace_skipped,
+            "stale-worker sweep: pass complete",
+        );
     }
 }
 
@@ -135,9 +145,14 @@ pub fn spawn_loop(
     interval: Duration,
     stale_threshold_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let outcome = run_one_pass(
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let live_states = Arc::clone(&live_states);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let reaper = Arc::clone(&reaper);
+        async move {
+            run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 coordinator.clone(),
@@ -145,17 +160,7 @@ pub fn spawn_loop(
                 reaper.as_ref(),
                 stale_threshold_secs,
             )
-            .await;
-            if outcome.has_activity() {
-                tracing::info!(
-                    reaped = outcome.reaped,
-                    fresh_skipped = outcome.fresh_skipped,
-                    tool_in_flight_skipped = outcome.tool_in_flight_skipped,
-                    grace_skipped = outcome.grace_skipped,
-                    "stale-worker sweep: pass complete",
-                );
-            }
-            tokio::time::sleep(interval).await;
+            .await
         }
     })
 }
