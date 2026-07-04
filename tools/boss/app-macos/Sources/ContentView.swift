@@ -1642,11 +1642,16 @@ private struct WorkBoardCardItem: View {
             .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
             ?? task.docLinkState
         let externalRefLink = ExternalRefLinkPresentation.forTask(task)
-        let inReviewRevisions: [WorkTask] = column == .review
-            ? model.inReviewRevisions(forParentTaskID: task.id)
-            : column == .done
-                ? model.doneRevisions(forParentTaskID: task.id)
-                : []
+        // Roll-up rows must render wherever the parent's OWN card lands, not
+        // just in Review/Done. A revision that reaches in_review/done never
+        // gets a standalone card (see `workItems(in:)`'s rollup filter), so
+        // gating this on `column` left revisions with no visual
+        // representation at all whenever the parent's card landed somewhere
+        // else — e.g. a parent blocked for a non-review reason renders in
+        // Backlog (T2189/T2143: `reveal_work_item` had nothing to point at).
+        let inReviewRevisions: [WorkTask] = (
+            model.inReviewRevisions(forParentTaskID: task.id) + model.doneRevisions(forParentTaskID: task.id)
+        ).sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
         let parentShortID: Int? = task.kind == "revision"
             ? task.parentTaskId.flatMap { model.workTask(withID: $0)?.shortID }
             : nil

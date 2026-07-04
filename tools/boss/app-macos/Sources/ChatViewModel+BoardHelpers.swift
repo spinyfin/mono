@@ -1,7 +1,64 @@
 import Foundation
 
+/// Outcome of resolving a reveal target (`bossctl reveal` / attention-item
+/// jumps) to the actual card that should be scrolled to and highlighted.
+enum RevealCardResult: Equatable {
+    /// A real, visible card exists with this id — either the requested
+    /// item's own card, or (for a revision rolled up into its parent
+    /// because it reached `in_review`/`done`) the parent's card.
+    case revealed(cardID: String)
+    /// The id isn't loaded locally yet — the common cross-product case,
+    /// before the target product's work tree has been fetched into this
+    /// session. `revealWorkCard` proceeds optimistically against the raw
+    /// id; the `pendingRevealScrollID` handshake finishes the job once the
+    /// tree arrives. Reachability genuinely can't be verified before then.
+    case deferred
+    /// The id resolves locally but has no reachable card anywhere on the
+    /// board: it's deleted, or it's a rolled-up revision whose parent
+    /// couldn't be resolved either.
+    case unreachable(reason: String)
+}
+
 extension ChatViewModel {
     // MARK: Revisions
+
+    /// Resolves the reveal target for `taskID`. Tasks, chores, projects, and
+    /// products always host their own card. A revision that has reached
+    /// `in_review` or `done` never gets a standalone card — `workItems(in:)`
+    /// filters it out of the Review/Done columns, and it never had one in
+    /// Backlog/Doing since its own status already moved it past those — it
+    /// only ever surfaces as a rollup line on its PARENT's card (see the
+    /// `inReviewRevisions` computation in `ContentView`). So the reveal
+    /// target for such a revision is its parent's card, wherever that
+    /// parent's own status happens to place it (Backlog included — a parent
+    /// blocked for a non-review reason still renders there).
+    func revealCardTarget(for taskID: String) -> RevealCardResult {
+        guard let item = task(withID: taskID) else {
+            return .deferred
+        }
+        guard item.deletedAt == nil else {
+            return .unreachable(reason: "\(revealLabel(for: item)) is deleted")
+        }
+        guard item.kind == "revision", item.status == "in_review" || item.status == "done" else {
+            return .revealed(cardID: item.id)
+        }
+        guard let parentID = item.parentTaskId, let parent = task(withID: parentID) else {
+            return .unreachable(
+                reason: "no visible card for \(revealLabel(for: item)): its parent (\(item.parentTaskId ?? "unknown")) could not be resolved"
+            )
+        }
+        guard parent.deletedAt == nil else {
+            return .unreachable(
+                reason: "no visible card for \(revealLabel(for: item)): parent \(revealLabel(for: parent)) is deleted"
+            )
+        }
+        return .revealed(cardID: parent.id)
+    }
+
+    private func revealLabel(for task: WorkTask) -> String {
+        task.shortID.map { "T\($0)" } ?? task.id
+    }
+
 
     /// `kind == "revision"` tasks for parentID with status `"in_review"`.
     func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
