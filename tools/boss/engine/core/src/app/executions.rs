@@ -30,13 +30,7 @@ pub(super) async fn handle_create_execution(ctx: Dispatch, req: FrontendRequest)
             send_response(&sink, &request_id, FrontendEvent::ExecutionCreated { execution });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -89,13 +83,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                         match coordinator.force_dispatch(&execution_id).await {
                             Ok(_worker_id) => {}
                             Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: err.to_string(),
-                                    },
-                                );
+                                send_work_error(&sink, &request_id, &err);
                                 return;
                             }
                         }
@@ -131,13 +119,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                 }
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -178,13 +160,7 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -206,13 +182,7 @@ pub(super) async fn handle_get_task_runtime(ctx: Dispatch, req: FrontendRequest)
                 send_response(&sink, &request_id, FrontendEvent::TaskRuntimeResult { runtime });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -233,13 +203,7 @@ pub(super) async fn handle_get_execution(ctx: Dispatch, req: FrontendRequest) {
             send_response(&sink, &request_id, FrontendEvent::ExecutionResult { execution });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -259,13 +223,7 @@ pub(super) async fn handle_create_run(ctx: Dispatch, req: FrontendRequest) {
             send_response(&sink, &request_id, FrontendEvent::RunCreated { run });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -285,13 +243,7 @@ pub(super) async fn handle_list_runs(ctx: Dispatch, req: FrontendRequest) {
             send_response(&sink, &request_id, FrontendEvent::RunsList { execution_id, runs });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -534,13 +486,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                 send_response(&sink, &request_id, FrontendEvent::ExecutionCancelled { execution });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -614,13 +560,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                 send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -799,13 +739,7 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
         let execution = match work_db.get_execution(&execution_id) {
             Ok(exec) => exec,
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
                 return;
             }
         };
@@ -894,13 +828,7 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
     {
         match work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
             Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::EngineAttemptsList { attempts }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

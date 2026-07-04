@@ -267,13 +267,7 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
                 );
                 send_response(&sink, &request_id, FrontendEvent::FeatureFlagSet { name, enabled });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -361,13 +355,7 @@ pub(super) async fn handle_set_setting(ctx: Dispatch, req: FrontendRequest) {
                 );
                 send_response(&sink, &request_id, FrontendEvent::SettingSet { key, enabled });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }

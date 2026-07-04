@@ -35,13 +35,7 @@ pub(super) async fn handle_create_product(ctx: Dispatch, req: FrontendRequest) {
             send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -67,13 +61,7 @@ pub(super) async fn handle_list_products(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }
@@ -107,13 +95,7 @@ pub(super) async fn handle_set_product_default_model(ctx: Dispatch, req: Fronten
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -147,13 +129,7 @@ pub(super) async fn handle_set_product_default_driver(ctx: Dispatch, req: Fronte
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -187,13 +163,7 @@ pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: Front
                 .await;
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -227,13 +197,7 @@ pub(super) async fn handle_evaluate_editorial_rules(ctx: Dispatch, req: Frontend
             return;
         }
         Err(err) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            );
+            send_work_error(&sink, &request_id, &err);
             return;
         }
     };

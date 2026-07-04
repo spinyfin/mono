@@ -29,13 +29,7 @@ pub(super) async fn handle_list_conflict_resolutions(ctx: Dispatch, req: Fronten
         // caller can already read the SQLite file.
         match work_db.list_conflict_resolutions(product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
             Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::ConflictResolutionsList { attempts }),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -60,13 +54,7 @@ pub(super) async fn handle_get_conflict_resolution(ctx: Dispatch, req: FrontendR
                     message: format!("conflict resolution attempt {attempt_id:?} is unknown",),
                 },
             ),
-            Err(err) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError {
-                    message: err.to_string(),
-                },
-            ),
+            Err(err) => send_work_error(&sink, &request_id, &err),
         }
     }
 }
@@ -122,13 +110,7 @@ pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: Fronten
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -184,13 +166,7 @@ pub(super) async fn handle_abandon_conflict_resolution(ctx: Dispatch, req: Front
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }
@@ -258,13 +234,7 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
                 );
             }
             Err(err) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
+                send_work_error(&sink, &request_id, &err);
             }
         }
     }

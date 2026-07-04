@@ -96,7 +96,7 @@ use handler_helpers::{
     handle_create_many, in_review_chore_execution, live_execution_for_deleted_item, load_dispatch_paused_state,
     load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
     publish_comment_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    segment_to_wire, send_push, send_response, send_response_with_revision, tail_lines_from_content,
+    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
     task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
     transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
     work_item_product_id,

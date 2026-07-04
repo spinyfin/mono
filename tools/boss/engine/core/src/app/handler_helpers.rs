@@ -298,6 +298,20 @@ pub(super) fn send_response(sink: &SessionSink, request_id: &str, payload: Front
     sink.enqueue(FrontendEventEnvelope::response(request_id.to_owned(), payload));
 }
 
+/// Reply to `request_id` with a `WorkError` carrying `err`'s display
+/// string. Factors out the identical error-response arm repeated across
+/// every `FrontendRequest` handler module. The `impl Display` bound lets
+/// callers pass an `anyhow::Error` (`&err`), a `String`, or a `&str`.
+pub(super) fn send_work_error(sink: &SessionSink, request_id: &str, err: impl std::fmt::Display) {
+    send_response(
+        sink,
+        request_id,
+        FrontendEvent::WorkError {
+            message: err.to_string(),
+        },
+    );
+}
+
 pub(super) fn send_response_with_revision(sink: &SessionSink, request_id: &str, revision: u64, payload: FrontendEvent) {
     sink.enqueue(FrontendEventEnvelope::response_with_revision(
         request_id.to_owned(),
