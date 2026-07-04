@@ -35,19 +35,144 @@ swift_library(
     ],
 )
 
+# BossTests is sharded across four independent macos_unit_test targets so
+# each one fits comfortably inside the "small" (60s) timeout as the suite
+# grows (see CI timeout in exec_18bf0a6008fc0cc0_170). rules_apple's default
+# macos test runner (apple/testing/default_runner) does not implement Bazel's
+# native shard_count sharding protocol (no TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
+# handling), so `shard_count` on a single macos_unit_test is a no-op here —
+# splitting into separate targets is the mechanism that actually parallelizes
+# test execution for this rule.
+#
+# CommentsTests.swift + TranscriptViewTests.swift are split into their own
+# shard because CommentLayerTests alone accounts for ~85% of total XCTest
+# runtime (~12.8s of ~14.9s measured locally); bundling it with anything else
+# risks that shard alone approaching the timeout. The remaining files are
+# split into three buckets balanced by source line count.
 macos_unit_test(
-    name = "BossTests",
+    name = "BossTestsCommentsTranscript",
     size = "small",
     minimum_os_version = "15.0",
-    deps = [":boss_mac_app_tests_lib"],
+    deps = [":boss_mac_app_tests_comments_transcript_lib"],
 )
 
 swift_library(
-    name = "boss_mac_app_tests_lib",
+    name = "boss_mac_app_tests_comments_transcript_lib",
     testonly = True,
-    srcs = glob(["Tests/BossTests/**/*.swift"]),
+    srcs = [
+        "Tests/BossTests/CommentsTests.swift",
+        "Tests/BossTests/TranscriptViewTests.swift",
+    ],
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
-    module_name = "BossTests",
+    module_name = "BossTestsCommentsTranscript",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard1",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard1_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard1_lib",
+    testonly = True,
+    srcs = [
+        "Tests/BossTests/APIKeyStoreTests.swift",
+        "Tests/BossTests/ApplyAttentionGroupsListTests.swift",
+        "Tests/BossTests/DesignsTests.swift",
+        "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
+        "Tests/BossTests/KanbanExternalRefLinkTests.swift",
+        "Tests/BossTests/KanbanRepoChipTests.swift",
+        "Tests/BossTests/KanbanShortIDBadgeTests.swift",
+        "Tests/BossTests/LogTailWindowTests.swift",
+        "Tests/BossTests/LogViewerTailPerfTests.swift",
+        "Tests/BossTests/MainThreadStallDiagnosticsTests.swift",
+        "Tests/BossTests/OpenQuestionGroupsForDocPathTests.swift",
+        "Tests/BossTests/PopulationTimingDiagnosticsTests.swift",
+        "Tests/BossTests/ProductCreateFormCopyTests.swift",
+        "Tests/BossTests/ProjectDesignDocAffordanceTests.swift",
+        "Tests/BossTests/ProjectShortIDBadgeTests.swift",
+        "Tests/BossTests/ReviewColumnOrderingTests.swift",
+        "Tests/BossTests/WorkBlockedBadgeTests.swift",
+        "Tests/BossTests/WorkerProcessKillerTests.swift",
+        "Tests/BossTests/WorkersWorkspaceModelTests.swift",
+    ],
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard1",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard2",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard2_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard2_lib",
+    testonly = True,
+    srcs = [
+        "Tests/BossTests/ActiveProductsFilterTests.swift",
+        "Tests/BossTests/ActivityLogTests.swift",
+        "Tests/BossTests/AttentionGroupsListRaceTests.swift",
+        "Tests/BossTests/EffortChipTests.swift",
+        "Tests/BossTests/EngineClientLargeMessageFramingTests.swift",
+        "Tests/BossTests/EngineHealthBannerTests.swift",
+        "Tests/BossTests/EngineUnreachableErrorRoutingTests.swift",
+        "Tests/BossTests/ExternalTrackerAttentionTests.swift",
+        "Tests/BossTests/ExternalTrackerTests.swift",
+        "Tests/BossTests/GitHubAuthTests.swift",
+        "Tests/BossTests/GitHubContentFetcherTests.swift",
+        "Tests/BossTests/InvestigationKanbanTests.swift",
+        "Tests/BossTests/KanbanFilterBannerTests.swift",
+        "Tests/BossTests/KanbanInRevisionWarningTests.swift",
+        "Tests/BossTests/KanbanPRLinkLabelTests.swift",
+        "Tests/BossTests/ProjectArchiveContextMenuTests.swift",
+        "Tests/BossTests/ProjectNavigatorCountBadgeTests.swift",
+        "Tests/BossTests/WorkDependencyKanbanTests.swift",
+        "Tests/BossTests/WorkItemRepoRowTests.swift",
+    ],
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard2",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard3",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard3_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard3_lib",
+    testonly = True,
+    srcs = [
+        "Tests/BossTests/AttentionScoreOrderingTests.swift",
+        "Tests/BossTests/AttentionsTests.swift",
+        "Tests/BossTests/AutomationTimeTests.swift",
+        "Tests/BossTests/AwaitingInputKanbanTests.swift",
+        "Tests/BossTests/ConflictBadgeMutualExclusionTests.swift",
+        "Tests/BossTests/ConflictClearedBadgeTests.swift",
+        "Tests/BossTests/ConflictResolutionKanbanTests.swift",
+        "Tests/BossTests/DesignDocPointerTests.swift",
+        "Tests/BossTests/DispatchPendingKanbanTests.swift",
+        "Tests/BossTests/InvestigationDocLinkAffordanceTests.swift",
+        "Tests/BossTests/OptimisticKanbanMoveTests.swift",
+        "Tests/BossTests/RevealClearsFiltersTests.swift",
+        "Tests/BossTests/RevealRevisionRollupTests.swift",
+        "Tests/BossTests/ReviewNotificationTests.swift",
+        "Tests/BossTests/RevisionKanbanTests.swift",
+        "Tests/BossTests/TerminalLoopDiagnosticsTests.swift",
+        "Tests/BossTests/TestSourcesDoNotCallRealOpenerTests.swift",
+        "Tests/BossTests/WorkCreateRepoFieldTests.swift",
+        "Tests/BossTests/WorkerStalenessTests.swift",
+    ],
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard3",
     deps = [":boss_mac_app_lib"],
 )
 
