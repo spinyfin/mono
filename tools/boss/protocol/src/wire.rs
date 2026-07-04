@@ -6,16 +6,16 @@ use crate::host_registry_wire::HostSnapshot;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictResolution, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
-    CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    AddDependencyInput, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch, AutomationRun,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictResolution,
+    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction,
+    EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrWorkItemMatch, Product,
+    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -798,6 +798,16 @@ pub enum FrontendRequest {
 
     ListAttentionItemsForWorkItem {
         work_item_id: String,
+    },
+
+    /// List the `attention_merges` provenance rows recorded against one
+    /// canonical `Attention` id — every fold that was reconciled into it.
+    /// Feeds the Notifications UI's merge-provenance affordance ("edited by
+    /// merge" marker + "folded N duplicate reports" detail). Replies with
+    /// [`FrontendEvent::AttentionMergesList`]. Empty until the dedup
+    /// creation/sweep paths (P1203 tasks 5/7) start writing rows.
+    ListAttentionMerges {
+        attention_id: String,
     },
 
     /// List the `automation_runs` history for an automation, newest first.
@@ -1800,6 +1810,12 @@ pub enum FrontendEvent {
         group: AttentionGroup,
         #[serde(default)]
         members: Vec<Attention>,
+    },
+    /// Reply to [`FrontendRequest::ListAttentionMerges`]. `merges` are the
+    /// `attention_merges` rows recorded against `attention_id`, chronological.
+    AttentionMergesList {
+        attention_id: String,
+        merges: Vec<AttentionMerge>,
     },
     WorkItemDeleted {
         id: String,

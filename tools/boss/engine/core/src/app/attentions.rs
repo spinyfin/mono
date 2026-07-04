@@ -125,6 +125,40 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
     }
 }
 
+/// P1203 task 8: the Notifications UI's merge-provenance affordance reads
+/// the `attention_merges` ledger (already built in task 1) for one canonical
+/// `Attention` id, on demand. Empty until the dedup creation/sweep paths
+/// (tasks 5/7) exist to write rows.
+pub(super) async fn handle_list_attention_merges(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListAttentionMerges { attention_id } = req else {
+        unreachable!()
+    };
+    match work_db.list_attention_merges_for_canonical(&attention_id) {
+        Ok(merges) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::AttentionMergesList { attention_id, merges },
+            );
+        }
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+        }
+    }
+}
+
 pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

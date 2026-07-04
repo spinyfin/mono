@@ -126,7 +126,7 @@ final class AttentionsTests: XCTestCase {
         let member = try decodeAttention("""
         {"id":"atn_1","group_id":"atg_1","ordinal":1,"answer_state":"open",
          "created_at":"2026-05-31T00:00:00Z","question_type":"yes_no",
-         "prompt_text":"Gate extraction behind a flag?","confidence_source":"structured"}
+         "prompt_text":"Gate extraction behind a flag?","confidence_source":"structured","score":1}
         """)
         XCTAssertEqual(member.questionType, "yes_no")
         XCTAssertEqual(member.promptText, "Gate extraction behind a flag?")
@@ -141,7 +141,7 @@ final class AttentionsTests: XCTestCase {
          "created_at":"2026-05-31T00:00:00Z","question_type":"multiple_choice",
          "prompt_text":"One table or two?",
          "choice_options":"[\\"one table\\",\\"two tables\\"]",
-         "answer":"two tables","confidence_source":"structured"}
+         "answer":"two tables","confidence_source":"structured","score":1}
         """)
         XCTAssertEqual(member.choices, ["one table", "two tables"])
         XCTAssertEqual(member.answer, "two tables")
@@ -153,7 +153,7 @@ final class AttentionsTests: XCTestCase {
         let member = try decodeAttention("""
         {"id":"atn_3","group_id":"atg_1","ordinal":3,"answer_state":"open",
          "created_at":"2026-05-31T00:00:00Z","question_type":"multiple_choice",
-         "choice_options":"not-json","confidence_source":"structured"}
+         "choice_options":"not-json","confidence_source":"structured","score":1}
         """)
         XCTAssertTrue(member.choices.isEmpty)
     }
@@ -164,7 +164,7 @@ final class AttentionsTests: XCTestCase {
          "created_at":"2026-05-31T00:00:00Z","proposed_name":"Add retry budget",
          "proposed_description":"Bound CI retries","proposed_effort":"small",
          "proposed_work_kind":"chore","rationale":"noticed during impl",
-         "confidence_source":"extracted"}
+         "confidence_source":"extracted","score":1}
         """)
         XCTAssertEqual(member.proposedName, "Add retry budget")
         XCTAssertEqual(member.proposedWorkKind, "chore")
@@ -179,7 +179,7 @@ final class AttentionsTests: XCTestCase {
         func member(_ state: String) throws -> Attention {
             try decodeAttention("""
             {"id":"atn_x","group_id":"g","ordinal":1,"answer_state":"\(state)",
-             "created_at":"2026-05-31T00:00:00Z","confidence_source":"structured"}
+             "created_at":"2026-05-31T00:00:00Z","confidence_source":"structured","score":1}
             """)
         }
         XCTAssertTrue(try member("answered").isAnswered)
@@ -187,5 +187,35 @@ final class AttentionsTests: XCTestCase {
         XCTAssertTrue(try member("dismissed").isDismissed)
         XCTAssertFalse(try member("open").isResolved)
         XCTAssertTrue(try member("answered").isResolved)
+    }
+
+    // MARK: - score / merge-provenance (notification-dedup-scoring.md §8)
+
+    func testDecodesFoldedScore() throws {
+        let member = try decodeAttention("""
+        {"id":"atn_5","group_id":"atg_1","ordinal":1,"answer_state":"open",
+         "created_at":"2026-05-31T00:00:00Z","confidence_source":"structured","score":3}
+        """)
+        XCTAssertEqual(member.score, 3)
+    }
+
+    func testAttentionMergeEditedCanonical() throws {
+        let decode = { (json: String) throws -> AttentionMerge in
+            try JSONDecoder().decode(AttentionMerge.self, from: Data(json.utf8))
+        }
+        let withEdit = try decode("""
+        {"id":"merge_1","candidate_summary":"dup report","created_at":"2026-05-31T00:00:00Z",
+         "model":"claude-haiku-4-5","product_id":"prod_1","trigger":"creation",
+         "canonical_attention_id":"atn_1",
+         "edits_applied":"[{\\"field\\":\\"rationale\\",\\"before\\":\\"a\\",\\"after\\":\\"a; also b\\"}]"}
+        """)
+        XCTAssertTrue(withEdit.editedCanonical)
+
+        let withoutEdit = try decode("""
+        {"id":"merge_2","candidate_summary":"dup report","created_at":"2026-05-31T00:00:00Z",
+         "model":"claude-haiku-4-5","product_id":"prod_1","trigger":"sweep",
+         "canonical_attention_id":"atn_1"}
+        """)
+        XCTAssertFalse(withoutEdit.editedCanonical)
     }
 }

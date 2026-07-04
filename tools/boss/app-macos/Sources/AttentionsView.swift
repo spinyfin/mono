@@ -121,6 +121,9 @@ struct AttentionGroupCard: View {
     private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
     private var answeredCount: Int { members.filter(\.isAnswered).count }
     private var hasExtracted: Bool { members.contains { $0.confidenceSource == "extracted" } }
+    /// Highest member score — the card-level priority signal (design:
+    /// notification-dedup-scoring.md §8). `1` when no item has been folded.
+    private var maxScore: Int64 { members.map(\.score).max() ?? 1 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -156,6 +159,10 @@ struct AttentionGroupCard: View {
                 AttentionChip(text: group.kindLabel, system: group.kind == "question" ? "questionmark.circle" : "arrow.up.forward.app")
                 if hasExtracted {
                     AttentionChip(text: "Extracted", system: "sparkle.magnifyingglass", tint: .orange)
+                }
+                if maxScore > 1 {
+                    AttentionChip(text: "×\(maxScore)", system: "flame.fill", tint: .red)
+                        .help("\(maxScore) independent reports converged on this card's top item")
                 }
                 Spacer(minLength: 0)
                 Text("\(members.count) \(members.count == 1 ? "item" : "items")")
@@ -295,6 +302,7 @@ struct AttentionMemberRow: View {
     let group: AttentionGroup
     let member: Attention
     @Binding var promptDraft: String
+    @State private var showingMergeProvenance = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -309,9 +317,14 @@ struct AttentionMemberRow: View {
                             .font(.caption2.monospaced())
                             .foregroundStyle(.tertiary)
                     }
-                    Text(title)
-                        .font(.subheadline.weight(.medium))
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.subheadline.weight(.medium))
+                            .fixedSize(horizontal: false, vertical: true)
+                        if member.score > 1 {
+                            scoreBadge
+                        }
+                    }
                 }
             }
             control
@@ -329,6 +342,24 @@ struct AttentionMemberRow: View {
             return member.proposedName ?? "Proposed work"
         }
         return member.promptText ?? "Question"
+    }
+
+    /// Priority badge for an item that folded near-duplicate reports (design:
+    /// notification-dedup-scoring.md §8). Tapping fetches and shows the
+    /// `attention_merges` provenance — how many reports folded in, and
+    /// whether any of them edited this item's content.
+    private var scoreBadge: some View {
+        Button {
+            model.loadAttentionMergesIfNeeded(forAttention: member.id)
+            showingMergeProvenance = true
+        } label: {
+            AttentionChip(text: "×\(member.score)", system: "flame.fill", tint: .red)
+        }
+        .buttonStyle(.plain)
+        .help("Reported \(member.score) times — tap for merge provenance")
+        .popover(isPresented: $showingMergeProvenance) {
+            MergeProvenancePopoverView(attentionID: member.id)
+        }
     }
 
     @ViewBuilder
@@ -559,5 +590,70 @@ struct AttentionChip: View {
         .padding(.vertical, 3)
         .background(Capsule().fill(tint.opacity(0.15)))
         .foregroundStyle(tint == .secondary ? Color.secondary : tint)
+    }
+}
+
+/// Popover content for the score badge's merge-provenance affordance: how
+/// many near-duplicate reports folded into this item, and whether any fold
+/// edited its content (design: notification-dedup-scoring.md §5, §8). Reads
+/// `attention_merges` rows fetched on demand — empty until the dedup
+/// creation/sweep paths exist to write them.
+struct MergeProvenancePopoverView: View {
+    @EnvironmentObject private var model: ChatViewModel
+    let attentionID: String
+
+    private var merges: [AttentionMerge]? { model.attentionMerges(forAttention: attentionID) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Merge provenance")
+                .font(.headline)
+            content
+        }
+        .padding(14)
+        .frame(width: 280)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let merges {
+            if merges.isEmpty {
+                Text("No fold history recorded yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Folded \(merges.count) duplicate \(merges.count == 1 ? "report" : "reports")")
+                    .font(.subheadline.weight(.medium))
+                if merges.contains(where: \.editedCanonical) {
+                    Label("Edited by merge", systemImage: "pencil")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(merges) { merge in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(merge.candidateSummary)
+                                    .font(.caption)
+                                    .lineLimit(3)
+                                if let rationale = merge.decisionRationale, !rationale.isEmpty {
+                                    Text(rationale)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                            if merge.id != merges.last?.id {
+                                Divider()
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 160)
+            }
+        } else {
+            ProgressView()
+                .controlSize(.small)
+        }
     }
 }
