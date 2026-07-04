@@ -354,9 +354,9 @@ pub enum ExecutionKind {
     /// implementation/design kind: it runs under a **capability-restricted
     /// dispatch surface** (allowlist, not blocklist) — read-only DB queries,
     /// a read-only workspace checkout, and the post-thread-reply command
-    /// only; every mutating tool/RPC is omitted. See
-    /// [`crate::MagicWandDispatch`]-adjacent `answer_agent_runs` tracking and
-    /// the engine's `answer_agent` module for the enforced tool table.
+    /// only; every mutating tool/RPC is omitted. See the `answer_agent_runs`
+    /// tracking table and the engine's `answer_agent` module for the
+    /// enforced tool table.
     AnswerAgent,
     AutomationTriage,
     ChoreImplementation,
@@ -876,10 +876,6 @@ pub const COMMENT_STATUS_ACTIVE: &str = "active";
 pub const COMMENT_STATUS_RESOLVED: &str = "resolved";
 pub const COMMENT_STATUS_ORPHANED: &str = "orphaned";
 pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
-/// Phase 4: comment against a PR-backed doc whose magic-wand button dispatched
-/// a Boss chore worker. Transitions `active` → `dispatched` at chore creation,
-/// then `dispatched` → `resolved` when the chore's PR merges.
-pub const COMMENT_STATUS_DISPATCHED: &str = "dispatched";
 /// Phase 2 (buckets 1&3, `comment-triggered-document-revisions.md`): a
 /// `directive`/`larger_change` comment addressed by a `CommentsReviseDoc`
 /// batch. `revise_task_id` is set for the duration of this status.
@@ -2094,70 +2090,17 @@ pub struct ListDependenciesInput {
     pub direction: Option<DependencyDirection>,
 }
 
-/// An engine-persisted magic-wand dispatch row (`magic_wand_dispatches` table).
-/// Records the one-shot specialised Claude call dispatched when the user clicks
-/// the magic-wand button on a comment (Phase 3: engine-owned doc; Phase 4:
-/// PR-backed doc → Boss chore worker). 13+ fields → builder pattern per project
-/// convention.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub struct MagicWandDispatch {
-    pub id: String,
-    pub artifact_id: String,
-    pub comment_id: String,
-    /// True when the model returned a result but the highlighted anchor text is
-    /// absent from the result AND wholesale changes occurred elsewhere. Surfaced
-    /// as a warning in the preview sheet; the user decides whether to apply.
-    #[serde(default)]
-    #[builder(default)]
-    pub anchor_warning: bool,
-
-    pub artifact_kind: String,
-    pub created_at: String,
-    /// The `doc_version` from the comment — the plain-text-projection SHA the
-    /// dispatch ran against. Used as the CAS value on Apply.
-    pub doc_version: String,
-
-    /// `in_flight` | `returned` | `applied` | `discarded` | `conflict` |
-    /// `failed` | `chore_created`
-    pub status: String,
-
-    /// Phase 4 only: the id of the Boss chore worker spawned to address this
-    /// comment. Set when `status = 'chore_created'`; `None` for all Phase 3
-    /// dispatches. Links the dispatch row to the chore for audit traceability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chore_id: Option<String>,
-
-    /// Short error classification (`length_sanity` | `diff_sanity` | `api_error`
-    /// | `empty_response`). `None` on success.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_kind: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<i64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<i64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_at: Option<String>,
-
-    /// The proposed updated markdown. `None` until the dispatch completes
-    /// successfully (Phase 3 only; always `None` for `chore_created`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_md: Option<String>,
-}
-
 /// An engine-persisted answer-agent run row (`answer_agent_runs` table).
 ///
 /// Tracks one ephemeral, read-only "mini-coordinator" answer-agent execution
 /// against a `question`-classified doc comment (P3a of
 /// `comment-triggered-document-revisions.md`). Deliberately mirrors the shape
-/// of [`MagicWandDispatch`] — comment-keyed, per-run row, status + result —
-/// because it solves the analogous problem (track one ephemeral LLM run against
-/// a comment) with a different capability profile: the answer agent runs under
-/// the capability-restricted `answer_agent` execution kind and produces a
-/// thread reply instead of an apply/discard result.
+/// of the retired `magic_wand_dispatches` row (comment-keyed, per-run row,
+/// status + result) because it solves the analogous problem (track one
+/// ephemeral LLM run against a comment) with a different capability profile:
+/// the answer agent runs under the capability-restricted `answer_agent`
+/// execution kind and produces a thread reply instead of an apply/discard
+/// result.
 ///
 /// No `tasks` row backs an answer-agent run (no kanban card); it is tracked
 /// purely as an agent run here. 12 fields → builder pattern per project
@@ -2544,20 +2487,6 @@ pub struct ResolvedComment {
     pub comment: WorkComment,
     pub resolution: CommentResolution,
 }
-
-// --- Magic-wand dispatch (Phase 3: engine-owned docs) ---
-
-/// `magic_wand_dispatches.status` values.
-pub const MAGIC_WAND_STATUS_IN_FLIGHT: &str = "in_flight";
-pub const MAGIC_WAND_STATUS_RETURNED: &str = "returned";
-pub const MAGIC_WAND_STATUS_APPLIED: &str = "applied";
-pub const MAGIC_WAND_STATUS_DISCARDED: &str = "discarded";
-pub const MAGIC_WAND_STATUS_CONFLICT: &str = "conflict";
-pub const MAGIC_WAND_STATUS_FAILED: &str = "failed";
-/// Phase 4 terminal status: a Boss chore worker was created to address the
-/// comment on a PR-backed doc. The `chore_id` column carries the spawned
-/// chore's id for audit linkage. There is no further engine-side Claude call.
-pub const MAGIC_WAND_STATUS_CHORE_CREATED: &str = "chore_created";
 
 // --- Answer-agent runs (P3a: read-only mini-coordinator answer agent) ---
 
@@ -3398,14 +3327,13 @@ pub struct WorkComment {
     /// PR branch).
     pub artifact_kind: String,
 
-    /// `user:<email>` for human-authored comments; `magic_wand:<id>` reserved.
+    /// `user:<email>` for human-authored comments.
     pub author: String,
 
     pub body: String,
     pub created_at: String,
     /// SHA-256 (or other opaque digest) of the plain-text projection the
-    /// comment was authored against. Used only for equality (magic-wand
-    /// CAS in a later phase); never parsed.
+    /// comment was authored against. Used only for equality; never parsed.
     pub doc_version: String,
 
     /// Version of the renderer's plain-text-projection algorithm the anchor

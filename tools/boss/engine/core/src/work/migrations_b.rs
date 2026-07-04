@@ -1646,3 +1646,61 @@ pub(crate) fn migrate_comment_thread_entries_table(conn: &Connection) -> Result<
     )?;
     Ok(())
 }
+
+/// One-time data migration (Phase 2 task 2e, magic-wand removal, of
+/// `comment-triggered-document-revisions.md`): retires every `work_comments`
+/// row left in `status = 'dispatched'` by the now-deleted magic-wand
+/// PR-doc dispatch path — the only path that ever set this status. For each
+/// such comment, looks up its most recent `magic_wand_dispatches` row:
+/// - `status = 'applied'` → the comment was genuinely addressed; flip to
+///   `resolved` and stamp `last_resolved_with = 'magic-wand:<dispatch_id>'`
+///   so the historical fact survives without inventing a fictional
+///   `revise_task_id`.
+/// - any other status (including no row at all, or `chore_created`, which
+///   never advances further since the chore-completion reconciliation for
+///   that path was never wired up) → the dispatch is abandoned by this
+///   migration; the comment falls back to `active` and will be classified
+///   fresh next time comment state is loaded (its `intent` is `NULL`).
+///
+/// Idempotent: only rows still `status = 'dispatched'` are touched, so a
+/// second run is a no-op. The `magic_wand_dispatches` table itself is left
+/// in place, unread by any other live code path, as a historical record.
+/// Design § "Migration: retiring the magic wand".
+pub(crate) fn migrate_retire_magic_wand_dispatched_comments(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id FROM work_comments WHERE status = 'dispatched'")?;
+    let comment_ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    let now = now_string();
+    for comment_id in comment_ids {
+        let latest_dispatch: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, status FROM magic_wand_dispatches
+                 WHERE comment_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                [&comment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        match latest_dispatch {
+            Some((dispatch_id, status)) if status == "applied" => {
+                conn.execute(
+                    "UPDATE work_comments
+                     SET status = 'resolved', last_resolved_with = ?2, updated_at = ?3, dismissed_at = ?3
+                     WHERE id = ?1",
+                    params![comment_id, format!("magic-wand:{dispatch_id}"), now],
+                )?;
+            }
+            _ => {
+                conn.execute(
+                    "UPDATE work_comments SET status = 'active', updated_at = ?2 WHERE id = ?1",
+                    params![comment_id, now],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}

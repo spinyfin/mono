@@ -15,9 +15,9 @@
 //! Mirrors `crate::attentions_detector`'s backstop-call shape (dedicated
 //! billing env var, JSON-only prompt, `serde_json` parse of the reply) —
 //! this is a classification call, not a doc-rewrite call, so it has no need
-//! for `crate::magic_wand`'s length/diff sanity checks. Transport goes
-//! through the shared [`crate::claude_client`] pipeline like every other
-//! Claude call in the engine.
+//! for length/diff sanity checks. Transport goes through the shared
+//! [`crate::claude_client`] pipeline like every other Claude call in the
+//! engine.
 
 use std::time::Duration;
 

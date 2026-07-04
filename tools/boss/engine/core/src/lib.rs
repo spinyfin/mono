@@ -49,7 +49,6 @@ pub mod live_status_loop;
 pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod lost_workspace_sweep;
-pub mod magic_wand;
 pub mod materializer;
 pub mod merge_poller;
 pub mod merge_when_ready;

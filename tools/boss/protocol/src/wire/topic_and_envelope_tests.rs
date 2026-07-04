@@ -36,11 +36,6 @@ fn comment_topic_pins_documented_grammar() {
 }
 
 #[test]
-fn magic_wand_dispatch_topic_pins_grammar() {
-    assert_eq!(magic_wand_dispatch_topic("disp_5"), "magic_wand.dispatch.disp_5");
-}
-
-#[test]
 fn editorial_actions_topic_pins_grammar() {
     assert_eq!(editorial_actions_topic("prod_123"), "editorial_actions.prod_123");
 }
