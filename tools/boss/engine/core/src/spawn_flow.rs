@@ -434,6 +434,7 @@ mod tests {
             self.canned_response.clone().map_err(|e| match e {
                 SendToAppError::NotRegistered => SendToAppError::NotRegistered,
                 SendToAppError::AppDisconnected => SendToAppError::AppDisconnected,
+                SendToAppError::SessionWedged => SendToAppError::SessionWedged,
                 SendToAppError::Timeout => SendToAppError::Timeout,
                 SendToAppError::ResponseKindMismatch(s) => SendToAppError::ResponseKindMismatch(s),
             })

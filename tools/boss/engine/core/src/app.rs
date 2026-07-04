@@ -521,6 +521,17 @@ struct ServerState {
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+    /// Count of *consecutive* failed engine→app sends (`Timeout` or
+    /// `SessionWedged`) since the last success or (re)registration.
+    /// Incremented in `send_to_app`, reset to zero on any successful
+    /// round-trip and whenever a fresh app session registers. Read by
+    /// [`build_engine_health_report`] to raise an `app_session_wedged`
+    /// banner once it crosses [`APP_SEND_FAILURE_HEALTH_THRESHOLD`], so
+    /// a wedged outbound channel produces one visible health signal
+    /// rather than only per-call WARNs. See the reveal/`release_worker_pane`
+    /// timeout incident this instrumentation was added for.
+    #[builder(default = AtomicU64::new(0))]
+    app_send_failures: AtomicU64,
     /// Serializes outbound `SpawnWorkerPane` round-trips so the app
     /// only ever sees one pane allocation in flight at a time. See the
     /// `WorkerSpawner` impl for the why.
@@ -670,6 +681,14 @@ pub enum SendToAppError {
     NotRegistered,
     #[error("app disconnected before responding")]
     AppDisconnected,
+    /// The app session *is* registered, but its outbound queue is full
+    /// and has latched `slow`: the engine could not even enqueue the
+    /// request. Distinct from [`NotRegistered`](Self::NotRegistered) (no
+    /// app at all) and [`Timeout`](Self::Timeout) (enqueued but no reply
+    /// in time) so a caller can tell "no app" from "app present but its
+    /// receive path is wedged / not draining".
+    #[error("app session is wedged: engine→app outbound queue is full and not draining")]
+    SessionWedged,
     #[error("timed out waiting for app response")]
     Timeout,
     #[error("app responded with unexpected response kind for request kind {0}")]
@@ -1159,28 +1178,108 @@ impl ServerState {
                 return Err(SendToAppError::NotRegistered);
             };
             let request_id = handle.allocate_request_id();
-            handle.pending.insert(request_id.clone(), tx);
-            handle
+            // Handle the enqueue outcome instead of ignoring it. A `Slow`
+            // latch means the outbound queue is full and not draining —
+            // silently waiting for the full `wait` deadline (the old
+            // behaviour) burned 5s per RPC and produced a bare `Timeout`
+            // that looked identical to a slow app. Fail fast with a
+            // distinct `SessionWedged` and record the queue stats so the
+            // engine→app channel state is attributable.
+            let outcome = handle
                 .sink
                 .enqueue(FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
                     request_id: request_id.clone(),
                     request: request.clone(),
                 }));
-            request_id
+            match outcome {
+                EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced => {
+                    handle.pending.insert(request_id.clone(), tx);
+                    request_id
+                }
+                EnqueueOutcome::Slow => {
+                    let stats = handle.sink.stats();
+                    drop(guard);
+                    self.note_app_send_failure("session_wedged", &request_id, Some(stats));
+                    return Err(SendToAppError::SessionWedged);
+                }
+                EnqueueOutcome::Closed => {
+                    // Sink already closed (session tearing down): treat as
+                    // a disconnect. Don't count this against the wedge
+                    // health signal — the session is going away, not stuck.
+                    return Err(SendToAppError::AppDisconnected);
+                }
+            }
         };
 
         self.ipc_logger.log_request(&request_id, &request);
 
         match timeout(wait, rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                self.note_app_send_success();
+                Ok(response)
+            }
             Ok(Err(_recv_err)) => {
                 self.drop_pending(&request_id).await;
                 Err(SendToAppError::AppDisconnected)
             }
             Err(_elapsed) => {
                 self.drop_pending(&request_id).await;
+                let stats = self.app_session_queue_stats().await;
+                self.note_app_send_failure("timeout", &request_id, stats);
                 Err(SendToAppError::Timeout)
             }
+        }
+    }
+
+    /// Snapshot the registered app session's outbound-queue stats, if a
+    /// session is registered. Used to attach queue depth + oldest-envelope
+    /// age to send-timeout warnings and the periodic sampler.
+    async fn app_session_queue_stats(&self) -> Option<QueueStats> {
+        self.app_session.lock().await.as_ref().map(|handle| handle.sink.stats())
+    }
+
+    /// One pass of the periodic app-session queue sampler (spawned in
+    /// `serve`). Snapshots the outbound queue so a persistently deep or
+    /// stalled channel is visible in the trace even between send timeouts.
+    async fn sample_app_session_queue(&self) -> AppQueueSample {
+        AppQueueSample {
+            stats: self.app_session_queue_stats().await,
+        }
+    }
+
+    /// Reset the consecutive engine→app send-failure counter after a
+    /// successful round-trip.
+    fn note_app_send_success(&self) {
+        self.app_send_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failed engine→app send (`Timeout` or `SessionWedged`),
+    /// emitting a WARN carrying the outbound-queue depth and oldest-envelope
+    /// age so the engine↔app channel state is diagnosable, and — once the
+    /// consecutive-failure count crosses the health threshold — a second
+    /// WARN announcing that the channel is being surfaced as unhealthy
+    /// (rather than only per-call WARNs). See [`build_engine_health_report`].
+    fn note_app_send_failure(&self, failure: &str, request_id: &str, stats: Option<QueueStats>) {
+        let consecutive = self.app_send_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let depth = stats.map(|s| s.depth);
+        let oldest_ms = stats.and_then(|s| s.oldest_age).map(|d| d.as_millis() as u64);
+        let latched = stats.map(|s| s.slow).unwrap_or(false);
+        tracing::warn!(
+            request_id,
+            failure,
+            consecutive_app_send_failures = consecutive,
+            queue_depth = ?depth,
+            oldest_envelope_age_ms = ?oldest_ms,
+            queue_slow_latched = latched,
+            "send_to_app failed: engine→app outbound channel is not draining",
+        );
+        if consecutive == APP_SEND_FAILURE_HEALTH_THRESHOLD {
+            tracing::warn!(
+                consecutive_app_send_failures = consecutive,
+                "app session appears wedged after {consecutive} consecutive engine→app send \
+                 failures; surfacing as an engine-health issue until a send succeeds or the app \
+                 reconnects",
+            );
         }
     }
 
@@ -1450,13 +1549,34 @@ impl ServerState {
             .app_session
             .lock()
             .await
-            .replace(AppSessionHandle::new(session_id, sink));
+            .replace(AppSessionHandle::new(session_id.clone(), sink));
+        // A fresh registration atomically replaces any wedged prior one,
+        // so the wedge health signal must reset — otherwise a reconnect
+        // would inherit the dead session's failure count and keep the
+        // banner up. Reset before resolving the prior pending requests.
+        self.app_send_failures.store(0, Ordering::Relaxed);
         if let Some(prior) = prior {
+            // Log the takeover with a reason: prior to this the app
+            // session lifecycle was logged NOWHERE, so a silent
+            // re-registration (app relaunch) was indistinguishable from a
+            // stuck session in the traces.
+            tracing::info!(
+                new_session_id = %session_id,
+                prior_session_id = %prior.session_id,
+                pending_dropped = prior.pending.len(),
+                "app session registered, replacing prior registration; prior pending engine→app \
+                 requests resolved as AppDisconnected",
+            );
             for (_, tx) in prior.pending {
                 let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
                     result: Err(EngineToAppError::AppDisconnected),
                 });
             }
+        } else {
+            tracing::info!(
+                session_id = %session_id,
+                "app session registered (no prior registration)",
+            );
         }
     }
 
@@ -1466,6 +1586,16 @@ impl ServerState {
         let mut guard = self.app_session.lock().await;
         let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
         if take && let Some(prior) = guard.take() {
+            // Log the drop with a reason. The 2026-07-03 incident where the
+            // app session silently vanished ~17:40 PDT and every spawn then
+            // failed "no app session is registered" was undiagnosable
+            // precisely because this teardown was logged nowhere.
+            tracing::info!(
+                session_id = %session_id,
+                pending_dropped = prior.pending.len(),
+                "app session dropped: frontend connection closed; pending engine→app requests \
+                 resolved as AppDisconnected. No app session is registered until the app reconnects",
+            );
             for (_, tx) in prior.pending {
                 let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
                     result: Err(EngineToAppError::AppDisconnected),
@@ -1742,7 +1872,16 @@ impl ServerState {
                 let _ = tx.send(response);
             }
             None => {
-                tracing::warn!(request_id, "engine_response dropped: no pending request matches",);
+                // The app *did* answer, but no caller is waiting: the
+                // request already timed out and dropped its pending entry
+                // before this (late) reply arrived. This is the signature
+                // of a slow/wedged outbound queue rather than a dead app —
+                // the app is alive and answering, just too late.
+                tracing::warn!(
+                    request_id,
+                    "engine_response dropped: no pending request matches (app answered after the \
+                     caller timed out — indicates a slow/wedged engine→app channel, not a dead app)",
+                );
             }
         }
     }
@@ -1864,6 +2003,27 @@ impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerSta
 /// memory.
 const MAX_SESSION_QUEUE: usize = 256;
 
+/// Consecutive engine→app send failures (`Timeout` / `SessionWedged`)
+/// before [`build_engine_health_report`] raises an `app_session_wedged`
+/// banner. Small so a genuinely-stuck channel surfaces quickly, but > 1
+/// so a single transient timeout doesn't flap the health signal.
+const APP_SEND_FAILURE_HEALTH_THRESHOLD: u64 = 3;
+
+/// How often the background sampler logs the app session's outbound-queue
+/// depth + oldest-envelope age. Read-only; only emits when the queue is
+/// actually backing up (see [`AppQueueSample::has_activity`]).
+const APP_QUEUE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Queue depth at or above which the periodic sampler logs even without a
+/// stalled front envelope — a persistently deep queue is itself a
+/// backpressure signal worth a periodic line.
+const APP_QUEUE_SAMPLE_DEPTH: usize = 32;
+
+/// Oldest-envelope age at or above which the periodic sampler logs: a
+/// front envelope that has waited this long means the writer/app is not
+/// keeping up even if the queue is shallow.
+const APP_QUEUE_SAMPLE_OLDEST_AGE: Duration = Duration::from_secs(1);
+
 #[derive(Debug, PartialEq, Eq)]
 enum EnqueueOutcome {
     Enqueued,
@@ -1872,8 +2032,55 @@ enum EnqueueOutcome {
     Slow,
 }
 
+/// Point-in-time snapshot of a [`SessionQueue`]'s health, used to attach
+/// diagnosable state (depth + oldest-envelope age + latch flags) to
+/// send-timeout warnings and the periodic sampler.
+#[derive(Debug, Clone, Copy)]
+struct QueueStats {
+    /// Number of envelopes waiting to be written.
+    depth: usize,
+    /// How long the front (oldest) envelope has been waiting, if any.
+    oldest_age: Option<Duration>,
+    /// Whether the `slow` overflow latch is currently set.
+    slow: bool,
+}
+
+/// One pass of the periodic app-session queue sampler. Logs only when the
+/// outbound queue is genuinely backing up so an idle engine stays quiet.
+struct AppQueueSample {
+    stats: Option<QueueStats>,
+}
+
+impl crate::sweep_loop::SweepOutcome for AppQueueSample {
+    fn has_activity(&self) -> bool {
+        matches!(
+            self.stats,
+            Some(s) if s.depth >= APP_QUEUE_SAMPLE_DEPTH
+                || s.slow
+                || s.oldest_age.is_some_and(|age| age >= APP_QUEUE_SAMPLE_OLDEST_AGE)
+        )
+    }
+
+    fn log(&self) {
+        if let Some(s) = self.stats {
+            tracing::warn!(
+                queue_depth = s.depth,
+                oldest_envelope_age_ms = ?s.oldest_age.map(|d| d.as_millis() as u64),
+                queue_slow_latched = s.slow,
+                "app session outbound queue is backing up (engine→app delivery falling behind)",
+            );
+        }
+    }
+}
+
 struct SessionQueue {
     items: VecDeque<FrontendEventEnvelope>,
+    /// Enqueue instant of each entry in `items`, in lockstep (same length,
+    /// pushed/popped together). Coalescing overwrites the payload in place
+    /// but keeps the original instant, so `oldest_age` reflects how long
+    /// that topic has had a pending unsent invalidation — the quantity
+    /// that matters for spotting a stalled writer. Used by [`stats`].
+    enqueued_at: VecDeque<Instant>,
     /// For each topic with a pending unsent TopicEvent, the index of that
     /// envelope in `items` (front-relative; decremented on pop). Lets us
     /// overwrite stale invalidations instead of growing the queue.
@@ -1886,6 +2093,7 @@ impl SessionQueue {
     fn new() -> Self {
         Self {
             items: VecDeque::new(),
+            enqueued_at: VecDeque::new(),
             pending_topics: HashMap::new(),
             closed: false,
             slow: false,
@@ -1903,6 +2111,8 @@ impl SessionQueue {
         if let Some(topic) = topic_event_topic(&env.payload) {
             if let Some(&idx) = self.pending_topics.get(&topic) {
                 debug_assert!(idx < self.items.len());
+                // Coalesce in place: keep the original `enqueued_at` so the
+                // age reflects how long this topic has been pending unsent.
                 self.items[idx] = env;
                 return EnqueueOutcome::Coalesced;
             }
@@ -1912,6 +2122,7 @@ impl SessionQueue {
             }
             let idx = self.items.len();
             self.items.push_back(env);
+            self.enqueued_at.push_back(Instant::now());
             self.pending_topics.insert(topic, idx);
             return EnqueueOutcome::Enqueued;
         }
@@ -1921,11 +2132,23 @@ impl SessionQueue {
             return EnqueueOutcome::Slow;
         }
         self.items.push_back(env);
+        self.enqueued_at.push_back(Instant::now());
         EnqueueOutcome::Enqueued
+    }
+
+    /// Point-in-time queue health for diagnostics. Cheap: reads lengths
+    /// and the front timestamp under the caller's lock.
+    fn stats(&self) -> QueueStats {
+        QueueStats {
+            depth: self.items.len(),
+            oldest_age: self.enqueued_at.front().map(Instant::elapsed),
+            slow: self.slow,
+        }
     }
 
     fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
         let env = self.items.pop_front()?;
+        self.enqueued_at.pop_front();
         // Indices in `pending_topics` are front-relative; shift them down
         // by one and drop the entry that pointed at the just-popped item.
         let mut next = HashMap::with_capacity(self.pending_topics.len());
@@ -1936,6 +2159,18 @@ impl SessionQueue {
             next.insert(topic, idx - 1);
         }
         self.pending_topics = next;
+        // Recover the `slow` latch once the writer has fully caught up.
+        // The latch used to be one-way: after a single overflow burst the
+        // queue silently dropped *every* subsequent enqueue forever (and
+        // `send_to_app` never noticed), so a transient snapshot storm
+        // permanently wedged the app session with no path back short of a
+        // reconnect. Clearing it on drain-to-empty lets a session that
+        // briefly fell behind resume delivering once it is caught up,
+        // while a session that never drains still trips the latch (and the
+        // broker's slow-subscriber teardown) on the very next enqueue.
+        if self.items.is_empty() {
+            self.slow = false;
+        }
         Some(env)
     }
 }
@@ -1992,6 +2227,12 @@ impl SessionSink {
             .lock()
             .expect("pop_traces lock poisoned")
             .remove(request_id)
+    }
+
+    /// Snapshot the outbound queue's health (depth, oldest-envelope age,
+    /// latch flags) for diagnostics. Takes the queue lock briefly.
+    fn stats(&self) -> QueueStats {
+        self.queue.lock().expect("session queue lock poisoned").stats()
     }
 
     fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {

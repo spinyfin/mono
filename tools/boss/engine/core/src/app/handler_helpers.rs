@@ -142,6 +142,32 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    // Engine→app channel wedged: `send_to_app` has failed N consecutive
+    // times (send timeout or a full/latched outbound queue) since the last
+    // success or app (re)registration. This is the reveal /
+    // `release_worker_pane` `Send(Timeout)` failure mode — the app process
+    // can be alive while its outbound queue is saturated or its receive
+    // loop stalled, so every engine→app RPC silently times out. Surfacing
+    // it here turns a stream of per-call WARNs into one health signal that
+    // clears automatically once a send succeeds or the app reconnects.
+    let app_send_failures = server_state
+        .app_send_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if app_send_failures >= super::APP_SEND_FAILURE_HEALTH_THRESHOLD {
+        issues.push(EngineHealthIssue {
+            kind: "app_session_wedged".to_owned(),
+            severity: "error".to_owned(),
+            title: format!("Engine→app channel not draining ({app_send_failures} consecutive send failures)"),
+            body: "The engine has failed to deliver several consecutive requests to the Boss app \
+                   (e.g. reveal, worker-pane teardown). The app process may be alive, but its \
+                   outbound queue is saturated or its receive loop is stalled, so these requests \
+                   time out. Reveal and worker-pane cleanup will keep failing until the app \
+                   catches up or reconnects. If this persists, quit and relaunch Boss to force a \
+                   fresh app-session registration."
+                .to_owned(),
+        });
+    }
+
     EngineHealthReport {
         anthropic_api_key_present,
         dispatch_paused,

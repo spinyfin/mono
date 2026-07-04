@@ -143,6 +143,52 @@ fn enqueue_returns_closed_after_close() {
     assert_eq!(q.enqueue(response_envelope("r-1")), EnqueueOutcome::Closed);
 }
 
+#[test]
+fn slow_latch_recovers_once_queue_fully_drains() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            q.enqueue(response_envelope(&format!("r-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    // Overflow latches `slow`.
+    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Slow);
+    assert!(q.slow);
+    // Draining down to — but not including — empty keeps the latch: the
+    // session is still catching up.
+    for _ in 0..MAX_SESSION_QUEUE - 1 {
+        assert!(q.pop_front().is_some());
+    }
+    assert!(q.slow, "latch must hold while items remain");
+    // The final pop empties the queue and clears the latch.
+    assert!(q.pop_front().is_some());
+    assert!(q.pop_front().is_none());
+    assert!(!q.slow, "slow latch must clear once the queue fully drains");
+    // Enqueues succeed again after recovery — the wedge is not permanent.
+    assert_eq!(q.enqueue(response_envelope("after-recovery")), EnqueueOutcome::Enqueued);
+}
+
+#[test]
+fn queue_stats_report_depth_slow_and_oldest_age() {
+    let mut q = SessionQueue::new();
+    let empty = q.stats();
+    assert_eq!(empty.depth, 0);
+    assert!(empty.oldest_age.is_none());
+    assert!(!empty.slow);
+
+    q.enqueue(response_envelope("r-1"));
+    q.enqueue(response_envelope("r-2"));
+    let stats = q.stats();
+    assert_eq!(stats.depth, 2);
+    assert!(stats.oldest_age.is_some(), "a non-empty queue must report an age");
+
+    q.pop_front();
+    assert_eq!(q.stats().depth, 1);
+    q.pop_front();
+    assert!(q.stats().oldest_age.is_none(), "a drained queue has no oldest envelope");
+}
+
 #[tokio::test]
 async fn sink_next_drains_queue_and_returns_none_when_closed() {
     let (tx, _rx) = oneshot::channel::<()>();
@@ -368,6 +414,10 @@ async fn send_to_app_round_trips_via_deliver_response() {
     server_state
         .register_app_session("session-app".into(), sink.clone())
         .await;
+    // Seed a nonzero failure count so the success path's reset is observable.
+    server_state
+        .app_send_failures
+        .store(2, std::sync::atomic::Ordering::Relaxed);
 
     let server_clone = server_state.clone();
     let send = tokio::spawn(async move {
@@ -418,6 +468,13 @@ async fn send_to_app_round_trips_via_deliver_response() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
+    // A successful round-trip clears the consecutive-failure health signal.
+    assert_eq!(
+        server_state
+            .app_send_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+    );
 }
 
 #[tokio::test]
@@ -481,6 +538,113 @@ async fn send_to_app_times_out_when_app_silent() {
         )
         .await;
     assert!(matches!(result, Err(SendToAppError::Timeout)));
+}
+
+#[tokio::test]
+async fn send_to_app_returns_session_wedged_when_queue_is_full() {
+    let server_state = test_server_state();
+    let sink = make_session_sink();
+    // Saturate the outbound queue so the app session is registered but its
+    // sink has no room: the next enqueue latches `slow`.
+    {
+        let mut q = sink.queue.lock().unwrap();
+        for i in 0..MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(response_envelope(&format!("r-{i}"))),
+                EnqueueOutcome::Enqueued
+            );
+        }
+    }
+    server_state.register_app_session("session-app".into(), sink).await;
+
+    // The request cannot even be enqueued: instead of silently burning the
+    // full 5s deadline and returning a bare `Timeout`, we fail fast with a
+    // distinct `SessionWedged` that a caller can tell apart from
+    // `NotRegistered` (no app at all).
+    let result = server_state
+        .send_to_app(
+            EngineToAppRequest::ReleaseWorkerPane(crate::protocol::ReleaseWorkerPaneInput {
+                slot_id: 1,
+                kill_grace_seconds: 2,
+            }),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(matches!(result, Err(SendToAppError::SessionWedged)), "got {result:?}");
+    // A wedge counts toward the consecutive-failure health signal.
+    assert_eq!(
+        server_state
+            .app_send_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn send_timeout_increments_wedge_counter_and_register_resets_it() {
+    let server_state = test_server_state();
+    let sink = make_session_sink();
+    server_state.register_app_session("session-app".into(), sink).await;
+
+    // A silent app: the send is enqueued but no reply arrives, so it times
+    // out and bumps the consecutive-failure counter.
+    let result = server_state
+        .send_to_app(
+            EngineToAppRequest::ReleaseWorkerPane(crate::protocol::ReleaseWorkerPaneInput {
+                slot_id: 1,
+                kill_grace_seconds: 2,
+            }),
+            Duration::from_millis(20),
+        )
+        .await;
+    assert!(matches!(result, Err(SendToAppError::Timeout)), "got {result:?}");
+    assert_eq!(
+        server_state
+            .app_send_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+    );
+
+    // A fresh registration atomically replaces the (wedged) session and
+    // clears the health signal, so a relaunch/reconnect recovers cleanly.
+    let fresh = make_session_sink();
+    server_state.register_app_session("session-fresh".into(), fresh).await;
+    assert_eq!(
+        server_state
+            .app_send_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn engine_health_flags_wedged_app_session_at_threshold() {
+    let server_state = test_server_state();
+
+    // Below the threshold: no wedge issue.
+    server_state.app_send_failures.store(
+        APP_SEND_FAILURE_HEALTH_THRESHOLD - 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let report = build_engine_health_report(&server_state);
+    assert!(
+        !report.issues.iter().any(|i| i.kind == "app_session_wedged"),
+        "must not flag a wedge below the threshold: {:?}",
+        report.issues,
+    );
+
+    // At the threshold: the wedge is surfaced as an error-severity issue.
+    server_state
+        .app_send_failures
+        .store(APP_SEND_FAILURE_HEALTH_THRESHOLD, std::sync::atomic::Ordering::Relaxed);
+    let report = build_engine_health_report(&server_state);
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "app_session_wedged")
+        .expect("wedge issue must be present at the threshold");
+    assert_eq!(issue.severity, "error");
+    assert!(!issue.title.is_empty() && !issue.body.is_empty());
 }
 
 #[tokio::test]
