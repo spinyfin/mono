@@ -165,9 +165,11 @@ private struct RevisionChip: View {
     }
 }
 
-/// Renders a comment's `comment_thread_entries` inline, oldest first —
-/// today this is just the nudge (bucket 1&3); `answer`/`operator_followup`
-/// entries (bucket 2) render generically once those phases land.
+/// Renders a comment's `comment_thread_entries` inline, oldest first.
+/// `nudge` (bucket 1&3) and `answer` (bucket 2, engine-authored) share a
+/// neutral background; `operator_followup` gets an accent tint so the
+/// back-and-forth of a bucket-2 conversation reads like a thread rather than
+/// a flat list.
 private struct ThreadEntriesView: View {
     let entries: [CommentThreadEntry]
 
@@ -188,7 +190,7 @@ private struct ThreadEntriesView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.secondary.opacity(0.08))
+                        .fill(backgroundColor(for: entry.entryKind))
                 )
             }
         }
@@ -200,6 +202,89 @@ private struct ThreadEntriesView: View {
         case .answer: return "text.bubble"
         case .operatorFollowup: return "arrowshape.turn.up.left"
         }
+    }
+
+    private func backgroundColor(for kind: ThreadEntryKind) -> Color {
+        switch kind {
+        case .nudge, .answer: return Color.secondary.opacity(0.08)
+        case .operatorFollowup: return Color.accentColor.opacity(0.1)
+        }
+    }
+}
+
+/// The bucket-2 "other party is typing" indicator, shown under a comment
+/// while its answer agent run is `.answering` (design § "Bucket 2" —
+/// "Thinking indicator"). Pulses via opacity rather than a canned SF Symbol
+/// content-transition effect so it doesn't require a newer macOS deployment
+/// target.
+private struct ThinkingIndicatorView: View {
+    @State private var isPulsing = false
+
+    var body: some View {
+        Label("Thinking…", systemImage: "ellipsis.bubble")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .opacity(isPulsing ? 0.35 : 1.0)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    isPulsing = true
+                }
+            }
+    }
+}
+
+/// The reply box under an `answered` bucket-2 thread — the UI half of the
+/// engine's `CommentsPostFollowup` RPC (design § "Follow-up loop").
+private struct FollowupComposer: View {
+    let comment: Comment
+    @ObservedObject var layer: CommentLayer
+    @State private var text: String = ""
+
+    var body: some View {
+        HStack(spacing: 6) {
+            TextField("Reply…", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .onSubmit(send)
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private func send() {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        layer.postFollowup(body: text, for: comment)
+        text = ""
+    }
+}
+
+/// Stands in for the engine's async reclassification of a pending follow-up
+/// while a comment sits in `.awaitingFollowup` — mirrors `IntentBadge`'s
+/// manual-override menu since no live classifier is wired up yet. Picking an
+/// intent here drives `reclassifyFollowup`, the loop-vs-bridge fork (design §
+/// "Follow-up loop" / "Bridging a bucket-2 answer into a revision").
+private struct FollowupClassificationBadge: View {
+    let comment: Comment
+    @ObservedObject var layer: CommentLayer
+
+    var body: some View {
+        Menu {
+            ForEach(CommentIntent.allCases, id: \.self) { intent in
+                Button(intent.displayName) {
+                    layer.reclassifyFollowup(intent, for: comment)
+                }
+            }
+        } label: {
+            Label("classifying reply…", systemImage: "ellipsis.circle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Click to classify this follow-up — a question loops back to the answer agent, a change request moves this comment to the revision track")
     }
 }
 
@@ -262,6 +347,31 @@ private struct CommentRow: View {
         .buttonStyle(.plain)
     }
 
+    /// The bucket-2 thread-level indicators (design § "Comment/thread state
+    /// machine"): a thinking indicator while the answer agent runs, an
+    /// "Answered" checkmark + follow-up composer once it's replied, or the
+    /// reclassification badge while a just-posted follow-up is pending
+    /// routing. `active`/`resolved`/`inRevision` render nothing here — that
+    /// track has its own `RevisionChip` instead.
+    @ViewBuilder
+    private var bucketTwoTrack: some View {
+        switch comment.status {
+        case .answering:
+            ThinkingIndicatorView()
+        case .answered:
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Answered", systemImage: "checkmark.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+                FollowupComposer(comment: comment, layer: layer)
+            }
+        case .awaitingFollowup:
+            FollowupClassificationBadge(comment: comment, layer: layer)
+        case .active, .resolved, .inRevision:
+            EmptyView()
+        }
+    }
+
     private var rowContent: some View {
         ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 8) {
@@ -294,6 +404,8 @@ private struct CommentRow: View {
                 if !comment.threadEntries.isEmpty {
                     ThreadEntriesView(entries: comment.threadEntries)
                 }
+
+                bucketTwoTrack
 
                 HStack(spacing: 8) {
                     IntentBadge(comment: comment, layer: layer)

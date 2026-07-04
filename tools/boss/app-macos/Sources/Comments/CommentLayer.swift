@@ -293,6 +293,100 @@ final class CommentLayer: NSObject, ObservableObject {
                     )
                 )
             }
+        } else if intent == .question, comments[index].status != .answering {
+            // Mirrors the engine's `classifying` → `answering` transition
+            // (design § "Comment/thread state machine"): classification as
+            // `question` immediately spawns the answer agent. Guarded on not
+            // already `.answering` so reclassifying to `question` twice in a
+            // row doesn't spawn a second run.
+            comments[index].status = .answering
+            runAnswerAgent(for: comment.id)
+        }
+    }
+
+    // MARK: - Bucket 2: answer agent + follow-up loop (Phase 3d thin client)
+
+    /// Canned reply used in place of a real answer-agent run — engine
+    /// connectivity for bucket 2 lands with P529 persistence. Mirrors an
+    /// `entry_kind='answer'` thread entry (design § "Bucket 2").
+    static let stubAnswerBody =
+        "This is a stubbed answer — real answer-agent replies land once engine connectivity is wired up."
+
+    /// Simulates the answer agent: after a short "thinking" delay, posts an
+    /// `answer` thread entry and flips `answering → answered`. No-ops if the
+    /// comment has moved off `.answering` in the meantime (e.g. dismissed, or
+    /// manually reclassified away) — mirrors the engine's completion callback
+    /// being guarded on the run's expected state.
+    private func runAnswerAgent(for commentId: UUID) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard let self, let index = self.comments.firstIndex(where: { $0.id == commentId }) else { return }
+            guard self.comments[index].status == .answering else { return }
+            self.comments[index].threadEntries.append(
+                CommentThreadEntry(
+                    id: UUID(),
+                    entryKind: .answer,
+                    author: "engine",
+                    body: Self.stubAnswerBody,
+                    createdAt: Date()
+                )
+            )
+            self.comments[index].status = .answered
+        }
+    }
+
+    /// The operator's reply in an `answered` bucket-2 thread — mirrors the
+    /// engine's `CommentsPostFollowup` RPC. Appends an `operator_followup`
+    /// thread entry and moves the comment to `awaitingFollowup`, where
+    /// `reclassifyFollowup` (driven by the sidebar's classification badge,
+    /// standing in for the real async classifier) decides whether it loops
+    /// back into bucket 2 or bridges to bucket 1&3.
+    func postFollowup(body: String, for comment: Comment) {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = comments.firstIndex(where: { $0.id == comment.id }),
+              comments[index].status == .answered
+        else { return }
+        comments[index].threadEntries.append(
+            CommentThreadEntry(
+                id: UUID(),
+                entryKind: .operatorFollowup,
+                author: "you",
+                body: trimmed,
+                createdAt: Date()
+            )
+        )
+        comments[index].status = .awaitingFollowup
+        print("[CommentsPostFollowup] comment=\(comment.id)")
+    }
+
+    /// Reclassifies a pending follow-up (design § "Follow-up loop" /
+    /// "Bridging a bucket-2 answer into a revision"). `question` loops back
+    /// into bucket 2 (`answering`, the agent runs again); `directive`/
+    /// `largerChange` bridges the comment onto the bucket-1&3 track
+    /// (`active`, with a nudge entry so the next `[Revise]` batch picks it
+    /// up) — the comment's chip visibly swaps from the bucket-2 thread
+    /// indicators to the `RevisionChip`.
+    func reclassifyFollowup(_ intent: CommentIntent, for comment: Comment) {
+        guard let index = comments.firstIndex(where: { $0.id == comment.id }),
+              comments[index].status == .awaitingFollowup
+        else { return }
+        comments[index].intent = intent
+        switch intent {
+        case .question:
+            comments[index].status = .answering
+            runAnswerAgent(for: comment.id)
+        case .directive, .largerChange:
+            comments[index].status = .active
+            comments[index].threadEntries.append(
+                CommentThreadEntry(
+                    id: UUID(),
+                    entryKind: .nudge,
+                    author: "engine",
+                    body: Self.nudgeBody,
+                    createdAt: Date()
+                )
+            )
         }
     }
 

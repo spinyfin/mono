@@ -27,15 +27,27 @@ enum CommentIntent: String, CaseIterable, Equatable {
     }
 }
 
-/// Mirrors the engine's `work_comments.status` values that matter to the
-/// `[Revise]`-track chip (`boss-protocol/src/types.rs`
-/// `COMMENT_STATUS_*`). `orphaned`/`dismissed` aren't rendered as a revision
-/// chip so they're left out of this thin-client enum; a dismissed comment is
-/// already removed from `CommentLayer.comments` entirely.
+/// Mirrors the engine's `work_comments.status` values
+/// (`boss-protocol/src/types.rs` `COMMENT_STATUS_*`): `active`/`resolved`/
+/// `inRevision` drive the bucket-1&3 `[Revise]`-track chip; `answering`/
+/// `answered`/`awaitingFollowup` drive the bucket-2 thread's thinking
+/// indicator and follow-up composer (design § "Comment/thread state
+/// machine"). `orphaned`/`dismissed` aren't rendered at all so they're left
+/// out of this thin-client enum; a dismissed comment is already removed from
+/// `CommentLayer.comments` entirely.
 enum CommentStatus: String, Equatable {
     case active
     case resolved
     case inRevision = "in_revision"
+    /// The answer agent is running for this comment (design § "Bucket 2" —
+    /// "Thinking indicator").
+    case answering
+    /// The answer agent posted its reply; awaiting an operator follow-up.
+    case answered
+    /// An operator follow-up was posted and awaits reclassification —
+    /// loops back to `.answering` (another question) or bridges to
+    /// `.active` (directive/larger_change).
+    case awaitingFollowup = "awaiting_followup"
 }
 
 /// Identifies the exact occurrence of a quoted-text span a comment is anchored to.
@@ -119,6 +131,11 @@ struct Comment: Identifiable, Equatable {
             if wasInRevision, statusActor == "engine" { return .reopened }
             let hasNudge = threadEntries.contains { $0.entryKind == .nudge }
             return hasNudge ? .nudged : nil
+        case .answering, .answered, .awaitingFollowup:
+            // Bucket-2 track states never show the bucket-1&3 chip — they
+            // render their own thread-level indicators instead (design §
+            // "Comment/thread state machine").
+            return nil
         }
     }
 }

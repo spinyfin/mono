@@ -202,8 +202,9 @@ final class CommentLayerTests: XCTestCase {
             XCTFail("expected .inRevision chip state")
         }
 
-        // The question-classified comment never joins the batch.
-        XCTAssertEqual(layer.comments[1].status, .active)
+        // The question-classified comment enters the bucket-2 track instead
+        // and never joins the batch.
+        XCTAssertEqual(layer.comments[1].status, .answering)
         XCTAssertNil(layer.comments[1].reviseTaskId)
 
         XCTAssertFalse(layer.bannerState.revisable)
@@ -249,6 +250,116 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].revisionChipState, .reopened)
         // Back on the banner.
         XCTAssertTrue(layer.bannerState.revisable)
+    }
+
+    // MARK: - Bucket 2: answer agent + follow-up loop (Phase 3d)
+
+    func testQuestionClassificationEntersAnsweringState() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+        XCTAssertNil(layer.comments[0].revisionChipState)
+    }
+
+    func testAnswerAgentPostsAnswerAndTransitionsToAnswered() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+
+        try await Task.sleep(for: .seconds(2))
+
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
+        XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .answer)
+        XCTAssertEqual(layer.comments[0].threadEntries[0].body, CommentLayer.stubAnswerBody)
+    }
+
+    func testPostFollowupIgnoredBeforeAnswered() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        layer.postFollowup(body: "still waiting?", for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+        XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
+    }
+
+    func testPostFollowupAppendsEntryAndAwaitsReclassification() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+
+        layer.postFollowup(body: "one more thing", for: layer.comments[0])
+
+        XCTAssertEqual(layer.comments[0].status, .awaitingFollowup)
+        XCTAssertEqual(layer.comments[0].threadEntries.count, 2)
+        XCTAssertEqual(layer.comments[0].threadEntries[1].entryKind, .operatorFollowup)
+        XCTAssertEqual(layer.comments[0].threadEntries[1].body, "one more thing")
+    }
+
+    func testReclassifyFollowupQuestionLoopsBackToAnswering() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+        layer.postFollowup(body: "and another question", for: layer.comments[0])
+
+        layer.reclassifyFollowup(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.filter { $0.entryKind == .answer }.count, 2)
+    }
+
+    func testReclassifyFollowupDirectiveBridgesToRevisionTrack() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+        layer.postFollowup(body: "actually, please change it", for: layer.comments[0])
+
+        layer.reclassifyFollowup(.directive, for: layer.comments[0])
+
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .nudge)
+        XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
+        XCTAssertTrue(layer.bannerState.revisable)
+    }
+
+    func testReclassifyFollowupIgnoredWhenNotAwaitingFollowup() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        layer.reclassifyFollowup(.directive, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+        XCTAssertEqual(layer.comments[0].intent, .question)
+    }
+
+    func testCommentSidebarRendersThinkingIndicator() {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        let view = CommentSidebar(layer: layer)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    func testCommentSidebarRendersFollowupComposer() async throws {
+        let layer = CommentLayer()
+        layer.addComment(quoted: "some text", body: "a note")
+        layer.setIntent(.question, for: layer.comments[0])
+        try await Task.sleep(for: .seconds(2))
+
+        let view = CommentSidebar(layer: layer)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
     func testCommentSidebarRendersReviseBannerAndChips() {
