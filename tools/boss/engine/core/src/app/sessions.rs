@@ -81,6 +81,32 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                 new_app_pid = observed,
                 "app session re-attached: trust root re-pinned to relaunched app",
             );
+            // The relaunched app killed every worker shell that was a
+            // child of the prior (now-dead) app process, but their engine
+            // slot bindings, pool claims, and DB execution rows survive.
+            // Reconcile them now via the dead-PID probe: waiting for the
+            // periodic dead-PID sweep would leave the slots bound and the
+            // work items stuck "active" for up to a full sweep interval,
+            // exactly the 2026-07-03 relaunch-orphan desync. Spawned
+            // detached so the app's RegisterAppSession round-trip is not
+            // blocked on the DB lookups + coordinator kicks the reconcile
+            // performs. Only genuinely-dead PIDs are reaped, so a worker
+            // that somehow outlived the relaunch is left untouched.
+            let work_db = server_state.work_db.clone();
+            let live_worker_states = server_state.live_worker_states.clone();
+            let execution_coordinator = server_state.execution_coordinator.clone();
+            let dispatch_events = server_state.dispatch_events.clone();
+            tokio::spawn(async move {
+                crate::dead_pid_sweep::reconcile_orphans_on_reattach(
+                    work_db,
+                    live_worker_states,
+                    execution_coordinator,
+                    dispatch_events,
+                    prior,
+                    observed,
+                )
+                .await;
+            });
         }
         server_state
             .register_app_session(session_id.clone(), sink.clone())
