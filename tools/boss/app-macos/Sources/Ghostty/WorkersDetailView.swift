@@ -152,11 +152,24 @@ private struct WorkerSlotView: View {
     @ViewBuilder
     private var slotBody: some View {
         if let session = slot.session {
+            // `.id(session.id)` forces SwiftUI to tear down and recreate
+            // this subtree — including the libghostty NSViewRepresentable
+            // — whenever the slot is rebound to a different run, even if
+            // two `WorkersWorkspaceModel.slots` mutations (the prior
+            // tenant's release nil-ing `session`, then the next spawn
+            // setting it again) land in the same publish cycle and
+            // SwiftUI's diff never observes the intermediate `nil`. Without
+            // this, the `if let` branch never flips, `updateNSView` runs
+            // instead of `makeNSView`, and the OLD `GhosttyTerminalHostView`
+            // (with its `let session` fixed at `init`) keeps hosting the
+            // PREVIOUS tenant's pty and scrollback under the NEW
+            // execution's header — the false-live pane-attribution bug.
             WorkerPaneTerminalView(
                 runtime: runtime,
                 session: session,
                 liveState: liveState
             )
+            .id(session.id)
         } else {
             idlePaneView
         }

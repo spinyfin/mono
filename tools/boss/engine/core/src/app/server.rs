@@ -824,6 +824,29 @@ pub async fn serve(
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );
 
+    // Periodic spawn-liveness sweep: detects worker slots whose
+    // `SpawnWorkerPane` RPC returned `ok` but which never produced a live
+    // `claude` session — `shell_pid` stayed 0 and no hook event ever
+    // arrived. `mark_stalled_spawns` (the 10s loop below) only promotes
+    // the legitimate directory-trust-prompt stall (shell_pid > 0) to
+    // `WaitingForInput`; a slot with no shell pid at all is left in
+    // `Spawning` for this sweep to catch as a confirmed dead spawn instead
+    // of being mislabelled "waiting for input" forever (the 2026-07-03/04
+    // false-live incident: `pane_spawned/ok` logged, `shell_pid: 0` and
+    // no hook event for 13+ minutes, no claude session ever started).
+    // Reaps via the same `release_worker_pane` teardown the stale-worker
+    // sweep uses, then releases the slot so the orphan sweep redispatches.
+    // Runs every 30s and fires on boot.
+    let _spawn_liveness_sweep_handle = crate::spawn_liveness_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+        Duration::from_secs(30),
+        crate::spawn_liveness_sweep::SPAWN_LIVENESS_TIMEOUT_SECS,
+    );
+
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
     // daemon wedges in a ~100% CPU spin. While it is stuck it stops
     // servicing code-signing assessments, so every `dlopen` of a
