@@ -839,6 +839,20 @@ pub async fn serve(
         crate::syspolicyd_monitor::DEFAULT_SAMPLE_INTERVAL,
     );
 
+    // Periodic app-session outbound-queue sampler: logs the engine→app
+    // queue depth + oldest-envelope age whenever it is backing up. Pairs
+    // with the on-send-timeout WARNs so a channel that drains seconds-late
+    // under snapshot-traffic saturation (the reveal / `release_worker_pane`
+    // `Send(Timeout)` incident) is visible in the trace continuously, not
+    // only at the moment an RPC happens to fail. Read-only.
+    let _app_queue_sampler_handle = {
+        let sampler_state = server_state.clone();
+        crate::sweep_loop::spawn_sweep_loop(super::APP_QUEUE_SAMPLE_INTERVAL, move || {
+            let state = sampler_state.clone();
+            async move { state.sample_app_session_queue().await }
+        })
+    };
+
     // Periodic transient-recovery reconciler: detects workers wedged by
     // a transient Claude API error (the interactive `claude` session
     // printed the error, ended its turn, and sits Idle while the chore
