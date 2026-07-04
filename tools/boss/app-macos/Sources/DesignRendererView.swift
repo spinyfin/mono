@@ -44,6 +44,23 @@ struct DesignRendererContent: Codable, Hashable {
     /// `task_id` alongside.
     let projectID: String
 
+    // The resolved doc's repo/branch/path — the pieces of the engine's
+    // `pr_doc:<repo_remote_url>:<branch>:<path>` comment-artifact id. Optional so
+    // an old state-restored payload (or the local-file open path) decodes without
+    // them; comments are engine-backed only when all three are present.
+    var repoRemoteURL: String? = nil
+    var branch: String? = nil
+    var path: String? = nil
+
+    /// The comment artifact this doc corresponds to (`pr_doc:*`), or `nil` when
+    /// the payload lacks the repo/branch/path needed to key it.
+    var commentArtifact: CommentArtifactRef? {
+        guard let repoRemoteURL, let branch, let path,
+              !repoRemoteURL.isEmpty, !branch.isEmpty, !path.isEmpty
+        else { return nil }
+        return .prDoc(repoRemoteURL: repoRemoteURL, branch: branch, path: path)
+    }
+
     /// Convenience for tests and the wiring layer in
     /// [[ChatViewModel.openProjectDesignDoc(_:)]] — builds the payload
     /// from a [[ResolvedDesignDoc]] + workspace path. Returns nil when
@@ -70,7 +87,10 @@ struct DesignRendererContent: Codable, Hashable {
             filePath: absolute,
             webURL: webURL,
             repoLabel: repoOwnerSlash(repoURL: resolved.repoRemoteURL),
-            projectID: projectID
+            projectID: projectID,
+            repoRemoteURL: resolved.repoRemoteURL,
+            branch: resolved.branch,
+            path: resolved.path
         )
     }
 
@@ -145,7 +165,11 @@ struct DesignRendererView: View {
             .task(id: content.filePath) {
                 await load()
             }
-            .withComments()
+            .withComments(
+                artifact: content.commentArtifact,
+                source: source,
+                baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent()
+            )
 
             if !questionGroups.isEmpty {
                 Divider()

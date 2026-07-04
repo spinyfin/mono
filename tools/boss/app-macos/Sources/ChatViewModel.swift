@@ -802,6 +802,10 @@ final class ChatViewModel: ObservableObject {
     }
 
     let engine: EngineClient
+    /// Routes engine comment RPC replies + `comments.artifact.*` invalidations
+    /// to the open [`CommentLayer`]s (P529 Phase 2). Injected into the markdown
+    /// viewers via the `@EnvironmentObject` `ChatViewModel`.
+    let commentBridge: CommentEngineBridge
     /// Test-only hook: forwarded to `EngineClient.outboundRecorder`
     /// so an XCTest can assert that the form's submit lands the
     /// expected `repo_remote_url` on the wire. The real socket write
@@ -857,6 +861,7 @@ final class ChatViewModel: ObservableObject {
         let showSystem = ProcessInfo.processInfo.environment["BOSS_SHOW_SYSTEM_MESSAGES"] ?? ""
         showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
         engine = EngineClient(socketPath: paths.socketPath)
+        commentBridge = CommentEngineBridge(engine: engine)
 
         commonInit()
     }
@@ -1845,6 +1850,9 @@ final class ChatViewModel: ObservableObject {
             hasConnectedOnce = true
             engine.sendRegisterAppSession()
             refreshWorkSubscriptions()
+            // Re-subscribe any open markdown viewers' comment topics and reload
+            // them; the engine dropped every subscription on the disconnect.
+            commentBridge.handleReconnected()
             engine.sendListProducts()
             engine.sendListWorkerLiveStates()
             engine.sendListLiveStatusDisabledSlots()
@@ -1944,6 +1952,11 @@ final class ChatViewModel: ObservableObject {
                 }
             }
         case .workInvalidated(let topic, let productId, _):
+            if CommentEngineBridge.isCommentTopic(topic) {
+                // A comment row on an open viewer's artifact changed elsewhere;
+                // the bridge reloads the bound layer(s). Invalidation-not-patch.
+                commentBridge.handleCommentInvalidation(topic: topic)
+            }
             if topic == "work.products" {
                 engine.sendListProducts()
             }
@@ -2404,6 +2417,13 @@ final class ChatViewModel: ObservableObject {
                 findings: findings,
                 rewrittenBody: rewrittenBody
             )
+        // MARK: Comments (P529 Phase 2)
+        case .commentsList(let artifactKind, let artifactId, let comments):
+            commentBridge.handleCommentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
+        case .commentsResolved(let artifactKind, let artifactId, let comments):
+            commentBridge.handleCommentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
+        case .commentResult(let comment):
+            commentBridge.handleCommentResult(comment)
         }
     }
 

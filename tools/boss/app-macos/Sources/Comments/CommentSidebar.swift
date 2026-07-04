@@ -37,7 +37,7 @@ struct CommentSidebar: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Comments")
                     .font(.callout.weight(.semibold))
@@ -47,9 +47,14 @@ struct CommentSidebar: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            Text("Comments not yet persisted — Phase 1 preview")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            // Soft-dismiss "show resolved" toggle (P529 Phase 2). Only meaningful
+            // on an engine-backed viewer, where resolved comments are retained.
+            if layer.isEngineBacked {
+                Toggle("Show resolved", isOn: $layer.showResolved)
+                    .toggleStyle(.checkbox)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -333,6 +338,30 @@ private struct IntentBadge: View {
     }
 }
 
+/// The anchor-resolution glyph on a comment row: a ⚠ when the engine could only
+/// re-anchor the comment via fuzzy match (so the highlight may sit on slightly
+/// shifted text), or an "anchor lost" badge when the anchor could not be
+/// resolved at all (the comment paints no doc highlight). Nothing when the anchor
+/// resolved exactly. Mirrors `work_comments.last_resolved_with` (design §
+/// "Re-anchoring on load").
+private struct AnchorStatusBadge: View {
+    let comment: Comment
+
+    var body: some View {
+        if comment.isOrphaned {
+            Label("anchor lost", systemImage: "mappin.slash")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .help("This comment's anchor could not be found in the current document.")
+        } else if comment.isFuzzyAnchored {
+            Label("fuzzy", systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.yellow)
+                .help("Re-anchored by fuzzy match — the document changed near this comment; double-check the highlighted text.")
+        }
+    }
+}
+
 private struct CommentRow: View {
     let comment: Comment
     @ObservedObject var layer: CommentLayer
@@ -367,7 +396,7 @@ private struct CommentRow: View {
             }
         case .awaitingFollowup:
             FollowupClassificationBadge(comment: comment, layer: layer)
-        case .active, .resolved, .inRevision:
+        case .active, .resolved, .inRevision, .orphaned, .dismissed:
             EmptyView()
         }
     }
@@ -412,6 +441,7 @@ private struct CommentRow: View {
                     if let chipState = comment.revisionChipState {
                         RevisionChip(state: chipState)
                     }
+                    AnchorStatusBadge(comment: comment)
                     Text(comment.createdAt, style: .relative)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)

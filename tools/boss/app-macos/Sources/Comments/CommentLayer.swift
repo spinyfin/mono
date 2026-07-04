@@ -13,12 +13,16 @@ private let anchorLog = Logger(subsystem: "com.boss.app", category: "CommentPopu
 ///   log stream --predicate 'subsystem == "com.boss.markdown" AND category == "coordinates"' --style compact
 private let coordLog = Logger(subsystem: "com.boss.markdown", category: "coordinates")
 
-/// Owns the in-memory comment array for a single markdown viewer instance
-/// and coordinates the selection → authoring → sidebar → highlight flow.
+/// Owns the comment array for a single markdown viewer instance and
+/// coordinates the selection → authoring → sidebar → highlight flow.
 ///
-/// Phase 1: all state is in-memory; no engine RPCs; closing the viewer
-/// loses all comments. This is intentional and surfaced to the user in
-/// the sidebar header.
+/// Since P529 Phase 2 the layer is engine-backed: when [`configure`] is given an
+/// artifact id and a [`CommentBackend`], comments load via `comments_list`,
+/// persist via `comments_create`/`comments_dismiss`, re-anchor via
+/// `comments_resolve`, and stay live via the `comments.artifact.*` subscription
+/// — so they survive the viewer closing and the app restarting. Absent an
+/// artifact (an artifact-less viewer, or a unit test), it degrades to the
+/// Phase-1 in-memory behaviour so those surfaces keep working unchanged.
 @MainActor
 final class CommentLayer: NSObject, ObservableObject {
     @Published var comments: [Comment] = []
@@ -28,6 +32,28 @@ final class CommentLayer: NSObject, ObservableObject {
     @Published var pendingFirstChar: Character? = nil
     /// Anchor of the comment just clicked in the sidebar; clears after the flash.
     @Published var flashingAnchor: CommentAnchor? = nil
+    /// Soft-dismiss "show resolved" sidebar toggle (design § "Soft-dismiss").
+    /// Resolved/orphaned comments are hidden from the active sidebar unless this
+    /// is on; flipping it re-lists with `include_resolved`.
+    @Published var showResolved: Bool = false {
+        didSet { if showResolved != oldValue { reload() } }
+    }
+
+    // MARK: - Engine backing
+
+    /// The artifact these comments attach to (`work_item` / `pr_doc`). Empty on
+    /// the artifact-less in-memory path.
+    private(set) var artifactKind: String = ""
+    private(set) var artifactId: String = ""
+    /// The raw markdown the viewer renders; the plain-text projection (for
+    /// anchoring + `doc_version`) is derived from it.
+    private var source: String = ""
+    private var baseURL: URL? = nil
+    /// The engine facade. `nil` ⇒ in-memory fallback.
+    private weak var backend: (any CommentBackend)? = nil
+
+    /// True when this layer is persisting through the engine.
+    var isEngineBacked: Bool { backend != nil && !artifactId.isEmpty }
 
     /// Occurrence index computed at selection time; consumed by addComment().
     private var pendingOccurrenceIndex: Int = 0
@@ -237,15 +263,44 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     func addComment(quoted: String, body: String) {
-        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let comment = Comment(
-            id: UUID(),
-            quotedText: quoted,
-            occurrenceIndex: pendingOccurrenceIndex,
-            body: body.trimmingCharacters(in: .whitespacesAndNewlines),
-            createdAt: Date()
-        )
-        comments.append(comment)
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        // Build the W3C anchor from the plain-text projection: locate the
+        // selected occurrence, take the verbatim `exact` span plus ~64 chars of
+        // `prefix`/`suffix` context around it. Falls back to a bare `exact`
+        // anchor when there is no projection (artifact-less tests).
+        let projection = currentProjection()
+        let anchor = Self.captureAnchor(
+            quoted: quoted, occurrenceIndex: pendingOccurrenceIndex, in: projection)
+
+        resetAuthoringState()
+
+        if let backend, !artifactId.isEmpty {
+            // Engine-backed: persist and let the reload (triggered by the
+            // engine's echo + topic invalidation) materialise the comment.
+            backend.createComment(
+                artifactKind: artifactKind,
+                artifactId: artifactId,
+                anchor: anchor,
+                body: trimmed,
+                docVersion: CommentProjection.docVersion(forPlainText: projection)
+            )
+        } else {
+            // In-memory fallback (artifact-less viewer / unit test).
+            let comment = Comment(
+                id: "local:\(UUID().uuidString)",
+                anchor: anchor,
+                body: trimmed,
+                author: CommentAuthor.current,
+                createdAt: Date()
+            )
+            comments.append(comment)
+        }
+    }
+
+    /// Close the popover and clear the pending-authoring scratch state.
+    private func resetAuthoringState() {
         activePopover?.close()
         activePopover = nil
         isShowingPopover = false
@@ -258,8 +313,135 @@ final class CommentLayer: NSObject, ObservableObject {
         activePopover?.close()
     }
 
+    /// Soft-dismiss. Engine-backed comments transition to `resolved` (hidden
+    /// unless `showResolved`) via `comments_dismiss`; in-memory comments are
+    /// removed outright.
     func dismiss(_ comment: Comment) {
-        comments.removeAll { $0.id == comment.id }
+        if let backend, isEngineBacked, !comment.id.hasPrefix("local:") {
+            backend.dismissComment(commentId: comment.id)
+        } else {
+            comments.removeAll { $0.id == comment.id }
+        }
+    }
+
+    // MARK: - Engine backing lifecycle
+
+    /// Bind this layer to a viewer's document and (optionally) the engine.
+    /// Called from the view modifier's `onAppear`. When `artifact` is non-nil the
+    /// layer registers with the backend and loads persisted comments; otherwise
+    /// it stays in in-memory mode.
+    func configure(
+        source: String,
+        baseURL: URL?,
+        artifact: CommentArtifactRef?,
+        backend: (any CommentBackend)?
+    ) {
+        self.source = source
+        self.baseURL = baseURL
+        guard let artifact, let backend else { return }
+        // Re-configuring the same artifact is a no-op beyond refreshing source.
+        if artifactId == artifact.id, self.backend != nil { return }
+        self.artifactKind = artifact.kind
+        self.artifactId = artifact.id
+        self.backend = backend
+        backend.registerCommentLayer(self, artifactKind: artifact.kind, artifactId: artifact.id)
+        reload()
+    }
+
+    /// Unbind from the engine (view `onDisappear`). Keeps monitors teardown a
+    /// separate concern so the modifier can order them.
+    func unbindFromEngine() {
+        backend?.unregisterCommentLayer(self)
+    }
+
+    /// Update the rendered source (the viewer may load it asynchronously, after
+    /// `configure`). Re-resolves anchors against the freshly-available projection
+    /// so highlights + the ⚠/orphan glyphs settle once the doc text arrives.
+    func updateSource(_ source: String, baseURL: URL?) {
+        guard source != self.source else { return }
+        self.source = source
+        self.baseURL = baseURL
+        guard let backend, isEngineBacked else { return }
+        let projection = currentProjection()
+        if !projection.isEmpty {
+            backend.resolveComments(
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+        }
+    }
+
+    /// Re-fetch the artifact's comments and re-resolve their anchors against the
+    /// current projection. No-op when not engine-backed. Invoked on load, on the
+    /// engine's single-comment echo, and on `comments.artifact.*` invalidations.
+    func reload() {
+        guard let backend, isEngineBacked else { return }
+        backend.listComments(
+            artifactKind: artifactKind, artifactId: artifactId, includeResolved: showResolved)
+        let projection = currentProjection()
+        if !projection.isEmpty {
+            backend.resolveComments(
+                artifactKind: artifactKind, artifactId: artifactId, plainText: projection)
+        }
+    }
+
+    /// Apply a `comments_list` reply: rebuild the comment array from the engine's
+    /// authoritative rows + thread entries.
+    func applyList(_ wire: [CommentWithThread]) {
+        // Resolution outcomes arrive on a separate `comments_resolved` reply;
+        // preserve the last-known one per id so the ⚠/anchor-lost glyph doesn't
+        // flicker off between a list refresh and the following resolve.
+        let priorResolved: [String: ResolvedWith] = Dictionary(
+            comments.compactMap { c in c.lastResolvedWith.map { (c.id, $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        comments = wire.map { cw in
+            var c = Comment.from(cw.comment, threadEntries: cw.threadEntries)
+            if c.lastResolvedWith == nil { c.lastResolvedWith = priorResolved[c.id] }
+            return c
+        }
+    }
+
+    /// Apply a `comments_resolved` reply: stamp each comment's anchor-resolution
+    /// outcome (drives the ⚠ fuzzy glyph and the anchor-lost badge). The engine
+    /// has already persisted fuzzy re-anchors and orphan flips server-side, so
+    /// this only reflects them into the UI.
+    func applyResolved(_ resolved: [ResolvedComment]) {
+        let byId = Dictionary(resolved.map { ($0.comment.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for i in comments.indices {
+            guard let rc = byId[comments[i].id] else { continue }
+            comments[i].lastResolvedWith = ResolvedWith(rawValue: rc.resolution.kind) ?? .exact
+            if rc.resolution.isOrphan { comments[i].status = .orphaned }
+        }
+    }
+
+    /// The rendered plain-text projection of the current source — the space the
+    /// W3C anchor and `doc_version` live in. Computed identically to what
+    /// [`HighlightingMarkdownParser`] paints against.
+    func currentProjection() -> String {
+        guard !source.isEmpty else { return "" }
+        return CommentProjection.plainText(for: source, baseURL: baseURL)
+    }
+
+    /// Build a W3C `{exact, prefix, suffix}` anchor for the `occurrenceIndex`-th
+    /// occurrence of `quoted` in the plain-text projection. `exact` is taken
+    /// verbatim from the projection (normalising the pasteboard whitespace), with
+    /// up to 64 chars of surrounding context. Falls back to a bare `exact` anchor
+    /// when the projection is empty or the occurrence can't be located.
+    static func captureAnchor(quoted: String, occurrenceIndex: Int, in plain: String) -> CommentAnchor {
+        let contextLength = 64
+        guard !plain.isEmpty else { return CommentAnchor(exact: quoted) }
+        let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: quoted, in: plain)
+        guard occurrenceIndex >= 0, occurrenceIndex < ranges.count else {
+            return CommentAnchor(exact: quoted)
+        }
+        let range = ranges[occurrenceIndex]
+        let exact = String(plain[range])
+        let prefixStart = plain.index(range.lowerBound, offsetBy: -contextLength, limitedBy: plain.startIndex)
+            ?? plain.startIndex
+        let suffixEnd = plain.index(range.upperBound, offsetBy: contextLength, limitedBy: plain.endIndex)
+            ?? plain.endIndex
+        let prefix = String(plain[prefixStart..<range.lowerBound])
+        let suffix = String(plain[range.upperBound..<suffixEnd])
+        return CommentAnchor(exact: exact, prefix: prefix, suffix: suffix)
     }
 
     // MARK: - Intent classification badge (Phase 1d)
@@ -285,7 +467,7 @@ final class CommentLayer: NSObject, ObservableObject {
             if !alreadyNudged {
                 comments[index].threadEntries.append(
                     CommentThreadEntry(
-                        id: UUID(),
+                        id: UUID().uuidString,
                         entryKind: .nudge,
                         author: "engine",
                         body: Self.nudgeBody,
@@ -317,14 +499,14 @@ final class CommentLayer: NSObject, ObservableObject {
     /// comment has moved off `.answering` in the meantime (e.g. dismissed, or
     /// manually reclassified away) — mirrors the engine's completion callback
     /// being guarded on the run's expected state.
-    private func runAnswerAgent(for commentId: UUID) {
+    private func runAnswerAgent(for commentId: String) {
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(1.5))
             guard let self, let index = self.comments.firstIndex(where: { $0.id == commentId }) else { return }
             guard self.comments[index].status == .answering else { return }
             self.comments[index].threadEntries.append(
                 CommentThreadEntry(
-                    id: UUID(),
+                    id: UUID().uuidString,
                     entryKind: .answer,
                     author: "engine",
                     body: Self.stubAnswerBody,
@@ -349,7 +531,7 @@ final class CommentLayer: NSObject, ObservableObject {
         else { return }
         comments[index].threadEntries.append(
             CommentThreadEntry(
-                id: UUID(),
+                id: UUID().uuidString,
                 entryKind: .operatorFollowup,
                 author: "you",
                 body: trimmed,
@@ -380,7 +562,7 @@ final class CommentLayer: NSObject, ObservableObject {
             comments[index].status = .active
             comments[index].threadEntries.append(
                 CommentThreadEntry(
-                    id: UUID(),
+                    id: UUID().uuidString,
                     entryKind: .nudge,
                     author: "engine",
                     body: Self.nudgeBody,
@@ -700,37 +882,70 @@ private final class CommentMenuTarget: NSObject, @unchecked Sendable {
     }
 }
 
+// MARK: - Artifact reference
+
+/// Identifies the document a viewer's comments attach to. Mirrors the engine's
+/// two-part `artifact_kind` + `artifact_id` key (`work_comments`). Threaded into
+/// `.withComments(artifact:)` so comments land on the right document.
+struct CommentArtifactRef: Equatable {
+    let kind: String
+    let id: String
+
+    /// A comment on an engine-owned work-item description. `artifact_id` is the
+    /// raw work-item id.
+    static func workItem(id: String) -> CommentArtifactRef {
+        CommentArtifactRef(kind: WireArtifactKind.workItem, id: id)
+    }
+
+    /// A comment on a markdown file under a PR's branch. `artifact_id` is the
+    /// synthetic `pr_doc:<repo_remote_url>:<branch>:<path>` composite the engine
+    /// keys on (`design_detector.rs` / `products_design.rs`).
+    static func prDoc(repoRemoteURL: String, branch: String, path: String) -> CommentArtifactRef {
+        CommentArtifactRef(kind: WireArtifactKind.prDoc, id: "pr_doc:\(repoRemoteURL):\(branch):\(path)")
+    }
+}
+
 // MARK: - View modifier
 
 /// Wraps a markdown viewer with the full comment affordance:
-/// sidebar (when comments exist), "Add Comment" button, popover authoring form,
-/// and three entry paths (type-to-comment, right-click context menu, ⌘⇧K).
+/// sidebar, "Add Comment" button, popover authoring form, and three entry paths
+/// (type-to-comment, right-click context menu, ⌘⇧K).
+///
+/// When `artifact` is non-nil and a [`CommentBackend`] is present in the
+/// environment (injected as `\.commentBackend`), comments are engine-backed and
+/// persist. Otherwise the layer runs in-memory (artifact-less viewers, tests).
 ///
 /// Usage:
 /// ```swift
 /// MarkdownViewerView(...)
-///     .withComments()
+///     .withComments(artifact: .prDoc(repoRemoteURL: …, branch: …, path: …), source: markdown)
 /// ```
 struct WithCommentsModifier: ViewModifier {
+    let artifact: CommentArtifactRef?
+    let source: String
+    let baseURL: URL?
+
+    @Environment(\.commentBackend) private var commentBackend
     @StateObject private var layer = CommentLayer()
 
     func body(content: Content) -> some View {
-        let commentedAnchors = layer.comments.map(\.anchor).filter { !$0.quotedText.isEmpty }
+        let commentedAnchors = layer.comments.filter(\.isHighlightable).map(\.anchor)
         let flashingAnchor = layer.flashingAnchor
+        let showSidebar = !layer.comments.isEmpty || layer.isEngineBacked
 
         HStack(spacing: 0) {
             content
                 .environment(\.commentedAnchors, commentedAnchors)
                 .environment(\.commentFlashAnchor, flashingAnchor)
 
-            if !layer.comments.isEmpty {
+            if showSidebar {
                 Divider()
                 CommentSidebar(layer: layer)
                     .frame(width: 280)
             }
         }
         .overlay(alignment: .topTrailing) {
-            if layer.comments.isEmpty {
+            if !showSidebar {
                 addCommentButton
                     .padding(.trailing, 16)
                     .padding(.top, 20)
@@ -745,8 +960,17 @@ struct WithCommentsModifier: ViewModifier {
             .frame(width: 0, height: 0)
             .hidden()
         }
-        .onAppear { layer.installMonitors() }
-        .onDisappear { layer.removeMonitors() }
+        .onAppear {
+            layer.configure(source: source, baseURL: baseURL, artifact: artifact, backend: commentBackend)
+            layer.installMonitors()
+        }
+        .onChange(of: source) { _, newSource in
+            layer.updateSource(newSource, baseURL: baseURL)
+        }
+        .onDisappear {
+            layer.removeMonitors()
+            layer.unbindFromEngine()
+        }
     }
 
     private var addCommentButton: some View {
@@ -763,8 +987,15 @@ struct WithCommentsModifier: ViewModifier {
 }
 
 extension View {
-    func withComments() -> some View {
-        modifier(WithCommentsModifier())
+    /// Attach the comment affordance. Pass the rendered markdown `source` (the
+    /// anchor projection is derived from it) and, to persist through the engine,
+    /// the `artifact` the doc corresponds to.
+    func withComments(
+        artifact: CommentArtifactRef? = nil,
+        source: String = "",
+        baseURL: URL? = nil
+    ) -> some View {
+        modifier(WithCommentsModifier(artifact: artifact, source: source, baseURL: baseURL))
     }
 }
 
@@ -778,6 +1009,14 @@ private struct CommentFlashAnchorKey: EnvironmentKey {
     static var defaultValue: CommentAnchor? { nil }
 }
 
+/// The engine facade the comment layer persists through. `nil` (the default)
+/// leaves the layer in-memory; `BossMacApp` injects `chatModel.commentBridge`
+/// into the markdown-viewer scenes. Using `@Environment` (not `@EnvironmentObject`)
+/// means an un-injected host (e.g. a unit test) reads `nil` rather than crashing.
+private struct CommentBackendKey: EnvironmentKey {
+    static var defaultValue: (any CommentBackend)? { nil }
+}
+
 extension EnvironmentValues {
     var commentedAnchors: [CommentAnchor] {
         get { self[CommentedAnchorsKey.self] }
@@ -787,5 +1026,10 @@ extension EnvironmentValues {
     var commentFlashAnchor: CommentAnchor? {
         get { self[CommentFlashAnchorKey.self] }
         set { self[CommentFlashAnchorKey.self] = newValue }
+    }
+
+    var commentBackend: (any CommentBackend)? {
+        get { self[CommentBackendKey.self] }
+        set { self[CommentBackendKey.self] = newValue }
     }
 }

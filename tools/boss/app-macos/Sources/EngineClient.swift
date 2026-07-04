@@ -335,6 +335,18 @@ enum EngineEvent {
         findings: [String],
         rewrittenBody: String?
     )
+    // MARK: Comments in the markdown viewer (P529 Phase 2)
+    /// Reply to `comments_create` / `comments_dismiss` / `comments_set_status`
+    /// / `comments_update_anchor` — the single-comment `comment_result` echo of
+    /// the persisted `WorkComment` row.
+    case commentResult(comment: WorkComment)
+    /// Reply to `comments_list` — each comment with its thread entries and the
+    /// answer-agent-running flag, for the artifact.
+    case commentsList(artifactKind: String, artifactId: String, comments: [CommentWithThread])
+    /// Reply to `comments_resolve` (wire type `comments_resolved`) — each active
+    /// comment paired with its anchor [`CommentResolution`] against the supplied
+    /// plain-text projection.
+    case commentsResolved(artifactKind: String, artifactId: String, comments: [ResolvedComment])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -1064,6 +1076,110 @@ final class EngineClient: @unchecked Sendable {
             payload["title"] = title
         }
         sendLine(payload)
+    }
+
+    // MARK: - Comments in the markdown viewer (P529 Phase 2)
+    //
+    // The engine ships these RPCs (`engine/core/src/app/comments.rs`); this is
+    // the macOS half PR #915 deferred. Requests are `FrontendRequest` variants
+    // tagged by a snake_case `type`; `comments_create` / `comments_revise_doc`
+    // flatten their input struct, so those fields sit at the top level. The
+    // engine's `CommentAnchor` serialises `{exact, prefix, suffix}`.
+
+    /// Create an `active` comment on an artifact. Engine replies `comment_result`
+    /// with the persisted `WorkComment`.
+    func sendCommentsCreate(
+        artifactKind: String,
+        artifactId: String,
+        anchor: CommentAnchor,
+        body: String,
+        author: String,
+        docVersion: String,
+        plainTextProjectionVersion: Int
+    ) {
+        sendLine([
+            "type": "comments_create",
+            "artifact_kind": artifactKind,
+            "artifact_id": artifactId,
+            "anchor": anchorPayload(anchor),
+            "body": body,
+            "author": author,
+            "doc_version": docVersion,
+            "plain_text_projection_version": plainTextProjectionVersion,
+        ])
+    }
+
+    /// List comments for an artifact. Excludes `resolved` / `dismissed` unless
+    /// `includeResolved`. Engine replies `comments_list` with `CommentWithThread`s.
+    func sendCommentsList(artifactKind: String, artifactId: String, includeResolved: Bool = false) {
+        sendLine([
+            "type": "comments_list",
+            "artifact_kind": artifactKind,
+            "artifact_id": artifactId,
+            "include_resolved": includeResolved,
+        ])
+    }
+
+    /// Resolve every active comment on the artifact against the renderer's
+    /// current plain-text projection. The engine re-anchors (persisting fuzzy
+    /// hits and flipping unresolvable comments to `orphaned`) and replies
+    /// `comments_resolved` with each comment + its `CommentResolution`.
+    func sendCommentsResolve(
+        artifactKind: String,
+        artifactId: String,
+        plainText: String,
+        plainTextProjectionVersion: Int
+    ) {
+        sendLine([
+            "type": "comments_resolve",
+            "artifact_kind": artifactKind,
+            "artifact_id": artifactId,
+            "plain_text": plainText,
+            "plain_text_projection_version": plainTextProjectionVersion,
+        ])
+    }
+
+    /// Soft-dismiss: transition a comment to `resolved`. Engine replies
+    /// `comment_result`.
+    func sendCommentsDismiss(commentId: String, actor: String? = nil) {
+        var payload: [String: Any] = ["type": "comments_dismiss", "comment_id": commentId]
+        if let actor { payload["actor"] = actor }
+        sendLine(payload)
+    }
+
+    /// Set a comment's status (`active` / `resolved` / `orphaned` / `dismissed`).
+    /// Engine replies `comment_result`.
+    func sendCommentsSetStatus(commentId: String, status: String, actor: String? = nil) {
+        var payload: [String: Any] = [
+            "type": "comments_set_status",
+            "comment_id": commentId,
+            "status": status,
+        ]
+        if let actor { payload["actor"] = actor }
+        sendLine(payload)
+    }
+
+    /// Write back a re-resolved anchor (used for a renderer-side re-anchor).
+    /// Engine replies `comment_result`. Note the engine also persists fuzzy
+    /// re-anchors as a side effect of `comments_resolve`, so the resolve-on-load
+    /// loop does not need this in the common case.
+    func sendCommentsUpdateAnchor(
+        commentId: String,
+        anchor: CommentAnchor,
+        newDocVersion: String,
+        plainTextProjectionVersion: Int
+    ) {
+        sendLine([
+            "type": "comments_update_anchor",
+            "comment_id": commentId,
+            "anchor": anchorPayload(anchor),
+            "new_doc_version": newDocVersion,
+            "plain_text_projection_version": plainTextProjectionVersion,
+        ])
+    }
+
+    private func anchorPayload(_ anchor: CommentAnchor) -> [String: Any] {
+        ["exact": anchor.exact, "prefix": anchor.prefix, "suffix": anchor.suffix]
     }
 
 
@@ -1980,10 +2096,43 @@ final class EngineClient: @unchecked Sendable {
                         rewrittenBody: rewrittenBody
                     ))
                 }
+            // MARK: Comments (P529 Phase 2)
+            case "comment_result":
+                guard let commentPayload = payload["comment"] as? [String: Any],
+                      let comment = decodeWire(WorkComment.self, from: commentPayload)
+                else {
+                    emit(.error(message: "received invalid comment_result payload"))
+                    break
+                }
+                emit(.commentResult(comment: comment))
+            case "comments_list":
+                let artifactKind = payload["artifact_kind"] as? String ?? ""
+                let artifactId = payload["artifact_id"] as? String ?? ""
+                let comments = (payload["comments"] as? [[String: Any]] ?? [])
+                    .compactMap { decodeWire(CommentWithThread.self, from: $0) }
+                emit(.commentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments))
+            case "comments_resolved":
+                let artifactKind = payload["artifact_kind"] as? String ?? ""
+                let artifactId = payload["artifact_id"] as? String ?? ""
+                let comments = (payload["comments"] as? [[String: Any]] ?? [])
+                    .compactMap { decodeWire(ResolvedComment.self, from: $0) }
+                emit(.commentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments))
             default:
                 break
             }
         }
+    }
+
+    /// Decode a `Codable` wire type from a `JSONSerialization` dict, mirroring
+    /// the `parseAttentionItem` re-serialise-then-`JSONDecoder` pattern used for
+    /// the other snake_cased engine payloads in this file.
+    private func decodeWire<T: Decodable>(_ type: T.Type, from payload: [String: Any]) -> T? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let value = try? JSONDecoder().decode(T.self, from: data)
+        else {
+            return nil
+        }
+        return value
     }
 
     private func emit(_ event: EngineEvent) {
