@@ -1943,8 +1943,24 @@ pub enum FrontendEvent {
     /// and the body of pushes on the `worker.live_states` topic. The
     /// list is the entire snapshot, not a delta — receivers can
     /// blindly replace their local map.
+    ///
+    /// `engine_process_started_at` identifies which engine process
+    /// produced this snapshot (the same value surfaced by
+    /// `LiveStatusDebugReport::engine_process_started_at`, i.e.
+    /// `build_info::process_started_at()`). The app compares this
+    /// against the value from its last snapshot to detect an engine
+    /// restart: the in-memory live-worker registry is rebuilt empty on
+    /// every engine boot, and reattach on startup only re-populates
+    /// *remote* runs, so a restarted engine can report a non-empty but
+    /// locally-incomplete snapshot (remote runs present, local runs
+    /// silently missing). Reconciling a locally-hosted pane against
+    /// such a snapshot would treat still-running local work as dead.
+    /// Comparing boot identity lets the app skip the reconciliation
+    /// sweep entirely across a boot transition, instead of only
+    /// guarding the fully-empty case.
     WorkerLiveStatesList {
         states: Vec<LiveWorkerState>,
+        engine_process_started_at: String,
     },
     /// Engine confirms an execution has been cancelled. The cancelled
     /// row's status is now `cancelled`; resource teardown (pane

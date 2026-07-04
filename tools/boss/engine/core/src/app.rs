@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
-    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
+    CommandPrDetector, PaneReleaseOutcome, PaneVacateReport, PrDetector, ProbeQueuer, WorkerCompletionHandler,
+    WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
@@ -33,7 +34,7 @@ use crate::protocol::{
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, InterruptWorkerPaneInput,
     OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
     TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload,
-    comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    VacatePaneByRunIdInput, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -290,18 +291,35 @@ impl ServerStatePaneReleaser {
 #[async_trait]
 impl WorkerPaneReleaser for ServerStatePaneReleaser {
     async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_pane_detailed(run_id).await.outcome
+    }
+
+    // Overrides the default (which infers `app_confirmed` purely from
+    // `outcome`) with the real signal from
+    // `ServerState::release_worker_pane_detailed` — this is the
+    // implementation `force_stop_execution` relies on to learn whether
+    // the app actually confirmed the pane close, so
+    // `ServerState::force_vacate_run`'s run-id-keyed fallback can be
+    // skipped when it would just be a redundant no-op round trip.
+    async fn release_pane_detailed(&self, run_id: &str) -> PaneVacateReport {
         let Some(weak) = self.server.get() else {
             tracing::warn!(run_id, "pane releaser called before server state was bound");
             // No server bound: nothing could be reaped. Treat as
             // "no live worker" so the caller does not free a lease on
             // the strength of a release that never happened.
-            return PaneReleaseOutcome::NoLiveWorker;
+            return PaneVacateReport {
+                outcome: PaneReleaseOutcome::NoLiveWorker,
+                app_confirmed: false,
+            };
         };
         let Some(server) = weak.upgrade() else {
             tracing::debug!(run_id, "pane releaser: server state already dropped");
-            return PaneReleaseOutcome::NoLiveWorker;
+            return PaneVacateReport {
+                outcome: PaneReleaseOutcome::NoLiveWorker,
+                app_confirmed: false,
+            };
         };
-        server.release_worker_pane(run_id).await
+        server.release_worker_pane_detailed(run_id).await
     }
 }
 
@@ -674,6 +692,19 @@ pub enum SendToAppError {
     Timeout,
     #[error("app responded with unexpected response kind for request kind {0}")]
     ResponseKindMismatch(&'static str),
+}
+
+/// Result of [`ServerState::force_vacate_run`]. Surfaced to `bossctl
+/// agents stop` / `bossctl agents reap` so they can fail loudly instead
+/// of reporting success while a pane may still be rendered.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ForceVacateOutcome {
+    #[error("pane vacated")]
+    Vacated,
+    #[error("no pane found for this run — nothing to vacate")]
+    NothingToVacate,
+    #[error("could not confirm the pane is closed: app is unreachable ({0})")]
+    AppUnreachable(#[source] SendToAppError),
 }
 
 /// Surfaced by [`ServerState::focus_worker_pane`]. Distinguishes
@@ -1198,14 +1229,29 @@ impl ServerState {
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
     ///
-    /// Also drops the matching `LiveWorkerStateRegistry` entry and
-    /// broadcasts the snapshot so subscribers (the kanban Doing dot,
-    /// the pane titlebar pill) stop showing the worker as attached
-    /// to its work item. Without this step a chore-done update would
-    /// release the libghostty pane but leave the live state stuck on
-    /// `WaitingForInput`, making the UI think the worker was still
-    /// running.
+    /// Thin wrapper over [`Self::release_worker_pane_detailed`] that
+    /// discards whether the app actually confirmed the close — this is
+    /// the historical, widely-used call site (completion, sweeps,
+    /// shutdown) where "the engine-side backstop ran" has always been
+    /// good enough. [`Self::force_vacate_run`] is the caller that needs
+    /// the finer distinction.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        self.release_worker_pane_detailed(run_id).await.outcome
+    }
+
+    /// Same teardown as [`Self::release_worker_pane`], but also reports
+    /// whether the app session was actually reached and positively
+    /// confirmed the pane close (`app_confirmed`). A `false` here means
+    /// the engine-side backstop (process-tree signal, pool-slot release,
+    /// live-state drop) ran, but nobody ever told the app to close the
+    /// pane — the exact gap behind the zombie-Riker-pane incident
+    /// (2026-07-01/02): the app was unreachable, the release "succeeded"
+    /// from the engine's point of view, and the pane was left rendered
+    /// forever with no further owner. Callers that must guarantee the
+    /// pane is actually gone (`bossctl agents stop` / `bossctl agents
+    /// reap`) use this to know when they need to fall back to
+    /// [`Self::force_vacate_run`]'s run-id-keyed sweep.
+    pub async fn release_worker_pane_detailed(&self, run_id: &str) -> PaneVacateReport {
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             tracing::debug!(
                 run_id,
@@ -1214,8 +1260,15 @@ impl ServerState {
             // No mapped slot means no pane and no recorded pid to reap —
             // the worker either already released or has not finished
             // spawning. Either way the caller must not treat this as a
-            // reap that frees the workspace lease.
-            return PaneReleaseOutcome::NoLiveWorker;
+            // reap that frees the workspace lease. `app_confirmed` is
+            // `false`: there was never anything to confirm, so a caller
+            // that needs a hard guarantee still must not assume the app
+            // has no stale pane under this run id (bookkeeping loss is
+            // exactly what produces that state).
+            return PaneVacateReport {
+                outcome: PaneReleaseOutcome::NoLiveWorker,
+                app_confirmed: false,
+            };
         };
         // Snapshot the worker's recorded shell pid *before* we drop the
         // live-state entry further down — the engine-side reap backstop
@@ -1230,9 +1283,14 @@ impl ServerState {
             slot_id,
             kill_grace_seconds: 5,
         });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
+        // `app_confirmed` is `true` only for the two outcomes where the
+        // app positively told us the pane is gone (torn down just now,
+        // or already unknown to it) — every other branch means the
+        // message may never have reached a pane that is still rendered.
+        let app_confirmed = match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
                 tracing::info!(run_id, slot_id, "released worker pane");
+                true
             }
             Ok(EngineToAppResponse::ReleaseWorkerPane {
                 result: Err(EngineToAppError::UnknownSlot),
@@ -1242,6 +1300,7 @@ impl ServerState {
                     slot_id,
                     "release_worker_pane: app reports unknown slot — already released",
                 );
+                true
             }
             Ok(other) => {
                 tracing::warn!(
@@ -1250,6 +1309,7 @@ impl ServerState {
                     ?other,
                     "release_worker_pane: app returned unexpected response",
                 );
+                false
             }
             Err(SendToAppError::NotRegistered) => {
                 tracing::debug!(
@@ -1257,11 +1317,13 @@ impl ServerState {
                     slot_id,
                     "release_worker_pane: no app session registered; skipping",
                 );
+                false
             }
             Err(err) => {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
+                false
             }
-        }
+        };
         // Engine-side reap backstop. The app's pane teardown above is
         // the primary reaper, but it cannot act when no app session is
         // registered, when the app is unresponsive, or when a wedged
@@ -1304,7 +1366,83 @@ impl ServerState {
         // A slot was mapped, so a worker had finished spawning: its pane
         // was torn down and (above) its OS process tree signalled. Report
         // `Reaped` so the caller may free the workspace lease.
-        PaneReleaseOutcome::Reaped
+        PaneVacateReport {
+            outcome: PaneReleaseOutcome::Reaped,
+            app_confirmed,
+        }
+    }
+
+    /// Guarantee `run_id`'s pane is vacated end-to-end, or report loudly
+    /// that it could not be confirmed — the direct fix for the
+    /// zombie-Riker/Garak-pane dead end (2026-07-01/02), where neither
+    /// `bossctl agents stop` nor `bossctl agents reap` could clear a
+    /// corpse pane because both were keyed on `slot_id` resolution the
+    /// engine had already forgotten.
+    ///
+    /// Two-tier strategy:
+    ///  1. The normal slot-keyed teardown ([`Self::release_worker_pane_detailed`]).
+    ///     If the app positively confirmed the close, done.
+    ///  2. Otherwise (no slot mapped, or the app didn't confirm), fall
+    ///     back to [`VacatePaneByRunIdInput`] — a run-id-keyed request the
+    ///     app answers by scanning its OWN pane inventory (worker,
+    ///     automation, and review pools) independent of any engine-side
+    ///     bookkeeping. This is what recovers a pane whose slot mapping
+    ///     is already gone.
+    ///
+    /// Returns [`ForceVacateOutcome::AppUnreachable`] when neither tier
+    /// could reach the app — callers (`bossctl agents stop` / `reap`)
+    /// MUST surface this as a hard failure rather than reporting success
+    /// while a pane may still be on screen.
+    pub async fn force_vacate_run(&self, run_id: &str) -> ForceVacateOutcome {
+        let report = self.release_worker_pane_detailed(run_id).await;
+        if report.app_confirmed {
+            return ForceVacateOutcome::Vacated;
+        }
+        // No slot was ever mapped for this run, AND there is no
+        // execution row at all for it — there both never was and never
+        // could be a pane. Skip the app round trip entirely: it would
+        // either fail every time (no app reachable) or burn several
+        // seconds proving a negative for a caller that passed a bogus or
+        // long-forgotten run id. Callers referencing a REAL execution
+        // (even a terminal one) always fall through to the fallback
+        // below, since a slot mapping or execution row is exactly the
+        // evidence that a pane might still exist.
+        if matches!(report.outcome, PaneReleaseOutcome::NoLiveWorker) && self.work_db.get_execution(run_id).is_err() {
+            tracing::debug!(
+                run_id,
+                "force_vacate_run: no slot and no execution row — nothing to vacate"
+            );
+            return ForceVacateOutcome::NothingToVacate;
+        }
+        tracing::info!(
+            run_id,
+            outcome = ?report.outcome,
+            "force_vacate_run: slot-keyed release did not confirm with the app; \
+             falling back to a run-id-keyed vacate that scans the app's own pane inventory",
+        );
+        let request = EngineToAppRequest::VacatePaneByRunId(VacatePaneByRunIdInput {
+            run_id: run_id.to_owned(),
+            kill_grace_seconds: 5,
+        });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::VacatePaneByRunId { result: Ok(result) }) => {
+                if result.vacated {
+                    tracing::info!(run_id, "force_vacate_run: vacated via run-id-keyed fallback");
+                    ForceVacateOutcome::Vacated
+                } else {
+                    tracing::debug!(run_id, "force_vacate_run: app has no pane under this run id");
+                    ForceVacateOutcome::NothingToVacate
+                }
+            }
+            Ok(other) => {
+                tracing::warn!(run_id, ?other, "force_vacate_run: app returned unexpected response");
+                ForceVacateOutcome::AppUnreachable(SendToAppError::ResponseKindMismatch("VacatePaneByRunId"))
+            }
+            Err(err) => {
+                tracing::warn!(run_id, ?err, "force_vacate_run: app unreachable");
+                ForceVacateOutcome::AppUnreachable(err)
+            }
+        }
     }
 
     /// Release every live worker pane the engine knows about. Called
@@ -1484,7 +1622,10 @@ impl ServerState {
     /// consumer or the spawn flow mutates the registry.
     pub async fn broadcast_live_worker_states(&self) {
         let states = self.live_worker_states.snapshot();
-        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList {
+            states,
+            engine_process_started_at: crate::build_info::process_started_at().to_owned(),
+        });
         self.topic_broker.publish(TOPIC_WORKER_LIVE_STATES, envelope).await;
     }
 

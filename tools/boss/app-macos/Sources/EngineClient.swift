@@ -89,6 +89,20 @@ enum EngineRevealResult: Sendable {
     case failure(EngineRevealError)
 }
 
+enum EngineVacateError: Sendable {
+    case internalFailure(String)
+}
+
+/// Reply to `vacate_pane_by_run_id`. `vacated` is `true` when a pane
+/// hosting the run id was found and torn down; `false` is not an
+/// error — it means no locally-hosted pane matched, which is the
+/// normal idempotent "nothing to do" case (e.g. the run finished and
+/// the pane already closed through the ordinary path).
+enum EngineVacateResult: Sendable {
+    case success(vacated: Bool)
+    case failure(EngineVacateError)
+}
+
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
@@ -96,6 +110,15 @@ enum EngineRequestKind: Sendable {
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)
     case revealWorkItem(workItemId: String, productId: String)
+    /// Close whichever pane (if any) is hosting `runId`, wherever it
+    /// lives — main worker, automation, or review pool. Unlike
+    /// `releaseWorkerPane`, this is keyed by run id, not slot id, so it
+    /// still works when the engine's own slot↔run-id bookkeeping has
+    /// already been dropped by a prior teardown attempt that the app
+    /// never received (the zombie-Riker/Garak-pane incident,
+    /// 2026-07-01/02). Backs the `bossctl agents stop` / `bossctl
+    /// agents reap` guaranteed-vacate fallback.
+    case vacatePaneByRunId(runId: String, killGraceSeconds: UInt32)
 }
 
 enum EngineEvent {
@@ -118,7 +141,11 @@ enum EngineEvent {
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
-    case workerLiveStatesList(states: [WorkerLiveState])
+    ///
+    /// `engineProcessStartedAt` identifies the engine process that
+    /// produced this snapshot — see `ChatViewModel`'s boot-id gate on
+    /// the reconciliation sweep.
+    case workerLiveStatesList(states: [WorkerLiveState], engineProcessStartedAt: String)
     /// Snapshot of slot ids whose live-status summarizer has been
     /// manually disabled by the human. Sourced from a one-shot reply
     /// to `list_live_status_disabled_slots`.
@@ -1242,6 +1269,24 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendVacatePaneByRunIdResponse(requestId: String, result: EngineVacateResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success(let vacated):
+            resultPayload = ["Ok": ["vacated": vacated]]
+        case .failure(let error):
+            resultPayload = ["Err": vacateEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "vacate_pane_by_run_id",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
         switch error {
         case .noAvailableSlot:
@@ -1257,6 +1302,13 @@ final class EngineClient: @unchecked Sendable {
         switch error {
         case .unknownSlot:
             return ["kind": "unknown_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func vacateEngineToAppErrorPayload(_ error: EngineVacateError) -> [String: Any] {
+        switch error {
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]
         }
@@ -1591,13 +1643,21 @@ final class EngineClient: @unchecked Sendable {
                         requestId: requestId,
                         request: .revealWorkItem(workItemId: workItemId, productId: productId)
                     ))
+                case "vacate_pane_by_run_id":
+                    let runId = request["run_id"] as? String ?? ""
+                    let killGrace = (request["kill_grace_seconds"] as? NSNumber)?.uint32Value ?? 0
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .vacatePaneByRunId(runId: runId, killGraceSeconds: killGrace)
+                    ))
                 default:
                     emit(.error(message:"engine_request unknown kind: \(kind)"))
                 }
             case "worker_live_states_list":
                 let raw = payload["states"] as? [[String: Any]] ?? []
                 let states = raw.compactMap(parseWorkerLiveState)
-                emit(.workerLiveStatesList(states: states))
+                let engineProcessStartedAt = payload["engine_process_started_at"] as? String ?? ""
+                emit(.workerLiveStatesList(states: states, engineProcessStartedAt: engineProcessStartedAt))
             case "live_status_disabled_slots_list":
                 let raw = payload["slot_ids"] as? [Any] ?? []
                 let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }

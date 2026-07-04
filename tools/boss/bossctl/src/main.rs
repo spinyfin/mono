@@ -1174,7 +1174,7 @@ async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<LiveWorkerStat
         .await
         .context("sending ListWorkerLiveStates")?
     {
-        FrontendEvent::WorkerLiveStatesList { states } => Ok(states),
+        FrontendEvent::WorkerLiveStatesList { states, .. } => Ok(states),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected list: {message}")
         }

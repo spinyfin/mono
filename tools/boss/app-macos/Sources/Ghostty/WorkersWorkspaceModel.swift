@@ -24,6 +24,20 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// the engine reports a pool size change on reconnect.
     @Published private(set) var reviewSlotCount: Int = 8
 
+    /// The most recently observed `engine_process_started_at` boot id,
+    /// updated by `ChatViewModel` (via a wired closure — see
+    /// `ContentView`) every time a `worker_live_states_list` snapshot
+    /// arrives, BEFORE that snapshot is reconciled. Every pane spawned
+    /// from here on stamps its `WorkerSlot.spawnEngineBootId` with this
+    /// value, and `reconcilePanes` refuses to sweep any slot whose
+    /// `spawnEngineBootId` disagrees with the snapshot's boot id — a
+    /// pane spawned under an older engine boot is never reconciled
+    /// against a snapshot from a newer one, on the first reconnect
+    /// after a restart OR any later one, since local runs are never
+    /// re-registered with a restarted engine (see the doc comment on
+    /// `ChatViewModel.lastKnownEngineProcessStartedAt`).
+    var currentEngineBootId: String?
+
     var reviewSlotRange: ClosedRange<Int> {
         WorkersWorkspaceModel.reviewSlotBase...(WorkersWorkspaceModel.reviewSlotBase + reviewSlotCount - 1)
     }
@@ -126,16 +140,19 @@ final class WorkersWorkspaceModel: ObservableObject {
             reviewSlots[index].runId = request.runId
             reviewSlots[index].summary = request.summary
             reviewSlots[index].taskTitle = request.taskTitle
+            reviewSlots[index].spawnEngineBootId = currentEngineBootId
         } else if isAutomation {
             automationSlots[index].session = session
             automationSlots[index].runId = request.runId
             automationSlots[index].summary = request.summary
             automationSlots[index].taskTitle = request.taskTitle
+            automationSlots[index].spawnEngineBootId = currentEngineBootId
         } else {
             slots[index].session = session
             slots[index].runId = request.runId
             slots[index].summary = request.summary
             slots[index].taskTitle = request.taskTitle
+            slots[index].spawnEngineBootId = currentEngineBootId
         }
 
         // Return shell_pid 0 now — the libghostty surface is created
@@ -209,6 +226,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         targetSlots[index].runId = nil
         targetSlots[index].summary = nil
         targetSlots[index].taskTitle = nil
+        targetSlots[index].spawnEngineBootId = nil
         // Re-roll the idle flavor so consecutive idle bouts on the same
         // slot don't show the same line — fresh recreation each time
         // the crew member clocks out.
@@ -230,6 +248,104 @@ final class WorkersWorkspaceModel: ObservableObject {
             }
         }
         return .success
+    }
+
+    /// Close whichever pane (if any) is hosting `runId`, wherever it
+    /// lives — main worker, automation, or review pool. Unlike
+    /// `releaseWorkerPane(slotId:)`, this does not require the caller
+    /// to already know the slot id: it scans this model's OWN pane
+    /// inventory by run id, which is authoritative for what is actually
+    /// on screen regardless of what the engine's slot bookkeeping
+    /// currently believes.
+    ///
+    /// This is the run-id-keyed escape hatch `bossctl agents stop` /
+    /// `bossctl agents reap` fall back to when the engine's normal
+    /// slot-keyed teardown finds nothing to release — the exact gap
+    /// behind the zombie-Riker/Garak-pane incident (2026-07-01/02): a
+    /// prior teardown attempt had already consumed the engine's
+    /// slot↔run-id mapping while the app was unreachable, leaving no
+    /// way for a later verb to resolve which slot to close.
+    ///
+    /// Returns `true` when a pane was found and closed; `false` is not
+    /// a failure — it means this model has no pane under that run id,
+    /// which is the idempotent "nothing to do" case (e.g. the pane
+    /// already closed through the ordinary path).
+    func vacatePaneByRunId(_ runId: String, killGraceSeconds: UInt32) -> Bool {
+        let allPools = [slots, automationSlots, reviewSlots]
+        guard let slot = allPools.lazy.flatMap({ $0 }).first(where: { $0.runId == runId && $0.session != nil }) else {
+            return false
+        }
+        if case .success = releaseWorkerPane(slotId: slot.slotId, killGraceSeconds: killGraceSeconds) {
+            return true
+        }
+        return false
+    }
+
+    /// Close every locally-hosted pane whose run id is NOT present in
+    /// `liveRunIds` — the engine's current live-worker snapshot
+    /// (fetched via `list_worker_live_states` on every connect/reconnect,
+    /// and pushed on the `worker.live_states` topic thereafter).
+    ///
+    /// This is the automatic recovery for a lost pane-teardown message:
+    /// when the engine tears down a run, it drops that run from its own
+    /// live-state registry UNCONDITIONALLY — independent of whether the
+    /// app was reachable to confirm the pane close (see
+    /// `ServerState.release_worker_pane_detailed` on the engine side).
+    /// So "missing from the live set" is a sound and sufficient signal
+    /// that any locally-rendered pane under that run id is stale, even
+    /// with zero information about what specifically happened to it.
+    ///
+    /// Must run at minimum on app launch and on every engine reconnect
+    /// — see `ChatViewModel`'s `.connected` handler — so a stale pane
+    /// never survives indefinitely just because one teardown event was
+    /// lost (the zombie-Riker/Garak-pane incident, 2026-07-01/02).
+    ///
+    /// Returns the vacated slot ids, purely for caller-side logging.
+    ///
+    /// Guard: an EMPTY `liveRunIds` snapshot is treated as "unknown",
+    /// never as "everything is dead", and the sweep is skipped entirely.
+    /// The engine's in-memory live-worker registry is rebuilt from
+    /// scratch on every engine restart (crash/upgrade/manual restart);
+    /// engine-startup reattach only re-populates REMOTE runs
+    /// (`remote_reattach.rs`), so a restarted engine reports an empty
+    /// local live set even while this app's local worker/reviewer
+    /// panes are still running real, unfinished work. Without this
+    /// guard the very first post-restart reconnect would read as "no
+    /// runs are live" and `releaseWorkerPane` would SIGKILL every
+    /// locally-hosted pane's process tree — turning a routine engine
+    /// restart into a mass kill of in-progress work. A genuinely idle
+    /// app (zero locally-hosted panes) is unaffected either way, since
+    /// the loop below is then a no-op regardless of this guard.
+    @discardableResult
+    func reconcilePanes(liveRunIds: Set<String>) -> [Int] {
+        guard !liveRunIds.isEmpty else {
+            return []
+        }
+        var vacatedSlotIDs: [Int] = []
+        for pool in [slots, automationSlots, reviewSlots] {
+            for slot in pool {
+                guard slot.session != nil, let runId = slot.runId, !liveRunIds.contains(runId) else {
+                    continue
+                }
+                // Refuse to sweep a pane whose owning boot id disagrees
+                // with the boot id this snapshot came from: local runs
+                // are never re-registered with a restarted engine, so a
+                // pane spawned under an earlier boot is permanently
+                // absent from every subsequent snapshot — not just the
+                // first one after the restart. Comparing per-pane (not
+                // just gating the whole sweep once at the ChatViewModel
+                // layer) means a SECOND reconnect to the same restarted
+                // engine still can't mass-kill it. See
+                // `currentEngineBootId` / `WorkerSlot.spawnEngineBootId`.
+                guard slot.spawnEngineBootId == currentEngineBootId else {
+                    continue
+                }
+                if case .success = releaseWorkerPane(slotId: slot.slotId, killGraceSeconds: 5) {
+                    vacatedSlotIDs.append(slot.slotId)
+                }
+            }
+        }
+        return vacatedSlotIDs
     }
 
     /// Resolve the foreground pid of the pty hosting `session`, or
@@ -348,6 +464,15 @@ struct WorkerSlot: Identifiable, Equatable {
     /// changes between idle bouts; kept stable for the lifetime of a
     /// single bout so renders don't flicker.
     var idleFlavorCycle: Int = 0
+    /// The engine's `engine_process_started_at` boot id that was
+    /// current (per `WorkersWorkspaceModel.currentEngineBootId`) at the
+    /// moment this slot's pane was spawned. `nil` if spawned before any
+    /// boot id was ever known. Used by `reconcilePanes` to refuse to
+    /// sweep a pane against a snapshot from a DIFFERENT engine boot
+    /// than the one that was live when the pane was created — see
+    /// `WorkersWorkspaceModel.currentEngineBootId` for why this must
+    /// persist across reconnects, not just the first one.
+    var spawnEngineBootId: String?
 
     var id: Int { slotId }
 
@@ -358,5 +483,6 @@ struct WorkerSlot: Identifiable, Equatable {
             && lhs.taskTitle == rhs.taskTitle
             && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
+            && lhs.spawnEngineBootId == rhs.spawnEngineBootId
     }
 }
