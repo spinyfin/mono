@@ -110,6 +110,61 @@ pub fn spawn_loop(
     })
 }
 
+/// Reconcile engine-side worker slots against live worker processes
+/// immediately after the macOS app re-attaches (a relaunch against a
+/// surviving engine — see `handle_register_app_session`).
+///
+/// A worker's shell process is a child of the app process, so when the
+/// app is killed and relaunched every in-flight worker's process dies
+/// with it — yet the engine's slot bindings, pool claims, and DB
+/// execution rows all survive the app's death. Left alone they sit
+/// orphaned until the next periodic [`spawn_loop`] pass (up to its
+/// interval later), producing the three-way desync from the 2026-07-03
+/// relaunch: the engine slot stays bound to a terminated run, the new
+/// app has no pane for that slot, and the work item stays "active"
+/// indefinitely.
+///
+/// This is the event-driven counterpart to the periodic sweep: on
+/// re-attach we run one [`run_one_pass`] immediately so dead workers are
+/// finalized (execution → `orphaned`, pool slot released, cube lease
+/// freed via the coordinator, chore redispatchable) within seconds
+/// instead of waiting for the timer. It reuses the sweep's PID-liveness
+/// probe verbatim, so a worker whose process somehow survived the
+/// relaunch is never reaped (`kill(pid, 0)` still reports it alive) —
+/// this checks *process* liveness, not lease health, which the
+/// cube-lease heartbeat keeps refreshing even for dead-process
+/// executions.
+pub async fn reconcile_orphans_on_reattach(
+    work_db: Arc<WorkDb>,
+    live_states: Arc<LiveWorkerStateRegistry>,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: Arc<dyn DispatchEventSink>,
+    prior_app_pid: libc::pid_t,
+    new_app_pid: libc::pid_t,
+) -> DeadPidSweepOutcome {
+    tracing::info!(
+        prior_app_pid,
+        new_app_pid,
+        "app re-attach: reconciling engine worker slots against live processes",
+    );
+    let outcome = run_one_pass(
+        work_db.as_ref(),
+        live_states.as_ref(),
+        coordinator,
+        dispatch_events.as_ref(),
+    )
+    .await;
+    tracing::info!(
+        prior_app_pid,
+        new_app_pid,
+        reaped = outcome.reaped,
+        alive_skipped = outcome.alive_skipped,
+        grace_skipped = outcome.grace_skipped,
+        "app re-attach: slot reconciliation complete",
+    );
+    outcome
+}
+
 /// Run a single dead-PID sweep pass. Returns a summary of what
 /// happened; callers may log it.
 ///
@@ -753,6 +808,105 @@ mod tests {
         assert!(
             desc.contains("[engine-reconcile]"),
             "task description must contain the engine-reconcile audit line; got: {desc:?}",
+        );
+    }
+
+    /// The app-re-attach entry point reaps a dead-PID slot exactly like a
+    /// periodic pass: the relaunch orphan is finalized (`orphaned`), its
+    /// pool slot released, and a `dead_pid_reconcile` event emitted — so a
+    /// worker whose host app died does not survive as engine state.
+    #[tokio::test]
+    async fn reattach_reconcile_reaps_dead_pid() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let the_dead_pid = dead_pid();
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, the_dead_pid, &work_item_id);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = reconcile_orphans_on_reattach(
+            db.clone(),
+            live_states.clone(),
+            coordinator.clone(),
+            sink.clone() as Arc<dyn DispatchEventSink>,
+            // Prior (dead) app pid and the relaunched app pid; values are
+            // only used for logging so any distinct pair is fine.
+            1111,
+            2222,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 1, "re-attach must reap the dead relaunch orphan");
+
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            exec.status,
+            ExecutionStatus::Orphaned,
+            "execution must be orphaned after re-attach reconcile",
+        );
+
+        let claimed_after = coordinator.worker_pool().claimed_execution_ids().await;
+        assert!(
+            !claimed_after.contains(&execution_id),
+            "pool slot must be released after re-attach reconcile",
+        );
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "dead_pid_reconcile");
+    }
+
+    /// A worker whose process outlived the relaunch (live PID) is never
+    /// reaped by the re-attach reconcile — it checks process liveness, not
+    /// the app's death, so a surviving worker keeps its slot.
+    #[tokio::test]
+    async fn reattach_reconcile_spares_live_pid() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(
+            &live_states,
+            1,
+            &execution_id,
+            std::process::id() as i32, // self is always alive
+            &work_item_id,
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = reconcile_orphans_on_reattach(
+            db.clone(),
+            live_states.clone(),
+            coordinator.clone(),
+            sink.clone() as Arc<dyn DispatchEventSink>,
+            1111,
+            2222,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 0, "live PID must survive the re-attach reconcile");
+        assert_eq!(outcome.alive_skipped, 1);
+        assert!(sink.events().await.is_empty());
+
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            exec.status,
+            ExecutionStatus::Ready,
+            "a live worker's execution must be untouched by re-attach reconcile",
         );
     }
 }
