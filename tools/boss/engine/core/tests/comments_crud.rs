@@ -13,8 +13,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CommentAnchor, CreateCommentInput, FrontendEvent, FrontendRequest, ResolvedComment, TopicEventPayload, WorkComment,
-    comment_topic,
+    CommentAnchor, CommentWithThread, CreateCommentInput, FrontendEvent, FrontendRequest, ResolvedComment,
+    TopicEventPayload, WorkComment, comment_topic,
 };
 
 mod watcher_support;
@@ -80,7 +80,7 @@ async fn list_comments(
     artifact_kind: &str,
     artifact_id: &str,
     include_resolved: bool,
-) -> Result<Vec<WorkComment>> {
+) -> Result<Vec<CommentWithThread>> {
     match client
         .send_request(&FrontendRequest::CommentsList {
             artifact_kind: artifact_kind.to_owned(),
@@ -200,9 +200,13 @@ async fn comments_create_list_resolve_dismiss_round_trip() -> Result<()> {
     let dismissed = dismiss_comment(&mut client, &c1.id).await?;
     assert_eq!(dismissed.status, "resolved");
     let default_list = list_comments(&mut client, kind, id, false).await?;
-    assert!(default_list.iter().all(|c| c.id != c1.id));
+    assert!(default_list.iter().all(|c| c.comment.id != c1.id));
     let full_list = list_comments(&mut client, kind, id, true).await?;
-    assert!(full_list.iter().any(|c| c.id == c1.id && c.status == "resolved"));
+    assert!(
+        full_list
+            .iter()
+            .any(|c| c.comment.id == c1.id && c.comment.status == "resolved")
+    );
 
     Ok(())
 }

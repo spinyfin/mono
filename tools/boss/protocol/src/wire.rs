@@ -7,7 +7,7 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentsBannerState, ConflictResolution, CreateAttentionInput,
+    CiRemediation, CommentAnchor, CommentWithThread, CommentsBannerState, ConflictResolution, CreateAttentionInput,
     CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
     CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry,
@@ -2538,11 +2538,13 @@ pub enum FrontendEvent {
     CommentResult {
         comment: WorkComment,
     },
-    /// Reply to `comments_list`.
+    /// Reply to `comments_list`. Each comment carries its thread entries and
+    /// whether an answer-agent run is currently in flight for it — design
+    /// `comment-triggered-document-revisions.md` §"UI / thread behavior".
     CommentsList {
         artifact_kind: String,
         artifact_id: String,
-        comments: Vec<WorkComment>,
+        comments: Vec<CommentWithThread>,
     },
     /// Reply to `comments_banner_state`.
     CommentsBannerState {

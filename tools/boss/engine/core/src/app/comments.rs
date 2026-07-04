@@ -627,7 +627,7 @@ pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
     else {
         unreachable!()
     };
-    match work_db.list_comments(&artifact_kind, &artifact_id, include_resolved) {
+    match work_db.list_comments_with_thread(&artifact_kind, &artifact_id, include_resolved) {
         Ok(comments) => send_response_with_revision(
             &sink,
             &request_id,

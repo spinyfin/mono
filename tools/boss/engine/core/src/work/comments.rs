@@ -84,6 +84,32 @@ impl WorkDb {
         query_comment(&conn, comment_id)
     }
 
+    /// [`Self::list_comments`], with each comment paired with its
+    /// [`CommentThreadEntry`] rows and whether an answer-agent run is
+    /// currently `running` for it — the `CommentsList` read-path shape the
+    /// design specifies (`comment-triggered-document-revisions.md` §"UI /
+    /// thread behavior").
+    pub fn list_comments_with_thread(
+        &self,
+        artifact_kind: &str,
+        artifact_id: &str,
+        include_resolved: bool,
+    ) -> Result<Vec<CommentWithThread>> {
+        let comments = self.list_comments(artifact_kind, artifact_id, include_resolved)?;
+        comments
+            .into_iter()
+            .map(|comment| {
+                let thread_entries = self.list_comment_thread_entries(&comment.id)?;
+                let answer_agent_running = self.running_answer_agent_run_for_comment(&comment.id)?.is_some();
+                Ok(CommentWithThread {
+                    comment,
+                    thread_entries,
+                    answer_agent_running,
+                })
+            })
+            .collect()
+    }
+
     /// Read-only `[Revise]`-banner summary for an artifact: `revisable`,
     /// `unresolved_count` (active `directive`/`larger_change` comments —
     /// same candidate set as `query_revisable_comments`), `in_revision_count`,
@@ -1304,5 +1330,78 @@ mod tests {
     fn reclassify_comment_intent_rejects_unknown_comment() {
         let db = mem_db();
         assert!(db.reclassify_comment_intent("cmt_missing", "directive", 0.5).is_err());
+    }
+
+    // --- CommentsList read path: thread entries + answer_agent_running ---
+
+    #[test]
+    fn list_comments_with_thread_carries_answer_and_operator_followup_entries() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&c.id).unwrap();
+        let run = db.create_answer_agent_run(&c.id, "work_item", "t1", "v0", 0).unwrap();
+        db.create_comment_thread_entry(
+            &c.id,
+            boss_protocol::THREAD_ENTRY_KIND_ANSWER,
+            boss_protocol::THREAD_ENTRY_AUTHOR_ENGINE,
+            "The retry backoff is exponential because…",
+            None,
+            Some(&run.id),
+        )
+        .unwrap();
+        db.complete_answer_agent_run(
+            &run.id,
+            "replied",
+            Some("The retry backoff is exponential because…"),
+            None,
+        )
+        .unwrap();
+        db.transition_comment_to_answered(&c.id).unwrap();
+        db.create_comment_thread_entry(
+            &c.id,
+            boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+            "user:me",
+            "Does that also apply to the retry-after header?",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let list = db.list_comments_with_thread("work_item", "t1", false).unwrap();
+        assert_eq!(list.len(), 1);
+        let wrapped = &list[0];
+        assert_eq!(wrapped.comment.id, c.id);
+        assert!(!wrapped.answer_agent_running);
+        assert_eq!(wrapped.thread_entries.len(), 2);
+        assert_eq!(wrapped.thread_entries[0].entry_kind, "answer");
+        assert_eq!(
+            wrapped.thread_entries[0].answer_agent_run_id.as_deref(),
+            Some(run.id.as_str())
+        );
+        assert_eq!(wrapped.thread_entries[1].entry_kind, "operator_followup");
+        assert_eq!(wrapped.thread_entries[1].author, "user:me");
+    }
+
+    #[test]
+    fn list_comments_with_thread_reports_a_live_answer_agent_run() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&c.id).unwrap();
+        db.create_answer_agent_run(&c.id, "work_item", "t1", "v0", 0).unwrap();
+
+        let list = db.list_comments_with_thread("work_item", "t1", false).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].answer_agent_running);
+        assert!(list[0].thread_entries.is_empty());
+    }
+
+    #[test]
+    fn list_comments_with_thread_is_empty_for_a_plain_comment() {
+        let db = mem_db();
+        db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        let list = db.list_comments_with_thread("work_item", "t1", false).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].answer_agent_running);
+        assert!(list[0].thread_entries.is_empty());
     }
 }
