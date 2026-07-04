@@ -3393,7 +3393,14 @@ struct WorkCardPopoverView: View {
                 Button {
                     openWindow(
                         id: "markdown-viewer",
-                        value: MarkdownViewerContent(title: task.name, markdown: task.description)
+                        value: MarkdownViewerContent(
+                            title: task.name,
+                            markdown: task.description,
+                            // Engine-back this description's comments (P529 Phase 2)
+                            // on the work-item artifact.
+                            artifactKind: WireArtifactKind.workItem,
+                            artifactId: task.id
+                        )
                     )
                 } label: {
                     Label("Read full description", systemImage: "doc.text.magnifyingglass")

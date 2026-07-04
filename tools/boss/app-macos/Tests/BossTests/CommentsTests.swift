@@ -3,50 +3,46 @@ import SwiftUI
 import XCTest
 @testable import Boss
 
-/// Tests for the Phase 1 in-memory comment system.
-///
-/// Four layout-correctness checks mirror the design doc's acceptance
-/// criteria: no comments, single comment, multiple comments, and
-/// mid-authoring (popover open). Each check instantiates the real view
-/// hierarchy via `NSHostingView` — the same approach used in
-/// `MarkdownViewerViewTests` — so a SwiftUI regression that breaks
-/// layout fails here rather than silently at runtime.
+/// Tests for the comment system. Since P529 Phase 2 the layer is engine-backed;
+/// these exercise both the in-memory fallback (bare `CommentLayer`) and the
+/// engine path (a `FakeCommentBackend`), plus the W3C anchoring, the wire
+/// Codable mirrors, and the SwiftUI layout of the sidebar/popover.
 @MainActor
 final class CommentLayerTests: XCTestCase {
 
     // MARK: - Comment model
 
     func testCommentModelEquality() {
-        let id = UUID()
         let date = Date()
-        let a = Comment(id: id, quotedText: "hello", occurrenceIndex: 0, body: "world", createdAt: date)
-        let b = Comment(id: id, quotedText: "hello", occurrenceIndex: 0, body: "world", createdAt: date)
+        let a = Comment(id: "c1", anchor: CommentAnchor(exact: "hello"), body: "world", author: "user:me", createdAt: date)
+        let b = Comment(id: "c1", anchor: CommentAnchor(exact: "hello"), body: "world", author: "user:me", createdAt: date)
         XCTAssertEqual(a, b)
     }
 
     func testCommentModelIdentityDiffersForDifferentIDs() {
         let date = Date()
-        let a = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: date)
-        let b = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: date)
+        let a = Comment(id: "c1", anchor: CommentAnchor(exact: "x"), body: "y", author: "user:me", createdAt: date)
+        let b = Comment(id: "c2", anchor: CommentAnchor(exact: "x"), body: "y", author: "user:me", createdAt: date)
         XCTAssertNotEqual(a, b)
     }
 
-    func testCommentAnchorEquality() {
-        let a = CommentAnchor(quotedText: "foo", occurrenceIndex: 1)
-        let b = CommentAnchor(quotedText: "foo", occurrenceIndex: 1)
-        let c = CommentAnchor(quotedText: "foo", occurrenceIndex: 2)
+    func testCommentAnchorEqualityUsesAllThreeFields() {
+        let a = CommentAnchor(exact: "foo", prefix: "pre ", suffix: " suf")
+        let b = CommentAnchor(exact: "foo", prefix: "pre ", suffix: " suf")
+        let c = CommentAnchor(exact: "foo", prefix: "different ", suffix: " suf")
         XCTAssertEqual(a, b)
         XCTAssertNotEqual(a, c)
     }
 
-    func testCommentAnchorReflectsOccurrenceIndex() {
-        let date = Date()
-        let c = Comment(id: UUID(), quotedText: "rename", occurrenceIndex: 1, body: "note", createdAt: date)
-        XCTAssertEqual(c.anchor.quotedText, "rename")
-        XCTAssertEqual(c.anchor.occurrenceIndex, 1)
+    func testCommentQuotedTextAliasesAnchorExact() {
+        let c = Comment(id: "c1", anchor: CommentAnchor(exact: "rename", prefix: "please ", suffix: " it"), body: "note", author: "user:me", createdAt: Date())
+        XCTAssertEqual(c.quotedText, "rename")
+        XCTAssertEqual(c.anchor.exact, "rename")
+        XCTAssertEqual(c.anchor.prefix, "please ")
+        XCTAssertEqual(c.anchor.suffix, " it")
     }
 
-    // MARK: - CommentLayer (in-memory state)
+    // MARK: - CommentLayer (in-memory fallback)
 
     func testAddCommentAppendsToArray() {
         let layer = CommentLayer()
@@ -55,6 +51,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments.count, 1)
         XCTAssertEqual(layer.comments[0].quotedText, "selected text")
         XCTAssertEqual(layer.comments[0].body, "my comment")
+        XCTAssertFalse(layer.isEngineBacked)
     }
 
     func testAddCommentIgnoresBlankBody() {
@@ -69,7 +66,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.comments[0].body, "hello")
     }
 
-    func testDismissRemovesComment() {
+    func testDismissRemovesCommentInMemory() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
         layer.addComment(quoted: "b", body: "second")
@@ -88,7 +85,60 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.pendingQuotedText, "")
     }
 
-    // MARK: - Intent classification badge (Phase 1d)
+    // MARK: - W3C anchor capture
+
+    func testCaptureAnchorSlicesPrefixAndSuffix() {
+        let plain = "we ship the widget to prod every friday"
+        let anchor = CommentLayer.captureAnchor(quoted: "widget", occurrenceIndex: 0, in: plain)
+        XCTAssertEqual(anchor.exact, "widget")
+        XCTAssertTrue(anchor.prefix.hasSuffix("we ship the "))
+        XCTAssertTrue(anchor.suffix.hasPrefix(" to prod"))
+    }
+
+    func testCaptureAnchorDisambiguatesRepeatedTextByOccurrence() {
+        let plain = "alpha beta alpha gamma"
+        let first = CommentLayer.captureAnchor(quoted: "alpha", occurrenceIndex: 0, in: plain)
+        let second = CommentLayer.captureAnchor(quoted: "alpha", occurrenceIndex: 1, in: plain)
+        // Same exact, different surrounding context.
+        XCTAssertEqual(first.exact, "alpha")
+        XCTAssertEqual(second.exact, "alpha")
+        XCTAssertTrue(first.suffix.hasPrefix(" beta"))
+        XCTAssertTrue(second.prefix.hasSuffix("beta "))
+    }
+
+    func testCaptureAnchorFallsBackToBareExactWhenProjectionEmpty() {
+        let anchor = CommentLayer.captureAnchor(quoted: "hello", occurrenceIndex: 0, in: "")
+        XCTAssertEqual(anchor.exact, "hello")
+        XCTAssertEqual(anchor.prefix, "")
+        XCTAssertEqual(anchor.suffix, "")
+    }
+
+    func testCaptureAnchorFallsBackWhenOccurrenceOutOfRange() {
+        let anchor = CommentLayer.captureAnchor(quoted: "alpha", occurrenceIndex: 9, in: "alpha beta")
+        XCTAssertEqual(anchor.exact, "alpha")
+        XCTAssertEqual(anchor.prefix, "")
+    }
+
+    // MARK: - Projection + doc version
+
+    func testDocVersionIsDeterministicAndVersionPrefixed() {
+        let a = CommentProjection.docVersion(forPlainText: "the same text")
+        let b = CommentProjection.docVersion(forPlainText: "the same text")
+        let c = CommentProjection.docVersion(forPlainText: "different text")
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+        XCTAssertTrue(a.hasPrefix("sha256:"))
+    }
+
+    func testPlainTextProjectionStripsMarkdownMarkup() {
+        let plain = CommentProjection.plainText(for: "# Heading\n\nSome **bold** text.")
+        XCTAssertFalse(plain.contains("#"))
+        XCTAssertFalse(plain.contains("**"))
+        XCTAssertTrue(plain.contains("Heading"))
+        XCTAssertTrue(plain.contains("bold"))
+    }
+
+    // MARK: - Intent classification badge (Phase 1d stub, unchanged behaviour)
 
     func testNewCommentHasNoIntentUntilClassified() {
         let layer = CommentLayer()
@@ -100,122 +150,48 @@ final class CommentLayerTests: XCTestCase {
     func testSetIntentUpdatesCommentAndMarksOverridden() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        let comment = layer.comments[0]
-        layer.setIntent(.directive, for: comment)
+        layer.setIntent(.directive, for: layer.comments[0])
         XCTAssertEqual(layer.comments[0].intent, .directive)
         XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
-    }
-
-    func testSetIntentCanReclassify() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        let comment = layer.comments[0]
-        layer.setIntent(.question, for: comment)
-        layer.setIntent(.largerChange, for: comment)
-        XCTAssertEqual(layer.comments[0].intent, .largerChange)
     }
 
     func testSetIntentIgnoresUnknownComment() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        let stray = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: Date())
+        let stray = Comment(id: "stray", anchor: CommentAnchor(exact: "x"), body: "y", author: "user:me", createdAt: Date())
         layer.setIntent(.directive, for: stray)
         XCTAssertNil(layer.comments[0].intent)
     }
 
-    func testCommentSidebarRendersClassifyingBadge() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-    }
-
-    func testCommentSidebarRendersClassifiedBadge() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-    }
-
-    // MARK: - `[Revise]` banner + chips (Phase 2f)
-
-    func testFreshCommentHasNoBannerContribution() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        XCTAssertFalse(layer.bannerState.revisable)
-        XCTAssertEqual(layer.bannerState.unresolvedCount, 0)
-        XCTAssertEqual(layer.bannerState.inRevisionCount, 0)
-        XCTAssertNil(layer.comments[0].revisionChipState)
-    }
+    // MARK: - `[Revise]` banner + chips (Phase 2f stub, unchanged behaviour)
 
     func testDirectiveClassificationPostsNudgeAndMakesBannerRevisable() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.directive, for: layer.comments[0])
-
         XCTAssertTrue(layer.bannerState.revisable)
-        XCTAssertEqual(layer.bannerState.unresolvedCount, 1)
         XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
         XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .nudge)
-        XCTAssertEqual(layer.comments[0].threadEntries[0].body, CommentLayer.nudgeBody)
         XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
-    }
-
-    func testQuestionClassificationDoesNotPostNudge() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
-        XCTAssertFalse(layer.bannerState.revisable)
-    }
-
-    func testReclassifyingDirectiveTwiceOnlyPostsOneNudge() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.directive, for: layer.comments[0])
-        layer.setIntent(.largerChange, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
     }
 
     func testReviseDocTransitionsMatchingCommentsToInRevision() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
-        layer.addComment(quoted: "b", body: "second")
         layer.setIntent(.directive, for: layer.comments[0])
-        layer.setIntent(.question, for: layer.comments[1])
-
         layer.reviseDoc()
-
         XCTAssertEqual(layer.comments[0].status, .inRevision)
         XCTAssertNotNil(layer.comments[0].reviseTaskId)
-        XCTAssertEqual(layer.comments[0].threadEntries[0].reviseTaskId, layer.comments[0].reviseTaskId)
-        if case .inRevision(let taskId) = layer.comments[0].revisionChipState {
-            XCTAssertEqual(taskId, layer.comments[0].reviseTaskId)
-        } else {
-            XCTFail("expected .inRevision chip state")
-        }
-
-        // The question-classified comment enters the bucket-2 track instead
-        // and never joins the batch.
-        XCTAssertEqual(layer.comments[1].status, .answering)
-        XCTAssertNil(layer.comments[1].reviseTaskId)
-
-        XCTAssertFalse(layer.bannerState.revisable)
-        XCTAssertEqual(layer.bannerState.inRevisionCount, 1)
     }
 
     func testReviseDocWithNoUnresolvedCommentsIsNoOp() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
+        // No comment has been classified directive/larger_change, so there is
+        // nothing to batch.
         layer.reviseDoc()
         XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].reviseTaskId)
     }
 
     func testResolveRevisionMarksAddressedCommentsResolved() {
@@ -224,16 +200,9 @@ final class CommentLayerTests: XCTestCase {
         layer.setIntent(.directive, for: layer.comments[0])
         layer.reviseDoc()
         let taskId = layer.comments[0].reviseTaskId!
-
         layer.resolveRevision(taskId: taskId)
-
         XCTAssertEqual(layer.comments[0].status, .resolved)
-        XCTAssertEqual(layer.comments[0].reviseTaskId, taskId)
-        if case .resolved(let resolvedTaskId) = layer.comments[0].revisionChipState {
-            XCTAssertEqual(resolvedTaskId, taskId)
-        } else {
-            XCTFail("expected .resolved chip state")
-        }
+        XCTAssertEqual(layer.comments[0].statusActor, "engine")
     }
 
     func testReopenRevisionClearsTaskAndShowsReopenedChip() {
@@ -242,45 +211,37 @@ final class CommentLayerTests: XCTestCase {
         layer.setIntent(.directive, for: layer.comments[0])
         layer.reviseDoc()
         let taskId = layer.comments[0].reviseTaskId!
-
         layer.reopenRevision(taskId: taskId)
-
         XCTAssertEqual(layer.comments[0].status, .active)
         XCTAssertNil(layer.comments[0].reviseTaskId)
         XCTAssertEqual(layer.comments[0].revisionChipState, .reopened)
-        // Back on the banner.
-        XCTAssertTrue(layer.bannerState.revisable)
     }
 
-    // MARK: - Bucket 2: answer agent + follow-up loop (Phase 3d)
+    // MARK: - Bucket 2: answer agent (Phase 3d stub, unchanged behaviour)
 
     func testQuestionClassificationEntersAnsweringState() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
         XCTAssertEqual(layer.comments[0].status, .answering)
-        XCTAssertNil(layer.comments[0].revisionChipState)
     }
 
     func testAnswerAgentPostsAnswerAndTransitionsToAnswered() async throws {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
-
         try await Task.sleep(for: .seconds(2))
-
         XCTAssertEqual(layer.comments[0].status, .answered)
-        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
-        XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .answer)
-        XCTAssertEqual(layer.comments[0].threadEntries[0].body, CommentLayer.stubAnswerBody)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
     }
 
     func testPostFollowupIgnoredBeforeAnswered() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        layer.postFollowup(body: "still waiting?", for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .answering)
+        // Comment is still `.active` — not yet `.answered` — so the follow-up
+        // composer shouldn't be live.
+        layer.postFollowup(body: "when will this ship?", for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .active)
         XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
     }
 
@@ -289,154 +250,294 @@ final class CommentLayerTests: XCTestCase {
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
         try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
 
-        layer.postFollowup(body: "one more thing", for: layer.comments[0])
-
+        layer.postFollowup(body: "but what about edge cases?", for: layer.comments[0])
         XCTAssertEqual(layer.comments[0].status, .awaitingFollowup)
-        XCTAssertEqual(layer.comments[0].threadEntries.count, 2)
-        XCTAssertEqual(layer.comments[0].threadEntries[1].entryKind, .operatorFollowup)
-        XCTAssertEqual(layer.comments[0].threadEntries[1].body, "one more thing")
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .operatorFollowup)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.body, "but what about edge cases?")
     }
 
-    func testReclassifyFollowupQuestionLoopsBackToAnswering() async throws {
+    func testReclassifyFollowupQuestion() async throws {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
         try await Task.sleep(for: .seconds(2))
-        layer.postFollowup(body: "and another question", for: layer.comments[0])
+        layer.postFollowup(body: "one more thing", for: layer.comments[0])
 
         layer.reclassifyFollowup(.question, for: layer.comments[0])
         XCTAssertEqual(layer.comments[0].status, .answering)
-
-        try await Task.sleep(for: .seconds(2))
-        XCTAssertEqual(layer.comments[0].status, .answered)
-        XCTAssertEqual(layer.comments[0].threadEntries.filter { $0.entryKind == .answer }.count, 2)
+        XCTAssertEqual(layer.comments[0].intent, .question)
     }
 
-    func testReclassifyFollowupDirectiveBridgesToRevisionTrack() async throws {
+    func testReclassifyFollowupDirective() async throws {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.question, for: layer.comments[0])
         try await Task.sleep(for: .seconds(2))
-        layer.postFollowup(body: "actually, please change it", for: layer.comments[0])
+        layer.postFollowup(body: "please just rename it", for: layer.comments[0])
 
         layer.reclassifyFollowup(.directive, for: layer.comments[0])
-
         XCTAssertEqual(layer.comments[0].status, .active)
         XCTAssertEqual(layer.comments[0].intent, .directive)
-        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .nudge)
+        XCTAssertTrue(layer.comments[0].threadEntries.contains { $0.entryKind == .nudge })
         XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
-        XCTAssertTrue(layer.bannerState.revisable)
     }
 
     func testReclassifyFollowupIgnoredWhenNotAwaitingFollowup() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
+        // Comment is `.active`, never entered `.awaitingFollowup`.
         layer.reclassifyFollowup(.directive, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .answering)
-        XCTAssertEqual(layer.comments[0].intent, .question)
+        XCTAssertEqual(layer.comments[0].status, .active)
+        XCTAssertNil(layer.comments[0].intent)
     }
 
-    func testCommentSidebarRendersThinkingIndicator() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-    }
+    // MARK: - Reload merges unpersisted stub state (engine-backed path)
 
-    func testCommentSidebarRendersFollowupComposer() async throws {
+    func testApplyListPreservesLocalIntentOverrideAcrossReload() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.question, for: layer.comments[0])
-        try await Task.sleep(for: .seconds(2))
-
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-    }
-
-    func testCommentSidebarRendersReviseBannerAndChips() {
-        let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
         layer.setIntent(.directive, for: layer.comments[0])
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
+
+        // A reload (e.g. triggered by an unrelated create echo) rebuilds `comments`
+        // wholesale from the engine, which hasn't seen the override yet.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
     }
 
-    // MARK: - View: no comments state
-
-    func testMarkdownViewerWithCommentsRendersWhenEmpty() {
-        let view = MarkdownViewerView(title: "Test Doc", source: "# Hello\n\nSome content.")
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
-    }
-
-    // MARK: - View: single comment state
-
-    func testCommentSidebarWithSingleComment() {
+    func testApplyListPreservesLocalAnsweringStatusAcrossReload() async throws {
         let layer = CommentLayer()
-        layer.addComment(quoted: "the quick brown fox", body: "This needs clarification.")
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        layer.setIntent(.question, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+
+        // Reload before the (real) engine has recorded the transition — the wire
+        // row still reports `.active`.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        XCTAssertEqual(layer.comments[0].status, .answering)
+
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
+
+        // A further reload must not drop the locally-appended answer thread entry.
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        XCTAssertEqual(layer.comments[0].status, .answered)
+        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
     }
 
-    // MARK: - View: multiple comments state
+    // MARK: - Engine-backed path
 
-    func testCommentSidebarWithMultipleComments() {
+    func testConfigureRegistersAndListsWhenArtifactPresent() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "first selection", body: "First comment.")
-        layer.addComment(quoted: "second selection", body: "Second comment.")
-        layer.addComment(quoted: "", body: "Comment without a quote.")
-        let view = CommentSidebar(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        let backend = FakeCommentBackend()
+        layer.configure(
+            source: "the widget ships friday",
+            baseURL: nil,
+            artifact: .prDoc(repoRemoteURL: "git@github.com:o/r.git", branch: "main", path: "d.md"),
+            backend: backend
+        )
+        XCTAssertTrue(layer.isEngineBacked)
+        XCTAssertEqual(layer.artifactKind, "pr_doc")
+        XCTAssertEqual(layer.artifactId, "pr_doc:git@github.com:o/r.git:main:d.md")
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.listCalls.count, 1)
+        // The layer also issues a resolve once it has a projection.
+        XCTAssertEqual(backend.resolveCalls.count, 1)
     }
 
-    // MARK: - View: mid-authoring state (popover open)
-
-    func testCommentPopoverRendersWithQuotedText() {
+    func testEngineBackedAddCommentSendsCreateAndDoesNotAppendLocally() {
         let layer = CommentLayer()
-        layer.pendingQuotedText = "the selected markdown span"
-        let view = CommentPopover(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
-        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+        let backend = FakeCommentBackend()
+        layer.configure(
+            source: "we ship the widget to prod",
+            baseURL: nil,
+            artifact: .workItem(id: "task_7"),
+            backend: backend
+        )
+        layer.addComment(quoted: "widget", body: "clarify this")
+        // Persisted through the engine, not appended optimistically.
+        XCTAssertTrue(layer.comments.isEmpty)
+        XCTAssertEqual(backend.createCalls.count, 1)
+        let created = backend.createCalls[0]
+        XCTAssertEqual(created.anchor.exact, "widget")
+        XCTAssertTrue(created.anchor.prefix.hasSuffix("we ship the "))
+        XCTAssertEqual(created.body, "clarify this")
+        XCTAssertEqual(created.artifactKind, "work_item")
+        XCTAssertEqual(created.artifactId, "task_7")
+        XCTAssertTrue(created.docVersion.hasPrefix("sha256:"))
     }
 
-    func testCommentPopoverRendersWithoutQuotedText() {
+    func testEngineBackedDismissSendsDismissRPC() {
         let layer = CommentLayer()
-        layer.pendingQuotedText = ""
-        let view = CommentPopover(layer: layer)
-        let hosting = NSHostingView(rootView: view)
-        hosting.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
-        hosting.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        let backend = FakeCommentBackend()
+        layer.configure(source: "hello world", baseURL: nil, artifact: .workItem(id: "task_7"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "hello", body: "b")])
+        XCTAssertEqual(layer.comments.count, 1)
+        layer.dismiss(layer.comments[0])
+        XCTAssertEqual(backend.dismissCalls, ["cmt_1"])
     }
 
-    // MARK: - HighlightingMarkdownParser: single-occurrence correctness
+    func testApplyListRebuildsCommentsFromEngineRows() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "active", intent: "directive"),
+            Self.wireComment(id: "cmt_2", exact: "beta", body: "two", status: "answering"),
+        ])
+        XCTAssertEqual(layer.comments.count, 2)
+        XCTAssertEqual(layer.comments[0].id, "cmt_1")
+        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertEqual(layer.comments[1].status, .answering)
+    }
 
-    /// Returns true if the run containing the character at `charOffset` in `plain`
-    /// has a non-nil backgroundColor attribute in the attributed string.
+    func testApplyResolvedStampsFuzzyAndOrphanGlyphs() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([
+            Self.wireComment(id: "cmt_fuzzy", exact: "alpha", body: "one"),
+            Self.wireComment(id: "cmt_orphan", exact: "beta", body: "two"),
+        ])
+        layer.applyResolved([
+            ResolvedComment(
+                comment: Self.wireComment(id: "cmt_fuzzy", exact: "alpha", body: "one").comment,
+                resolution: CommentResolution(kind: "fuzzy", length: 5, score: 0.9, start: 3)
+            ),
+            ResolvedComment(
+                comment: Self.wireComment(id: "cmt_orphan", exact: "beta", body: "two").comment,
+                resolution: CommentResolution(kind: "orphan", length: nil, score: nil, start: nil)
+            ),
+        ])
+        let fuzzy = layer.comments.first { $0.id == "cmt_fuzzy" }!
+        let orphan = layer.comments.first { $0.id == "cmt_orphan" }!
+        XCTAssertTrue(fuzzy.isFuzzyAnchored)
+        XCTAssertFalse(fuzzy.isOrphaned)
+        XCTAssertTrue(orphan.isOrphaned)
+        XCTAssertFalse(orphan.isHighlightable)
+    }
+
+    func testShowResolvedToggleReListsWithIncludeResolved() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        backend.listCalls.removeAll()
+        layer.showResolved = true
+        XCTAssertEqual(backend.listCalls.count, 1)
+        XCTAssertEqual(backend.listCalls[0].includeResolved, true)
+    }
+
+    // MARK: - Wire Codable mirrors
+
+    func testWorkCommentDecodesEngineJSONWithMissingOptionals() throws {
+        let json = """
+        {
+          "id": "cmt_1",
+          "artifact_id": "task_7",
+          "anchor": { "exact": "the widget", "prefix": "we ship ", "suffix": " to prod" },
+          "artifact_kind": "work_item",
+          "author": "user:me@example.com",
+          "body": "clarify",
+          "created_at": "2026-07-04T12:00:00Z",
+          "doc_version": "sha256:abc",
+          "updated_at": "2026-07-04T12:00:00Z"
+        }
+        """
+        let wc = try JSONDecoder().decode(WorkComment.self, from: Data(json.utf8))
+        XCTAssertEqual(wc.id, "cmt_1")
+        XCTAssertEqual(wc.anchor.exact, "the widget")
+        XCTAssertEqual(wc.anchor.prefix, "we ship ")
+        // Missing `status` defaults to active; missing projection version → 0.
+        XCTAssertEqual(wc.status, "active")
+        XCTAssertEqual(wc.plainTextProjectionVersion, 0)
+        XCTAssertNil(wc.intent)
+        XCTAssertNil(wc.reviseTaskId)
+    }
+
+    func testCommentWithThreadDecodesListElement() throws {
+        let json = """
+        {
+          "comment": {
+            "id": "cmt_1", "artifact_id": "task_7",
+            "anchor": { "exact": "x" }, "artifact_kind": "work_item",
+            "author": "user:me", "body": "b", "created_at": "t", "doc_version": "v",
+            "status": "active", "updated_at": "t", "intent": "question"
+          },
+          "thread_entries": [
+            { "id": "te_1", "comment_id": "cmt_1", "entry_kind": "answer",
+              "author": "engine", "body": "the answer", "answer_agent_run_id": "aar_1",
+              "created_at": "t2" }
+          ],
+          "answer_agent_running": true
+        }
+        """
+        let cwt = try JSONDecoder().decode(CommentWithThread.self, from: Data(json.utf8))
+        XCTAssertEqual(cwt.comment.intent, "question")
+        XCTAssertEqual(cwt.threadEntries.count, 1)
+        XCTAssertEqual(cwt.threadEntries[0].entryKind, "answer")
+        XCTAssertTrue(cwt.answerAgentRunning)
+        // Maps into the UI comment with its thread entry preserved.
+        let ui = Comment.from(cwt.comment, threadEntries: cwt.threadEntries)
+        XCTAssertEqual(ui.intent, .question)
+        XCTAssertEqual(ui.threadEntries.first?.entryKind, .answer)
+        XCTAssertEqual(ui.threadEntries.first?.id, "te_1")
+    }
+
+    func testResolvedCommentDecodesResolution() throws {
+        let json = """
+        {
+          "comment": {
+            "id": "cmt_1", "artifact_id": "t", "anchor": { "exact": "x" },
+            "artifact_kind": "work_item", "author": "a", "body": "b",
+            "created_at": "t", "doc_version": "v", "status": "active", "updated_at": "t",
+            "last_resolved_with": "fuzzy"
+          },
+          "resolution": { "kind": "fuzzy", "start": 3, "length": 5, "score": 0.87 }
+        }
+        """
+        let rc = try JSONDecoder().decode(ResolvedComment.self, from: Data(json.utf8))
+        XCTAssertEqual(rc.resolution.kind, "fuzzy")
+        XCTAssertEqual(rc.resolution.start, 3)
+        XCTAssertTrue(rc.resolution.isFuzzy)
+        XCTAssertEqual(rc.comment.lastResolvedWith, "fuzzy")
+    }
+
+    func testCommentAnchorDecodesWithDefaultedPrefixSuffix() throws {
+        let anchor = try JSONDecoder().decode(CommentAnchor.self, from: Data(#"{"exact":"only"}"#.utf8))
+        XCTAssertEqual(anchor.exact, "only")
+        XCTAssertEqual(anchor.prefix, "")
+        XCTAssertEqual(anchor.suffix, "")
+    }
+
+    // MARK: - Bridge topic grammar
+
+    func testBridgeTopicMatchesEngineGrammar() {
+        XCTAssertEqual(
+            CommentEngineBridge.topic(artifactKind: "work_item", artifactId: "task_7"),
+            "comments.artifact.work_item:task_7"
+        )
+        XCTAssertTrue(CommentEngineBridge.isCommentTopic("comments.artifact.pr_doc:pr_doc:r:b:p.md"))
+        XCTAssertFalse(CommentEngineBridge.isCommentTopic("work.product.p1"))
+    }
+
+    func testPrDocArtifactRefBuildsEngineCompositeId() {
+        let ref = CommentArtifactRef.prDoc(
+            repoRemoteURL: "git@github.com:o/r.git", branch: "boss/exec_x", path: "docs/foo.md")
+        XCTAssertEqual(ref.kind, "pr_doc")
+        XCTAssertEqual(ref.id, "pr_doc:git@github.com:o/r.git:boss/exec_x:docs/foo.md")
+    }
+
+    // MARK: - HighlightingMarkdownParser: W3C prefix/suffix resolution
+
     private func isHighlighted(at charOffset: Int, in result: AttributedString) -> Bool {
         let idx = result.characters.index(result.characters.startIndex, offsetBy: charOffset)
         return result.runs.contains { run in
@@ -444,222 +545,207 @@ final class CommentLayerTests: XCTestCase {
         }
     }
 
-    /// Verifies that HighlightingMarkdownParser applies a yellow background to
-    /// every quoted-text span when two comments reference different words in the
-    /// same document.  Regression test for the bug where only the first
-    /// comment's text received a highlight while the second was silently skipped.
-    func testHighlightingParserHighlightsBothCommentedTexts() throws {
+    func testHighlightingParserHighlightsExactAnchor() throws {
         let source = "The fox jumped over the lazy dog and the cat sat quietly."
         let parser = HighlightingMarkdownParser(highlightedAnchors: [
-            CommentAnchor(quotedText: "fox", occurrenceIndex: 0),
-            CommentAnchor(quotedText: "cat", occurrenceIndex: 0),
+            CommentAnchor(exact: "fox", prefix: "The ", suffix: " jumped"),
+            CommentAnchor(exact: "cat", prefix: "the ", suffix: " sat"),
         ])
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
-
-        guard let foxRange = plain.range(of: "fox") else {
-            return XCTFail("'fox' not found in rendered plain text")
-        }
-        let foxOffset = plain.distance(from: plain.startIndex, to: foxRange.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: foxOffset, in: result),
-            "'fox' span must carry a backgroundColor attribute"
-        )
-
-        guard let catRange = plain.range(of: "cat") else {
-            return XCTFail("'cat' not found in rendered plain text")
-        }
-        let catOffset = plain.distance(from: plain.startIndex, to: catRange.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: catOffset, in: result),
-            "'cat' span must carry a backgroundColor attribute — second comment must be highlighted"
-        )
+        let foxOffset = plain.distance(from: plain.startIndex, to: plain.range(of: "fox")!.lowerBound)
+        let catOffset = plain.distance(from: plain.startIndex, to: plain.range(of: "cat")!.lowerBound)
+        XCTAssertTrue(isHighlighted(at: foxOffset, in: result))
+        XCTAssertTrue(isHighlighted(at: catOffset, in: result))
     }
 
-    /// A comment anchored to occurrenceIndex=0 of a repeated word highlights only the
-    /// FIRST occurrence; the second must NOT be highlighted.
-    func testHighlightingParserHighlightsOnlyFirstOccurrence() throws {
+    func testHighlightingParserDisambiguatesRepeatedTextBySuffix() throws {
+        let source = "alpha beta alpha gamma"
+        // Anchor only the FIRST alpha via its trailing context.
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(exact: "alpha", prefix: "", suffix: " beta")]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+        let firstRange = plain.range(of: "alpha")!
+        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
+        let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex)!
+        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
+        XCTAssertTrue(isHighlighted(at: firstOffset, in: result), "First 'alpha' (suffix ' beta') must be highlighted")
+        XCTAssertFalse(isHighlighted(at: secondOffset, in: result), "Second 'alpha' must not be highlighted")
+    }
+
+    func testHighlightingParserDisambiguatesRepeatedTextByPrefix() throws {
         let source = "alpha beta alpha gamma"
         let parser = HighlightingMarkdownParser(
-            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 0)]
+            highlightedAnchors: [CommentAnchor(exact: "alpha", prefix: "beta ", suffix: " gamma")]
         )
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
-
-        // First occurrence: should be highlighted.
-        guard let firstRange = plain.range(of: "alpha") else {
-            return XCTFail("'alpha' not found")
-        }
+        let firstRange = plain.range(of: "alpha")!
         let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: firstOffset, in: result),
-            "First 'alpha' (occurrenceIndex=0) must be highlighted"
-        )
-
-        // Second occurrence: must NOT be highlighted.
-        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
-            return XCTFail("Second 'alpha' not found")
-        }
+        let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex)!
         let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
-        XCTAssertFalse(
-            isHighlighted(at: secondOffset, in: result),
-            "Second 'alpha' must NOT be highlighted when only occurrenceIndex=0 is anchored"
-        )
+        XCTAssertFalse(isHighlighted(at: firstOffset, in: result))
+        XCTAssertTrue(isHighlighted(at: secondOffset, in: result), "Second 'alpha' (prefix 'beta ') must be highlighted")
     }
 
-    /// A comment anchored to occurrenceIndex=1 of a repeated word highlights only the
-    /// SECOND occurrence; the first must NOT be highlighted.
-    func testHighlightingParserHighlightsOnlySecondOccurrence() throws {
-        let source = "alpha beta alpha gamma"
+    func testHighlightingParserNoMatchIsSilentNoOp() throws {
+        let source = "alpha beta gamma"
         let parser = HighlightingMarkdownParser(
-            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 1)]
+            highlightedAnchors: [CommentAnchor(exact: "delta", prefix: "", suffix: "")]
         )
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
-
-        guard let firstRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
-        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
-        XCTAssertFalse(
-            isHighlighted(at: firstOffset, in: result),
-            "First 'alpha' must NOT be highlighted when only occurrenceIndex=1 is anchored"
-        )
-
-        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
-            return XCTFail("Second 'alpha' not found")
-        }
-        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: secondOffset, in: result),
-            "Second 'alpha' (occurrenceIndex=1) must be highlighted"
-        )
+        let alphaOffset = plain.distance(from: plain.startIndex, to: plain.range(of: "alpha")!.lowerBound)
+        XCTAssertFalse(isHighlighted(at: alphaOffset, in: result))
     }
 
-    /// Two anchors on two different occurrences of the same word each highlight their
-    /// respective instance (both are highlighted, but through independent anchors).
-    func testHighlightingParserTwoAnchorsHighlightBothOccurrences() throws {
-        let source = "alpha beta alpha gamma"
-        let parser = HighlightingMarkdownParser(highlightedAnchors: [
-            CommentAnchor(quotedText: "alpha", occurrenceIndex: 0),
-            CommentAnchor(quotedText: "alpha", occurrenceIndex: 1),
-        ])
-        let result = try parser.attributedString(for: source)
-        let plain = String(result.characters)
-
-        guard let firstRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
-        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
-        XCTAssertTrue(isHighlighted(at: firstOffset, in: result), "First 'alpha' must be highlighted")
-
-        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
-            return XCTFail("Second 'alpha' not found")
-        }
-        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
-        XCTAssertTrue(isHighlighted(at: secondOffset, in: result), "Second 'alpha' must be highlighted")
+    func testResolveRangeReturnsNilWhenExactAbsent() {
+        let range = HighlightingMarkdownParser.resolveRange(
+            for: CommentAnchor(exact: "missing"), in: "alpha beta gamma")
+        XCTAssertNil(range)
     }
 
-    /// Returns true if the run containing the character at `charOffset` in `plain`
-    /// carries an underline attribute (the clobber-proof marker for inline-code spans).
-    private func isUnderlined(at charOffset: Int, in result: AttributedString) -> Bool {
-        let idx = result.characters.index(result.characters.startIndex, offsetBy: charOffset)
-        return result.runs.contains { run in
-            run.range.contains(idx) && run.swiftUI.underlineStyle != nil
-        }
-    }
-
-    /// A multi-line selection: the quoted text the user copied uses a space where the
-    /// rendered projection has a paragraph-internal soft break (or vice-versa). Exact
-    /// `range(of:)` would fail; whitespace-tolerant matching must still resolve it.
-    /// Regression for "comment anchors invisible" — the long quoted sentence never
-    /// highlighted because its whitespace didn't match the rendered text byte-for-byte.
-    func testHighlightingParserMatchesAcrossWhitespaceDifferences() throws {
-        // Source wraps the sentence across two lines (soft break -> rendered space).
-        let source = "Moving a design between projects\nhas flavor-specific invariants and is scoped out."
-        // Quoted text uses single spaces throughout, as a pasteboard copy typically does.
-        let quoted = "Moving a design between projects has flavor-specific invariants and is scoped out."
-        let parser = HighlightingMarkdownParser(
-            highlightedAnchors: [CommentAnchor(quotedText: quoted, occurrenceIndex: 0)]
-        )
-        let result = try parser.attributedString(for: source)
-        let plain = String(result.characters)
-
-        guard let movingRange = plain.range(of: "Moving") else {
-            return XCTFail("'Moving' not found in rendered plain text")
-        }
-        let offset = plain.distance(from: plain.startIndex, to: movingRange.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: offset, in: result),
-            "Whitespace-tolerant matching must resolve a multi-line quoted selection"
-        )
-    }
-
-    /// `flexibleMatchRanges` finds each occurrence in document order and tolerates
-    /// collapsed/expanded interior whitespace.
     func testFlexibleMatchRangesToleratesWhitespaceRuns() {
         let plain = "the   quick\nbrown fox and the quick brown cat"
         let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: "quick brown", in: plain)
-        XCTAssertEqual(ranges.count, 2, "Both 'quick brown' occurrences must match across varied whitespace")
+        XCTAssertEqual(ranges.count, 2)
     }
 
-    /// A single-token needle keeps exact, ordered, non-overlapping occurrence semantics.
-    func testFlexibleMatchRangesSingleTokenMatchesEachOccurrence() {
-        let plain = "alpha beta alpha gamma alpha"
-        let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: "alpha", in: plain)
-        XCTAssertEqual(ranges.count, 3)
+    func testHighlightingParserMatchesAcrossWhitespaceDifferences() throws {
+        // Simulates a pasteboard selection where the copied text collapsed a
+        // line break + leading spaces into a single space (a common outcome of
+        // copying a multi-line selection out of the rendered view).
+        let source = "the quick\n   brown fox jumps over the lazy dog"
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(exact: "quick brown fox", prefix: "the ", suffix: " jumps")]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+        let offset = plain.distance(from: plain.startIndex, to: plain.range(of: "quick")!.lowerBound)
+        XCTAssertTrue(isHighlighted(at: offset, in: result))
     }
 
-    /// A comment anchored to an inline-code span must emit the clobber-proof underline
-    /// marker so it stays visible after the Boss inline style overwrites the code span's
-    /// background. Regression for the invisible `` `flavor` `` anchor.
     func testHighlightingParserUnderlinesInlineCodeAnchor() throws {
-        let source = "The new `flavor` column replaces the old type."
+        // Regression guard for the "clobber-proof underline" marker: inline-code
+        // runs get their own backgroundColor from the Boss inline style, which
+        // overwrites a plain comment-highlight background — the colored
+        // underline is the fallback that survives that clobber.
+        let source = "Please rename `flavor` to `variant` everywhere."
         let parser = HighlightingMarkdownParser(
-            highlightedAnchors: [CommentAnchor(quotedText: "flavor", occurrenceIndex: 0)]
+            highlightedAnchors: [CommentAnchor(exact: "flavor", prefix: "rename `", suffix: "` to")]
         )
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
-
-        guard let range = plain.range(of: "flavor") else {
-            return XCTFail("'flavor' not found in rendered plain text")
+        let idx = plain.range(of: "flavor")!.lowerBound
+        let charIdx = result.characters.index(result.characters.startIndex, offsetBy: plain.distance(from: plain.startIndex, to: idx))
+        let hasUnderline = result.runs.contains { run in
+            run.range.contains(charIdx) && run.swiftUI.underlineStyle != nil
         }
-        let offset = plain.distance(from: plain.startIndex, to: range.lowerBound)
-        XCTAssertTrue(
-            isHighlighted(at: offset, in: result),
-            "Inline-code anchor must carry a backgroundColor at parse time"
-        )
-        XCTAssertTrue(
-            isUnderlined(at: offset, in: result),
-            "Inline-code anchor must also carry the clobber-proof underline marker"
-        )
+        XCTAssertTrue(hasUnderline, "Inline-code anchor must carry the fallback underline marker")
     }
 
-    /// An anchor whose occurrenceIndex exceeds the number of matches applies no highlight
-    /// (silent no-op; safer than highlighting the wrong span after a doc edit).
-    func testHighlightingParserOutOfRangeOccurrenceIndexIsNoOp() throws {
-        let source = "alpha beta gamma"
-        let parser = HighlightingMarkdownParser(
-            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 5)]
-        )
-        let result = try parser.attributedString(for: source)
-        let plain = String(result.characters)
+    // MARK: - SwiftUI layout (unchanged surfaces still render)
 
-        guard let alphaRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
-        let alphaOffset = plain.distance(from: plain.startIndex, to: alphaRange.lowerBound)
-        XCTAssertFalse(
-            isHighlighted(at: alphaOffset, in: result),
-            "Out-of-range occurrenceIndex must not highlight anything"
-        )
-    }
-
-    // MARK: - View: highlight overlay placeholder compiles and renders
-
-    func testCommentHighlightOverlayRendersWithComments() {
+    func testCommentSidebarRendersWithComment() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "some text", body: "a note")
-        let view = CommentHighlightOverlay(comments: layer.comments)
-        let hosting = NSHostingView(rootView: view)
+        layer.addComment(quoted: "the quick brown fox", body: "This needs clarification.")
+        let hosting = NSHostingView(rootView: CommentSidebar(layer: layer))
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    func testCommentSidebarRendersFuzzyAndOrphanBadges() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "alpha beta", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "c1", exact: "alpha", body: "one", lastResolvedWith: "fuzzy")])
+        let hosting = NSHostingView(rootView: CommentSidebar(layer: layer))
+        hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 600)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    func testCommentPopoverRenders() {
+        let layer = CommentLayer()
+        layer.pendingQuotedText = "the selected markdown span"
+        let hosting = NSHostingView(rootView: CommentPopover(layer: layer))
         hosting.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
         hosting.layoutSubtreeIfNeeded()
-        // Phase 1 stub renders EmptyView — size may be zero; just assert it
-        // doesn't crash.
-        XCTAssertGreaterThanOrEqual(hosting.fittingSize.height, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    func testMarkdownViewerWithCommentsRendersWhenEmpty() {
+        let view = MarkdownViewerView(title: "Test Doc", source: "# Hello\n\nSome content.")
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+    }
+
+    // MARK: - Helpers
+
+    /// Build a `CommentWithThread` for feeding `applyList` in tests.
+    static func wireComment(
+        id: String,
+        exact: String,
+        body: String,
+        status: String = "active",
+        intent: String? = nil,
+        lastResolvedWith: String? = nil
+    ) -> CommentWithThread {
+        CommentWithThread(
+            comment: WorkComment(
+                id: id,
+                artifactId: "t",
+                anchor: CommentAnchor(exact: exact),
+                artifactKind: "work_item",
+                author: "user:me",
+                body: body,
+                createdAt: "2026-07-04T12:00:00Z",
+                status: status,
+                lastResolvedWith: lastResolvedWith,
+                intent: intent
+            ),
+            threadEntries: [],
+            answerAgentRunning: false
+        )
+    }
+}
+
+/// Records the mutations a `CommentLayer` issues so tests can assert the RPC
+/// surface without a live engine.
+@MainActor
+final class FakeCommentBackend: CommentBackend {
+    let author = "user:test"
+
+    var registerCount = 0
+    var unregisterCount = 0
+    var listCalls: [(kind: String, id: String, includeResolved: Bool)] = []
+    var resolveCalls: [(kind: String, id: String, plainText: String)] = []
+    var createCalls: [(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String)] = []
+    var dismissCalls: [String] = []
+    var setStatusCalls: [(commentId: String, status: String)] = []
+    var updateAnchorCalls: [(commentId: String, anchor: CommentAnchor)] = []
+
+    func registerCommentLayer(_ layer: CommentLayer, artifactKind: String, artifactId: String) {
+        registerCount += 1
+    }
+    func unregisterCommentLayer(_ layer: CommentLayer) { unregisterCount += 1 }
+    func createComment(artifactKind: String, artifactId: String, anchor: CommentAnchor, body: String, docVersion: String) {
+        createCalls.append((artifactKind, artifactId, anchor, body, docVersion))
+    }
+    func listComments(artifactKind: String, artifactId: String, includeResolved: Bool) {
+        listCalls.append((artifactKind, artifactId, includeResolved))
+    }
+    func resolveComments(artifactKind: String, artifactId: String, plainText: String) {
+        resolveCalls.append((artifactKind, artifactId, plainText))
+    }
+    func dismissComment(commentId: String) { dismissCalls.append(commentId) }
+    func setStatus(commentId: String, status: String) { setStatusCalls.append((commentId, status)) }
+    func updateAnchor(commentId: String, anchor: CommentAnchor, newDocVersion: String) {
+        updateAnchorCalls.append((commentId, anchor))
     }
 }

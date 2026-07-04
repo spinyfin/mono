@@ -27,14 +27,14 @@ enum CommentIntent: String, CaseIterable, Equatable {
     }
 }
 
-/// Mirrors the engine's `work_comments.status` values
-/// (`boss-protocol/src/types.rs` `COMMENT_STATUS_*`): `active`/`resolved`/
-/// `inRevision` drive the bucket-1&3 `[Revise]`-track chip; `answering`/
-/// `answered`/`awaitingFollowup` drive the bucket-2 thread's thinking
-/// indicator and follow-up composer (design § "Comment/thread state
-/// machine"). `orphaned`/`dismissed` aren't rendered at all so they're left
-/// out of this thin-client enum; a dismissed comment is already removed from
-/// `CommentLayer.comments` entirely.
+/// Mirrors the engine's full `work_comments.status` domain
+/// (`boss-protocol/src/types.rs` `COMMENT_STATUS_*`, types.rs:892-923):
+/// `active`/`resolved`/`inRevision` drive the bucket-1&3 `[Revise]`-track chip;
+/// `answering`/`answered`/`awaitingFollowup` drive the bucket-2 thread's
+/// thinking indicator and follow-up composer; `orphaned` (anchor lost) and
+/// `dismissed` are terminal states the sidebar surfaces distinctly. The full
+/// set is mirrored (P529 Phase-2 scope item 6) so a comment loaded from the
+/// engine in any state round-trips without falling through to a default.
 enum CommentStatus: String, Equatable {
     case active
     case resolved
@@ -48,72 +48,120 @@ enum CommentStatus: String, Equatable {
     /// loops back to `.answering` (another question) or bridges to
     /// `.active` (directive/larger_change).
     case awaitingFollowup = "awaiting_followup"
+    /// The renderer could no longer resolve this comment's anchor against the
+    /// current doc; the engine recorded the flip. Shown in the sidebar with an
+    /// "anchor lost" badge and no doc highlight.
+    case orphaned
+    /// Reserved for a future hard-dismiss (soft-dismiss uses `.resolved`).
+    case dismissed
 }
 
-/// Identifies the exact occurrence of a quoted-text span a comment is anchored to.
+/// How a comment's anchor last resolved against the doc's plain-text
+/// projection — mirrors the engine's `last_resolved_with` / `CommentResolution.kind`
+/// (`RESOLVED_WITH_*`). `fuzzy` drives the ⚠ sidebar glyph.
+enum ResolvedWith: String, Equatable {
+    case exact
+    case fuzzy
+    case orphan
+}
+
+/// A [W3C Web Annotation `TextQuoteSelector`][wadm], mirroring the engine's
+/// `CommentAnchor` (`boss-protocol/src/types.rs:863-877`). The three fields are
+/// taken from the rendered *plain-text projection* of the markdown (not the raw
+/// source), because the user selects on rendered text. `prefix`/`suffix`
+/// (~64 chars each) disambiguate `exact` when it recurs and let the engine's
+/// fuzzy resolver re-anchor through edits that touch the surrounding text —
+/// replacing the Phase-1 `occurrenceIndex` scheme.
 ///
-/// Two comments on two different occurrences of the same word have the same
-/// `quotedText` but different `occurrenceIndex` values, letting the highlight
-/// renderer paint each one independently.
-struct CommentAnchor: Equatable {
+/// [wadm]: https://www.w3.org/TR/annotation-model/#text-quote-selector
+struct CommentAnchor: Codable, Equatable, Sendable {
     /// The verbatim selected text.
-    let quotedText: String
-    /// 0-based index: which occurrence of `quotedText` in the plain-text
-    /// projection this anchor targets.
-    let occurrenceIndex: Int
+    let exact: String
+    /// Up to ~64 chars of plain text immediately preceding `exact`.
+    let prefix: String
+    /// Up to ~64 chars of plain text immediately following `exact`.
+    let suffix: String
+
+    init(exact: String, prefix: String = "", suffix: String = "") {
+        self.exact = exact
+        self.prefix = prefix
+        self.suffix = suffix
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        exact = try c.decode(String.self, forKey: .exact)
+        // `prefix`/`suffix` carry `#[serde(default)]` on the engine side.
+        prefix = try c.decodeIfPresent(String.self, forKey: .prefix) ?? ""
+        suffix = try c.decodeIfPresent(String.self, forKey: .suffix) ?? ""
+    }
 }
 
-/// A single in-memory comment attached to a markdown viewer.
-///
-/// Phase 1 anchoring is naive: the quoted text and its occurrence index are
-/// stored verbatim in memory and lost when the viewer window closes.
-/// Resilient TextQuoteSelector anchoring lives in Phase 2.
+/// A comment attached to a markdown viewer. Since P529 Phase 2 comments are
+/// engine-backed: `id` is the engine's `work_comments.id` (`cmt_…`) for a
+/// persisted comment, or a `local:` sentinel for an optimistic in-memory
+/// comment on an artifact-less viewer. Anchoring is W3C `{exact, prefix,
+/// suffix}`; the occurrence-index scheme is gone.
 struct Comment: Identifiable, Equatable {
-    let id: UUID
-    /// The text the user had selected when they created this comment.
-    let quotedText: String
-    /// Which occurrence of `quotedText` in the rendered plain text this
-    /// comment targets (0-based). Captured at selection time.
-    let occurrenceIndex: Int
+    /// Engine `work_comments.id`, or a `local:<uuid>` sentinel for the
+    /// artifact-less in-memory fallback path.
+    let id: String
+    /// The W3C anchor the comment is attached to.
+    let anchor: CommentAnchor
     /// The comment body the user typed.
     let body: String
+    let author: String
     let createdAt: Date
-    /// `nil` while classification is pending (or, in this Phase 1 thin client,
-    /// indefinitely — no engine RPC classifies comments yet; the badge shows
-    /// "classifying…" and the operator can set this directly via the override
-    /// control). Set by `CommentsClassify` once engine connectivity lands, or
-    /// by a manual override (`CommentsSetIntent`) either way.
+
+    /// `nil` while classification is pending. Set by the engine's classifier or
+    /// a manual override.
     var intent: CommentIntent? = nil
     /// `true` once the operator has manually reclassified this comment via the
-    /// badge's override control, mirroring the engine's `intent_overridden_by`
-    /// audit trail.
+    /// badge's override control, mirroring the engine's `intent_overridden_by`.
     var intentOverriddenByUser: Bool = false
 
-    /// Mirrors `work_comments.status`. Defaults to `active`, same as the
-    /// engine's `default_comment_status`.
+    /// Mirrors `work_comments.status`. Defaults to `active`.
     var status: CommentStatus = .active
-    /// Mirrors `work_comments.revise_task_id`: the revision/chore that this
-    /// comment's `[Revise]` batch was dispatched to. `nil` unless `status ==
-    /// .inRevision` (or a `.resolved` comment keeping it as provenance).
+    /// Mirrors `work_comments.revise_task_id`.
     var reviseTaskId: String? = nil
-    /// Mirrors `work_comments.status_actor`. `"engine"` marks a transition
-    /// driven by (stubbed) reconciliation rather than a direct user action —
-    /// the signal `revisionChipState` uses to tell a freshly-reopened
-    /// comment apart from one that was never addressed.
+    /// Mirrors `work_comments.status_actor`.
     var statusActor: String? = nil
-    /// Engine-authored nudge/answer/follow-up entries, oldest first. Mirrors
-    /// `comment_thread_entries` (design § "Reply/link mechanics").
+    /// How this comment's anchor last resolved on load (drives the ⚠/anchor-lost
+    /// sidebar glyphs). `nil` until a `comments_resolve` round-trip lands.
+    var lastResolvedWith: ResolvedWith? = nil
+    /// Engine-authored nudge/answer/follow-up entries, oldest first.
     var threadEntries: [CommentThreadEntry] = []
 
-    var anchor: CommentAnchor {
-        CommentAnchor(quotedText: quotedText, occurrenceIndex: occurrenceIndex)
+    // Persistence provenance carried so the layer can issue mutations without a
+    // separate lookup. Empty on the artifact-less in-memory path.
+    var artifactKind: String = ""
+    var artifactId: String = ""
+    var docVersion: String = ""
+
+    /// The selected text this comment is anchored to. Alias for `anchor.exact`,
+    /// kept so the sidebar snippet and tests read naturally.
+    var quotedText: String { anchor.exact }
+
+    /// `true` when the engine could not re-anchor this comment on the current
+    /// doc — either an explicit `orphaned` status or an `orphan` resolution.
+    var isOrphaned: Bool {
+        status == .orphaned || lastResolvedWith == .orphan
+    }
+
+    /// `true` when the anchor re-attached only via fuzzy match — the ⚠ glyph.
+    var isFuzzyAnchored: Bool { lastResolvedWith == .fuzzy }
+
+    /// Whether this comment should paint a highlight in the doc: it must have
+    /// text to anchor to and be in a live, resolvable state (orphaned / resolved
+    /// / dismissed comments carry no doc highlight).
+    var isHighlightable: Bool {
+        !anchor.exact.isEmpty && !isOrphaned && status != .resolved && status != .dismissed
     }
 
     /// The `[Revise]`-track chip state, derived from `status` /
     /// `reviseTaskId` / thread history — mirrors the engine's comment state
     /// machine (design § "Comment/thread state machine"). `nil` when the
-    /// comment isn't on the directive/larger_change track at all (no nudge
-    /// posted yet).
+    /// comment isn't on the directive/larger_change track at all.
     var revisionChipState: RevisionChipState? {
         switch status {
         case .inRevision:
@@ -123,20 +171,56 @@ struct Comment: Identifiable, Equatable {
             guard let taskId = reviseTaskId else { return nil }
             return .resolved(taskId: taskId)
         case .active:
-            // A comment only passes back through `.active` via engine-driven
-            // reconciliation after a nudge entry's `revise_task_id` was
-            // filled in by a `[Revise]` batch — that combination is what
-            // distinguishes "reopened" from "never addressed."
             let wasInRevision = threadEntries.contains { $0.entryKind == .nudge && $0.reviseTaskId != nil }
             if wasInRevision, statusActor == "engine" { return .reopened }
             let hasNudge = threadEntries.contains { $0.entryKind == .nudge }
             return hasNudge ? .nudged : nil
-        case .answering, .answered, .awaitingFollowup:
-            // Bucket-2 track states never show the bucket-1&3 chip — they
-            // render their own thread-level indicators instead (design §
-            // "Comment/thread state machine").
+        case .answering, .answered, .awaitingFollowup, .orphaned, .dismissed:
             return nil
         }
+    }
+}
+
+// MARK: - Wire → UI mapping
+
+extension Comment {
+    /// Build a UI `Comment` from an engine `WorkComment`, its thread entries,
+    /// and (optionally) the anchor resolution from `comments_resolve`.
+    static func from(
+        _ wc: WorkComment,
+        threadEntries: [WireCommentThreadEntry] = [],
+        resolution: CommentResolution? = nil
+    ) -> Comment {
+        var c = Comment(
+            id: wc.id,
+            anchor: wc.anchor,
+            body: wc.body,
+            author: wc.author,
+            createdAt: parseWireTimestamp(wc.createdAt)
+        )
+        c.intent = wc.intent.flatMap(CommentIntent.init(rawValue:))
+        c.intentOverriddenByUser = wc.intentOverriddenBy != nil
+        c.status = CommentStatus(rawValue: wc.status) ?? .active
+        c.reviseTaskId = wc.reviseTaskId
+        c.statusActor = wc.statusActor
+        // Prefer the fresh resolution kind when present, else the persisted
+        // `last_resolved_with` the engine echoes on the row.
+        c.lastResolvedWith =
+            resolution.map { ResolvedWith(rawValue: $0.kind) ?? .exact }
+            ?? wc.lastResolvedWith.flatMap(ResolvedWith.init(rawValue:))
+        c.threadEntries = threadEntries.map(CommentThreadEntry.from)
+        c.artifactKind = wc.artifactKind
+        c.artifactId = wc.artifactId
+        c.docVersion = wc.docVersion
+        return c
+    }
+
+    /// Lenient ISO-8601 parse of an engine timestamp string; falls back to the
+    /// current instant so a malformed value never drops the comment. Shared with
+    /// [`CommentThreadEntry.from`]. Delegates to `WorkerStaleness.parse` so both
+    /// call sites share the same cached formatters.
+    static func parseWireTimestamp(_ s: String) -> Date {
+        WorkerStaleness.parse(s) ?? Date()
     }
 }
 
@@ -154,9 +238,7 @@ enum RevisionChipState: Equatable {
 
 /// Client mirror of the engine's `CommentsBannerState`
 /// (`boss-protocol/src/types.rs`) — a read-only summary driving the
-/// `[Revise]` banner. `docKind` is omitted: the client only ever renders
-/// this banner inside a design/investigation doc viewer, so the engine-side
-/// `resolve_doc_owner` scope guard has no thin-client equivalent to mirror.
+/// `[Revise]` banner.
 struct CommentsBannerState: Equatable {
     let revisable: Bool
     let unresolvedCount: Int

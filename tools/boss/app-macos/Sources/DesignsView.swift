@@ -449,6 +449,21 @@ private struct MarkdownDocumentView: View {
 struct MarkdownViewerContent: Codable, Hashable {
     let title: String
     let markdown: String
+    // The comment artifact this doc corresponds to (engine's `artifact_kind` +
+    // `artifact_id`). Optional so an old state-restored payload decodes without
+    // them and so viewers with no stable identity (e.g. a locally-opened file)
+    // stay in-memory. For a task/chore description these are `work_item` + the
+    // work-item id.
+    var artifactKind: String? = nil
+    var artifactId: String? = nil
+
+    /// The comment artifact ref, or `nil` when this payload has no stable
+    /// document identity to attach persistent comments to.
+    var commentArtifact: CommentArtifactRef? {
+        guard let artifactKind, let artifactId, !artifactKind.isEmpty, !artifactId.isEmpty
+        else { return nil }
+        return CommentArtifactRef(kind: artifactKind, id: artifactId)
+    }
 }
 
 /// Stand-alone scrolling viewer for long task / chore descriptions.
@@ -471,6 +486,9 @@ struct MarkdownViewerView: View {
     /// flow (e.g. design-doc browser) — interactive is only meaningful for
     /// the click-to-first-paint user journey.
     var clickStartTime: Date? = nil
+    /// The comment artifact this doc corresponds to (e.g. `work_item` for a
+    /// task/chore description). `nil` leaves comments in-memory.
+    var artifact: CommentArtifactRef? = nil
 
     var body: some View {
         MarkdownViewerScrollContent(
@@ -479,7 +497,7 @@ struct MarkdownViewerView: View {
             projectShortID: projectShortID,
             clickStartTime: clickStartTime
         )
-        .withComments()
+        .withComments(artifact: artifact, source: source)
     }
 }
 

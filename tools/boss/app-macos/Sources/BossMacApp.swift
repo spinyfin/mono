@@ -66,8 +66,15 @@ struct BossMacApp: App {
 
         WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
             if let content {
-                MarkdownViewerView(title: content.title, source: content.markdown)
-                    .navigationTitle(content.title)
+                MarkdownViewerView(
+                    title: content.title,
+                    source: content.markdown,
+                    artifact: content.commentArtifact
+                )
+                .navigationTitle(content.title)
+                // Engine-back the comment layer (P529 Phase 2); the layer stays
+                // in-memory if `content.commentArtifact` is nil.
+                .environment(\.commentBackend, chatModel.commentBridge)
             }
         }
         .defaultSize(width: 760, height: 640)
@@ -88,6 +95,7 @@ struct BossMacApp: App {
         // comment layer and other descendants.
         .environmentObject(chatModel)
         .environmentObject(chatModel.asyncMarkdownViewerVM)
+        .environment(\.commentBackend, chatModel.commentBridge)
         .defaultSize(width: 760, height: 640)
 
         // In-app renderer for a project's design-doc pointer. Wired to
@@ -103,6 +111,7 @@ struct BossMacApp: App {
             }
         }
         .environmentObject(chatModel)
+        .environment(\.commentBackend, chatModel.commentBridge)
         .defaultSize(width: 880, height: 700)
 
         // Review-terminal window: opened from a Review-column card's

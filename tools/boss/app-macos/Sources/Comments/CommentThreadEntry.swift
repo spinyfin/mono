@@ -2,10 +2,7 @@ import Foundation
 
 /// Mirrors the engine's `comment_thread_entries.entry_kind` values
 /// (`THREAD_ENTRY_KIND_NUDGE` / `_ANSWER` / `_OPERATOR_FOLLOWUP`,
-/// `boss-protocol/src/types.rs`). Only `nudge` is produced anywhere today
-/// (Phase 2b); `answer`/`operatorFollowup` are later bucket-2 phases, but the
-/// type carries all three so the thread view doesn't need to change shape
-/// when those land. See
+/// `boss-protocol/src/types.rs`). See
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
 /// § "Reply/link mechanics".
 enum ThreadEntryKind: String, Equatable {
@@ -18,8 +15,11 @@ enum ThreadEntryKind: String, Equatable {
 /// table) — an engine-authored (or operator-authored follow-up) entry in a
 /// comment's conversation thread. Always a child of exactly one `Comment`,
 /// rendered inline beneath it in chronological order.
+///
+/// `id` is the engine's `comment_thread_entries.id` for a persisted entry, or a
+/// fresh `UUID` string for an entry synthesised by a local stub.
 struct CommentThreadEntry: Identifiable, Equatable {
-    let id: UUID
+    let id: String
     let entryKind: ThreadEntryKind
     /// `"engine"` for nudge/answer entries; operator identity for follow-ups.
     let author: String
@@ -29,4 +29,16 @@ struct CommentThreadEntry: Identifiable, Equatable {
     /// mechanics").
     var reviseTaskId: String? = nil
     let createdAt: Date
+
+    /// Map an engine wire entry into the UI type, keeping the engine's stable id.
+    static func from(_ wire: WireCommentThreadEntry) -> CommentThreadEntry {
+        CommentThreadEntry(
+            id: wire.id,
+            entryKind: ThreadEntryKind(rawValue: wire.entryKind) ?? .nudge,
+            author: wire.author,
+            body: wire.body,
+            reviseTaskId: wire.reviseTaskId,
+            createdAt: Comment.parseWireTimestamp(wire.createdAt)
+        )
+    }
 }
