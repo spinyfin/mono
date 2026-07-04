@@ -1,4 +1,6 @@
-use super::super::server::{pid_is_alive, process_group_signal_target};
+#[cfg(target_os = "macos")]
+use super::super::server::pid_is_alive;
+use super::super::server::process_group_signal_target;
 use super::super::worker_events::extract_last_assistant_text;
 use super::*;
 
