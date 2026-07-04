@@ -368,6 +368,20 @@ pub struct AutomationRun {
     /// when no triage execution was created (e.g. `suppressed_at_limit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage_execution_id: Option<String>,
+
+    /// How many consecutive `automation_runs` rows (newest-first, same
+    /// `outcome` and `produced_task_id`) this entry represents. `1` for an
+    /// ungrouped run. Only `list_automation_runs`'s retry-chain collapsing
+    /// sets this above `1` — every other producer of an `AutomationRun`
+    /// (single-occurrence lookups) leaves it at the default, since there
+    /// is nothing to collapse against.
+    #[serde(default = "one_repeat_count")]
+    #[builder(default = 1)]
+    pub repeat_count: u32,
+}
+
+fn one_repeat_count() -> u32 {
+    1
 }
 
 /// `automation_runs.outcome` discriminators. The scheduler writes

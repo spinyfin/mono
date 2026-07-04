@@ -843,6 +843,20 @@ pub async fn serve(
         crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
     );
 
+    // Periodic execution-retention sweep: prunes terminal `work_executions`
+    // rows (abandoned/failed/orphaned/cancelled) past the retention bound,
+    // keeping a per-work-item diagnostics floor of recent failures. Bounds
+    // the "Failed (retrying)" backlog a `redundant_spawn` storm leaves
+    // behind (2,087 rows in one incident night) so it never drags down
+    // queries over `work_executions` (and, transitively, the Automations
+    // pane's run history). Fires on boot, so the first pass after this
+    // ships also performs the one-time cleanup of any pre-existing
+    // backlog. See `crate::work::execution_retention` for the full policy.
+    let _execution_retention_sweep_handle = crate::execution_retention_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::execution_retention_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
     // daemon wedges in a ~100% CPU spin. While it is stuck it stops
     // servicing code-signing assessments, so every `dlopen` of a

@@ -817,5 +817,6 @@ pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protoco
         outcome: row.get(6)?,
         produced_task_id: row.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
         detail: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+        repeat_count: 1,
     })
 }

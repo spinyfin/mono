@@ -38,6 +38,7 @@ pub mod effort;
 pub mod engine_control;
 pub mod events_socket;
 pub mod execution_liveness;
+pub mod execution_retention_sweep;
 pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
 pub mod gh_invocation;

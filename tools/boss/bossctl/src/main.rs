@@ -132,6 +132,19 @@ enum Command {
         #[command(subcommand)]
         action: HostsAction,
     },
+    /// Inspect and prune terminal `work_executions` rows (retention).
+    ///
+    /// A running engine already prunes this on a recurring background
+    /// sweep (see `crate::execution_retention_sweep`); this verb is for
+    /// on-demand cleanup between sweeps or while the engine is stopped.
+    /// Reads/writes `state.db` directly, scoped to this install's state
+    /// root (`--state-root`, `BOSS_DB_PATH`, or
+    /// `$HOME/Library/Application Support/Boss` — same resolution as
+    /// `metrics`/`hosts`) — never a cross-install sweep.
+    Executions {
+        #[command(subcommand)]
+        action: ExecutionsAction,
+    },
     /// Scroll the kanban in the macOS app to a work item's card and
     /// play a short transient highlight. Accepts a short id (`T607`)
     /// or a canonical id. Returns an error when the app is not
@@ -545,6 +558,31 @@ enum HostsTagAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ExecutionsAction {
+    /// Delete terminal (`abandoned` / `failed` / `orphaned` / `cancelled`)
+    /// `work_executions` rows past the retention bound. `completed`
+    /// executions are never touched. Always keeps the most recent
+    /// `--keep-per-work-item` eligible rows per work item regardless of
+    /// age, so recent diagnostics survive.
+    Prune {
+        /// Only prune rows whose `created_at` is more than this many days
+        /// old.
+        #[arg(long, default_value_t = boss_engine::work::DEFAULT_RETENTION_MAX_AGE_SECS / (24 * 60 * 60))]
+        older_than_days: i64,
+        /// Always keep at least this many of the most recent eligible
+        /// executions per work item, regardless of age.
+        #[arg(long, default_value_t = boss_engine::work::DEFAULT_RETENTION_KEEP_PER_WORK_ITEM)]
+        keep_per_work_item: u32,
+        /// Preview what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
 // Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
 // BOSS_BUILD_INFO_RS is set to an absolute path by:
 //   - Bazel: via compile_data + $(execpath) in rustc_env (stamped release value)
@@ -740,6 +778,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Hosts {
             action: HostsAction::Remove { id, state_root },
         } => hosts_remove(cli.json, state_root, id),
+        Command::Executions {
+            action:
+                ExecutionsAction::Prune {
+                    older_than_days,
+                    keep_per_work_item,
+                    dry_run,
+                    state_root,
+                },
+        } => executions_prune(cli.json, state_root, older_than_days, keep_per_work_item, dry_run),
         Command::Reveal { id } => reveal_work_item(&cli.socket_path, cli.json, id).await,
         Command::Logs {
             source,
@@ -1988,6 +2035,52 @@ fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow::anyhow!("cannot resolve Boss state.db: HOME is unset; pass --state-root"))?;
     Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
+}
+
+/// `bossctl executions prune` — on-demand retention cleanup of terminal
+/// `work_executions` rows. Opens `state.db` directly via [`resolve_db_path`]
+/// (same resolution `metrics`/`hosts` use), so it is always scoped to this
+/// install's own state, never a cross-install sweep.
+fn executions_prune(
+    json: bool,
+    state_root: Option<PathBuf>,
+    older_than_days: i64,
+    keep_per_work_item: u32,
+    dry_run: bool,
+) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let policy = boss_engine::work::ExecutionRetentionPolicy {
+        max_age_secs: older_than_days.saturating_mul(24 * 60 * 60),
+        keep_per_work_item,
+    };
+    let now_epoch = now_epoch_ms() as i64 / 1000;
+    let outcome = db
+        .prune_terminal_executions(policy, now_epoch, dry_run)
+        .context("pruning terminal executions")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "deleted": outcome.deleted,
+                "dry_run": dry_run,
+                "older_than_days": older_than_days,
+                "keep_per_work_item": keep_per_work_item,
+            })
+        );
+    } else if dry_run {
+        println!(
+            "would delete {} terminal execution row(s) older than {}d (keeping {} most recent per work item)",
+            outcome.deleted, older_than_days, keep_per_work_item
+        );
+    } else {
+        println!(
+            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item)",
+            outcome.deleted, older_than_days, keep_per_work_item
+        );
+    }
+    Ok(())
 }
 
 /// Format a millisecond timestamp as a human-friendly relative age

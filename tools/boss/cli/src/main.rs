@@ -4633,9 +4633,14 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
     for r in runs {
         let produced = r.produced_task_id.as_deref().unwrap_or("-");
         let detail = r.detail.as_deref().unwrap_or("-");
+        let outcome = if r.repeat_count > 1 {
+            format!("{} (x{})", r.outcome, r.repeat_count)
+        } else {
+            r.outcome.clone()
+        };
         table.add_row([
             r.scheduled_for.as_str(),
-            r.outcome.as_str(),
+            outcome.as_str(),
             r.started_at.as_str(),
             produced,
             detail,

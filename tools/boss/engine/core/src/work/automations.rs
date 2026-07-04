@@ -299,7 +299,24 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
-    /// List `automation_runs` rows for an automation, newest first.
+    /// Raw rows examined per [`list_automation_runs`] call, before
+    /// retry-chain collapsing. Bounds the query itself (not just what gets
+    /// rendered) against an automation with a very long fire history —
+    /// the 2000+-row `redundant_spawn` storm this exists to survive.
+    const AUTOMATION_RUNS_RAW_FETCH_LIMIT: i64 = 500;
+
+    /// Collapsed rows returned to the caller (UI / CLI) after retry-chain
+    /// collapsing. Small enough that a plain, non-virtualized list view
+    /// never has to scroll through history to stay responsive.
+    const AUTOMATION_RUNS_DISPLAY_LIMIT: usize = 50;
+
+    /// List `automation_runs` rows for an automation, newest first,
+    /// collapsing consecutive rows that share the same `outcome` and
+    /// `produced_task_id` into a single entry with `repeat_count` set —
+    /// e.g. 23 consecutive `failed_will_retry` rows become one "failed,
+    /// retried 23x" entry instead of 23 rows. `produced_task_id` is part
+    /// of the grouping key so distinct produced tasks are never merged
+    /// together even if they happen to sit outcome-adjacent.
     pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<boss_protocol::AutomationRun>> {
         let conn = self.connect()?;
         let _existing = query_automation(&conn, automation_id).require("automation", automation_id)?;
@@ -309,10 +326,19 @@ impl WorkDb {
                     triage_execution_id, outcome, produced_task_id, detail
                FROM automation_runs
               WHERE automation_id = ?1
-              ORDER BY scheduled_for DESC, started_at DESC",
+              ORDER BY scheduled_for DESC, started_at DESC
+              LIMIT ?2",
         )?;
-        let rows = stmt.query_map([automation_id], map_automation_run)?;
-        collect_rows(rows)
+        let rows = stmt.query_map(
+            params![automation_id, Self::AUTOMATION_RUNS_RAW_FETCH_LIMIT],
+            map_automation_run,
+        )?;
+        let raw: Vec<boss_protocol::AutomationRun> = collect_rows(rows)?;
+        let collapsed = collapse_automation_run_retries(raw);
+        Ok(collapsed
+            .into_iter()
+            .take(Self::AUTOMATION_RUNS_DISPLAY_LIMIT)
+            .collect())
     }
 
     /// List tasks produced by an automation (`source_automation_id = ?`),
@@ -820,5 +846,85 @@ impl WorkDb {
         tx.commit()?;
         task.source_automation_id = Some(automation_id.to_owned());
         Ok(task)
+    }
+}
+
+/// Collapse consecutive `runs` (newest-first, as returned by the DB query)
+/// that share the same `outcome` and `produced_task_id` into a single
+/// entry, incrementing `repeat_count`. The kept entry is always the
+/// newest of the run (input order is newest-first, so the first row of a
+/// matching streak is the one retained).
+fn collapse_automation_run_retries(runs: Vec<boss_protocol::AutomationRun>) -> Vec<boss_protocol::AutomationRun> {
+    let mut collapsed: Vec<boss_protocol::AutomationRun> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(last) = collapsed.last_mut()
+            && last.outcome == run.outcome
+            && last.produced_task_id == run.produced_task_id
+        {
+            last.repeat_count += 1;
+            continue;
+        }
+        collapsed.push(run);
+    }
+    collapsed
+}
+
+#[cfg(test)]
+mod retry_collapse_tests {
+    use super::*;
+
+    fn run(outcome: &str, produced_task_id: Option<&str>) -> boss_protocol::AutomationRun {
+        boss_protocol::AutomationRun::builder()
+            .id(format!("run_{outcome}_{produced_task_id:?}"))
+            .automation_id("auto_1")
+            .scheduled_for("1700000000")
+            .started_at("1700000001")
+            .outcome(outcome)
+            .maybe_produced_task_id(produced_task_id.map(str::to_owned))
+            .build()
+    }
+
+    #[test]
+    fn collapses_consecutive_same_outcome_runs() {
+        let runs = vec![
+            run("failed_will_retry", None),
+            run("failed_will_retry", None),
+            run("failed_will_retry", None),
+        ];
+        let collapsed = collapse_automation_run_retries(runs);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].repeat_count, 3);
+        assert_eq!(collapsed[0].outcome, "failed_will_retry");
+    }
+
+    #[test]
+    fn does_not_collapse_across_a_different_outcome() {
+        let runs = vec![
+            run("failed_will_retry", None),
+            run("failed_will_retry", None),
+            run("produced_task", Some("t1")),
+            run("failed_will_retry", None),
+        ];
+        let collapsed = collapse_automation_run_retries(runs);
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(collapsed[0].repeat_count, 2);
+        assert_eq!(collapsed[1].repeat_count, 1);
+        assert_eq!(collapsed[1].produced_task_id.as_deref(), Some("t1"));
+        assert_eq!(collapsed[2].repeat_count, 1);
+    }
+
+    #[test]
+    fn does_not_collapse_distinct_produced_tasks_with_same_outcome() {
+        let runs = vec![run("produced_task", Some("t1")), run("produced_task", Some("t2"))];
+        let collapsed = collapse_automation_run_retries(runs);
+        assert_eq!(collapsed.len(), 2, "distinct produced tasks must never merge");
+        assert!(collapsed.iter().all(|r| r.repeat_count == 1));
+    }
+
+    #[test]
+    fn single_run_has_repeat_count_one() {
+        let collapsed = collapse_automation_run_retries(vec![run("skipped", None)]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].repeat_count, 1);
     }
 }
