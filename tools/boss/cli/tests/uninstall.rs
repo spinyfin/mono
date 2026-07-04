@@ -10,25 +10,11 @@
 //! (i.e. the default ~/Applications install root is in use). When
 //! BOSS_INSTALL_ROOT is set the caller owns their engine lifecycle.
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-fn boss_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_boss") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(runfiles_dir) = std::env::var("RUNFILES_DIR") {
-        let p = PathBuf::from(runfiles_dir).join("_main/tools/boss/cli/boss");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("boss binary not found; compile with cargo test or bazel test");
-}
+mod common;
+use common::boss_binary;
 
 /// Regression: `boss uninstall --yes` with BOSS_INSTALL_ROOT set must not
 /// send SIGTERM to the process whose PID lives in BOSS_ENGINE_PID_PATH.

@@ -13,59 +13,16 @@
 //! - JSON output exposes the structured report so machine readers
 //!   can branch on per-row annotations.
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{Result, anyhow};
-use boss_client::{BossClient, wait_for_socket};
-use boss_engine::app::serve;
-use boss_engine::config::{RuntimeConfig, WorkConfig};
+use boss_client::BossClient;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, EffortLevel, FrontendEvent, FrontendRequest, Product, Task, WorkItem,
 };
-use serde_json::Value;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-struct TestEngine {
-    socket_path: PathBuf,
-    _temp: tempfile::TempDir,
-    join: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl TestEngine {
-    async fn spawn() -> Result<Self> {
-        let temp = tempfile::tempdir()?;
-        let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder()
-            .cwd(temp.path().to_path_buf())
-            .db_path(temp.path().join("state.db"))
-            .build();
-        let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
-        let socket_for_serve = socket_path.clone();
-        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
-        if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
-        }
-        Ok(Self {
-            socket_path,
-            _temp: temp,
-            join,
-        })
-    }
-
-    fn socket_str(&self) -> &str {
-        self.socket_path.to_str().expect("socket path is utf-8")
-    }
-}
-
-impl Drop for TestEngine {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
-}
+mod common;
+mod harness;
+use common::{run_boss, run_boss_human};
+use harness::TestEngine;
 
 async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> {
     match client
@@ -127,54 +84,6 @@ async fn record_escalation(
         FrontendEvent::EffortEscalationRecorded { .. } => Ok(()),
         other => Err(anyhow!("unexpected response for record escalation: {other:?}")),
     }
-}
-
-fn boss_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_boss") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(runfiles_dir) = std::env::var("RUNFILES_DIR") {
-        let p = PathBuf::from(runfiles_dir).join("_main/tools/boss/cli/boss");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("boss binary path not found");
-}
-
-fn run_boss(socket: &str, args: &[&str]) -> Result<Value> {
-    let output = Command::new(boss_binary())
-        .args(["--json", "--no-input", "--no-autostart", "--socket-path", socket])
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "boss {} failed:\nstdout: {}\nstderr: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    Ok(serde_json::from_str(&String::from_utf8(output.stdout)?)?)
-}
-
-fn run_boss_human(socket: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(boss_binary())
-        .args(["--no-input", "--no-autostart", "--socket-path", socket])
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "boss {} failed:\nstdout: {}\nstderr: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    Ok(String::from_utf8(output.stdout)?)
 }
 
 /// Integration smoke test: file three escalation events with known

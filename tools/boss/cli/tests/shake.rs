@@ -4,24 +4,10 @@
 //! GitHub API. The via-shake tests confirm the non-suppressible label
 //! is present in the payload regardless of CLI flags.
 
-use std::path::PathBuf;
 use std::process::Command;
 
-fn boss_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_boss") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(runfiles_dir) = std::env::var("RUNFILES_DIR") {
-        let p = PathBuf::from(runfiles_dir).join("_main/tools/boss/cli/boss");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("boss binary not found; compile with cargo test or bazel test");
-}
+mod common;
+use common::boss_binary;
 
 /// `--dry-run --json` round-trips the parsed title/body/repo. This is the
 /// minimum check that the subcommand is wired up and that
