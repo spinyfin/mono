@@ -1,20 +1,18 @@
 //! Shared test-support helpers for the `boss` CLI integration tests.
 //!
-//! Each integration test under `tools/boss/cli/tests/*.rs` is its own
-//! `rust_test` target, so this file is listed in the `srcs` of every target
-//! and pulled in via `mod common;` from each test. It holds the helpers that
-//! only drive the compiled `boss` binary as a subprocess: locating it, and
-//! running it in JSON / human mode or expecting failure. These need nothing
-//! from the engine library, so even the tests that never spawn an engine
-//! (`shake`, `uninstall`) can share them without pulling `boss-engine` in.
+//! This is its own `rust_library` (testonly), depended on by every
+//! integration test under `tools/boss/cli/tests/*.rs` and used via
+//! `use common::...`. It holds the helpers that only drive the compiled
+//! `boss` binary as a subprocess: locating it, and running it in JSON /
+//! human mode or expecting failure. These need nothing from the engine
+//! library, so even the tests that never spawn an engine (`shake`,
+//! `uninstall`) can depend on it without pulling `boss-engine` in.
 //!
 //! The in-process engine harness (`TestEngine`) lives in the sibling
-//! `harness` module, which only the engine-backed targets wire into their
-//! `srcs`.
-
-// Each integration test binary compiles this file independently and not every
-// binary uses every helper; suppress dead-code noise rather than gate items.
-#![allow(dead_code)]
+//! `harness` library, which only the engine-backed targets depend on.
+//! Because this is a library crate, `pub` items that only some
+//! dependents use are not flagged as dead code the way they would be if
+//! this were compiled directly into each test binary.
 
 use std::path::PathBuf;
 use std::process::Command;

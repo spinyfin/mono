@@ -19,8 +19,6 @@ use boss_protocol::{
     CreateChoreInput, CreateProductInput, EffortLevel, FrontendEvent, FrontendRequest, Product, Task, WorkItem,
 };
 
-mod common;
-mod harness;
 use common::{run_boss, run_boss_human};
 use harness::TestEngine;
 

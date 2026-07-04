@@ -17,8 +17,6 @@ use boss_protocol::{
     WorkItem,
 };
 
-mod common;
-mod harness;
 use common::{boss_binary, run_boss};
 use harness::TestEngine;
 

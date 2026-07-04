@@ -4,16 +4,14 @@
 //! `TestEngine::spawn` starts the engine's `serve` loop on a temp Unix socket
 //! backed by a temp SQLite db; `socket_str()` exposes the wire path to pass to
 //! the `boss` binary and `db()` opens the same db for tests that seed rows
-//! directly. Each integration test is its own `rust_test` target, so this file
-//! is listed in the `srcs` of every engine-backed target and pulled in via
-//! `mod harness;`.
+//! directly. This is its own `rust_library` (testonly), depended on by every
+//! engine-backed integration test and used via `use harness::...`. Because
+//! it's a library crate, `pub` items that only some dependents use (e.g.
+//! `db()`) are not flagged as dead code the way they would be if this were
+//! compiled directly into each test binary.
 //!
 //! The subprocess-driving helpers (`boss_binary`, `run_boss`, …) live in the
-//! sibling `common` module.
-
-// Each integration test binary compiles this file independently and not every
-// binary touches every item (e.g. `db()`); suppress dead-code noise.
-#![allow(dead_code)]
+//! sibling `common` library.
 
 use std::path::PathBuf;
 use std::sync::Arc;

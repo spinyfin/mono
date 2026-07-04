@@ -11,8 +11,6 @@ use anyhow::{Result, anyhow};
 use boss_client::BossClient;
 use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
 
-mod common;
-mod harness;
 use common::{run_boss, run_boss_expect_failure};
 use harness::TestEngine;
 

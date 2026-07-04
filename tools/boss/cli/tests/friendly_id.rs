@@ -19,8 +19,6 @@ use boss_protocol::{
     Project, Task, WorkItem,
 };
 
-mod common;
-mod harness;
 use common::{run_boss, run_boss_expect_failure};
 use harness::TestEngine;
 

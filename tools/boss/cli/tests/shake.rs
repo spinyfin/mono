@@ -6,7 +6,6 @@
 
 use std::process::Command;
 
-mod common;
 use common::boss_binary;
 
 /// `--dry-run --json` round-trips the parsed title/body/repo. This is the

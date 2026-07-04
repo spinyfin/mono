@@ -13,7 +13,6 @@
 use std::process::Command;
 use std::time::Duration;
 
-mod common;
 use common::boss_binary;
 
 /// Regression: `boss uninstall --yes` with BOSS_INSTALL_ROOT set must not
