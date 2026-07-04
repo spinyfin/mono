@@ -38,12 +38,19 @@ swept; `release` frees the slot and resets the working copy; and
 reclaiming merged bookmarks. Recovery flags (`--allow-dirty`,
 `--keep-dirty`, `--reason`) let a stranded dirty workspace be reclaimed
 or quarantined instead of being silently wiped. `pr create` pushes the
-current `jj` bookmark and opens a GitHub PR via `gh` (erroring if one
-already exists), while `pr update` pushes new commits to an existing PR
-(erroring if none does); both resolve the GitHub remote and verify the
-push the same way. (`pr ensure`, the old create-or-reuse verb, is a
-deprecated alias kept for one transitional release.) The `change`,
-`stack`, and `pr sync`/`pr merge` verbs are scaffolding for
+current `jj` bookmark and opens a GitHub PR via `gh`; it is safe to call
+again for a branch that already has an open PR — it returns that PR's
+URL (`action: "already_exists"`) instead of pushing again or erroring, so
+a caller killed by its own timeout mid-push can retry without ceremony.
+`pr update` pushes new commits to an existing PR (erroring if none does);
+both resolve the GitHub remote and verify the push the same way. A single
+`jj git push` attempt is itself bounded and retried: it runs with a
+generous per-attempt deadline (`CUBE_PUSH_TIMEOUT_SECS`, default 300s)
+and periodic stderr progress so a push queued behind a contended shared
+store is never mistaken for a hang, and a timed-out attempt is retried
+once before surfacing a clear error. (`pr ensure`, the old create-or-reuse
+verb, is a deprecated alias kept for one transitional release.) The
+`change`, `stack`, and `pr sync`/`pr merge` verbs are scaffolding for
 stacked-change management and are only partially implemented today.
 
 ### `pr create` / `pr update` push to GitHub, not a local mirror

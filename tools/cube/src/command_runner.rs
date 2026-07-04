@@ -33,6 +33,13 @@ pub trait CommandRunner {
     }
 }
 
+/// How often [`RealCommandRunner::run_with_timeout`] emits a stderr progress
+/// line while a subprocess is still running. Long enough not to spam a
+/// normal-latency command, short enough that a caller's own output-silence
+/// timeout (commonly ~120s) never fires on a command that is still making
+/// progress under lock contention.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 pub struct RealCommandRunner;
 
 impl RealCommandRunner {
@@ -99,6 +106,29 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String, CubeError> {
+        let program = invocation.program.clone();
+        let args = invocation.args.join(" ");
+        self.run_with_timeout_and_heartbeat(invocation, timeout, HEARTBEAT_INTERVAL, |elapsed, timeout| {
+            eprintln!(
+                "cube: still waiting on `{program} {args}` ({}s elapsed, {}s deadline)...",
+                elapsed.as_secs(),
+                timeout.as_secs(),
+            );
+        })
+    }
+}
+
+impl RealCommandRunner {
+    /// Core of [`CommandRunner::run_with_timeout`], with the heartbeat
+    /// cadence and callback injectable so tests can verify heartbeats fire
+    /// without waiting out a real 15s interval or scraping process stderr.
+    fn run_with_timeout_and_heartbeat(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+        heartbeat_interval: Duration,
+        mut on_heartbeat: impl FnMut(Duration, Duration),
+    ) -> Result<String, CubeError> {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args)
             .current_dir(&invocation.cwd)
@@ -132,17 +162,20 @@ impl CommandRunner for RealCommandRunner {
             buf
         });
 
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
         // Adaptive backoff: fast commands return promptly, slow ones poll
         // cheaply. Capped so a hung command is detected within ~50ms of the
         // deadline.
         let mut wait = Duration::from_millis(1);
         let max_wait = Duration::from_millis(50);
+        let mut last_heartbeat = started;
         let status = loop {
             match child.try_wait().map_err(CubeError::Io)? {
                 Some(status) => break status,
                 None => {
-                    if Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
                         // Kill the child so cube stops waiting and any lock it
                         // holds is released; reap it to avoid a zombie, and
                         // join the drain threads so the pipe fds close.
@@ -155,6 +188,17 @@ impl CommandRunner for RealCommandRunner {
                             args: invocation.args.clone(),
                             timeout_secs: timeout.as_secs(),
                         });
+                    }
+                    // Long-running commands (most importantly `jj git push`
+                    // queued behind a contended shared-store lock) must never
+                    // go silent: a caller with its own output-silence timeout
+                    // (e.g. a Bash tool's default) would otherwise read the
+                    // silence as a hang and kill/retry a command that was
+                    // actually making progress. Emit a heartbeat at a fixed
+                    // cadence for the whole wait.
+                    if now.duration_since(last_heartbeat) >= heartbeat_interval {
+                        on_heartbeat(now.duration_since(started), timeout);
+                        last_heartbeat = now;
                     }
                     thread::sleep(wait);
                     wait = (wait * 2).min(max_wait);
@@ -216,6 +260,31 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "run_with_timeout returned in {elapsed:?}, expected to bail out near the 200ms deadline"
         );
+    }
+
+    #[test]
+    fn run_with_timeout_emits_heartbeats_while_child_is_still_running() {
+        let runner = RealCommandRunner;
+        let dir = std::env::temp_dir();
+        let heartbeats = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heartbeats_cb = heartbeats.clone();
+        let out = runner
+            .run_with_timeout_and_heartbeat(
+                &RealCommandRunner::invocation(&dir, "sleep", &["1"]),
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                move |elapsed, timeout| {
+                    heartbeats_cb.lock().unwrap().push((elapsed, timeout));
+                },
+            )
+            .expect("command should complete within the timeout");
+        assert_eq!(out, "");
+        let recorded = heartbeats.lock().unwrap();
+        assert!(
+            !recorded.is_empty(),
+            "expected at least one heartbeat while `sleep 1` was still running"
+        );
+        assert!(recorded.iter().all(|(_, timeout)| *timeout == Duration::from_secs(10)));
     }
 
     #[test]
