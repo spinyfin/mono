@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobSetBuilder};
+use tracing::warn;
 
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
@@ -185,20 +186,53 @@ fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
     out
 }
 
-/// Strip `repo_root` from any absolute finding paths so every finding emitted by
-/// the declarative runtime is repo-relative. This is a framework-level guarantee:
-/// tools may receive absolute paths (e.g. when the hermetic Bazel toolchain wrapper
-/// canonicalizes inputs) and echo them back — the framework normalises before the
-/// finding reaches the runner.
+/// Normalise finding paths to genuine repo-relative source paths so every finding
+/// emitted by the declarative runtime can be matched against the changeset. This is
+/// a framework-level guarantee covering two distinct path shapes tools may report:
+///
+/// 1. Absolute paths — tools invoked via the hermetic Bazel toolchain wrapper may
+///    receive absolute input paths and echo them back; strip the repo root prefix.
+/// 2. `bazel-out/<config>/bin/<path>` relative paths — `bazel_aspect` invocations
+///    (e.g. `rust_clippy_aspect`) build sources through Bazel's sandbox, which
+///    stages a crate's source files at their sandboxed bin-relative location for
+///    hermetic, cache-stable builds. rustc's `--remap-path-prefix` flags collapse
+///    the sandbox's absolute exec root down to that relative form, so diagnostic
+///    spans report `bazel-out/.../bin/tools/foo/src/bar.rs` instead of
+///    `tools/foo/src/bar.rs`. Left unstripped, this NEVER matches a real
+///    repo-relative path in the changeset, so the change-scope filter
+///    (`scope_findings_to_changeset`, a documented no-op under `--all`) silently
+///    drops every such finding — a check that finds real warnings but never
+///    reports them, in both scoped and `--all` runs alike.
 fn normalize_finding_paths(findings: &mut [Finding], repo_root: &Path) {
     for finding in findings.iter_mut() {
-        if let Some(location) = &mut finding.location
-            && location.path.is_absolute()
-            && let Ok(relative) = location.path.strip_prefix(repo_root)
-        {
-            location.path = relative.to_path_buf();
+        let Some(location) = &mut finding.location else {
+            continue;
+        };
+        if location.path.is_absolute() {
+            if let Ok(relative) = location.path.strip_prefix(repo_root) {
+                location.path = relative.to_path_buf();
+            }
+        } else if let Some(stripped) = strip_bazel_out_bin_prefix(&location.path) {
+            location.path = stripped;
         }
     }
+}
+
+/// Strip a leading `bazel-out/<config>/bin/` segment (the same prefix the
+/// `bazel-bin` convenience symlink points at) from a relative path, returning the
+/// genuine workspace-relative path underneath. Returns `None` for paths that don't
+/// have this shape, including a bare `bazel-out/<config>/bin` with nothing after it.
+fn strip_bazel_out_bin_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next()?.as_os_str() != "bazel-out" {
+        return None;
+    }
+    components.next()?; // the `<cpu>-<compilation_mode>` config segment; name varies
+    if components.next()?.as_os_str() != "bin" {
+        return None;
+    }
+    let rest: PathBuf = components.collect();
+    if rest.as_os_str().is_empty() { None } else { Some(rest) }
 }
 
 /// Count the files in `changeset` that the declarative check will actually process
@@ -498,6 +532,23 @@ fn run_bazel_aspect_invocation(
             String::from_utf8_lossy(&query_output.stderr).trim()
         );
     }
+    if query_output.exit_code == Some(3) {
+        // --keep_going tolerates unresolvable labels (e.g. a matched file that
+        // bazel does not own in any package), but a partial result must not look
+        // identical to a full one: log how many files were dropped so a query that
+        // silently degrades toward empty is visible in the logs, not just in an
+        // ever-shrinking finding count.
+        let dropped = String::from_utf8_lossy(&query_output.stderr)
+            .lines()
+            .filter(|line| line.trim_start().starts_with("ERROR: Skipping"))
+            .count();
+        warn!(
+            invocation_id = %invocation.id,
+            matched_files = files.len(),
+            dropped_files = dropped,
+            "bazel_aspect target query returned a partial result (--keep_going); some matched files could not be resolved to a target"
+        );
+    }
     let mut targets: Vec<String> = String::from_utf8_lossy(&query_output.stdout)
         .lines()
         .map(str::trim)
@@ -539,6 +590,17 @@ fn run_bazel_aspect_invocation(
     targets.sort();
     targets.dedup();
     if targets.is_empty() {
+        // A non-empty matched-file set that resolves to zero targets is always
+        // suspicious — it means every file the check was supposed to cover was
+        // either untracked by Bazel or dropped by a partial (--keep_going) query.
+        // Silently returning no findings here would make that indistinguishable
+        // from "these files really have no clippy violations"; warn so the gap is
+        // visible instead of masquerading as a clean run.
+        warn!(
+            invocation_id = %invocation.id,
+            matched_files = files.len(),
+            "bazel_aspect target query resolved 0 targets from a non-empty matched-file set; no aspect coverage for this run"
+        );
         return Ok(Vec::new());
     }
 
@@ -1249,10 +1311,11 @@ mod tests {
 
     use tempfile::{TempDir, tempdir};
 
-    use super::{execute_fix_batch, execute_fix_per_file};
+    use super::{execute_fix_batch, execute_fix_per_file, normalize_finding_paths};
     use crate::external::declarative::FixBlock;
     use crate::external::sandbox::HostCeiling;
     use crate::fix::safety::WritableSandbox;
+    use crate::output::{Finding, Location, Severity};
     use crate::source_tree::LocalSourceTree;
 
     fn paths(p: &[&str]) -> Vec<PathBuf> {
@@ -1482,6 +1545,74 @@ exit 1"#,
             fs::read(dir.path().join("a.txt")).unwrap(),
             b"before",
             "real tree untouched"
+        );
+    }
+
+    #[test]
+    fn strip_bazel_out_bin_prefix_strips_config_segment() {
+        // The rust_clippy_aspect reports diagnostic spans using this exact shape:
+        // bazel-out/<cpu>-<mode>/bin/<pkg-relative-path>. The middle config segment
+        // varies by platform/mode (darwin_arm64-fastbuild, k8-opt, ...); the function
+        // must not hardcode it.
+        assert_eq!(
+            super::strip_bazel_out_bin_prefix(Path::new(
+                "bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/core/src/app/comments.rs"
+            )),
+            Some(PathBuf::from("tools/boss/engine/core/src/app/comments.rs"))
+        );
+        assert_eq!(
+            super::strip_bazel_out_bin_prefix(Path::new("bazel-out/k8-opt/bin/lib/rust/git_utils/src/lib.rs")),
+            Some(PathBuf::from("lib/rust/git_utils/src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn strip_bazel_out_bin_prefix_ignores_non_matching_paths() {
+        // A genuine repo-relative path (the common case for every other invocation
+        // kind) must pass through untouched.
+        assert_eq!(
+            super::strip_bazel_out_bin_prefix(Path::new("tools/boss/engine/core/src/lib.rs")),
+            None
+        );
+        // genfiles (not bin) is a different bazel-out subtree; not our concern here.
+        assert_eq!(
+            super::strip_bazel_out_bin_prefix(Path::new("bazel-out/k8-opt/genfiles/tools/foo.rs")),
+            None
+        );
+        // A bare bazel-out/<config>/bin with nothing underneath isn't a file path.
+        assert_eq!(
+            super::strip_bazel_out_bin_prefix(Path::new("bazel-out/k8-opt/bin")),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_finding_paths_rewrites_bazel_out_bin_relative_clippy_paths() {
+        // Regression test for the lint/rust silent-miss: without this
+        // normalization, every clippy finding's location.path never matches a real
+        // changeset path, so `scope_findings_to_changeset` (the "no-op under --all"
+        // change-scope filter) silently drops every finding — a check that finds
+        // real warnings but never reports them, in both scoped and `--all` runs.
+        let mut findings = vec![Finding {
+            severity: Severity::Warning,
+            message: "clippy::collapsible_if: this if statement can be collapsed".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from("bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/core/src/app/comments.rs"),
+                line: Some(98),
+                column: Some(9),
+            }),
+            remediations: Vec::new(),
+            suggested_fix: None,
+            fixable: false,
+        }];
+
+        normalize_finding_paths(&mut findings, Path::new("/repo"));
+
+        let location = findings[0].location.as_ref().expect("location retained");
+        assert_eq!(
+            location.path,
+            PathBuf::from("tools/boss/engine/core/src/app/comments.rs"),
+            "finding path must be repo-relative so the change-scope filter can match it against the changeset"
         );
     }
 }
