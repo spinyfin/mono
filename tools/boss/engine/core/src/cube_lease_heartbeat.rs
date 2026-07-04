@@ -300,6 +300,26 @@ pub fn spawn_loop(
     })
 }
 
+/// The dependencies shared by every helper in a heartbeat pass, bundled so
+/// they can be threaded through as a single argument instead of four
+/// (keeps helper signatures under clippy's `too_many_arguments`).
+struct HeartbeatCtx<'a> {
+    work_db: &'a WorkDb,
+    cube_client: &'a dyn CubeClient,
+    dispatch_events: &'a dyn DispatchEventSink,
+    breaker: &'a HeartbeatFailureBreaker,
+}
+
+/// The identifiers naming one heartbeat target, bundled for the same
+/// reason as [`HeartbeatCtx`].
+#[derive(Clone, Copy)]
+struct HeartbeatTarget<'a> {
+    execution_id: &'a str,
+    lease_id: &'a str,
+    work_item_id: &'a str,
+    cube_workspace_id: &'a str,
+}
+
 /// Run a single heartbeat pass: refresh the cube lease of every live
 /// worker, auto-reaping any execution whose lease has failed
 /// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive times. Returns a
@@ -332,6 +352,12 @@ async fn run_one_pass_impl(
     breaker: &HeartbeatFailureBreaker,
     heartbeat_timeout: Duration,
 ) -> HeartbeatSweepOutcome {
+    let ctx = HeartbeatCtx {
+        work_db,
+        cube_client,
+        dispatch_events,
+        breaker,
+    };
     let mut outcome = HeartbeatSweepOutcome::default();
     let mut registered_run_ids: HashSet<String> = HashSet::new();
     let mut db_fallback_sweep_succeeded = false;
@@ -408,29 +434,21 @@ async fn run_one_pass_impl(
         // extend a live one reclaims a working copy out from under an active
         // worker (the incident this whole module fixes).
 
-        let succeeded = heartbeat_one(
-            cube_client,
-            dispatch_events,
+        let target = HeartbeatTarget {
             execution_id,
             lease_id,
-            &execution.work_item_id,
-            execution.cube_workspace_id.as_deref().unwrap_or(""),
+            work_item_id: &execution.work_item_id,
+            cube_workspace_id: execution.cube_workspace_id.as_deref().unwrap_or(""),
+        };
+        let succeeded = heartbeat_one(
+            &ctx,
+            &target,
             heartbeat_timeout,
             &mut outcome.heartbeated,
             &mut outcome.failed,
         )
         .await;
-        record_heartbeat_result(
-            work_db,
-            dispatch_events,
-            cube_client,
-            breaker,
-            &execution,
-            lease_id,
-            succeeded,
-            &mut outcome.auto_reaped,
-        )
-        .await;
+        record_heartbeat_result(&ctx, &execution, lease_id, succeeded, &mut outcome.auto_reaped).await;
     }
 
     // DB-fallback sweep: heartbeat in-flight executions not yet present in
@@ -458,13 +476,15 @@ async fn run_one_pass_impl(
                 let execution_id = &execution.id;
                 let mut succeeded_count = 0usize;
                 let mut failed_count = 0usize;
-                let succeeded = heartbeat_one(
-                    cube_client,
-                    dispatch_events,
+                let target = HeartbeatTarget {
                     execution_id,
                     lease_id,
-                    &execution.work_item_id,
-                    execution.cube_workspace_id.as_deref().unwrap_or(""),
+                    work_item_id: &execution.work_item_id,
+                    cube_workspace_id: execution.cube_workspace_id.as_deref().unwrap_or(""),
+                };
+                let succeeded = heartbeat_one(
+                    &ctx,
+                    &target,
                     heartbeat_timeout,
                     &mut succeeded_count,
                     &mut failed_count,
@@ -479,17 +499,7 @@ async fn run_one_pass_impl(
                     );
                 }
                 outcome.failed += failed_count;
-                record_heartbeat_result(
-                    work_db,
-                    dispatch_events,
-                    cube_client,
-                    breaker,
-                    &execution,
-                    lease_id,
-                    succeeded,
-                    &mut outcome.auto_reaped,
-                )
-                .await;
+                record_heartbeat_result(&ctx, &execution, lease_id, succeeded, &mut outcome.auto_reaped).await;
             }
         }
         Err(err) => {
@@ -529,17 +539,19 @@ async fn run_one_pass_impl(
 /// failure or timeout, and returns whether the heartbeat succeeded so the
 /// caller can feed [`HeartbeatFailureBreaker`].
 async fn heartbeat_one(
-    cube_client: &dyn CubeClient,
-    dispatch_events: &dyn DispatchEventSink,
-    execution_id: &str,
-    lease_id: &str,
-    work_item_id: &str,
-    cube_workspace_id: &str,
+    ctx: &HeartbeatCtx<'_>,
+    target: &HeartbeatTarget<'_>,
     timeout: Duration,
     succeeded: &mut usize,
     failed: &mut usize,
 ) -> bool {
-    let result = tokio::time::timeout(timeout, cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
+    let HeartbeatTarget {
+        execution_id,
+        lease_id,
+        work_item_id,
+        cube_workspace_id,
+    } = *target;
+    let result = tokio::time::timeout(timeout, ctx.cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
         Ok(Ok(())) => {
             *succeeded += 1;
@@ -559,7 +571,7 @@ async fn heartbeat_one(
                 error = %format!("{err:#}"),
                 "cube-lease heartbeat: failed to refresh lease (cube may have reclaimed it; the worker's workspace is at risk)",
             );
-            dispatch_events
+            ctx.dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
                         .with_work_item(work_item_id)
@@ -585,7 +597,7 @@ async fn heartbeat_one(
                 timeout_secs = timeout.as_secs(),
                 "cube-lease heartbeat: heartbeat call timed out; treating as failure so other leases continue",
             );
-            dispatch_events
+            ctx.dispatch_events
                 .emit(
                     DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
                         .with_work_item(work_item_id)
@@ -609,34 +621,21 @@ async fn heartbeat_one(
 /// [`auto_reap_dead_lease`]. A success clears the streak — a lease that
 /// recovers even once is no longer evidence of death.
 async fn record_heartbeat_result(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    cube_client: &dyn CubeClient,
-    breaker: &HeartbeatFailureBreaker,
+    ctx: &HeartbeatCtx<'_>,
     execution: &WorkExecution,
     lease_id: &str,
     succeeded: bool,
     auto_reaped: &mut usize,
 ) {
     if succeeded {
-        breaker.forget(&execution.id);
+        ctx.breaker.forget(&execution.id);
         return;
     }
-    let consecutive_failures = breaker.record_failure(&execution.id);
+    let consecutive_failures = ctx.breaker.record_failure(&execution.id);
     if consecutive_failures < AUTO_REAP_AFTER_CONSECUTIVE_FAILURES {
         return;
     }
-    if auto_reap_dead_lease(
-        work_db,
-        dispatch_events,
-        cube_client,
-        breaker,
-        execution,
-        lease_id,
-        consecutive_failures,
-    )
-    .await
-    {
+    if auto_reap_dead_lease(ctx, execution, lease_id, consecutive_failures).await {
         *auto_reaped += 1;
     }
 }
@@ -671,15 +670,13 @@ async fn record_heartbeat_result(
 /// already terminal by the time we get here, this is a no-op that still
 /// clears the breaker streak).
 async fn auto_reap_dead_lease(
-    work_db: &WorkDb,
-    dispatch_events: &dyn DispatchEventSink,
-    cube_client: &dyn CubeClient,
-    breaker: &HeartbeatFailureBreaker,
+    ctx: &HeartbeatCtx<'_>,
     execution: &WorkExecution,
     lease_id: &str,
     consecutive_failures: u32,
 ) -> bool {
-    let verdict = run_reconcile::confirm_execution_dead(cube_client, execution, run_reconcile::current_epoch_s()).await;
+    let verdict =
+        run_reconcile::confirm_execution_dead(ctx.cube_client, execution, run_reconcile::current_epoch_s()).await;
     if !matches!(verdict, RunReconcileVerdict::Dead) {
         // Sustained heartbeat failure alone is not proof of death — could be
         // a transient cube CLI error or a cube outage hitting every lease at
@@ -688,7 +685,7 @@ async fn auto_reap_dead_lease(
         // us one failure away from reaping a live worker on the next pass;
         // if the lease really is gone, it fails to heartbeat again and the
         // streak rebuilds to another confirmation attempt.
-        breaker.forget(&execution.id);
+        ctx.breaker.forget(&execution.id);
         tracing::warn!(
             execution_id = %execution.id,
             lease_id,
@@ -705,16 +702,17 @@ async fn auto_reap_dead_lease(
          treating the workspace as gone and auto-reaping (same terminal path as `bossctl agents reap`)"
     );
 
-    if let Err(err) = work_db.mark_execution_orphaned(&execution.id, &reason) {
+    if let Err(err) = ctx.work_db.mark_execution_orphaned(&execution.id, &reason) {
         // A concurrent sweep/guard/hook may have finalized this execution
         // between our snapshot and now — that's success from our
         // perspective (the row is no longer a live blocker), just not
         // something we get to take credit for.
-        let already_terminal = work_db
+        let already_terminal = ctx
+            .work_db
             .get_execution(&execution.id)
             .map(|cur| cur.status.is_terminal())
             .unwrap_or(false);
-        breaker.forget(&execution.id);
+        ctx.breaker.forget(&execution.id);
         if already_terminal {
             return false;
         }
@@ -725,11 +723,11 @@ async fn auto_reap_dead_lease(
         );
         return false;
     }
-    breaker.forget(&execution.id);
+    ctx.breaker.forget(&execution.id);
 
     if execution.kind == ExecutionKind::AutomationTriage {
         crate::execution_liveness::finalize_dead_automation_triage_run(
-            work_db,
+            ctx.work_db,
             execution,
             &format!(
                 "its cube lease `{lease_id}` was no longer tracked after {consecutive_failures} consecutive \
@@ -741,7 +739,8 @@ async fn auto_reap_dead_lease(
     // Best-effort: the lease is already failing to heartbeat (almost
     // certainly because cube no longer tracks it), so force-release is
     // very likely a no-op. Failure here is benign.
-    if let Err(err) = cube_client
+    if let Err(err) = ctx
+        .cube_client
         .force_release_lease(
             lease_id,
             Some("cube-lease heartbeat auto-reap: lease failed to refresh after repeated attempts"),
@@ -756,7 +755,7 @@ async fn auto_reap_dead_lease(
         );
     }
 
-    dispatch_events
+    ctx.dispatch_events
         .emit(
             DispatchEvent::new(Stage::CubeLeaseAutoReap, Outcome::Ok, &execution.id)
                 .with_work_item(&execution.work_item_id)
