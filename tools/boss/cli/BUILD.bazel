@@ -1,7 +1,36 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
+
+# Shared test-support helpers for the `boss` CLI integration tests below.
+# Kept as real library crates (rather than srcs compiled into each test
+# binary) so that helpers only some dependents use aren't flagged as dead
+# code — pub items in a library are assumed reachable by external callers,
+# unlike pub items compiled straight into a bin/test crate root.
+rust_library(
+    name = "common",
+    testonly = True,
+    srcs = ["tests/common/mod.rs"],
+    crate_root = "tests/common/mod.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_library(
+    name = "harness",
+    testonly = True,
+    srcs = ["tests/harness/mod.rs"],
+    crate_root = "tests/harness/mod.rs",
+    edition = "2024",
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
 
 rust_binary(
     name = "boss",
@@ -65,7 +94,10 @@ rust_test(
     name = "infer_product_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/infer_product.rs"],
+    srcs = [
+        "tests/infer_product.rs",
+    ],
+    crate_root = "tests/infer_product.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -73,6 +105,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -91,7 +125,10 @@ rust_test(
     name = "effort_and_model_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/effort_and_model.rs"],
+    srcs = [
+        "tests/effort_and_model.rs",
+    ],
+    crate_root = "tests/effort_and_model.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -99,6 +136,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -117,7 +156,10 @@ rust_test(
     name = "repo_resolution_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/repo_resolution.rs"],
+    srcs = [
+        "tests/repo_resolution.rs",
+    ],
+    crate_root = "tests/repo_resolution.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -125,6 +167,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -139,14 +183,17 @@ rust_test(
 rust_test(
     name = "uninstall_test",
     size = "small",
-    srcs = ["tests/uninstall.rs"],
+    srcs = [
+        "tests/uninstall.rs",
+    ],
+    crate_root = "tests/uninstall.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [] + all_crate_deps(
+    deps = [":common"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
@@ -157,14 +204,17 @@ rust_test(
 rust_test(
     name = "shake_test",
     size = "small",
-    srcs = ["tests/shake.rs"],
+    srcs = [
+        "tests/shake.rs",
+    ],
+    crate_root = "tests/shake.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [] + all_crate_deps(
+    deps = [":common"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),
@@ -178,7 +228,10 @@ rust_test(
     name = "friendly_id_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/friendly_id.rs"],
+    srcs = [
+        "tests/friendly_id.rs",
+    ],
+    crate_root = "tests/friendly_id.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -186,6 +239,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -204,7 +259,10 @@ rust_test(
     name = "audit_effort_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/audit_effort.rs"],
+    srcs = [
+        "tests/audit_effort.rs",
+    ],
+    crate_root = "tests/audit_effort.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -212,6 +270,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -229,7 +289,10 @@ rust_test(
     name = "external_tracker_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/external_tracker.rs"],
+    srcs = [
+        "tests/external_tracker.rs",
+    ],
+    crate_root = "tests/external_tracker.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -237,6 +300,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -254,7 +319,10 @@ rust_test(
     name = "editorial_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/editorial.rs"],
+    srcs = [
+        "tests/editorial.rs",
+    ],
+    crate_root = "tests/editorial.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -262,6 +330,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
@@ -280,7 +350,10 @@ rust_test(
     name = "engine_ci_verbs_test",
     size = "small",
     timeout = "moderate",
-    srcs = ["tests/engine_ci_verbs.rs"],
+    srcs = [
+        "tests/engine_ci_verbs.rs",
+    ],
+    crate_root = "tests/engine_ci_verbs.rs",
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -288,6 +361,8 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        ":common",
+        ":harness",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
