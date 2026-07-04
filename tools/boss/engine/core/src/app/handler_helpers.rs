@@ -142,6 +142,34 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    // Engine→app push channel wedged: consecutive `send_to_app` timeouts /
+    // undeliverable enqueues mean small RPCs (reveal, pane release) are
+    // stuck behind a saturated outbound queue. Surface it once here instead
+    // of only as a stream of per-call `Send(Timeout)` WARNs, so the operator
+    // sees a single actionable banner. See `AppChannelHealth`.
+    let app_channel = server_state.app_channel_health.snapshot();
+    if app_channel.consecutive_failures >= APP_CHANNEL_UNHEALTHY_STREAK {
+        issues.push(EngineHealthIssue {
+            kind: "app_session_unresponsive".to_owned(),
+            severity: "error".to_owned(),
+            title: "Engine cannot reach the Boss app".to_owned(),
+            body: format!(
+                "The engine's outbound channel to the Boss app is saturated: {failures} \
+                 consecutive engine→app requests (e.g. reveal, worker-pane release) have failed \
+                 to get a reply within their send deadline. At the last failure the app's \
+                 outbound queue held {depth} envelope(s), the oldest waiting {age_ms}ms.\n\
+                 \n\
+                 The app process may still be alive but is not draining engine pushes fast \
+                 enough (or its socket reader has stalled). Reveal and pane-release will keep \
+                 timing out until the backlog clears. If the UI is unresponsive, quit and \
+                 relaunch Boss — a fresh app session re-registers and clears the wedged one.",
+                failures = app_channel.consecutive_failures,
+                depth = app_channel.last_queue_depth,
+                age_ms = app_channel.last_oldest_age_ms,
+            ),
+        });
+    }
+
     EngineHealthReport {
         anthropic_api_key_present,
         dispatch_paused,

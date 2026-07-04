@@ -433,6 +433,7 @@ mod tests {
             *self.last_request.lock().unwrap() = Some(request);
             self.canned_response.clone().map_err(|e| match e {
                 SendToAppError::NotRegistered => SendToAppError::NotRegistered,
+                SendToAppError::SessionWedged => SendToAppError::SessionWedged,
                 SendToAppError::AppDisconnected => SendToAppError::AppDisconnected,
                 SendToAppError::Timeout => SendToAppError::Timeout,
                 SendToAppError::ResponseKindMismatch(s) => SendToAppError::ResponseKindMismatch(s),
