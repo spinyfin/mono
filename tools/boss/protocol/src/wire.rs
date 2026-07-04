@@ -1563,6 +1563,17 @@ pub enum FrontendRequest {
         patch: WorkItemPatch,
     },
 
+    /// Snapshot every engine worker pool's (main, automation, review)
+    /// own claimed-slot bookkeeping — capacity, idle count, and each
+    /// held slot's `worker_id → execution_id` mapping — cross-referenced
+    /// against `LiveWorkerStateRegistry` so a claim with no backing live
+    /// worker is flagged. Read-only. This is the diagnostic surface for
+    /// "pool reports N/M busy but `bossctl agents list` shows fewer live
+    /// workers": before this existed, diagnosing a leaked claim required
+    /// manually diffing `agents list` against `pool_capacity` from
+    /// `dispatch.jsonl` rejections.
+    WorkerPoolSummary,
+
     /// Snapshot the cube workspace pool. Proxies to
     /// `cube --json workspace list`; the engine adds no editorial — the
     /// returned vector mirrors cube's view, optionally annotated with
@@ -1920,6 +1931,11 @@ pub enum FrontendEvent {
     /// matching state) with the execution id currently leasing it.
     WorkspacePoolSummaryResult {
         workspaces: Vec<WorkspacePoolEntry>,
+    },
+    /// Snapshot of every engine worker pool's own claim bookkeeping,
+    /// as requested by [`FrontendRequest::WorkerPoolSummary`].
+    WorkerPoolSummaryResult {
+        pools: Vec<WorkerPoolEntry>,
     },
     /// Engine confirms a dependency edge has been added. Returns the
     /// row that was inserted (or the existing row if the call was an
@@ -2681,6 +2697,41 @@ pub struct WorkspacePoolEntry {
     /// workspace is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+}
+
+/// One engine worker pool's claim summary, as exposed via
+/// [`FrontendEvent::WorkerPoolSummaryResult`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct WorkerPoolEntry {
+    /// Pool name: `"main"`, `"automation"`, or `"review"`.
+    pub name: String,
+    /// Configured pool capacity (max concurrent slots).
+    pub capacity: usize,
+    /// Number of currently idle (unclaimed) slots.
+    pub idle: usize,
+    /// Every currently-claimed slot in this pool.
+    pub claims: Vec<WorkerPoolClaimEntry>,
+}
+
+/// One claimed slot within a [`WorkerPoolEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct WorkerPoolClaimEntry {
+    pub worker_id: String,
+    pub execution_id: String,
+    /// The execution's current status, as recorded in the DB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_status: Option<String>,
+    /// The work item this execution is running, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    /// True when a `LiveWorkerStateRegistry` entry still backs this
+    /// claim. `false` with a terminal `execution_status` means the
+    /// claim has outlived its execution — a leak the reconciler should
+    /// pick up within `pool_claim_sweep::LEAK_GRACE_SECS`, or a bug in
+    /// whatever path terminated the execution if it doesn't.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

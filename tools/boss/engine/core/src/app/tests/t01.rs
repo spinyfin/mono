@@ -729,6 +729,120 @@ async fn release_worker_pane_pool_release_is_idempotent() {
 }
 
 #[tokio::test]
+async fn reap_run_releases_worker_pool_claim_and_live_state() {
+    // Regression: `bossctl agents reap` (`handle_reap_run`) used to
+    // only mark the execution `orphaned` in the DB — unlike every
+    // other teardown path (`agents stop`, completion, dead-pid /
+    // stale-worker sweeps), it never called `release_worker_pane`,
+    // so a reaped run's WorkerPool claim and LiveWorkerStateRegistry
+    // entry outlived it forever. Worse, the stale live-state entry
+    // defeated `pool_claim_sweep`'s self-heal too: the reconciler
+    // treats a claim with a live-state entry still present as "owned
+    // by a live pane's teardown path" and skips it, so the one
+    // backstop meant to catch leaked claims never fired for a reaped
+    // run either.
+    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+    let server_state = test_server_state();
+    let product = server_state
+        .work_db
+        .create_product(CreateProductInput {
+            name: "p".into(),
+            description: None,
+            repo_remote_url: Some("git@example.com:p.git".into()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = server_state
+        .work_db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    let pool = server_state.execution_coordinator.worker_pool();
+    let claimed = pool
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("pool starts with a free slot");
+    assert_eq!(claimed, "worker-1");
+    server_state.worker_registry.register_run_slot(&execution.id, 1);
+    server_state
+        .live_worker_states
+        .register_spawn(1, &execution.id, "claude-opus-4-8", 0, None);
+    assert_eq!(
+        pool.idle_count().await,
+        pool.capacity().await - 1,
+        "precondition: slot claimed"
+    );
+    assert!(
+        server_state.live_worker_states.get(1).is_some(),
+        "precondition: live state registered",
+    );
+
+    let sink = make_session_sink();
+    let ctx = Dispatch::builder()
+        .server_state(server_state.clone())
+        .work_db(server_state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("s1")
+        .request_id("req-1")
+        .build();
+    executions::handle_reap_run(
+        ctx,
+        FrontendRequest::ReapRun {
+            run_id: execution.id.clone(),
+        },
+    )
+    .await;
+
+    let response = sink.next().await.expect("reap response enqueued");
+    match response.payload {
+        FrontendEvent::RunReaped { execution: reaped, .. } => {
+            assert_eq!(reaped.status.to_string(), "orphaned");
+        }
+        other => panic!("expected RunReaped, got {other:?}"),
+    }
+
+    // The pane/pool/live-state cleanup happens on a background task
+    // (mirrors `handle_stop_run`) so the RPC response doesn't wait on
+    // it — poll for it to land.
+    for _ in 0..50 {
+        if server_state.live_worker_states.get(1).is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        server_state.live_worker_states.get(1).is_none(),
+        "reap must drop the live-state entry, not just mark the execution terminal",
+    );
+    assert_eq!(
+        pool.idle_count().await,
+        pool.capacity().await,
+        "reap must release the WorkerPool claim immediately rather than leaving it \
+         to outlive the execution until the pool-claim reconciler's grace period",
+    );
+
+    let reclaimed = pool
+        .claim_worker("exec-fresh", None)
+        .await
+        .expect("slot must be free after reap");
+    assert_eq!(reclaimed, "worker-1");
+}
+
+#[tokio::test]
 async fn focus_worker_pane_unknown_run_returns_unknown_run() {
     let server_state = test_server_state();
     let sink = make_session_sink();

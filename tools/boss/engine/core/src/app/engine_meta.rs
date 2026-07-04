@@ -97,6 +97,92 @@ pub(super) async fn handle_workspace_pool_summary(ctx: Dispatch, req: FrontendRe
     }
 }
 
+pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::WorkerPoolSummary = req else {
+        unreachable!()
+    };
+    {
+        // Read-only diagnostic surface — same rationale as
+        // `workspace_pool_summary`: no extra subtree gate buys any
+        // security here, and User tier avoids breaking legitimate
+        // callers that aren't app/Boss descendants.
+        if !server_state.authorize_rpc(RpcTier::User, peer_pid) {
+            tracing::warn!(
+                peer_pid = ?peer_pid,
+                "worker_pool_summary rejected: caller failed user tier",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "worker_pool_summary failed user-tier check".to_owned(),
+                },
+            );
+            return;
+        }
+
+        let coordinator = &server_state.execution_coordinator;
+        // Live-backed execution ids, same cross-check `pool_claim_sweep`
+        // uses: a claim with no matching live-state entry has outlived
+        // its execution and is either mid-reconciliation or a leak.
+        let live_run_ids: std::collections::HashSet<String> = server_state
+            .live_worker_states
+            .snapshot()
+            .into_iter()
+            .map(|state| state.run_id)
+            .collect();
+
+        let mut pools = Vec::with_capacity(3);
+        for (pool, name) in [
+            (coordinator.worker_pool(), "main"),
+            (coordinator.automation_worker_pool(), "automation"),
+            (coordinator.review_worker_pool(), "review"),
+        ] {
+            let capacity = pool.capacity().await;
+            let mut claims = Vec::new();
+            for claim in pool.claims().await {
+                let (execution_status, work_item_id) = match server_state.work_db.get_execution(&claim.execution_id) {
+                    Ok(execution) => (Some(execution.status.to_string()), Some(execution.work_item_id)),
+                    Err(err) => {
+                        tracing::warn!(
+                            worker_id = %claim.worker_id,
+                            execution_id = %claim.execution_id,
+                            ?err,
+                            "worker_pool_summary: failed to look up claimed execution",
+                        );
+                        (None, None)
+                    }
+                };
+                claims.push(boss_protocol::WorkerPoolClaimEntry {
+                    worker_id: claim.worker_id.clone(),
+                    execution_id: claim.execution_id.clone(),
+                    execution_status,
+                    work_item_id,
+                    live: live_run_ids.contains(&claim.execution_id),
+                });
+            }
+            let idle = capacity.saturating_sub(claims.len());
+            pools.push(
+                boss_protocol::WorkerPoolEntry::builder()
+                    .name(name)
+                    .capacity(capacity)
+                    .idle(idle)
+                    .claims(claims)
+                    .build(),
+            );
+        }
+
+        send_response(&sink, &request_id, FrontendEvent::WorkerPoolSummaryResult { pools });
+    }
+}
+
 pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch { sink, request_id, .. } = ctx;
     let FrontendRequest::GetEngineVersion = req else {
