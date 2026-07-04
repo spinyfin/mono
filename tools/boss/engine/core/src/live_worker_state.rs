@@ -349,6 +349,18 @@ impl LiveWorkerStateRegistry {
     /// `WaitingForInput` so the existing kanban dot and
     /// `WorkerWaitingIndicator` fire.
     ///
+    /// Only promotes slots that have a real `shell_pid` (`> 0`) — i.e.
+    /// the pane's shell has, at minimum, exec'd and become the pty's
+    /// foreground process group, which is the precondition for Claude
+    /// Code to have reached the trust prompt at all. A slot whose
+    /// `shell_pid` is still `<= 0` has no evidence any process ever
+    /// started; promoting *that* case to `WaitingForInput` is what
+    /// produced the "false-live" incident (a spawn that never came up
+    /// looked identical to one legitimately parked on a human prompt,
+    /// forever). Left in `Spawning`, that case is instead caught by
+    /// [`crate::spawn_liveness_sweep`], which reaps and redispatches it
+    /// as a confirmed failure rather than masking it.
+    ///
     /// Returns the slot IDs that were changed so callers can broadcast
     /// the updated snapshot. Normal-running workers (whose `SessionStart`
     /// hook fires within seconds of spawn) always have `last_event_at`
@@ -367,6 +379,12 @@ impl LiveWorkerStateRegistry {
             if state.last_event_at.is_some() {
                 // SessionStart (or any other hook) already fired — the
                 // worker is past the startup phase; not our concern.
+                continue;
+            }
+            if state.shell_pid <= 0 {
+                // No evidence any process ever started for this slot —
+                // do not mask that as "waiting for input". Leave it in
+                // `Spawning` for `spawn_liveness_sweep` to judge.
                 continue;
             }
             let Some(&age_secs) = spawned_at.get(slot_id) else {
@@ -963,5 +981,29 @@ mod tests {
         let second = reg.mark_stalled_spawns(now + 10, STALLED_SPAWN_THRESHOLD_SECS);
         assert!(second.is_empty(), "should not fire again after first transition");
         assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    }
+
+    /// A slot with no `shell_pid` at all (spawn never produced evidence of
+    /// a real process) must NOT be promoted to `WaitingForInput` — that
+    /// would mask a genuine spawn failure as "waiting on a human", the
+    /// false-live incident. It stays `Spawning` for
+    /// `spawn_liveness_sweep` to catch as a confirmed failure.
+    #[test]
+    fn zero_shell_pid_spawn_is_never_promoted_to_waiting_for_input() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 0, None);
+        reg.set_spawn_time_for_test(1, 1_700_000_000);
+
+        let now = 1_700_000_000 + STALLED_SPAWN_THRESHOLD_SECS + 100;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(changed.is_empty(), "zero-shell_pid slot must not be flagged as changed");
+        let state = reg.get(1).unwrap();
+        assert_eq!(
+            state.activity,
+            WorkerActivity::Spawning,
+            "must remain Spawning, not be promoted to WaitingForInput"
+        );
+        assert!(state.last_event_at.is_none());
     }
 }

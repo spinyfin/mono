@@ -280,6 +280,24 @@ pub enum Stage {
     /// `details` object carries `prior_status`, the `remote_pid`, and the
     /// reap `reason` so the strand is diagnosable from `bossctl dispatch tail`.
     RemoteLeaseReconcile,
+    /// The periodic spawn-liveness sweep ([`crate::spawn_liveness_sweep`])
+    /// found a worker slot whose `SpawnWorkerPane` RPC returned `ok` but
+    /// which never produced a live `claude` session: `shell_pid` stayed
+    /// `0` and no hook event arrived within the liveness window. Before
+    /// this existed, `mark_stalled_spawns` promoted this exact case to
+    /// `WaitingForInput` — the same transition a legitimate
+    /// directory-trust-prompt stall produces — so a spawn that silently
+    /// never started looked indistinguishable from one waiting on a
+    /// human, and the run sat that way indefinitely with zero operator
+    /// signal (the 2026-07-03/04 "false-live" incident). The `details`
+    /// object carries `shell_pid` (always `<= 0` here),
+    /// `hook_event_received: false`, and `seconds_since_started` so
+    /// `bossctl dispatch diagnose <exec-id>` shows exactly what evidence
+    /// of life was (not) observed. Distinct from `dead_pid_reconcile`
+    /// (which requires a PID to probe in the first place) and from
+    /// `stale_worker_reconcile` (which requires `activity == Working`,
+    /// i.e. at least one hook already fired).
+    SpawnLivenessTimeout,
 }
 
 impl Stage {
@@ -314,6 +332,7 @@ impl Stage {
             Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
             Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
             Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
+            Stage::SpawnLivenessTimeout => "spawn_liveness_timeout",
         }
     }
 }
@@ -815,6 +834,7 @@ mod tests {
         assert_eq!(Stage::LostWorkspaceReconcile.as_str(), "lost_workspace_reconcile");
         assert_eq!(Stage::CubeLeaseAutoReap.as_str(), "cube_lease_auto_reap");
         assert_eq!(Stage::RemoteLeaseReconcile.as_str(), "remote_lease_reconcile");
+        assert_eq!(Stage::SpawnLivenessTimeout.as_str(), "spawn_liveness_timeout");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
