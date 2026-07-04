@@ -29,7 +29,9 @@
 
 use std::path::Path;
 
-use boss_protocol::WorkExecution;
+use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_PRODUCED_TASK, WorkExecution};
+
+use crate::work::WorkDb;
 
 /// `true` when `execution` records a non-empty `workspace_path` that no
 /// longer exists on the local filesystem — positive evidence that the
@@ -48,6 +50,70 @@ pub fn execution_workspace_dir_missing(execution: &WorkExecution) -> bool {
     match execution.workspace_path.as_deref() {
         Some(path) if !path.is_empty() => !Path::new(path).exists(),
         _ => false,
+    }
+}
+
+/// Record the terminal `automation_runs` outcome for an `automation_triage`
+/// execution that died before ever reaching a Stop-driven finalize — shared
+/// by every reconciler that discovers positive evidence a triage pane is
+/// gone ([`crate::lost_workspace_sweep`]'s missing-workspace-directory check
+/// and [`crate::cube_lease_heartbeat`]'s repeated-heartbeat-failure
+/// auto-reap). Both need the same open-task-recovery bookkeeping: a triage
+/// that created a task before its pane died is recorded as `produced_task`
+/// (fixing the historical bug where a crash-before-`Stop` silently dropped
+/// the produced task), otherwise the occurrence is `failed_gave_up`. Either
+/// way this overwrites the pessimistic dispatch-time placeholder
+/// ("dispatched; awaiting triage worker decision …") with the truth so the
+/// automation's run history is honest.
+///
+/// `death_reason` is a human-readable clause describing *why* the caller
+/// believes the pane is gone (e.g. "its cube workspace `{path}` is gone" or
+/// "its cube lease `{id}` was no longer tracked after N heartbeat
+/// failures") — it is folded into the recorded detail text. Best-effort:
+/// failures are logged, never propagated, since the execution itself is
+/// already finalized by the time this is called.
+pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExecution, death_reason: &str) {
+    let automation_id = &execution.work_item_id;
+    let (outcome, produced_task_id, detail) = match work_db.find_most_recent_open_task_for_automation(automation_id) {
+        Ok(Some(task)) => {
+            let detail = format!(
+                "produced_task (dead-pane recovery): task {} was created before the triage pane died; {death_reason}",
+                task.id
+            );
+            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
+        }
+        Ok(None) => (
+            AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+            None,
+            format!("triage pane died before Stop and {death_reason}; no task was produced"),
+        ),
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                automation_id = %automation_id,
+                error = %format!("{err:#}"),
+                "dead-triage reconcile: open-task lookup failed; recording failed_gave_up",
+            );
+            (
+                AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                None,
+                format!("triage pane died before Stop and {death_reason}"),
+            )
+        }
+    };
+
+    match work_db.finalize_automation_triage_run(&execution.id, outcome, produced_task_id.as_deref(), Some(&detail)) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            execution_id = %execution.id,
+            automation_id = %automation_id,
+            "dead-triage reconcile: no automation_runs row matched this triage execution; outcome not recorded",
+        ),
+        Err(err) => tracing::warn!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "dead-triage reconcile: failed to finalize automation_runs row",
+        ),
     }
 }
 

@@ -256,6 +256,19 @@ pub enum Stage {
     /// `workspace_path`, and the reap `reason` so the strand is diagnosable
     /// from `bossctl dispatch tail`; see `crate::lost_workspace_sweep`.
     LostWorkspaceReconcile,
+    /// The cube-lease heartbeat sweep gave up refreshing a lease after
+    /// [`crate::cube_lease_heartbeat::AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`]
+    /// consecutive failures and auto-reaped the execution through the same
+    /// terminal path as `bossctl agents reap` (`mark_execution_orphaned`).
+    /// Before this existed, a lease cube no longer tracked (workspace
+    /// directory still present, so `lost_workspace_reconcile` never fired)
+    /// produced only an endless stream of `cube_lease_heartbeat` warnings
+    /// while the row stayed `waiting_human`/`running` forever, permanently
+    /// blocking the redundant-spawn guard for that work item (2026-07-03
+    /// incident). The `details` object carries `consecutive_failures` so an
+    /// operator can see how long the lease had been failing before the
+    /// auto-reap fired.
+    CubeLeaseAutoReap,
 }
 
 impl Stage {
@@ -288,6 +301,7 @@ impl Stage {
             Stage::TerminalWorkReconcile => "terminal_work_reconcile",
             Stage::CubeLeaseHeartbeat => "cube_lease_heartbeat",
             Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
+            Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
         }
     }
 }
@@ -787,6 +801,7 @@ mod tests {
         assert_eq!(Stage::TerminalWorkReconcile.as_str(), "terminal_work_reconcile");
         assert_eq!(Stage::CubeLeaseHeartbeat.as_str(), "cube_lease_heartbeat");
         assert_eq!(Stage::LostWorkspaceReconcile.as_str(), "lost_workspace_reconcile");
+        assert_eq!(Stage::CubeLeaseAutoReap.as_str(), "cube_lease_auto_reap");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
