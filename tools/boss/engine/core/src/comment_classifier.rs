@@ -55,6 +55,7 @@ struct ClassifyReply {
 }
 
 /// A validated classification outcome.
+#[derive(Debug)]
 pub struct Classification {
     pub intent: String,
     pub confidence: f64,
@@ -154,7 +155,18 @@ async fn call_classifier(api_key: &str, prompt: String) -> Result<Classification
         .await
         .map_err(|e| e.to_string())?;
 
-    let text = response.first_text().unwrap_or_default().trim();
+    let text = response.first_text().unwrap_or_default();
+    parse_classifier_reply(text)
+}
+
+/// The pure parse+validate step of a classifier call: turn the model's raw
+/// reply text into a validated [`Classification`], independent of transport.
+/// Kept as a standalone helper so its decision behavior (empty-reply,
+/// malformed-JSON, unknown-intent, confidence clamping) is unit-testable
+/// without a network call. [`call_classifier`] invokes it on the response
+/// text — its observable behavior must match what lived inline before.
+fn parse_classifier_reply(text: &str) -> Result<Classification, String> {
+    let text = text.trim();
     if text.is_empty() {
         return Err("Anthropic returned an empty response".to_owned());
     }
@@ -263,5 +275,56 @@ mod tests {
         let prompt = build_followup_prompt("original", &anchor, &[], "follow-up");
         assert!(prompt.contains("original"));
         assert!(prompt.contains("follow-up"));
+    }
+
+    #[test]
+    fn parse_reply_rejects_an_empty_reply() {
+        let err = parse_classifier_reply("").unwrap_err();
+        assert_eq!(err, "Anthropic returned an empty response");
+    }
+
+    #[test]
+    fn parse_reply_rejects_a_whitespace_only_reply() {
+        let err = parse_classifier_reply("   \n\t ").unwrap_err();
+        assert_eq!(err, "Anthropic returned an empty response");
+    }
+
+    #[test]
+    fn parse_reply_rejects_malformed_json() {
+        let err = parse_classifier_reply("not json at all").unwrap_err();
+        assert!(err.contains("failed to parse classifier JSON reply"));
+    }
+
+    #[test]
+    fn parse_reply_rejects_an_unrecognised_intent() {
+        let err = parse_classifier_reply(r#"{"intent": "praise", "confidence": 0.9}"#).unwrap_err();
+        assert_eq!(err, "classifier returned unknown intent: praise");
+    }
+
+    #[test]
+    fn parse_reply_accepts_each_recognised_intent() {
+        for intent in [INTENT_DIRECTIVE, INTENT_QUESTION, INTENT_LARGER_CHANGE] {
+            let raw = format!(r#"{{"intent": "{intent}", "confidence": 0.5}}"#);
+            let classification = parse_classifier_reply(&raw).unwrap();
+            assert_eq!(classification.intent, intent);
+        }
+    }
+
+    #[test]
+    fn parse_reply_passes_an_in_range_confidence_through_unchanged() {
+        let classification = parse_classifier_reply(r#"{"intent": "question", "confidence": 0.73}"#).unwrap();
+        assert_eq!(classification.confidence, 0.73);
+    }
+
+    #[test]
+    fn parse_reply_clamps_an_over_range_confidence_to_one() {
+        let classification = parse_classifier_reply(r#"{"intent": "directive", "confidence": 1.5}"#).unwrap();
+        assert_eq!(classification.confidence, 1.0);
+    }
+
+    #[test]
+    fn parse_reply_clamps_a_negative_confidence_to_zero() {
+        let classification = parse_classifier_reply(r#"{"intent": "larger_change", "confidence": -0.3}"#).unwrap();
+        assert_eq!(classification.confidence, 0.0);
     }
 }
