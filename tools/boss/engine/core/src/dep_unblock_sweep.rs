@@ -81,6 +81,25 @@ pub struct DepUnblockSweepOutcome {
     pub rows_stuck_promoted: usize,
 }
 
+impl crate::sweep_loop::SweepOutcome for DepUnblockSweepOutcome {
+    /// dep-unblock logs every pass (the `rows_evaluated` / stale-secs line
+    /// is a useful heartbeat even when nothing changed), so a pass is
+    /// always considered worth logging.
+    fn has_activity(&self) -> bool {
+        true
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            rows_evaluated = self.rows_evaluated,
+            rows_unblocked = self.rows_unblocked,
+            rows_stuck_promoted = self.rows_stuck_promoted,
+            longest_stale_secs = self.longest_stale_secs,
+            "dep-unblock sweep: pass complete",
+        );
+    }
+}
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so items blocked before engine boot are
 /// recovered without waiting for the first interval.
@@ -94,21 +113,17 @@ pub fn spawn_loop(
     metrics: Arc<Registry>,
     kick_fn: Arc<dyn Fn() + Send + Sync>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let metrics = Arc::clone(&metrics);
+        let kick_fn = Arc::clone(&kick_fn);
+        async move {
             let outcome = run_one_pass(work_db.as_ref()).await;
             DEP_UNBLOCK_LONGEST_STALE_SECONDS.set(&metrics, outcome.longest_stale_secs as i64);
-            tracing::info!(
-                rows_evaluated = outcome.rows_evaluated,
-                rows_unblocked = outcome.rows_unblocked,
-                rows_stuck_promoted = outcome.rows_stuck_promoted,
-                longest_stale_secs = outcome.longest_stale_secs,
-                "dep-unblock sweep: pass complete",
-            );
             if outcome.rows_unblocked > 0 || outcome.rows_stuck_promoted > 0 {
                 kick_fn();
             }
-            tokio::time::sleep(interval).await;
+            outcome
         }
     })
 }
