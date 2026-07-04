@@ -25,6 +25,7 @@ pub mod cube_commands;
 pub mod cube_lease_heartbeat;
 pub mod database_backup;
 pub mod day_rotated_log;
+pub mod dead_pane_sweep;
 pub mod dead_pid_sweep;
 pub mod dep_unblock_sweep;
 pub mod design_detector;

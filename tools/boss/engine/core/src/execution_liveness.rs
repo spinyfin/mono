@@ -117,6 +117,68 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
     }
 }
 
+/// Shared terminal-finalize for a non-terminal execution a reconciler has
+/// proven dead. The two DB-driven reconcilers — [`crate::lost_workspace_sweep`]
+/// (workspace directory gone) and [`crate::dead_pane_sweep`] (worker pane pid
+/// dead) — both funnel their reap through here so the orphan → triage
+/// bookkeeping → dispatch-event flow lives in exactly one place; each caller
+/// supplies only what distinguishes its signal.
+///
+/// - `reason` is recorded on the orphan (`mark_execution_orphaned`, which
+///   deliberately preserves the cube lease + workspace so a resume redispatch
+///   can reclaim the work in place).
+/// - `triage_death_clause` is folded into the automation-run bookkeeping for
+///   `automation_triage` executions (produced_task if a task was created before
+///   the worker died, else failed_gave_up).
+/// - `stage` + `details` identify which signal fired on the dispatch event.
+///
+/// Returns `true` when the row was (or already had been) reconciled to a
+/// terminal status; `false` when the orphan failed and the row is still live
+/// (a later pass retries). Idempotent against a concurrent reconciler: if
+/// another path finalized the row first, that still counts as reconciled.
+pub async fn finalize_gone_execution(
+    work_db: &WorkDb,
+    dispatch_events: &dyn crate::dispatch_events::DispatchEventSink,
+    execution: &WorkExecution,
+    reason: &str,
+    triage_death_clause: &str,
+    stage: crate::dispatch_events::Stage,
+    details: serde_json::Value,
+) -> bool {
+    match work_db.mark_execution_orphaned(&execution.id, reason) {
+        Ok(_) => {}
+        Err(err) => {
+            let already_terminal = work_db
+                .get_execution(&execution.id)
+                .map(|cur| cur.status.is_terminal())
+                .unwrap_or(false);
+            if already_terminal {
+                return true;
+            }
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "reconcile: failed to orphan gone execution; leaving row as-is",
+            );
+            return false;
+        }
+    }
+
+    if execution.kind == boss_protocol::ExecutionKind::AutomationTriage {
+        finalize_dead_automation_triage_run(work_db, execution, triage_death_clause);
+    }
+
+    dispatch_events
+        .emit(
+            crate::dispatch_events::DispatchEvent::new(stage, crate::dispatch_events::Outcome::Ok, &execution.id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(details),
+        )
+        .await;
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

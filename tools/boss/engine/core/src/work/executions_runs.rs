@@ -1322,6 +1322,70 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Persist the real OS shell pid of a *local* libghostty worker pane onto
+    /// the latest `work_runs` row for `execution_id`. The macOS app reports
+    /// this via the `UpdateWorkerShellPid` RPC once the pane's surface
+    /// attaches; the engine stamps it here so the pid is durable across an
+    /// engine restart (the in-memory [`crate::live_worker_state::LiveWorkerStateRegistry`]
+    /// is empty on boot). [`crate::dead_pane_sweep`] then probes this pid with
+    /// `kill(pid, 0)` to detect a pane that died with its host app while the
+    /// execution row is still `waiting_human`.
+    ///
+    /// Keyed by `execution_id` (the app's `run_id`), which the `work_runs` row
+    /// always exists for by the time the pid arrives (the run row is inserted
+    /// synchronously at dispatch, before the pane is spawned). This makes the
+    /// write **race-free** with respect to in-memory slot registration — the
+    /// concurrent-spawn race that could drop the pid from the live registry
+    /// ("no live slot found for run_id") cannot drop it from the DB. Mirrors
+    /// [`Self::set_run_remote_pid_for_execution`]. Returns `true` when a row
+    /// was updated, `false` when no run exists yet (benign).
+    pub fn set_run_shell_pid_for_execution(&self, execution_id: &str, shell_pid: i64) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET shell_pid = ?2
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, shell_pid],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// The shell pid of the **latest** `work_runs` row for `execution_id`,
+    /// returned only when that latest run ran locally and recorded a pid;
+    /// `None` when the latest run ran on a remote host, has no pid yet, or no
+    /// run exists. Used by [`crate::dead_pane_sweep`] to probe pane liveness
+    /// after a restart.
+    ///
+    /// Deliberately keys on the *latest* run's id (via subquery), NOT "the
+    /// latest run that happens to have a pid": on a resumed execution the
+    /// current run is what matters, and falling back to a prior run's stale
+    /// (now-dead) pid while the current pane is merely still reporting would
+    /// risk reaping a live worker. The `host_id = 'local'` gate is a hard
+    /// safety rail — a `kill(pid, 0)` probe on the engine host is meaningless
+    /// for a remote worker whose pid lives on another machine.
+    pub fn latest_local_shell_pid_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT shell_pid FROM work_runs
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             ) AND host_id = 'local'",
+            params![execution_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
     /// Active runs on a non-local host whose backing execution is still
     /// non-terminal — the set of detached remote workers the engine
     /// should re-attach to after a restart.

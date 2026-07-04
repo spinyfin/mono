@@ -208,10 +208,39 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
         );
         return;
     }
+    // Persist the pid to the DB FIRST, keyed by run_id (the execution id).
+    // The `work_runs` row always exists by now (inserted synchronously at
+    // dispatch, before the pane was spawned), so unlike the in-memory slot
+    // registration below this write can never lose to the concurrent-spawn
+    // race — even when `update_shell_pid` reports "no live slot found", the
+    // durable pid is recorded. This is the restart-robust signal
+    // `dead_pane_sweep` probes to detect a pane that died with its host app.
+    match server_state
+        .work_db
+        .set_run_shell_pid_for_execution(&run_id, shell_pid as i64)
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            run_id = %run_id,
+            shell_pid,
+            "update_worker_shell_pid: no work_runs row for run_id yet; durable pid not stored this pass",
+        ),
+        Err(err) => tracing::warn!(
+            run_id = %run_id,
+            shell_pid,
+            ?err,
+            "update_worker_shell_pid: failed to persist durable shell pid (pane-liveness may be blind after restart)",
+        ),
+    }
     // Update the pid→run_id registry so hook-event ancestor walk works.
     server_state.worker_registry.register(shell_pid, run_id.clone());
     // Update the live-state registry so dead-pid sweep and bossctl reaping
-    // can signal the process when needed.
+    // can signal the process when needed. A miss here (the concurrent-spawn
+    // race where the app's pid push outran the engine's `register_spawn`, or a
+    // late/duplicate report after the slot was released) only affects the
+    // in-memory live registry — the durable pid persisted above is the
+    // authoritative signal `dead_pane_sweep` reads, and it is never lost — so
+    // the miss is logged for observability but is no longer a data-loss event.
     match server_state.live_worker_states.update_shell_pid(&run_id, shell_pid) {
         Some(slot_id) => {
             tracing::info!(
@@ -226,7 +255,8 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
             tracing::warn!(
                 run_id = %run_id,
                 shell_pid,
-                "update_worker_shell_pid: no live slot found for run_id (already released?)",
+                "update_worker_shell_pid: no live slot found for run_id (already released?); \
+                 durable pid recorded, in-memory live-state not updated this pass",
             );
         }
     }

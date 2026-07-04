@@ -157,6 +157,21 @@ pub enum Stage {
     /// operators can distinguish "slot claimed but PID dead" from
     /// "slot not claimed at all."
     DeadPidReconcile,
+    /// The periodic pane-death sweep ([`crate::dead_pane_sweep`]) found a
+    /// still-`running`/`waiting_human` local execution whose worker pane is
+    /// provably gone — its durable shell pid (persisted from the app's
+    /// `UpdateWorkerShellPid`) reports `ESRCH` from `kill(pid, 0)`. Unlike
+    /// `dead_pid_reconcile`, which reads the in-memory live-worker registry
+    /// (empty after any engine restart), this probes the DB-persisted pid, so
+    /// it catches a pane that died *with its host app* across a relaunch —
+    /// the 2026-07-04 wedge where a triage worker ran normally, an app/engine
+    /// relaunch killed its pane mid-run, and the row then sat `waiting_human`
+    /// with a still-green cube lease and no pane forever, permanently blocking
+    /// the redundant-spawn guard. The execution is marked `orphaned`
+    /// (workspace/lease preserved for resume redispatch) and the work item is
+    /// redispatched on the next tick. The `details` object carries the dead
+    /// `shell_pid` and `prior_status`.
+    PaneDeathReconcile,
     /// A dispatch *trigger* loop (orphan-active sweep, startup
     /// reconcile, worker-release rescan, kanban drag) evaluated whether
     /// a work item needs a fresh dispatch. Emitted UPSTREAM of
@@ -333,6 +348,7 @@ impl Stage {
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
             Stage::DeadPidReconcile => "dead_pid_reconcile",
+            Stage::PaneDeathReconcile => "pane_death_reconcile",
             Stage::DispatchDecision => "dispatch_decision",
             Stage::TransientRecovery => "transient_recovery",
             Stage::TransientRecoveryExhausted => "transient_recovery_exhausted",
@@ -833,6 +849,7 @@ mod tests {
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
         assert_eq!(Stage::DeadPidReconcile.as_str(), "dead_pid_reconcile");
+        assert_eq!(Stage::PaneDeathReconcile.as_str(), "pane_death_reconcile");
         assert_eq!(Stage::DispatchDecision.as_str(), "dispatch_decision");
         assert_eq!(Stage::TransientRecovery.as_str(), "transient_recovery");
         assert_eq!(
