@@ -121,6 +121,22 @@
 //! automation retry (which fires every 15 min): a pane that dies at spawn
 //! now self-heals on its very first retry instead of wedging behind
 //! `redundant_spawn`.
+//!
+//! **Offline-host bypass.** The confirm-dead gate exists to avoid mass-reaping
+//! live workers during a *cube* outage. It does NOT apply when the
+//! execution's bound host has been deliberately taken offline — the operator
+//! disabled it (`bossctl hosts disable`), the dispatch-health circuit breaker
+//! auto-disabled it, or it was removed. There, the disable is itself positive
+//! evidence the worker is unreachable, and no `cube workspace list`
+//! confirmation is possible. So [`auto_reap_dead_lease`] checks
+//! [`WorkDb::execution_bound_host_offline`] first and, when the host is
+//! offline, reaps directly without the confirm probe. This is the heartbeat
+//! half of the 2026-07-03 anaplian fix (in-flight executions on a disabled
+//! host that heartbeat-errored forever with no re-route); the proactive
+//! drainer is [`crate::host_reconcile`], and this path is the
+//! belt-and-suspenders for a lease whose streak crosses threshold between
+//! that sweep's ticks. A cube outage never flips a host's `enabled` flag, so
+//! the bypass cannot fire spuriously during one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -675,32 +691,59 @@ async fn auto_reap_dead_lease(
     lease_id: &str,
     consecutive_failures: u32,
 ) -> bool {
-    let verdict =
-        run_reconcile::confirm_execution_dead(ctx.cube_client, execution, run_reconcile::current_epoch_s()).await;
-    if !matches!(verdict, RunReconcileVerdict::Dead) {
-        // Sustained heartbeat failure alone is not proof of death — could be
-        // a transient cube CLI error or a cube outage hitting every lease at
-        // once. Only a confirmed `Dead` verdict from cube's own workspace
-        // snapshot is. Reset the streak so a genuine cube blip doesn't leave
-        // us one failure away from reaping a live worker on the next pass;
-        // if the lease really is gone, it fails to heartbeat again and the
-        // streak rebuilds to another confirmation attempt.
-        ctx.breaker.forget(&execution.id);
-        tracing::warn!(
-            execution_id = %execution.id,
-            lease_id,
-            consecutive_failures,
-            ?verdict,
-            "cube-lease heartbeat: consecutive failures reached auto-reap threshold but cube workspace list did not \
-             confirm the lease is dead; not reaping (avoids mass-reaping live workers during a cube outage)",
-        );
-        return false;
+    // When the execution's bound host has been declared offline — the
+    // operator ran `bossctl hosts disable`, the dispatch-health circuit
+    // breaker auto-disabled it, or it was removed — that is itself positive
+    // evidence the worker is unreachable: no `cube workspace list`
+    // confirmation is possible (the host is gone) or needed (the operator
+    // said so). Skip the confirm-dead gate and reap directly, so a heartbeat
+    // that keeps erroring against a disabled host is terminalized and
+    // re-routed rather than emitting `outcome=error` forever — the second
+    // half of the 2026-07-03 anaplian incident. [`crate::host_reconcile`] is
+    // the primary drainer for offline hosts; this is the belt-and-suspenders
+    // path for a lease whose failure streak crosses the reap threshold
+    // between that sweep's ticks. The mass-reap-during-cube-outage hazard the
+    // confirm gate guards against does not apply here: a cube outage never
+    // flips a host's `enabled` flag, so this bypass only fires when a host
+    // was deliberately taken offline.
+    let host_offline = ctx.work_db.execution_bound_host_offline(&execution.id).unwrap_or(false);
+
+    if !host_offline {
+        let verdict =
+            run_reconcile::confirm_execution_dead(ctx.cube_client, execution, run_reconcile::current_epoch_s()).await;
+        if !matches!(verdict, RunReconcileVerdict::Dead) {
+            // Sustained heartbeat failure alone is not proof of death — could be
+            // a transient cube CLI error or a cube outage hitting every lease at
+            // once. Only a confirmed `Dead` verdict from cube's own workspace
+            // snapshot is. Reset the streak so a genuine cube blip doesn't leave
+            // us one failure away from reaping a live worker on the next pass;
+            // if the lease really is gone, it fails to heartbeat again and the
+            // streak rebuilds to another confirmation attempt.
+            ctx.breaker.forget(&execution.id);
+            tracing::warn!(
+                execution_id = %execution.id,
+                lease_id,
+                consecutive_failures,
+                ?verdict,
+                "cube-lease heartbeat: consecutive failures reached auto-reap threshold but cube workspace list did not \
+                 confirm the lease is dead; not reaping (avoids mass-reaping live workers during a cube outage)",
+            );
+            return false;
+        }
     }
 
-    let reason = format!(
-        "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times; \
-         treating the workspace as gone and auto-reaping (same terminal path as `bossctl agents reap`)"
-    );
+    let reason = if host_offline {
+        format!(
+            "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times and \
+             its host is offline (disabled/removed); treating the workspace as gone and auto-reaping (same terminal \
+             path as `bossctl agents reap`)"
+        )
+    } else {
+        format!(
+            "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times; \
+             treating the workspace as gone and auto-reaping (same terminal path as `bossctl agents reap`)"
+        )
+    };
 
     if let Err(err) = ctx.work_db.mark_execution_orphaned(&execution.id, &reason) {
         // A concurrent sweep/guard/hook may have finalized this execution
@@ -736,6 +779,33 @@ async fn auto_reap_dead_lease(
         );
     }
 
+    // Mirror host_reconcile::drain_execution's pr_review bookkeeping: this
+    // bypass can now reap a pr_review whose bound host was just disabled,
+    // before host_reconcile's own sweep gets to it. Without advancing the
+    // task here too, it stays `active` + `pr_url` and slips past the
+    // orphan-active sweep's running-reviewer guard (dispatch.rs), producing
+    // a spurious re-implementation on a task whose PR already exists — the
+    // exact class of bug this reconciliation work exists to close.
+    if execution.kind == ExecutionKind::PrReview {
+        match ctx
+            .work_db
+            .advance_pending_review_task_to_in_review(&execution.work_item_id)
+        {
+            Ok(true) => tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "cube-lease heartbeat: auto-reaped pr_review's task advanced to in_review (reviewer fallback)",
+            ),
+            Ok(false) => {} // Already past `active`, or a live implementation worker holds it.
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                error = %format!("{err:#}"),
+                "cube-lease heartbeat: failed to advance auto-reaped pr_review's task to in_review",
+            ),
+        }
+    }
+
     // Best-effort: the lease is already failing to heartbeat (almost
     // certainly because cube no longer tracks it), so force-release is
     // very likely a no-op. Failure here is benign.
@@ -761,7 +831,8 @@ async fn auto_reap_dead_lease(
                 .with_work_item(&execution.work_item_id)
                 .with_cube_lease(lease_id)
                 .with_details(serde_json::json!({
-                    "reason": "heartbeat_failures_exhausted",
+                    "reason": if host_offline { "host_offline" } else { "heartbeat_failures_exhausted" },
+                    "host_offline": host_offline,
                     "consecutive_failures": consecutive_failures,
                 })),
         )
@@ -1003,6 +1074,23 @@ mod tests {
             lease_id,
             "mono-agent-001",
             "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        execution_id
+    }
+
+    /// Create a `running` execution whose run is attributed to `host_id`
+    /// (models an in-flight worker on a remote host).
+    fn running_execution_on_host_with_lease(db: &WorkDb, work_item_id: &str, lease_id: &str, host_id: &str) -> String {
+        let execution_id = ready_execution(db, work_item_id);
+        db.start_execution_run_on_host(
+            &execution_id,
+            "agent-1",
+            "repo",
+            lease_id,
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+            host_id,
         )
         .unwrap();
         execution_id
@@ -1356,6 +1444,60 @@ mod tests {
             cube.force_release_calls().is_empty(),
             "no lease may be force-released without confirmed death"
         );
+    }
+
+    /// The offline-host bypass (second half of the 2026-07-03 anaplian
+    /// incident): when the execution's bound host has been disabled, a
+    /// heartbeat that keeps failing is auto-reaped WITHOUT a confirmed-dead
+    /// `cube workspace list` verdict — the disable is itself positive
+    /// evidence the worker is unreachable. Here `list_workspaces` returns an
+    /// empty snapshot (classifies `Unknown`, which normally blocks the reap),
+    /// but because the host is disabled the reap proceeds anyway and the
+    /// event records `reason = host_offline`. This is exactly the case that
+    /// stranded anaplian's `pr_review` executions heartbeat-erroring forever.
+    #[tokio::test]
+    async fn auto_reaps_offline_host_execution_without_cube_confirmation() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+        let execution_id = running_execution_on_host_with_lease(&db, &work_item_id, "lease-anaplian", "anaplian");
+        db.set_host_enabled("anaplian", false).unwrap();
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cube = RecordingCube::default();
+        cube.fail.store(true, Ordering::SeqCst);
+        // Deliberately DO NOT set any workspaces: the confirm probe returns
+        // an empty snapshot → `Unknown`. On an enabled host this would block
+        // the reap (see `sustained_failure_without_cube_confirmation_never_auto_reaps`);
+        // the disabled host makes it proceed regardless.
+
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+            assert_eq!(outcome.auto_reaped, 0, "must stay live below the failure threshold");
+        }
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(
+            outcome.auto_reaped, 1,
+            "a disabled host's heartbeat-failing execution is reaped without cube confirmation"
+        );
+
+        let reaped = db.get_execution(&execution_id).unwrap();
+        assert_eq!(reaped.status, ExecutionStatus::Orphaned);
+        assert_eq!(cube.force_release_calls(), vec!["lease-anaplian".to_owned()]);
+
+        let events = sink.events().await;
+        let reap_event = events
+            .iter()
+            .find(|e| e.stage == "cube_lease_auto_reap")
+            .expect("a cube_lease_auto_reap event must be emitted");
+        assert_eq!(reap_event.details["reason"], "host_offline");
+        assert_eq!(reap_event.details["host_offline"], true);
     }
 
     /// An `automation_triage` execution auto-reaped this way still gets its

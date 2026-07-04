@@ -305,6 +305,22 @@ pub enum Stage {
     /// `details` object carries `prior_status`, the `remote_pid`, and the
     /// reap `reason` so the strand is diagnosable from `bossctl dispatch tail`.
     RemoteLeaseReconcile,
+    /// The host-reconcile sweep ([`crate::host_reconcile`]) terminalized a
+    /// non-terminal execution whose latest run was bound to a host that is
+    /// now offline — disabled by the operator (`bossctl hosts disable`),
+    /// auto-disabled by the dispatch-health circuit breaker, or removed
+    /// from the registry. Before this existed, disabling a host removed it
+    /// only from *future* `select_host` picks; anything already routed to
+    /// it stayed stuck (queued / leased / run-started / heartbeat-erroring)
+    /// with no re-route, and an operator had to reap each phantom by hand
+    /// (2026-07-03 anaplian incident). The execution is marked `orphaned`
+    /// (same terminal path as `bossctl agents reap`) and its cube lease
+    /// best-effort released; the existing orphan-active sweep then
+    /// re-dispatches the work item to a still-eligible host. The `details`
+    /// object carries the offline `host_id` and the reap `reason`
+    /// (`host_disabled` / `host_removed`) so the re-route is diagnosable
+    /// from `bossctl dispatch tail`.
+    HostDrainReconcile,
     /// The periodic spawn-ack sweep ([`crate::spawn_ack_sweep`]) found a
     /// slot stuck in `Spawning` that never reported a shell pid AND never
     /// received a single hook event, past the grace window — proof no
@@ -371,6 +387,7 @@ impl Stage {
             Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
             Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
             Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
+            Stage::HostDrainReconcile => "host_drain_reconcile",
             Stage::SpawnAckTimeout => "spawn_ack_timeout",
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
         }
@@ -876,6 +893,7 @@ mod tests {
         assert_eq!(Stage::LostWorkspaceReconcile.as_str(), "lost_workspace_reconcile");
         assert_eq!(Stage::CubeLeaseAutoReap.as_str(), "cube_lease_auto_reap");
         assert_eq!(Stage::RemoteLeaseReconcile.as_str(), "remote_lease_reconcile");
+        assert_eq!(Stage::HostDrainReconcile.as_str(), "host_drain_reconcile");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

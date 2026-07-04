@@ -966,6 +966,25 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic host-reconcile sweep: drains non-terminal executions off
+    // hosts that have gone offline (operator `bossctl hosts disable`, the
+    // dispatch-health circuit breaker, or `remove_host`). Disabling a host
+    // otherwise only stops FUTURE dispatches to it — anything already routed
+    // there stays stuck (queued / leased / run-started / heartbeat-erroring)
+    // with no re-route, as the 2026-07-03 anaplian incident showed. This
+    // sweep terminalizes each bound execution (same terminal path as
+    // `bossctl agents reap`), best-effort releases its cube lease, and kicks
+    // the scheduler so the orphan-active sweep re-dispatches the freed work
+    // item to a still-eligible host. Runs every 60s and fires on boot so a
+    // host disabled while the engine was down is drained at startup.
+    let _host_reconcile_handle = crate::host_reconcile::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.cube_client.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        crate::host_reconcile::DEFAULT_INTERVAL,
+    );
+
     // External-tracker reconciler: periodically pulls upstream issue state
     // into Boss's work-item taxonomy. Default cadence: 120 s (2 min) per
     // the design doc's §"Cadence" rationale (Design Q5). Fires immediately

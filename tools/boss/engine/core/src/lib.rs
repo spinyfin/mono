@@ -45,6 +45,7 @@ pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
 pub mod gh_invocation;
 pub mod host_adapter;
+pub mod host_reconcile;
 pub mod host_registry;
 pub mod host_scheduling;
 pub mod ipc_log;
