@@ -6,6 +6,14 @@
 //! here means a new field on [`CreateProductInput`] touches one site
 //! instead of ~250, and keeps the setup readable at each call site.
 
+use std::path::Path;
+
+use anyhow::Result;
+use async_trait::async_trait;
+
+use crate::coordinator::{
+    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+};
 use crate::work::WorkDb;
 use boss_protocol::{CreateProductInput, Product};
 
@@ -37,4 +45,55 @@ pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: O
         worker_branch_prefix: None,
     })
     .unwrap()
+}
+
+/// A [`CubeClient`] test double that never touches cube. Every method
+/// panics with `unimplemented!()` except `list_workspaces`/`list_repos`,
+/// which return an empty vector.
+///
+/// The sweep test modules (`dead_pid_sweep`, `orphan_sweep`,
+/// `pool_claim_sweep`, `stale_worker_sweep`) drive coordinators whose
+/// cube interactions are never exercised, so this single stub replaces
+/// the byte-identical copy each used to hand-roll.
+pub struct NoopCube;
+
+#[async_trait]
+impl CubeClient for NoopCube {
+    async fn ensure_repo(&self, _: &str) -> Result<CubeRepoHandle> {
+        unimplemented!()
+    }
+    async fn lease_workspace(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: bool,
+        _: &[&str],
+    ) -> Result<CubeWorkspaceLease> {
+        unimplemented!()
+    }
+    async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+        unimplemented!()
+    }
+    async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
+        unimplemented!()
+    }
+    async fn release_workspace(&self, _: &str) -> Result<()> {
+        unimplemented!()
+    }
+    async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
+        unimplemented!()
+    }
+    async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
+        unimplemented!()
+    }
+    async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+        unimplemented!()
+    }
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        Ok(vec![])
+    }
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+        Ok(vec![])
+    }
 }
