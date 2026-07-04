@@ -1512,13 +1512,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Honor a *validated-green* "no CI to fix" signal atomically.
@@ -1643,13 +1637,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, cube_lease_id, cube_workspace_id, worker_id, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Flip a non-terminal `ci_remediations` attempt to `failed` with
@@ -1673,13 +1661,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Abandon all `pending` or `running` `ci_remediations` rows for
@@ -1721,13 +1703,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Stamp the soft-FK from a `ci_remediations` trigger-ledger row to the
@@ -1755,13 +1731,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, revision_task_id],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Store the engine-collected log tail on a pending `ci_remediations`
@@ -1779,13 +1749,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, log_excerpt],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Record the worker's post-log triage decision on a `running`
@@ -1805,13 +1769,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, triage_class],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_ci_remediation(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
     /// Record that a CI-remediation worker classified the failure as

@@ -707,6 +707,31 @@ pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option
     Ok(row)
 }
 
+/// Shared transaction epilogue for the attempt-row mutators in
+/// [`super::conflict_res`] and [`super::blocking`]. Every `set_*` /
+/// `mark_*` method there runs one guarded `UPDATE` and then finishes
+/// identically: if the UPDATE matched no rows it commits and returns
+/// `Ok(None)` (the idempotent no-op / already-terminal case); otherwise
+/// it re-reads the row via the per-table query fn, commits, and returns
+/// it. Factoring the tail here keeps that sequence — and its
+/// commit-on-both-paths semantics — in exactly one place across the ~14
+/// call sites, differing only in the `query` passed
+/// (`query_conflict_resolution` vs `query_ci_remediation`).
+pub(crate) fn finish_attempt_update<T>(
+    tx: rusqlite::Transaction<'_>,
+    rows: usize,
+    attempt_id: &str,
+    query: impl FnOnce(&Connection, &str) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    if rows == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let updated = query(&tx, attempt_id)?;
+    tx.commit()?;
+    Ok(updated)
+}
+
 /// Reconstruct an [`AutomationTrigger`] from the two DB columns
 /// (`trigger_kind` discriminator + `trigger_config` JSON body).
 ///

@@ -215,13 +215,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, diagnosis_json],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Stamp the soft-FK from a `conflict_resolutions` trigger-ledger row
@@ -248,13 +242,7 @@ impl WorkDb {
               WHERE id = ?1",
             params![attempt_id, revision_task_id],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Flip a `pending` attempt to `running` and stamp the lease
@@ -282,13 +270,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, cube_lease_id, cube_workspace_id, worker_id, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Worker-visible terminal transition: flip an attempt to
@@ -316,13 +298,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Auto-retire transition: flip an attempt from `pending` or `running`
@@ -349,13 +325,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
@@ -379,13 +349,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Abandon a stale `conflict_resolutions` row for supersede when the base
@@ -420,13 +384,7 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
         )?;
-        if rows == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let updated = query_conflict_resolution(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(updated)
+        finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
     /// Read-only list of `conflict_resolutions` rows for the Phase 5
