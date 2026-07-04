@@ -250,6 +250,129 @@ impl WorkDb {
         }))
     }
 
+    /// Record that the engine gave up nudging a live worker: the auto-nudge
+    /// circuit breaker tripped ([`crate::completion::WorkerCompletionHandler::park_for_unproductive_nudges`])
+    /// because repeated Stops produced no state change — no new commit, no
+    /// PR, no bound-PR anomaly resolved. Unlike
+    /// [`Self::record_worker_no_op_completion`], there is no positive
+    /// evidence the assigned work is done — only that further automated
+    /// nudging is unproductive — so, unlike that sibling, this does **not**
+    /// touch the task/chore's `status` or `pr_url` at all. Requiring the
+    /// [`crate::no_op_signal`] marker for a `done` close (and never
+    /// fabricating one here) is what distinguishes "verified already done"
+    /// from "gave up without trying"; conflating them would be exactly the
+    /// dishonest auto-close this module's own no-op gate was built to avoid.
+    ///
+    /// What this closes: without it, a live worker the breaker parks holds
+    /// its cube lease and worker pane/slot forever — the operator has to
+    /// notice and reap it by hand (incident `exec_18b932df99d17658_475`: a
+    /// worker concluded a CI failure had already resolved itself, never
+    /// produced a PR, and sat parked indefinitely holding its slot). In one
+    /// transaction:
+    ///   - the execution moves to `abandoned`, cube lease/workspace columns
+    ///     cleared, `finished_at` stamped — freeing the slot/lease is the
+    ///     whole point;
+    ///   - the most-recent run captures `detail` (the breaker's park reason)
+    ///     as its result summary if it does not already have one;
+    ///   - the task/chore's `autostart` flag is cleared (mirroring
+    ///     [`Self::bounce_dispatch_failed_to_backlog`]'s single-shot
+    ///     convention) so [`Self::rescan_active_dispatch`] does not
+    ///     immediately re-dispatch a fresh worker onto the same task the
+    ///     moment this one's slot frees up — without this, a task whose
+    ///     worker keeps concluding "nothing to do" without emitting the
+    ///     no-op marker would loop abandon → rescan-redispatch → abandon
+    ///     forever, churning a cube lease and worker slot with no human in
+    ///     the loop. `status`/`pr_url` are otherwise left untouched, so the
+    ///     merge poller's late-PR sweep and the dispatcher's redundant-spawn
+    ///     guard continue to see it exactly as they did before — a human
+    ///     reviewing the attention item this call's caller files can
+    ///     explicitly re-arm `autostart` (or dispatch a fresh execution
+    ///     directly) once they've decided the task is worth another try.
+    ///
+    /// Tolerates the task/chore row having been hard-deleted while the
+    /// execution was live: the lease/pane are the resource this method
+    /// exists to free, and that must happen unconditionally rather than
+    /// bailing out because a best-effort metadata lookup came up empty —
+    /// `work_item` is `None` in the returned completion in that case.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler that
+    /// may fire repeatedly.
+    pub fn record_worker_idle_abandonment(
+        &self,
+        execution_id: &str,
+        detail: &str,
+    ) -> Result<Option<IdleAbandonmentCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+        if !execution.status.is_live() {
+            bail!(
+                "execution {execution_id} cannot be idle-abandoned from status `{}`",
+                execution.status
+            );
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+        let task = query_task(&tx, &work_item_id)?;
+
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
+                 workspace_path = NULL,
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        // Stop the automated re-dispatch loop: clear `autostart` so the
+        // on-free rescan (`rescan_active_dispatch`) leaves this task parked
+        // in `active` instead of immediately spawning a replacement worker
+        // that may just abandon again the same way. Best-effort — if the
+        // task row is gone there's nothing to clear.
+        tx.execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+
+        // Capture the park reason as the run summary if the run hasn't
+        // already recorded one — the durable "why was this abandoned" note
+        // an operator finds on the row.
+        let trimmed = detail.trim();
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE work_runs
+                 SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                 WHERE execution_id = ?1
+                   AND id = (
+                       SELECT id FROM work_runs
+                       WHERE execution_id = ?1
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )",
+                params![execution_id, trimmed],
+            )?;
+        }
+
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        tx.commit()?;
+        Ok(Some(IdleAbandonmentCompletion {
+            execution: updated_execution,
+            work_item: task.map(task_to_item),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+        }))
+    }
+
     /// Chores and project_tasks currently in `in_review` whose
     /// `pr_url` is set. The merge poller iterates this list, asks
     /// GitHub whether each PR is merged, and calls

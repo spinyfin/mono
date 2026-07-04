@@ -53,13 +53,30 @@ pub struct RemoteRunHandle {
     pub remote_pid: Option<i64>,
 }
 
-/// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
-/// Carries the cube lease/workspace ids that were attached to the
-/// execution so the caller can drive cube release out-of-band.
+/// Result of a successful [`WorkDb::record_worker_pr_completion`] call (also
+/// reused by [`WorkDb::record_worker_no_op_completion`] and
+/// [`WorkDb::record_worker_idle_abandonment`], which finalize an execution
+/// the same lease/pane-releasing way without a fresh PR). Carries the cube
+/// lease/workspace ids that were attached to the execution so the caller can
+/// drive cube release out-of-band.
 #[derive(Debug, Clone)]
 pub struct WorkerPrCompletion {
     pub execution: WorkExecution,
     pub work_item: WorkItem,
+    pub released_lease_id: Option<String>,
+    pub released_workspace_id: Option<String>,
+}
+
+/// Result of a successful [`WorkDb::record_worker_idle_abandonment`] call.
+/// Distinct from [`WorkerPrCompletion`] because the idle-abandon path must
+/// free the execution's lease/pane even when the task/chore row has been
+/// hard-deleted out from under a still-live execution — `work_item` is
+/// `None` in that case so the caller can skip the work-item-changed publish
+/// instead of failing the whole finalize and leaking the lease/pane.
+#[derive(Debug, Clone)]
+pub struct IdleAbandonmentCompletion {
+    pub execution: WorkExecution,
+    pub work_item: Option<WorkItem>,
     pub released_lease_id: Option<String>,
     pub released_workspace_id: Option<String>,
 }

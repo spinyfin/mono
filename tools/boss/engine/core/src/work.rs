@@ -264,6 +264,7 @@ pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
 pub use metrics_types::MetricsCounterRow;
 pub use metrics_types::MetricsGaugeRow;
+pub use output_types::IdleAbandonmentCompletion;
 pub use output_types::LatePrCandidate;
 pub use output_types::PendingMergeCheck;
 pub use output_types::RemoteRunHandle;

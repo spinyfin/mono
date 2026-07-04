@@ -3988,10 +3988,15 @@ must not be asked to open one",
         let reason = if nudge_count > 0 {
             format!(
                 "Auto-nudge circuit breaker tripped: nudged {nudge_count} times with {detail}. \
-{pr_clause} Parked for human review."
+{pr_clause} Parked for human review. The execution's cube lease and worker slot have been \
+released; the task/chore status is left unchanged for re-dispatch or manual review."
             )
         } else {
-            format!("Worker parked without nudging: {detail}. {pr_clause}")
+            format!(
+                "Worker parked without nudging: {detail}. {pr_clause} The execution's cube lease \
+and worker slot have been released; the task/chore status is left unchanged for re-dispatch or \
+manual review."
+            )
         };
 
         // Deduplicate: only one open attention item of this kind per
@@ -4053,7 +4058,93 @@ must not be asked to open one",
             %reason,
             "auto-nudge circuit breaker tripped — parked execution, no further nudges"
         );
+        // Release the slot/lease this execution would otherwise hold
+        // forever — the `exec_18b932df99d17658_475` incident this closes:
+        // a worker concluded there was nothing left to do, the breaker
+        // parked it, and it sat holding its cube lease and worker pane
+        // indefinitely until an operator noticed and reaped it by hand.
+        // The attention item filed above is the durable human-facing
+        // surface; this is what actually frees the resources.
+        self.finalize_idle_park(execution, &reason).await;
         StopOutcome::NudgeBreakerParked { reason }
+    }
+
+    /// Finalize an execution the auto-nudge circuit breaker gave up on:
+    /// release its cube lease and worker pane so it stops holding a slot
+    /// forever. Mirrors [`Self::finalize_no_op_completion`]'s teardown
+    /// mechanics, but deliberately does NOT touch the task/chore status —
+    /// there is no positive evidence the work is done here, only that
+    /// further automated nudging is unproductive (see
+    /// [`crate::work::WorkDb::record_worker_idle_abandonment`] for why that
+    /// distinction matters, including why it clears `autostart` to stop an
+    /// automated abandon/re-dispatch churn loop). The attention item
+    /// [`Self::park_for_unproductive_nudges`] already filed is the durable
+    /// surface for a human to review or re-dispatch the work item.
+    ///
+    /// Best-effort and idempotent: a DB write against an already-terminal
+    /// execution is a silent no-op (the row was already finalized by a
+    /// concurrent path), and a lease-release failure is logged, never
+    /// propagated — this must never block the Stop-boundary response. The
+    /// lease/pane release also proceeds even if the task/chore row itself
+    /// was hard-deleted out from under the execution — `record_worker_idle_abandonment`
+    /// returns `work_item: None` in that case rather than erroring the
+    /// whole finalize, so the work-item-changed publish is simply skipped.
+    async fn finalize_idle_park(&self, execution: &crate::work::WorkExecution, detail: &str) {
+        let completion = match self.work_db.record_worker_idle_abandonment(&execution.id, detail) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "idle-park finalize: failed to record",
+                );
+                return;
+            }
+        };
+        self.staged_pr_urls.forget(&execution.id);
+        self.nudge_breaker.forget(&execution.id);
+        if let Some(lease_id) = completion.released_lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "idle-park finalize: cube release failed"
+            );
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+        let work_item_id = completion.execution.work_item_id.clone();
+        self.publisher
+            .publish(
+                &completion.execution.id,
+                &work_item_id,
+                completion.execution.status.as_str(),
+                "worker_idle_park_finalized",
+            )
+            .await;
+        match completion.work_item.as_ref() {
+            Some(work_item) => {
+                let product_id = work_item_product_id(work_item);
+                self.publisher
+                    .publish_work_item_changed(&product_id, &work_item_id, "worker_idle_park_finalized")
+                    .await;
+            }
+            None => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %work_item_id,
+                    "idle-park finalize: task/chore row missing, skipping work-item-changed publish",
+                );
+            }
+        }
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %work_item_id,
+            "idle-park finalize: cube lease and worker slot released; execution abandoned; \
+             autostart cleared so the automated rescan won't immediately re-dispatch it",
+        );
     }
 
     /// Scan `execution`'s Stop-boundary transcript for `[effort-escalation]`
@@ -9074,6 +9165,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // no PR on its branch. The legitimate "produce a PR" nudge must
         // still fire — but the breaker bounds it too. Cap lowered to 2
         // to keep the test short.
+        //
+        // `exec_18b932df99d17658_475` incident: a worker that concludes
+        // there's nothing left to do (whether or not it emits the sanctioned
+        // NO_CHANGES_NEEDED marker) must not be left parked holding its cube
+        // lease and worker slot forever once the breaker gives up on it —
+        // the auto-remediation this test now also proves.
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
@@ -9109,11 +9206,60 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             matches!(o3, StopOutcome::NudgeBreakerParked { .. }),
             "breaker must bound the no-PR nudge after the cap; got {o3:?}",
         );
-        // Chore is untouched (no false finalize); execution stays parked.
+        // Chore is left exactly as it was — no false "done" finalize; a
+        // human or a re-dispatch decides what happens next.
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::Active);
+                assert!(t.pr_url.is_none());
+            }
             other => panic!("expected chore, got {other:?}"),
         }
+        // The execution itself, however, MUST be finalized — this is the
+        // auto-remediation: the slot and lease are freed instead of being
+        // held by a parked worker forever.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Abandoned,
+            "a breaker-tripped no-op conclusion must finalize the execution, not leave it parked",
+        );
+        assert!(execution.cube_lease_id.is_none());
+        assert!(execution.cube_workspace_id.is_none());
+        assert!(execution.finished_at.is_some());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "the breaker-tripped park must release the cube lease",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "the breaker-tripped park must tear down the worker pane",
+        );
+        assert!(
+            publisher
+                .events
+                .lock()
+                .await
+                .iter()
+                .any(|(_, _, _, reason)| reason == "worker_idle_park_finalized"),
+            "must publish a worker_idle_park_finalized event",
+        );
+
+        // Idempotent: a further Stop (hook re-fire) on the now-terminal
+        // execution must not double-release or re-park.
+        let o4 = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(o4, StopOutcome::AlreadyTerminal),
+            "a re-fired Stop on an already-abandoned execution must be AlreadyTerminal; got {o4:?}",
+        );
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "a re-fired Stop must not release the lease a second time",
+        );
+
         let items = db.list_attention_items(&execution_id).unwrap();
         assert!(
             items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
@@ -9427,6 +9573,82 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 .count(),
             1,
             "exactly one worker_blocked attention item must be filed; got {items:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_worker_is_never_reaped_across_repeated_stops() {
+        // The other half of the auto-remediation contract: a worker with a
+        // GENUINE pending question ([blocked]) must never be finalized by
+        // the idle-park path, no matter how many Stops fire while it awaits
+        // a coordinator decision. `nudge_or_park` short-circuits to
+        // `EscalationPending` before the circuit breaker is ever consulted,
+        // so `park_for_unproductive_nudges` (and its new
+        // lease/pane-releasing finalizer) must never run for this case.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "[blocked] reason=\"need a decision on approach A vs B before I can continue\"\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher,
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_max_unproductive_nudges(2); // lower than the number of Stops below
+
+        // Fire more Stops than the (lowered) breaker cap. If the blocked
+        // marker were not correctly suppressing the breaker, this would
+        // trip `park_for_unproductive_nudges` and finalize the execution —
+        // exactly the wrong behaviour for a genuine pending question.
+        for _ in 0..5 {
+            let outcome = handler.on_stop(&execution_id).await;
+            assert!(
+                matches!(outcome, StopOutcome::EscalationPending { .. }),
+                "every Stop while [blocked] is unresolved must be EscalationPending; got {outcome:?}",
+            );
+        }
+
+        assert!(
+            probes.snapshot().is_empty(),
+            "a genuinely blocked worker must never be nudged; got {:?}",
+            probes.snapshot(),
+        );
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "a genuinely blocked worker's lease must never be released",
+        );
+        assert!(
+            pane.calls.lock().await.is_empty(),
+            "a genuinely blocked worker's pane must never be torn down",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::WaitingHuman,
+            "a genuinely blocked worker must stay live, not be finalized",
+        );
+        assert!(execution.cube_lease_id.is_some(), "lease must remain attached");
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // No nudge-breaker attention item — only the worker_blocked one.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "a suppressed-nudge escalation must not also masquerade as a breaker trip",
         );
     }
 
@@ -11207,10 +11429,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // `finalize_conflict_resolution_attempt`, which — ONLY on
         // `NudgeBreakerParked` — marks the bound `conflict_resolutions`
         // ledger row `failed` (a false classification: the worker DID
-        // push). `park_for_unproductive_nudges` never releases the cube
-        // lease or the pane, so the execution stays `waiting_human`
-        // forever with a stranded, unresponsive pane — exactly "lingering
-        // Claude Not Detected panes."
+        // push). At the time of the original incident,
+        // `park_for_unproductive_nudges` never released the cube lease or
+        // the pane, so the execution stayed `waiting_human` forever with a
+        // stranded, unresponsive pane — exactly "lingering Claude Not
+        // Detected panes." (`park_for_unproductive_nudges` now finalizes
+        // via `finalize_idle_park`, releasing both — see
+        // `record_worker_idle_abandonment` — but the false `failed`
+        // ledger classification this test guards against is unrelated to
+        // that leak and remains possible on the nudge-breaker path.)
         //
         // With the fix, the missing-baseline case never reaches the nudge
         // at all: it tries the satisfied-deliverable gate first. Here the
