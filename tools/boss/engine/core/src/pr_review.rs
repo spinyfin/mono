@@ -953,6 +953,20 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
                finding, not an advisory suggestion.\n\
              - **Code quality/readability** — fails to match surrounding style, \
                naming issues, dead/confusing code. (`category: \"readability\"`)\n\
+             - **Lint/warning suppressions** — scrutinize every new \
+               `#[allow(...)]`, `#[expect(...)]`, lint-disable comment, type/lint \
+               ignore, or unused-variable underscoring (`_foo`) of something \
+               that should instead be removed or fixed. Ask whether a more \
+               correct remedy exists instead of suppressing the check: e.g. \
+               `#[allow(dead_code)]` on a helper only used by tests usually \
+               means the helper should be compiled under `#[cfg(test)]` (or \
+               live in a test-only module) rather than silenced; an unused \
+               import usually means dead code to delete, not hide. A \
+               suppression is acceptable only when it is genuinely the right \
+               tool (e.g. a false positive, or a documented, narrowly-scoped \
+               exception) — this is a scrutiny instruction, not a blanket ban. \
+               When a more correct remedy exists, raise a finding naming it. \
+               (`category: \"readability\"`)\n\
              - **Test coverage gaps** — untested new behaviour, missing \
                edge-case tests. (`category: \"tests\"`)\n\
              - **Edge cases/gotchas** — boundary conditions, nullability, \
