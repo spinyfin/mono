@@ -2518,11 +2518,12 @@ impl ExecutionCoordinator {
                 let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Error, &execution.id)
+                        DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
                             .with_work_item(&execution.work_item_id)
                             .with_worker(worker_id)
                             .with_error(&err)
-                            .with_cube_invocation(ensure_repr),
+                            .with_cube_invocation(ensure_repr)
+                            .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
                     )
                     .await;
                 self.record_start_failure(
@@ -2544,7 +2545,7 @@ impl ExecutionCoordinator {
                 let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Error, &execution.id)
+                        DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
                             .with_work_item(&execution.work_item_id)
                             .with_worker(worker_id)
                             .with_error(&err)
@@ -2552,6 +2553,7 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({
                                 "reason": "timeout",
                                 "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                                "host_id": selected_host.id.clone(),
                             })),
                     )
                     .await;
@@ -6536,6 +6538,87 @@ mod tests {
             "cube_workspace_leased (success) must not appear when lease fails; got {stages:?}",
         );
         assert!(!stages.contains(&"cube_change_created"));
+        assert!(!stages.contains(&"run_started"));
+        assert!(!stages.contains(&"pane_spawned"));
+    }
+
+    /// `cube repo ensure` failures used to be recorded as
+    /// `cube_repo_ensured` with `outcome=error` — a success-shaped stage
+    /// name with an error attached, which is exactly how the anaplian
+    /// incident's `command not found: cube` failure hid in plain sight in
+    /// `dispatch.jsonl` for 12 consecutive attempts. Pin that the failure
+    /// now emits its own terminal `cube_repo_ensure_failed:error` stage,
+    /// and that the success-shaped `cube_repo_ensured` stage never
+    /// appears at all when the ensure call fails.
+    #[tokio::test]
+    async fn cube_repo_ensure_failure_emits_dedicated_failed_stage() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Ensure Failure")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_ensure: true,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        // No retries: go straight to permanent failure so the test does
+        // not have to wait through backoff delays.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![])
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+        let events = recording.events_for(&execution_id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+
+        let failed_event = events
+            .iter()
+            .find(|event| event.stage == "cube_repo_ensure_failed")
+            .unwrap_or_else(|| panic!("cube_repo_ensure_failed event missing; got {stages:?}"));
+        assert_eq!(failed_event.outcome, "error");
+        assert!(
+            failed_event
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cube repo ensure failed")),
+            "failed event must carry the verbatim cube error; got {:?}",
+            failed_event.error_message,
+        );
+
+        // The success-shaped stage must never appear for a failed attempt
+        // — that ambiguity is exactly the bug this split fixes.
+        assert!(
+            !stages.contains(&"cube_repo_ensured"),
+            "cube_repo_ensured (success-shaped) must not appear when ensure fails; got {stages:?}",
+        );
+        assert!(!stages.contains(&"cube_workspace_lease_attempted"));
         assert!(!stages.contains(&"run_started"));
         assert!(!stages.contains(&"pane_spawned"));
     }

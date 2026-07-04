@@ -309,7 +309,13 @@ impl SshHostAdapter {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         full.push("cube");
         full.extend_from_slice(args);
-        let output = self.transport.run(&full).await?;
+        let output = match self.transport.run(&full).await {
+            Ok(output) => output,
+            Err(err) => {
+                self.record_host_health_failure(&format!("{err:#}"));
+                return Err(err);
+            }
+        };
         if !output.success() {
             let detail = if !output.stderr.trim().is_empty() {
                 output.stderr.trim().to_owned()
@@ -318,13 +324,65 @@ impl SshHostAdapter {
             } else {
                 format!("exit status {}", output.status)
             };
-            return Err(anyhow!(
-                "ssh cube command failed on host {}: {detail}",
-                self.transport.host_id
-            ));
+            let message = format!("ssh cube command failed on host {}: {detail}", self.transport.host_id);
+            self.record_host_health_failure(&message);
+            return Err(anyhow!(message));
         }
+        // The ssh/cube round trip itself succeeded — record health success
+        // here rather than after the JSON decode below, since a malformed
+        // payload is a data-shape problem (cube version skew, a bug in this
+        // command's output), not evidence the *host* is unreachable.
+        self.record_host_health_success();
         serde_json::from_str(&output.stdout)
             .with_context(|| format!("decoding cube JSON output from host {}", self.transport.host_id))
+    }
+
+    /// Record a dispatch-time cube invocation failure against this host's
+    /// health counter (see `host_registry::record_host_dispatch_failure`).
+    /// Best-effort: a DB error here must never mask the real dispatch
+    /// error the caller is already propagating, so failures just log.
+    fn record_host_health_failure(&self, error_text: &str) {
+        use crate::host_registry::HostHealthOutcome;
+        match self
+            .work_db
+            .record_host_dispatch_failure(&self.transport.host_id, error_text)
+        {
+            Ok(HostHealthOutcome::AutoDisabled { consecutive_failures }) => {
+                tracing::warn!(
+                    host_id = %self.transport.host_id,
+                    consecutive_failures,
+                    "host auto-disabled after repeated dispatch-time failures; \
+                     future dispatches will fall back to another eligible host",
+                );
+            }
+            Ok(HostHealthOutcome::Degraded { consecutive_failures }) => {
+                tracing::debug!(
+                    host_id = %self.transport.host_id,
+                    consecutive_failures,
+                    "recorded host dispatch-time failure",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    host_id = %self.transport.host_id,
+                    ?err,
+                    "failed to record host dispatch-time failure",
+                );
+            }
+        }
+    }
+
+    /// Reset this host's health counter after a successful dispatch-time
+    /// cube invocation. Best-effort, same rationale as
+    /// `record_host_health_failure`.
+    fn record_host_health_success(&self) {
+        if let Err(err) = self.work_db.record_host_dispatch_success(&self.transport.host_id) {
+            tracing::warn!(
+                host_id = %self.transport.host_id,
+                ?err,
+                "failed to record host dispatch-time success",
+            );
+        }
     }
 
     /// Append the Bazel pre-push build gate to the worker prompt when the

@@ -80,8 +80,20 @@ pub enum Stage {
     /// With this marker the stall is attributed to the repo-ensure
     /// subprocess. `details` carries the origin URL and the timeout.
     CubeRepoEnsureAttempted,
-    /// `cube repo ensure` returned a repo handle.
+    /// `cube repo ensure` returned a repo handle. Always `outcome=ok` —
+    /// a failed or timed-out attempt emits [`Stage::CubeRepoEnsureFailed`]
+    /// instead (see that variant for why the split exists).
     CubeRepoEnsured,
+    /// `cube repo ensure` failed or timed out. Split out from
+    /// `cube_repo_ensured` (which used to carry `outcome=error` for this
+    /// case) because a success-shaped stage name with an error attached
+    /// reads as a passing stage to anyone `jq`-filtering or skimming
+    /// `dispatch.jsonl` — exactly the "Waiting for a slot" incident this
+    /// fixes: the ssh `command not found: cube` failure was recorded
+    /// under `cube_repo_ensured`, so nothing in the timeline *looked*
+    /// like a failure. `error_message` carries the verbatim failure
+    /// (ssh/cube error text, or the timeout message).
+    CubeRepoEnsureFailed,
     /// Engine is about to call `cube workspace lease`. Emitted *before*
     /// the subprocess invocation so an operator can see what the
     /// engine intended to do (preferred workspace id, fallback
@@ -255,6 +267,7 @@ impl Stage {
             Stage::HostSelected => "host_selected",
             Stage::CubeRepoEnsureAttempted => "cube_repo_ensure_attempted",
             Stage::CubeRepoEnsured => "cube_repo_ensured",
+            Stage::CubeRepoEnsureFailed => "cube_repo_ensure_failed",
             Stage::CubeWorkspaceLeaseAttempted => "cube_workspace_lease_attempted",
             Stage::CubeWorkspaceLeased => "cube_workspace_leased",
             Stage::CubeWorkspaceLeaseFailed => "cube_workspace_lease_failed",
@@ -749,6 +762,7 @@ mod tests {
         assert_eq!(Stage::HostSelected.as_str(), "host_selected");
         assert_eq!(Stage::CubeRepoEnsureAttempted.as_str(), "cube_repo_ensure_attempted");
         assert_eq!(Stage::CubeRepoEnsured.as_str(), "cube_repo_ensured");
+        assert_eq!(Stage::CubeRepoEnsureFailed.as_str(), "cube_repo_ensure_failed");
         assert_eq!(
             Stage::CubeWorkspaceLeaseAttempted.as_str(),
             "cube_workspace_lease_attempted"

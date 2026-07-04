@@ -18,6 +18,7 @@ fn to_host_snapshot(host: Host, caps: Vec<HostCapability>) -> HostSnapshot {
         enabled: host.enabled,
         last_seen_at: host.last_seen_at,
         last_error_text: host.last_error_text,
+        consecutive_failures: host.consecutive_failures,
         created_at: host.created_at,
         capabilities: caps
             .into_iter()
@@ -229,7 +230,9 @@ pub(super) async fn handle_remove_host_tag(ctx: Dispatch, req: FrontendRequest) 
 /// to surface the result to the UI (disabled + error text = add failed).
 async fn eager_push_wrapper_rpc(work_db: &crate::work::WorkDb, host_id: &str, ssh_target: &str) {
     use crate::ssh_transport::{SshTransport, default_control_socket_dir};
-    use crate::wrapper_distribution::{WrapperPushOutcome, push_wrapper, subclass_label};
+    use crate::wrapper_distribution::{
+        CubeProbeOutcome, WrapperPushOutcome, push_wrapper, subclass_label, verify_cube_invocable,
+    };
 
     let Some(socket_dir) = default_control_socket_dir() else {
         tracing::warn!(host_id, "eager_push_wrapper: HOME unset; skipping");
@@ -247,7 +250,29 @@ async fn eager_push_wrapper_rpc(work_db: &crate::work::WorkDb, host_id: &str, ss
 
     match push_wrapper(&transport).await {
         Ok(WrapperPushOutcome::Ok) => {
-            let _ = work_db.set_host_last_error(host_id, None);
+            // Wrapper script verified — but that's a separate artifact
+            // from the `cube` binary every dispatch-time call shells out
+            // to. Probe it now so a host missing `cube` on its
+            // non-interactive PATH (the anaplian incident) is caught and
+            // disabled at registration time instead of silently failing
+            // every future dispatch.
+            match verify_cube_invocable(&transport).await {
+                Ok(CubeProbeOutcome::Ok) => {
+                    let _ = work_db.set_host_last_error(host_id, None);
+                }
+                Ok(CubeProbeOutcome::Failed(detail)) => {
+                    let msg = format!("cube not invocable via non-interactive ssh: {detail}");
+                    tracing::warn!(host_id, %msg, "eager_push_wrapper: cube probe failed");
+                    let _ = work_db.set_host_enabled(host_id, false);
+                    let _ = work_db.set_host_last_error(host_id, Some(&msg));
+                }
+                Err(err) => {
+                    let msg = format!("probing cube invocability errored: {err:#}");
+                    tracing::warn!(host_id, %msg, "eager_push_wrapper: cube probe errored");
+                    let _ = work_db.set_host_enabled(host_id, false);
+                    let _ = work_db.set_host_last_error(host_id, Some(&msg));
+                }
+            }
         }
         Ok(WrapperPushOutcome::Failed(kind, detail)) => {
             let label = subclass_label(&kind);

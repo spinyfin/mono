@@ -275,6 +275,11 @@ impl WorkDb {
         // so the macOS app (and run-failure paths) can see which host
         // a run executed on.
         crate::host_registry::migrate_work_runs_host_columns(&conn)?;
+        // Dispatch-time host health circuit breaker (starves-on-broken-host
+        // fix): consecutive-failure counter used by
+        // `record_host_dispatch_failure` / `_success` to auto-disable a
+        // host that fails every dispatch instead of retrying it forever.
+        crate::host_registry::migrate_hosts_health_columns(&conn)?;
         crate::host_registry::ensure_local_host(&conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(&conn)?;
         // Revision tasks (Phase 1): parent linkage column + index on tasks,

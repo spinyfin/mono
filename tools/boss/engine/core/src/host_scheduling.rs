@@ -160,6 +160,7 @@ mod tests {
             enabled,
             last_seen_at: None,
             last_error_text: None,
+            consecutive_failures: 0,
             created_at: "0".to_owned(),
         }
     }
