@@ -1770,6 +1770,14 @@ fn redispatch_preserves_investigation_execution_kind() {
         "first dispatch should carry the investigation kind"
     );
 
+    // A worker actually attaches (stamping a `work_runs` row) and then
+    // dies without cleaning up. Only once a run has genuinely started is
+    // the `is_live` oracle meaningful — a still-`ready`, zero-run row
+    // must be reused rather than liveness-tested (see
+    // `request_execution_reuses_ready_row_with_no_run_within_pickup_window`).
+    db.start_execution_run(&first.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+
     // The original worker is now gone. Re-issuing RequestExecution with an
     // `is_live` oracle that reports the slot dead drives the
     // abandon-and-redispatch path: the stale row is abandoned and a fresh
@@ -1922,6 +1930,12 @@ fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
                 .work_item_id(investigation.id.clone())
                 .build(),
         )
+        .unwrap();
+    // A worker actually attaches (stamping a `work_runs` row) and dies —
+    // only then is the `is_live` oracle meaningful for this row (a
+    // still-`ready`, zero-run row must instead be reused; see
+    // `request_execution_reuses_ready_row_with_no_run_within_pickup_window`).
+    db.start_execution_run(&first.id, "agent", "repo", "lease", "ws", "/tmp/ws")
         .unwrap();
     // Original worker died → abandon-and-redispatch.
     let redispatched = db
