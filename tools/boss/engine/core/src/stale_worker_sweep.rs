@@ -432,19 +432,15 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use anyhow::Result;
     use async_trait::async_trait;
     use boss_protocol::{WorkItemBinding, WorkerEvent};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::coordinator::{ExecutionCoordinator, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::runner::{ExecutionRunner, RunOutcome};
     use crate::test_support::*;
     use crate::work::{CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
-    use boss_protocol::WorkExecution;
 
     // A staleness threshold whose cutoff lands in the *future*, so any
     // `last_event_at` stamped "now" by `apply_event` compares as stale.
@@ -454,24 +450,6 @@ mod tests {
     // A threshold whose cutoff is an hour in the past, so a just-stamped
     // event is comfortably fresh.
     const NEVER_STALE: i64 = 3_600;
-
-    // ─── stubs (mirrors dead_pid_sweep) ──────────────────────────────────────
-
-    struct NoopRunner;
-
-    #[async_trait]
-    impl ExecutionRunner for NoopRunner {
-        async fn run_execution(
-            &self,
-            _worker_id: &str,
-            _execution: &WorkExecution,
-            _work_item: &crate::work::WorkItem,
-            _workspace_path: &std::path::Path,
-            _cube_change_id: Option<&str>,
-        ) -> Result<RunOutcome> {
-            unimplemented!()
-        }
-    }
 
     /// Records every `reap_worker` call and, at reap time, snapshots
     /// whether the execution's pool slot is still claimed. The production
@@ -516,12 +494,6 @@ mod tests {
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
-
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
 
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id

@@ -302,12 +302,6 @@ mod tests {
         AutomationTrigger, CreateAutomationInput, ExecutionStatus, FinishExecutionRunInput,
     };
 
-    fn open_db() -> (TempDir, WorkDb) {
-        let dir = TempDir::new().unwrap();
-        let db = WorkDb::open(dir.path().join("state.db")).unwrap();
-        (dir, db)
-    }
-
     fn create_product(db: &WorkDb) -> String {
         create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
     }

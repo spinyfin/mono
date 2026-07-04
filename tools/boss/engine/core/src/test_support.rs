@@ -10,15 +10,29 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tempfile::TempDir;
 
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
+use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::WorkDb;
-use boss_protocol::{CreateProductInput, Product};
+use boss_protocol::{CreateProductInput, Product, WorkExecution};
 
 /// The mono repo remote used by the overwhelming majority of tests.
 pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
+
+/// Open a fresh file-backed [`WorkDb`] under a throwaway [`TempDir`].
+///
+/// The returned `TempDir` must be kept alive for the lifetime of the
+/// `WorkDb` — dropping it deletes the backing `state.db`. The sweep and
+/// scheduler test modules all open a DB this exact way, so this replaces
+/// the byte-identical local `open_db()` each used to hand-roll.
+pub fn open_db() -> (TempDir, WorkDb) {
+    let dir = TempDir::new().unwrap();
+    let db = WorkDb::open(dir.path().join("state.db")).unwrap();
+    (dir, db)
+}
 
 /// Create the standard test product: name `Boss`, the mono repo
 /// remote, all other fields defaulted to `None`.
@@ -95,5 +109,27 @@ impl CubeClient for NoopCube {
     }
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
         Ok(vec![])
+    }
+}
+
+/// An [`ExecutionRunner`] test double whose `run_execution` panics with
+/// `unimplemented!()`. The sweep and recovery test modules
+/// (`dead_pid_sweep`, `orphan_sweep`, `pool_claim_sweep`,
+/// `stale_worker_sweep`, `transient_recovery`) construct coordinators
+/// whose runner is never actually driven, so this single stub replaces
+/// the byte-identical copy each used to hand-roll.
+pub struct NoopRunner;
+
+#[async_trait]
+impl ExecutionRunner for NoopRunner {
+    async fn run_execution(
+        &self,
+        _worker_id: &str,
+        _execution: &WorkExecution,
+        _work_item: &crate::work::WorkItem,
+        _workspace_path: &Path,
+        _cube_change_id: Option<&str>,
+    ) -> Result<RunOutcome> {
+        unimplemented!()
     }
 }
