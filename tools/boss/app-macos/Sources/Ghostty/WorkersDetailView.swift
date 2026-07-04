@@ -51,7 +51,8 @@ struct WorkersDetailView: View {
                     runtime: workspace.runtime,
                     slots: workspace.automationSlots,
                     liveStates: liveStates,
-                    liveStatusModel: liveStatusModel
+                    liveStatusModel: liveStatusModel,
+                    columns: 3
                 )
                 .opacity(selectedPool == .automations ? 1 : 0)
                 .allowsHitTesting(selectedPool == .automations)
@@ -96,9 +97,9 @@ private struct WorkerGrid: View {
     let slots: [WorkerSlot]
     @ObservedObject var liveStates: LiveWorkerStateStore
     @ObservedObject var liveStatusModel: ChatViewModel
+    var columns: Int = 4
 
     var body: some View {
-        let columns = 4
         let rows = stride(from: 0, to: slots.count, by: columns).map { start in
             Array(slots[start..<min(start + columns, slots.count)])
         }

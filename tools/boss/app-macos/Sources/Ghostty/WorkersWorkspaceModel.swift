@@ -6,7 +6,8 @@ import GhosttyKit
 final class WorkersWorkspaceModel: ObservableObject {
     static let workerSlotCount = 8
     /// Automation pool occupies slot IDs immediately above the main pool.
-    static let automationSlotCount = 3
+    /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
+    static let automationSlotCount = 6
     static let automationSlotBase = workerSlotCount + 1   // 9
     static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 9...11
     /// Review pool occupies slot IDs immediately above the automation pool.
@@ -32,7 +33,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     @Published private(set) var slots: [WorkerSlot]
     /// Automation-pool slots. These are always idle until the engine wires
     /// up automation pane spawning; the pool-switcher UI shows them so the
-    /// 3-slot grid is visible before any automation worker runs.
+    /// slot grid is visible before any automation worker runs.
     @Published private(set) var automationSlots: [WorkerSlot]
     /// Review-pool slots. Mirror the automation pool layout; always idle
     /// until the engine routes a `pr_review` execution to this pool.

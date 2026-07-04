@@ -291,7 +291,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::coordinator::{ExecutionCoordinator, WorkerPool};
+    use crate::coordinator::{ExecutionCoordinator, MAX_AUTOMATION_POOL_SIZE, WorkerPool};
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::runner::{ExecutionRunner, RunOutcome};
@@ -380,7 +380,7 @@ mod tests {
 
     /// Build an `Arc<ExecutionCoordinator>` whose main pool has
     /// `main_pool_size` slots and whose automation pool is the default
-    /// full 3-slot pool.
+    /// full `MAX_AUTOMATION_POOL_SIZE`-slot pool.
     fn make_coordinator(db: Arc<WorkDb>, main_pool_size: usize) -> Arc<ExecutionCoordinator> {
         Arc::new(ExecutionCoordinator::new(
             db,
@@ -429,7 +429,11 @@ mod tests {
             let worker_id = pool.claim_worker(exec, None).await.unwrap();
             assert!(worker_id.starts_with("auto-worker-"));
         }
-        assert_eq!(pool.idle_count().await, 0, "pool must start fully claimed");
+        assert_eq!(
+            pool.idle_count().await,
+            MAX_AUTOMATION_POOL_SIZE - 3,
+            "pool must have exactly the three leaked claims outstanding",
+        );
 
         // Terminate the holders, one per terminal path, then age each
         // past the leak grace (the terminal paths stamp finished_at=now).
@@ -453,7 +457,7 @@ mod tests {
 
         assert_eq!(
             pool.idle_count().await,
-            3,
+            MAX_AUTOMATION_POOL_SIZE,
             "automation pool must be fully idle after the sweep — dispatch unwedged",
         );
         assert!(pool.claimed_execution_ids().await.is_empty(), "no claims may remain",);
