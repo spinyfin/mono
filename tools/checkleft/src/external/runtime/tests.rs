@@ -1241,6 +1241,29 @@ fn bundled_component_bytes(name: &str) -> Vec<u8> {
     component.artifact_bytes.expect("bundled component has bytes").to_vec()
 }
 
+/// Compile the bundled `rust/giant-structs` component for a test, deserializing
+/// the build-time precompiled `.cwasm` fixture when one is staged (under `bazel
+/// test`) instead of paying a fresh JIT compile.
+///
+/// These epoch-interrupt tests only care about the *call*, not the compile, but
+/// calling `compile_component` directly (bypassing the fixture) used to make
+/// each of them pay a ~35-45 s debug-mode Cranelift compile — the dominant cost
+/// in `checkleft_lib_test`'s 60 s small-test timeouts. See
+/// docs/investigations/checkleft-lib-test-wasm-compile-timeout.md.
+fn giant_structs_component_for_test(engine: &wasmtime::Engine) -> wasmtime::component::Component {
+    let bytes = bundled_component_bytes("rust/giant-structs");
+    match crate::external::test_support::precompiled_cwasm_dir() {
+        Some(dir) => {
+            let cache = super::cwasm_cache::ComponentAotCache::open(dir).expect("open precompiled .cwasm cache");
+            let sha256 = super::sha256_hex(&bytes);
+            cache
+                .load_or_compile(engine, "rust/giant-structs", &bytes, &sha256)
+                .expect("load cached giant-structs component")
+        }
+        None => compile_component(engine, "rust/giant-structs", &bytes).expect("compile component"),
+    }
+}
+
 /// `call_declared_exclusions` must produce an epoch-interrupt error when
 /// `timeout_ticks = 0` (deadline = current epoch, already exhausted at the
 /// first WASM instruction). This verifies that the previously unbounded audit
@@ -1248,8 +1271,7 @@ fn bundled_component_bytes(name: &str) -> Vec<u8> {
 #[test]
 fn call_declared_exclusions_times_out_when_deadline_exhausted() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let bytes = bundled_component_bytes("rust/giant-structs");
-    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+    let component = giant_structs_component_for_test(&engine);
 
     // timeout_ticks = 0 → deadline = current_epoch + 0 = current_epoch.
     // At the first WASM instruction, engine.current_epoch() >= deadline → trap.
@@ -1269,8 +1291,7 @@ fn call_evaluate_exclusion_times_out_when_deadline_exhausted() {
     use super::wit_types;
 
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let bytes = bundled_component_bytes("rust/giant-structs");
-    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+    let component = giant_structs_component_for_test(&engine);
 
     let excl = wit_types::DeclaredExclusion {
         entry: "some/entry".to_owned(),
@@ -1292,8 +1313,7 @@ fn call_evaluate_exclusion_times_out_when_deadline_exhausted() {
 #[test]
 fn call_declared_exclusions_timeout_error_names_check_and_budget() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let bytes = bundled_component_bytes("rust/giant-structs");
-    let component = compile_component(&engine, "rust/giant-structs", &bytes).unwrap();
+    let component = giant_structs_component_for_test(&engine);
 
     let err = call_declared_exclusions(&engine, &component, "rust/giant-structs", "{}", 0)
         .expect_err("expected timeout error");
