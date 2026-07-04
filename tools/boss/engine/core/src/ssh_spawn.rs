@@ -196,6 +196,16 @@ pub trait SshExec: Send + Sync {
     fn host_id(&self) -> &str;
     /// Run a command on the remote over the master, capturing output.
     async fn run(&self, argv: &[&str]) -> Result<SshOutput>;
+    /// Like [`run`](Self::run), but any `argv` element that is a
+    /// home-relative remote path (starts with `~/`) keeps its
+    /// tilde-expansion instead of being fully quoted. Use only when an
+    /// element is known to be an engine-constructed remote path — e.g.
+    /// the wrapper binary path in the launch command — never for
+    /// arbitrary free text. See
+    /// [`SshTransport::run_with_remote_paths`](crate::ssh_transport::SshTransport::run_with_remote_paths).
+    async fn run_with_remote_paths(&self, argv: &[&str]) -> Result<SshOutput> {
+        self.run(argv).await
+    }
     /// Run a pre-composed shell script on the remote over the master,
     /// passed as a single un-quoted argument so the remote shell
     /// evaluates its own `&&`/`|`/redirects/quoting. See
@@ -214,6 +224,9 @@ impl SshExec for SshTransport {
     }
     async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
         SshTransport::run(self, argv).await
+    }
+    async fn run_with_remote_paths(&self, argv: &[&str]) -> Result<SshOutput> {
+        SshTransport::run_with_remote_paths(self, argv).await
     }
     async fn run_shell(&self, script: &str) -> Result<SshOutput> {
         SshTransport::run_shell(self, script).await
@@ -278,10 +291,12 @@ pub async fn perform_remote_launch(
         });
     }
 
-    // 3. Launch the (detached) worker.
+    // 3. Launch the (detached) worker. The last argv element is the
+    //    engine-constructed `~/.boss-remote/bin/...` wrapper path, so this
+    //    must go through the remote-path-aware quoting to tilde-expand.
     let argv = build_remote_command(plan);
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = exec.run(&argv_refs).await?;
+    let out = exec.run_with_remote_paths(&argv_refs).await?;
 
     match classify_wrapper_exit(out.status) {
         WrapperLaunch::Launched => Ok(RemoteLaunchOutcome {
