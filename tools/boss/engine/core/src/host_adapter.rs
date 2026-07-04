@@ -438,7 +438,7 @@ impl SshHostAdapter {
         let host = &self.transport.host_id;
         let mkdir = self
             .transport
-            .run(&["mkdir", "-p", remote_dir])
+            .run_with_remote_paths(&["mkdir", "-p", remote_dir])
             .await
             .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
         if !mkdir.success() {

@@ -85,7 +85,7 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
     //    and never fails on an existing directory.
     let mkdir_dir = format!("~/{REMOTE_WRAPPER_DIR}");
     let mkdir = transport
-        .run(&["mkdir", "-p", mkdir_dir.as_str()])
+        .run_with_remote_paths(&["mkdir", "-p", mkdir_dir.as_str()])
         .await
         .with_context(|| format!("mkdir on host {}", transport.host_id))?;
     if !mkdir.success() {
@@ -244,7 +244,7 @@ pub enum VersionCheck {
 pub async fn verify_wrapper_version(transport: &SshTransport) -> Result<VersionCheck> {
     let wrapper_path = remote_wrapper_path();
     let output = transport
-        .run(&[wrapper_path.as_str(), "--version"])
+        .run_with_remote_paths(&[wrapper_path.as_str(), "--version"])
         .await
         .with_context(|| format!("--version probe on host {}", transport.host_id))?;
     if !output.success() {
