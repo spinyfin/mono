@@ -1,8 +1,8 @@
 # Investigation: multi-second task-population delay on app start / product switch
 
-**Status:** investigation complete — no code changed. Deliverable is this writeup plus ranked follow-up chores. **R1 (end-to-end per-segment timing) has since shipped and produced live diagnostics; §10 reports the results. §11 (engine-side segment instrumentation from T2165 / PR #1737) further decomposes §10's opaque `request` segment and locks down the measured root cause, superseding §10.3's speculative "per-row work inside the engine handler or DB layer" guess.**
-**Date:** 2026-07-01 (revised 2026-07-01 — real-data DB validation, see §9; revised 2026-07-03 — live production timing diagnostics, see §10; revised 2026-07-04 — engine-side segment breakdown locks down the measured root cause, see §11)
-**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-DB-snapshot revision); `exec_18bee836b1025060_33` (live-diagnostics revision); `exec_18befac852e7eb08_87` (root-cause-lock-down revision)
+**Status:** RESOLVED — root cause fixed and verified live. §11 locked down the root cause (quadratic client-side read/frame loop in `EngineClient.consumeLines()`); PR #1758 fixed it, shipped in Boss 1.0.162, and §12 confirms the fix on live production timing: `socket_write` p50 for a ~6.28 MB reply dropped ~200× (7,656 ms → 39 ms) and end-to-end population dropped ~29–56× (7.8–10.3 s p50 → ~270–400 ms). No further remediation from this investigation is required; the residual ~270 ms is the known, separately-tracked `db.task_runtimes` N+1 (§11.6 item 3).
+**Date:** 2026-07-01 (revised 2026-07-01 — real-data DB validation, see §9; revised 2026-07-03 — live production timing diagnostics, see §10; revised 2026-07-04 — engine-side segment breakdown locks down the measured root cause, see §11; revised 2026-07-04 — fix verified live post-PR #1758, see §12)
+**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-DB-snapshot revision); `exec_18bee836b1025060_33` (live-diagnostics revision); `exec_18befac852e7eb08_87` (root-cause-lock-down revision); `exec_18bf08a26b79d360_b1` (resolution-verification revision)
 **Scope:** measure and attribute the wall-clock of populating the kanban board (lanes, nav, counts) on (a) cold app start and (b) product switch, then propose remediations grounded in the measurements.
 **Real-data validation:** all DB-dependent numbers in §3/§5 were re-measured against a read-only `.backup` snapshot of the live engine database (§9). **Live validation (§10):** with R1's instrumentation now running in production, the full engine→wire→decode→apply→render path has been measured directly on the live dataset (1,949-item Boss product) instead of reconstructed from a DB snapshot plus structural reasoning about the unmeasured app/engine segments. **Root cause locked down (§11):** T2165 (PR #1737) shipped engine-side per-segment instrumentation that decomposes §10's black-box `request` segment into decode/DB/assemble/queue_wait/serialize/socket_write; a 2026-07-04 live capture shows **97.8% of wall clock is `socket_write`**, not the DB or render. §11 is now the authoritative attribution; read it first, then §10 for how the request-vs-client split was established, then §3–§9 for the investigation's origin and methodology.
 
@@ -458,6 +458,62 @@ Every socket read is capped at 64 KiB (`:1332`), appended to `buffer` (`:1345`),
 - **No per-chunk events.** Today's instrumentation times `socket_write` as one span per request; it does not emit per-syscall or per-chunk timestamps engine-side, so the chunk-size-vs-scan-cost mechanism in §11.5 is derived from reading the client code, not from a chunk-level trace. Instrumenting `NWConnection.receive` chunk arrivals (or the engine's per-`write()` syscall boundaries) would let a future pass confirm the ~94-chunk count and per-chunk scan-cost growth directly instead of computing it from `maximumLength: 64 * 1024` and payload size.
 - **Client-side slow-reader backpressure is not 100% excluded by the timing data alone** — the engine-side JSONL only proves `socket_write` correlates with payload size squared; it cannot, by itself, distinguish "client scans quadratically" from some other client-side or kernel-level slowdown. What resolves this is the code read in §11.5: the 8× throughput difference between the 605 KB and 6.14 MB replies on the _same_ client/socket path is exactly what an O(n²) client scan predicts (small payloads pay negligible quadratic overhead; large ones pay a lot), and it is inconsistent with a fixed per-message or fixed-bandwidth kernel/transport cost, which would show the _same_ throughput regardless of size. The client code is the stronger, corroborating half of this evidence, not the timing data alone.
 - **`db.task_runtimes` query texts (~2.9/row) are not labelled in the schema** — §5.1's N+1 characterization (`query_latest_execution_for_work_item` / `query_live_execution_for_work_item` / `query_latest_run`) is assumed to still be the shape of the 5,865 queries observed live, but this revision did not re-verify that assumption against the live schema; it is inherited from §5/§9 and is not load-bearing for §11's conclusion (DB cost is 1.2% of total regardless of its internal shape).
+
+---
+
+## 12. Resolution — verified fixed by PR #1758 (2026-07-04 revision)
+
+§11.6 item 1 called for fixing the O(n²) client read/frame loop in `EngineClient.consumeLines()` as the dominant fix. **PR #1758, "app-macos: fix O(n²) buffer rescan in EngineClient.consumeLines()"** (merge commit `83c7ed6ce783a75cd4437fabb0d684abce090d29`, merged 2026-07-04 06:05:49Z / 2026-07-03 11:05pm PDT), did exactly that, and this section confirms — with live production timing on both sides of the fix — that it resolved the problem this investigation exists to explain.
+
+### 12.1 Build verification
+
+The running app was confirmed to be on a build containing the fix: `/Applications/Boss.app`'s `Info.plist` reports `CFBundleVersion`/`CFBundleShortVersionString`/`BossFullVersion` all `1.0.162`, and the app/engine restarted onto this build at 2026-07-04 01:01:44 PDT (08:01:44 UTC) — the pre/post cutoff used below. GitHub release `boss-v1.0.162` (tag commit `5b74a226636c256a8da4afa4f22f5cafcdc2067f`, published 2026-07-04 07:34:37Z) is confirmed ahead of the PR #1758 merge commit (`git compare` reports `status: ahead`, `behind_by: 0`), and `EngineClient.swift` at that tag contains the fix — the `unscannedPrefixLength` scan-cursor field and its use sites (a resumable scan cursor replacing the from-scratch `buffer.firstIndex(of: 0x0A)` scan §11.5 identified) are present at lines 351, 1370, 1375, and 1380.
+
+### 12.2 Pre vs. post comparison (engine-side instrumentation, same payload class as §11)
+
+Engine-side segment timing (`engine-population-timing-2026-07-04.jsonl`, the same instrumentation from T2165/PR #1737 used in §11) captured a continuous window straddling the 1:01:44am PDT restart, for the same large product (~2,038–2,040 items, ~6.28 MB payload — the same payload class as §11's 6.14 MB baseline). Pre-fix window: 2026-07-03 8:49pm–2026-07-04 1:01:38am PDT (n=374). Post-fix window: 1:01:46am–1:21:18am PDT (n=79).
+
+| Metric                 | §11 baseline (n=23)       | Pre-fix full window (n=374) | Post-fix (n=79)       |
+| ---------------------- | ------------------------- | --------------------------- | --------------------- |
+| total p50 / max        | 7,832 / 16,376 ms         | 15,113 / 193,481 ms         | **271 / 5,137 ms**    |
+| socket_write p50 / max | 7,656 ms (97.8% of total) | 8,539 / 92,734 ms           | **39 / 2,366 ms**     |
+| queue_wait p50 / max   | 59 / 8,398 ms             | 735 / 100,645 ms            | **81 / 926 ms**       |
+| db.task_runtimes p50   | 79 ms                     | 100 ms                      | 84 ms (unchanged N+1) |
+| serialize p50          | 4.3 ms                    | 5 ms                        | 5 ms                  |
+| socket throughput      | 0.8 MB/s                  | ~0.7 MB/s                   | **~160 MB/s (p50)**   |
+
+`socket_write` improved ~219× (p50, full pre-fix window vs. post-fix; ~196× vs. the §11 baseline); end-to-end total improved ~29–56×. The pre-fix full-window p50 (15.1 s) is higher than §11's clean n=23 capture (7.8 s) because it includes `queue_wait` pile-ups (max total 193 s, consistent with §11.1's serialization-amplifier finding) — the fix eliminates both the base cost and the pile-up, since the pile-up was itself downstream of the slow write (§11.6 item 2).
+
+App-side confirmation (`population-timing-2026-07-04.jsonl`, request segment, items > 1,500): pre-fix p50 10,282 ms (n=704, min 7,019) → post-fix p50 398 ms (n=89). Post-fix per-flow p50s: `product_switch` ~210 ms (n=2), `cold_start` 452 ms (first-ever fetch 1,280 ms, n=11), `invalidation_refetch` 385 ms (n=70), `manual_refresh` 474 ms (n=9).
+
+### 12.3 Representative samples
+
+First post-fix large-product request (1:01:46am PDT), `request_id F5C64D4F-8B34-45DA-9452-F5116452D906`, `fetch_seq` 1:
+
+```json
+{"segment":"serialize","duration_ms":4.113292,"payload_bytes":6282204,"items":2038}
+{"segment":"socket_write","duration_ms":33.493083999999996,"items":2038}
+{"segment":"total","duration_ms":341.841375,"items":2038}
+```
+
+`socket_write` for the 6.28 MB payload: 33.5 ms ≈ 187 MB/s, vs. §11's 7,656 ms ≈ 0.8 MB/s for the same payload class.
+
+Median post-fix request (`fetch_seq` 38, 1:03:29am PDT): `socket_write` 89.6 ms, total 272.7 ms, payload 6,282,295 B.
+
+Worst post-fix request (`fetch_seq` 77, 1:19:45am PDT), captured during CPU-saturating concurrent bazel test load (`engine_lib_test` + `clippy` started 1:17am): `db.task_runtimes` 1,499.8 ms, `socket_write` 2,366.0 ms, total 5,136.5 ms — the inflation is uniform across every segment while payload size stayed constant, the signature of machine-wide contention, **not** a recurrence of the quadratic mechanism. Even this worst post-fix total (5.1 s) is below the pre-fix _minimum_ app-side total (7.0 s).
+
+### 12.4 Conclusion
+
+**Definitive yes: PR #1758 fixed the problem this investigation set out to explain.** At the 1:01:44am PDT build boundary — visible within a single continuous log file, ruling out any measurement-methodology change — `socket_write` for the same ~6.28 MB payload collapsed from p50 8.5 s (97%+ of wall clock) to 39 ms, ~200×, exactly where §11.5's client-backpressure mechanism predicted it would if the O(n²) scan were replaced with an O(1)-amortized cursor. End-to-end task population dropped from ~7.8–10.3 s p50 to ~270–400 ms. The `queue_wait` amplification (§11.6 item 2) resolved as a side effect, as predicted. The residual ~270 ms is now dominated by the known, separately-tracked `db.task_runtimes` N+1 (~84 ms, ~5,980 queries/request, §11.6 item 3) plus noise — consistent with §11.6's follow-up ranking, which correctly predicted this would be the next-largest remaining cost once the dominant fix landed.
+
+### 12.5 Caveats
+
+1. The post-fix window is one app session, 79 large-product engine samples over ~19.5 minutes — ample to establish a ~200× signal, but a single-session sample nonetheless.
+2. Late-window samples (after ~1:07am) rose to 0.5–5.1 s totals under concurrent bazel load (§12.3); the uniform per-segment inflation there is machine contention, not a regression of the fixed mechanism.
+3. Both `cold_start` and `product_switch` flows were exercised post-fix, giving some flow diversity despite the single-session caveat above.
+4. Version-to-commit mapping is via the `boss-v1.0.162` release tag (the bundle carries no embedded commit hash), corroborated by the install/restart time (1:01am PDT) postdating the release publish time (12:34am PDT) and by behavior flipping exactly at the restart boundary rather than gradually.
+
+This closes the investigation. §11.6's remaining items (N+1 cleanup, payload slimming) stand as optional, low-priority follow-up chores — not blockers, and not expected to move perceived latency meaningfully given §12.2's residuals.
 
 ---
 
