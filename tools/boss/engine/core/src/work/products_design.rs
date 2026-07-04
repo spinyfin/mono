@@ -792,7 +792,7 @@ pub(crate) fn resolve_task_doc_pointer(
 /// fields (path, then branch) leaves everything else — however many colons
 /// it has — as the repo. Returns `None` for anything missing the `pr_doc:`
 /// prefix or a field.
-fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_pr_doc_artifact_id(artifact_id: &str) -> Option<(String, String, String)> {
     let rest = artifact_id.strip_prefix("pr_doc:")?;
     let mut parts = rest.rsplitn(3, ':');
     let path = parts.next()?;

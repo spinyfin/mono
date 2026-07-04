@@ -1088,6 +1088,30 @@ pub(crate) fn migrate_answer_agent_runs_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Create the `comment_thread_entries` table — engine-authored (and, in a
+/// later phase, operator-authored) turns in a comment's thread, shared by
+/// the bucket-1&3 nudge and the bucket-2 answer/follow-up paths (P3b of
+/// `comment-triggered-document-revisions.md` §"Reply/link mechanics").
+/// Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`, independent of every
+/// other table so migration order doesn't matter.
+pub(crate) fn migrate_comment_thread_entries_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS comment_thread_entries (
+             id                   TEXT PRIMARY KEY,
+             comment_id           TEXT NOT NULL REFERENCES work_comments(id),
+             entry_kind           TEXT NOT NULL,
+             author               TEXT NOT NULL,
+             body                 TEXT NOT NULL,
+             revise_task_id       TEXT,
+             answer_agent_run_id  TEXT REFERENCES answer_agent_runs(id),
+             created_at           TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS comment_thread_entries_by_comment
+             ON comment_thread_entries(comment_id, created_at);",
+    )?;
+    Ok(())
+}
+
 /// Create the `work_comments` table for the comments-in-markdown-viewer
 /// feature (Phase 2). Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`,
 /// safe to re-run on every engine start. Schema follows design
@@ -1619,30 +1643,6 @@ pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS work_comments_by_revise_task ON work_comments(revise_task_id)",
         [],
-    )?;
-    Ok(())
-}
-
-/// Create the `comment_thread_entries` table — Phase 2 task 2b of
-/// `comment-triggered-document-revisions.md` (the shared "conversation" shape
-/// behind bucket 1&3's nudge and bucket 2's answer/follow-up). Independent of
-/// every other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
-/// Mirrors `migrate_answer_agent_runs_table`'s idempotent table-creation
-/// pattern. Design § "Reply/link mechanics".
-pub(crate) fn migrate_comment_thread_entries_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS comment_thread_entries (
-             id                  TEXT PRIMARY KEY,
-             comment_id          TEXT NOT NULL REFERENCES work_comments(id),
-             entry_kind          TEXT NOT NULL,
-             author              TEXT NOT NULL,
-             body                TEXT NOT NULL,
-             revise_task_id      TEXT,
-             answer_agent_run_id TEXT REFERENCES answer_agent_runs(id),
-             created_at          TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS comment_thread_entries_by_comment
-             ON comment_thread_entries(comment_id, created_at);",
     )?;
     Ok(())
 }

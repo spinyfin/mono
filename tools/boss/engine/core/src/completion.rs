@@ -64,7 +64,8 @@ use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeD
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget,
+    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck,
+    THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
 };
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_github::pr_url::pr_number_from_url;
@@ -1171,6 +1172,18 @@ impl WorkerCompletionHandler {
             return self.finalize_automation_triage(&execution).await;
         }
 
+        // P3b: an `answer_agent` execution never opens a PR either. Its
+        // reply — if any — was already posted mid-session via
+        // `CommentsPostAnswer` (the `boss comment reply` command), which
+        // already completed the `answer_agent_runs` row and transitioned the
+        // comment. This just finalises the execution/run rows and, if the
+        // agent's session ended without ever posting a reply, resolves the
+        // stranded `running` run so the comment doesn't sit in `answering`
+        // forever.
+        if execution.kind == ExecutionKind::AnswerAgent {
+            return self.finalize_answer_agent(&execution).await;
+        }
+
         // P992: a `pr_review` reviewer execution never opens a PR. It reads
         // the PR diff and emits structured findings; the producing task already
         // advanced to `in_review` on PR-open, so the Stop handler just finalises
@@ -2232,6 +2245,138 @@ must not be asked to open one",
         StopOutcome::AutomationTriage {
             outcome: outcome.to_owned(),
         }
+    }
+
+    /// P3b: resolve a finished `answer_agent` execution when its Stop hook
+    /// fires. Unlike triage, there is no marker protocol to parse here — the
+    /// agent's *only* permitted write is `CommentsPostAnswer` (`boss comment
+    /// reply`), which the RPC handler already used to complete the
+    /// `answer_agent_runs` row, post the `entry_kind = 'answer'` thread
+    /// entry, and transition the comment `answering → answered` mid-session.
+    /// So this handler's real job is the failure path: if the run is STILL
+    /// `running` when Stop fires (the agent crashed, ran out of turns, or
+    /// otherwise ended without ever posting a reply), resolve it here so the
+    /// comment doesn't sit `answering` forever — mark the run `failed` and
+    /// post an apology thread entry standing in for the missing answer,
+    /// mirroring the design's `answering → answered` transition (an
+    /// unanswered question is still "no longer in flight").
+    ///
+    /// Either way, finalise the execution (`completed`) and release its pane
+    /// + workspace, mirroring `finalize_automation_triage`'s tail.
+    async fn finalize_answer_agent(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let comment_id = execution.work_item_id.clone();
+        let replied = match self.work_db.running_answer_agent_run_for_comment(&comment_id) {
+            Ok(Some(run)) => {
+                if let Err(err) = self.work_db.complete_answer_agent_run(
+                    &run.id,
+                    ANSWER_AGENT_RUN_STATUS_FAILED,
+                    None,
+                    Some("no_reply_posted"),
+                ) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        run_id = %run.id,
+                        ?err,
+                        "answer-agent finalizer: failed to mark the stranded run 'failed'",
+                    );
+                }
+                if let Err(err) = self.work_db.create_comment_thread_entry(
+                    &comment_id,
+                    THREAD_ENTRY_KIND_ANSWER,
+                    "engine",
+                    "I wasn't able to finish answering this question — the session ended before \
+                     posting a reply. Please try again, or answer directly.",
+                    None,
+                    Some(&run.id),
+                ) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        run_id = %run.id,
+                        ?err,
+                        "answer-agent finalizer: failed to post the no-reply-posted thread entry",
+                    );
+                }
+                if let Err(err) = self.work_db.transition_comment_to_answered(&comment_id) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        comment_id = %comment_id,
+                        ?err,
+                        "answer-agent finalizer: failed to transition the comment to 'answered'",
+                    );
+                }
+                false
+            }
+            Ok(None) => true, // already completed via `CommentsPostAnswer` mid-session
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %comment_id,
+                    ?err,
+                    "answer-agent finalizer: failed to look up the running run; \
+                     leaving comment state as-is",
+                );
+                true
+            }
+        };
+
+        // Finalise the execution + release pane and cube workspace, mirroring
+        // the triage finalizer's release order. Capture the lease id before
+        // `finish_execution_run` nulls the lease columns.
+        let lease_id = execution.cube_lease_id.clone();
+        match self.work_db.active_run_ids_for_execution(&execution.id) {
+            Ok(run_ids) => {
+                for run_id in run_ids {
+                    if let Err(err) = self.work_db.finish_execution_run(
+                        &execution.id,
+                        &run_id,
+                        ExecutionStatus::Completed,
+                        "completed",
+                        Some(if replied {
+                            "answer agent: replied"
+                        } else {
+                            "answer agent: no reply posted"
+                        }),
+                        None,
+                        /* clear_workspace_lease */ true,
+                        None,
+                    ) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            run_id,
+                            ?err,
+                            "failed to finish answer-agent execution run",
+                        );
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to list active runs for answer-agent finalisation",
+            ),
+        }
+        if let Some(lease_id) = lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "answer-agent finalisation: cube workspace release failed",
+            );
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+        self.publisher
+            .publish(&execution.id, &comment_id, "completed", "answer_agent_completed")
+            .await;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            comment_id = %comment_id,
+            replied,
+            "answer-agent execution finalised",
+        );
+        StopOutcome::AnswerAgent { replied }
     }
 
     /// P992 task 8: finalise a `pr_review` reviewer execution when its Stop
@@ -3443,6 +3588,9 @@ must not be asked to open one",
             // Unreachable here (this finalizer only runs for `ci_remediation`
             // kind), but a triage outcome must never mark a CI attempt failed.
             StopOutcome::AutomationTriage { .. } => false,
+            // Unreachable here for the same reason: an answer-agent outcome
+            // must never mark a CI attempt failed either.
+            StopOutcome::AnswerAgent { .. } => false,
             // Unreachable: reviewer executions short-circuit before CI
             // remediation finalisation. Covered for exhaustiveness.
             StopOutcome::ReviewerEnqueued { .. }
@@ -5221,6 +5369,13 @@ pub enum StopOutcome {
     /// finalised (`completed`) and its pane/workspace released regardless of
     /// which marker (if any) the agent emitted.
     AutomationTriage { outcome: String },
+    /// P3b: an `answer_agent` execution finished. `replied` is `true` when
+    /// the agent posted its reply mid-session via `CommentsPostAnswer`
+    /// before Stop fired, `false` when the session ended without one (the
+    /// finalizer marks the run `failed` and posts an apology thread entry so
+    /// the comment doesn't sit in `answering` forever). The execution is
+    /// finalised (`completed`) and its pane/workspace released either way.
+    AnswerAgent { replied: bool },
     /// P992 task 7: a primary-implementation worker's PR was detected and
     /// an independent reviewer pass has been enqueued. The producing task
     /// remains in `active` (Doing column) until the reviewer resolves.
@@ -5451,7 +5606,9 @@ mod tests {
     }
 
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
-    use crate::work::{CreateChoreInput, CreateExecutionInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItem};
+    use crate::work::{
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItem,
+    };
 
     /// Captured arguments from one `detect_pr` call. Tests assert on
     /// these to confirm the branch name passed in is execution-unique
@@ -5795,6 +5952,170 @@ mod tests {
             .unwrap();
 
         (db, product.id, chore.id, execution.id)
+    }
+
+    /// Stand up a `question`-classified comment already `answering`, with its
+    /// tracking `answer_agent_runs` row (`running`) and a `running`
+    /// `answer_agent` execution bound to it — the state `finalize_answer_agent`
+    /// (called from `on_stop`) expects to find. Returns `(db, comment_id,
+    /// run_id, execution_id)`.
+    fn answer_agent_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let comment = db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "pr_doc".into(),
+                author: "human".into(),
+                body: "What does this mean?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        db.set_comment_intent(&comment.id, crate::work::INTENT_QUESTION, 0.9)
+            .unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        let run = db
+            .create_answer_agent_run(
+                &comment.id,
+                &comment.artifact_kind,
+                &comment.artifact_id,
+                &comment.doc_version,
+                0,
+            )
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment.id, &product.repo_remote_url.clone().unwrap())
+            .unwrap();
+        let (execution, _run_row) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        (db, comment.id, run.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answered() {
+        // Regression test for the "stranded running run" edge case: the
+        // agent's session ended (Stop fired) without ever calling
+        // `CommentsPostAnswer` to post a reply. `finalize_answer_agent` must
+        // mark the still-`running` run 'failed', post an apology thread
+        // entry, and force the comment `answering -> answered` so it doesn't
+        // sit unanswered forever.
+        let workspace = tempdir().unwrap();
+        let (db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane.clone(), probes);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::AnswerAgent { replied: false }),
+            "expected AnswerAgent {{ replied: false }}, got {outcome:?}",
+        );
+
+        let run = db
+            .get_answer_agent_run(&run_id)
+            .unwrap()
+            .expect("run should still exist");
+        assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_FAILED);
+        assert_eq!(run.error_kind.as_deref(), Some("no_reply_posted"));
+
+        let comment = db
+            .get_comment(&comment_id)
+            .unwrap()
+            .expect("comment should still exist");
+        assert_eq!(comment.status, "answered");
+
+        let entries = db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(entries.len(), 1, "an apology thread entry should have been posted");
+        assert_eq!(entries[0].entry_kind, THREAD_ENTRY_KIND_ANSWER);
+
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "the cube lease must still be released even on the no-reply path",
+        );
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn on_stop_finalizes_answer_agent_already_replied_mid_session() {
+        // Happy-path counterpart: the reply was already posted via
+        // `CommentsPostAnswer` mid-session (run -> 'replied', comment ->
+        // 'answered') before Stop ever fired. `finalize_answer_agent` must
+        // detect there's no longer a `running` run and leave that state
+        // alone — it should only finalise the execution/run rows and
+        // release resources.
+        let workspace = tempdir().unwrap();
+        let (db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
+        db.complete_answer_agent_run(
+            &run_id,
+            boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED,
+            Some("here's the answer"),
+            None,
+        )
+        .unwrap();
+        db.transition_comment_to_answered(&comment_id).unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube.clone(), publisher, pane.clone(), probes);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::AnswerAgent { replied: true }),
+            "expected AnswerAgent {{ replied: true }}, got {outcome:?}",
+        );
+
+        let run = db
+            .get_answer_agent_run(&run_id)
+            .unwrap()
+            .expect("run should still exist");
+        assert_eq!(
+            run.status,
+            boss_protocol::ANSWER_AGENT_RUN_STATUS_REPLIED,
+            "the already-replied run must not be touched by the finalizer",
+        );
+        let comment = db
+            .get_comment(&comment_id)
+            .unwrap()
+            .expect("comment should still exist");
+        assert_eq!(comment.status, "answered");
+
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
     }
 
     fn ci_remediation_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String, String) {
