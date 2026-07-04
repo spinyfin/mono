@@ -22,6 +22,7 @@
 //!   db.ai_reviewing
 //!   db.doc_pointers  per-task doc-pointer resolution (gated N+1)
 //!   assemble         in-memory projection / flag attachment
+//!   queue_wait       handler enqueue → writer-task dequeue (session backlog)
 //!   serialize        serde_json of the whole WorkTree response
 //!   socket_write     bytes written + flushed to the Unix socket
 //!   total            line receipt → last byte flushed (the whole window)
@@ -40,8 +41,9 @@
 //!   `<boss-state-root>/diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`
 //!
 //! (`<boss-state-root>` = `~/Library/Application Support/Boss`, overridable
-//! for local runs / tests via `BOSS_ENGINE_DIAGNOSTICS_DIR`.) The rotation,
-//! retention, and background-writer conventions mirror [`crate::ipc_log`].
+//! for local runs / tests via `BOSS_ENGINE_DIAGNOSTICS_DIR`.) Rotation,
+//! retention, and the background-writer task are the generic machinery in
+//! [`crate::day_rotated_log`], shared with [`crate::ipc_log`].
 //!
 //! # Correlation
 //!
@@ -57,15 +59,12 @@
 //! records per fetch; emission is a non-blocking channel send to a
 //! background writer task. Nothing runs unless a `GetWorkTree` is served.
 
-use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::mpsc;
 
-/// Days of history retained before a rotated file is pruned. Matches the
-/// app-side `PopulationTimingLog` and [`crate::ipc_log`] default.
-const RETAIN_DAYS: u64 = 7;
+use crate::day_rotated_log::DayRotatedLogger;
 
 /// Environment override for the diagnostics directory. When set (and
 /// non-empty after trimming) the day files are written under this path
@@ -98,6 +97,10 @@ pub mod segment {
     pub const DB_DOC_POINTERS: &str = "db.doc_pointers";
     /// In-memory projection / flag attachment (no DB).
     pub const ASSEMBLE: &str = "assemble";
+    /// Handler enqueue → writer-task dequeue. Non-zero only when the
+    /// session's writer queue has other events ahead of this response;
+    /// otherwise the gap is negligible and this segment stays near zero.
+    pub const QUEUE_WAIT: &str = "queue_wait";
     /// `serde_json` serialization of the whole `WorkTree` response.
     pub const SERIALIZE: &str = "serialize";
     /// Bytes written + flushed to the socket.
@@ -143,6 +146,12 @@ pub struct EnginePopulationRecord {
     pub items: Option<i64>,
 }
 
+impl crate::day_rotated_log::TimestampedRecord for EnginePopulationRecord {
+    fn ts_epoch_ms(&self) -> u128 {
+        self.ts_epoch_ms
+    }
+}
+
 /// One recorded segment, pending flush. Stamped with its own wall-clock
 /// time so the flushed lines preserve per-segment ordering even though a
 /// whole trace is emitted at once.
@@ -184,6 +193,11 @@ pub struct PopulationTrace {
     /// decode. `None` marks a disabled trace.
     started: Option<Instant>,
     segments: Vec<PendingSegment>,
+    /// Set by [`Self::mark_enqueued`] when the handler hands the trace to
+    /// the writer task's session queue. [`Self::record_queue_wait`] turns
+    /// the gap between that instant and its own call into the `queue_wait`
+    /// segment, then clears this so a repeat call is a no-op.
+    enqueued_at: Option<Instant>,
 }
 
 impl PopulationTrace {
@@ -204,6 +218,7 @@ impl PopulationTrace {
             },
             started: Some(started),
             segments: Vec::new(),
+            enqueued_at: None,
         }
     }
 
@@ -219,6 +234,7 @@ impl PopulationTrace {
             },
             started: None,
             segments: Vec::new(),
+            enqueued_at: None,
         }
     }
 
@@ -259,7 +275,26 @@ impl PopulationTrace {
     /// Elapsed ms since the window start, or `0.0` if disabled/unset.
     /// Used by the writer to compute the `total` segment.
     pub fn elapsed_ms(&self) -> f64 {
-        self.started.map(|s| elapsed_ms(s)).unwrap_or(0.0)
+        self.started.map(elapsed_ms).unwrap_or(0.0)
+    }
+
+    /// Mark the instant the handler hands this trace off to the writer
+    /// task's session queue (stashed just before the response is enqueued).
+    /// No-op on a disabled trace.
+    pub fn mark_enqueued(&mut self) {
+        if self.is_enabled() {
+            self.enqueued_at = Some(Instant::now());
+        }
+    }
+
+    /// Record the `queue_wait` segment: the gap between [`Self::mark_enqueued`]
+    /// and this call, i.e. how long the response sat in the writer task's
+    /// session queue before being dequeued for serialization. No-op if
+    /// `mark_enqueued` was never called (or the trace is disabled).
+    pub fn record_queue_wait(&mut self) {
+        if let Some(enqueued_at) = self.enqueued_at.take() {
+            self.record_plain(segment::QUEUE_WAIT, elapsed_ms(enqueued_at));
+        }
     }
 
     fn push(
@@ -275,7 +310,7 @@ impl PopulationTrace {
         }
         self.segments.push(
             PendingSegment::builder()
-                .ts_epoch_ms(now_ms())
+                .ts_epoch_ms(crate::day_rotated_log::now_ms())
                 .segment(segment)
                 .duration_ms(duration_ms)
                 .maybe_rows(rows)
@@ -327,38 +362,30 @@ pub fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1_000.0
 }
 
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
+const FILE_PREFIX: &str = "engine-population-timing-";
 
 /// Non-blocking, append-only day-rotated writer for the engine
-/// population-timing log. Entries are sent over an in-process channel to a
-/// background task that owns the file handle and does all I/O — the serve
-/// path never blocks on disk. Mirrors [`crate::ipc_log::IpcLogger`].
+/// population-timing log. Built on [`crate::day_rotated_log::DayRotatedLogger`],
+/// the same machinery [`crate::ipc_log::IpcLogger`] uses.
 pub struct PopulationTimingLog {
-    tx: mpsc::UnboundedSender<EnginePopulationRecord>,
+    inner: DayRotatedLogger<EnginePopulationRecord>,
 }
 
 impl PopulationTimingLog {
     /// Create a logger that writes day files directly under `dir`. Spawns
     /// the background writer task when a Tokio runtime is available; when
     /// created outside a runtime (synchronous tests) entries queue and are
-    /// dropped on sender drop — use [`Self::new_blocking`] to test I/O.
+    /// dropped on sender drop.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(writer_task(dir.into(), rx));
+        Self {
+            inner: DayRotatedLogger::new(dir, FILE_PREFIX),
         }
-        Self { tx }
     }
 
     /// Fire-and-forget a segment record. Dropped silently if the writer
     /// task has exited.
     pub fn emit(&self, rec: EnginePopulationRecord) {
-        let _ = self.tx.send(rec);
+        self.inner.emit(rec);
     }
 }
 
@@ -384,102 +411,9 @@ fn resolve_diagnostics_dir() -> Option<PathBuf> {
     Some(boss_log_files::default_state_root()?.join("diagnostics"))
 }
 
-async fn writer_task(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<EnginePopulationRecord>) {
-    use std::io::Write;
-
-    let mut current_date = String::new();
-    let mut file: Option<std::fs::File> = None;
-
-    while let Some(rec) = rx.recv().await {
-        let date_str = epoch_ms_to_date(rec.ts_epoch_ms);
-
-        if date_str != current_date {
-            // Date rolled over: close the old file and prune old logs.
-            file = None;
-            prune_old_files(&dir, RETAIN_DAYS);
-        }
-
-        if file.is_none() {
-            if let Err(err) = std::fs::create_dir_all(&dir) {
-                tracing::warn!(
-                    ?err,
-                    "population_timing: failed to create diagnostics dir; dropping entry"
-                );
-                continue;
-            }
-            let path = dir.join(format!("engine-population-timing-{date_str}.jsonl"));
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(f) => {
-                    file = Some(f);
-                    current_date = date_str;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        path = %path.display(),
-                        "population_timing: failed to open log file; dropping entry"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        let Some(ref mut f) = file else { continue };
-        match serde_json::to_vec(&rec) {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                if let Err(err) = f.write_all(&bytes) {
-                    tracing::warn!(?err, "population_timing: write failed; dropping entry");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(?err, "population_timing: serialization failed; dropping entry");
-            }
-        }
-    }
-}
-
-fn prune_old_files(dir: &Path, keep_days: u64) {
-    let cutoff_ms = now_ms().saturating_sub(u128::from(keep_days) * 86_400_000);
-    let cutoff_date = epoch_ms_to_date(cutoff_ms);
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(date_part) = name
-            .strip_prefix("engine-population-timing-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-            && date_part < cutoff_date.as_str()
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// UTC `YYYY-MM-DD` for an epoch-millis instant. Uses `chrono` (already a
-/// dep) so the day boundary matches the app-side UTC formatter exactly.
-fn epoch_ms_to_date(ms: u128) -> String {
-    match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64) {
-        Some(dt) => dt.format("%Y-%m-%d").to_string(),
-        None => "1970-01-01".to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn epoch_ms_to_date_known_values() {
-        // 2026-05-14 00:00:00 UTC = 1 778 716 800 seconds
-        let ms = 1_778_716_800_000u128;
-        assert_eq!(epoch_ms_to_date(ms), "2026-05-14");
-        assert_eq!(epoch_ms_to_date(ms + 43_200_000), "2026-05-14"); // noon
-        assert_eq!(epoch_ms_to_date(ms + 86_400_000), "2026-05-15"); // next day
-    }
 
     #[test]
     fn disabled_trace_records_nothing() {
@@ -565,7 +499,7 @@ mod tests {
         let log = PopulationTimingLog::new(dir.path());
 
         log.emit(EnginePopulationRecord {
-            ts_epoch_ms: now_ms(),
+            ts_epoch_ms: crate::day_rotated_log::now_ms(),
             product_id: "prod-1".to_owned(),
             request_id: "req-1".to_owned(),
             fetch_seq: Some(3),
@@ -596,27 +530,6 @@ mod tests {
         assert_eq!(entry["product_id"], "prod-1");
         assert_eq!(entry["fetch_seq"], 3);
         assert_eq!(entry["items"], 1949);
-    }
-
-    #[test]
-    fn prune_old_files_removes_stale() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path()).unwrap();
-
-        let old_ms = now_ms().saturating_sub(8 * 86_400_000);
-        let old_date = epoch_ms_to_date(old_ms);
-        let old_path = dir.path().join(format!("engine-population-timing-{old_date}.jsonl"));
-        std::fs::write(&old_path, b"old\n").unwrap();
-
-        let recent_ms = now_ms().saturating_sub(3 * 86_400_000);
-        let recent_date = epoch_ms_to_date(recent_ms);
-        let recent_path = dir.path().join(format!("engine-population-timing-{recent_date}.jsonl"));
-        std::fs::write(&recent_path, b"recent\n").unwrap();
-
-        prune_old_files(dir.path(), RETAIN_DAYS);
-
-        assert!(!old_path.exists(), "8-day-old file should be pruned");
-        assert!(recent_path.exists(), "3-day-old file should be kept");
     }
 
     #[test]

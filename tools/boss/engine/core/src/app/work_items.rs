@@ -846,8 +846,12 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
 
     match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
         Ok(tree) => {
-            // Stash BEFORE enqueueing: the writer task runs concurrently and
-            // must find the trace by `request_id` when it pops this response.
+            // Mark the handoff instant so the writer task can attribute the
+            // time this trace spends sitting in the session's writer queue
+            // (queue_wait), then stash BEFORE enqueueing: the writer task
+            // runs concurrently and must find the trace by `request_id`
+            // when it pops this response.
+            trace.mark_enqueued();
             sink.stash_population_trace(&request_id, trace);
             send_response_with_revision(
                 &sink,

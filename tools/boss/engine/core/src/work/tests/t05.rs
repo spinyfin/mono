@@ -2577,7 +2577,8 @@ fn set_task_doc_pointer_branch_only_keeps_path() {
     db.set_task_doc_pointer(&task.id, None, Some("main"), None).unwrap();
 
     let conn = db.connect().unwrap();
-    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None)
+    let mut queries = 0u64;
+    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut queries)
         .unwrap()
         .expect("pointer still set");
     match state {
@@ -2594,7 +2595,8 @@ fn resolve_task_doc_pointer_none_when_unset() {
     let db = WorkDb::open(temp_db_path("task-doc-resolve-unset")).unwrap();
     let (_product, task) = seed_investigation_for_doc(&db);
     let conn = db.connect().unwrap();
-    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None).unwrap();
+    let mut queries = 0u64;
+    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut queries).unwrap();
     assert!(state.is_none(), "no pointer -> None so the affordance stays hidden");
 }
 
@@ -2606,7 +2608,8 @@ fn resolve_task_doc_pointer_builds_same_product_urls() {
         .unwrap();
 
     let conn = db.connect().unwrap();
-    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None)
+    let mut queries = 0u64;
+    let state = resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut queries)
         .unwrap()
         .expect("pointer set -> resolved");
     match state {

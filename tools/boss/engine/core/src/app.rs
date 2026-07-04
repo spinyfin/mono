@@ -2273,6 +2273,9 @@ async fn handle_frontend_connection(
                 .request_id
                 .as_deref()
                 .and_then(|rid| writer_sink.take_population_trace(rid));
+            if let Some(t) = trace.as_mut() {
+                t.record_queue_wait();
+            }
 
             let serialize_start = Instant::now();
             let line = match serde_json::to_string(&event) {

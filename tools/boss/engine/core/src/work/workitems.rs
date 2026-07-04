@@ -443,15 +443,19 @@ impl WorkDb {
         //
         // Secondary, gated N+1: only the docs-backed subset enters
         // `resolve_task_doc_pointer` (2-3 queries each). `resolved` is the
-        // number of items that did, i.e. the rows this loop touched.
+        // number of items that did, i.e. the rows this loop touched;
+        // `doc_pointer_queries` is the aggregate statement count across all
+        // of them, exposing the per-row fan-out the same way
+        // `db.task_runtimes` does.
         let t = Instant::now();
         let mut resolved = 0usize;
+        let mut doc_pointer_queries = 0u64;
         for task in &mut tasks {
             if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
                 continue;
             }
             resolved += 1;
-            match resolve_task_doc_pointer(&conn, &task.id, |_| None) {
+            match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
                 Ok(state) => task.doc_link_state = state,
                 Err(err) => tracing::warn!(
                     task_id = %task.id,
@@ -460,7 +464,7 @@ impl WorkDb {
                 ),
             }
         }
-        trace.record_query(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved);
+        trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
         Ok(WorkTree {
             product,
