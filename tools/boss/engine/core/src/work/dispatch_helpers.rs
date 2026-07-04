@@ -1172,6 +1172,92 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     )
 }
 
+/// Re-fire the automated review pipeline for `work_item_id` by enqueuing a
+/// fresh `pr_review` execution. Shared by two callers:
+///
+/// - [`crate::pr_review_recovery`]'s dead-review sweep, which calls this
+///   when a prior `pr_review` execution died (host failure, cube-lease
+///   reap, crash) without ever reaching `finalize_pr_review_pass` — a
+///   review that silently vanished must not leave the PR unreviewed.
+/// - the operator-facing `bossctl review start --pr <n>` verb, for a
+///   deliberate re-review after an incident or significant new commits.
+///
+/// Unlike [`request_execution_in_tx_with_live_check`], this does NOT go
+/// through [`execution_kind_for_work_item`] — that resolver only knows
+/// about the task-kind-derived implementation kinds and has no notion of
+/// `pr_review`, so a generic redispatch would wrongly spawn a fresh
+/// implementer on top of an already-open PR instead of re-running the
+/// reviewer. This function always creates `ExecutionKind::PrReview`.
+///
+/// Refuses (returns `Err`) when:
+/// - the work item is unknown or soft-deleted,
+/// - the work item's status is terminal (`done`/`archived`/`cancelled`) —
+///   nothing left to review,
+/// - `pr_url` is unset — the item has no PR yet,
+/// - the live PR-state probe reports the PR merged or closed — nothing to
+///   review; the human enqueue path and the sweep both want this to fail
+///   loudly rather than dispatch a reviewer at a dead PR,
+/// - a live execution (`running`/`waiting_human`) of ANY kind already
+///   claims the item — re-triggering would race that worker.
+///
+/// Idempotent when a non-terminal `pr_review` execution (`ready` /
+/// `waiting_dependency`) is already the item's latest execution: returns
+/// that row instead of creating a duplicate.
+pub(crate) fn request_pr_review_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_checker: &dyn PrStateChecker,
+) -> Result<WorkExecution> {
+    let task = query_task(conn, work_item_id)?
+        .filter(|t| t.deleted_at.is_none())
+        .with_context(|| format!("unknown task: {work_item_id}"))?;
+
+    if task.status.is_terminal() {
+        bail!(
+            "cannot review {work_item_id}: task is `{}` — terminal work items have no open PR to review",
+            task.status
+        );
+    }
+
+    let pr_url = task
+        .pr_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("cannot review {work_item_id}: task has no open PR (pr_url unset)"))?
+        .to_owned();
+
+    match pr_checker.check(&pr_url)? {
+        PrOpenState::Merged => bail!("cannot review {work_item_id}: PR {pr_url} is already merged"),
+        PrOpenState::ClosedUnmerged => bail!("cannot review {work_item_id}: PR {pr_url} is closed (not merged)"),
+        PrOpenState::Open => {}
+    }
+
+    if let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? {
+        bail!(
+            "cannot review {work_item_id}: execution {} ({}) is already live for this item — \
+             wait for it to finish or cancel it first",
+            live.id,
+            live.kind,
+        );
+    }
+
+    if let Some(latest) = query_latest_execution_for_work_item(conn, work_item_id)?
+        && latest.kind == ExecutionKind::PrReview
+        && !latest.status.is_terminal()
+    {
+        return Ok(latest);
+    }
+
+    insert_execution(
+        conn,
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id.to_owned())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,5 +1860,138 @@ mod tests {
             "dispatch-time catch-up archive must also tombstone the row, matching \
              block_pending_revisions_on_parent_close"
         );
+    }
+
+    // ── request_pr_review ───────────────────────────────────────────────────
+
+    fn chore_with_pr(db: &WorkDb, pr_url: &str, status: &str) -> String {
+        let product = product_with_repo(db, Some("https://github.com/test/repo"));
+        let chore = db
+            .create_chore(CreateChoreInput::builder().product_id(product).name("chore").build())
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some(status.to_owned()),
+                pr_url: Some(pr_url.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        chore.id
+    }
+
+    #[test]
+    fn request_pr_review_creates_fresh_ready_execution() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/1", "active");
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let execution = db.request_pr_review(&work_item_id, &checker).unwrap();
+
+        assert_eq!(execution.kind, ExecutionKind::PrReview);
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+        assert_eq!(execution.work_item_id, work_item_id);
+    }
+
+    #[test]
+    fn request_pr_review_is_idempotent_on_existing_ready_pr_review() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/2", "active");
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let first = db.request_pr_review(&work_item_id, &checker).unwrap();
+        let second = db.request_pr_review(&work_item_id, &checker).unwrap();
+
+        assert_eq!(
+            first.id, second.id,
+            "a second trigger while a pr_review is already queued must reuse the same execution"
+        );
+    }
+
+    #[test]
+    fn request_pr_review_refuses_when_no_pr_url() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("https://github.com/test/repo"));
+        let chore = db
+            .create_chore(CreateChoreInput::builder().product_id(product).name("chore").build())
+            .unwrap();
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let err = db.request_pr_review(&chore.id, &checker).unwrap_err();
+        assert!(err.to_string().contains("no open PR"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn request_pr_review_refuses_when_task_terminal() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/3", "done");
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let err = db.request_pr_review(&work_item_id, &checker).unwrap_err();
+        assert!(err.to_string().contains("done"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn request_pr_review_refuses_when_pr_merged() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/4", "active");
+        let checker = FakePrStateChecker::always(PrOpenState::Merged);
+
+        let err = db.request_pr_review(&work_item_id, &checker).unwrap_err();
+        assert!(err.to_string().contains("already merged"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn request_pr_review_refuses_when_pr_closed_unmerged() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/5", "active");
+        let checker = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
+
+        let err = db.request_pr_review(&work_item_id, &checker).unwrap_err();
+        assert!(err.to_string().contains("closed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn request_pr_review_refuses_when_execution_already_live() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/6", "active");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+                 VALUES ('exec_live_test', ?1, 'chore_implementation', 'running', 'https://github.com/test/repo', ?2)",
+                params![work_item_id, now_string()],
+            )
+            .unwrap();
+        }
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let err = db.request_pr_review(&work_item_id, &checker).unwrap_err();
+        assert!(err.to_string().contains("already live"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn request_pr_review_accepts_friendly_id() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("https://github.com/test/repo"));
+        let chore = db
+            .create_chore(CreateChoreInput::builder().product_id(product).name("chore").build())
+            .unwrap();
+        let short_id = chore.short_id.expect("chore has a short id");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                pr_url: Some("https://github.com/test/repo/pull/7".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let friendly_id = format!("T{short_id}");
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let execution = db.request_pr_review(&friendly_id, &checker).unwrap();
+        assert_eq!(execution.work_item_id, chore.id);
     }
 }

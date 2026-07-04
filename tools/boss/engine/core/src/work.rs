@@ -170,6 +170,21 @@ pub struct AbandonedStrandedExecution {
     pub work_item_id: String,
 }
 
+/// One work item returned by
+/// [`WorkDb::list_dead_pr_review_candidates`] — a non-terminal work item
+/// whose latest execution is a `pr_review` that reached a terminal state
+/// (`orphaned`/`abandoned`/`failed`/`cancelled`) WITHOUT ever reaching
+/// `finalize_pr_review_pass` (the only path that produces `completed`).
+/// The review died silently — host failure, cube-lease reap, crash — and
+/// the PR it was reviewing may now merge with no automated review and no
+/// visible signal that one is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadPrReviewCandidate {
+    pub work_item_id: String,
+    pub execution_id: String,
+    pub execution_status: ExecutionStatus,
+}
+
 /// A task returned by
 /// [`WorkDb::list_in_review_tasks_for_doc_branch_backfill`] — an
 /// `in_review` task whose doc-branch pointer is `NULL` and that has a

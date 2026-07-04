@@ -54,11 +54,11 @@ use crate::gh_invocation::gh_output;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
-use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
+use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrStateChecker, WorkDb};
 use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
-use boss_protocol::{self, TaskKind};
+use boss_protocol::{self, CreateAttentionItemInput, TaskKind};
 
 /// Review-gating state of a PR at probe time. Derived from
 /// GitHub's `reviewDecision` field and the `reviews` array.
@@ -1301,6 +1301,11 @@ pub struct SweepOutcome {
     /// or has been running past the stale threshold. Ensures the hold
     /// always resolves so no card is stranded in Doing forever.
     pub reviewer_fallback_advanced: usize,
+    /// Of the `reviewer_fallback_advanced` count, how many also got a fresh
+    /// `pr_review` execution re-enqueued immediately (the rest are pending
+    /// re-fire via `pr_review_recovery` once their stale execution is
+    /// reaped — see `sweep_stalled_reviewer`).
+    pub reviewer_fallback_review_refired: usize,
     /// Number of `in_revision` comments reopened (comment-intent-
     /// classification design §"Reconciliation", task 2c) because the task
     /// that was addressing them — or a revision in its chain — had its PR
@@ -1526,7 +1531,16 @@ pub async fn run_one_pass(
         }
     };
     for (task_id, product_id, pr_url) in &stalled_candidates {
-        sweep_stalled_reviewer(work_db, publisher, task_id, product_id, pr_url, &mut outcome).await;
+        sweep_stalled_reviewer(
+            work_db,
+            publisher,
+            task_id,
+            product_id,
+            pr_url,
+            &GhPrStateChecker,
+            &mut outcome,
+        )
+        .await;
     }
 
     outcome
@@ -2690,12 +2704,27 @@ pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
 /// its AI reviewer pass has either finished without advancing it (missed Stop
 /// hook) or has been running past the stale threshold (timeout). Ensures the
 /// `PendingReview` hold always resolves so no card is stranded in Doing.
+///
+/// Incident (2026-07-04, T2235 / PR spinyfin/mono#1766): this fallback used
+/// to ONLY unstick the kanban lane, silently leaving the PR with no
+/// completed AI review — indistinguishable in the UI from a task that was
+/// reviewed and found clean. Advancing the task now also (a) re-enqueues a
+/// fresh `pr_review` execution via `WorkDb::request_pr_review` (the same
+/// path `bossctl review start` and the dead-review recovery sweep use) and
+/// (b) files a `pr_review_died_without_findings` attention item so the gap
+/// is visible instead of silent. Re-enqueue is best-effort: if the stale
+/// reviewer execution is still nominally `running` (the timeout sub-case),
+/// `request_pr_review` correctly refuses — a wedged worker must be reaped
+/// first (`stale_worker_sweep`/`transient_recovery`), after which the
+/// standalone `pr_review_recovery` sweep picks it up. Either way the
+/// attention item is filed so the gap is never silent.
 async fn sweep_stalled_reviewer(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     task_id: &str,
     product_id: &str,
     pr_url: &str,
+    pr_checker: &dyn PrStateChecker,
     outcome: &mut SweepOutcome,
 ) {
     match work_db.advance_pending_review_task_to_in_review(task_id) {
@@ -2710,6 +2739,57 @@ async fn sweep_stalled_reviewer(
                 .publish_work_item_changed(product_id, task_id, "reviewer_fallback_advanced")
                 .await;
             outcome.reviewer_fallback_advanced += 1;
+
+            match work_db.request_pr_review(task_id, pr_checker) {
+                Ok(execution) => {
+                    tracing::warn!(
+                        task_id,
+                        pr_url,
+                        execution_id = %execution.id,
+                        "merge poller: reviewer-fallback re-enqueued a fresh pr_review \
+                         execution — the prior pass never produced findings",
+                    );
+                    outcome.reviewer_fallback_review_refired += 1;
+                }
+                Err(err) => {
+                    // Best-effort: the stale reviewer may still be nominally
+                    // `running` (timeout sub-case) — `request_pr_review`
+                    // correctly refuses to double-dispatch. The standalone
+                    // `pr_review_recovery` sweep re-attempts once that
+                    // execution is reaped. Not re-enqueuing here must never
+                    // block filing the attention item below.
+                    tracing::warn!(
+                        task_id,
+                        pr_url,
+                        error = %err,
+                        "merge poller: reviewer-fallback could not re-enqueue a review \
+                         (will retry via pr_review_recovery once any stale execution is reaped)",
+                    );
+                }
+            }
+
+            let body = "The automated reviewer for this PR did not complete a review pass before \
+                 the merge-poller's reviewer-fallback advanced this task to Review — its \
+                 `pr_review` execution either finished without ever writing a `ReviewResult`, \
+                 or was still running past the 10-minute stale threshold. This is distinct \
+                 from \"reviewed, no findings.\" A fresh review has been (or will shortly be) \
+                 re-enqueued; dismiss this item once that pass completes."
+                .to_owned();
+            if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
+                execution_id: None,
+                work_item_id: Some(task_id.to_owned()),
+                kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
+                status: None,
+                title: "Automated review did not complete — advanced without a review".to_owned(),
+                body_markdown: body,
+                resolved_at: None,
+            }) {
+                tracing::warn!(
+                    task_id,
+                    ?err,
+                    "merge poller: failed to file review-missing attention item",
+                );
+            }
         }
         Ok(false) => {
             // No-op. Either the task was already past `active` (a concurrent
@@ -3069,6 +3149,149 @@ mod tests {
         )
         .unwrap();
         (product.id, chore.id)
+    }
+
+    /// Build a `kind = 'chore'` row held `active` (P992 `PendingReview`)
+    /// with a `pr_review` execution in the given terminal-but-not-completed
+    /// status — the reviewer-fallback candidate shape
+    /// `list_tasks_with_stalled_reviewer` targets (T2235 / PR #1766: a
+    /// `pr_review` pane-spawn failure left the execution `failed` while the
+    /// task stayed `active`).
+    fn make_chore_active_with_dead_review(
+        db: &WorkDb,
+        name: &str,
+        pr_url: &str,
+        review_status: &str,
+    ) -> (String, String) {
+        let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("https://github.com/foo/bar"));
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name(name)
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(boss_protocol::ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                rusqlite::params![execution.id, review_status],
+            )
+            .unwrap();
+        (product.id, chore.id)
+    }
+
+    #[tokio::test]
+    async fn stalled_reviewer_fallback_refires_review_and_files_attention() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1766";
+        let (product_id, task_id) = make_chore_active_with_dead_review(&db, "T2235", pr, "failed");
+
+        let publisher = Arc::new(RecordingPublisher::default());
+        let checker = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open);
+        let mut outcome = SweepOutcome::default();
+
+        sweep_stalled_reviewer(
+            &db,
+            publisher.as_ref(),
+            &task_id,
+            &product_id,
+            pr,
+            &checker,
+            &mut outcome,
+        )
+        .await;
+
+        assert_eq!(outcome.reviewer_fallback_advanced, 1);
+        assert_eq!(
+            outcome.reviewer_fallback_review_refired, 1,
+            "a dead (terminal, non-completed) pr_review execution must be re-enqueued immediately"
+        );
+
+        let item = db.get_work_item(&task_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let executions = db.list_executions(Some(&task_id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.kind == boss_protocol::ExecutionKind::PrReview && e.status == ExecutionStatus::Ready),
+            "expected a fresh ready pr_review execution; got: {executions:?}"
+        );
+
+        let attentions = db.list_attention_items_for_work_item(&task_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND),
+            "expected a pr_review_died_without_findings attention item; got: {attentions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_reviewer_fallback_skips_refire_when_execution_still_running() {
+        // Timeout sub-case: the pr_review execution is still nominally
+        // `running` (wedged, not yet reaped). The fallback must still
+        // unstick the kanban lane and file the attention item, but must
+        // NOT double-dispatch a second reviewer on top of the still-live
+        // (even if wedged) one.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1767";
+        let (product_id, task_id) = make_chore_active_with_dead_review(&db, "T-timeout", pr, "running");
+
+        let publisher = Arc::new(RecordingPublisher::default());
+        let checker = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open);
+        let mut outcome = SweepOutcome::default();
+
+        sweep_stalled_reviewer(
+            &db,
+            publisher.as_ref(),
+            &task_id,
+            &product_id,
+            pr,
+            &checker,
+            &mut outcome,
+        )
+        .await;
+
+        assert_eq!(outcome.reviewer_fallback_advanced, 1);
+        assert_eq!(
+            outcome.reviewer_fallback_review_refired, 0,
+            "must not re-enqueue while the stale execution is still nominally live"
+        );
+
+        let attentions = db.list_attention_items_for_work_item(&task_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND),
+            "attention item must still be filed even when re-fire is deferred"
+        );
     }
 
     #[tokio::test]

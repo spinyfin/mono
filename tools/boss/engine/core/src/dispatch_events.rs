@@ -149,6 +149,16 @@ pub enum Stage {
     /// `bossctl dispatch tail` can filter orphan-sweep redispatches
     /// separately from human-initiated ones.
     OrphanActiveRedispatch,
+    /// The periodic pr_review dead-review recovery sweep
+    /// (`pr_review_recovery`) found a `pr_review` execution that reached a
+    /// terminal state without ever finalizing (host failure, cube-lease
+    /// reap, crash) and re-enqueued a fresh `pr_review` execution against
+    /// the same PR. `details` carries the dead execution's id and status.
+    /// Distinct from `orphan_active_redispatch`: that sweep explicitly
+    /// excludes these items (it has no notion of `pr_review` as a kind and
+    /// would wrongly redispatch an implementer) so this stage's presence
+    /// is the sole signal that a review was auto-recovered.
+    PrReviewDeadRecovery,
     /// The periodic dead-PID sweep found a claimed worker slot whose
     /// backing OS process is gone (ESRCH from `kill(pid, 0)`). The
     /// execution has been marked `orphaned`, the pool slot released,
@@ -332,6 +342,7 @@ impl Stage {
             Stage::PaneSpawned => "pane_spawned",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
+            Stage::PrReviewDeadRecovery => "pr_review_dead_recovery",
             Stage::DeadPidReconcile => "dead_pid_reconcile",
             Stage::DispatchDecision => "dispatch_decision",
             Stage::TransientRecovery => "transient_recovery",
@@ -832,6 +843,7 @@ mod tests {
         assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
+        assert_eq!(Stage::PrReviewDeadRecovery.as_str(), "pr_review_dead_recovery");
         assert_eq!(Stage::DeadPidReconcile.as_str(), "dead_pid_reconcile");
         assert_eq!(Stage::DispatchDecision.as_str(), "dispatch_decision");
         assert_eq!(Stage::TransientRecovery.as_str(), "transient_recovery");

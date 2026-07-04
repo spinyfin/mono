@@ -68,6 +68,7 @@ pub mod population_timing;
 pub mod populator;
 pub use boss_pr_template as pr_template;
 pub mod pr_review;
+pub mod pr_review_recovery;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod recovery_backup;

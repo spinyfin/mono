@@ -1574,6 +1574,28 @@ pub enum FrontendRequest {
         lines: usize,
     },
 
+    /// Re-fire the automated review pipeline for a PR on demand —
+    /// `bossctl review start --pr <n>`. Enqueues a fresh `pr_review`
+    /// execution against the work item bound to `pr_number`, the same
+    /// dispatch path the engine's dead-review auto-recovery sweep uses
+    /// (see `pr_review_recovery`). Useful for post-hoc review after an
+    /// incident (a prior reviewer died without producing findings) or a
+    /// deliberate re-review after significant new commits.
+    ///
+    /// `repo` disambiguates when the same PR number exists in more than
+    /// one repo (mirrors `FindWorkItemsByPr`'s ambiguity handling).
+    ///
+    /// Replies with [`FrontendEvent::PrReviewTriggered`] on success, or
+    /// `WorkError` when: no work item is bound to the PR (or the match
+    /// is ambiguous and `repo` doesn't narrow it to one), the item has
+    /// no open PR, the item is terminal, or a live execution already
+    /// claims the item.
+    TriggerPrReview {
+        pr_number: i64,
+        #[serde(default)]
+        repo: Option<String>,
+    },
+
     /// Remove the external-tracker binding from a work item. Clears the
     /// `external_ref_*` columns without touching other fields. Replies with
     /// [`FrontendEvent::WorkItemUpdated`] carrying the updated row, or
@@ -1743,6 +1765,14 @@ pub enum FrontendEvent {
     },
     ExecutionRequested {
         execution: WorkExecution,
+    },
+    /// Reply for [`FrontendRequest::TriggerPrReview`]. Carries the
+    /// freshly-enqueued (or reused, if one was already queued) `pr_review`
+    /// execution, the work item it targets, and the PR URL under review.
+    PrReviewTriggered {
+        execution: WorkExecution,
+        work_item_id: String,
+        pr_url: String,
     },
     RunsList {
         execution_id: String,

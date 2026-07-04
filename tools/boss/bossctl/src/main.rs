@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 
 mod logs;
+mod review;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -96,6 +97,11 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Automated-review control verbs.
+    Review {
+        #[command(subcommand)]
+        action: review::ReviewAction,
     },
     /// Diagnose the live-status pipeline (engine build SHA, API key
     /// presence, per-slot trigger/outcome/transcript-path detail).
@@ -687,6 +693,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
+        Command::Review {
+            action: review::ReviewAction::Start { pr_number, repo },
+        } => review::review_start(&cli.socket_path, cli.json, pr_number, repo).await,
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,

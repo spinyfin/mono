@@ -2816,6 +2816,7 @@ async fn handle_frontend_connection(
                 external_tracker::handle_sync_product_external_tracker(ctx, r).await
             }
             r @ FrontendRequest::TailRunTranscript { .. } => executions::handle_tail_run_transcript(ctx, r).await,
+            r @ FrontendRequest::TriggerPrReview { .. } => review::handle_trigger_pr_review(ctx, r).await,
             r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
             }

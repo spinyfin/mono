@@ -54,6 +54,24 @@ impl WorkDb {
         Ok(execution)
     }
 
+    /// Re-fire the automated review pipeline for `work_item_id`'s
+    /// currently-open PR by enqueuing a fresh `pr_review` execution.
+    ///
+    /// Accepts a friendly id (`T3`) or a primary `task_…` id. The single
+    /// dispatch path shared by the dead-review auto-recovery sweep
+    /// ([`crate::pr_review_recovery`]) and the operator-facing `bossctl
+    /// review start --pr <n>` verb — see
+    /// [`dispatch_helpers::request_pr_review_in_tx`] for the full refusal
+    /// conditions and idempotency contract.
+    pub fn request_pr_review(&self, work_item_id: &str, pr_checker: &dyn PrStateChecker) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
+        let tx = conn.transaction()?;
+        let execution = request_pr_review_in_tx(&tx, &resolved, pr_checker)?;
+        tx.commit()?;
+        Ok(execution)
+    }
+
     /// Repo-resolution precheck that does not create or mutate any
     /// `work_executions` row. The kanban drag-to-Doing path calls this
     /// before flipping `tasks.status = 'active'` so a deterministic
@@ -606,6 +624,24 @@ impl WorkDb {
     /// non-terminal execution (if any) is claimed by a live worker
     /// slot — that check requires in-memory worker-pool state that the
     /// DB layer does not have access to.
+    ///
+    /// Excludes items whose latest **`pr_review`** execution is a
+    /// *terminal-but-not-completed* one (`orphaned`/`abandoned`/`failed`/
+    /// `cancelled`) — i.e. a reviewer pass that died (host failure,
+    /// cube-lease reap, crash) without ever finalizing. The "latest"
+    /// comparison is scoped to `pr_review`-kind rows so an unrelated
+    /// terminal execution of a different kind created afterwards (e.g. a
+    /// churned `chore_implementation` retry) never masks a still-dead
+    /// review. A `running`/`waiting_human` `pr_review` is unaffected by
+    /// this exclusion (it is still a candidate here, handled by the
+    /// existing running-reviewer defense-in-depth check below) — only the
+    /// dead ones are diverted. `execution_kind_for_work_item` has no
+    /// notion of `pr_review` (it only derives the task-kind-based
+    /// implementation kinds), so if this sweep redispatched a dead-review
+    /// item it would wrongly spawn a fresh implementer on top of an
+    /// already-open PR instead of re-running the reviewer. Those items are
+    /// handled exclusively by [`crate::pr_review_recovery`], which creates
+    /// the correct `pr_review` execution kind.
     pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let now_secs: i64 = SystemTime::now()
@@ -640,12 +676,83 @@ impl WorkDb {
                      AND a.status = 'open'
                      AND a.kind IN ('{permanent}', '{exhausted}')
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = t.id
+                     AND we.kind = 'pr_review'
+                     AND we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM work_executions we2
+                         WHERE we2.work_item_id = t.id
+                           AND we2.kind = 'pr_review'
+                           AND (we2.created_at > we.created_at
+                                OR (we2.created_at = we.created_at AND we2.id > we.id))
+                     )
+               )
              ORDER BY t.updated_at ASC, t.id ASC",
             permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
             exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
         );
         let mut stmt = conn.prepare(&stmt_sql)?;
         let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Return every non-terminal, non-deleted work item with an open PR
+    /// whose latest **`pr_review`** execution reached a terminal state
+    /// WITHOUT ever finalizing — see [`DeadPrReviewCandidate`]. Used by
+    /// [`crate::pr_review_recovery`]'s sweep to auto-refire the review
+    /// pipeline for a PR whose reviewer died mid-run (host failure,
+    /// cube-lease reap, crash) so the PR is never silently left unreviewed.
+    ///
+    /// `we.status != 'completed'` is the detection signal:
+    /// `finalize_pr_review_pass` is the ONLY path that transitions a
+    /// `pr_review` execution to `completed` (success or reviewer give-up
+    /// both still finalize as `completed`), so any other terminal status
+    /// on the item's latest `pr_review` execution means that path never
+    /// ran.
+    ///
+    /// The "latest" comparison is scoped to `kind = 'pr_review'` rows only
+    /// (not the item's latest execution of ANY kind) — a work item can
+    /// accumulate unrelated terminal executions of other kinds (e.g. a
+    /// churned `chore_implementation` retry) after its review died without
+    /// that superseding the dead review; scoping by kind is what makes this
+    /// query answer "has a fresh review been attempted since the last one
+    /// died," not "is a pr_review the single most recent row of any kind."
+    pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, we.id, we.status
+             FROM tasks t
+             JOIN work_executions we ON we.work_item_id = t.id
+             WHERE t.deleted_at IS NULL
+               AND t.status NOT IN ('done', 'archived', 'cancelled')
+               AND t.pr_url IS NOT NULL AND t.pr_url != ''
+               AND we.kind = 'pr_review'
+               AND we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we2
+                   WHERE we2.work_item_id = t.id
+                     AND we2.kind = 'pr_review'
+                     AND (we2.created_at > we.created_at
+                          OR (we2.created_at = we.created_at AND we2.id > we.id))
+               )
+             ORDER BY t.updated_at ASC, t.id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status: String = row.get(2)?;
+            Ok(DeadPrReviewCandidate {
+                work_item_id: row.get(0)?,
+                execution_id: row.get(1)?,
+                execution_status: status.parse().map_err(|e: String| {
+                    rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+                })?,
+            })
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
