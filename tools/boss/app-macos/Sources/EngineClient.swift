@@ -341,6 +341,14 @@ final class EngineClient: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
     private var buffer = Data()
+    /// Byte count at the front of `buffer` already scanned for a newline
+    /// with none found. `consumeLines()` resumes scanning from here instead
+    /// of `buffer`'s start, so a large multi-chunk message (e.g. a ~6 MB
+    /// `work_tree` reply arriving as ~94 64 KiB reads) doesn't re-scan
+    /// already-scanned bytes on every chunk — that repeated full-buffer
+    /// scan was O(n²) in the message size. Reset to 0 whenever a line is
+    /// consumed, since the unscanned region starts over from the new front.
+    private var unscannedPrefixLength = 0
     private var shouldReconnect = false
 
     init(socketPath: String) {
@@ -1358,9 +1366,18 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func consumeLines() {
-        while let newline = buffer.firstIndex(of: 0x0A) {
+        while true {
+            let searchStart = buffer.index(buffer.startIndex, offsetBy: unscannedPrefixLength)
+            guard let newline = buffer[searchStart...].firstIndex(of: 0x0A) else {
+                // No delimiter in the unscanned tail; remember how much of
+                // `buffer` we've already ruled out so the next chunk's
+                // arrival only scans what's new.
+                unscannedPrefixLength = buffer.count
+                return
+            }
             let lineData = buffer[..<newline]
             buffer.removeSubrange(...newline)
+            unscannedPrefixLength = 0
 
             guard !lineData.isEmpty else {
                 continue
