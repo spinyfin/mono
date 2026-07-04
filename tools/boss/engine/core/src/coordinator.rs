@@ -1209,6 +1209,27 @@ impl ExecutionCoordinator {
         .await
     }
 
+    /// Run one cross-host remote-lease reconcile pass and kick the
+    /// scheduler if anything was reaped (a cleared remote zombie unblocks
+    /// the redundant-spawn guard for its work item). Thin binding of the
+    /// coordinator's `work_db` + host-adapter provider + dispatch-event
+    /// sink to [`crate::remote_lease_reconcile::reconcile_remote_leases`];
+    /// the periodic sweep in `app.rs` drives it.
+    pub async fn reconcile_remote_leases_once(
+        self: &Arc<Self>,
+    ) -> crate::remote_lease_reconcile::RemoteLeaseReconcileOutcome {
+        let outcome = crate::remote_lease_reconcile::reconcile_remote_leases(
+            &self.work_db,
+            self.host_adapter_provider.as_ref(),
+            self.dispatch_events.as_ref(),
+        )
+        .await;
+        if outcome.reaped > 0 {
+            self.kick();
+        }
+        outcome
+    }
+
     /// Return a clone of the automation worker pool handle. Used by
     /// `app.rs` to expose the pool's live state to the Agents-tab UI.
     pub fn automation_worker_pool(&self) -> WorkerPool {
@@ -2846,6 +2867,10 @@ impl ExecutionCoordinator {
                 repo.repo_id.as_str(),
                 "--task",
                 task.as_str(),
+                // Mirror the flag the actual lease call passes (see
+                // `cube_commands::lease_workspace`) so this diagnostic repr
+                // reproduces exactly what ran.
+                "--release-on-setup-failure",
             ];
             if let Some(p) = execution.preferred_workspace_id.as_deref() {
                 lease_args.extend_from_slice(&["--prefer", p]);
@@ -3409,7 +3434,15 @@ impl ExecutionCoordinator {
 
         // Build the lease args for attempt 1 so we can attach the
         // exact command to both the attempted and failed events.
-        let mut attempt1_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
+        let mut attempt1_args = vec![
+            "--json",
+            "workspace",
+            "lease",
+            repo.repo_id.as_str(),
+            "--task",
+            task,
+            "--release-on-setup-failure",
+        ];
         if let Some(p) = prefer {
             attempt1_args.extend_from_slice(&["--prefer", p]);
         }
@@ -3471,6 +3504,15 @@ impl ExecutionCoordinator {
                     error = format!("{err:#}"),
                     "cube workspace lease attempt failed"
                 );
+                let mut details = serde_json::json!({
+                    "attempt": 1,
+                    "prefer_workspace_id": prefer,
+                    "reason": reason,
+                    "fallback_policy": fallback_policy,
+                    "allow_dirty": allow_dirty,
+                    "excluded_workspace_ids": refused,
+                });
+                augment_details_with_cube_cli_error(&mut details, &err);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
@@ -3479,14 +3521,7 @@ impl ExecutionCoordinator {
                             .with_cube_repo(&repo.repo_id)
                             .with_error(&err)
                             .with_cube_invocation(attempt1_repr)
-                            .with_details(serde_json::json!({
-                                "attempt": 1,
-                                "prefer_workspace_id": prefer,
-                                "reason": reason,
-                                "fallback_policy": fallback_policy,
-                                "allow_dirty": allow_dirty,
-                                "excluded_workspace_ids": refused,
-                            })),
+                            .with_details(details),
                     )
                     .await;
                 err
@@ -3509,7 +3544,15 @@ impl ExecutionCoordinator {
             return Err(first_err);
         }
 
-        let mut attempt2_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
+        let mut attempt2_args = vec![
+            "--json",
+            "workspace",
+            "lease",
+            repo.repo_id.as_str(),
+            "--task",
+            task,
+            "--release-on-setup-failure",
+        ];
         for excluded in &refused_refs {
             attempt2_args.extend_from_slice(&["--exclude", excluded]);
         }
@@ -3552,6 +3595,15 @@ impl ExecutionCoordinator {
                     error = format!("{err:#}"),
                     "cube workspace lease fallback also failed"
                 );
+                let mut details = serde_json::json!({
+                    "attempt": 2,
+                    "prefer_workspace_id": serde_json::Value::Null,
+                    "reason": reason,
+                    "fallback_policy": "none",
+                    "fallback_from_prefer": prefer,
+                    "excluded_workspace_ids": refused,
+                });
+                augment_details_with_cube_cli_error(&mut details, &err);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
@@ -3560,14 +3612,7 @@ impl ExecutionCoordinator {
                             .with_cube_repo(&repo.repo_id)
                             .with_error(&err)
                             .with_cube_invocation(attempt2_repr)
-                            .with_details(serde_json::json!({
-                                "attempt": 2,
-                                "prefer_workspace_id": serde_json::Value::Null,
-                                "reason": reason,
-                                "fallback_policy": "none",
-                                "fallback_from_prefer": prefer,
-                                "excluded_workspace_ids": refused,
-                            })),
+                            .with_details(details),
                     )
                     .await;
                 CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
@@ -4433,6 +4478,38 @@ fn work_item_product_id(item: &WorkItem) -> String {
     }
 }
 
+/// Copy a [`crate::cube_commands::CubeCliError`]'s structured exit code +
+/// stderr into a dispatch-event `details` object when the failure was a
+/// non-zero cube CLI exit (the anaplian failure-mode A: cube granted the
+/// lease then a setup step exited non-zero). No-op for any other error —
+/// a local timeout, a plain `anyhow!` from a test fake — so the field set
+/// stays additive. Walks the error chain so a future `.context(…)` wrap
+/// doesn't hide the typed cause.
+fn augment_details_with_cube_cli_error(details: &mut serde_json::Value, err: &anyhow::Error) {
+    let Some(cube_err) = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<crate::cube_commands::CubeCliError>())
+    else {
+        return;
+    };
+    let Some(obj) = details.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "cube_exit_code".to_owned(),
+        match cube_err.exit_code {
+            Some(code) => serde_json::json!(code),
+            None => serde_json::Value::Null,
+        },
+    );
+    // Clip so a step that dumps a large trace can't bloat the JSONL line.
+    obj.insert(
+        "cube_stderr".to_owned(),
+        serde_json::json!(cube_err.clipped_stderr(2000)),
+    );
+    obj.insert("cube_host".to_owned(), serde_json::json!(cube_err.host));
+}
+
 /// The owning project id for capability-requirement lookup, if any. A
 /// project is its own subject; a product has none.
 fn work_item_project_id(item: &WorkItem) -> Option<String> {
@@ -4755,6 +4832,12 @@ mod tests {
         repos: Mutex<Vec<CubeRepoSummary>>,
         fail_ensure: bool,
         fail_lease: bool,
+        /// Model the anaplian failure-mode A: cube exits non-zero on a
+        /// post-lease setup step, surfaced as a typed [`CubeCliError`]
+        /// carrying the exit code + stderr (as the remote SSH adapter
+        /// does). Lets a test assert those signals reach the dispatch
+        /// event `details`.
+        fail_lease_with_cube_cli_error: bool,
         /// Simulate cube refusing a `--prefer` request because the
         /// preferred workspace is held: `lease_workspace` errors when
         /// `prefer_workspace_id` is `Some(_)`. Models the "prefer set,
@@ -4833,6 +4916,17 @@ mod tests {
                 exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
             ));
             drop(calls);
+            if self.fail_lease_with_cube_cli_error {
+                return Err(crate::cube_commands::CubeCliError {
+                    host: "anaplian".to_owned(),
+                    exit_code: Some(1),
+                    stderr: "setup step `copy-config-secrets` failed: cp: backend/config-secrets.toml: \
+                             No such file or directory"
+                        .to_owned(),
+                    stdout: String::new(),
+                }
+                .into());
+            }
             if self.fail_lease {
                 return Err(anyhow!("cube workspace lease failed"));
             }
@@ -6620,6 +6714,81 @@ mod tests {
         assert!(!stages.contains(&"cube_change_created"));
         assert!(!stages.contains(&"run_started"));
         assert!(!stages.contains(&"pane_spawned"));
+    }
+
+    /// The anaplian failure-mode A produced an opaque `reason: "cube_error"`
+    /// even though the engine held the real cause (cube granted the lease,
+    /// then a setup step exited non-zero). Pin that a typed `CubeCliError`
+    /// now propagates its exit code + stderr into the `cube_workspace_lease_failed`
+    /// event `details` so the failure is attributable in one read.
+    #[tokio::test]
+    async fn cube_lease_failure_surfaces_exit_code_and_stderr_in_details() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Cleanup")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease_with_cube_cli_error: true,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![])
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+        let events = recording.events_for(&execution_id).await;
+        let lease_failed = events
+            .iter()
+            .find(|event| event.stage == "cube_workspace_lease_failed")
+            .expect("cube_workspace_lease_failed event missing");
+        // The structured exit code is now attributable without parsing.
+        assert_eq!(
+            lease_failed.details.get("cube_exit_code").and_then(|v| v.as_i64()),
+            Some(1),
+            "lease_failed must carry the cube exit code; got {:?}",
+            lease_failed.details,
+        );
+        // The real cause (the setup-step stderr) rides the event, not just
+        // the flattened error_message.
+        assert!(
+            lease_failed
+                .details
+                .get("cube_stderr")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("copy-config-secrets")),
+            "lease_failed must carry the cube stderr; got {:?}",
+            lease_failed.details,
+        );
+        assert_eq!(
+            lease_failed.details.get("cube_host").and_then(|v| v.as_str()),
+            Some("anaplian"),
+        );
+        // The verbatim message is still preserved for humans.
+        assert!(
+            lease_failed
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("copy-config-secrets")),
+        );
     }
 
     /// `cube repo ensure` failures used to be recorded as
