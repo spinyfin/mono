@@ -806,3 +806,405 @@ fn find_most_recent_open_task_ignores_deleted_tasks() {
         "soft-deleted task must not be returned"
     );
 }
+
+// ── scheduler due-selection + run-recording ──────────────────────────────────
+//
+// These behavior tests exercise the scheduler-facing query/mutation surface in
+// `automations.rs` (documented invariants, previously untested). They assert on
+// observable state via the public query methods, never on internal SQL.
+
+/// Insert an automation row directly, bypassing `create_automation`, so a test
+/// can control the columns the scheduler filters on (`enabled`, `trigger_kind`,
+/// `next_due_at`, `created_at`). Returns the generated automation id.
+///
+/// Needed because the public `create_automation` path only produces enabled,
+/// `schedule`-triggered rows with `next_due_at = NULL` and a `now`-stamped
+/// `created_at` — it cannot express the disabled / non-schedule / pre-initialised
+/// / distinctly-timed rows these tests need to prove the filters and ordering.
+fn insert_raw_automation(
+    db: &WorkDb,
+    product_id: &str,
+    enabled: bool,
+    trigger_kind: &str,
+    next_due_at: Option<i64>,
+    created_at: &str,
+) -> String {
+    let id = next_id("auto");
+    let conn = db.connect().unwrap();
+    // A valid `schedule` config body (the discriminator is stored separately in
+    // `trigger_kind`). Non-schedule rows are never deserialised by the queries
+    // under test (they filter `trigger_kind = 'schedule'` or aggregate without
+    // mapping), so this body is harmless for them and satisfies the mapper for
+    // schedule rows.
+    let trigger_config = r#"{"cron":"0 14 * * 1-5","timezone":"America/Los_Angeles"}"#;
+    conn.execute(
+        "INSERT INTO automations
+             (id, product_id, name, trigger_kind, trigger_config, standing_instruction,
+              open_task_limit, enabled, created_via, created_at, updated_at, next_due_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'inst', 1, ?6, 'cli', ?7, ?7, ?8)",
+        rusqlite::params![
+            id,
+            product_id,
+            "raw automation",
+            trigger_kind,
+            trigger_config,
+            enabled as i64,
+            created_at,
+            next_due_at.map(|v| v.to_string()),
+        ],
+    )
+    .unwrap();
+    id
+}
+
+/// `list_due_automations(now)` returns only enabled, `schedule`-triggered rows
+/// whose `next_due_at` is NULL (never initialised) or `<= now`. Disabled,
+/// non-schedule, and not-yet-due rows are all excluded.
+#[test]
+fn list_due_automations_filters_to_enabled_schedule_and_due() {
+    let db = WorkDb::open(temp_db_path("auto-due-filter")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let now = 1_700_000_000i64;
+
+    // Should be selected: never-initialised (NULL), due-in-the-past, due-exactly-now.
+    let uninit = insert_raw_automation(&db, &product.id, true, "schedule", None, "1700000001");
+    let past = insert_raw_automation(&db, &product.id, true, "schedule", Some(now - 60), "1700000002");
+    let exactly_now = insert_raw_automation(&db, &product.id, true, "schedule", Some(now), "1700000003");
+
+    // Should be excluded.
+    let _future = insert_raw_automation(&db, &product.id, true, "schedule", Some(now + 60), "1700000004");
+    let _disabled = insert_raw_automation(&db, &product.id, false, "schedule", Some(now - 60), "1700000005");
+    let _non_schedule = insert_raw_automation(&db, &product.id, true, "manual", Some(now - 60), "1700000006");
+
+    let due: Vec<String> = db
+        .list_due_automations(now)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+
+    assert_eq!(due.len(), 3, "exactly the three due rows, got {due:?}");
+    assert!(due.contains(&uninit), "uninitialised (next_due_at NULL) is due");
+    assert!(due.contains(&past), "past next_due_at is due");
+    assert!(due.contains(&exactly_now), "next_due_at == now is due (inclusive)");
+}
+
+/// `list_due_automations` orders results `created_at ASC, id ASC`. We insert in
+/// a deliberately shuffled created_at order and assert the returned order sorts
+/// by created_at ascending.
+#[test]
+fn list_due_automations_orders_by_created_at_ascending() {
+    let db = WorkDb::open(temp_db_path("auto-due-order")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let now = 1_700_000_000i64;
+
+    // Insert out of chronological order.
+    let middle = insert_raw_automation(&db, &product.id, true, "schedule", None, "1700000200");
+    let oldest = insert_raw_automation(&db, &product.id, true, "schedule", None, "1700000100");
+    let newest = insert_raw_automation(&db, &product.id, true, "schedule", None, "1700000300");
+
+    let order: Vec<String> = db
+        .list_due_automations(now)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+
+    assert_eq!(order, vec![oldest, middle, newest], "sorted by created_at ASC");
+}
+
+/// `list_min_next_due_at_for_scheduler()` on an empty automation set returns
+/// `(None, false)`: no minimum, and no uninitialised rows.
+#[test]
+fn list_min_next_due_returns_none_false_when_empty() {
+    let db = WorkDb::open(temp_db_path("auto-min-empty")).unwrap();
+    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    assert_eq!(min_next_due, None);
+    assert!(!has_uninitialized);
+}
+
+/// `list_min_next_due_at_for_scheduler()` returns MIN(next_due_at) over enabled
+/// `schedule` rows with a non-NULL `next_due_at`, and `true` for the uninitialised
+/// flag when any enabled `schedule` row still has `next_due_at IS NULL`. Disabled
+/// and non-schedule rows are ignored for both the minimum and the flag.
+#[test]
+fn list_min_next_due_computes_min_and_uninitialized_flag() {
+    let db = WorkDb::open(temp_db_path("auto-min-flag")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+
+    // Enabled schedule rows with initialised next_due_at — the minimum is 300.
+    insert_raw_automation(&db, &product.id, true, "schedule", Some(500), "1700000001");
+    insert_raw_automation(&db, &product.id, true, "schedule", Some(300), "1700000002");
+    // Enabled schedule row still uninitialised — drives the flag true.
+    insert_raw_automation(&db, &product.id, true, "schedule", None, "1700000003");
+    // Excluded: a disabled row with a smaller value, and a non-schedule row with
+    // a smaller value + NULL — neither may influence the min or the flag.
+    insert_raw_automation(&db, &product.id, false, "schedule", Some(100), "1700000004");
+    insert_raw_automation(&db, &product.id, true, "manual", None, "1700000005");
+
+    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    assert_eq!(min_next_due, Some(300), "MIN over enabled schedule initialised rows");
+    assert!(has_uninitialized, "an enabled schedule row is still uninitialised");
+}
+
+/// The uninitialised flag is `false` when every enabled `schedule` row has a
+/// non-NULL `next_due_at`, even though non-schedule / disabled NULL rows exist.
+#[test]
+fn list_min_next_due_flag_false_when_all_schedule_rows_initialized() {
+    let db = WorkDb::open(temp_db_path("auto-min-flag-false")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+
+    insert_raw_automation(&db, &product.id, true, "schedule", Some(700), "1700000001");
+    // NULL rows that must NOT flip the flag: disabled schedule + enabled manual.
+    insert_raw_automation(&db, &product.id, false, "schedule", None, "1700000002");
+    insert_raw_automation(&db, &product.id, true, "manual", None, "1700000003");
+
+    let (min_next_due, has_uninitialized) = db.list_min_next_due_at_for_scheduler().unwrap();
+    assert_eq!(min_next_due, Some(700));
+    assert!(!has_uninitialized, "no enabled schedule row is uninitialised");
+}
+
+/// `initialize_automation_next_due_at` parks `next_due_at` without disturbing
+/// `updated_at` or the `last_*` fire bookkeeping. We stamp sentinels on those
+/// columns first, then assert only `next_due_at` moved.
+#[test]
+fn initialize_automation_next_due_at_parks_without_touching_bookkeeping() {
+    let db = WorkDb::open(temp_db_path("auto-init-due")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+
+    // Stamp distinguishable sentinels on the columns that must be preserved.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE automations
+                SET updated_at = 'SENTINEL_UPDATED',
+                    last_fired_at = 'SENTINEL_FIRED',
+                    last_outcome = 'SENTINEL_OUTCOME'
+              WHERE id = ?1",
+            rusqlite::params![automation.id],
+        )
+        .unwrap();
+    }
+
+    db.initialize_automation_next_due_at(&automation.id, 1_700_000_500)
+        .unwrap();
+
+    let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
+    assert_eq!(
+        reloaded.next_due_at.as_deref(),
+        Some("1700000500"),
+        "next_due_at is parked"
+    );
+    assert_eq!(reloaded.updated_at, "SENTINEL_UPDATED", "updated_at untouched");
+    assert_eq!(
+        reloaded.last_fired_at.as_deref(),
+        Some("SENTINEL_FIRED"),
+        "last_fired_at untouched"
+    );
+    assert_eq!(
+        reloaded.last_outcome.as_deref(),
+        Some("SENTINEL_OUTCOME"),
+        "last_outcome untouched"
+    );
+}
+
+/// `automation_run_for_occurrence` returns the row for a fired occurrence and
+/// `None` for an `(automation_id, scheduled_for)` pair that never fired.
+#[test]
+fn automation_run_for_occurrence_returns_row_only_for_fired_pair() {
+    let db = WorkDb::open(temp_db_path("auto-run-occurrence")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+    let scheduled_for = 1_700_000_000i64;
+
+    // Unfired occurrence → None.
+    assert!(
+        db.automation_run_for_occurrence(&automation.id, scheduled_for)
+            .unwrap()
+            .is_none(),
+        "no run recorded yet for this occurrence"
+    );
+
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(scheduled_for)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+            .next_due_at(scheduled_for + 86_400)
+            .build(),
+    )
+    .unwrap();
+
+    // Fired occurrence → the recorded row.
+    let run = db
+        .automation_run_for_occurrence(&automation.id, scheduled_for)
+        .unwrap()
+        .expect("run recorded for this occurrence");
+    assert_eq!(run.automation_id, automation.id);
+    assert_eq!(run.scheduled_for, scheduled_for.to_string());
+    assert_eq!(run.outcome, boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY);
+
+    // A different, unfired occurrence for the same automation → still None.
+    assert!(
+        db.automation_run_for_occurrence(&automation.id, scheduled_for + 86_400)
+            .unwrap()
+            .is_none(),
+        "the following occurrence has not fired"
+    );
+}
+
+/// `record_automation_run_and_advance` inserts a run row for a fresh occurrence
+/// and advances `next_due_at` when `record.next_due_at` is `Some`.
+#[test]
+fn record_run_inserts_fresh_occurrence_and_advances_schedule() {
+    let db = WorkDb::open(temp_db_path("auto-record-fresh")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+    let scheduled_for = 1_700_000_000i64;
+    let following = scheduled_for + 86_400;
+
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(scheduled_for)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT)
+            .next_due_at(following)
+            .build(),
+    )
+    .unwrap();
+
+    // One run row exists for the occurrence.
+    let runs = db.list_automation_runs(&automation.id).unwrap();
+    assert_eq!(runs.len(), 1, "a fresh occurrence inserts exactly one run row");
+
+    // Bookkeeping advanced.
+    let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
+    assert_eq!(
+        reloaded.next_due_at.as_deref(),
+        Some(following.to_string().as_str()),
+        "next_due_at advances to the following occurrence"
+    );
+    assert_eq!(
+        reloaded.last_fired_at.as_deref(),
+        Some(scheduled_for.to_string().as_str()),
+        "last_fired_at mirrors this decision's started_at"
+    );
+    assert_eq!(
+        reloaded.last_outcome.as_deref(),
+        Some(boss_protocol::AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT)
+    );
+}
+
+/// Re-recording the SAME `(automation_id, scheduled_for)` upserts the existing
+/// run row in place rather than creating a duplicate, and always refreshes
+/// `last_fired_at` / `last_outcome` to mirror the latest decision.
+#[test]
+fn record_run_upserts_same_occurrence_and_refreshes_bookkeeping() {
+    let db = WorkDb::open(temp_db_path("auto-record-upsert")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+    let scheduled_for = 1_700_000_000i64;
+
+    // First decision: pessimistic failed_will_retry, holding the occurrence.
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(scheduled_for)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+            .build(),
+    )
+    .unwrap();
+
+    let first_run_id = db
+        .automation_run_for_occurrence(&automation.id, scheduled_for)
+        .unwrap()
+        .expect("first run present")
+        .id;
+
+    // Re-record the same occurrence with a new outcome and later started_at.
+    let retry_started = scheduled_for + 300;
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(retry_started)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING)
+            .build(),
+    )
+    .unwrap();
+
+    // Still exactly one run row — upsert in place, not a duplicate.
+    let runs = db.list_automation_runs(&automation.id).unwrap();
+    assert_eq!(runs.len(), 1, "re-recording must not create a duplicate run");
+
+    let run = db
+        .automation_run_for_occurrence(&automation.id, scheduled_for)
+        .unwrap()
+        .expect("run present");
+    assert_eq!(run.id, first_run_id, "same row id — updated in place");
+    assert_eq!(
+        run.outcome,
+        boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING,
+        "outcome updated on the existing row"
+    );
+    assert_eq!(run.started_at, retry_started.to_string(), "started_at updated");
+
+    // Bookkeeping always mirrors the latest decision.
+    let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
+    assert_eq!(
+        reloaded.last_fired_at.as_deref(),
+        Some(retry_started.to_string().as_str()),
+        "last_fired_at refreshed to the retry's started_at"
+    );
+    assert_eq!(
+        reloaded.last_outcome.as_deref(),
+        Some(boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING)
+    );
+}
+
+/// When `record.next_due_at` is `None`, the schedule HOLDS: `next_due_at` is left
+/// unchanged (used for transient-failure retry) while `last_fired_at` /
+/// `last_outcome` still update.
+#[test]
+fn record_run_holds_schedule_when_next_due_is_none() {
+    let db = WorkDb::open(temp_db_path("auto-record-hold")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 1);
+    let scheduled_for = 1_700_000_000i64;
+
+    // Park a known next_due_at first so we can prove it is not disturbed.
+    db.initialize_automation_next_due_at(&automation.id, scheduled_for)
+        .unwrap();
+
+    db.record_automation_run_and_advance(
+        crate::work::AutomationFireRecord::builder()
+            .automation_id(automation.id.clone())
+            .scheduled_for(scheduled_for)
+            .started_at(scheduled_for + 10)
+            .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+            // next_due_at omitted → None → hold the occurrence.
+            .build(),
+    )
+    .unwrap();
+
+    let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
+    assert_eq!(
+        reloaded.next_due_at.as_deref(),
+        Some(scheduled_for.to_string().as_str()),
+        "next_due_at held (unchanged) when record.next_due_at is None"
+    );
+    // Bookkeeping still updates even while holding.
+    assert_eq!(
+        reloaded.last_fired_at.as_deref(),
+        Some((scheduled_for + 10).to_string().as_str()),
+        "last_fired_at still updates on a hold"
+    );
+    assert_eq!(
+        reloaded.last_outcome.as_deref(),
+        Some(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+    );
+}
