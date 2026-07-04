@@ -285,6 +285,67 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
     assert!(stale_after.finished_at.is_some());
 }
 
+/// Regression for the 2026-07-03 dispatch race: two `dispatch_decision`
+/// evaluations landing within the scheduler pickup window (e.g. the
+/// product-executions reconciler racing the normal `RequestExecution`
+/// path after an engine restart) must not abandon-and-recreate a fresh
+/// `ready` row that no worker has claimed yet. The runtime `is_live`
+/// oracle only answers "is a worker slot attached to this execution",
+/// which is trivially false for a row nothing has picked up — before
+/// the fix, a second evaluation within milliseconds of the first
+/// abandoned the still-fresh row and inserted a duplicate (the
+/// `abandon_stale_and_redispatch` decision firing on a zero-run `ready`
+/// row), and any worker that later picked up the abandoned row crashed
+/// on dispatch.
+#[test]
+fn request_execution_reuses_ready_row_with_no_run_within_pickup_window() {
+    let path = temp_db_path("request-ready-no-run-race");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Race chore")
+                .build(),
+        )
+        .unwrap();
+
+    // First evaluation: no prior execution — creates the first `ready` row.
+    let first = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Ready);
+
+    // Second evaluation, milliseconds later: the scheduler has not yet
+    // picked up the row, so `is_live` reports false for any execution id
+    // — exactly like the runtime oracle would for a row no worker has
+    // attached to. The row still has zero `work_runs` rows.
+    let second = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        second.id, first.id,
+        "an un-dispatched ready row with zero runs must be reused, not abandoned"
+    );
+    assert_eq!(second.status, ExecutionStatus::Ready);
+
+    let all = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(
+        all.len(),
+        1,
+        "no duplicate execution should be created for a ready row with zero runs"
+    );
+    assert_ne!(all[0].status, ExecutionStatus::Abandoned);
+}
+
 /// When drag-to-Doing fires for a chore whose latest non-terminal
 /// execution is a stale (no live worker) `ci_remediation`, the engine
 /// must re-queue that execution (flip `waiting_human` → `ready`) rather

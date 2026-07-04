@@ -891,13 +891,26 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     if let Some(existing) = governing {
         if !existing.status.is_terminal() {
-            // Existing non-terminal row. Two cases:
+            // Existing non-terminal row. Three cases:
+            //   - never dispatched (no `work_runs` row yet): the `is_live`
+            //     oracle is meaningless here — it answers "is a worker
+            //     attached to this execution", and a row no worker has
+            //     ever claimed is trivially "not live" regardless of
+            //     whether it is genuinely fresh or actually stale. Reuse
+            //     it unconditionally instead of liveness-testing it. This
+            //     is what closes the re-dispatch race: two
+            //     `dispatch_decision` evaluations landing within the
+            //     scheduler pickup window (e.g. the product-executions
+            //     reconciler racing the normal RequestExecution path)
+            //     must not abandon-and-recreate a `ready` row the
+            //     scheduler simply hasn't picked up yet.
             //   - is_live=true: a worker is genuinely attached to the
             //     slot. Keep the row, refresh priority / preferred
             //     workspace, return the same execution. (Idempotent —
             //     this is what bossctl `work start` and a kanban
             //     drag both depend on for "don't double-spawn.")
-            //   - is_live=false: the row is stale (worker gone). Two sub-cases:
+            //   - is_live=false (and a run has started): the row is stale
+            //     (worker gone). Two sub-cases:
             //       * ci_remediation kind: re-queue it instead of abandoning.
             //         The branch/PR already exists; the human dragging to Doing
             //         (or calling `bossctl work start`) means "retry the CI fix
@@ -915,16 +928,36 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             // each having to instrument itself.
             let latest_id = latest.as_ref().map(|e| e.id.clone());
             let live_id = live.as_ref().map(|e| e.id.clone());
-            if is_live(&existing.id) {
+            // Scoped to pre-dispatch statuses (queued/ready/waiting_dependency):
+            // those are the only statuses a row can sit in before any worker
+            // has ever attached, so `can_reconcile()` doubles as "this row
+            // could plausibly still be un-claimed." Once a worker actually
+            // attaches, status flips to running/waiting_human and a
+            // `work_runs` row exists — so this never masks a genuinely dead
+            // live-status row (see `request_execution_marks_existing_stale_when_no_live_worker`).
+            let never_dispatched = existing.status.can_reconcile() && query_latest_run(conn, &existing.id)?.is_none();
+            if never_dispatched || is_live(&existing.id) {
+                let (decision, message) = if never_dispatched {
+                    (
+                        "reuse_never_dispatched",
+                        "dispatch_decision: governing execution has never been dispatched \
+                         (no work_runs row) — reusing it without a liveness test, no new dispatch",
+                    )
+                } else {
+                    (
+                        "reuse_live",
+                        "dispatch_decision: work item already has a live execution — \
+                         returning it, no new dispatch",
+                    )
+                };
                 tracing::info!(
                     work_item_id = %work_item_id,
                     governing_execution_id = %existing.id,
                     governing_status = %existing.status,
                     latest_execution_id = ?latest_id,
                     live_execution_id = ?live_id,
-                    decision = "reuse_live",
-                    "dispatch_decision: work item already has a live execution — \
-                     returning it, no new dispatch",
+                    decision = decision,
+                    "{}", message,
                 );
                 let next_status = if existing.status == ExecutionStatus::WaitingDependency {
                     ExecutionStatus::Ready
