@@ -119,9 +119,20 @@ pub struct PoolClaimSweepOutcome {
     pub race_skipped: usize,
 }
 
-impl PoolClaimSweepOutcome {
+impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
     fn has_activity(&self) -> bool {
         self.released > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            released = self.released,
+            live_backed_skipped = self.live_backed_skipped,
+            non_terminal_skipped = self.non_terminal_skipped,
+            grace_skipped = self.grace_skipped,
+            race_skipped = self.race_skipped,
+            "pool-claim sweep: released leaked worker-pool claim(s)",
+        );
     }
 }
 
@@ -135,26 +146,19 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let outcome = run_one_pass(
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let live_states = Arc::clone(&live_states);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        async move {
+            run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
             )
-            .await;
-            if outcome.has_activity() {
-                tracing::info!(
-                    released = outcome.released,
-                    live_backed_skipped = outcome.live_backed_skipped,
-                    non_terminal_skipped = outcome.non_terminal_skipped,
-                    grace_skipped = outcome.grace_skipped,
-                    race_skipped = outcome.race_skipped,
-                    "pool-claim sweep: released leaked worker-pool claim(s)",
-                );
-            }
-            tokio::time::sleep(interval).await;
+            .await
         }
     })
 }

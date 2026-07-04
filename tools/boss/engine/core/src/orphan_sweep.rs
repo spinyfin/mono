@@ -69,12 +69,23 @@ pub struct OrphanSweepOutcome {
     pub running_reviewer_skipped: usize,
 }
 
-impl OrphanSweepOutcome {
+impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
     fn has_activity(&self) -> bool {
         self.redispatched > 0
             || self.churn_skipped > 0
             || self.waiting_human_skipped > 0
             || self.running_reviewer_skipped > 0
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            redispatched = self.redispatched,
+            churn_skipped = self.churn_skipped,
+            no_worker_skipped = self.no_worker_skipped,
+            waiting_human_skipped = self.waiting_human_skipped,
+            running_reviewer_skipped = self.running_reviewer_skipped,
+            "orphan sweep: pass complete",
+        );
     }
 }
 
@@ -87,21 +98,11 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let outcome = run_one_pass(work_db.as_ref(), coordinator.clone(), dispatch_events.as_ref()).await;
-            if outcome.has_activity() {
-                tracing::info!(
-                    redispatched = outcome.redispatched,
-                    churn_skipped = outcome.churn_skipped,
-                    no_worker_skipped = outcome.no_worker_skipped,
-                    waiting_human_skipped = outcome.waiting_human_skipped,
-                    running_reviewer_skipped = outcome.running_reviewer_skipped,
-                    "orphan sweep: pass complete",
-                );
-            }
-            tokio::time::sleep(interval).await;
-        }
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        async move { run_one_pass(work_db.as_ref(), coordinator.clone(), dispatch_events.as_ref()).await }
     })
 }
 
