@@ -701,10 +701,17 @@ pub async fn serve(
     // (mirrors the dead-PID sweep): a dead worker is left alone so its lease
     // expires and cube frees the workspace within ~TTL. Cadence is
     // deliberately well under the TTL (default 300 s, overridable via
-    // BOSS_CUBE_LEASE_HEARTBEAT_INTERVAL_SECS). See `crate::cube_lease_heartbeat`.
+    // BOSS_CUBE_LEASE_HEARTBEAT_INTERVAL_SECS). Also auto-reaps an execution
+    // (same terminal path as `bossctl agents reap`) once its lease has
+    // failed to heartbeat 3 consecutive times — proof cube no longer tracks
+    // it even when the workspace directory is still on disk (so the
+    // lost-workspace sweep never fires) and the pane never registered with
+    // the live-worker registry (so the dead-pid sweep never sees it). See
+    // `crate::cube_lease_heartbeat`.
     let _cube_lease_heartbeat_handle = crate::cube_lease_heartbeat::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
         server_state.cube_client.clone(),
         server_state.dispatch_events.clone(),
         crate::cube_lease_heartbeat::heartbeat_interval(),

@@ -81,19 +81,90 @@
 //! module's periodic sweep is the complementary fix that covers the
 //! pane-worker gap. Both mechanisms are intentionally left in place:
 //! the guard covers blocking runners; this sweep covers pane workers.
+//!
+//! ## Auto-reap on sustained heartbeat failure
+//!
+//! A heartbeat failure alone used to be purely observational: it was
+//! logged and evented, but the execution row was left exactly as it was —
+//! forever, if the lease never recovered. That is precisely what happened
+//! on 2026-07-03: three `automation_triage` panes died in their first
+//! second (before ever registering with the live-worker registry), cube
+//! reclaimed/never-tracked their leases, and every heartbeat pass warned
+//! `lease ... is not tracked` for 30+ minutes with no consequence — the
+//! rows stayed `waiting_human`/`running`, the redundant-spawn guard (which
+//! only reads `work_executions.status`, a *paper* liveness signal — see
+//! `crate::execution_liveness`) treated them as live, and every retry died
+//! with `redundant_spawn`. The workspace directory itself was still on
+//! disk, so `crate::lost_workspace_sweep`'s missing-directory check never
+//! fired either.
+//!
+//! [`HeartbeatFailureBreaker`] closes this gap: it tracks *consecutive*
+//! heartbeat failures per execution across passes (reset to zero on the
+//! next success) and, once a lease has failed
+//! [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] times in a row, auto-reaps the
+//! execution through the exact same terminal path as `bossctl agents reap`
+//! (`WorkDb::mark_execution_orphaned`) — see [`auto_reap_dead_lease`]. At
+//! the default 300 s cadence that is a 15-minute bound, chosen so the
+//! reap lands well before the next automation retry (which fires every 15
+//! min): a pane that dies at spawn now self-heals on its very first retry
+//! instead of wedging behind `redundant_spawn`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use boss_protocol::{WorkExecution, WorkerActivity};
+use boss_protocol::{ExecutionKind, WorkExecution, WorkerActivity};
 
-use crate::coordinator::CubeClient;
+use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
+
+/// Consecutive cube-lease-heartbeat failures for one execution before the
+/// engine treats the lease as definitively gone and auto-reaps the
+/// execution (see the module-level "Auto-reap on sustained heartbeat
+/// failure" doc above). At the default 300 s [`DEFAULT_HEARTBEAT_INTERVAL`]
+/// this is a 15-minute bound.
+pub const AUTO_REAP_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Tracks consecutive cube-lease-heartbeat failures per execution id
+/// across passes. A transient blip (one failed subprocess call, one cube
+/// hiccup) must not trigger a reap — only a lease that *never* recovers
+/// should. Failures accumulate per execution id; a success, or the
+/// execution going terminal by any path, clears its streak.
+///
+/// Deliberately in-memory rather than a DB column: it is a short-lived
+/// breaker over a single engine process's uptime, not a durable fact, and
+/// every consumer of it (`run_one_pass`) already runs inside that same
+/// process. An engine restart resets every streak to zero, which is safe —
+/// [`crate::run_reconcile`]'s startup probe independently re-verifies lease
+/// liveness against cube before any redispatch is allowed.
+#[derive(Default)]
+pub struct HeartbeatFailureBreaker {
+    consecutive_failures: Mutex<HashMap<String, u32>>,
+}
+
+impl HeartbeatFailureBreaker {
+    /// Record a failed heartbeat for `execution_id` and return the new
+    /// consecutive-failure count.
+    fn record_failure(&self, execution_id: &str) -> u32 {
+        let mut counts = self.consecutive_failures.lock().unwrap();
+        let count = counts.entry(execution_id.to_owned()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Clear any tracked failure streak for `execution_id` — called on a
+    /// successful heartbeat, and once an execution is confirmed terminal
+    /// (reaped by this sweep or any other path) so the map does not grow
+    /// unboundedly over the engine's lifetime.
+    fn forget(&self, execution_id: &str) {
+        self.consecutive_failures.lock().unwrap().remove(execution_id);
+    }
+}
 
 /// Environment variable overriding the heartbeat cadence (seconds).
 pub const HEARTBEAT_INTERVAL_SECS_ENV: &str = "BOSS_CUBE_LEASE_HEARTBEAT_INTERVAL_SECS";
@@ -151,51 +222,71 @@ pub struct HeartbeatSweepOutcome {
     pub no_lease_skipped: usize,
     /// Slots whose execution/activity is already terminal.
     pub terminal_skipped: usize,
+    /// Executions auto-reaped this pass after
+    /// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive heartbeat
+    /// failures.
+    pub auto_reaped: usize,
 }
 
 impl HeartbeatSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.heartbeated > 0 || self.db_fallback_heartbeated > 0 || self.failed > 0
+        self.heartbeated > 0 || self.db_fallback_heartbeated > 0 || self.failed > 0 || self.auto_reaped > 0
     }
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn. The returned handle is detached by the
-/// caller (the loop lives for the engine's lifetime).
+/// caller (the loop lives for the engine's lifetime). Owns the
+/// [`HeartbeatFailureBreaker`] across passes so consecutive-failure streaks
+/// survive from one tick to the next.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
+    coordinator: Arc<ExecutionCoordinator>,
     cube_client: Arc<dyn CubeClient>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let breaker = HeartbeatFailureBreaker::default();
         loop {
-            run_one_pass(
+            let outcome = run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 cube_client.as_ref(),
                 dispatch_events.as_ref(),
+                &breaker,
             )
             .await;
+            if outcome.auto_reaped > 0 {
+                // An auto-reap clears the redundant-spawn guard's blocker
+                // for that work item; kick the scheduler so a queued retry
+                // dispatches immediately instead of waiting for the next
+                // opportunistic kick.
+                coordinator.kick();
+            }
             tokio::time::sleep(interval).await;
         }
     })
 }
 
 /// Run a single heartbeat pass: refresh the cube lease of every live
-/// worker. Returns a summary of what happened.
+/// worker, auto-reaping any execution whose lease has failed
+/// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive times. Returns a
+/// summary of what happened.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
+    breaker: &HeartbeatFailureBreaker,
 ) -> HeartbeatSweepOutcome {
     run_one_pass_impl(
         work_db,
         live_states,
         cube_client,
         dispatch_events,
+        breaker,
         HEARTBEAT_CUBE_TIMEOUT,
     )
     .await
@@ -208,6 +299,7 @@ async fn run_one_pass_impl(
     live_states: &LiveWorkerStateRegistry,
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
+    breaker: &HeartbeatFailureBreaker,
     heartbeat_timeout: Duration,
 ) -> HeartbeatSweepOutcome {
     let mut outcome = HeartbeatSweepOutcome::default();
@@ -232,6 +324,7 @@ async fn run_one_pass_impl(
         if is_terminal_activity(state.activity) {
             outcome.terminal_skipped += 1;
             registered_run_ids.insert(state.run_id.clone());
+            breaker.forget(&state.run_id);
             continue;
         }
 
@@ -258,6 +351,7 @@ async fn run_one_pass_impl(
         // re-extend it.
         if execution.status.is_terminal() {
             outcome.terminal_skipped += 1;
+            breaker.forget(execution_id);
             continue;
         }
 
@@ -283,7 +377,7 @@ async fn run_one_pass_impl(
         // extend a live one reclaims a working copy out from under an active
         // worker (the incident this whole module fixes).
 
-        heartbeat_one(
+        let succeeded = heartbeat_one(
             cube_client,
             dispatch_events,
             execution_id,
@@ -293,6 +387,17 @@ async fn run_one_pass_impl(
             heartbeat_timeout,
             &mut outcome.heartbeated,
             &mut outcome.failed,
+        )
+        .await;
+        record_heartbeat_result(
+            work_db,
+            dispatch_events,
+            cube_client,
+            breaker,
+            &execution,
+            lease_id,
+            succeeded,
+            &mut outcome.auto_reaped,
         )
         .await;
     }
@@ -314,9 +419,9 @@ async fn run_one_pass_impl(
                     continue;
                 };
                 let execution_id = &execution.id;
-                let mut succeeded = 0usize;
-                let mut failed = 0usize;
-                heartbeat_one(
+                let mut succeeded_count = 0usize;
+                let mut failed_count = 0usize;
+                let succeeded = heartbeat_one(
                     cube_client,
                     dispatch_events,
                     execution_id,
@@ -324,11 +429,11 @@ async fn run_one_pass_impl(
                     &execution.work_item_id,
                     execution.cube_workspace_id.as_deref().unwrap_or(""),
                     heartbeat_timeout,
-                    &mut succeeded,
-                    &mut failed,
+                    &mut succeeded_count,
+                    &mut failed_count,
                 )
                 .await;
-                if succeeded > 0 {
+                if succeeded {
                     outcome.db_fallback_heartbeated += 1;
                     tracing::debug!(
                         execution_id,
@@ -336,7 +441,18 @@ async fn run_one_pass_impl(
                         "cube-lease heartbeat: DB-fallback beat (not yet in live registry)",
                     );
                 }
-                outcome.failed += failed;
+                outcome.failed += failed_count;
+                record_heartbeat_result(
+                    work_db,
+                    dispatch_events,
+                    cube_client,
+                    breaker,
+                    &execution,
+                    lease_id,
+                    succeeded,
+                    &mut outcome.auto_reaped,
+                )
+                .await;
             }
         }
         Err(err) => {
@@ -354,6 +470,7 @@ async fn run_one_pass_impl(
             failed = outcome.failed,
             dead_pid_skipped = outcome.dead_pid_skipped,
             no_lease_skipped = outcome.no_lease_skipped,
+            auto_reaped = outcome.auto_reaped,
             "cube-lease heartbeat: pass complete",
         );
     }
@@ -362,8 +479,9 @@ async fn run_one_pass_impl(
 }
 
 /// Execute one `cube workspace heartbeat` call with a timeout. Increments
-/// either `*succeeded` or `*failed` and emits a dispatch error event on
-/// failure or timeout.
+/// either `*succeeded` or `*failed`, emits a dispatch error event on
+/// failure or timeout, and returns whether the heartbeat succeeded so the
+/// caller can feed [`HeartbeatFailureBreaker`].
 async fn heartbeat_one(
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
@@ -374,7 +492,7 @@ async fn heartbeat_one(
     timeout: Duration,
     succeeded: &mut usize,
     failed: &mut usize,
-) {
+) -> bool {
     let result = tokio::time::timeout(timeout, cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
         Ok(Ok(())) => {
@@ -385,6 +503,7 @@ async fn heartbeat_one(
                 ttl_secs = LEASE_TTL_SECS,
                 "cube-lease heartbeat: refreshed lease",
             );
+            true
         }
         Ok(Err(err)) => {
             *failed += 1;
@@ -406,6 +525,7 @@ async fn heartbeat_one(
                         })),
                 )
                 .await;
+            false
         }
         Err(_elapsed) => {
             *failed += 1;
@@ -432,8 +552,149 @@ async fn heartbeat_one(
                         })),
                 )
                 .await;
+            false
         }
     }
+}
+
+/// Feed one heartbeat outcome into `breaker` and, once the consecutive-
+/// failure streak for `execution`'s id reaches
+/// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`], auto-reap it via
+/// [`auto_reap_dead_lease`]. A success clears the streak — a lease that
+/// recovers even once is no longer evidence of death.
+async fn record_heartbeat_result(
+    work_db: &WorkDb,
+    dispatch_events: &dyn DispatchEventSink,
+    cube_client: &dyn CubeClient,
+    breaker: &HeartbeatFailureBreaker,
+    execution: &WorkExecution,
+    lease_id: &str,
+    succeeded: bool,
+    auto_reaped: &mut usize,
+) {
+    if succeeded {
+        breaker.forget(&execution.id);
+        return;
+    }
+    let consecutive_failures = breaker.record_failure(&execution.id);
+    if consecutive_failures < AUTO_REAP_AFTER_CONSECUTIVE_FAILURES {
+        return;
+    }
+    if auto_reap_dead_lease(
+        work_db,
+        dispatch_events,
+        cube_client,
+        breaker,
+        execution,
+        lease_id,
+        consecutive_failures,
+    )
+    .await
+    {
+        *auto_reaped += 1;
+    }
+}
+
+/// Auto-reap `execution` after its cube lease has failed to heartbeat
+/// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive times — proof the
+/// workspace is gone even though its directory may still be on disk (so
+/// [`crate::lost_workspace_sweep`] never fires) and it may never have
+/// registered with the live-worker registry (so [`crate::dead_pid_sweep`]
+/// never sees it). Routes through the exact same terminal path as
+/// `bossctl agents reap` (`WorkDb::mark_execution_orphaned`), so the
+/// redundant-spawn guard's `is_live()` check stops treating the row as
+/// live and the next scheduler tick can dispatch a fresh execution.
+///
+/// Returns `true` iff this call actually transitioned the row to terminal
+/// (idempotent against a race with any other reconciler: if the row is
+/// already terminal by the time we get here, this is a no-op that still
+/// clears the breaker streak).
+async fn auto_reap_dead_lease(
+    work_db: &WorkDb,
+    dispatch_events: &dyn DispatchEventSink,
+    cube_client: &dyn CubeClient,
+    breaker: &HeartbeatFailureBreaker,
+    execution: &WorkExecution,
+    lease_id: &str,
+    consecutive_failures: u32,
+) -> bool {
+    let reason = format!(
+        "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times; \
+         treating the workspace as gone and auto-reaping (same terminal path as `bossctl agents reap`)"
+    );
+
+    if let Err(err) = work_db.mark_execution_orphaned(&execution.id, &reason) {
+        // A concurrent sweep/guard/hook may have finalized this execution
+        // between our snapshot and now — that's success from our
+        // perspective (the row is no longer a live blocker), just not
+        // something we get to take credit for.
+        let already_terminal = work_db
+            .get_execution(&execution.id)
+            .map(|cur| cur.status.is_terminal())
+            .unwrap_or(false);
+        breaker.forget(&execution.id);
+        if already_terminal {
+            return false;
+        }
+        tracing::warn!(
+            execution_id = %execution.id,
+            error = %format!("{err:#}"),
+            "cube-lease heartbeat: auto-reap failed to mark execution orphaned; leaving row as-is",
+        );
+        return false;
+    }
+    breaker.forget(&execution.id);
+
+    if execution.kind == ExecutionKind::AutomationTriage {
+        crate::execution_liveness::finalize_dead_automation_triage_run(
+            work_db,
+            execution,
+            &format!(
+                "its cube lease `{lease_id}` was no longer tracked after {consecutive_failures} consecutive \
+                 heartbeat failures"
+            ),
+        );
+    }
+
+    // Best-effort: the lease is already failing to heartbeat (almost
+    // certainly because cube no longer tracks it), so force-release is
+    // very likely a no-op. Failure here is benign.
+    if let Err(err) = cube_client
+        .force_release_lease(
+            lease_id,
+            Some("cube-lease heartbeat auto-reap: lease failed to refresh after repeated attempts"),
+        )
+        .await
+    {
+        tracing::debug!(
+            execution_id = %execution.id,
+            lease_id,
+            error = %format!("{err:#}"),
+            "cube-lease heartbeat: best-effort force-release after auto-reap failed (likely already released)",
+        );
+    }
+
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::CubeLeaseAutoReap, Outcome::Ok, &execution.id)
+                .with_work_item(&execution.work_item_id)
+                .with_cube_lease(lease_id)
+                .with_details(serde_json::json!({
+                    "reason": "heartbeat_failures_exhausted",
+                    "consecutive_failures": consecutive_failures,
+                })),
+        )
+        .await;
+
+    tracing::warn!(
+        execution_id = %execution.id,
+        work_item_id = %execution.work_item_id,
+        lease_id,
+        consecutive_failures,
+        "cube-lease heartbeat: auto-reaped execution after repeated heartbeat failures",
+    );
+
+    true
 }
 
 /// Re-heartbeat, once at engine startup, the cube lease of every
@@ -531,12 +792,17 @@ mod tests {
     #[derive(Default)]
     struct RecordingCube {
         heartbeats: Mutex<Vec<(String, Option<u64>)>>,
+        force_releases: Mutex<Vec<String>>,
         fail: AtomicBool,
     }
 
     impl RecordingCube {
         fn calls(&self) -> Vec<(String, Option<u64>)> {
             self.heartbeats.lock().unwrap().clone()
+        }
+
+        fn force_release_calls(&self) -> Vec<String> {
+            self.force_releases.lock().unwrap().clone()
         }
     }
 
@@ -571,8 +837,9 @@ mod tests {
             }
             Ok(())
         }
-        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
-            unimplemented!()
+        async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> Result<()> {
+            self.force_releases.lock().unwrap().push(lease_id.to_owned());
+            Ok(())
         }
         async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             unimplemented!()
@@ -684,7 +951,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.heartbeated, 1, "live lease must be heartbeated");
         assert_eq!(outcome.failed, 0);
@@ -706,7 +974,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.heartbeated, 0);
         assert_eq!(outcome.dead_pid_skipped, 1);
@@ -727,7 +996,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.no_pid_skipped, 1);
         assert!(cube.calls().is_empty());
@@ -747,7 +1017,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.terminal_skipped, 1);
         assert!(cube.calls().is_empty());
@@ -766,7 +1037,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.no_lease_skipped, 1);
         assert!(cube.calls().is_empty());
@@ -787,15 +1059,221 @@ mod tests {
         let cube = RecordingCube::default();
         cube.fail.store(true, Ordering::SeqCst);
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.heartbeated, 0);
+        assert_eq!(outcome.auto_reaped, 0, "a single failure must not trigger an auto-reap");
         let events = sink.events().await;
         assert_eq!(events.len(), 1, "exactly one failure event");
         assert_eq!(events[0].stage, "cube_lease_heartbeat");
         assert_eq!(events[0].outcome, "error");
         assert_eq!(events[0].cube_lease_id.as_deref(), Some("lease-fail"));
+    }
+
+    /// The core fix (2026-07-03 incident): a lease that fails to
+    /// heartbeat `AUTO_REAP_AFTER_CONSECUTIVE_FAILURES` times in a row is
+    /// auto-reaped through the same terminal path as `bossctl agents
+    /// reap` — the execution goes `orphaned`, its (already-untracked)
+    /// lease is best-effort force-released, and a `cube_lease_auto_reap`
+    /// event is emitted. Before this fix the row stayed `running` forever
+    /// and blocked the redundant-spawn guard.
+    #[tokio::test]
+    async fn auto_reaps_after_consecutive_heartbeat_failures() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-dead-forever");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cube = RecordingCube::default();
+        cube.fail.store(true, Ordering::SeqCst);
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        // Two failing passes: below threshold, no reap yet.
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+            assert_eq!(outcome.auto_reaped, 0);
+            assert_eq!(
+                db.get_execution(&execution_id).unwrap().status,
+                ExecutionStatus::Running,
+                "must stay live below the consecutive-failure threshold"
+            );
+        }
+
+        // The Nth consecutive failure crosses the threshold and reaps.
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(outcome.auto_reaped, 1);
+
+        let reaped = db.get_execution(&execution_id).unwrap();
+        assert_eq!(reaped.status, ExecutionStatus::Orphaned);
+        assert!(reaped.finished_at.is_some(), "auto-reaped execution must be finalized");
+        assert_eq!(
+            cube.force_release_calls(),
+            vec!["lease-dead-forever".to_owned()],
+            "the untracked lease must be best-effort force-released"
+        );
+
+        let events = sink.events().await;
+        let reap_event = events
+            .iter()
+            .find(|e| e.stage == "cube_lease_auto_reap")
+            .expect("a cube_lease_auto_reap event must be emitted");
+        assert_eq!(reap_event.outcome, "ok");
+        assert_eq!(reap_event.cube_lease_id.as_deref(), Some("lease-dead-forever"));
+    }
+
+    /// A successful heartbeat clears the consecutive-failure streak, so a
+    /// lease that recovers even once never gets auto-reaped just because it
+    /// failed a few times in the past.
+    #[tokio::test]
+    async fn heartbeat_success_resets_failure_streak() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-flaky");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cube = RecordingCube::default();
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        // Fail, fail, then succeed — the streak resets to zero.
+        cube.fail.store(true, Ordering::SeqCst);
+        run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        cube.fail.store(false, Ordering::SeqCst);
+        run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+
+        // Two more failures: still below threshold because the streak reset.
+        cube.fail.store(true, Ordering::SeqCst);
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+            assert_eq!(outcome.auto_reaped, 0);
+        }
+
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running,
+            "an intervening success must reset the streak, so the execution stays live"
+        );
+    }
+
+    /// The DB-fallback sweep (executions not yet registered with the
+    /// live-worker registry — exactly the shape of a pane that died before
+    /// ever reporting a hook event) also auto-reaps after repeated
+    /// failures, not just the registry-driven path.
+    #[tokio::test]
+    async fn db_fallback_auto_reaps_after_consecutive_failures() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-never-registered");
+
+        // Registry is empty for the whole test: this execution never
+        // registered a live slot, mirroring a pane that crashed before its
+        // first hook event.
+        let live_states = LiveWorkerStateRegistry::new();
+
+        let cube = RecordingCube::default();
+        cube.fail.store(true, Ordering::SeqCst);
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES - 1 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+            assert_eq!(outcome.auto_reaped, 0);
+        }
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        assert_eq!(outcome.auto_reaped, 1);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+    }
+
+    /// An `automation_triage` execution auto-reaped this way still gets its
+    /// `automation_runs` outcome recorded honestly (via the same
+    /// open-task-recovery helper `lost_workspace_sweep` uses) instead of
+    /// leaving the pessimistic dispatch-time placeholder in place.
+    #[tokio::test]
+    async fn automation_triage_auto_reap_records_failed_gave_up() {
+        use crate::work::AutomationFireRecord;
+        use boss_protocol::{
+            AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AutomationTrigger,
+            CreateAutomationInput,
+        };
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let automation_id = db
+            .create_automation(
+                CreateAutomationInput::builder()
+                    .product_id(product_id.as_str())
+                    .name("daily")
+                    .trigger(AutomationTrigger::Schedule {
+                        cron: "0 14 * * *".to_owned(),
+                        timezone: "UTC".to_owned(),
+                    })
+                    .standing_instruction("do the thing")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let exec = db
+            .create_automation_triage_execution(&automation_id, "https://github.com/test/repo")
+            .unwrap();
+        db.start_execution_run_on_host(
+            &exec.id,
+            "auto-worker-1",
+            "repo-1",
+            "lease-triage-dead",
+            "mono-agent-999",
+            "/tmp/mono-agent-999",
+            "local",
+        )
+        .unwrap();
+        // Seed the pessimistic dispatch-time `automation_runs` row the
+        // scheduler writes at fire time, so there is a row for the auto-reap
+        // path to finalize with the honest outcome.
+        db.record_automation_run_and_advance(
+            AutomationFireRecord::builder()
+                .automation_id(automation_id.clone())
+                .scheduled_for(1_700_000_000)
+                .started_at(1_700_000_000)
+                .outcome(AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                .detail("dispatched; awaiting triage worker decision (Stop not yet received)")
+                .triage_execution_id(exec.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &exec.id, std::process::id() as i32);
+
+        let cube = RecordingCube::default();
+        cube.fail.store(true, Ordering::SeqCst);
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES {
+            run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+        }
+
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
+        let runs = db.list_automation_runs(&automation_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+            "no task was produced before the pane died, so the honest outcome is failed_gave_up"
+        );
+        assert!(runs[0].finished_at.is_some());
     }
 
     /// Startup re-adoption heartbeats ONLY the `Live`-verdict leases.
@@ -910,7 +1388,8 @@ mod tests {
         let sink = RecordingDispatchEventSink::new();
 
         // Use a short timeout so the test does not wait 30 s.
-        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, Duration::from_millis(50)).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, Duration::from_millis(50)).await;
 
         assert_eq!(outcome.failed, 1, "the hung slot must count as failed");
         assert_eq!(outcome.heartbeated, 1, "the non-hung slot must succeed");
@@ -944,7 +1423,8 @@ mod tests {
 
         let cube = RecordingCube::default();
         let sink = RecordingDispatchEventSink::new();
-        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, HEARTBEAT_CUBE_TIMEOUT).await;
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, HEARTBEAT_CUBE_TIMEOUT).await;
 
         assert_eq!(
             outcome.db_fallback_heartbeated, 1,

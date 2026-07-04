@@ -61,9 +61,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{
-    AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_PRODUCED_TASK, ExecutionKind, WorkExecution,
-};
+use boss_protocol::{ExecutionKind, WorkExecution};
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -260,7 +258,11 @@ pub async fn reconcile_if_workspace_lost(
     // Either way this overwrites the pessimistic dispatch-time placeholder
     // ("dispatched; awaiting triage worker decision …") with the truth.
     if execution.kind == ExecutionKind::AutomationTriage {
-        finalize_lost_automation_triage_run(work_db, execution, &workspace_path);
+        crate::execution_liveness::finalize_dead_automation_triage_run(
+            work_db,
+            execution,
+            &format!("its cube workspace `{workspace_path}` is gone"),
+        );
     }
 
     dispatch_events
@@ -285,58 +287,6 @@ pub async fn reconcile_if_workspace_lost(
     );
 
     true
-}
-
-/// Record the terminal automation-run outcome for a triage execution whose
-/// workspace was lost. Best-effort: failures are logged, never propagated,
-/// since the execution itself is already finalized.
-fn finalize_lost_automation_triage_run(work_db: &WorkDb, execution: &WorkExecution, workspace_path: &str) {
-    let automation_id = &execution.work_item_id;
-    let (outcome, produced_task_id, detail) = match work_db.find_most_recent_open_task_for_automation(automation_id) {
-        Ok(Some(task)) => {
-            let detail = format!(
-                "produced_task (lost-workspace recovery): task {} was created before the triage pane \
-                     died; its workspace `{workspace_path}` is gone",
-                task.id
-            );
-            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
-        }
-        Ok(None) => (
-            AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-            None,
-            format!(
-                "triage pane died before Stop and its cube workspace `{workspace_path}` is gone; \
-                     no task was produced"
-            ),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                execution_id = %execution.id,
-                automation_id = %automation_id,
-                error = %format!("{err:#}"),
-                "lost-workspace reconcile: open-task lookup failed; recording failed_gave_up",
-            );
-            (
-                AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-                None,
-                format!("triage pane died and its cube workspace `{workspace_path}` is gone"),
-            )
-        }
-    };
-
-    match work_db.finalize_automation_triage_run(&execution.id, outcome, produced_task_id.as_deref(), Some(&detail)) {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            execution_id = %execution.id,
-            automation_id = %automation_id,
-            "lost-workspace reconcile: no automation_runs row matched this triage execution; outcome not recorded",
-        ),
-        Err(err) => tracing::warn!(
-            execution_id = %execution.id,
-            error = %format!("{err:#}"),
-            "lost-workspace reconcile: failed to finalize automation_runs row",
-        ),
-    }
 }
 
 #[cfg(test)]
