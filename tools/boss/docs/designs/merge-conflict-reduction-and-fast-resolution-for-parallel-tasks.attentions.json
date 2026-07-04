@@ -1,0 +1,36 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Deterministic lockfile resolver (rung 0): should a regenerated Cargo.lock / MODULE.bazel.lock be auto-applied with no agent and no human, trusting the build gate + both-parents tripwire to catch a bad regen — or gate the first N auto-regens behind a light review before fully trusting them?",
+    "choices": [
+      "Auto-apply immediately; rely on the build gate + tripwire",
+      "Gate the first N regens behind a light review, then auto-apply",
+      "Always require a lightweight confirmation for lockfile regen"
+    ],
+    "anchor": "layer-1--the-resolution-escalation-ladder"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Sequencing against T2253 (the safety gates): should ALL escalation-ladder work hard-block until T2253's both-parents tripwire (P2) and preservation brief (P1) land, or may we ship rungs 0/1 (deterministic + engine-direct rebase, which are preserving by construction) first under today's checks and hold only rung 2's prompt hardening for T2253?",
+    "choices": [
+      "Ship rungs 0/1 first; hold only rung 2 prompt hardening for T2253",
+      "Hard-block all ladder work until T2253 (P1/P2) lands"
+    ],
+    "anchor": "composition-with-t2253-the-safety-gates"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Conflict-aware scheduling (direction 2) v1 scope: ship only the lightweight expander file-overlap hint (P5-lite), or also build the non-blocking merge_order relation + merge sequencing enforcement in v1?",
+    "choices": [
+      "Expander hint (P5-lite) only for v1; defer merge_order relation",
+      "Both the hint and the merge_order relation in v1",
+      "Neither in v1 — defer all of direction 2 until the ladder + telemetry prove out"
+    ],
+    "anchor": "layer-3--conflict-aware-scheduling-direction-2-without-serializing"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Rung 2 (small focused resolution agent): should it be capped to single-file semantic conflicts in v1 (multi-file conflicts escalate straight to the full worker), rather than allowing the small/cheap agent to attempt multi-file semantic resolutions?",
+    "anchor": "layer-1--the-resolution-escalation-ladder"
+  }
+]
