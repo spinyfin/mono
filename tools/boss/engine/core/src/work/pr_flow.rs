@@ -274,11 +274,26 @@ impl WorkDb {
     ///     whole point;
     ///   - the most-recent run captures `detail` (the breaker's park reason)
     ///     as its result summary if it does not already have one;
-    ///   - the task/chore row is left completely untouched, so the merge
-    ///     poller's late-PR sweep and the dispatcher's redundant-spawn guard
-    ///     continue to see it exactly as they did before — a human can
-    ///     re-dispatch or review it via the attention item the caller files
-    ///     alongside this call.
+    ///   - the task/chore's `autostart` flag is cleared (mirroring
+    ///     [`Self::bounce_dispatch_failed_to_backlog`]'s single-shot
+    ///     convention) so [`Self::rescan_active_dispatch`] does not
+    ///     immediately re-dispatch a fresh worker onto the same task the
+    ///     moment this one's slot frees up — without this, a task whose
+    ///     worker keeps concluding "nothing to do" without emitting the
+    ///     no-op marker would loop abandon → rescan-redispatch → abandon
+    ///     forever, churning a cube lease and worker slot with no human in
+    ///     the loop. `status`/`pr_url` are otherwise left untouched, so the
+    ///     merge poller's late-PR sweep and the dispatcher's redundant-spawn
+    ///     guard continue to see it exactly as they did before — a human
+    ///     reviewing the attention item this call's caller files can
+    ///     explicitly re-arm `autostart` (or dispatch a fresh execution
+    ///     directly) once they've decided the task is worth another try.
+    ///
+    /// Tolerates the task/chore row having been hard-deleted while the
+    /// execution was live: the lease/pane are the resource this method
+    /// exists to free, and that must happen unconditionally rather than
+    /// bailing out because a best-effort metadata lookup came up empty —
+    /// `work_item` is `None` in the returned completion in that case.
     ///
     /// Returns `Ok(None)` if the execution has already been finalised
     /// (terminal status), making this safe to call from a hook handler that
@@ -287,7 +302,7 @@ impl WorkDb {
         &self,
         execution_id: &str,
         detail: &str,
-    ) -> Result<Option<WorkerPrCompletion>> {
+    ) -> Result<Option<IdleAbandonmentCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -305,8 +320,7 @@ impl WorkDb {
         let original_workspace_id = execution.cube_workspace_id.clone();
 
         let work_item_id = execution.work_item_id.clone();
-        let task =
-            query_task(&tx, &work_item_id)?.with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        let task = query_task(&tx, &work_item_id)?;
 
         let now = now_string();
         tx.execute(
@@ -318,6 +332,16 @@ impl WorkDb {
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now],
+        )?;
+
+        // Stop the automated re-dispatch loop: clear `autostart` so the
+        // on-free rescan (`rescan_active_dispatch`) leaves this task parked
+        // in `active` instead of immediately spawning a replacement worker
+        // that may just abandon again the same way. Best-effort — if the
+        // task row is gone there's nothing to clear.
+        tx.execute(
+            "UPDATE tasks SET autostart = 0 WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
         )?;
 
         // Capture the park reason as the run summary if the run hasn't
@@ -341,9 +365,9 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         tx.commit()?;
-        Ok(Some(WorkerPrCompletion {
+        Ok(Some(IdleAbandonmentCompletion {
             execution: updated_execution,
-            work_item: task_to_item(task),
+            work_item: task.map(task_to_item),
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
         }))

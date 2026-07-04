@@ -4076,14 +4076,19 @@ manual review."
     /// there is no positive evidence the work is done here, only that
     /// further automated nudging is unproductive (see
     /// [`crate::work::WorkDb::record_worker_idle_abandonment`] for why that
-    /// distinction matters). The attention item [`Self::park_for_unproductive_nudges`]
-    /// already filed is the durable surface for a human to review or
-    /// re-dispatch the (untouched) work item.
+    /// distinction matters, including why it clears `autostart` to stop an
+    /// automated abandon/re-dispatch churn loop). The attention item
+    /// [`Self::park_for_unproductive_nudges`] already filed is the durable
+    /// surface for a human to review or re-dispatch the work item.
     ///
     /// Best-effort and idempotent: a DB write against an already-terminal
     /// execution is a silent no-op (the row was already finalized by a
     /// concurrent path), and a lease-release failure is logged, never
-    /// propagated — this must never block the Stop-boundary response.
+    /// propagated — this must never block the Stop-boundary response. The
+    /// lease/pane release also proceeds even if the task/chore row itself
+    /// was hard-deleted out from under the execution — `record_worker_idle_abandonment`
+    /// returns `work_item: None` in that case rather than erroring the
+    /// whole finalize, so the work-item-changed publish is simply skipped.
     async fn finalize_idle_park(&self, execution: &crate::work::WorkExecution, detail: &str) {
         let completion = match self.work_db.record_worker_idle_abandonment(&execution.id, detail) {
             Ok(Some(completion)) => completion,
@@ -4119,15 +4124,26 @@ manual review."
                 "worker_idle_park_finalized",
             )
             .await;
-        let product_id = work_item_product_id(&completion.work_item);
-        self.publisher
-            .publish_work_item_changed(&product_id, &work_item_id, "worker_idle_park_finalized")
-            .await;
+        match completion.work_item.as_ref() {
+            Some(work_item) => {
+                let product_id = work_item_product_id(work_item);
+                self.publisher
+                    .publish_work_item_changed(&product_id, &work_item_id, "worker_idle_park_finalized")
+                    .await;
+            }
+            None => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %work_item_id,
+                    "idle-park finalize: task/chore row missing, skipping work-item-changed publish",
+                );
+            }
+        }
         tracing::warn!(
             execution_id = %execution.id,
             work_item_id = %work_item_id,
             "idle-park finalize: cube lease and worker slot released; execution abandoned; \
-             task/chore left untouched for review or re-dispatch",
+             autostart cleared so the automated rescan won't immediately re-dispatch it",
         );
     }
 
@@ -11413,10 +11429,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // `finalize_conflict_resolution_attempt`, which — ONLY on
         // `NudgeBreakerParked` — marks the bound `conflict_resolutions`
         // ledger row `failed` (a false classification: the worker DID
-        // push). `park_for_unproductive_nudges` never releases the cube
-        // lease or the pane, so the execution stays `waiting_human`
-        // forever with a stranded, unresponsive pane — exactly "lingering
-        // Claude Not Detected panes."
+        // push). At the time of the original incident,
+        // `park_for_unproductive_nudges` never released the cube lease or
+        // the pane, so the execution stayed `waiting_human` forever with a
+        // stranded, unresponsive pane — exactly "lingering Claude Not
+        // Detected panes." (`park_for_unproductive_nudges` now finalizes
+        // via `finalize_idle_park`, releasing both — see
+        // `record_worker_idle_abandonment` — but the false `failed`
+        // ledger classification this test guards against is unrelated to
+        // that leak and remains possible on the nudge-breaker path.)
         //
         // With the fix, the missing-baseline case never reaches the nudge
         // at all: it tries the satisfied-deliverable gate first. Here the
