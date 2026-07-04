@@ -484,7 +484,7 @@ Outcome: the user installs cube + claude + gh on zakalwe, runs `bossctl hosts ad
 ### Phase 6: Failure Classification
 
 - The full Q6 failure-mode classifier on top of the run-failure path.
-- Surface `host_disk_full`, `host_pool_exhausted`, etc. as run reasons with corresponding attention items.
+- Surface `host_disk_full`, `host_lease_failed`, etc. as run reasons with corresponding attention items.
 
 ### Phase 7: UI Polish
 

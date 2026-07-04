@@ -632,7 +632,7 @@ Sample lease JSON:
 
 Error handling:
 
-- **Lease fails (pool exhausted)**: engine emits a `WorkError`, marks
+- **Lease fails (lease fault)**: engine emits a `WorkError`, marks
   the task `queued_waiting_workspace`, retries on the next workspace
   `released` notification (or polls every 30s).
 - **Worker crash mid-task**: the `tokio::spawn` watching the ACP
