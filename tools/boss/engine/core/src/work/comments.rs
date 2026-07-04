@@ -223,6 +223,141 @@ impl WorkDb {
             .with_context(|| format!("missing comment after answered transition: {comment_id}"))
     }
 
+    /// Bucket-2 track (P3c): `answered → awaiting_followup`, fired when an
+    /// operator posts a reply in the thread (`CommentsPostFollowup`).
+    /// Guarded on `status = 'answered'` — in particular, a comment still
+    /// `answering` (a run already in flight) rejects a second follow-up
+    /// rather than queuing it (design §"Concurrency/idempotency" describes
+    /// queuing as the eventual UX; not yet implemented).
+    pub fn transition_comment_to_awaiting_followup(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                comment_id,
+                COMMENT_STATUS_AWAITING_FOLLOWUP,
+                now,
+                COMMENT_STATUS_ANSWERED
+            ],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'answered' (expected answered → awaiting_followup)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after awaiting_followup transition: {comment_id}"))
+    }
+
+    /// Bucket-2 re-entry (P3c): `awaiting_followup → answering`, fired when a
+    /// follow-up reply reclassifies as `question` — the answer agent runs
+    /// again with the accumulated thread as context (design
+    /// §"Reclassifying follow-ups").
+    pub fn transition_comment_awaiting_followup_to_answering(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                comment_id,
+                COMMENT_STATUS_ANSWERING,
+                now,
+                COMMENT_STATUS_AWAITING_FOLLOWUP
+            ],
+        )?;
+        if n == 0 {
+            bail!(
+                "comment {comment_id} not found, or not 'awaiting_followup' (expected awaiting_followup → answering)"
+            );
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after awaiting_followup->answering transition: {comment_id}"))
+    }
+
+    /// Compensation for a follow-up re-entry spawn that flipped a comment to
+    /// `answering` and then failed to finish creating its tracking rows —
+    /// the follow-up analogue of [`Self::transition_comment_answering_to_active`].
+    /// Puts the comment back in `awaiting_followup` (its state before the
+    /// failed re-spawn attempt) rather than `active`, so a subsequent
+    /// `[Revise]` batch doesn't pick it up prematurely. Guarded on
+    /// `status = 'answering'`.
+    pub fn transition_comment_answering_to_awaiting_followup(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                comment_id,
+                COMMENT_STATUS_AWAITING_FOLLOWUP,
+                now,
+                COMMENT_STATUS_ANSWERING
+            ],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'answering' (expected answering → awaiting_followup)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after answering->awaiting_followup transition: {comment_id}"))
+    }
+
+    /// The bucket-1&3 bridge (P3c): `awaiting_followup → active`, fired when
+    /// a follow-up reply reclassifies as `directive`/`larger_change`. The
+    /// comment re-enters the `[Revise]` candidate pool exactly like any
+    /// other `active` `directive`/`larger_change` comment (design
+    /// §"Bridging a bucket-2 answer into a revision") — `revise_task_id`
+    /// stays `NULL` since no batch has claimed it yet.
+    pub fn transition_comment_awaiting_followup_to_active(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![comment_id, COMMENT_STATUS_ACTIVE, now, COMMENT_STATUS_AWAITING_FOLLOWUP],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'awaiting_followup' (expected awaiting_followup → active)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after awaiting_followup->active transition: {comment_id}"))
+    }
+
+    /// Reclassify a comment's intent from a follow-up reply (P3c). Unlike
+    /// [`Self::set_comment_intent`] (guarded to fire once, for the
+    /// comment's original top-level classification), this has no
+    /// `intent_classified_at IS NULL` guard: a follow-up is a fresh
+    /// classification event on new thread content, so it always overwrites
+    /// `intent`/`intent_confidence`/`intent_classified_at`. Distinct from
+    /// [`Self::override_comment_intent`] in one way that matters: this is an
+    /// **engine** classification, not a human correction, so it clears
+    /// `intent_overridden_by` (any earlier manual override is superseded by
+    /// the operator's new reply, not preserved as if the classifier never
+    /// ran) rather than stamping `'user'`.
+    pub fn reclassify_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
+        match intent {
+            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            other => bail!("invalid comment intent: {other}"),
+        }
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET intent = ?2, intent_confidence = ?3, intent_classified_at = ?4, intent_overridden_by = NULL
+             WHERE id = ?1",
+            params![comment_id, intent, confidence, now],
+        )?;
+        if n == 0 {
+            bail!("unknown comment: {comment_id}");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after intent reclassification: {comment_id}"))
+    }
+
     /// Persist the async classifier's output onto a comment's intent
     /// columns — called from the detached task spawned off `CommentsCreate`
     /// (comment-intent-classification design § "The classifier"). Guarded
@@ -652,7 +787,7 @@ pub(crate) fn reconcile_comments_for_task(
 mod tests {
     use crate::comments_anchor::CommentFuzzyConfig;
     use crate::work::WorkDb;
-    use boss_protocol::{CommentAnchor, CreateCommentInput};
+    use boss_protocol::{CommentAnchor, CreateCommentInput, WorkComment};
     use std::path::PathBuf;
 
     /// Per-test named shared-cache in-memory db (see `work::tests`).
@@ -1037,5 +1172,137 @@ mod tests {
         let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         // Still 'active' — never entered 'answering'.
         assert!(db.transition_comment_to_answered(&comment.id).is_err());
+    }
+
+    // --- Follow-up reclassification loop + bridge (P3c) ---
+
+    fn seed_answered_comment(db: &WorkDb) -> WorkComment {
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        db.transition_comment_to_answered(&comment.id).unwrap()
+    }
+
+    #[test]
+    fn transition_to_awaiting_followup_from_answered_succeeds() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+
+        let awaiting = db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+        assert_eq!(awaiting.status, "awaiting_followup");
+        assert_eq!(awaiting.status_actor.as_deref(), Some("engine"));
+    }
+
+    #[test]
+    fn transition_to_awaiting_followup_rejects_non_answered_source() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        // Still 'active' — a follow-up on a comment that was never answered
+        // (or is still 'answering') must be rejected, not silently queued.
+        assert!(db.transition_comment_to_awaiting_followup(&comment.id).is_err());
+
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        assert!(db.transition_comment_to_awaiting_followup(&comment.id).is_err());
+    }
+
+    #[test]
+    fn awaiting_followup_loops_back_to_answering_for_a_question() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+
+        let answering = db
+            .transition_comment_awaiting_followup_to_answering(&comment.id)
+            .unwrap();
+        assert_eq!(answering.status, "answering");
+    }
+
+    #[test]
+    fn awaiting_followup_to_answering_rejects_non_awaiting_source() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        // Still 'answered' — never entered 'awaiting_followup'.
+        assert!(
+            db.transition_comment_awaiting_followup_to_answering(&comment.id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn answering_compensates_back_to_awaiting_followup_on_respawn_failure() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+        db.transition_comment_awaiting_followup_to_answering(&comment.id)
+            .unwrap();
+
+        let compensated = db
+            .transition_comment_answering_to_awaiting_followup(&comment.id)
+            .unwrap();
+        assert_eq!(compensated.status, "awaiting_followup");
+    }
+
+    #[test]
+    fn awaiting_followup_bridges_to_active_for_a_directive() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+
+        let bridged = db.transition_comment_awaiting_followup_to_active(&comment.id).unwrap();
+        assert_eq!(bridged.status, "active");
+        assert!(bridged.revise_task_id.is_none());
+    }
+
+    #[test]
+    fn awaiting_followup_to_active_rejects_non_awaiting_source() {
+        let db = mem_db();
+        let comment = seed_answered_comment(&db);
+        // Still 'answered' — never entered 'awaiting_followup'.
+        assert!(db.transition_comment_awaiting_followup_to_active(&comment.id).is_err());
+    }
+
+    #[test]
+    fn reclassify_comment_intent_overwrites_a_prior_classification() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "question", 0.9).unwrap();
+
+        let reclassified = db.reclassify_comment_intent(&c.id, "directive", 0.8).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("directive"));
+        assert_eq!(reclassified.intent_confidence, Some(0.8));
+        assert!(reclassified.intent_overridden_by.is_none());
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+    }
+
+    #[test]
+    fn reclassify_comment_intent_clears_a_prior_manual_override() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.override_comment_intent(&c.id, "question").unwrap();
+        assert_eq!(
+            db.get_comment(&c.id).unwrap().unwrap().intent_overridden_by.as_deref(),
+            Some("user")
+        );
+
+        // A fresh engine reclassification (a new follow-up reply) supersedes
+        // the earlier manual override rather than preserving its audit trail
+        // forever — the operator's new reply is the thing being classified.
+        let reclassified = db.reclassify_comment_intent(&c.id, "larger_change", 0.7).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("larger_change"));
+        assert!(reclassified.intent_overridden_by.is_none());
+    }
+
+    #[test]
+    fn reclassify_comment_intent_rejects_unknown_intent() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(db.reclassify_comment_intent(&c.id, "bogus", 0.5).is_err());
+    }
+
+    #[test]
+    fn reclassify_comment_intent_rejects_unknown_comment() {
+        let db = mem_db();
+        assert!(db.reclassify_comment_intent("cmt_missing", "directive", 0.5).is_err());
     }
 }

@@ -51,7 +51,7 @@ impl WorkDb {
             return Ok(ReviseDocOutcome::NoUnresolvedComments);
         }
 
-        let directive = compose_doc_comment_directive(&input.artifact_id, &candidates);
+        let directive = compose_doc_comment_directive(self, &input.artifact_id, &candidates);
         let name = format!(
             "Address {} reviewer comment{}",
             candidates.len(),
@@ -208,8 +208,14 @@ impl WorkDb {
 /// Assemble the worker directive from every addressed comment: the doc's
 /// artifact id, each comment's quoted anchor, and its body (design
 /// §"Risks" — "directive assembly includes doc path, quoted anchors, and
-/// comment bodies").
-fn compose_doc_comment_directive(artifact_id: &str, comments: &[WorkComment]) -> String {
+/// comment bodies"). Also appends, per comment, any bucket-2 bridge context
+/// (P3c §"Bridging a bucket-2 answer into a revision") — a comment that
+/// arrived here via a follow-up bridge (`awaiting_followup → active`,
+/// design §"Reclassifying follow-ups") carries a prior answer-agent reply
+/// and the operator's follow-up that asked for the change; comments that
+/// never went through bucket 2 simply have no thread entries and this is a
+/// no-op for them.
+fn compose_doc_comment_directive(db: &WorkDb, artifact_id: &str, comments: &[WorkComment]) -> String {
     let mut out = format!(
         "Reviewer comment{} on `{artifact_id}` request{} the following change{}:\n\n",
         if comments.len() == 1 { "" } else { "s" },
@@ -221,7 +227,26 @@ fn compose_doc_comment_directive(artifact_id: &str, comments: &[WorkComment]) ->
         out.push_str(&comment.anchor.exact);
         out.push_str("\n\nComment:\n> ");
         out.push_str(&comment.body);
-        out.push_str("\n\n");
+        out.push('\n');
+
+        if let Ok(Some(run)) = db.latest_answer_agent_run_for_comment(&comment.id)
+            && let Some(reply) = run.reply_body.as_deref()
+        {
+            out.push_str("\nPrior answer-agent reply on this thread (bucket-2 bridge context):\n> ");
+            out.push_str(reply);
+            out.push('\n');
+        }
+        if let Ok(entries) = db.list_comment_thread_entries(&comment.id) {
+            for entry in entries
+                .iter()
+                .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP)
+            {
+                out.push_str("\nOperator follow-up on this thread:\n> ");
+                out.push_str(&entry.body);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
     }
     out.push_str("Please update the document accordingly.");
     out
@@ -232,8 +257,8 @@ mod tests {
     use super::*;
     use crate::work::{FakePrStateChecker, PrOpenState, WorkDb};
     use boss_protocol::{
-        CommentAnchor, CreateCommentInput, CreateProductInput, CreateProjectInput, SetProjectDesignDocInput, TaskKind,
-        WorkItemPatch,
+        CommentAnchor, CreateCommentInput, CreateProductInput, CreateProjectInput, SetProjectDesignDocInput,
+        THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, TaskKind, WorkItemPatch,
     };
     use std::path::PathBuf;
 
@@ -877,5 +902,84 @@ mod tests {
         assert_eq!(reopened, 0);
         let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
         assert_eq!(reloaded.status, "resolved");
+    }
+
+    // --- Bucket-2 bridge context in the directive (P3c) ---
+
+    #[test]
+    fn directive_includes_bridged_bucket2_context_when_present() {
+        let db = mem_db();
+        let (design, artifact_id) = seed_design_owned_artifact(&db);
+        let pr_url = "https://github.com/o/r/pull/1".to_owned();
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // A comment that started as a `question`, got an answer-agent
+        // reply, then an operator follow-up that reclassified it into a
+        // directive — the bucket-2 → bucket-1&3 bridge (design
+        // §"Bridging a bucket-2 answer into a revision").
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "question", 0.9).unwrap();
+        db.transition_comment_to_answering(&c1.id).unwrap();
+        let run = db
+            .create_answer_agent_run(&c1.id, "pr_doc", &artifact_id, "v0", 0)
+            .unwrap();
+        db.complete_answer_agent_run(&run.id, "replied", Some("You should reword this to Y."), None)
+            .unwrap();
+        db.create_comment_thread_entry(
+            &c1.id,
+            THREAD_ENTRY_KIND_ANSWER,
+            "engine",
+            "You should reword this to Y.",
+            None,
+            Some(&run.id),
+        )
+        .unwrap();
+        db.transition_comment_to_answered(&c1.id).unwrap();
+        db.transition_comment_to_awaiting_followup(&c1.id).unwrap();
+        db.create_comment_thread_entry(
+            &c1.id,
+            THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+            "user:test@example.com",
+            "ok, please make that change",
+            None,
+            None,
+        )
+        .unwrap();
+        db.reclassify_comment_intent(&c1.id, "directive", 0.85).unwrap();
+        db.transition_comment_awaiting_followup_to_active(&c1.id).unwrap();
+
+        // An ordinary directive comment with no bucket-2 history alongside
+        // it — its directive text must not gain any bridge context.
+        let c2 = make_comment(&db, &artifact_id, "beta");
+        db.set_comment_intent(&c2.id, "directive", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        let task = match db.get_work_item(&task_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        };
+        assert!(task.description.contains("You should reword this to Y."));
+        assert!(task.description.contains("ok, please make that change"));
+        // The ordinary comment's own request is still present.
+        assert!(task.description.contains("beta"));
     }
 }
