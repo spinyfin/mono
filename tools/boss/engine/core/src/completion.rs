@@ -64,8 +64,8 @@ use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeD
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck,
-    THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
+    ANSWER_AGENT_RUN_STATUS_FAILED, CreateAttentionItemInput, CreateExecutionInput, FinishExecutionRunInput,
+    PendingMergeCheck, THREAD_ENTRY_KIND_ANSWER, WorkDb, WorkItem, WorkerPrCompletionTarget,
 };
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_github::pr_url::pr_number_from_url;
@@ -2190,14 +2190,14 @@ must not be asked to open one",
             Ok(run_ids) => {
                 for run_id in run_ids {
                     if let Err(err) = self.work_db.finish_execution_run(
-                        &execution.id,
-                        &run_id,
-                        ExecutionStatus::Completed,
-                        "completed",
-                        Some(&format!("automation triage: {outcome}")),
-                        None,
-                        /* clear_workspace_lease */ true,
-                        None,
+                        FinishExecutionRunInput::builder()
+                            .execution_id(&execution.id)
+                            .run_id(&run_id)
+                            .execution_status(ExecutionStatus::Completed)
+                            .run_status("completed")
+                            .result_summary(format!("automation triage: {outcome}"))
+                            .clear_workspace_lease(true)
+                            .build(),
                     ) {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -2327,18 +2327,18 @@ must not be asked to open one",
             Ok(run_ids) => {
                 for run_id in run_ids {
                     if let Err(err) = self.work_db.finish_execution_run(
-                        &execution.id,
-                        &run_id,
-                        ExecutionStatus::Completed,
-                        "completed",
-                        Some(if replied {
-                            "answer agent: replied"
-                        } else {
-                            "answer agent: no reply posted"
-                        }),
-                        None,
-                        /* clear_workspace_lease */ true,
-                        None,
+                        FinishExecutionRunInput::builder()
+                            .execution_id(&execution.id)
+                            .run_id(&run_id)
+                            .execution_status(ExecutionStatus::Completed)
+                            .run_status("completed")
+                            .result_summary(if replied {
+                                "answer agent: replied"
+                            } else {
+                                "answer agent: no reply posted"
+                            })
+                            .clear_workspace_lease(true)
+                            .build(),
                     ) {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -6031,14 +6031,13 @@ mod tests {
         // execution sits in `waiting_human` with the lease still held.
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
             )
             .unwrap();
 
@@ -6275,14 +6274,13 @@ mod tests {
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
             )
             .unwrap();
         (db, product.id, chore.id, execution.id, attempt.id)
@@ -7540,14 +7538,13 @@ mod tests {
             .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
             .unwrap();
         db.finish_execution_run(
-            &exec.id,
-            &run.id,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            Some("spawned worker pane"),
-            None,
-            false,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .result_summary("spawned worker pane")
+                .build(),
         )
         .unwrap();
         (chore.id, exec.id)
@@ -7890,14 +7887,13 @@ PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
             )
             .unwrap();
 
@@ -8008,14 +8004,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
             )
             .unwrap();
 
@@ -8335,14 +8330,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &exec2.id,
-                &run2.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                None,
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&exec2.id)
+                    .run_id(&run2.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .build(),
             )
             .unwrap();
         let chore3 = db
@@ -8377,14 +8370,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &exec3.id,
-                &run3.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                None,
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&exec3.id)
+                    .run_id(&run3.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .build(),
             )
             .unwrap();
 
@@ -9815,14 +9806,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned revision worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned revision worker pane")
+                    .build(),
             )
             .unwrap();
         (db, product.id, revision.id, execution.id)
@@ -9964,14 +9954,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned revision worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned revision worker pane")
+                    .build(),
             )
             .unwrap();
 
@@ -10180,14 +10169,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         // Mirror the waiting_human state.
         db.finish_execution_run(
-            &execution.id,
-            &run.id,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            Some("spawned pane"),
-            None,
-            false,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .result_summary("spawned pane")
+                .build(),
         )
         .unwrap();
         // Simulate orphan sweep abandoning exec_A.
@@ -10352,14 +10340,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned revision worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned revision worker pane")
+                    .build(),
             )
             .unwrap();
         // Snapshot the parent PR's head SHA as `on_execution_started` does.
@@ -11277,14 +11264,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned conflict-resolution worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned conflict-resolution worker pane")
+                    .build(),
             )
             .unwrap();
         db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
@@ -11868,14 +11854,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned CI-fix revision worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned CI-fix revision worker pane")
+                    .build(),
             )
             .unwrap();
         db.set_execution_pr_head_before(&execution.id, head).unwrap();
@@ -12893,14 +12878,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &pr_review_exec.id,
-                &run.id,
-                ExecutionStatus::Running,
-                "completed",
-                Some("reviewer spawned"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&pr_review_exec.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::Running)
+                    .run_status("completed")
+                    .result_summary("reviewer spawned")
+                    .build(),
             )
             .unwrap();
 
@@ -13634,14 +13618,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &pr_review_exec_1.id,
-                &run1.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("reviewer spawned"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&pr_review_exec_1.id)
+                    .run_id(&run1.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("reviewer spawned")
+                    .build(),
             )
             .unwrap();
 
@@ -13701,14 +13684,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &rev_exec.id,
-                &rev_run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("revision worker spawned"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&rev_exec.id)
+                    .run_id(&rev_run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("revision worker spawned")
+                    .build(),
             )
             .unwrap();
 
@@ -13761,14 +13743,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &pr_review_exec_2.id,
-                &run2.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("reviewer 2 spawned"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&pr_review_exec_2.id)
+                    .run_id(&run2.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("reviewer 2 spawned")
+                    .build(),
             )
             .unwrap();
 
@@ -13983,14 +13964,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &pr_review_exec.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("reviewer spawned"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&pr_review_exec.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("reviewer spawned")
+                    .build(),
             )
             .unwrap();
 
@@ -14258,14 +14238,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .unwrap();
         let _ = db
             .finish_execution_run(
-                &execution.id,
-                &run.id,
-                ExecutionStatus::WaitingHuman,
-                "completed",
-                Some("spawned worker pane"),
-                None,
-                false,
-                None,
+                FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::WaitingHuman)
+                    .run_status("completed")
+                    .result_summary("spawned worker pane")
+                    .build(),
             )
             .unwrap();
         db.set_execution_pr_head_before(&execution.id, head).unwrap();

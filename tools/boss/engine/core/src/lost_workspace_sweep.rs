@@ -299,7 +299,7 @@ mod tests {
     use crate::work::{AutomationFireRecord, CreateChoreInput, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
-        AutomationTrigger, CreateAutomationInput, ExecutionStatus,
+        AutomationTrigger, CreateAutomationInput, ExecutionStatus, FinishExecutionRunInput,
     };
 
     fn open_db() -> (TempDir, WorkDb) {
@@ -347,14 +347,12 @@ mod tests {
             )
             .unwrap();
         db.finish_execution_run(
-            &exec.id,
-            &run.id,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            None,
-            None,
-            /* clear_workspace_lease */ false,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
         )
         .unwrap();
         db.get_execution(&exec.id).unwrap()

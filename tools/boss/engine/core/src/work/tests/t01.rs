@@ -1565,14 +1565,13 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
 
     // Reviewer finishes (terminal) → badge off again.
     db.finish_execution_run(
-        &review.id,
-        &run.id,
-        ExecutionStatus::Completed,
-        "completed",
-        None,
-        None,
-        true,
-        None,
+        FinishExecutionRunInput::builder()
+            .execution_id(&review.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Completed)
+            .run_status("completed")
+            .clear_workspace_lease(true)
+            .build(),
     )
     .unwrap();
 
@@ -1648,14 +1647,13 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
     // Simulate `PaneSpawnRunner` returning `ReviewerPaneAlive`: the run is
     // recorded as completed but the execution stays `running`.
     db.finish_execution_run(
-        &review.id,
-        &run.id,
-        ExecutionStatus::Running,
-        "completed",
-        Some("Spawned reviewer pane in slot 17."),
-        None,
-        false,
-        None,
+        FinishExecutionRunInput::builder()
+            .execution_id(&review.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Running)
+            .run_status("completed")
+            .result_summary("Spawned reviewer pane in slot 17.")
+            .build(),
     )
     .unwrap();
 

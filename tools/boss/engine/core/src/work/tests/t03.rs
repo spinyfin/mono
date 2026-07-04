@@ -183,22 +183,22 @@ fn finishes_active_run_into_waiting_human_with_attention() {
 
     let (execution, run, attention) = db
         .finish_execution_run(
-            &execution.id,
-            &run.id,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            Some("Implemented the first pass."),
-            None,
-            false,
-            Some(CreateAttentionItemInput {
-                execution_id: Some(execution.id.clone()),
-                work_item_id: None,
-                kind: "review_required".to_owned(),
-                status: None,
-                title: "Review implementation output for Cleanup".to_owned(),
-                body_markdown: "Review requested.".to_owned(),
-                resolved_at: None,
-            }),
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .result_summary("Implemented the first pass.")
+                .attention(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: "review_required".to_owned(),
+                    status: None,
+                    title: "Review implementation output for Cleanup".to_owned(),
+                    body_markdown: "Review requested.".to_owned(),
+                    resolved_at: None,
+                })
+                .build(),
         )
         .unwrap();
 
@@ -254,14 +254,14 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
 
     let (execution, run, attention) = db
         .finish_execution_run(
-            &execution.id,
-            &run.id,
-            ExecutionStatus::Failed,
-            "failed",
-            None,
-            Some("agent run failed"),
-            true,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::Failed)
+                .run_status("failed")
+                .error_text("agent run failed")
+                .clear_workspace_lease(true)
+                .build(),
         )
         .unwrap();
 
@@ -1998,14 +1998,12 @@ fn cold_path_pr_detection_covers_investigations() {
         .start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/workspaces/ws")
         .unwrap();
     db.finish_execution_run(
-        &exec.id,
-        &run.id,
-        ExecutionStatus::WaitingHuman,
-        "completed",
-        None,
-        None,
-        false,
-        None,
+        FinishExecutionRunInput::builder()
+            .execution_id(&exec.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
     )
     .unwrap();
 

@@ -273,14 +273,12 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/workspaces/ws-1")
         .unwrap();
     db.finish_execution_run(
-        &exec.id,
-        &run.id,
-        ExecutionStatus::WaitingHuman,
-        "completed",
-        None,
-        None,
-        false,
-        None,
+        FinishExecutionRunInput::builder()
+            .execution_id(&exec.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
     )
     .unwrap();
     (product.id, chore.id, exec.id)
