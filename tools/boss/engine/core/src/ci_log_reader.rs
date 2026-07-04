@@ -279,16 +279,40 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// Shell out to `binary` with `args`, capture stdout. Returns an
 /// error annotated with the binary + args + stderr on non-zero exit
 /// so the caller's logs make the failure mode obvious.
+///
+/// Retries a few times on `ETXTBSY`: a binary that was just written +
+/// chmod'd (as our fake-CLI integration tests do, and as a freshly
+/// deployed worker-CLI binary could be) can briefly still be held open
+/// for writing by the kernel/filesystem, making it unspawnable for a
+/// few milliseconds after `close()` returns.
 async fn run_capture(binary: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(binary)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `{binary} {}`", args.join(" ")))?;
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    let output = loop {
+        attempt += 1;
+        let spawn_result = Command::new(binary)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await;
+        match spawn_result {
+            Ok(output) => break output,
+            // ETXTBSY (errno 26 on Unix): the binary is transiently open
+            // for writing (e.g. we just chmod'd it). No `libc` dependency
+            // in this crate, so the errno is inlined rather than adding one
+            // just for this constant.
+            Err(err) if err.raw_os_error() == Some(26) && attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(20 * u64::from(attempt))).await;
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to spawn `{binary} {}`", args.join(" ")));
+            }
+        }
+    };
     if !output.status.success() {
         return Err(anyhow!(
             "`{binary} {}` failed (exit {:?}): {}",
