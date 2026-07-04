@@ -149,11 +149,34 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
                 expected_version()
             ),
         )),
-        VersionCheck::Missing => Ok(WrapperPushOutcome::Failed(
+        VersionCheck::Missing { status, stdout, stderr } => Ok(WrapperPushOutcome::Failed(
             SshFailureKind::Unclassified,
-            "wrapper missing after push (--version returned non-zero)".to_owned(),
+            format!(
+                "wrapper missing after push (--version {})",
+                describe_probe_failure(status, &stdout, &stderr)
+            ),
         )),
     }
+}
+
+/// Render an ssh probe's exit code and any captured stdout/stderr into
+/// one diagnostic string, so a probe failure never collapses into an
+/// unactionable "(unclassified)" line with no detail. Before this, the
+/// `anaplian` incident's host row said only "wrapper missing after push
+/// (--version returned non-zero)" — no exit code, no stderr — even
+/// though the remote command had in fact printed a specific "no such
+/// file or directory" error explaining exactly what went wrong.
+fn describe_probe_failure(status: i32, stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    let mut detail = format!("exit {status}");
+    if !stdout.is_empty() {
+        detail.push_str(&format!(", stdout: {stdout:?}"));
+    }
+    if !stderr.is_empty() {
+        detail.push_str(&format!(", stderr: {stderr:?}"));
+    }
+    detail
 }
 
 /// Outcome of [`verify_cube_invocable`].
@@ -163,7 +186,8 @@ pub enum CubeProbeOutcome {
     /// non-interactive `PATH`.
     Ok,
     /// The probe ran but `cube` was not invocable. `detail` carries the
-    /// verbatim stderr/stdout (e.g. `zsh:1: command not found: cube`).
+    /// exit code plus any stdout/stderr (e.g. `exit 127, stderr: "zsh:1:
+    /// command not found: cube"`) via [`describe_probe_failure`].
     Failed(String),
 }
 
@@ -190,14 +214,11 @@ pub async fn verify_cube_invocable(transport: &SshTransport) -> Result<CubeProbe
     if output.success() {
         return Ok(CubeProbeOutcome::Ok);
     }
-    let detail = if !output.stderr.trim().is_empty() {
-        output.stderr.trim().to_owned()
-    } else if !output.stdout.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else {
-        format!("exit status {}", output.status)
-    };
-    Ok(CubeProbeOutcome::Failed(detail))
+    Ok(CubeProbeOutcome::Failed(describe_probe_failure(
+        output.status,
+        &output.stdout,
+        &output.stderr,
+    )))
 }
 
 /// Outcome of a `--version` handshake.
@@ -207,8 +228,14 @@ pub enum VersionCheck {
     Match,
     /// `--version` returned a different version. Trigger re-push.
     Mismatch { actual: String },
-    /// The wrapper file is absent or unexecutable. Trigger push.
-    Missing,
+    /// The wrapper file is absent or unexecutable. Trigger push. Carries
+    /// the probe's raw exit code/stdout/stderr so a genuine failure is
+    /// diagnosable instead of collapsing into a bare "non-zero" report.
+    Missing {
+        status: i32,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 /// Invoke the wrapper with `--version` over the existing master and
@@ -221,7 +248,11 @@ pub async fn verify_wrapper_version(transport: &SshTransport) -> Result<VersionC
         .await
         .with_context(|| format!("--version probe on host {}", transport.host_id))?;
     if !output.success() {
-        return Ok(VersionCheck::Missing);
+        return Ok(VersionCheck::Missing {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
     let actual = output.stdout.trim().to_owned();
     if actual == expected_version() {
@@ -244,7 +275,7 @@ pub async fn ensure_wrapper_current(transport: &SshTransport, locks: &WrapperPus
     let _guard = host_lock.lock().await;
     match verify_wrapper_version(transport).await? {
         VersionCheck::Match => Ok(WrapperPushOutcome::Ok),
-        VersionCheck::Mismatch { .. } | VersionCheck::Missing => push_wrapper(transport).await,
+        VersionCheck::Mismatch { .. } | VersionCheck::Missing { .. } => push_wrapper(transport).await,
     }
 }
 
@@ -313,6 +344,33 @@ impl Drop for TempFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── describe_probe_failure tests ────────────────────────────────────────
+
+    #[test]
+    fn describe_probe_failure_includes_exit_code_only_when_streams_empty() {
+        assert_eq!(describe_probe_failure(127, "", ""), "exit 127");
+    }
+
+    #[test]
+    fn describe_probe_failure_includes_stderr() {
+        assert_eq!(
+            describe_probe_failure(
+                127,
+                "",
+                "sh: ~/.boss-remote/bin/boss-remote-run: No such file or directory\n"
+            ),
+            "exit 127, stderr: \"sh: ~/.boss-remote/bin/boss-remote-run: No such file or directory\""
+        );
+    }
+
+    #[test]
+    fn describe_probe_failure_includes_stdout_and_stderr_together() {
+        assert_eq!(
+            describe_probe_failure(1, "partial output\n", "warning: something\n"),
+            "exit 1, stdout: \"partial output\", stderr: \"warning: something\""
+        );
+    }
 
     // ── WrapperPushLocks tests ──────────────────────────────────────────────
 

@@ -398,7 +398,24 @@ pub fn reverse_forward_spec(remote_socket: &str, local_socket: &str) -> String {
 /// remote shell's re-parse of that string intact — spaces, `*`/`?`
 /// globs, `$`/backtick expansion, and quote characters all lose their
 /// special meaning inside the single quotes.
+///
+/// **Exception: a leading `~/` is left unquoted.** Every remote path
+/// this engine constructs is home-relative (`~/.boss-remote/bin/...`),
+/// and POSIX tilde-expansion only fires on an *unquoted* `~` at the
+/// start of a word — quoting the whole token (the naive approach)
+/// silently defeats it, so the remote shell goes looking for a literal,
+/// nonexistent file named `~` instead of the real path under `$HOME`.
+/// That was the root cause of a false-negative wrapper-push failure: a
+/// freshly-pushed, working wrapper got reported as missing because the
+/// post-push `--version` probe quoted its own `~/...` path. Only the
+/// `~/` prefix itself is exempted from quoting; everything after it —
+/// including any shell metacharacters — is still fully quoted exactly
+/// as before, so this carves out tilde-expansion without reopening any
+/// injection surface.
 pub fn shell_quote(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        return format!("~/{}", shell_quote(rest));
+    }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -579,6 +596,62 @@ mod tests {
                 "shell_quote round-trip mismatch for {raw:?} (quoted as {quoted:?})"
             );
         }
+    }
+
+    /// Reproduces the `anaplian` false-negative: a real shell must still
+    /// resolve a `shell_quote`d `~/...` remote path to `$HOME/...`, not
+    /// to a literal (nonexistent) `~` file. Overrides `$HOME` to a temp
+    /// dir so the assertion doesn't depend on the test runner's real
+    /// home directory.
+    #[test]
+    fn shell_quote_preserves_tilde_expansion_for_remote_paths() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".boss-remote/bin")).unwrap();
+        std::fs::write(home.path().join(".boss-remote/bin/marker"), b"eng-abc123").unwrap();
+
+        let quoted = shell_quote("~/.boss-remote/bin/marker");
+        assert_eq!(quoted, "~/'.boss-remote/bin/marker'");
+
+        let output = std::process::Command::new("sh")
+            .env("HOME", home.path())
+            .arg("-c")
+            .arg(format!("cat {quoted}"))
+            .output()
+            .expect("spawn sh");
+        assert!(
+            output.status.success(),
+            "expected tilde-expanded path to resolve under $HOME: {output:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "eng-abc123");
+    }
+
+    /// The `~/` exemption must not reopen an injection surface: only the
+    /// prefix itself goes unquoted, so shell metacharacters anywhere
+    /// after it stay inert (still delivered as literal argument content,
+    /// not interpreted by the shell).
+    #[test]
+    fn shell_quote_tilde_prefix_still_quotes_remainder_metacharacters() {
+        let home = TempDir::new().unwrap();
+        let quoted = shell_quote("~/dir with $(danger) & `backticks` *and?globs");
+
+        let output = std::process::Command::new("sh")
+            .env("HOME", home.path())
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .expect("spawn sh");
+        assert!(output.status.success(), "sh failed: {output:?}");
+        let expected = format!("{}/dir with $(danger) & `backticks` *and?globs", home.path().display());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+
+    #[test]
+    fn shell_quote_without_tilde_prefix_is_unaffected() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("has spaces"), "'has spaces'");
+        // A bare `~` (no following slash) isn't the pattern this repo's
+        // remote paths use, so it is quoted like any other token.
+        assert_eq!(shell_quote("~"), "'~'");
     }
 
     /// Reproduces the exact bug scenario end-to-end: a multi-token argv
