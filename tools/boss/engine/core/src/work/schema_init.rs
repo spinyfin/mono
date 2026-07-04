@@ -403,6 +403,11 @@ impl WorkDb {
         // in place, unread, as a historical record.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_retire_magic_wand_dispatched_comments(&conn)?;
+        // Dispatch-failure surface: tasks.dispatch_failed_reason /
+        // dispatch_failed_error / dispatch_failed_at, so a task that fails
+        // to start (as opposed to merely waiting on a full worker pool)
+        // renders an error inline on its kanban card.
+        migrate_tasks_dispatch_failure_columns(&conn)?;
         // `schema_version` is a coarse bookkeeping marker, not a per-migration
         // dispatch key: additive `CREATE TABLE IF NOT EXISTS` migrations (like
         // this one and the P1a intent columns above) ride the current marker

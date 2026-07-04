@@ -468,6 +468,9 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         origin_task_short_id: None,
         origin_pr_number: None,
         completed_at: None,
+        dispatch_failed_reason: None,
+        dispatch_failed_error: None,
+        dispatch_failed_at: None,
     }
 }
 

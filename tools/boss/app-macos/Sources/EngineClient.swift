@@ -2211,7 +2211,10 @@ final class EngineClient: @unchecked Sendable {
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
-            completedAt: payload["completed_at"] as? String
+            completedAt: payload["completed_at"] as? String,
+            dispatchFailedReason: payload["dispatch_failed_reason"] as? String,
+            dispatchFailedError: payload["dispatch_failed_error"] as? String,
+            dispatchFailedAt: payload["dispatch_failed_at"] as? String
         )
     }
 

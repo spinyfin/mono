@@ -258,6 +258,14 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // SELECT includes those columns. None in all standard query paths.
         origin_task_short_id: None,
         origin_pr_number: None,
+        // Dispatch-failure surface; populated by
+        // map_task_with_parent_provenance_and_archived_reason and
+        // map_task_with_external_ref_parent_source_and_provenance when the
+        // SELECT includes the trailing dispatch_failed_* columns. None in
+        // all standard query paths.
+        dispatch_failed_reason: None,
+        dispatch_failed_error: None,
+        dispatch_failed_at: None,
     })
 }
 
@@ -301,6 +309,9 @@ pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Re
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.archived_reason = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -363,13 +374,18 @@ pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &R
 
 /// Like [`map_task_with_external_ref_parent_and_source_automation_id`] but
 /// also reads `origin_task_short_id` (index 38), `origin_pr_number`
-/// (index 39), and `completed_at` (index 40). Used by `get_work_tree`
-/// for both task and chore queries, which append these columns at the end.
+/// (index 39), `completed_at` (index 40), and the trailing
+/// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
+/// columns (indices 41-43). Used by `get_work_tree` for both task and chore
+/// queries, which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
     task.origin_task_short_id = row.get(38)?;
     task.origin_pr_number = row.get(39)?;
     task.completed_at = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
