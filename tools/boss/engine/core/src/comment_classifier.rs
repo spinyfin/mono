@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use boss_protocol::{CommentAnchor, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION};
+use boss_protocol::{CommentAnchor, CommentThreadEntry, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION};
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 
@@ -90,12 +90,59 @@ shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\
     )
 }
 
-/// Make a one-shot classification call. Returns `Err(message)` on any
-/// failure (transport, non-2xx, malformed/invalid reply) — the caller logs
-/// and leaves the comment's `intent` `NULL` (still `classifying`); there is
-/// no retry in this phase.
-pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
-    let prompt = build_prompt(body, anchor);
+/// Render a follow-up reply's classification prompt (P3c "Reclassifying
+/// follow-ups"): the same three-intent rubric as [`build_prompt`], but with
+/// the original comment plus the thread's prior turns as context ahead of
+/// the reply actually being classified — design § "The classifier":
+/// "for a reply — the prior thread turns."
+fn build_followup_prompt(
+    original_body: &str,
+    anchor: &CommentAnchor,
+    thread: &[CommentThreadEntry],
+    followup_body: &str,
+) -> String {
+    let mut thread_block = String::new();
+    for entry in thread {
+        thread_block.push_str(&format!("{} ({}):\n{}\n\n", entry.entry_kind, entry.author, entry.body));
+    }
+    format!(
+        "You classify a reviewer's follow-up reply in an ongoing thread on a design/investigation \
+document comment, into exactly one of three intents:\n\
+\n\
+- \"directive\": a clear, small, actionable instruction to change the doc (e.g. \
+\"typo, should be X\", \"reword this sentence\", \"add a link to Y here\").\n\
+- \"larger_change\": wants a substantive change but isn't a one-line edit (e.g. \
+\"this section needs a new alternative considered\", \"rethink this approach\", \
+\"this whole section is missing an important case\").\n\
+- \"question\": asks something rather than asking for an edit (e.g. \"why did you \
+choose X over Y?\", \"what does this mean?\", \"does this handle Z?\"). Not a \
+request to change the doc.\n\
+\n\
+Quoted section from the document (the highlighted span, with surrounding context):\n\
+> {prefix}[[{exact}]]{suffix}\n\
+\n\
+Original comment:\n\
+> {original_body}\n\
+\n\
+Prior thread on this comment:\n\
+{thread_block}\n\
+Follow-up reply to classify:\n\
+> {followup_body}\n\
+\n\
+Respond with ONLY a JSON object — no explanation, no markdown fences — of the exact \
+shape: {{\"intent\": \"directive\"|\"question\"|\"larger_change\", \"confidence\": \
+<number between 0.0 and 1.0>}}.",
+        prefix = anchor.prefix,
+        exact = anchor.exact,
+        suffix = anchor.suffix,
+    )
+}
+
+/// Shared call plumbing for [`classify`] and [`classify_followup`]: send the
+/// prompt, parse and validate the reply. Returns `Err(message)` on any
+/// failure (transport, non-2xx, malformed/invalid reply) — callers log and
+/// leave the comment's state unchanged; there is no retry in this phase.
+async fn call_classifier(api_key: &str, prompt: String) -> Result<Classification, String> {
     let request = MessagesRequest::builder()
         .model(CLASSIFIER_MODEL)
         .max_tokens(CLASSIFIER_MAX_TOKENS)
@@ -126,6 +173,27 @@ pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Resu
     })
 }
 
+/// Make a one-shot classification call for a fresh top-level comment.
+pub async fn classify(api_key: &str, body: &str, anchor: &CommentAnchor) -> Result<Classification, String> {
+    call_classifier(api_key, build_prompt(body, anchor)).await
+}
+
+/// Make a one-shot classification call for an operator's follow-up reply
+/// (P3c), with the original comment and the thread's prior turns as context.
+pub async fn classify_followup(
+    api_key: &str,
+    original_body: &str,
+    anchor: &CommentAnchor,
+    thread: &[CommentThreadEntry],
+    followup_body: &str,
+) -> Result<Classification, String> {
+    call_classifier(
+        api_key,
+        build_followup_prompt(original_body, anchor, thread, followup_body),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +219,49 @@ mod tests {
         let reply: ClassifyReply = serde_json::from_str(raw).unwrap();
         assert_eq!(reply.intent, "question");
         assert_eq!(reply.confidence, 0.92);
+    }
+
+    #[test]
+    fn build_followup_prompt_contains_original_thread_and_followup() {
+        let anchor = CommentAnchor {
+            exact: "the retry logic".to_owned(),
+            prefix: "before ".to_owned(),
+            suffix: " after".to_owned(),
+        };
+        let thread = vec![
+            CommentThreadEntry::builder()
+                .id("cte_1")
+                .comment_id("cmt_1")
+                .entry_kind("answer")
+                .author("engine")
+                .body("The retry backoff is exponential because…")
+                .created_at("2026-01-01T00:00:00Z")
+                .build(),
+        ];
+        let prompt = build_followup_prompt(
+            "why does this retry three times?",
+            &anchor,
+            &thread,
+            "ok, please document that in the doc then",
+        );
+        assert!(prompt.contains("the retry logic"));
+        assert!(prompt.contains("why does this retry three times?"));
+        assert!(prompt.contains("The retry backoff is exponential because…"));
+        assert!(prompt.contains("ok, please document that in the doc then"));
+        assert!(prompt.contains("directive"));
+        assert!(prompt.contains("question"));
+        assert!(prompt.contains("larger_change"));
+    }
+
+    #[test]
+    fn build_followup_prompt_handles_an_empty_thread() {
+        let anchor = CommentAnchor {
+            exact: "x".to_owned(),
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let prompt = build_followup_prompt("original", &anchor, &[], "follow-up");
+        assert!(prompt.contains("original"));
+        assert!(prompt.contains("follow-up"));
     }
 }

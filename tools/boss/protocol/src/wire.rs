@@ -300,6 +300,28 @@ pub enum FrontendRequest {
         body: String,
     },
 
+    /// Operator-authored reply in a bucket-2 comment's thread (P3c "Follow-up
+    /// reclassification loop" of `comment-triggered-document-revisions.md`).
+    /// Only valid while the comment is `answered` — replying to any other
+    /// status is a `WorkError` (in particular, a comment still `answering`
+    /// rejects a second follow-up rather than queuing it; design
+    /// §"Concurrency/idempotency" describes queuing as the eventual UX, not
+    /// yet implemented). On success: appends an `entry_kind =
+    /// 'operator_followup'` `comment_thread_entries` row, transitions the
+    /// comment `answered → awaiting_followup`, and — off the request's
+    /// critical path, mirroring `CommentsCreate`'s classifier dispatch —
+    /// reclassifies the follow-up with the accumulated thread as context.
+    /// `question` re-enters bucket 2 (`awaiting_followup → answering`,
+    /// answer agent runs again); `directive`/`larger_change` bridges into
+    /// the bucket-1&3 path (`awaiting_followup → active`), carrying the
+    /// thread's answer-agent reply into the next `[Revise]` batch's
+    /// directive.
+    CommentsPostFollowup {
+        comment_id: String,
+        body: String,
+        author: String,
+    },
+
     /// Resolve every active comment on an artifact against the renderer's
     /// current plain-text projection. The engine runs the
     /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting

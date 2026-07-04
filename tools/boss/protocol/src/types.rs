@@ -901,6 +901,15 @@ pub const COMMENT_STATUS_ANSWERING: &str = "answering";
 /// into `answering` for another question, or into `active` for a
 /// directive/larger-change bridge into the revision path).
 pub const COMMENT_STATUS_ANSWERED: &str = "answered";
+/// Bucket-2 track (P3c): an operator has posted an `entry_kind =
+/// 'operator_followup'` reply on an `answered` comment; the reply is being
+/// (re)classified. Exits back to [`COMMENT_STATUS_ANSWERING`] if the
+/// follow-up reclassifies as `question` (the answer agent runs again with
+/// the accumulated thread as context), or to [`COMMENT_STATUS_ACTIVE`] if it
+/// reclassifies as `directive`/`larger_change` (the bucket-1&3 bridge — the
+/// comment re-enters the `[Revise]` candidate pool with the bucket-2
+/// thread's context carried into the eventual directive).
+pub const COMMENT_STATUS_AWAITING_FOLLOWUP: &str = "awaiting_followup";
 
 /// How the comment's anchor last resolved against the doc's plain-text
 /// projection: `exact`, `fuzzy` (drives the ⚠ sidebar glyph), or `orphan`.
@@ -3364,7 +3373,8 @@ pub struct WorkComment {
     #[builder(default)]
     pub plain_text_projection_version: i64,
 
-    /// `active` | `resolved` | `orphaned` | `dismissed`.
+    /// `active` | `resolved` | `orphaned` | `dismissed` | `in_revision` |
+    /// `answering` | `answered` | `awaiting_followup`.
     #[serde(default = "default_comment_status")]
     #[builder(default = default_comment_status())]
     pub status: String,

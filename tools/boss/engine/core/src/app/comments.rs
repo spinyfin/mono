@@ -7,7 +7,7 @@
 
 use super::*;
 
-use boss_protocol::{INTENT_DIRECTIVE, INTENT_LARGER_CHANGE};
+use boss_protocol::{INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP};
 
 /// Design § "Buckets 1 & 3 — unified" example nudge text.
 const NUDGE_BODY: &str = "This looks like it wants a doc change — click [Revise] to start one.";
@@ -167,56 +167,8 @@ async fn spawn_answer_agent(
     request_id: &str,
     comment: &WorkComment,
 ) {
-    let doc_owner = match work_db.resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id) {
-        Ok(Some(owner)) => owner,
-        Ok(None) => {
-            tracing::debug!(
-                comment_id = %comment.id,
-                artifact_kind = %comment.artifact_kind,
-                artifact_id = %comment.artifact_id,
-                "answer-agent spawn: comment's artifact has no design/investigation doc owner; skipping (out of bucket-2 scope)",
-            );
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                comment_id = %comment.id,
-                err = %err,
-                "answer-agent spawn: resolve_doc_owner failed; leaving comment active",
-            );
-            return;
-        }
-    };
-
-    let repo_remote_url = match work_db.get_work_item(&doc_owner.task_id) {
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => match task.repo_remote_url {
-            Some(url) if !url.is_empty() => url,
-            _ => {
-                tracing::warn!(
-                    comment_id = %comment.id,
-                    task_id = %doc_owner.task_id,
-                    "answer-agent spawn: doc owner task has no repo_remote_url; skipping",
-                );
-                return;
-            }
-        },
-        Ok(_) => {
-            tracing::warn!(
-                comment_id = %comment.id,
-                task_id = %doc_owner.task_id,
-                "answer-agent spawn: doc owner did not resolve to a task; skipping",
-            );
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                comment_id = %comment.id,
-                task_id = %doc_owner.task_id,
-                err = %err,
-                "answer-agent spawn: failed to load doc owner task; skipping",
-            );
-            return;
-        }
+    let Some(repo_remote_url) = resolve_answer_agent_repo(work_db, comment) else {
+        return;
     };
 
     // Guarded status flip first (cheapest failure mode, no side effects to
@@ -231,12 +183,164 @@ async fn spawn_answer_agent(
         return;
     }
 
+    finish_answer_agent_spawn(
+        server_state,
+        work_db,
+        session_id,
+        request_id,
+        comment,
+        &repo_remote_url,
+        0,
+        "comment_answer_agent_spawned",
+        WorkDb::transition_comment_answering_to_active,
+    )
+    .await;
+}
+
+/// Re-entrant answer-agent spawn for a bucket-2 follow-up loop (P3c
+/// "Follow-up reclassification loop"): a comment sitting `awaiting_followup`
+/// whose reply reclassified as `question` re-enters bucket 2. Mirrors
+/// [`spawn_answer_agent`] except for the source status
+/// (`awaiting_followup`, not `active`) and the `thread_turn`, which
+/// increments from the comment's latest run rather than starting at `0` —
+/// design §"Reclassifying follow-ups": "the answer agent runs again with the
+/// accumulated thread as context (`thread_turn` increments)."
+async fn respawn_answer_agent_for_followup(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+) {
+    let Some(repo_remote_url) = resolve_answer_agent_repo(work_db, comment) else {
+        return;
+    };
+
+    let next_turn = match work_db.latest_answer_agent_run_for_comment(&comment.id) {
+        Ok(Some(run)) => run.thread_turn + 1,
+        Ok(None) => 0,
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent follow-up respawn: failed to look up the latest run; defaulting thread_turn to 0",
+            );
+            0
+        }
+    };
+
+    if let Err(err) = work_db.transition_comment_awaiting_followup_to_answering(&comment.id) {
+        tracing::warn!(
+            comment_id = %comment.id,
+            err = %err,
+            "answer-agent follow-up respawn: comment was not 'awaiting_followup'; skipping respawn",
+        );
+        return;
+    }
+
+    finish_answer_agent_spawn(
+        server_state,
+        work_db,
+        session_id,
+        request_id,
+        comment,
+        &repo_remote_url,
+        next_turn,
+        "comment_followup_answer_agent_spawned",
+        WorkDb::transition_comment_answering_to_awaiting_followup,
+    )
+    .await;
+}
+
+/// Resolve the repo an answer-agent execution should be spawned against:
+/// `resolve_doc_owner`'s owning task's `repo_remote_url`. `None` (logged) if
+/// the comment's artifact has no design/investigation doc owner, or that
+/// owner's task has no repo — either way the spawn is skipped and the
+/// comment is left in its current state (design §"Scope guard"). Shared by
+/// [`spawn_answer_agent`] (P3b) and [`respawn_answer_agent_for_followup`]
+/// (P3c) — the doc-owner/repo lookup is identical for a fresh spawn and a
+/// follow-up re-entry.
+fn resolve_answer_agent_repo(work_db: &WorkDb, comment: &WorkComment) -> Option<String> {
+    let doc_owner = match work_db.resolve_doc_owner(&comment.artifact_kind, &comment.artifact_id) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            tracing::debug!(
+                comment_id = %comment.id,
+                artifact_kind = %comment.artifact_kind,
+                artifact_id = %comment.artifact_id,
+                "answer-agent spawn: comment's artifact has no design/investigation doc owner; skipping (out of bucket-2 scope)",
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: resolve_doc_owner failed; leaving comment as-is",
+            );
+            return None;
+        }
+    };
+
+    match work_db.get_work_item(&doc_owner.task_id) {
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => match task.repo_remote_url {
+            Some(url) if !url.is_empty() => Some(url),
+            _ => {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    task_id = %doc_owner.task_id,
+                    "answer-agent spawn: doc owner task has no repo_remote_url; skipping",
+                );
+                None
+            }
+        },
+        Ok(_) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                task_id = %doc_owner.task_id,
+                "answer-agent spawn: doc owner did not resolve to a task; skipping",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                comment_id = %comment.id,
+                task_id = %doc_owner.task_id,
+                err = %err,
+                "answer-agent spawn: failed to load doc owner task; skipping",
+            );
+            None
+        }
+    }
+}
+
+/// Shared tail of an answer-agent spawn, once the caller has already
+/// performed the guarded transition into `answering`: create the tracking
+/// `answer_agent_runs` row, create the bound `answer_agent` execution, kick
+/// the coordinator, and publish the invalidation that drives the sidebar's
+/// thinking indicator. `compensate` is the guarded transition back to the
+/// comment's pre-`answering` status (`answering → active` for a fresh spawn,
+/// `answering → awaiting_followup` for a follow-up re-entry) — invoked if
+/// either tracking-row creation step fails, mirroring the original
+/// [`spawn_answer_agent`]'s compensation behaviour.
+#[allow(clippy::too_many_arguments)]
+async fn finish_answer_agent_spawn(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+    repo_remote_url: &str,
+    thread_turn: i64,
+    invalidation_reason: &str,
+    compensate: fn(&WorkDb, &str) -> anyhow::Result<WorkComment>,
+) {
     let run = match work_db.create_answer_agent_run(
         &comment.id,
         &comment.artifact_kind,
         &comment.artifact_id,
         &comment.doc_version,
-        0,
+        thread_turn,
     ) {
         Ok(run) => run,
         Err(err) => {
@@ -245,18 +349,18 @@ async fn spawn_answer_agent(
                 err = %err,
                 "answer-agent spawn: comment flipped to 'answering' but failed to create the tracking run row",
             );
-            if let Err(err) = work_db.transition_comment_answering_to_active(&comment.id) {
+            if let Err(err) = compensate(work_db, &comment.id) {
                 tracing::warn!(
                     comment_id = %comment.id,
                     err = %err,
-                    "answer-agent spawn: failed to compensate 'answering' back to 'active' after run-row creation failure",
+                    "answer-agent spawn: failed to compensate 'answering' back after run-row creation failure",
                 );
             }
             return;
         }
     };
 
-    if let Err(err) = work_db.create_answer_agent_execution(&comment.id, &repo_remote_url) {
+    if let Err(err) = work_db.create_answer_agent_execution(&comment.id, repo_remote_url) {
         tracing::error!(
             comment_id = %comment.id,
             err = %err,
@@ -275,11 +379,11 @@ async fn spawn_answer_agent(
                 "answer-agent spawn: failed to mark the orphaned run row 'failed' after execution creation failure",
             );
         }
-        if let Err(err) = work_db.transition_comment_answering_to_active(&comment.id) {
+        if let Err(err) = compensate(work_db, &comment.id) {
             tracing::warn!(
                 comment_id = %comment.id,
                 err = %err,
-                "answer-agent spawn: failed to compensate 'answering' back to 'active' after execution creation failure",
+                "answer-agent spawn: failed to compensate 'answering' back after execution creation failure",
             );
         }
         return;
@@ -295,9 +399,216 @@ async fn spawn_answer_agent(
         request_id,
         &comment.artifact_kind,
         &comment.artifact_id,
-        "comment_answer_agent_spawned",
+        invalidation_reason,
     )
     .await;
+}
+
+/// Operator-authored reply in a bucket-2 comment's thread (P3c "Follow-up
+/// reclassification loop" of `comment-triggered-document-revisions.md`).
+/// Only valid while the comment is `answered`. Appends the
+/// `entry_kind = 'operator_followup'` thread entry, transitions the comment
+/// `answered → awaiting_followup`, and — off the request's critical path,
+/// mirroring `CommentsCreate`'s classifier dispatch — reclassifies the
+/// follow-up with the accumulated thread as context.
+pub(super) async fn handle_comments_post_followup(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsPostFollowup {
+        comment_id,
+        body,
+        author,
+    } = req
+    else {
+        unreachable!()
+    };
+    if body.trim().is_empty() {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::WorkError {
+                message: "follow-up body may not be empty".to_owned(),
+            },
+        );
+        return;
+    }
+
+    // Guarded status flip first (cheapest failure mode, no side effects to
+    // unwind yet): only proceed once we know this comment is actually
+    // eligible for a follow-up. In particular this rejects a follow-up
+    // arriving while a prior run is still `answering` (design
+    // §"Concurrency/idempotency" describes queuing that case rather than
+    // rejecting it; not yet implemented — the operator sees a WorkError and
+    // can retry once the in-flight run completes).
+    let comment = match work_db.transition_comment_to_awaiting_followup(&comment_id) {
+        Ok(comment) => comment,
+        Err(err) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = work_db.create_comment_thread_entry(
+        &comment_id,
+        THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+        &author,
+        &body,
+        None,
+        None,
+    ) {
+        // The transition already succeeded; surfacing this as a hard error
+        // would tempt the caller into a (now-guarded, hence failing) retry.
+        // Log loudly and continue — the thread entry is an audit/UI
+        // artifact, not load-bearing for reclassification, which is passed
+        // the follow-up body directly rather than re-reading it back.
+        tracing::error!(
+            comment_id = %comment_id,
+            err = %err,
+            "CommentsPostFollowup: comment transitioned but failed to create the operator_followup thread entry",
+        );
+    }
+
+    let revision = publish_comment_invalidation(
+        &server_state,
+        &session_id,
+        &request_id,
+        &comment.artifact_kind,
+        &comment.artifact_id,
+        "comment_followup_posted",
+    )
+    .await;
+    send_response_with_revision(
+        &sink,
+        &request_id,
+        revision,
+        FrontendEvent::CommentResult {
+            comment: comment.clone(),
+        },
+    );
+
+    // Reclassification is NOT on the request's critical path, mirroring
+    // `CommentsCreate`'s classifier dispatch.
+    spawn_followup_classifier(&server_state, &work_db, &session_id, &request_id, &comment, &body);
+}
+
+/// Spawn the detached reclassification call for an operator's follow-up
+/// reply (P3c). Failures (no API key, transport, malformed reply) are
+/// logged and swallowed — the comment simply stays `awaiting_followup` with
+/// no retry in this phase, mirroring `spawn_comment_classifier`'s failure
+/// handling for the top-level classifier.
+fn spawn_followup_classifier(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    session_id: &str,
+    request_id: &str,
+    comment: &WorkComment,
+    followup_body: &str,
+) {
+    let Some(api_key) = crate::comment_classifier::resolve_api_key() else {
+        tracing::debug!(
+            comment_id = %comment.id,
+            "follow-up classifier: no API key configured; comment stays in awaiting_followup state",
+        );
+        return;
+    };
+    let server_state = server_state.clone();
+    let work_db = work_db.clone();
+    let session_id = session_id.to_owned();
+    let request_id = request_id.to_owned();
+    let comment = comment.clone();
+    let followup_body = followup_body.to_owned();
+
+    tokio::spawn(async move {
+        let thread = work_db.list_comment_thread_entries(&comment.id).unwrap_or_default();
+        let result = crate::comment_classifier::classify_followup(
+            &api_key,
+            &comment.body,
+            &comment.anchor,
+            &thread,
+            &followup_body,
+        )
+        .await;
+        let classification = match result {
+            Ok(classification) => classification,
+            Err(err) => {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    err = %err,
+                    "follow-up classifier: classification call failed; comment stays in awaiting_followup state",
+                );
+                return;
+            }
+        };
+
+        if let Err(err) =
+            work_db.reclassify_comment_intent(&comment.id, &classification.intent, classification.confidence)
+        {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %err,
+                "follow-up classifier: failed to persist the reclassification",
+            );
+            return;
+        }
+
+        match classification.intent.as_str() {
+            INTENT_QUESTION => {
+                // Loop back into bucket 2: `awaiting_followup → answering`,
+                // the answer agent runs again with the accumulated thread.
+                respawn_answer_agent_for_followup(&server_state, &work_db, &session_id, &request_id, &comment).await;
+            }
+            INTENT_DIRECTIVE | INTENT_LARGER_CHANGE => {
+                // The bucket-1&3 bridge: `awaiting_followup → active`, so
+                // the next `[Revise]` batch picks this comment up. The
+                // thread's answer-agent reply is carried into that batch's
+                // directive by `compose_doc_comment_directive` reading the
+                // comment's thread/latest run directly — no extra column
+                // needed here (design §"Bridging a bucket-2 answer into a
+                // revision").
+                if let Err(err) = work_db.transition_comment_awaiting_followup_to_active(&comment.id) {
+                    tracing::warn!(
+                        comment_id = %comment.id,
+                        err = %err,
+                        "follow-up classifier: failed to bridge 'awaiting_followup' into 'active'",
+                    );
+                    return;
+                }
+                if let Err(err) = work_db.create_nudge_thread_entry(&comment.id, NUDGE_BODY) {
+                    tracing::warn!(
+                        comment_id = %comment.id,
+                        err = %err,
+                        "follow-up classifier: failed to post the bridged nudge thread entry",
+                    );
+                }
+                publish_comment_invalidation(
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    &comment.artifact_kind,
+                    &comment.artifact_id,
+                    "comment_followup_bridged",
+                )
+                .await;
+            }
+            other => tracing::warn!(
+                comment_id = %comment.id,
+                intent = other,
+                "follow-up classifier: returned an intent with no routing case",
+            ),
+        }
+    });
 }
 
 pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
@@ -1047,5 +1358,147 @@ mod tests {
             "expected WorkError for a non-answer-agent run_id, got {:?}",
             envelope.payload
         );
+    }
+
+    // --- Follow-up reclassification loop (P3c) ---
+
+    /// Stand up a `question`-classified comment already `answered` — the
+    /// state `handle_comments_post_followup` expects an operator reply
+    /// against. No `answer_agent_runs`/execution rows are needed: the
+    /// `answering → answered` transition only guards on `work_comments`
+    /// status.
+    fn seed_answered_comment(work_db: &Arc<WorkDb>) -> String {
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "t1".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "work_item".into(),
+                author: "human".into(),
+                body: "What does this mean?".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
+        work_db.transition_comment_to_answering(&comment.id).unwrap();
+        work_db.transition_comment_to_answered(&comment.id).unwrap();
+        comment.id
+    }
+
+    #[tokio::test]
+    async fn post_followup_appends_thread_entry_and_transitions_to_awaiting_followup() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment_id = seed_answered_comment(&work_db);
+
+        handle_comments_post_followup(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostFollowup {
+                comment_id: comment_id.clone(),
+                body: "ok, please make that change".to_owned(),
+                author: "user:test@example.com".to_owned(),
+            },
+        )
+        .await;
+
+        let comment = work_db
+            .get_comment(&comment_id)
+            .unwrap()
+            .expect("comment should still exist");
+        assert_eq!(comment.status, "awaiting_followup");
+
+        let entries = work_db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_kind, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP);
+        assert_eq!(entries[0].body, "ok, please make that change");
+        assert_eq!(entries[0].author, "user:test@example.com");
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(
+            matches!(envelope.payload, FrontendEvent::CommentResult { .. }),
+            "expected CommentResult, got {:?}",
+            envelope.payload
+        );
+    }
+
+    #[tokio::test]
+    async fn post_followup_rejects_empty_body() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment_id = seed_answered_comment(&work_db);
+
+        handle_comments_post_followup(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostFollowup {
+                comment_id: comment_id.clone(),
+                body: "   ".to_owned(),
+                author: "user:test@example.com".to_owned(),
+            },
+        )
+        .await;
+
+        let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(
+            comment.status, "answered",
+            "an empty reply must not transition the comment"
+        );
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(matches!(envelope.payload, FrontendEvent::WorkError { .. }));
+    }
+
+    #[tokio::test]
+    async fn post_followup_rejects_a_comment_that_is_not_answered() {
+        let server_state = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let comment = work_db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_id: "t1".into(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "alpha".into(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                artifact_kind: "work_item".into(),
+                author: "human".into(),
+                body: "a directive comment".into(),
+                doc_version: "v1".into(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        // Still 'active' — never went through bucket 2 at all.
+
+        handle_comments_post_followup(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsPostFollowup {
+                comment_id: comment.id.clone(),
+                body: "a reply".to_owned(),
+                author: "user:test@example.com".to_owned(),
+            },
+        )
+        .await;
+
+        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, "active");
+        assert!(work_db.list_comment_thread_entries(&comment.id).unwrap().is_empty());
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("a response envelope should have been enqueued");
+        assert!(matches!(envelope.payload, FrontendEvent::WorkError { .. }));
     }
 }
