@@ -100,14 +100,27 @@
 //!
 //! [`HeartbeatFailureBreaker`] closes this gap: it tracks *consecutive*
 //! heartbeat failures per execution across passes (reset to zero on the
-//! next success) and, once a lease has failed
-//! [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] times in a row, auto-reaps the
-//! execution through the exact same terminal path as `bossctl agents reap`
-//! (`WorkDb::mark_execution_orphaned`) — see [`auto_reap_dead_lease`]. At
-//! the default 300 s cadence that is a 15-minute bound, chosen so the
-//! reap lands well before the next automation retry (which fires every 15
-//! min): a pane that dies at spawn now self-heals on its very first retry
-//! instead of wedging behind `redundant_spawn`.
+//! next success). Once a lease has failed
+//! [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] times in a row, that is only
+//! *candidate* evidence — a heartbeat failure proves the `cube workspace
+//! heartbeat` call errored or timed out, which is equally consistent with a
+//! transient cube CLI hiccup or a cube daemon outage hitting every in-flight
+//! lease at once (in which case reaping would mass-reclaim live workers'
+//! workspaces — precisely the working-copy-stolen / duplicate-dispatch harm
+//! this module exists to avoid). So before reaping, [`auto_reap_dead_lease`]
+//! takes an independent second opinion via
+//! [`crate::run_reconcile::confirm_execution_dead`] — the same `cube
+//! workspace list` classifier the startup reconciler uses — and only
+//! proceeds if it comes back [`RunReconcileVerdict::Dead`]. A `Live` or
+//! `Unknown` verdict (including because the confirmation probe itself
+//! failed, e.g. mid-outage) resets the streak instead of reaping. Only once
+//! confirmed dead does it auto-reap the execution through the exact same
+//! terminal path as `bossctl agents reap` (`WorkDb::mark_execution_orphaned`).
+//! At the default 300 s cadence the streak alone reaches threshold within 15
+//! minutes, chosen so a confirmed-dead lease self-heals well before the next
+//! automation retry (which fires every 15 min): a pane that dies at spawn
+//! now self-heals on its very first retry instead of wedging behind
+//! `redundant_spawn`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -120,7 +133,7 @@ use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
+use crate::run_reconcile::{self, RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
 
 /// Consecutive cube-lease-heartbeat failures for one execution before the
@@ -163,6 +176,23 @@ impl HeartbeatFailureBreaker {
     /// unboundedly over the engine's lifetime.
     fn forget(&self, execution_id: &str) {
         self.consecutive_failures.lock().unwrap().remove(execution_id);
+    }
+
+    /// Drop any tracked streak whose execution id is not in `known_ids`.
+    /// `forget` alone does not bound the map: an execution that records a
+    /// failure and then completes normally (success/terminal transitions
+    /// observed by a *different* sweep, or the row simply falling out of
+    /// both the live registry and `list_in_flight_executions` between one
+    /// pass and the next) is never individually `forget`-ten, so its entry
+    /// would otherwise linger for the engine's lifetime. Called once per
+    /// pass with the set of every execution id this pass actually saw
+    /// (live-registry ∪ DB-fallback), which bounds the map to executions
+    /// currently in flight.
+    fn retain_only(&self, known_ids: &HashSet<String>) {
+        self.consecutive_failures
+            .lock()
+            .unwrap()
+            .retain(|execution_id, _| known_ids.contains(execution_id));
     }
 }
 
@@ -304,6 +334,7 @@ async fn run_one_pass_impl(
 ) -> HeartbeatSweepOutcome {
     let mut outcome = HeartbeatSweepOutcome::default();
     let mut registered_run_ids: HashSet<String> = HashSet::new();
+    let mut db_fallback_sweep_succeeded = false;
 
     for state in live_states.snapshot() {
         // Slot hasn't reported a shell pid yet — we can't probe liveness,
@@ -411,9 +442,15 @@ async fn run_one_pass_impl(
     // re-register or their execution reaches a terminal state.
     match work_db.list_in_flight_executions() {
         Ok(in_flight) => {
+            db_fallback_sweep_succeeded = true;
             for execution in in_flight {
-                if registered_run_ids.contains(&execution.id) {
-                    continue; // already handled by the registry sweep above
+                // Track every in-flight id we saw this pass (whether or not
+                // it ends up heartbeated) so the end-of-pass breaker cleanup
+                // below never drops a streak for an execution that's still
+                // genuinely in flight. `insert` returning `false` means the
+                // registry sweep above already handled it.
+                if !registered_run_ids.insert(execution.id.clone()) {
+                    continue;
                 }
                 let Some(lease_id) = execution.cube_lease_id.as_deref() else {
                     continue;
@@ -461,6 +498,15 @@ async fn run_one_pass_impl(
                 "cube-lease heartbeat: failed to query in-flight executions for DB-fallback sweep",
             );
         }
+    }
+
+    // Bound the breaker map to executions this pass actually observed as
+    // in-flight. Skip this when the DB-fallback query itself failed: in that
+    // case `registered_run_ids` only reflects the live-registry sweep, and
+    // pruning against it would wrongly drop streaks for executions that are
+    // still in flight but weren't in the live registry this pass.
+    if db_fallback_sweep_succeeded {
+        breaker.retain_only(&registered_run_ids);
     }
 
     if outcome.has_activity() {
@@ -596,14 +642,29 @@ async fn record_heartbeat_result(
 }
 
 /// Auto-reap `execution` after its cube lease has failed to heartbeat
-/// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive times — proof the
-/// workspace is gone even though its directory may still be on disk (so
-/// [`crate::lost_workspace_sweep`] never fires) and it may never have
-/// registered with the live-worker registry (so [`crate::dead_pid_sweep`]
-/// never sees it). Routes through the exact same terminal path as
-/// `bossctl agents reap` (`WorkDb::mark_execution_orphaned`), so the
-/// redundant-spawn guard's `is_live()` check stops treating the row as
-/// live and the next scheduler tick can dispatch a fresh execution.
+/// [`AUTO_REAP_AFTER_CONSECUTIVE_FAILURES`] consecutive times AND an
+/// independent probe of `cube workspace list` confirms
+/// [`RunReconcileVerdict::Dead`] — proof the workspace is gone even though
+/// its directory may still be on disk (so [`crate::lost_workspace_sweep`]
+/// never fires) and it may never have registered with the live-worker
+/// registry (so [`crate::dead_pid_sweep`] never sees it). Routes through the
+/// exact same terminal path as `bossctl agents reap`
+/// (`WorkDb::mark_execution_orphaned`), so the redundant-spawn guard's
+/// `is_live()` check stops treating the row as live and the next scheduler
+/// tick can dispatch a fresh execution.
+///
+/// The consecutive-failure streak alone is NOT sufficient evidence: a
+/// heartbeat failure only proves the `cube workspace heartbeat` call
+/// errored or timed out, which is equally consistent with a transient cube
+/// CLI hiccup or a cube daemon outage affecting every in-flight lease at
+/// once. Only [`run_reconcile::confirm_execution_dead`] returning `Dead` —
+/// cube's own snapshot showing the workspace is no longer `leased` under
+/// our id, or has TTL-expired — is positive proof the workspace is gone.
+/// If confirmation comes back `Live` or `Unknown` (including because the
+/// confirmation probe itself failed, e.g. during a cube outage), this
+/// leaves the row alone and clears the breaker streak so the streak must
+/// rebuild before another reap attempt is considered — erring toward never
+/// reclaiming a working copy out from under a live worker.
 ///
 /// Returns `true` iff this call actually transitioned the row to terminal
 /// (idempotent against a race with any other reconciler: if the row is
@@ -618,6 +679,27 @@ async fn auto_reap_dead_lease(
     lease_id: &str,
     consecutive_failures: u32,
 ) -> bool {
+    let verdict = run_reconcile::confirm_execution_dead(cube_client, execution, run_reconcile::current_epoch_s()).await;
+    if !matches!(verdict, RunReconcileVerdict::Dead) {
+        // Sustained heartbeat failure alone is not proof of death — could be
+        // a transient cube CLI error or a cube outage hitting every lease at
+        // once. Only a confirmed `Dead` verdict from cube's own workspace
+        // snapshot is. Reset the streak so a genuine cube blip doesn't leave
+        // us one failure away from reaping a live worker on the next pass;
+        // if the lease really is gone, it fails to heartbeat again and the
+        // streak rebuilds to another confirmation attempt.
+        breaker.forget(&execution.id);
+        tracing::warn!(
+            execution_id = %execution.id,
+            lease_id,
+            consecutive_failures,
+            ?verdict,
+            "cube-lease heartbeat: consecutive failures reached auto-reap threshold but cube workspace list did not \
+             confirm the lease is dead; not reaping (avoids mass-reaping live workers during a cube outage)",
+        );
+        return false;
+    }
+
     let reason = format!(
         "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times; \
          treating the workspace as gone and auto-reaping (same terminal path as `bossctl agents reap`)"
@@ -789,11 +871,20 @@ mod tests {
     // ─── cube stub ────────────────────────────────────────────────────────────
 
     /// Records every `heartbeat_lease` call and can be told to fail them.
+    /// Also backs `list_workspaces`, the second-opinion check
+    /// [`auto_reap_dead_lease`] now requires before reaping: by default it
+    /// returns no workspaces at all (cube has no record of any of them),
+    /// which `run_reconcile::classify` reads as `Unknown` — a reap must
+    /// NOT proceed on the default state. Tests that want a reap to actually
+    /// happen must opt in via `set_workspaces` with an entry that classifies
+    /// as `Dead` (see the `workspace(...)` helper below).
     #[derive(Default)]
     struct RecordingCube {
         heartbeats: Mutex<Vec<(String, Option<u64>)>>,
         force_releases: Mutex<Vec<String>>,
         fail: AtomicBool,
+        workspaces: Mutex<Vec<CubeWorkspaceStatus>>,
+        list_workspaces_fail: AtomicBool,
     }
 
     impl RecordingCube {
@@ -803,6 +894,11 @@ mod tests {
 
         fn force_release_calls(&self) -> Vec<String> {
             self.force_releases.lock().unwrap().clone()
+        }
+
+        /// Set the `cube workspace list` snapshot `list_workspaces` returns.
+        fn set_workspaces(&self, workspaces: Vec<CubeWorkspaceStatus>) {
+            *self.workspaces.lock().unwrap() = workspaces;
         }
     }
 
@@ -845,7 +941,10 @@ mod tests {
             unimplemented!()
         }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(vec![])
+            if self.list_workspaces_fail.load(Ordering::SeqCst) {
+                return Err(anyhow!("simulated cube outage: workspace list unavailable"));
+            }
+            Ok(self.workspaces.lock().unwrap().clone())
         }
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(vec![])
@@ -853,6 +952,20 @@ mod tests {
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
+
+    /// Build a `cube workspace list` row. Mirrors `run_reconcile`'s test
+    /// helper of the same shape.
+    fn workspace(workspace_id: &str, state: &str, lease_id: Option<&str>) -> CubeWorkspaceStatus {
+        CubeWorkspaceStatus::builder()
+            .workspace_id(workspace_id)
+            .workspace_path(std::path::PathBuf::from(format!("/tmp/{workspace_id}")))
+            .state(state)
+            .maybe_lease_id(lease_id)
+            .holder("user@host:1234")
+            .task("test")
+            .leased_at_epoch_s(1_700_000_000)
+            .build()
+    }
 
     fn open_db() -> (TempDir, Arc<WorkDb>) {
         let dir = TempDir::new().unwrap();
@@ -1091,6 +1204,9 @@ mod tests {
 
         let cube = RecordingCube::default();
         cube.fail.store(true, Ordering::SeqCst);
+        // Cube's own snapshot confirms the workspace is no longer leased —
+        // the positive evidence auto-reap now requires before proceeding.
+        cube.set_workspaces(vec![workspace("mono-agent-001", "free", None)]);
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
 
@@ -1183,6 +1299,7 @@ mod tests {
 
         let cube = RecordingCube::default();
         cube.fail.store(true, Ordering::SeqCst);
+        cube.set_workspaces(vec![workspace("mono-agent-001", "free", None)]);
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
 
@@ -1195,6 +1312,50 @@ mod tests {
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
+        );
+    }
+
+    /// The core regression this revision fixes: sustained heartbeat failure
+    /// alone (e.g. a cube daemon outage affecting every in-flight lease at
+    /// once) must NOT auto-reap. Only a confirmed `Dead` verdict from `cube
+    /// workspace list` may do that. Here every heartbeat call fails but
+    /// `list_workspaces` (the confirmation probe) also fails throughout,
+    /// exactly modeling a cube outage — the reap must never fire, however
+    /// many passes run.
+    #[tokio::test]
+    async fn sustained_failure_without_cube_confirmation_never_auto_reaps() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-outage");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cube = RecordingCube::default();
+        cube.fail.store(true, Ordering::SeqCst);
+        cube.list_workspaces_fail.store(true, Ordering::SeqCst);
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+
+        // Run well past the consecutive-failure threshold — a mass-outage
+        // scenario like this one persists far longer than 15 minutes.
+        for _ in 0..AUTO_REAP_AFTER_CONSECUTIVE_FAILURES * 3 {
+            let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+            assert_eq!(
+                outcome.auto_reaped, 0,
+                "heartbeat failure without a confirmed-dead verdict must never auto-reap"
+            );
+        }
+
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running,
+            "the live worker's execution must stay untouched through a cube outage"
+        );
+        assert!(
+            cube.force_release_calls().is_empty(),
+            "no lease may be force-released without confirmed death"
         );
     }
 
@@ -1259,6 +1420,7 @@ mod tests {
 
         let cube = RecordingCube::default();
         cube.fail.store(true, Ordering::SeqCst);
+        cube.set_workspaces(vec![workspace("mono-agent-999", "free", None)]);
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
 
@@ -1434,5 +1596,30 @@ mod tests {
         assert_eq!(outcome.failed, 0);
         assert_eq!(cube.calls(), vec![("lease-orphan".to_owned(), Some(LEASE_TTL_SECS))],);
         let _ = execution_id; // used to set up DB row
+    }
+
+    /// A failure streak for an execution that then disappears from both the
+    /// live registry and `list_in_flight_executions` (e.g. it completed
+    /// normally and is no longer in-flight) must not linger in the breaker
+    /// map forever — `retain_only` prunes it at the end of the pass that
+    /// first no longer observes it.
+    #[test]
+    fn breaker_retain_only_drops_streaks_for_ids_no_longer_seen() {
+        let breaker = HeartbeatFailureBreaker::default();
+        breaker.record_failure("exec-still-in-flight");
+        breaker.record_failure("exec-completed");
+
+        breaker.retain_only(&HashSet::from(["exec-still-in-flight".to_owned()]));
+
+        assert_eq!(
+            breaker.record_failure("exec-still-in-flight"),
+            2,
+            "a still-in-flight execution's streak must survive the prune"
+        );
+        assert_eq!(
+            breaker.record_failure("exec-completed"),
+            1,
+            "a no-longer-seen execution's streak must have been dropped, so this is a fresh count"
+        );
     }
 }

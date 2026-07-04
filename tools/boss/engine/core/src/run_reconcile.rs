@@ -222,6 +222,40 @@ fn record(report: &mut RunReconcileReport, id: String, verdict: RunReconcileVerd
     report.verdicts.insert(id, verdict);
 }
 
+/// Probe `cube workspace list` for a single execution and classify it with
+/// the exact same [`classify`] logic [`probe_in_flight_runs`] uses at
+/// startup. Used by [`crate::cube_lease_heartbeat`] to get a *definitive*
+/// second opinion before auto-reaping on sustained heartbeat failure: a
+/// heartbeat failure alone (transient cube-CLI error, subprocess timeout)
+/// is not proof the workspace is gone — only cube's own snapshot saying the
+/// lease is no longer `leased` under our id (or has TTL-expired) is. If the
+/// `cube workspace list` call itself fails (e.g. cube is down), this
+/// deliberately returns [`RunReconcileVerdict::Unknown`] rather than
+/// [`RunReconcileVerdict::Dead`] — a cube outage must never look like proof
+/// of death, or it would mass-reap every live worker whose heartbeats are
+/// merely failing for the same outage reason.
+pub async fn confirm_execution_dead(
+    cube: &dyn CubeClient,
+    execution: &WorkExecution,
+    now_epoch_s: i64,
+) -> RunReconcileVerdict {
+    let snapshot = match cube.list_workspaces().await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = format!("{err:#}"),
+                "cube workspace list failed while confirming a heartbeat-failure auto-reap; treating as Unknown \
+                 (a cube outage is not proof of death)",
+            );
+            return RunReconcileVerdict::Unknown;
+        }
+    };
+    let by_workspace_id: HashMap<&str, &CubeWorkspaceStatus> =
+        snapshot.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
+    classify(execution, &by_workspace_id, now_epoch_s)
+}
+
 /// Production wall-clock helper for the probe. Tests pass a fixed
 /// epoch directly to [`probe_in_flight_runs`] so they don't depend on
 /// the system clock.
