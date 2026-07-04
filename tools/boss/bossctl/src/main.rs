@@ -2384,7 +2384,7 @@ enum EagerPushOutcome {
 async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> EagerPushOutcome {
     use boss_engine::remote_wrapper::expected_version;
     use boss_engine::ssh_transport::{SshTransport, default_control_socket_dir};
-    use boss_engine::wrapper_distribution::{push_wrapper, subclass_label};
+    use boss_engine::wrapper_distribution::{CubeProbeOutcome, push_wrapper, subclass_label, verify_cube_invocable};
 
     let Some(socket_dir) = default_control_socket_dir() else {
         return EagerPushOutcome::Skipped {
@@ -2414,9 +2414,38 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
         }
     };
     match outcome {
-        boss_engine::wrapper_distribution::WrapperPushOutcome::Ok => EagerPushOutcome::Ok {
-            version: expected_version(),
-        },
+        boss_engine::wrapper_distribution::WrapperPushOutcome::Ok => {
+            // The wrapper script itself is present and runs — but that
+            // says nothing about whether the separate `cube` binary it
+            // (and every dispatch-time `ssh <host> cube ...` call) depends
+            // on is actually on the remote's non-interactive PATH. Catch
+            // that gap here, at registration time, instead of leaving a
+            // registered-but-broken host to fail every future dispatch
+            // silently (the anaplian incident).
+            match verify_cube_invocable(&transport).await {
+                Ok(CubeProbeOutcome::Ok) => EagerPushOutcome::Ok {
+                    version: expected_version(),
+                },
+                Ok(CubeProbeOutcome::Failed(detail)) => {
+                    let msg = format!("cube not invocable via non-interactive ssh: {detail}");
+                    let _ = db.set_host_enabled(host_id, false);
+                    let _ = db.set_host_last_error(host_id, Some(&msg));
+                    EagerPushOutcome::Failed {
+                        kind: "unclassified".to_owned(),
+                        detail: msg,
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("probing cube invocability errored: {err:#}");
+                    let _ = db.set_host_enabled(host_id, false);
+                    let _ = db.set_host_last_error(host_id, Some(&msg));
+                    EagerPushOutcome::Failed {
+                        kind: "unclassified".to_owned(),
+                        detail: msg,
+                    }
+                }
+            }
+        }
         boss_engine::wrapper_distribution::WrapperPushOutcome::Failed(kind, detail) => {
             let _ = db.set_host_enabled(host_id, false);
             EagerPushOutcome::Failed {
@@ -2540,6 +2569,7 @@ fn host_to_json(host: &Host, caps: &[HostCapability]) -> serde_json::Value {
         "enabled": host.enabled,
         "last_seen_at": host.last_seen_at,
         "last_error_text": host.last_error_text,
+        "consecutive_failures": host.consecutive_failures,
         "created_at": host.created_at,
         "capabilities": caps.iter().map(|c| serde_json::json!({
             "capability": c.capability,
@@ -2575,6 +2605,9 @@ fn print_host_detail(host: &Host, caps: &[HostCapability]) {
     }
     if let Some(e) = &host.last_error_text {
         println!("  last_error:  {e}");
+    }
+    if host.consecutive_failures > 0 {
+        println!("  consecutive_failures: {}", host.consecutive_failures);
     }
     if caps.is_empty() {
         println!("  capabilities: (none)");

@@ -17,14 +17,22 @@ pub struct HostSnapshot {
     pub pool_size: i64,
     /// Whether the host will accept new work dispatches.
     pub enabled: bool,
-    /// ISO-8601 timestamp of the last successful heartbeat. `None`
-    /// when the host has never been seen (newly registered).
+    /// Epoch-seconds timestamp of the most recent contact *attempt*
+    /// with this host — success or failure, registration push or
+    /// dispatch-time cube invocation. `None` when the host has never
+    /// been contacted (newly registered).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
     /// Human-readable description of the last error, when the host is
-    /// in a degraded state (e.g. wrapper push failed at registration).
+    /// in a degraded state (e.g. wrapper push failed at registration,
+    /// or a dispatch-time cube invocation failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_text: Option<String>,
+    /// Consecutive dispatch-time cube invocation failures on this host.
+    /// Resets to 0 on any success; auto-disables the host at
+    /// `HOST_HEALTH_FAILURE_THRESHOLD`.
+    #[serde(default)]
+    pub consecutive_failures: i64,
     /// ISO-8601 timestamp of host registration.
     pub created_at: String,
     /// All capabilities on this host (both auto-discovered and

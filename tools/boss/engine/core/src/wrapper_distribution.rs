@@ -156,6 +156,50 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
     }
 }
 
+/// Outcome of [`verify_cube_invocable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CubeProbeOutcome {
+    /// `cube --help` returned success — the binary is on the remote's
+    /// non-interactive `PATH`.
+    Ok,
+    /// The probe ran but `cube` was not invocable. `detail` carries the
+    /// verbatim stderr/stdout (e.g. `zsh:1: command not found: cube`).
+    Failed(String),
+}
+
+/// Probe whether the `cube` binary itself is invocable over a
+/// non-interactive SSH session on the remote host.
+///
+/// `push_wrapper`/`verify_wrapper_version` only prove that the
+/// self-contained `boss-remote-run` *script* landed and runs — that
+/// script is scp'd byte-for-byte, so it says nothing about whether the
+/// separate `cube` binary the script (and every dispatch-time
+/// `ssh <host> cube ...` call) depends on is reachable. A host can pass
+/// wrapper verification and still be completely unable to run any real
+/// work if `cube` isn't on the non-interactive shell's `PATH` — exactly
+/// the anaplian incident (`zsh:1: command not found: cube`), which sat
+/// registered and enabled for 12 consecutive dispatch failures because
+/// nothing checked this at `hosts add` time. Run this right after a
+/// successful wrapper push so a broken host is caught — and disabled
+/// with a clear reason — before it is ever offered a dispatch slot.
+pub async fn verify_cube_invocable(transport: &SshTransport) -> Result<CubeProbeOutcome> {
+    let output = transport
+        .run(&["cube", "--help"])
+        .await
+        .with_context(|| format!("probing `cube --help` on host {}", transport.host_id))?;
+    if output.success() {
+        return Ok(CubeProbeOutcome::Ok);
+    }
+    let detail = if !output.stderr.trim().is_empty() {
+        output.stderr.trim().to_owned()
+    } else if !output.stdout.trim().is_empty() {
+        output.stdout.trim().to_owned()
+    } else {
+        format!("exit status {}", output.status)
+    };
+    Ok(CubeProbeOutcome::Failed(detail))
+}
+
 /// Outcome of a `--version` handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionCheck {

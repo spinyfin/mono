@@ -22,9 +22,37 @@ pub struct Host {
     pub ssh_target: Option<String>,
     pub pool_size: i64,
     pub enabled: bool,
+    /// Epoch-seconds string of the most recent contact *attempt* with
+    /// this host (success or failure) — either a dispatch-time cube
+    /// invocation or the registration-time wrapper push. `None` when
+    /// the host has never been contacted.
     pub last_seen_at: Option<String>,
     pub last_error_text: Option<String>,
+    /// Consecutive dispatch-time cube invocations that have failed on
+    /// this host, reset to 0 on any success. See
+    /// [`HOST_HEALTH_FAILURE_THRESHOLD`] / [`WorkDb::record_host_dispatch_failure`].
+    pub consecutive_failures: i64,
     pub created_at: String,
+}
+
+/// Number of consecutive dispatch-time cube invocation failures on a
+/// host before it is auto-disabled. Chosen to match the design's
+/// documented heartbeat threshold ("after three consecutive failures,
+/// marks the host `unhealthy`") — see
+/// `docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md`.
+/// A broken host (e.g. `cube` missing from the remote's non-interactive
+/// `PATH`) fails every single dispatch, so this threshold trips within
+/// one pre-start retry cycle rather than retrying forever while local
+/// capacity idles.
+pub const HOST_HEALTH_FAILURE_THRESHOLD: i64 = 3;
+
+/// Outcome of [`WorkDb::record_host_dispatch_failure`] — distinguishes
+/// "still under threshold" from "just tripped the breaker" so the
+/// caller can log/alert only on the transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostHealthOutcome {
+    Degraded { consecutive_failures: i64 },
+    AutoDisabled { consecutive_failures: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +88,21 @@ pub(crate) fn migrate_host_registry_tables(conn: &Connection) -> Result<()> {
              PRIMARY KEY (subject_kind, subject_id, capability)
          );",
     )?;
+    Ok(())
+}
+
+/// Add the health-tracking column used by the dispatch-time host
+/// circuit breaker (`record_host_dispatch_failure` / `_success`).
+/// Existing rows default to `0` (healthy) so upgrading engines don't
+/// spuriously trip the breaker on their first post-migration dispatch.
+pub(crate) fn migrate_hosts_health_columns(conn: &Connection) -> Result<()> {
+    let cols = pragma_columns(conn, "hosts")?;
+    if !cols.contains(&"consecutive_failures".to_owned()) {
+        conn.execute(
+            "ALTER TABLE hosts ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -203,7 +246,7 @@ impl WorkDb {
     pub fn list_hosts(&self) -> Result<Vec<Host>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, created_at
+            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
              FROM hosts
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -214,7 +257,7 @@ impl WorkDb {
     pub fn get_host(&self, id: &str) -> Result<Option<Host>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, created_at
+            "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
              FROM hosts WHERE id = ?1",
             params![id],
             map_host,
@@ -260,7 +303,7 @@ impl WorkDb {
 
         let host = tx
             .query_row(
-                "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, created_at
+                "SELECT id, ssh_target, pool_size, enabled, last_seen_at, last_error_text, consecutive_failures, created_at
                  FROM hosts WHERE id = ?1",
                 params![id],
                 map_host,
@@ -289,6 +332,69 @@ impl WorkDb {
     pub fn set_host_last_error(&self, id: &str, text: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
         conn.execute("UPDATE hosts SET last_error_text = ?1 WHERE id = ?2", params![text, id])?;
+        Ok(())
+    }
+
+    /// Record a dispatch-time cube invocation failure against `id`'s
+    /// health counter (the circuit breaker guarding against exactly the
+    /// anaplian incident: a registered-but-broken host — e.g. `cube`
+    /// missing from the remote's non-interactive `PATH` — that the
+    /// dispatcher would otherwise retry forever while healthy local
+    /// capacity idles). Bumps `consecutive_failures`, and stamps
+    /// `last_seen_at`/`last_error_text` so the failure is visible even
+    /// though no periodic heartbeat exists yet. Once the count reaches
+    /// [`HOST_HEALTH_FAILURE_THRESHOLD`] the host is auto-disabled —
+    /// [`crate::host_scheduling::select_host`] already excludes disabled
+    /// hosts, so the very next dispatch attempt for any queued execution
+    /// naturally falls back to a different (e.g. `local`) host instead of
+    /// re-selecting the broken one.
+    pub fn record_host_dispatch_failure(&self, id: &str, error_text: &str) -> Result<HostHealthOutcome> {
+        let conn = self.connect()?;
+        let now = now_epoch_string();
+        let n = conn.execute(
+            "UPDATE hosts SET consecutive_failures = consecutive_failures + 1,
+                 last_seen_at = ?1, last_error_text = ?2
+             WHERE id = ?3",
+            params![now, error_text, id],
+        )?;
+        if n == 0 {
+            bail!("host '{}' not found", id);
+        }
+        let failures: i64 = conn.query_row(
+            "SELECT consecutive_failures FROM hosts WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if failures >= HOST_HEALTH_FAILURE_THRESHOLD {
+            let reason =
+                format!("auto-disabled after {failures} consecutive dispatch failures; last error: {error_text}");
+            conn.execute(
+                "UPDATE hosts SET enabled = 0, last_error_text = ?1 WHERE id = ?2",
+                params![reason, id],
+            )?;
+            return Ok(HostHealthOutcome::AutoDisabled {
+                consecutive_failures: failures,
+            });
+        }
+        Ok(HostHealthOutcome::Degraded {
+            consecutive_failures: failures,
+        })
+    }
+
+    /// Reset `id`'s health counter after a successful dispatch-time cube
+    /// invocation. Clears `last_error_text` (a healthy host shouldn't show
+    /// a stale error) and stamps `last_seen_at`. Does not touch `enabled`
+    /// — re-enabling a host the operator (or a prior auto-disable) turned
+    /// off is an explicit `set_host_enabled` action, not an implicit
+    /// side-effect of one successful call.
+    pub fn record_host_dispatch_success(&self, id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_epoch_string();
+        conn.execute(
+            "UPDATE hosts SET consecutive_failures = 0, last_seen_at = ?1, last_error_text = NULL
+             WHERE id = ?2",
+            params![now, id],
+        )?;
         Ok(())
     }
 
@@ -468,7 +574,8 @@ fn map_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<Host> {
         enabled: row.get::<_, i64>(3)? != 0,
         last_seen_at: row.get(4)?,
         last_error_text: row.get(5)?,
-        created_at: row.get(6)?,
+        consecutive_failures: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -664,6 +771,124 @@ mod tests {
 
         db.set_host_enabled("zakalwe", true).unwrap();
         assert!(db.get_host("zakalwe").unwrap().unwrap().enabled);
+    }
+
+    // ── record_host_dispatch_failure / _success ─────────────────────────────
+
+    #[test]
+    fn record_host_dispatch_failure_errors_on_unknown_host() {
+        let db = open_db();
+        let err = db.record_host_dispatch_failure("ghost", "boom").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn record_host_dispatch_failure_degrades_below_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+
+        let outcome = db
+            .record_host_dispatch_failure("anaplian", "command not found: cube")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            HostHealthOutcome::Degraded {
+                consecutive_failures: 1
+            }
+        );
+
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert!(host.enabled, "host must stay enabled below the failure threshold");
+        assert_eq!(host.consecutive_failures, 1);
+        assert_eq!(host.last_error_text.as_deref(), Some("command not found: cube"));
+        assert!(
+            host.last_seen_at.is_some(),
+            "last_seen_at must be stamped on a failed attempt"
+        );
+    }
+
+    /// The exact regression this breaker exists for: a host that fails
+    /// every single dispatch (the anaplian incident — `cube` missing from
+    /// the remote's non-interactive PATH) must auto-disable at the
+    /// threshold instead of being retried forever while local capacity
+    /// idles. Once disabled, `host_scheduling::select_host` already
+    /// excludes it via the existing `enabled` gate.
+    #[test]
+    fn record_host_dispatch_failure_auto_disables_at_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+
+        for n in 1..HOST_HEALTH_FAILURE_THRESHOLD {
+            let outcome = db
+                .record_host_dispatch_failure("anaplian", "ssh cube command failed: command not found: cube")
+                .unwrap();
+            assert_eq!(
+                outcome,
+                HostHealthOutcome::Degraded {
+                    consecutive_failures: n
+                }
+            );
+            assert!(
+                db.get_host("anaplian").unwrap().unwrap().enabled,
+                "attempt {n} must not disable yet"
+            );
+        }
+
+        let tripping = db
+            .record_host_dispatch_failure("anaplian", "ssh cube command failed: command not found: cube")
+            .unwrap();
+        assert_eq!(
+            tripping,
+            HostHealthOutcome::AutoDisabled {
+                consecutive_failures: HOST_HEALTH_FAILURE_THRESHOLD
+            }
+        );
+
+        let host = db.get_host("anaplian").unwrap().unwrap();
+        assert!(
+            !host.enabled,
+            "host must be auto-disabled once the threshold is reached"
+        );
+        assert!(
+            host.last_error_text.as_deref().unwrap().contains("auto-disabled"),
+            "got: {:?}",
+            host.last_error_text
+        );
+        assert!(
+            host.last_error_text
+                .as_deref()
+                .unwrap()
+                .contains("command not found: cube")
+        );
+    }
+
+    #[test]
+    fn record_host_dispatch_success_resets_counter_and_clears_error() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.record_host_dispatch_failure("zakalwe", "transient blip").unwrap();
+        assert_eq!(db.get_host("zakalwe").unwrap().unwrap().consecutive_failures, 1);
+
+        db.record_host_dispatch_success("zakalwe").unwrap();
+
+        let host = db.get_host("zakalwe").unwrap().unwrap();
+        assert_eq!(host.consecutive_failures, 0);
+        assert!(host.last_error_text.is_none());
+        assert!(host.last_seen_at.is_some());
+    }
+
+    #[test]
+    fn record_host_dispatch_success_does_not_re_enable_a_disabled_host() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        db.record_host_dispatch_success("zakalwe").unwrap();
+
+        assert!(
+            !db.get_host("zakalwe").unwrap().unwrap().enabled,
+            "a successful call must not implicitly re-enable a host the operator disabled"
+        );
     }
 
     // ── get_host / list_hosts ───────────────────────────────────────────────
