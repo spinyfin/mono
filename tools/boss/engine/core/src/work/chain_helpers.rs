@@ -437,3 +437,107 @@ pub(crate) fn refuse_manual_move_off_archived_moot_revision(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::create_test_product;
+    use std::path::PathBuf;
+
+    // ── extract_pr_number_from_url ──────────────────────────────────────
+    // Pure fn: assert observable input -> output only.
+
+    #[test]
+    fn extract_pr_number_parses_canonical_url() {
+        assert_eq!(
+            extract_pr_number_from_url("https://github.com/o/r/pull/42"),
+            Some(42),
+            "canonical pull URL must yield the trailing PR number"
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_accepts_bare_number() {
+        assert_eq!(
+            extract_pr_number_from_url("42"),
+            Some(42),
+            "a bare integer is its own final path segment"
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_rejects_trailing_slash() {
+        // A trailing slash makes the last segment empty, which does not parse.
+        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/42/"), None);
+    }
+
+    #[test]
+    fn extract_pr_number_rejects_non_numeric_tail() {
+        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/abc"), None);
+    }
+
+    #[test]
+    fn extract_pr_number_rejects_empty_string() {
+        assert_eq!(extract_pr_number_from_url(""), None);
+    }
+
+    // ── is_moot_revision_kind ───────────────────────────────────────────
+    // Only the two engine-managed prefixes that self-resolve before a
+    // merge are moot; everything else is not.
+
+    #[test]
+    fn is_moot_true_for_merge_conflict_and_ci_fix() {
+        assert!(
+            is_moot_revision_kind(&format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}att_123")),
+            "merge-conflict revisions are moot once the parent PR merges"
+        );
+        assert!(
+            is_moot_revision_kind(&format!("{CREATED_VIA_CI_FIX_PREFIX}att_456")),
+            "ci-fix revisions are moot once the parent PR merges"
+        );
+    }
+
+    #[test]
+    fn is_moot_false_for_non_moot_kinds() {
+        assert!(!is_moot_revision_kind(CREATED_VIA_ATTENTION));
+        assert!(!is_moot_revision_kind(CREATED_VIA_ENGINE_AUTO));
+        assert!(!is_moot_revision_kind(&format!(
+            "{CREATED_VIA_DOC_COMMENT_PREFIX}c_789"
+        )));
+        assert!(!is_moot_revision_kind("something-unrelated"));
+    }
+
+    // ── chain_root cycle guard ──────────────────────────────────────────
+
+    /// A genuine parent-pointer cycle (A→B→A) would loop forever without
+    /// the `MAX_CHAIN_DEPTH` cap. Assert that the walk terminates and
+    /// returns one of the reachable ids rather than hanging — resilience
+    /// behavior observed only through the returned value.
+    #[test]
+    fn chain_root_terminates_on_parent_pointer_cycle() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = create_test_product(&db);
+        let conn = db.connect().unwrap();
+
+        // Two revision rows whose parent pointers loop back on each other.
+        // `parent_task_id` carries no enforced FK (see the orphan case in
+        // work/tests/t06.rs), so we can insert the mutual references directly.
+        let a = next_id("task");
+        let b = next_id("task");
+        let now = now_string();
+        for (id, parent) in [(&a, &b), (&b, &a)] {
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                     VALUES (?1, ?2, 'revision', 'cycle', '', 'todo', ?3, ?3, ?4)",
+                params![id, product.id, now, parent],
+            )
+            .unwrap();
+        }
+
+        let root = chain_root(&conn, &a).unwrap();
+        assert!(
+            root == a || root == b,
+            "a corrupt parent cycle must terminate at a reachable id, got {root}"
+        );
+    }
+}
