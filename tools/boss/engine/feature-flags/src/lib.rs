@@ -147,6 +147,31 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         default_enabled: false,
         capability_id: Some("toolbar_search_standard"),
     },
+    FeatureFlagSpec {
+        name: "notification_dedup",
+        description: "Run LLM near-duplicate detection when persisting an Attention item \
+             (creation path) and on startup (sweep). Off by default — enable to \
+             opt in; set to false to kill immediately if it misbehaves.",
+        category: "notifications",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "notification_dedup_taxonomy",
+        description: "Include non-terminal work items (tasks, chores, revisions, projects) \
+             in the dedup comparison set. Requires notification_dedup. Off by default.",
+        category: "notifications",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "notification_dedup_sensibility",
+        description: "Also evaluate whether a candidate Attention is stale or not actionable, \
+             and suppress on High confidence. Requires notification_dedup. Off by default.",
+        category: "notifications",
+        default_enabled: false,
+        capability_id: None,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.

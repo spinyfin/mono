@@ -870,6 +870,14 @@ impl ServerState {
         let feature_flags_for_handler = feature_flags.clone();
         let feature_flags_for_state = feature_flags.clone();
 
+        // Boot-time dedup sweep gate (design: notification-dedup-scoring.md §7).
+        // With the flag off (the default) this is a no-op. When on, a one-shot
+        // background task will be spawned here to sweep existing Attention items
+        // for near-duplicates as a backstop — not yet implemented.
+        if feature_flags.is_enabled("notification_dedup") {
+            // TODO(@brianduff,2026-12-31): spawn one-shot dedup sweep background task.
+        }
+
         // Load per-installation settings. Same boot contract as feature
         // flags: a missing or unreadable file falls back to registry
         // defaults; parse failures are logged but don't block startup.
@@ -1031,50 +1039,52 @@ impl ServerState {
             }
             let execution_coordinator = Arc::new(execution_coordinator_inner);
 
-            ServerState {
-                work_db,
-                execution_coordinator,
-                completion_handler,
-                cube_client: cube_client_for_state,
-                publisher: publisher_for_state,
-                dispatch_events: dispatch_events_for_state,
-                dispatch_event_root: dispatch_event_root_for_state,
-                topic_broker,
-                worker_registry: WorkerRegistry::new(),
-                live_worker_states,
-                live_status_manager: Arc::new(LiveStatusManager::new()),
-                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(metrics_for_dispatcher)),
-                transcript_path_cache: Arc::new(crate::live_status_loop::TranscriptPathCache::new()),
-                staged_pr_urls,
-                editorial_deny_tracker: Arc::new(crate::editorial_hook::DenyTracker::new()),
-                anthropic_api_key,
-                worker_pool_size,
-                automation_pool_size,
-                review_pool_size,
-                syspolicyd_health: Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()),
-                next_session_id: AtomicU64::new(1),
-                work_revision,
-                app_pid: StdMutex::new(app_pid),
-                boss_pid: StdMutex::new(None),
-                pending_probes: StdMutex::new(HashMap::new()),
-                in_flight_probes: StdMutex::new(HashMap::new()),
-                next_probe_id: AtomicU64::new(1),
-                app_session: Arc::new(Mutex::new(None)),
-                spawn_pane_lock: Arc::new(Mutex::new(())),
-                ipc_logger,
-                _self_weak: weak_self.clone(),
-                feature_flags: feature_flags_for_state,
-                capability_registry: Arc::new(crate::feature_flags::CapabilityRegistry::new()),
-                settings: settings_for_state,
-                metrics: metrics_for_state,
-                pr_reconciler_kick: pr_reconciler_kick_for_state,
-                automation_scheduler_kick: automation_scheduler_kick_for_state,
-                tracker_registry: tracker_registry_for_state,
-                github_auth: github_auth_for_state,
-                tracker_credential_resolver,
-                control_token: control_token_for_state,
-                shutdown_trigger: shutdown_trigger_for_state,
-            }
+            ServerState::builder()
+                .work_db(work_db)
+                .execution_coordinator(execution_coordinator)
+                .completion_handler(completion_handler)
+                .cube_client(cube_client_for_state)
+                .publisher(publisher_for_state)
+                .dispatch_events(dispatch_events_for_state)
+                .dispatch_event_root(dispatch_event_root_for_state)
+                .topic_broker(topic_broker)
+                .worker_registry(WorkerRegistry::new())
+                .live_worker_states(live_worker_states)
+                .live_status_manager(Arc::new(LiveStatusManager::new()))
+                .dispatcher_stats(Arc::new(crate::live_status_loop::DispatcherStats::new(
+                    metrics_for_dispatcher,
+                )))
+                .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
+                .staged_pr_urls(staged_pr_urls)
+                .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
+                .maybe_anthropic_api_key(anthropic_api_key)
+                .worker_pool_size(worker_pool_size)
+                .automation_pool_size(automation_pool_size)
+                .review_pool_size(review_pool_size)
+                .syspolicyd_health(Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()))
+                .next_session_id(AtomicU64::new(1))
+                .work_revision(work_revision)
+                .app_pid(StdMutex::new(app_pid))
+                .boss_pid(StdMutex::new(None))
+                .pending_probes(StdMutex::new(HashMap::new()))
+                .in_flight_probes(StdMutex::new(HashMap::new()))
+                .next_probe_id(AtomicU64::new(1))
+                .app_session(Arc::new(Mutex::new(None)))
+                .spawn_pane_lock(Arc::new(Mutex::new(())))
+                .ipc_logger(ipc_logger)
+                .self_weak(weak_self.clone())
+                .feature_flags(feature_flags_for_state)
+                .capability_registry(Arc::new(crate::feature_flags::CapabilityRegistry::new()))
+                .settings(settings_for_state)
+                .metrics(metrics_for_state)
+                .pr_reconciler_kick(pr_reconciler_kick_for_state)
+                .automation_scheduler_kick(automation_scheduler_kick_for_state)
+                .tracker_registry(tracker_registry_for_state)
+                .github_auth(github_auth_for_state)
+                .tracker_credential_resolver(tracker_credential_resolver)
+                .maybe_control_token(control_token_for_state)
+                .shutdown_trigger(shutdown_trigger_for_state)
+                .build()
         });
 
         // Register every binary-known counter / gauge handle before
