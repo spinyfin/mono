@@ -2523,7 +2523,8 @@ final class EngineClient: @unchecked Sendable {
             workItemID: workItemID,
             executionStatus: payload["execution_status"] as? String,
             runStatus: payload["run_status"] as? String,
-            executionID: payload["execution_id"] as? String
+            executionID: payload["execution_id"] as? String,
+            dispatchRetryAt: payload["dispatch_retry_at"] as? String
         )
     }
 

@@ -298,6 +298,18 @@ pub enum Stage {
     /// `details` object carries `shell_pid` (always `0`) and the
     /// `threshold_secs` grace window that elapsed.
     SpawnAckTimeout,
+    /// The periodic dispatch-failure-recovery sweep found a work item the
+    /// engine had bounced to Backlog after a pre-spawn dispatch failure
+    /// exhausted its immediate retries (`bounce_dispatch_failed_to_backlog`
+    /// — `autostart` cleared, `dispatch_failed_reason` set) and re-enqueued
+    /// it after a cooldown. This is the pre-spawn-failure sibling of
+    /// `orphan_active_redispatch` / `cube_lease_auto_reap`, which only
+    /// self-heal failures *after* `run_started`; before this stage existed
+    /// a pre-spawn failure that exhausted its retries stayed parked until
+    /// a human ran `bossctl work start` (2026-07-03 T215 incident — sat
+    /// undispatched 45+ minutes with free slots available). See
+    /// `crate::dispatch_failure_recovery_sweep`.
+    DispatchFailureRecoveryRedispatch,
 }
 
 impl Stage {
@@ -333,6 +345,7 @@ impl Stage {
             Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
             Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
             Stage::SpawnAckTimeout => "spawn_ack_timeout",
+            Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
         }
     }
 }

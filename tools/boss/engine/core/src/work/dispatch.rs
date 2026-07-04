@@ -295,6 +295,113 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Work items previously bounced to Backlog by
+    /// [`Self::bounce_dispatch_failed_to_backlog`] (a pre-spawn dispatch
+    /// failure exhausted its immediate retries), still schedulable, and
+    /// whose `dispatch_failed_at` is older than `min_age_secs` — the
+    /// candidate set for [`crate::dispatch_failure_recovery_sweep`].
+    /// Mirrors [`Self::list_orphan_active_candidates`]'s shape for the
+    /// pre-spawn side of the reconciliation story.
+    pub fn list_dispatch_failed_recovery_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now_secs - min_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks
+             WHERE status IN ('todo', 'active')
+               AND deleted_at IS NULL
+               AND dispatch_failed_reason IS NOT NULL
+               AND autostart = 0
+               AND dispatch_failed_at IS NOT NULL
+               AND CAST(dispatch_failed_at AS INTEGER) < ?1
+             ORDER BY CAST(dispatch_failed_at AS INTEGER) ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Reverse of [`Self::bounce_dispatch_failed_to_backlog`]: re-enable
+    /// `autostart` on a work item the engine previously parked after a
+    /// pre-spawn dispatch failure, so the fresh `ready` execution the
+    /// caller creates next renders as dispatch-pending again instead of
+    /// silently sitting in Backlog. Guarded on `dispatch_failed_reason
+    /// IS NOT NULL` so it's a no-op against a work item that isn't
+    /// actually parked in this state (e.g. a race against a human's own
+    /// retry). Returns `true` iff a row was updated.
+    ///
+    /// Callers that also call `request_execution` afterwards should
+    /// prefer [`Self::reenable_and_request_execution_with_live_check`],
+    /// which runs both in one transaction so a `request_execution`
+    /// failure can't strand the item with `autostart` flipped back on
+    /// but no fresh execution — see that method's docs.
+    fn reenable_autostart_after_dispatch_failure_in_tx(conn: &Connection, work_item_id: &str) -> Result<bool> {
+        let now = now_string();
+        let updated = conn.execute(
+            "UPDATE tasks
+             SET autostart = 1,
+                 last_status_actor = 'engine',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status IN ('todo', 'active')
+               AND deleted_at IS NULL
+               AND dispatch_failed_reason IS NOT NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Atomic combination of [`Self::reenable_autostart_after_dispatch_failure_in_tx`]
+    /// and [`Self::request_execution_with_live_check`], used by
+    /// [`crate::dispatch_failure_recovery_sweep`] to give a work item
+    /// bounced by [`Self::bounce_dispatch_failed_to_backlog`] another
+    /// shot after its cooldown elapses.
+    ///
+    /// Both steps run in the *same* transaction. This matters because
+    /// `request_execution_in_tx_with_live_check` can `bail!` (repo
+    /// became unresolvable, a gating dependency reappeared, ...), and
+    /// if the autostart re-enable had already been committed in an
+    /// earlier, separate transaction, that failure would leave the
+    /// item with `autostart = 1` but `dispatch_failed_reason` still
+    /// set and no new execution — invisible to both
+    /// `list_dispatch_failed_recovery_candidates` (requires
+    /// `autostart = 0`) and `rescan_active_dispatch` (requires `status
+    /// = 'active'`), i.e. permanently stranded. Running both in one
+    /// transaction means a `request_execution` failure rolls the
+    /// autostart flip back too, leaving the item exactly as it was
+    /// before this call — still a valid candidate for the next sweep
+    /// pass.
+    ///
+    /// Returns `Ok(None)` if the item was no longer eligible for
+    /// re-enable (raced a human retry, or the row moved on) — nothing
+    /// left to do. Returns `Ok(Some(execution))` on success.
+    pub fn reenable_and_request_execution_with_live_check<F: FnOnce(&str) -> bool>(
+        &self,
+        work_item_id: &str,
+        mut input: RequestExecutionInput,
+        is_live: F,
+    ) -> Result<Option<WorkExecution>> {
+        let mut conn = self.connect()?;
+        if let Some(resolved) = resolve_friendly_work_item_id(&conn, &input.work_item_id)? {
+            input.work_item_id = resolved;
+        }
+        ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
+        let tx = conn.transaction()?;
+        if !Self::reenable_autostart_after_dispatch_failure_in_tx(&tx, work_item_id)? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
+        tx.commit()?;
+        Ok(Some(execution))
+    }
+
     /// Re-issue `RequestExecution` for every non-deleted task / chore
     /// whose status is `active` but whose latest execution is terminal
     /// (or which has no execution). This is the engine-startup

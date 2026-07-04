@@ -1564,6 +1564,19 @@ private struct WorkBoardCardItem: View {
         // "waiting for a slot" subtitle distinct from an active worker.
         let isDispatchPending = task.status == "todo" && task.autostart
 
+        // `dispatchRetryAt` is set only while the engine is withholding
+        // this execution from dispatch because a *pre-spawn* attempt
+        // already failed and is backing off before retrying — a
+        // genuinely different wait than "no free slot" (T215 incident:
+        // the card read "Waiting for a slot" while dispatch had actually
+        // already failed and given up). Once the retry cap is exhausted
+        // the engine clears `autostart` and stamps `dispatchFailedReason`
+        // instead, which already renders its own failure banner outside
+        // the Doing column — this is only the brief in-process backoff
+        // window before that.
+        let dispatchRetryAt: Date? = runtime?.dispatchRetryAt.flatMap(AutomationTime.parse)
+        let isDispatchRetryPending = isDispatchPending && (dispatchRetryAt.map { $0 > Date() } ?? false)
+
         // A conflict-resolution card is status=blocked+merge_conflict with
         // an active resolution attempt. It routes to Doing for the duration
         // of the worker run; we surface a distinct "resolving conflicts"
@@ -1592,6 +1605,9 @@ private struct WorkBoardCardItem: View {
 
         let liveStatusForCard: String? = {
             guard column == .doing else { return nil }
+            if isDispatchRetryPending, let dispatchRetryAtRaw = runtime?.dispatchRetryAt {
+                return "Retrying dispatch — next attempt \(AutomationTime.relative(dispatchRetryAtRaw, now: Date()))"
+            }
             if isDispatchPending { return "Waiting for a slot" }
             if isResolvingConflicts { return nil }
             if isRemediatingCI { return nil }

@@ -3359,7 +3359,8 @@ fn is_false(b: &bool) -> bool {
 /// attached to that execution (`None` until the dispatch loop has
 /// progressed past the cube-workspace-lease stage and called
 /// `start_execution_run`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TaskRuntime {
     pub work_item_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3370,6 +3371,20 @@ pub struct TaskRuntime {
 
     pub execution_status: Option<ExecutionStatus>,
     pub run_status: Option<String>,
+
+    /// Unix epoch seconds (decimal string), set only while the current
+    /// execution is `ready` but withheld from dispatch by the engine's
+    /// in-process backoff after a pre-spawn dispatch failure. `None`
+    /// otherwise — including the ordinary "no failure yet, no free slot"
+    /// queue wait, which is a genuinely different state. Distinguishes
+    /// "dispatch is retrying after a failure" from "waiting for a slot"
+    /// so the kanban card doesn't render the misleading "Waiting for a
+    /// slot" label during the retry backoff window. The *post*-give-up
+    /// bounced state was already correctly labeled (clears `autostart`,
+    /// surfaces `dispatch_failed_reason` instead) before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_retry_at: Option<String>,
 }
 
 /// How strictly the product's `.github/PULL_REQUEST_TEMPLATE.md`
