@@ -280,6 +280,24 @@ pub enum Stage {
     /// `details` object carries `prior_status`, the `remote_pid`, and the
     /// reap `reason` so the strand is diagnosable from `bossctl dispatch tail`.
     RemoteLeaseReconcile,
+    /// The periodic spawn-ack sweep ([`crate::spawn_ack_sweep`]) found a
+    /// slot stuck in `Spawning` that never reported a shell pid AND never
+    /// received a single hook event, past the grace window — proof no
+    /// worker process ever came up at all, not merely one blocked on the
+    /// interactive directory-trust prompt (which `mark_stalled_spawns`
+    /// still handles, and which always has a pid). The execution has been
+    /// marked `orphaned`, the app's pane torn down, the pool slot
+    /// released, and the work item will be redispatched by the orphan
+    /// sweep on the next tick. This is the fix for the 2026-07-03/04
+    /// false-live incident, where such a slot instead sat at
+    /// `activity=waiting_for_input, shell_pid=0` forever, requiring a
+    /// human to notice and manually reap it. Distinct from
+    /// `dead_pid_reconcile` (a pid WAS observed, then the process died)
+    /// and `stale_worker_reconcile` (a pid is alive but wedged after
+    /// reaching `working`) — here no pid was ever observed at all. The
+    /// `details` object carries `shell_pid` (always `0`) and the
+    /// `threshold_secs` grace window that elapsed.
+    SpawnAckTimeout,
 }
 
 impl Stage {
@@ -314,6 +332,7 @@ impl Stage {
             Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
             Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
             Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
+            Stage::SpawnAckTimeout => "spawn_ack_timeout",
         }
     }
 }

@@ -26,6 +26,12 @@ pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 /// `WaitingForInput`. 30 seconds matches the dead-PID grace period and
 /// gives a fresh-but-slow worker enough runway while being well below the
 /// typical interactive-wait tolerance.
+///
+/// This threshold only ever promotes slots that already have a reported
+/// `shell_pid` (see the guard in `mark_stalled_spawns`) — a slot with no
+/// pid at all is a different failure class entirely, handled by
+/// `crate::spawn_ack_sweep` instead. See that module's doc comment for
+/// the 2026-07-03/04 false-live incident this split addresses.
 pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
@@ -349,6 +355,18 @@ impl LiveWorkerStateRegistry {
     /// `WaitingForInput` so the existing kanban dot and
     /// `WorkerWaitingIndicator` fire.
     ///
+    /// **Requires `shell_pid > 0`.** A slot that never reported a shell
+    /// pid at all has produced no evidence that any process — let alone
+    /// one blocked on an interactive prompt — ever started. Promoting
+    /// such a slot to `WaitingForInput` is exactly the 2026-07-03/04
+    /// false-live incident: the slot sat at `activity=waiting_for_input,
+    /// shell_pid=0` forever, presenting as "the worker needs a human"
+    /// when there was nothing an operator could attach to and answer.
+    /// A pid-less spawn stall is a different failure class, left in
+    /// `Spawning` here and handled instead by
+    /// `crate::spawn_ack_sweep::run_one_pass`, which terminal-fails and
+    /// redispatches it after a longer grace window.
+    ///
     /// Returns the slot IDs that were changed so callers can broadcast
     /// the updated snapshot. Normal-running workers (whose `SessionStart`
     /// hook fires within seconds of spawn) always have `last_event_at`
@@ -362,6 +380,11 @@ impl LiveWorkerStateRegistry {
         let mut changed = Vec::new();
         for (slot_id, state) in by_slot.iter_mut() {
             if state.activity != WorkerActivity::Spawning {
+                continue;
+            }
+            if state.shell_pid <= 0 {
+                // No process has reported in at all — `spawn_ack_sweep`
+                // owns this slot, not the directory-trust-prompt path.
                 continue;
             }
             if state.last_event_at.is_some() {
@@ -927,6 +950,40 @@ mod tests {
             WorkerActivity::Spawning,
             "activity must remain Spawning"
         );
+    }
+
+    /// Regression test for the 2026-07-03/04 false-live incident: a
+    /// slot that never reported a shell pid must NOT be promoted to
+    /// `WaitingForInput` by `mark_stalled_spawns`, no matter how long it
+    /// has been stuck in `Spawning`. Promoting it there previously left
+    /// the slot parked forever at `activity=waiting_for_input,
+    /// shell_pid=0` — a state with nothing for a human to attach to and
+    /// answer. This slot is instead left in `Spawning` for
+    /// `spawn_ack_sweep` to terminal-fail and redispatch.
+    #[test]
+    fn zero_pid_spawn_is_not_promoted_to_waiting_for_input() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 0, None);
+
+        let old_spawn = 1_700_000_000_i64;
+        reg.set_spawn_time_for_test(1, old_spawn);
+
+        // Far past the threshold — if this were a shell_pid > 0 slot it
+        // would have been promoted long ago.
+        let now = old_spawn + STALLED_SPAWN_THRESHOLD_SECS * 10;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(
+            changed.is_empty(),
+            "a pid-less slot must never be promoted by this path"
+        );
+        let state = reg.get(1).unwrap();
+        assert_eq!(
+            state.activity,
+            WorkerActivity::Spawning,
+            "must remain Spawning — spawn_ack_sweep owns the pid-less timeout path"
+        );
+        assert_eq!(state.shell_pid, 0);
     }
 
     /// Workers in non-Spawning states are never touched by `mark_stalled_spawns`.

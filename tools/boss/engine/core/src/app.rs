@@ -272,6 +272,20 @@ impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
     }
 }
 
+#[async_trait]
+impl crate::spawn_ack_sweep::SpawnAckReaper for ServerState {
+    /// Route the spawn-ack-timeout reconcile through the same
+    /// `release_worker_pane` teardown as the stale-worker sweep: tears
+    /// down whatever (possibly ghost) pane the app is holding for the
+    /// slot, signals the recorded shell pid's process group as a
+    /// backstop (a no-op when `shell_pid == 0`, which is always true for
+    /// this sweep's candidates), releases the pool slot, and drops the
+    /// live-state entry.
+    async fn reap_worker(&self, execution_id: &str) {
+        let _ = ServerState::release_worker_pane(self, execution_id).await;
+    }
+}
+
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
 /// ServerState owns the completion handler, which owns the releaser,

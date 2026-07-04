@@ -824,6 +824,25 @@ pub async fn serve(
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );
 
+    // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
+    // that never reported a shell pid AND never received a single hook
+    // event — proof no worker process ever came up at all, distinct from
+    // `mark_stalled_spawns` (which only ever promotes a slot that DOES
+    // have a pid, i.e. a real process blocked on the interactive
+    // directory-trust prompt). This is the fix for the 2026-07-03/04
+    // false-live incident, where such a slot instead sat at
+    // `activity=waiting_for_input, shell_pid=0` forever and had to be
+    // noticed and manually reaped. Runs every 60s and fires on boot.
+    let _spawn_ack_sweep_handle = crate::spawn_ack_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        server_state.clone() as Arc<dyn crate::spawn_ack_sweep::SpawnAckReaper>,
+        Duration::from_secs(60),
+        crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
+    );
+
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
     // daemon wedges in a ~100% CPU spin. While it is stuck it stops
     // servicing code-signing assessments, so every `dlopen` of a
