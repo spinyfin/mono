@@ -33,7 +33,7 @@ const GROUP_COLS: &str = "id, product_id, short_id, kind, \
 const ATTN_COLS: &str = "id, group_id, ordinal, source_anchor, answer_state, \
      created_at, answered_at, question_type, prompt_text, choice_options, answer, \
      proposed_name, proposed_description, proposed_effort, proposed_work_kind, \
-     rationale, confidence_source";
+     rationale, confidence_source, score, linked_work_item_id";
 
 /// A group in `actioned`/`dismissed` is terminal: members can no longer be
 /// changed and new attentions for the same key form a fresh generation.
@@ -1049,5 +1049,183 @@ impl WorkDb {
             group,
             produced_work_item_ids,
         })
+    }
+}
+
+// ===========================================================================
+// attention_merges — provenance ledger (P1203 task 1)
+// ===========================================================================
+
+/// One row of the `attention_merges` provenance ledger. Records every fold
+/// event: which candidate was reconciled into which canonical (or suppressed
+/// as a work-item dup / sensibility), the model that decided, the rationale,
+/// and any bounded edits applied to the canonical.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AttentionMerge {
+    pub id: String,
+    /// Set for `AttentionDup` folds; `None` for `WorkItemDup` / sensibility.
+    pub canonical_attention_id: Option<String>,
+    /// Set for `WorkItemDup` folds; `None` for `AttentionDup` / sensibility.
+    pub canonical_work_item_id: Option<String>,
+    pub product_id: String,
+    /// `"creation"` | `"sweep"` | `"sensibility"`.
+    pub trigger: String,
+    /// Set for sweep folds (retired loser row id); `None` for creation-time
+    /// folds (the candidate was never persisted).
+    pub duplicate_attention_id: Option<String>,
+    /// Rendered text of the candidate that was folded.
+    pub candidate_summary: String,
+    /// Source run / task id of the duplicate.
+    pub candidate_source: Option<String>,
+    pub model: String,
+    pub decision_rationale: Option<String>,
+    /// JSON `[{field, before, after}]` or `None` when no edit was applied.
+    pub edits_applied: Option<String>,
+    pub created_at: String,
+}
+
+/// Input for inserting one `attention_merges` row.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct InsertAttentionMergeInput {
+    pub canonical_attention_id: Option<String>,
+    pub canonical_work_item_id: Option<String>,
+    pub product_id: String,
+    pub trigger: String,
+    pub duplicate_attention_id: Option<String>,
+    pub candidate_summary: String,
+    pub candidate_source: Option<String>,
+    pub model: String,
+    pub decision_rationale: Option<String>,
+    pub edits_applied: Option<String>,
+}
+
+fn map_attention_merge(row: &Row<'_>) -> rusqlite::Result<AttentionMerge> {
+    Ok(AttentionMerge {
+        id: row.get(0)?,
+        canonical_attention_id: row.get(1)?,
+        canonical_work_item_id: row.get(2)?,
+        product_id: row.get(3)?,
+        trigger: row.get(4)?,
+        duplicate_attention_id: row.get(5)?,
+        candidate_summary: row.get(6)?,
+        candidate_source: row.get(7)?,
+        model: row.get(8)?,
+        decision_rationale: row.get(9)?,
+        edits_applied: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
+impl WorkDb {
+    /// Append one row to the `attention_merges` provenance ledger. Returns the
+    /// generated `id` of the new row.
+    ///
+    /// The pair-unique index on `(canonical_attention_id, duplicate_attention_id)`
+    /// enforces sweep idempotency at the DB level: inserting the same
+    /// (canonical, duplicate) pair a second time returns a constraint error
+    /// rather than silently double-counting the score. Callers that need
+    /// idempotent behaviour should use `INSERT OR IGNORE` semantics at the SQL
+    /// level (task 5/7 will do this via a dedicated sweep helper).
+    pub fn insert_attention_merge(&self, input: InsertAttentionMergeInput) -> Result<String> {
+        let conn = self.connect()?;
+        let id = next_id("merge");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO attention_merges (
+                 id, canonical_attention_id, canonical_work_item_id,
+                 product_id, trigger, duplicate_attention_id,
+                 candidate_summary, candidate_source, model,
+                 decision_rationale, edits_applied, created_at
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )",
+            params![
+                id,
+                input.canonical_attention_id,
+                input.canonical_work_item_id,
+                input.product_id,
+                input.trigger,
+                input.duplicate_attention_id,
+                input.candidate_summary,
+                input.candidate_source,
+                input.model,
+                input.decision_rationale,
+                input.edits_applied,
+                now,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// List all `attention_merges` rows for a canonical `Attention` id,
+    /// ordered chronologically. Used to render the merge-provenance affordance
+    /// in the Notifications UI ("folded N duplicate reports").
+    pub fn list_attention_merges_for_canonical(&self, canonical_attention_id: &str) -> Result<Vec<AttentionMerge>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, canonical_attention_id, canonical_work_item_id,
+                    product_id, trigger, duplicate_attention_id,
+                    candidate_summary, candidate_source, model,
+                    decision_rationale, edits_applied, created_at
+             FROM attention_merges
+             WHERE canonical_attention_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        collect_rows(stmt.query_map([canonical_attention_id], map_attention_merge)?)
+    }
+
+    /// Count `attention_merges` rows whose `canonical_work_item_id` matches
+    /// the given work-item id. Provides the "N related attentions suppressed"
+    /// signal for a work item (design §R11 — deferred count, available here
+    /// for callers that want it).
+    pub fn count_attention_merges_by_work_item(&self, work_item_id: &str) -> Result<i64> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM attention_merges WHERE canonical_work_item_id = ?1",
+            [work_item_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Empty-card cleanup: if the group identified by `group_id` has no
+    /// remaining open members (i.e. every member's `answer_state` is not
+    /// `'open'`), retire the group by setting `state = 'dismissed'` and
+    /// `dismissed_at = now()`. Returns `true` if the group was retired.
+    ///
+    /// Called inside the sweep fold transaction after retiring each loser
+    /// `Attention` item. Only affects non-terminal groups — a group that is
+    /// already `actioned` or `dismissed` is left unchanged (returns `false`).
+    pub fn retire_group_if_empty(&self, group_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        self.retire_group_if_empty_in_tx(&conn, group_id)
+    }
+
+    /// Transaction-aware variant of [`Self::retire_group_if_empty`] for use
+    /// inside an existing transaction.
+    pub(crate) fn retire_group_if_empty_in_tx(&self, conn: &Connection, group_id: &str) -> Result<bool> {
+        let group = match query_attention_group(conn, group_id)? {
+            Some(g) => g,
+            None => return Ok(false),
+        };
+        if group_is_terminal(&group.state) {
+            return Ok(false);
+        }
+        let open_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM attentions WHERE group_id = ?1 AND answer_state = 'open'",
+            [group_id],
+            |row| row.get(0),
+        )?;
+        if open_count > 0 {
+            return Ok(false);
+        }
+        let now = now_string();
+        conn.execute(
+            "UPDATE attention_groups SET state = 'dismissed', dismissed_at = ?2 WHERE id = ?1",
+            params![group_id, now],
+        )?;
+        Ok(true)
     }
 }
