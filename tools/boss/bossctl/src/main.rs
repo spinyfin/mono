@@ -1254,15 +1254,106 @@ async fn agents_status(socket_path: &Option<String>, json: bool, agent: String) 
         .send_request(&FrontendRequest::GetRun { id: agent.clone() })
         .await
         .context("sending GetRun")?;
-    match response {
-        FrontendEvent::RunResult { run } => {
-            print_run(json, &run);
-            Ok(())
-        }
+    let run = match response {
+        FrontendEvent::RunResult { run } => run,
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected status: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
+    };
+
+    // `run` is the `work_runs` row for the pane-spawn task, not the
+    // worker's lifecycle — every healthy spawn finalises that row
+    // within ~5-8s regardless of how long the worker actually runs
+    // (see the module docs on `LiveWorkerState`). Reporting `run`
+    // alone reads as "an 8-second run" even when the worker is alive
+    // and working minutes later. Resolve the owning execution and
+    // report on *that*: prefer the live worker state if the worker is
+    // still up, otherwise the execution's own status/timestamps.
+    let live = states
+        .iter()
+        .find(|s| s.execution_id.as_deref() == Some(run.execution_id.as_str()) || s.run_id == run.execution_id);
+
+    let execution = if live.is_some() {
+        None
+    } else {
+        match client
+            .send_request(&FrontendRequest::GetExecution {
+                id: run.execution_id.clone(),
+            })
+            .await
+            .context("sending GetExecution")?
+        {
+            FrontendEvent::ExecutionResult { execution } => Some(execution),
+            _ => None,
+        }
+    };
+
+    print_run_lifecycle(json, &run, live, execution.as_ref());
+    Ok(())
+}
+
+/// Renders a historical `GetRun` lookup alongside the worker's actual
+/// lifecycle rather than just the pane-spawn task row. See the
+/// `agents_status` doc comment above for why the two can diverge
+/// wildly (a `completed`, 8-second `run` next to a worker still alive
+/// 13+ minutes later). When `live` is `Some`, the worker is still up
+/// and its `LiveWorkerState` (with an authoritative `shell_pid`, not
+/// the possibly-stale `shell_pid 0` baked into the spawn row's
+/// `result_summary` text) is the source of truth. Otherwise `execution`
+/// carries the execution's own terminal status/timestamps, when the
+/// engine could resolve it.
+fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>, execution: Option<&WorkExecution>) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pane_spawn_run": run,
+                "note": "pane_spawn_run is the pane-spawn task record only; it finalises within \
+                         seconds of every healthy spawn and does not reflect the worker's \
+                         lifecycle. Use live_worker_state (if present) or execution for that.",
+                "live_worker_state": live,
+                "execution": execution,
+            })
+        );
+        return;
+    }
+
+    println!("run {} (pane-spawn step only — not the worker lifecycle)", run.id);
+    println!("  execution:     {}", run.execution_id);
+    println!("  spawn status:  {}", run.status);
+    if let Some(s) = &run.started_at {
+        println!("  spawn started: {s}");
+    }
+    if let Some(f) = &run.finished_at {
+        println!("  spawn finished:{f}");
+    }
+
+    match live {
+        Some(state) => {
+            println!();
+            println!("worker is live — actual state:");
+            print_live_state(false, state);
+        }
+        None => match execution {
+            Some(exec) => {
+                println!();
+                println!("worker lifecycle (execution {}):", exec.id);
+                println!("  status:   {}", exec.status.as_str());
+                if let Some(s) = &exec.started_at {
+                    println!("  started:  {s}");
+                }
+                if let Some(f) = &exec.finished_at {
+                    println!("  finished: {f}");
+                }
+            }
+            None => {
+                println!(
+                    "  (could not resolve owning execution {} for worker lifecycle)",
+                    run.execution_id
+                );
+            }
+        },
     }
 }
 
@@ -1797,29 +1888,6 @@ fn print_workspace_entry_short(entry: &WorkspacePoolEntry) {
         "{}  state={}  lease={}  execution={}  task=\"{}\"  path={}",
         entry.workspace_id, entry.state, lease, exec, task, entry.workspace_path,
     );
-}
-
-fn print_run(json: bool, run: &WorkRun) {
-    if json {
-        println!("{}", serde_json::to_string(run).expect("WorkRun serializes"));
-    } else {
-        println!("run {}", run.id);
-        println!("  execution:  {}", run.execution_id);
-        println!("  agent:      {}", run.agent_id);
-        println!("  status:     {}", run.status);
-        if let Some(s) = &run.started_at {
-            println!("  started:    {s}");
-        }
-        if let Some(f) = &run.finished_at {
-            println!("  finished:   {f}");
-        }
-        if let Some(t) = &run.transcript_path {
-            println!("  transcript: {t}");
-        }
-        if let Some(err) = &run.error_text {
-            println!("  error:      {err}");
-        }
-    }
 }
 
 #[allow(dead_code)]
