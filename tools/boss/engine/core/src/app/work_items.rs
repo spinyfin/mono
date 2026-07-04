@@ -409,6 +409,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
         session_id,
         request_id,
         peer_pid,
+        ..
     } = ctx;
     let FrontendRequest::UpdateWorkItem { id, patch } = req else {
         unreachable!()
@@ -827,13 +828,31 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         work_db,
         sink,
         request_id,
+        recv_instant,
+        decode_ms,
         ..
     } = ctx;
-    let FrontendRequest::GetWorkTree { product_id } = req else {
+    let FrontendRequest::GetWorkTree { product_id, fetch_seq } = req else {
         unreachable!()
     };
-    match work_db.get_work_tree(&product_id) {
+
+    // Open a population-timing trace for this fetch. The window started at
+    // line receipt (`recv_instant`); the decode segment was already timed in
+    // the reader loop. The DB call fills the per-query segments; the writer
+    // task appends serialize/socket_write/total and flushes.
+    let mut trace =
+        crate::population_timing::PopulationTrace::new(product_id.clone(), request_id.clone(), fetch_seq, recv_instant);
+    trace.record_plain(crate::population_timing::segment::DECODE, decode_ms);
+
+    match work_db.get_work_tree_instrumented(&product_id, &mut trace) {
         Ok(tree) => {
+            // Mark the handoff instant so the writer task can attribute the
+            // time this trace spends sitting in the session's writer queue
+            // (queue_wait), then stash BEFORE enqueueing: the writer task
+            // runs concurrently and must find the trace by `request_id`
+            // when it pops this response.
+            trace.mark_enqueued();
+            sink.stash_population_trace(&request_id, trace);
             send_response_with_revision(
                 &sink,
                 &request_id,
@@ -849,6 +868,7 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
             );
         }
         Err(err) => {
+            // Error path: drop the trace (no serialize/write to attribute).
             send_response(
                 &sink,
                 &request_id,

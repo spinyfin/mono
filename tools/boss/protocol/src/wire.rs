@@ -670,6 +670,17 @@ pub enum FrontendRequest {
 
     GetWorkTree {
         product_id: String,
+        /// App-side per-product population-fetch sequence number (T2101
+        /// R1). Purely a correlation id: the macOS app mints a 1-based
+        /// per-product `fetch_seq` for every `GetWorkTree` it issues and
+        /// stamps it on its `population-timing-*.jsonl` lines. Propagating
+        /// it here lets the engine stamp the same value on its
+        /// `engine-population-timing-*.jsonl` segment events, so the two
+        /// sides can be joined on `(product_id, fetch_seq)` for one fetch.
+        /// Optional for backward compatibility: older app builds omit it
+        /// and the engine falls back to its own envelope `request_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fetch_seq: Option<i64>,
     },
 
     /// Abort an in-progress device-flow authorization. The engine

@@ -367,7 +367,14 @@ final class PopulationTiming: @unchecked Sendable {
     /// and logs a `fetch_issued` marker carrying the sequence number and
     /// the gap since the previous issue so the cold-start double-fetch is
     /// visible in the log.
-    func fetchIssued(productId: String, flow: PopulationFlow) {
+    ///
+    /// Returns the assigned per-product `fetch_seq` so the caller can put it
+    /// on the `get_work_tree` request. The engine stamps the same value on
+    /// its `engine-population-timing-*.jsonl` segments, letting app-side and
+    /// engine-side events for one fetch be joined on `(product_id,
+    /// fetch_seq)`.
+    @discardableResult
+    func fetchIssued(productId: String, flow: PopulationFlow) -> Int {
         let sendNanos = nowNanos()
         let (seq, count, sinceLastMs) = lock.withLock { state -> (Int, Int, Double?) in
             let count = (state.fetchCountByProduct[productId] ?? 0) + 1
@@ -396,6 +403,8 @@ final class PopulationTiming: @unchecked Sendable {
         rec.productFetchCount = count
         rec.sinceLastMs = sinceLastMs
         log.record(rec)
+
+        return seq
     }
 
     // MARK: - Segments 1b + 2: request→reply and decode

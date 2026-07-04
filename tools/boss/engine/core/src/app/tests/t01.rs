@@ -797,6 +797,8 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .sink(sink.clone())
         .session_id("s1")
         .request_id("req-1")
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
         .build();
     executions::handle_reap_run(
         ctx,

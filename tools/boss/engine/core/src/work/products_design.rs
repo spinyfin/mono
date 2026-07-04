@@ -702,10 +702,18 @@ impl WorkDb {
 /// `|_| None` in `get_work_tree` (no cube lookup there — the app prefers
 /// the GitHub `raw_content_url` for in-review docs on the PR head branch
 /// anyway).
+///
+/// `queries` is incremented by the number of SQL statements this call
+/// actually executes (1-3, depending on whether the product row and a
+/// cross-product repo lookup are needed) — mirrors
+/// [`crate::work::dispatch_helpers::query_task_runtime`], so N+1 callers
+/// like `get_work_tree`'s `db.doc_pointers` segment can report an accurate
+/// aggregate statement count.
 pub(crate) fn resolve_task_doc_pointer(
     conn: &Connection,
     task_id: &str,
     lookup_repo_workspace_path: impl FnOnce(&str) -> Option<String>,
+    queries: &mut u64,
 ) -> Result<Option<ProjectDesignDocState>> {
     let row = conn
         .query_row(
@@ -721,6 +729,7 @@ pub(crate) fn resolve_task_doc_pointer(
             },
         )
         .optional()?;
+    *queries += 1;
     let Some((product_id, doc_repo, doc_branch, doc_path)) = row else {
         return Ok(None);
     };
@@ -728,6 +737,7 @@ pub(crate) fn resolve_task_doc_pointer(
         return Ok(None);
     };
     let product = query_product(conn, &product_id).require("product", &product_id)?;
+    *queries += 1;
 
     let resolved_repo = doc_repo.or_else(|| product.repo_remote_url.clone());
     let Some(repo) = resolved_repo else {
@@ -744,12 +754,15 @@ pub(crate) fn resolve_task_doc_pointer(
         ResolvedDesignDocKind::SameProduct {
             product_id: product_id.clone(),
         }
-    } else if let Some(other_product) = find_product_by_repo_remote_url(conn, &repo)? {
-        ResolvedDesignDocKind::OtherProduct {
-            product_id: other_product,
-        }
     } else {
-        ResolvedDesignDocKind::External
+        *queries += 1;
+        if let Some(other_product) = find_product_by_repo_remote_url(conn, &repo)? {
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: other_product,
+            }
+        } else {
+            ResolvedDesignDocKind::External
+        }
     };
 
     let web_url = render_design_doc_web_url(&repo, &branch, &path);

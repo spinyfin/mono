@@ -228,16 +228,31 @@ pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) 
     collect_rows(rows)
 }
 
-pub(crate) fn collect_task_runtimes(conn: &Connection, tasks: &[Task], chores: &[Task]) -> Result<Vec<TaskRuntime>> {
+/// Hydrate the per-item runtime for every task and chore. This is the
+/// primary N+1 on the `get_work_tree` path: one call per work item, each
+/// running 1-3 point queries. Returns the runtimes alongside the total
+/// number of SQL statements executed, so [`crate::population_timing`] can
+/// attribute the per-row subquery fan-out.
+pub(crate) fn collect_task_runtimes(
+    conn: &Connection,
+    tasks: &[Task],
+    chores: &[Task],
+) -> Result<(Vec<TaskRuntime>, u64)> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
+    let mut queries = 0u64;
     for task in tasks.iter().chain(chores.iter()) {
-        runtimes.push(query_task_runtime(conn, &task.id)?);
+        runtimes.push(query_task_runtime(conn, &task.id, &mut queries)?);
     }
-    Ok(runtimes)
+    Ok((runtimes, queries))
 }
 
-pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Result<TaskRuntime> {
+/// Runtime snapshot for a single work item. `queries` is incremented by the
+/// number of SQL statements this call actually executes (1-3, depending on
+/// whether a live-execution fallback and a latest-run lookup are needed) so
+/// N+1 callers can report an accurate aggregate subquery count.
+pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str, queries: &mut u64) -> Result<TaskRuntime> {
     let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
+    *queries += 1;
     // `current_execution_id` (the operator-facing label for
     // `TaskRuntime.execution_id`) and the kanban card must follow the
     // execution a worker is actually attached to. A re-dispatch storm
@@ -251,12 +266,15 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Resul
     let latest_is_live = latest.as_ref().map(|e| e.status.is_live()).unwrap_or(false);
     let execution = if latest_is_live {
         latest
-    } else if let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? {
-        Some(live)
     } else {
-        latest
+        *queries += 1;
+        match query_live_execution_for_work_item(conn, work_item_id)? {
+            Some(live) => Some(live),
+            None => latest,
+        }
     };
     let (execution_status, run_status, execution_id, current_run_id) = if let Some(execution) = execution {
+        *queries += 1;
         let latest_run = query_latest_run(conn, &execution.id)?;
         let (run_status, run_id) = match latest_run {
             Some((id, status)) => (Some(status), Some(id)),
