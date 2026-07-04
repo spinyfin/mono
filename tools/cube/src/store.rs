@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::app::CubeError;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
@@ -92,7 +92,7 @@ impl Store {
             })?;
         }
 
-        let connection = Connection::open(path).map_err(CubeError::Storage)?;
+        let mut connection = Connection::open(path).map_err(CubeError::Storage)?;
         // Wait up to 5 s when another connection holds the write lock instead
         // of immediately returning SQLITE_BUSY (default busy timeout is 0 ms).
         // This hardens the real lease path against transient contention from
@@ -105,6 +105,16 @@ impl Store {
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(CubeError::Storage)?;
+        // Our write transactions read-then-write (e.g. SELECT a free workspace,
+        // then UPDATE it). Under the default DEFERRED behavior the read only
+        // takes a read snapshot; if another connection commits a write before
+        // this transaction's own write statement runs, SQLite can't upgrade
+        // the snapshot and returns SQLITE_BUSY_SNAPSHOT immediately — a hard
+        // failure that busy_timeout does NOT retry (retrying the same
+        // statement can't fix a stale snapshot). IMMEDIATE acquires the write
+        // lock at BEGIN, before any read runs, so contention instead shows up
+        // as an ordinary SQLITE_BUSY wait that busy_timeout does retry.
+        connection.set_transaction_behavior(TransactionBehavior::Immediate);
         let store = Self { connection };
         store.migrate()?;
         Ok(store)
