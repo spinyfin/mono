@@ -1,8 +1,9 @@
 # cube
 
-`cube` is a standalone CLI that manages a pool of reusable agent
+`cube` is a standalone CLI that manages a growing set of reusable agent
 workspaces — pre-cloned `jj`/git checkouts of one or more repos — and
-hands them out under short-lived leases. It owns the lifecycle of those
+hands them out under short-lived leases, provisioning a brand-new one
+on demand whenever none is free. It owns the lifecycle of those
 checkouts: provisioning them, leasing exactly one to a caller for the
 duration of a single task, resetting them back to a clean state on
 release, and reclaiming abandoned leases. Boss is its primary consumer
@@ -28,8 +29,9 @@ registers and materializes repo pools: `repo ensure` resolves a bare
 user's configured `repo-resolvers` (from `~/.config/cube/cube.toml`),
 then a GitHub `<org>/<name>` fallback — so `cube` stays ignorant of any
 particular hosting setup. `workspace` is the heart of the tool: `lease`
-selects a free workspace (or the `--prefer`'d one), health-checks it,
-resets it with `jj git fetch && jj new main`, and marks it leased with
+selects a free workspace (or the `--prefer`'d one), or provisions a
+brand-new one on demand if none is free, health-checks it, resets it
+with `jj git fetch && jj new main`, and marks it leased with
 a TTL; `heartbeat` extends that TTL so long-running holders aren't
 swept; `release` frees the slot and resets the working copy; and
 `force-release`/`remove`/`gc` exist for recovery, registry cleanup, and

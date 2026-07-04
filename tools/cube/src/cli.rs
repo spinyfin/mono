@@ -88,7 +88,8 @@ pub enum WorkspaceCommand {
         task: String,
         /// Preferred workspace id to lease (best-effort). If the named
         /// workspace is free it will be leased; otherwise lease falls
-        /// back to the first free workspace in the repo.
+        /// back to the first free workspace in the repo, or provisions
+        /// a new one if none is free.
         #[arg(long)]
         prefer: Option<String>,
         /// Reclaim the `--prefer` workspace *with its dirty working copy

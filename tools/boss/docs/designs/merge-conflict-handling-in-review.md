@@ -391,7 +391,7 @@ The kanban projection rule from [`work-kanban.md`](work-kanban.md#status-mapping
 └────────────────────────────────────────┘
 ```
 
-The badge's secondary line is presence-driven: if a resolution worker is `running`, show "resolution worker running"; if it's `pending` (workspace lease unavailable), show "queued"; if `failed`, show "needs attention" (the failure surfacing path, Q6).
+The badge's secondary line is presence-driven: if a resolution worker is `running`, show "resolution worker running"; if it's `pending` (queued for the next merge-poller pass or a free worker slot), show "queued"; if `failed` (including a cube lease fault), show "needs attention" (the failure surfacing path, Q6).
 
 A subtle but important point: the parent card _does not get a separate card for the resolution attempt_. The attempt is invisible on the kanban. The user sees the parent card with a richer badge; clicking it opens the inspector, which shows the attempt's state inline. This is the operational shape of "ephemeral" in this design — the side-record exists, is inspectable, but does not produce its own kanban card.
 
@@ -1207,11 +1207,9 @@ The worker tries `jj git push --bookmark <branch>` and the push is rejected. Two
 
 Same handling as any worker crash. The completion path notices the worker exited without a successful Stop event and marks the attempt `failed` with `failure_reason='worker_crashed'`. The parent stays `blocked`. A retry verb (`boss engine conflicts retry <id>`) creates a fresh attempt that re-leases a workspace and re-spawns.
 
-### Cube lease unavailable at spawn time
+### Cube lease fails at spawn time
 
-Same as `auto-rebase-stacked-prs.md` Q4 sub-case 2. The attempt stays in `pending` (not `failed`); the merge-poller's next pass re-probes; if the conflict still exists, the existing `pending` attempt is consulted (idempotency unique key). The coordinator's lease loop is the natural retry mechanism.
-
-A `pending` attempt older than 30 minutes is logged at `warn` so the operator can investigate ("cube pool exhausted, no resolution worker started"). No auto-escalation; the pool is the constraint, not the trigger.
+Same as `auto-rebase-stacked-prs.md` Q4 sub-case 2: a real cube fault — repo not registered, remote unreachable, or a clone failure — never "no free workspace" (cube provisions a fresh workspace on demand whenever none is free). Mark the attempt `failed` with cube's error verbatim. The merge-poller's next pass re-probes; if the conflict still exists, a fresh attempt is created (idempotency unique key), following the same retry-then-promote policy as the rebase design.
 
 ### Parent PR closed while resolution is in flight
 

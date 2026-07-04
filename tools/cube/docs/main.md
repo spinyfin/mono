@@ -165,10 +165,13 @@ Behavior:
 - Otherwise find a free, healthy workspace from the pool, or create one. The
   pool is an optimisation (reuse a known-good checkout), not a hard cap: a
   lease for a registered, reachable repo always succeeds by growing the pool
-  on demand. The only hard stop is a pool in which every free workspace has a
-  dirty working copy — those may hold unpushed work, so the operator must
-  reclaim them (`cube workspace force-release --reason crash`) rather than have
-  cube silently discard the changes.
+  on demand. A free workspace with a dirty working copy is never handed out
+  either — cube skips it and provisions a fresh one instead, so a dirty tree
+  never blocks a lease. The real hard failures are: the repo isn't
+  registered, the remote is unreachable, or provisioning the fresh workspace
+  fails (e.g. clone error from a full disk). Reclaiming a dirty workspace's
+  unpushed work (`cube workspace force-release --reason crash`) is a separate
+  GC/recovery concern, decoupled from the lease path.
 - Self-heal degraded pool entries on lease. A free workspace whose directory
   has neither `.jj/` nor `.git/` (a "broken-empty" husk, e.g. from a clone
   interrupted before this guarantee landed) holds no recoverable work, so cube
@@ -448,7 +451,8 @@ Selection should prefer:
 1. already-existing free workspaces,
 2. workspaces recently used for the same repo branch,
 3. workspaces whose build outputs are likely still warm,
-4. creating a new workspace only after the pool is exhausted.
+4. creating a new workspace whenever no free one exists — routine, not an
+   error.
 
 Cube does not need perfect cache prediction in v1. "Prefer a free existing
 workspace over creating a new one" is already a meaningful win.
