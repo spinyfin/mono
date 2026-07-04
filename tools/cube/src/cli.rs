@@ -413,16 +413,22 @@ pub enum PrCommand {
     /// Open a new GitHub PR for the current jj bookmark.
     ///
     /// Resolves `owner/repo` from `jj git remote`, pushes the branch, and
-    /// opens a PR. Errors if an open PR already exists for the branch —
-    /// use `cube pr update` to push commits to an existing PR. Prints the
-    /// PR URL as the only stdout line. Uses `-R <owner/repo>` with `gh` so
-    /// no `GIT_DIR` guess is needed.
+    /// opens a PR. Prints the PR URL as the only stdout line. Uses
+    /// `-R <owner/repo>` with `gh` so no `GIT_DIR` guess is needed.
+    ///
+    /// Safe to retry: if an open PR already exists for the branch (e.g. a
+    /// prior invocation's push landed after your tool/shell killed it on a
+    /// timeout), this returns that PR's URL with success semantics
+    /// (`action: "already_exists"`) instead of erroring, and does NOT push
+    /// again. If you have NEW commits to add to an already-open PR, use
+    /// `cube pr update` instead — `create` never pushes onto an existing PR.
     Create(PrCreateArgs),
     /// Push new commits to the existing PR for the current jj bookmark.
     ///
     /// Resolves `owner/repo` from `jj git remote`, pushes the branch to its
     /// open PR's head, and prints the PR URL. Errors if no open PR exists for
-    /// the branch — use `cube pr create` to open one. Never creates a PR.
+    /// the branch — use `cube pr create` to open one (which is itself safe to
+    /// retry without duplicating the PR). Never creates a PR.
     Update(PrUpdateArgs),
     /// Deprecated alias for `cube pr create` / `cube pr update`.
     ///

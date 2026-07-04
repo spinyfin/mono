@@ -267,8 +267,12 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          - Open a PR with `cube pr create` once commits exist and tests pass.\n\
          - **If a PR already exists** (resuming or addressing review),\n\
            push new commits to it with `cube pr update`; do NOT open a\n\
-           duplicate. `cube pr create` errors if a PR already exists, and\n\
-           `cube pr update` errors if none does. Check first with:\n\
+           duplicate. `cube pr create` is safe to retry: if a prior call\n\
+           already created the PR (e.g. your tool killed an earlier\n\
+           invocation on a timeout but the push had actually landed), it\n\
+           returns that PR's URL instead of erroring. Use `cube pr update`\n\
+           only when you have new commits to push onto an already-open PR;\n\
+           it errors if none does. Check first with:\n\
            `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
            or `gh pr view`.\n\
          - Do not hard-wrap PR bodies.\n\
@@ -338,8 +342,10 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          cube pr create --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
          ```\n\
          \n\
-         `cube pr create` errors if an open PR already exists for the branch\n\
-         (use `cube pr update` for that — see below). `cube pr create` handles\n\
+         `cube pr create` is safe to retry: if an open PR already exists for\n\
+         the branch, it returns that PR's URL instead of erroring, without\n\
+         pushing again. Use `cube pr update` only when you have new commits\n\
+         to push onto an already-open PR (see below). `cube pr create` handles\n\
          the push and `--allow-new` automatically; never call `jj git push` directly.\n\
          \n\
          To update an existing PR (push new commits to it):\n\

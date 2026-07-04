@@ -2982,8 +2982,15 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<
     run_checkleft_gate(&ctx.cwd)?;
 
     // --allow-new is idempotent: fine when the remote bookmark already exists.
-    runner
-        .run(&RealCommandRunner::invocation(
+    // --ignore-working-copy: we push the named `ctx.branch` bookmark, an
+    // already-committed ref — not `@` — so jj's default eager working-copy
+    // snapshot buys nothing here. Skipping it avoids taking the shared
+    // store's snapshot lock for a workspace-local change that has no
+    // bearing on this push, shrinking one contributor to the store-wide
+    // lock contention under concurrent workers (see [`run_jj_push`]).
+    run_jj_push(
+        runner,
+        &RealCommandRunner::invocation(
             &ctx.cwd,
             "jj",
             &[
@@ -2994,9 +3001,11 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<
                 "--remote",
                 &ctx.github_remote,
                 "--allow-new",
+                "--ignore-working-copy",
             ],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to push branch `{}`: {e}", ctx.branch)))?;
+        ),
+    )
+    .map_err(|e| CubeError::InvalidArgument(format!("failed to push branch `{}`: {e}", ctx.branch)))?;
 
     // Verify the push actually reached GitHub. Confirming against the same
     // remote we pushed to (e.g. `git ls-remote origin`) is circular — if
@@ -3111,22 +3120,37 @@ fn gh_create_pr(args: &PrCreateArgs, ctx: &PrContext, runner: &dyn CommandRunner
 
 /// Open a new GitHub PR for the current jj bookmark.
 ///
-/// Errors if an open PR already exists for the branch — that is the job of
-/// `cube pr update`. Checks for the existing PR *before* pushing so a misfire
-/// fails fast with no side effects. Pushes the branch via `jj git push` and
+/// Idempotent across caller-side retries: if an open PR already exists for
+/// the branch, returns it with success semantics (`action: "already_exists"`)
+/// instead of erroring. This matters because a caller can be killed by its
+/// own timeout (e.g. a tool's output-silence timeout) after the underlying
+/// `jj git push` actually landed and the PR was created — a bare retry must
+/// not be punished with a hard failure. Checks for the existing PR *before*
+/// pushing so this never re-pushes on the idempotent path, and a genuine
+/// misfire (calling `create` on a branch it didn't just push) still fails
+/// fast with no push side effect. Pushes the branch via `jj git push` and
 /// then uses `gh pr create -R <owner/repo>` — no `GIT_DIR` guess needed, works
 /// from both primary and secondary cube workspaces.
 fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
     let ctx = resolve_pr_context(args.branch.clone(), runner)?;
 
-    // Fail fast: never push when a PR already exists — surface the existing
-    // PR and the exact verb to advance it.
+    // Already created by a prior invocation of this same command — treat as
+    // success rather than a hard error so retries after a caller-side
+    // timeout are safe. A caller with genuinely new commits to add should
+    // use `cube pr update` instead; this path never pushes.
     if let Some(url) = list_open_pr(&ctx, runner)? {
-        return Err(CubeError::InvalidArgument(format!(
-            "an open PR already exists for branch `{branch}`: {url}. Push commits to it with \
-             `cube pr update --branch {branch}` instead of creating a new PR.",
+        eprintln!(
+            "cube: an open PR already exists for branch `{branch}` — treating this `pr create` call \
+             as already satisfied. If you have new commits to push, use \
+             `cube pr update --branch {branch}` instead.",
             branch = ctx.branch
-        )));
+        );
+        let number = pr_number_from_url(&url);
+        let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
+        return RunResult::new(
+            url.clone(),
+            json!({"action": "already_exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
+        );
     }
 
     push_branch_to_github(&ctx, runner)?;
@@ -5012,6 +5036,74 @@ fn network_cmd_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Default wall-clock bound for a single `jj git push` attempt. Larger than
+/// [`DEFAULT_NETWORK_CMD_TIMEOUT_SECS`] on purpose: a push against a store
+/// shared by many concurrent cube workspaces can legitimately queue for
+/// minutes behind the fleet's other jj operations (fetches, snapshots,
+/// `jj new`) serializing on the same on-disk op-log lock, not because
+/// anything is actually wedged. Killing and restarting the git transport
+/// every ~2 minutes (as [`DEFAULT_NETWORK_CMD_TIMEOUT_SECS`] would) throws
+/// away queueing progress already made; one longer attempt with heartbeats
+/// (see [`crate::command_runner::RealCommandRunner::run_with_timeout`]) is
+/// cheaper and matches the multi-minute waits observed in production.
+/// Overridable via `CUBE_PUSH_TIMEOUT_SECS`.
+const DEFAULT_PUSH_CMD_TIMEOUT_SECS: u64 = 300;
+
+/// How many extra times a `jj git push` is retried after a timeout or a
+/// transient network failure before the error is surfaced. Safe to retry:
+/// every push this wraps is a non-force `--allow-new` push of an already-
+/// committed bookmark, so retrying an attempt that actually landed just
+/// reconfirms the remote ref is already where we want it.
+const PUSH_CMD_RETRIES: u32 = 1;
+
+/// Resolve the per-attempt `jj git push` timeout, honouring the
+/// `CUBE_PUSH_TIMEOUT_SECS` override (clamped to a sane floor so an
+/// operator typo can't reintroduce a near-zero/no timeout).
+fn push_cmd_timeout() -> Duration {
+    let secs = std::env::var("CUBE_PUSH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s >= 5)
+        .unwrap_or(DEFAULT_PUSH_CMD_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Run `jj git push` with a bounded per-attempt deadline and a bounded
+/// retry on timeout or transient network failure. No silent crawl: every
+/// attempt goes through [`CommandRunner::run_with_timeout`], which emits
+/// its own stderr heartbeat while the child is still running, so a push
+/// queued behind shared-store contention is never quiet for longer than
+/// that heartbeat interval — a caller's own output-silence timeout (e.g. a
+/// Bash tool's default) sees progress instead of reading silence as a hang.
+///
+/// Deliberately not [`run_jj`] / [`run_jj_network`]: those apply
+/// stale-working-copy and colocate-init recovery aimed at read/update
+/// operations on the local working copy, which doesn't fit a push (the
+/// invocation already carries `--ignore-working-copy`, so there is no
+/// working copy state to recover), and they use a shorter timeout tuned for
+/// fetches rather than a lock-contended push.
+fn run_jj_push(runner: &dyn CommandRunner, invocation: &CommandInvocation) -> Result<String> {
+    let timeout = push_cmd_timeout();
+    let mut attempt: u32 = 0;
+    loop {
+        match runner.run_with_timeout(invocation, timeout) {
+            Ok(out) => return Ok(out),
+            Err(err) if attempt < PUSH_CMD_RETRIES && is_retryable_network_error(&err) => {
+                attempt += 1;
+                eprintln!(
+                    "cube: `{} {}` did not complete within {}s (attempt {attempt}/{PUSH_CMD_RETRIES}); \
+                     this usually means the shared jj store is contended by concurrent workspaces — \
+                     retrying: {err}",
+                    invocation.program,
+                    invocation.args.join(" "),
+                    timeout.as_secs(),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Stable substrings that mark a network failure as transient (worth a
 /// bounded retry) rather than a hard error like an auth or merge failure.
 /// Matched case-insensitively against a failed command's stderr.
@@ -5994,7 +6086,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cli::{Cli, Command};
-    use crate::command_runner::{CommandInvocation, CommandRunner};
+    use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
     use crate::lock::RepoLock;
 
     use super::{
@@ -6002,7 +6094,8 @@ mod tests {
         RebaseOpts, RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
         gc_aged_unhealthy_workspaces, is_retryable_network_error, is_stdin_path, rebase_workspace_branch,
         render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
-        run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude, workspace_goto,
+        run_checkleft_gate_impl, run_jj_push, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        workspace_goto,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -11333,6 +11426,72 @@ mod tests {
     }
 
     #[test]
+    fn run_jj_push_retries_once_on_transient_failure_then_succeeds() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let push_args = &[
+            "git",
+            "push",
+            "-b",
+            "my-feature",
+            "--remote",
+            "origin",
+            "--allow-new",
+            "--ignore-working-copy",
+        ];
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand {
+                cwd: cwd.clone(),
+                program: "jj".to_string(),
+                args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                result: Err(CubeError::CommandTimedOut {
+                    program: "jj".to_string(),
+                    args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                    timeout_secs: 300,
+                }),
+                creates_dir: None,
+            },
+            ExpectedCommand::ok(cwd.clone(), "jj", push_args, ""),
+        ]);
+
+        let out = run_jj_push(&runner, &RealCommandRunner::invocation(&cwd, "jj", push_args))
+            .expect("should succeed after exactly one retry");
+        runner.assert_exhausted();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn run_jj_push_returns_immediately_on_non_retryable_failure() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let push_args = &[
+            "git",
+            "push",
+            "-b",
+            "my-feature",
+            "--remote",
+            "origin",
+            "--allow-new",
+            "--ignore-working-copy",
+        ];
+        let runner = FakeRunner::new(vec![ExpectedCommand {
+            cwd: cwd.clone(),
+            program: "jj".to_string(),
+            args: push_args.iter().map(|a| (*a).to_string()).collect(),
+            result: Err(CubeError::CommandFailed {
+                program: "jj".to_string(),
+                args: push_args.iter().map(|a| (*a).to_string()).collect(),
+                status: Some(1),
+                stderr: "fatal: permission denied (publickey)".to_string(),
+            }),
+            creates_dir: None,
+        }]);
+
+        let err = run_jj_push(&runner, &RealCommandRunner::invocation(&cwd, "jj", push_args))
+            .expect_err("non-retryable failure must surface immediately");
+        runner.assert_exhausted();
+        assert!(matches!(err, CubeError::CommandFailed { .. }));
+    }
+
+    #[test]
     fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
         // Two workspaces: 001 gets leased (skipped by gc), 002 stays free (gc'd).
         let (tempdir, database_path) = with_database_path();
@@ -14771,7 +14930,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             // Push verification: local commit vs GitHub branch head sha.
@@ -14862,7 +15030,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -14940,7 +15117,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15015,7 +15201,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "github", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "github",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15089,7 +15284,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15160,7 +15364,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15245,7 +15458,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15313,7 +15535,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15402,7 +15633,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
@@ -15448,9 +15688,12 @@ steps:
     }
 
     #[test]
-    fn pr_create_errors_when_pr_already_exists() {
-        // `cube pr create` must refuse — and must NOT push — when an open PR
-        // already exists, pointing the caller at `cube pr update`.
+    fn pr_create_is_idempotent_when_pr_already_exists() {
+        // Retry-safety contract: if a prior `cube pr create` invocation's
+        // push actually landed after the CALLER gave up on it (e.g. a tool's
+        // own output-silence timeout killed the original call), a bare retry
+        // of `cube pr create` must succeed with the existing PR's URL rather
+        // than erroring — and it must NOT push again.
         let cwd = std::env::current_dir().expect("cwd");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
@@ -15476,17 +15719,18 @@ steps:
                 ],
                 r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
             ),
-            // No push, no create — the existence check short-circuits.
+            // No push, no `gh pr create` — only the local pr/<n> bookmark is set.
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature", "--title", "Dup"]);
-        let err = run_with_dependencies(cli, None, &runner).expect_err("pr create must error when PR exists");
+        let result = run_with_dependencies(cli, None, &runner).expect("pr create must succeed when PR already exists");
         runner.assert_exhausted();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("already exists") && msg.contains("cube pr update") && msg.contains("my-feature"),
-            "error should name the existing PR and point at `cube pr update`: {msg}"
-        );
+
+        assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
+        assert_eq!(result.payload["action"], "already_exists");
+        assert_eq!(result.payload["number"], 7);
+        assert_eq!(result.payload["pr_bookmark"], "pr/7");
     }
 
     #[test]
@@ -15521,7 +15765,16 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    "my-feature",
+                    "--remote",
+                    "origin",
+                    "--allow-new",
+                    "--ignore-working-copy",
+                ],
                 "",
             ),
             ExpectedCommand::ok(
