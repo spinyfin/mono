@@ -1,16 +1,16 @@
 # Investigation: multi-second task-population delay on app start / product switch
 
-**Status:** investigation complete — no code changed. Deliverable is this writeup plus ranked follow-up chores. **R1 (end-to-end per-segment timing) has since shipped and produced live diagnostics; §10 reports the results and supersedes the speculative attribution in §6–§8 with measured numbers.**
-**Date:** 2026-07-01 (revised 2026-07-01 — real-data DB validation, see §9; revised 2026-07-03 — live production timing diagnostics, see §10)
-**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-DB-snapshot revision); `exec_18bee836b1025060_33` (live-diagnostics revision)
+**Status:** investigation complete — no code changed. Deliverable is this writeup plus ranked follow-up chores. **R1 (end-to-end per-segment timing) has since shipped and produced live diagnostics; §10 reports the results. §11 (engine-side segment instrumentation from T2165 / PR #1737) further decomposes §10's opaque `request` segment and locks down the measured root cause, superseding §10.3's speculative "per-row work inside the engine handler or DB layer" guess.**
+**Date:** 2026-07-01 (revised 2026-07-01 — real-data DB validation, see §9; revised 2026-07-03 — live production timing diagnostics, see §10; revised 2026-07-04 — engine-side segment breakdown locks down the measured root cause, see §11)
+**Execution:** `exec_18be5484b40c4f68_123` (original); `exec_18be578c9ec3e7a0_25c` (real-DB-snapshot revision); `exec_18bee836b1025060_33` (live-diagnostics revision); `exec_18befac852e7eb08_87` (root-cause-lock-down revision)
 **Scope:** measure and attribute the wall-clock of populating the kanban board (lanes, nav, counts) on (a) cold app start and (b) product switch, then propose remediations grounded in the measurements.
-**Real-data validation:** all DB-dependent numbers in §3/§5 were re-measured against a read-only `.backup` snapshot of the live engine database (§9). **Live validation (§10):** with R1's instrumentation now running in production, the full engine→wire→decode→apply→render path has been measured directly on the live dataset (1,949-item Boss product) instead of reconstructed from a DB snapshot plus structural reasoning about the unmeasured app/engine segments. §10 is the authoritative attribution; read it first, then §3–§9 for how the investigation got there.
+**Real-data validation:** all DB-dependent numbers in §3/§5 were re-measured against a read-only `.backup` snapshot of the live engine database (§9). **Live validation (§10):** with R1's instrumentation now running in production, the full engine→wire→decode→apply→render path has been measured directly on the live dataset (1,949-item Boss product) instead of reconstructed from a DB snapshot plus structural reasoning about the unmeasured app/engine segments. **Root cause locked down (§11):** T2165 (PR #1737) shipped engine-side per-segment instrumentation that decomposes §10's black-box `request` segment into decode/DB/assemble/queue_wait/serialize/socket_write; a 2026-07-04 live capture shows **97.8% of wall clock is `socket_write`**, not the DB or render. §11 is now the authoritative attribution; read it first, then §10 for how the request-vs-client split was established, then §3–§9 for the investigation's origin and methodology.
 
 ---
 
 ## TL;DR
 
-**Superseded by live measurement (§10, 2026-07-03):** production diagnostics from R1's instrumentation now show directly, on the real 1,949-item Boss product, that **the engine-side RPC round trip (`request` segment) is 92–99% of wall clock — p50 ~7.1 s** — and that **all client-side cost (decode + apply + render combined) is ~0.6 s**. This confirms and sharpens, rather than contradicts, the structural reasoning below: the DB N+1 this pass measured on a snapshot (§5, ~38 ms) is not what's running on the live engine at live cardinality; something in the engine-side request path costs ~7 s per full-population fetch, scaling super-linearly with item count (182 items → ~0.1 s; 1,949 items → ~7.1 s, i.e. 10.7× the items costs ~70× the time). **Client-side remediations (R4/R5 as originally framed around render cost) are deprioritized — the measured client-side budget is too small to matter.** The engine-side per-item cost is now the unambiguous #1 priority. See §10 for the full data and re-ranked remediations; §6–§9 below are retained as the investigation's original reasoning trail but should be read through the §10 correction.
+**Superseded by the measured root cause (§11, 2026-07-04):** engine-side segment instrumentation (T2165 / PR #1737) decomposes the §10 `request` black box directly on the 1,998-item large-product population: **97.8% of the ~7.8 s p50 is `socket_write`** — the engine writing its 6.14 MB JSON reply over the local Unix socket at 0.8 MB/s, versus 7–8 MB/s for a 605 KB reply. All eight DB segments combined are 94 ms (1.2%); the DB N+1 this investigation worried about since §5 is a rounding error at live cardinality, not the cause. Write time scales as payload-bytes-squared (10.14× payload → 96.1× time), and reading the actual write-loop code (engine `app.rs`) shows a clean two-`write_all` + `flush` call directly against a raw Unix-socket half — **no per-chunk buffer-copy bug in the engine**. The quadratic mechanism instead traces to the **macOS client's read loop** (`EngineClient.swift`), which re-scans its entire accumulated receive buffer for a newline delimiter on every 64 KB chunk before the single large JSON line completes — an O(n²) client-side scan that throttles how fast the client drains the socket, which is what the engine's `write_all().await` blocks on. See §11 for the full breakdown, code citations, and re-ranked remediations — **fixing the socket-write path (client read loop, or chunked/streamed framing) is now the dominant, ~7.5-of-7.8-second fix; the item-count/render/DB items below are all secondary.** **Superseded by live measurement (§10, 2026-07-03):** production diagnostics from R1's instrumentation showed directly, on the real 1,949-item Boss product, that **the engine-side RPC round trip (`request` segment) is 92–99% of wall clock — p50 ~7.1 s** — and that **all client-side cost (decode + apply + render combined) is ~0.6 s**. §10 correctly located the cost inside `request` but could not decompose it further; §11 does. This confirms and sharpens, rather than contradicts, the structural reasoning below: the DB N+1 this pass measured on a snapshot (§5, ~38 ms) is not what's running on the live engine at live cardinality; something in the engine-side request path costs ~7 s per full-population fetch, scaling super-linearly with item count (182 items → ~0.1 s; 1,949 items → ~7.1 s, i.e. 10.7× the items costs ~70× the time) — **§11 now names that something precisely: `socket_write`, driven by client-side read-loop backpressure, not a DB or render cost.** **Client-side remediations (R4/R5 as originally framed around render cost) are deprioritized — the measured client-side budget is too small to matter.** The engine-side per-item cost hypothesized here is now precisely attributed in §11 to the write/read path, not per-item DB or handler compute. See §11 for the current data and re-ranked remediations (§10 for how the request-vs-client split was established); §6–§9 below are retained as the investigation's original reasoning trail but should be read through the §10/§11 corrections.
 
 - Populating the whole board for a product is **one RPC**: `GetWorkTree { product_id }` → one `WorkTree` reply. There is **no app-issued per-task N+1**.
 - Inside that one RPC there **is a database N+1**: `get_work_tree` fans out to individual SQLite queries via `collect_task_runtimes`. **The real Boss-product population this loop runs over is 1,908 items (933 tasks incl. revisions + 975 chores), not the 395 "board tasks" the original pass counted** — the RPC's `tasks` query pulls in `kind = 'revision'` alongside `project_task`/`design`/`investigation`, and a separate `chores` query (975 rows) feeds the same loop; the original workload characterization (§3) counted only the 395 project_task/design/investigation rows and missed both. That undercounts the real fan-out by **4.9×** (1,131 → **5,593 queries**, measured on the real snapshot).
@@ -323,11 +323,16 @@ Note the honest limits of this sample: n=3 cold starts, n=1 manual refresh, sing
 
 1. **The engine-side RPC (`request`: issue → response received) is 92–99% of wall clock.** At 1,949 items: request p50 ≈ 7.06–7.06 s vs. total client-side (decode + apply + render) ≈ 65 + 250 + 270 ≈ **0.6 s**. This directly resolves the question §6/§8 could not answer structurally ("is it render, or is it the request?") — **it is overwhelmingly the request.** The app-side main-thread apply+render candidate ranked #1 in §6 is not supported by live data: it is real (~0.5 s) but roughly 12–14× smaller than the request segment, not the dominant cost.
 2. **Item-count scaling is super-linear, not linear.** 182 items → ~0.1 s; 1,949 items → ~7.1 s. 10.7× the items costs **~70×** the time. This is inconsistent with the §5 DB-snapshot N+1 model (which showed near-linear query-count growth and only ~1.5× warm-cache wall-clock growth for a 4.9× item-count increase) and inconsistent with payload/transport cost (decode of the full 1,949-item payload is only 65 ms — bytes-on-the-wire is not the bottleneck). Super-linear scaling of this shape is the signature of **per-row work inside the engine handler or DB layer that itself scales badly** (e.g. an N+1 pattern with per-item overhead that grows with table size — repeated full/partial scans, cache eviction as row count exceeds a fixed buffer, or similar) — not a fixed per-request cost multiplied by a bigger N. **This reopens §5's DB-snapshot N+1 as insufficient explanation**: whatever the live engine binary is actually doing differs from the schema/query-shape model used in §5, or the live table sizes have grown past a threshold the 1,908-row snapshot (§9) didn't cross. The engine-side handler and DB layer need to be profiled directly against the live database (`EXPLAIN QUERY PLAN` against the real live `state.db`, not the July 1 `.backup` snapshot) to find the actual per-item hot loop — this is now the single highest-priority action.
+
+   **Superseded by §11 (2026-07-04):** the "per-row work inside the engine handler or DB layer" guess above was wrong. Engine-side segment instrumentation (T2165 / PR #1737) shows all DB segments combined cost 94 ms (1.2% of total) at 1,998 items — not the driver of the super-linear scaling. The item-count-squared relationship instead comes from `socket_write` (97.8% of wall clock), whose cost is driven by payload-bytes-squared, not item-count directly (payload bytes and item count are themselves roughly linear in each other, which is why both looked super-linear here). See §11 for the measured breakdown and the code-level mechanism.
+
 3. **Cold start's concurrent duplicate fetch is confirmed live and costs ~7 s of perceived latency**, reproduced twice in a 180-event, 15-cycle capture — this is not a rare edge case.
 4. **Invalidation triggers full 7 s refetches**, with evidence of storms. This doesn't change the per-fetch cost but multiplies how often users pay it.
 5. **Minor, unresolved:** `apply` p50 is ~250 ms but its instrumented children (`bucket_rebuild` 36 ms + `sort` 4 ms) sum to only ~40 ms — roughly 210 ms of `apply` is unattributed to any instrumented sub-segment. Noted as an instrumentation gap, not a priority (it's ~3% of total wall clock at live cardinality).
 
-### 10.4 Re-ranked remediations (supersedes §7's ranking)
+### 10.4 Re-ranked remediations (supersedes §7's ranking; itself superseded by §11.6)
+
+**Superseded by §11.6 (2026-07-04):** item 1 below ("root-cause and fix the engine-side per-item cost in the list handler") was the correct priority call but the wrong mechanism — §11's engine-side segment breakdown shows the cost is not in the list handler or DB layer (94 ms combined) but in `socket_write` (97.8%), traced to client-side read-loop backpressure. §11.6 has the corrected ranking; items 2–4 below (dedupe concurrent fetches, invalidation coalescing, deprioritize client render/decode work) are unaffected and still stand.
 
 The §7 table remains as the investigation's original reasoning, but with live data in hand, the ranking changes as follows:
 
@@ -342,6 +347,117 @@ The §7 table remains as the investigation's original reasoning, but with live d
 - **n=3 cold starts, n=1 manual refresh.** Both flows have small samples; the max/p50 spread for `cold_start.request` (13.8 s p50 vs. 14.5 s max, n=3) is consistent with the duplicate-fetch mechanism (§10.2) rather than noise, but a larger sample would help confirm the duplicate-fetch pattern is the sole driver of cold-start variance and not one of several contributing factors.
 - **`apply`'s ~210 ms unattributed remainder (§10.3 item 5)** is not decomposed by current instrumentation — a gap in the instrumentation, not a mystery worth chasing given its size relative to the request segment.
 - **The `request` segment itself is not yet decomposed engine-side.** Today's diagnostics time issue→response-received as one span. It's now confirmed to be the dominant cost, but _within_ that ~7 s, handler-side compute, DB query time, serialization, and transport are still lumped together — exactly the further instrumentation needed to safely start the engine-side fix (#1 above) without guessing.
+
+---
+
+## 11. Root cause locked down: quadratic socket write (2026-07-04 revision)
+
+T2165 (PR #1737, "Instrument engine-side task-population timing end-to-end") shipped `population_timing.rs` and instrumented the writer task in `app.rs` to decompose §10's opaque `request` segment into `decode`, `db.product`, `db.projects`, `db.tasks`, `db.chores`, `db.task_runtimes`, `db.dependencies`, `db.ai_reviewing`, `db.doc_pointers`, `assemble`, `queue_wait`, `serialize`, `socket_write`, and `total`. This section reports the first live capture against that instrumentation — `engine-population-timing-2026-07-04.jsonl`, 25 requests (23 large-product ~1,998-item fetches, 2 small-product 189-item fetches), joined against the app-side population-timing files by the operator — and uses it to replace §10.3 item 2's speculative "per-row engine/DB cost" attribution with the measured mechanism. As with §10, the raw diagnostics files are engine/coordinator-owned runtime state and were not read directly by this pass; the aggregates and raw JSONL lines below were computed from them and handed to this investigation, dated 2026-07-04 local capture.
+
+### 11.1 Measured root cause
+
+The ~7.8 s p50 (17.1 s p95, n=23) population request for the 1,998-item product spends **7.66 s p50 — 97.8% of total — in `socket_write`**, pushing a 6.14 MB response over the local Unix socket at 0.8 MB/s, while the identical pipeline for a 605 KB response sustains 7–8 MB/s. `socket_write` time scales as the **square** of payload bytes (10.14× payload → 96.1× time ≈ 10.14² = 102.8), which is the signature of a per-chunk cost that grows with the amount of data already transferred rather than a fixed per-request cost. It is **not** the database: all eight DB segments combined are 94.4 ms (1.2% of total), and the real N+1 (`db.task_runtimes`: 5,865 queries for 1,998 rows, ~2.9 queries/row at 0.013 ms each = 79 ms) is a rounding error next to `socket_write`. Secondary effect: response writing serializes concurrent requests on the per-connection writer task — `queue_wait` p95 is 8.4 s (outlier requests queued behind a prior slow write hit 15–25 s totals; one request had `queue_wait` 16.3 s).
+
+### 11.2 Per-segment breakdown, large product (~1,998 items, p50/p95 in ms)
+
+| Segment          | p50       | p95        | Notes                                  |
+| ---------------- | --------- | ---------- | -------------------------------------- |
+| decode           | 0.01      | 0.01       |                                        |
+| db.product       | 0.03      | 0.10       | 1 row                                  |
+| db.projects      | 0.20      | 0.33       | 50 rows                                |
+| db.tasks         | 3.76      | 4.81       | 979 rows                               |
+| db.chores        | 10.05     | 16.03      | 1,019 rows                             |
+| db.task_runtimes | 78.65     | 86.28      | 1,998 rows, 5,865 queries              |
+| db.dependencies  | 0.99      | 1.20       | 669 rows                               |
+| assemble         | 0.88      | 1.08       |                                        |
+| db.ai_reviewing  | 0.05      | 0.10       |                                        |
+| db.doc_pointers  | 0.46      | 0.55       | 64 rows, 77 queries — second N+1       |
+| queue_wait       | 59.10     | 8,398      | serialization amplifier, see §11.1     |
+| serialize        | 4.29      | 4.97       | payload 6,136,572 bytes                |
+| **socket_write** | **7,656** | **8,233**  | **97.8% of total**                     |
+| **total**        | **7,832** | **16,376** | n=23: 7,841 / 17,089 across the sample |
+
+Segments sum to total within 0.9–3.2 ms per request — nothing engine-side is unaccounted for.
+
+Verbatim evidence lines from the 2026-07-04 capture (`engine-population-timing-2026-07-04.jsonl`):
+
+```json
+{"ts_epoch_ms":1783136943134,"product_id":"prod_18a1c4016e0cef98_1","request_id":"8230A353-D5BB-4E0E-8941-D0DA4E2EAFFE","fetch_seq":1,"segment":"socket_write","duration_ms":7002.977875,"items":1997}
+{"ts_epoch_ms":1783136936069,"product_id":"prod_18a1c4016e0cef98_1","request_id":"8230A353-D5BB-4E0E-8941-D0DA4E2EAFFE","fetch_seq":1,"segment":"db.task_runtimes","duration_ms":88.690917,"rows":1997,"db_queries":5864,"items":1997}
+```
+
+### 11.3 Scaling (189 items → 1,998 items, 10.6×; payload 604,906 B → 6,134,333 B, 10.14×)
+
+| Segment         | 189 items | 1,998 items | Ratio | Shape                            |
+| --------------- | --------- | ----------- | ----- | -------------------------------- |
+| all DB combined | 51 ms     | 94 ms       | 1.8×  | sub-linear                       |
+| serialize       | 0.44 ms   | 4.29 ms     | 9.7×  | linear                           |
+| socket_write    | 79.7 ms   | 7,658 ms    | 96.1× | **quadratic** (≈ payload-ratio²) |
+| total           | 194 ms    | 7,841 ms    | ~40×  | dominated by socket_write        |
+
+### 11.4 App↔engine join validation
+
+All 25 engine requests matched an app-side `request` segment (join by timestamp + product_id, all within 101–116 ms). App-observed duration = engine total + a median 42.5 ms constant gap (min 37.1, max 197.9; one 476 ms cold-start outlier is connection setup). Example: engine `fetch_seq` 1 total 7,182.9 ms ↔ app 7,220.0 ms (Δ37.1 ms, flow=`product_switch`). Engine instrumentation fully accounts for the app-observed 7.1–7.9 s from §10 — there is no hidden transport cost outside what §11.2 already itemizes.
+
+### 11.5 Code-level finding: the engine write path is clean; the quadratic mechanism is client-side read backpressure
+
+**Engine write path — instrumentation site and write loop (`tools/boss/engine/core/src/app.rs`):** the per-session writer task pops a queued `FrontendEvent`, serializes it, then writes it directly to the raw Unix-socket half:
+
+```rust
+// app.rs:2293-2304 (writer_task, inside handle_frontend_connection)
+let write_start = Instant::now();
+let mut write_failed = false;
+if let Err(err) = write_half.write_all(line.as_bytes()).await {
+    ...
+} else if let Err(err) = write_half.write_all(b"\n").await {
+    ...
+} else if let Err(err) = write_half.flush().await {
+    ...
+}
+```
+
+`write_half` is a plain `tokio::net::unix::OwnedWriteHalf` from `stream.into_split()` (`app.rs:2246,2255`; imports at `app.rs:9-10` — `tokio::io::AsyncWriteExt`, `tokio::net::UnixStream`) — there is no custom framing, chunking, or buffering wrapper around it anywhere in `app.rs` (confirmed by grep: no `chunk`, `SNDBUF`, `set_send_buffer_size`, or manual `drain`/`split_at` in the file). `AsyncWriteExt::write_all` in tokio 1.45 (pinned in the workspace root `Cargo.toml`) loops with `buf = &buf[n..]` — a slice re-slice, not a copy — so **each iteration's cost is bounded by the bytes actually written in that iteration, not by the size of the remaining buffer.** The hypothesized "per-chunk O(remaining-buffer) copy/re-slice in the engine's response-write loop" from the initial ask is **refuted for the engine side**: there is no such loop, manual or otherwise. `flush()` on a raw `OwnedWriteHalf` (no `BufWriter` wraps it here) is a no-op poll, contributing negligible cost.
+
+Given the write path itself does O(1)-per-byte work with no engine-side algorithmic bug, the `socket_write` `Instant` window is timing something else: **time blocked waiting for the kernel Unix-domain-socket send buffer to drain**, which happens exactly as fast as the client reads from the other end. Reading the client's read loop (`tools/boss/app-macos/Sources/EngineClient.swift`) finds that mechanism:
+
+```swift
+// EngineClient.swift:1331-1332 — 64 KiB per NWConnection receive
+private func receiveNext() {
+    connection?.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
+        [weak self] data, _, isComplete, error in
+        ...
+        if let data, !data.isEmpty {
+            self.buffer.append(data)        // :1345
+            self.consumeLines()             // :1346
+        }
+        ...
+        self.receiveNext()                  // :1356 — re-arm for the next chunk
+    }
+}
+
+// EngineClient.swift:1360-1363
+private func consumeLines() {
+    while let newline = buffer.firstIndex(of: 0x0A) {   // :1361 — O(current buffer size)
+        let lineData = buffer[..<newline]
+        buffer.removeSubrange(...newline)                // :1363
+        ...
+```
+
+Every socket read is capped at 64 KiB (`:1332`), appended to `buffer` (`:1345`), and then `consumeLines()` scans the **entire accumulated `buffer`** from the start looking for the `0x0A` delimiter (`:1361`). For the single ~6.1 MB `WorkTree` reply — which is one giant newline-terminated JSON line with no embedded `0x0A` (JSON string encoding escapes literal newlines as `\n`), so the delimiter is only found on the very last chunk — this is a full linear scan of the buffer-so-far repeated on **every one of the ~94 chunks** (6.14 MB / 64 KiB) needed to receive the whole reply, before a single line is ever produced. Total scan work is `Σ i·64 KiB` for `i = 1..94` ≈ 293 MB of byte comparisons for one 6.1 MB message — an **O(n²/chunk_size)** cost that is the same "cost grows with remaining/accumulated buffer size" shape hypothesized for the engine, just located on the **client's receive/frame loop**, not the engine's write loop. For the 605 KB small-product reply the same math gives ~10 chunks and ~3.6 MB of scan work — nearly free — which is exactly why small payloads see full 7–8 MB/s throughput while the large one collapses to 0.8 MB/s: **the client falls behind proportionally more as the message grows, and since `receiveNext()` (`:1356`) is only re-armed after `consumeLines()` returns, the client's Unix-socket receive buffer stops draining while that O(buffer) scan runs, applying kernel backpressure straight back to the engine's blocked `write_all().await`.** This client-side quadratic scan — not a database cost, not a render cost, and not an engine-side write bug — is the mechanism behind the measured `socket_write` numbers in §11.1–§11.3.
+
+### 11.6 Re-ranked remediations (supersedes §10.4's ranking)
+
+1. **Fix the O(n²) client read/frame loop — new #1, dominant fix (~7.5 s of the 7.8 s total).** `EngineClient.swift`'s `consumeLines()` (`:1360-1363`) re-scans the whole accumulated buffer for a newline on every 64 KiB chunk. Track a scan cursor (resume `firstIndex(of:)` from the last-scanned offset instead of `buffer`'s start) or switch to a length-prefixed frame so the client never needs to scan for a delimiter across multi-megabyte messages at all. This is a client-side (Swift) fix, not an engine fix — despite `socket_write` being the engine-measured segment name, the code owning the cost is `EngineClient.swift`. Alternatively/additionally, the engine could write in bounded chunks with interleaved yields so a slow client degrades other sessions' `queue_wait` less (§11.1's serialization amplifier) while the client-side fix lands — but the client fix is required to close the ~7.5 s gap itself. Target: sub-second write/receive for a 6 MB reply once client-side scanning is O(1) amortized per chunk.
+2. **`queue_wait` serialization resolves as a side effect of (1).** Once the dominant session's write/drain finishes in ~O(n) instead of ~O(n²), the other sessions queued behind it on the per-connection writer task (§11.1, `queue_wait` p95 8.4 s) stop paying multi-second amplified delays. No separate fix needed beyond (1); track it as confirmed-fixed once (1) ships and re-measure.
+3. **N+1 cleanups (`db.task_runtimes`, `db.doc_pointers`) — demoted to optional follow-ups worth <100 ms.** R3 (§7) and the `db.doc_pointers` second N+1 (§11.2, 64 rows/77 queries, 0.46–0.55 ms) are real but now measured at 79 ms and well under 1 ms combined against a 7.8 s total — under 1.5% of wall clock even summed. Still worth doing for the unbounded query-count growth argument (§9.2), but they do not move the latency needle Users actually feel. Size: small follow-up chore, unchanged from §7's original R3 sizing.
+4. **Payload slimming (R4, §7) — demoted to a secondary, linear win.** Stripping `description` (6.14 MB → ~2.2 MB per §5.3's real-data ratio) cuts `socket_write` roughly proportionally under the confirmed quadratic model — a payload cut of ~64% would cut `socket_write` time by roughly 1 − 0.36² ≈ 87%, which sounds large, but it is strictly worse than fixing the O(n²) scan directly (fix (1) removes the quadratic term itself regardless of payload size, and is what makes payload size stop mattering quadratically at all). Still worth doing as a follow-up chore for memory/bandwidth reasons independent of latency, but should not be pitched as the primary latency fix, and should ship after or alongside (1), not instead of it.
+
+### 11.7 Honest gaps in this revision
+
+- **Quadratic fit rests on two product sizes.** The 96.1× time-for-10.14×-payload observation is a single before/after comparison (189 vs. 1,998 items), not a curve fit across many sizes. The fit is tight (10.14² = 102.8 vs. measured 96.1×, within ~7%), and the independently-derived client-side chunk-scan math (§11.5) predicts the same quadratic shape from first principles, which corroborates the two-point fit — but a third or fourth data point (e.g. a ~600-item and a ~3,000-item product) would make this a real curve rather than an extrapolated line.
+- **No per-chunk events.** Today's instrumentation times `socket_write` as one span per request; it does not emit per-syscall or per-chunk timestamps engine-side, so the chunk-size-vs-scan-cost mechanism in §11.5 is derived from reading the client code, not from a chunk-level trace. Instrumenting `NWConnection.receive` chunk arrivals (or the engine's per-`write()` syscall boundaries) would let a future pass confirm the ~94-chunk count and per-chunk scan-cost growth directly instead of computing it from `maximumLength: 64 * 1024` and payload size.
+- **Client-side slow-reader backpressure is not 100% excluded by the timing data alone** — the engine-side JSONL only proves `socket_write` correlates with payload size squared; it cannot, by itself, distinguish "client scans quadratically" from some other client-side or kernel-level slowdown. What resolves this is the code read in §11.5: the 8× throughput difference between the 605 KB and 6.14 MB replies on the _same_ client/socket path is exactly what an O(n²) client scan predicts (small payloads pay negligible quadratic overhead; large ones pay a lot), and it is inconsistent with a fixed per-message or fixed-bandwidth kernel/transport cost, which would show the _same_ throughput regardless of size. The client code is the stronger, corroborating half of this evidence, not the timing data alone.
+- **`db.task_runtimes` query texts (~2.9/row) are not labelled in the schema** — §5.1's N+1 characterization (`query_latest_execution_for_work_item` / `query_live_execution_for_work_item` / `query_latest_run`) is assumed to still be the shape of the 5,865 queries observed live, but this revision did not re-verify that assumption against the live schema; it is inherited from §5/§9 and is not load-bearing for §11's conclusion (DB cost is 1.2% of total regardless of its internal shape).
 
 ---
 
@@ -365,4 +481,6 @@ They reconstruct the schema from (or, for the real-data scripts, connect directl
 - DB assembly + N+1: `work/workitems.rs:293` (get_work_tree), `:316` (task list SQL), `:363` (doc-pointer loop); `work/dispatch_helpers.rs:231` (collect_task_runtimes), `:239–341` (per-item exec/run queries), `:203` (collect_product_dependencies); `work/revision_helpers.rs:336` (attach_ai_reviewing_flag — the batched contrast); `work/products_design.rs:705` (resolve_task_doc_pointer); `work/schema_init.rs:53` (tasks DDL), `:82` (indexes), `:377` (connect/PRAGMA).
 - App fetch/apply/render: `tools/boss/app-macos/Sources/ChatViewModel.swift:1783` / `:1892` (double fetch), `:928` (selectWorkProduct), `:1898` (workTree apply), `:696` (computeVisibleWorkItems), `:2681` (workItems(in:)); `EngineClient.swift:318` (decode queue), `:543` (sendGetWorkTree), `:1236/1283` (framing).
 - Transport: `tools/boss/client/src/lib.rs:112`.
-- Instrumentation (absence): `engine/core/src/main.rs:58` (engine-trace.jsonl), `ipc_log.rs`, `app/metrics.rs`; Swift `Diagnostics/UISignposts.swift`, `MainThreadStallMonitor`.
+- Instrumentation (absence, original pass): `engine/core/src/main.rs:58` (engine-trace.jsonl), `ipc_log.rs`, `app/metrics.rs`; Swift `Diagnostics/UISignposts.swift`, `MainThreadStallMonitor`.
+- Instrumentation (§11, T2165 / PR #1737): `tools/boss/engine/core/src/population_timing.rs` (segment definitions, `PopulationTrace`); writer-task timing sites `app.rs:2281` (serialize start), `:2293-2304` (write_start, the three `write_all`/`flush` calls, `SOCKET_WRITE`/`TOTAL` record + flush).
+- Root-cause code (§11.5): engine write loop `app.rs:2246,2255` (`stream.into_split()`), `:2293-2304` (raw `OwnedWriteHalf::write_all`/`flush`, no chunking wrapper); client read/frame loop `tools/boss/app-macos/Sources/EngineClient.swift:1331-1332` (`receiveNext`, 64 KiB `NWConnection.receive`), `:1345-1346` (`buffer.append` + `consumeLines`), `:1360-1363` (`consumeLines` — O(buffer-size) `firstIndex(of: 0x0A)` scan + `removeSubrange`).
