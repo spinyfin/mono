@@ -35,19 +35,140 @@ swift_library(
     ],
 )
 
+# BossTests is sharded across four independent macos_unit_test targets so
+# each one fits comfortably inside the "small" (60s) timeout as the suite
+# grows (see CI timeout in exec_18bf0a6008fc0cc0_170). rules_apple's default
+# macos test runner (apple/testing/default_runner) does not implement Bazel's
+# native shard_count sharding protocol (no TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
+# handling), so `shard_count` on a single macos_unit_test is a no-op here —
+# splitting into separate targets is the mechanism that actually parallelizes
+# test execution for this rule.
+#
+# CommentsTests.swift + TranscriptViewTests.swift are split into their own
+# shard because CommentLayerTests alone accounts for ~85% of total XCTest
+# runtime (~12.8s of ~14.9s measured locally); bundling it with anything else
+# risks that shard alone approaching the timeout. The remaining files are
+# split into three buckets balanced by source line count.
+#
+# Shard3 is a catch-all glob rather than a fourth hand-listed file set: the
+# first three shards' file lists are named below and fed into both their own
+# srcs and shard3's glob exclude, so those two views of the same lists can
+# never drift apart. Any new file added under Tests/BossTests/ therefore
+# automatically lands in shard3 and runs, instead of silently being skipped
+# by every shard (a false green) because no one remembered to hand-list it.
+_COMMENTS_TRANSCRIPT_SHARD_SRCS = [
+    "Tests/BossTests/CommentsTests.swift",
+    "Tests/BossTests/TranscriptViewTests.swift",
+]
+
+_SHARD1_SRCS = [
+    "Tests/BossTests/APIKeyStoreTests.swift",
+    "Tests/BossTests/ApplyAttentionGroupsListTests.swift",
+    "Tests/BossTests/DesignsTests.swift",
+    "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
+    "Tests/BossTests/KanbanExternalRefLinkTests.swift",
+    "Tests/BossTests/KanbanRepoChipTests.swift",
+    "Tests/BossTests/KanbanShortIDBadgeTests.swift",
+    "Tests/BossTests/LogTailWindowTests.swift",
+    "Tests/BossTests/LogViewerTailPerfTests.swift",
+    "Tests/BossTests/MainThreadStallDiagnosticsTests.swift",
+    "Tests/BossTests/OpenQuestionGroupsForDocPathTests.swift",
+    "Tests/BossTests/PopulationTimingDiagnosticsTests.swift",
+    "Tests/BossTests/ProductCreateFormCopyTests.swift",
+    "Tests/BossTests/ProjectDesignDocAffordanceTests.swift",
+    "Tests/BossTests/ProjectShortIDBadgeTests.swift",
+    "Tests/BossTests/ReviewColumnOrderingTests.swift",
+    "Tests/BossTests/WorkBlockedBadgeTests.swift",
+    "Tests/BossTests/WorkerProcessKillerTests.swift",
+    "Tests/BossTests/WorkersWorkspaceModelTests.swift",
+]
+
+_SHARD2_SRCS = [
+    "Tests/BossTests/ActiveProductsFilterTests.swift",
+    "Tests/BossTests/ActivityLogTests.swift",
+    "Tests/BossTests/AttentionGroupsListRaceTests.swift",
+    "Tests/BossTests/EffortChipTests.swift",
+    "Tests/BossTests/EngineClientLargeMessageFramingTests.swift",
+    "Tests/BossTests/EngineHealthBannerTests.swift",
+    "Tests/BossTests/EngineUnreachableErrorRoutingTests.swift",
+    "Tests/BossTests/ExternalTrackerAttentionTests.swift",
+    "Tests/BossTests/ExternalTrackerTests.swift",
+    "Tests/BossTests/GitHubAuthTests.swift",
+    "Tests/BossTests/GitHubContentFetcherTests.swift",
+    "Tests/BossTests/InvestigationKanbanTests.swift",
+    "Tests/BossTests/KanbanFilterBannerTests.swift",
+    "Tests/BossTests/KanbanInRevisionWarningTests.swift",
+    "Tests/BossTests/KanbanPRLinkLabelTests.swift",
+    "Tests/BossTests/ProjectArchiveContextMenuTests.swift",
+    "Tests/BossTests/ProjectNavigatorCountBadgeTests.swift",
+    "Tests/BossTests/WorkDependencyKanbanTests.swift",
+    "Tests/BossTests/WorkItemRepoRowTests.swift",
+]
+
 macos_unit_test(
-    name = "BossTests",
+    name = "BossTestsCommentsTranscript",
     size = "small",
     minimum_os_version = "15.0",
-    deps = [":boss_mac_app_tests_lib"],
+    deps = [":boss_mac_app_tests_comments_transcript_lib"],
 )
 
 swift_library(
-    name = "boss_mac_app_tests_lib",
+    name = "boss_mac_app_tests_comments_transcript_lib",
     testonly = True,
-    srcs = glob(["Tests/BossTests/**/*.swift"]),
+    srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
-    module_name = "BossTests",
+    module_name = "BossTestsCommentsTranscript",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard1",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard1_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard1_lib",
+    testonly = True,
+    srcs = _SHARD1_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard1",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard2",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard2_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard2_lib",
+    testonly = True,
+    srcs = _SHARD2_SRCS,
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard2",
+    deps = [":boss_mac_app_lib"],
+)
+
+macos_unit_test(
+    name = "BossTestsShard3",
+    size = "small",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_shard3_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_shard3_lib",
+    testonly = True,
+    srcs = glob(
+        ["Tests/BossTests/**/*.swift"],
+        exclude = _COMMENTS_TRANSCRIPT_SHARD_SRCS + _SHARD1_SRCS + _SHARD2_SRCS,
+    ),
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    module_name = "BossTestsShard3",
     deps = [":boss_mac_app_lib"],
 )
 
