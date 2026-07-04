@@ -2518,6 +2518,20 @@ pub struct ResolvedComment {
     pub resolution: CommentResolution,
 }
 
+/// A comment paired with its thread — the `CommentsList` read-path shape the
+/// design specifies (`comment-triggered-document-revisions.md` §"UI / thread
+/// behavior"): `{ ..., thread_entries: [...], answer_agent_running: bool }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommentWithThread {
+    pub comment: WorkComment,
+    /// This comment's [`CommentThreadEntry`] rows, oldest first.
+    pub thread_entries: Vec<CommentThreadEntry>,
+    /// True iff an `answer_agent_runs` row for this comment is currently
+    /// `running` — lets the UI show a "thinking" indicator without a
+    /// separate poll.
+    pub answer_agent_running: bool,
+}
+
 // --- Answer-agent runs (P3a: read-only mini-coordinator answer agent) ---
 
 /// `answer_agent_runs.status` values. The run is created `running`, then flips
