@@ -6,6 +6,7 @@ rust_binary(
     srcs = [
         "src/logs.rs",
         "src/main.rs",
+        "src/tests.rs",
     ],
     compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
