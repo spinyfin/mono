@@ -25,9 +25,12 @@
 //!
 //! This sweep closes that gap. Every [`DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS`]
 //! it looks for work items still bounced in Backlog and gives them
-//! another shot, calling `reenable_autostart_after_dispatch_failure` and
-//! then `request_execution_with_live_check` — the same round trip a
-//! human's own retry already performs. A churn guard
+//! another shot via `WorkDb::reenable_and_request_execution_with_live_check`,
+//! which re-enables autostart and requests a fresh execution atomically
+//! in one transaction — the same round trip a human's own retry already
+//! performs, but with no window where a `request_execution` failure can
+//! strand the item with autostart flipped back on and no execution. A
+//! churn guard
 //! ([`DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD`] terminal
 //! executions inside [`DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS`])
 //! stops the automatic retries once a work item keeps failing. From
@@ -148,34 +151,29 @@ pub async fn run_one_pass(
             continue;
         }
 
-        match work_db.reenable_autostart_after_dispatch_failure(&work_item_id) {
-            Ok(true) => {}
-            // Raced a human retry (or the row moved on) between listing
-            // candidates and here — nothing left to do.
-            Ok(false) => continue,
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    ?err,
-                    "dispatch-failure recovery sweep: failed to re-enable autostart; skipping item",
-                );
-                continue;
-            }
-        }
-
         let is_live = |exec_id: &str| claimed.contains(exec_id);
-        let new_execution = match work_db.request_execution_with_live_check(
+        let new_execution = match work_db.reenable_and_request_execution_with_live_check(
+            &work_item_id,
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .build(),
             is_live,
         ) {
-            Ok(exec) => exec,
+            Ok(Some(exec)) => exec,
+            // Raced a human retry (or the row moved on) between listing
+            // candidates and here — nothing left to do.
+            Ok(None) => continue,
             Err(err) => {
+                // The autostart re-enable and `request_execution` ran in
+                // one transaction, so this rolled back together — the
+                // item is left exactly as it was (autostart = 0,
+                // dispatch_failed_reason still set), still a candidate
+                // for the next pass, instead of stranded with
+                // autostart = 1 and no execution.
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     ?err,
-                    "dispatch-failure recovery sweep: failed to request execution; skipping item",
+                    "dispatch-failure recovery sweep: failed to re-enqueue; leaving bounced for next pass",
                 );
                 continue;
             }
@@ -454,6 +452,70 @@ mod tests {
         assert!(
             !task.autostart,
             "autostart must stay cleared once the churn guard trips"
+        );
+    }
+
+    /// If `request_execution` fails *after* autostart has been
+    /// re-enabled, the whole re-enable-and-request must roll back
+    /// together: the item is left exactly as it was before the sweep
+    /// touched it (autostart cleared, dispatch_failed_reason still
+    /// set), so it remains a candidate for the next pass instead of
+    /// being stranded with autostart on and no execution.
+    #[tokio::test]
+    async fn rolls_back_autostart_when_request_execution_fails_after_reenable() {
+        use boss_protocol::AddDependencyInput;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_bounced_chore(&db, &product_id);
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+
+        // Gate the bounced chore on a still-incomplete prerequisite so
+        // `request_execution_in_tx_with_live_check`'s gating check bails.
+        let prereq = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("prereq chore")
+                    .build(),
+            )
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: work_item_id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "gated request_execution must not count as redispatched"
+        );
+        assert!(
+            sink.events().await.is_empty(),
+            "no redispatch event on a rolled-back attempt"
+        );
+
+        let task = get_task(&db, &work_item_id);
+        assert!(
+            !task.autostart,
+            "autostart re-enable must roll back alongside the failed request_execution"
+        );
+        assert!(
+            task.dispatch_failed_reason.is_some(),
+            "dispatch failure marker must still be set so the item remains a recovery candidate"
+        );
+
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            !executions.iter().any(|e| e.status == ExecutionStatus::Ready),
+            "no fresh execution should have been created"
         );
     }
 

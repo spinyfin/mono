@@ -1205,6 +1205,61 @@ mod tests {
         id
     }
 
+    // ── dispatch_retry_at_for_execution ─────────────────────────────────────
+
+    /// Minimal `ready` execution with a given `pre_start_failure_count`
+    /// / `dispatch_not_before`, for exercising
+    /// `dispatch_retry_at_for_execution`'s branches in isolation.
+    fn ready_execution(pre_start_failure_count: i64, dispatch_not_before: Option<&str>) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_test")
+            .work_item_id("task_test")
+            .created_at("2026-01-01T00:00:00Z")
+            .kind(ExecutionKind::TaskImplementation)
+            .repo_remote_url("https://github.com/test/repo")
+            .status(ExecutionStatus::Ready)
+            .pre_start_failure_count(pre_start_failure_count)
+            .maybe_dispatch_not_before(dispatch_not_before)
+            .build()
+    }
+
+    #[test]
+    fn dispatch_retry_at_none_for_non_ready_status() {
+        let mut exec = ready_execution(1, Some("9999999999"));
+        exec.status = ExecutionStatus::Running;
+        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+    }
+
+    #[test]
+    fn dispatch_retry_at_none_when_no_prior_failure() {
+        let exec = ready_execution(0, Some("9999999999"));
+        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+    }
+
+    #[test]
+    fn dispatch_retry_at_none_when_dispatch_not_before_absent() {
+        let exec = ready_execution(1, None);
+        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+    }
+
+    #[test]
+    fn dispatch_retry_at_none_when_dispatch_not_before_unparseable() {
+        let exec = ready_execution(1, Some("not-a-number"));
+        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+    }
+
+    #[test]
+    fn dispatch_retry_at_none_when_dispatch_not_before_in_past() {
+        let exec = ready_execution(1, Some("1"));
+        assert_eq!(dispatch_retry_at_for_execution(&exec), None);
+    }
+
+    #[test]
+    fn dispatch_retry_at_some_when_dispatch_not_before_in_future() {
+        let exec = ready_execution(1, Some("9999999999"));
+        assert_eq!(dispatch_retry_at_for_execution(&exec), Some("9999999999".to_owned()));
+    }
+
     // ── attention_target_from_input ─────────────────────────────────────────
 
     #[test]
