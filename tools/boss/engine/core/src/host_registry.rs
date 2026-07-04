@@ -137,6 +137,17 @@ pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
     if !cols.contains(&"remote_pid".to_owned()) {
         conn.execute("ALTER TABLE work_runs ADD COLUMN remote_pid INTEGER", [])?;
     }
+    // Local worker-pane shell pid, reported by the macOS app via
+    // `UpdateWorkerShellPid` once the libghostty surface attaches. Unlike
+    // `remote_pid` (SSH workers only), this is the LOCAL pane's pid — the one
+    // restart-robust signal a DB-driven reconciler can probe after an
+    // engine/app restart, when the in-memory `LiveWorkerStateRegistry` (which
+    // the dead-pid sweep keys off) is empty. `NULL` until the pane reports it,
+    // or forever if the pane never attached (a wedged pre-`pane_spawned`
+    // stall). See `crate::execution_liveness::classify_pane_liveness`.
+    if !cols.contains(&"worker_shell_pid".to_owned()) {
+        conn.execute("ALTER TABLE work_runs ADD COLUMN worker_shell_pid INTEGER", [])?;
+    }
     Ok(())
 }
 

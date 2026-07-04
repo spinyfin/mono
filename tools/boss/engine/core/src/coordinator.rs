@@ -2027,8 +2027,8 @@ impl ExecutionCoordinator {
     /// treating it as blocking (see the "Liveness gate" comment there); this
     /// applies the identical reconciliation to the *cross-work-item* chain
     /// sibling this guard inspects, using the same two positive-evidence
-    /// checks: [`crate::lost_workspace_sweep::reconcile_if_workspace_lost`]
-    /// (cube workspace directory gone) and
+    /// checks: [`crate::lost_workspace_sweep::reconcile_if_execution_dead`]
+    /// (cube workspace directory gone, pane pid dead, or pane never attached) and
     /// [`crate::dead_pane_sweep::reconcile_if_pane_dead`] (durable shell pid
     /// is `ESRCH`). Both only ever act on positive evidence of death, so
     /// this can only ever *unblock* a wrongly-serialized dispatch — it can
@@ -2055,7 +2055,7 @@ impl ExecutionCoordinator {
             }
             let mut any_reconciled = false;
             for sibling in &siblings {
-                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
+                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
                     sibling,
@@ -2944,16 +2944,14 @@ impl ExecutionCoordinator {
                 // three running triage panes, so their rows stayed `waiting_human`
                 // and every subsequent fire died right here with `redundant_spawn`.
                 // Before treating this execution as a redundant duplicate, verify
-                // the blocker is *actually* live. Two positive-death signals make
-                // a `waiting_human`/`running` blocker a zombie that must not block
-                // this spawn: (1) its recorded workspace directory has vanished
-                // (`lost_workspace`); or (2) its worker pane's durable shell pid is
-                // gone (`pane_death` — the 2026-07-04 app-relaunch wedge, where the
-                // pane died with the host app but the cube lease stayed green and
-                // the workspace dir survived, so only a pid probe reveals it).
-                // Either one reconciles the blocker to terminal and lets this spawn
-                // proceed instead of wedging behind `redundant_spawn` forever.
-                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_workspace_lost(
+                // the blocker is *actually* live: a local execution whose worker
+                // pane is provably gone (workspace dir vanished, recorded pane pid
+                // dead, or a pane that never attached) is a zombie — reconcile it
+                // to a terminal status and proceed with this spawn instead of
+                // blocking. This is the restart-robust check that keeps the guard
+                // from deferring forever to a corpse (the recurring 2026-07-03
+                // redundant_spawn spam).
+                let reconciled_lost_workspace = crate::lost_workspace_sweep::reconcile_if_execution_dead(
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
                     &live,
@@ -2973,16 +2971,28 @@ impl ExecutionCoordinator {
                         reconciled_execution_id = %live.id,
                         work_item_id = %execution.work_item_id,
                         reason = if reconciled_dead_pane { "pane_dead" } else { "workspace_lost" },
-                        "spawn_attempt: prior 'live' execution's worker pane is gone; \
+                        "spawn_attempt: prior 'live' execution's worker pane was gone; \
                          reconciled it and proceeding with this spawn",
                     );
                     // Not redundant after all — fall through to the rest of dispatch.
                 } else {
-                    tracing::warn!(
+                    // The blocker survived every death check the reconciler
+                    // applies, so it is genuinely live: this fire is redundant
+                    // *normal* scheduler behaviour (the work is already running),
+                    // NOT a failure. Annotate the blocker's liveness verdict +
+                    // age-in-status so the next recurrence is attributable in one
+                    // read.
+                    let live_age_secs = live
+                        .started_at
+                        .as_deref()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .map(|s| crate::epoch_time::now_epoch_secs().saturating_sub(s));
+                    tracing::info!(
                         execution_id = %execution.id,
                         live_execution_id = %live.id,
                         work_item_id = %execution.work_item_id,
-                        "spawn_attempt: redundant — another execution is already live; deferring to that one",
+                        live_execution_age_secs = ?live_age_secs,
+                        "spawn_attempt: work already running in a live execution; skipping this fire (not an error)",
                     );
                     if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
                         tracing::error!(
@@ -2991,34 +3001,41 @@ impl ExecutionCoordinator {
                             "spawn_attempt: failed to mark redundant execution abandoned",
                         );
                     }
-                    // Honest automation bookkeeping: an `automation_triage` fire
-                    // that dies here pre-spawn must record the real reason on its
-                    // `automation_runs` row, overwriting the pessimistic
-                    // "dispatched; awaiting triage worker decision" placeholder the
-                    // scheduler stamps at fire time (which is a lie once dispatch
-                    // failed before the worker ever ran).
+                    // Neutral automation bookkeeping: an `automation_triage` fire
+                    // superseded by a genuinely-live execution records
+                    // `triage_running` — the automation IS being triaged, just by
+                    // the live execution, not this one. This overwrites the
+                    // pessimistic "dispatched; awaiting triage worker decision"
+                    // placeholder with a *neutral* outcome so the automation UI
+                    // renders "Running" (blue), NOT "Failed (retrying)" (which is
+                    // reserved for dispatch failures that will not self-heal — a
+                    // redundant fire self-heals when the live execution finishes).
                     if execution.kind == ExecutionKind::AutomationTriage
                         && let Err(err) = self.work_db.finalize_automation_triage_run(
                             &execution.id,
-                            boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                            boss_protocol::AUTOMATION_OUTCOME_TRIAGE_RUNNING,
                             None,
-                            Some(
-                                "dispatch aborted pre-spawn at host_selected: redundant_spawn \
-                                 (superseded by another live execution)",
-                            ),
+                            Some(&format!(
+                                "skipped: work already running in live execution {} (this fire was redundant, \
+                                 not a failure)",
+                                live.id
+                            )),
                         )
                     {
                         tracing::warn!(
                             execution_id = %execution.id,
                             ?err,
-                            "spawn_attempt: failed to record redundant_spawn outcome on automation_runs row",
+                            "spawn_attempt: failed to record already-running outcome on automation_runs row",
                         );
                     }
                     // Emit a terminal event so the dispatch timeline doesn't
                     // silently stall at `worker_claimed/ok` for 30s until the
                     // watchdog fires. The execution is already marked redundant
-                    // (terminal DB state), so `host_selected:error` is the
-                    // correct closer — no `record_start_failure` needed.
+                    // (terminal DB state); `host_selected:error` remains the
+                    // timeline closer (`is_terminal_event` keys off `error`), but
+                    // its details carry `live_execution_liveness: "alive"` +
+                    // `live_execution_age_secs` so the diagnostic stream shows the
+                    // block was against a genuinely-live execution, not a corpse.
                     self.dispatch_events
                         .emit(
                             DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
@@ -3027,6 +3044,8 @@ impl ExecutionCoordinator {
                                 .with_details(serde_json::json!({
                                     "reason": "redundant_spawn",
                                     "live_execution_id": live.id,
+                                    "live_execution_liveness": "alive",
+                                    "live_execution_age_secs": live_age_secs,
                                 })),
                         )
                         .await;

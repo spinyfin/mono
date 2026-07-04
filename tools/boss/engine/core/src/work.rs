@@ -274,6 +274,7 @@ mod metrics_types;
 mod migrations_a;
 mod migrations_b;
 mod output_types;
+mod pane_pid;
 mod planner_runs;
 mod pr_flow;
 mod pr_state;
