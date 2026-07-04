@@ -143,6 +143,66 @@ fn enqueue_returns_closed_after_close() {
     assert_eq!(q.enqueue(response_envelope("r-1")), EnqueueOutcome::Closed);
 }
 
+/// The `slow` backpressure latch must be recoverable: once a session that
+/// briefly overflowed drains its backlog to empty, further enqueues have to
+/// succeed again. The old one-way latch permanently dropped every
+/// subsequent enqueue with no recovery — the silent-wedge failure mode.
+#[test]
+fn enqueue_recovers_from_slow_after_draining_to_empty() {
+    let mut q = SessionQueue::new();
+    for i in 0..MAX_SESSION_QUEUE {
+        assert_eq!(
+            q.enqueue(response_envelope(&format!("r-{i}"))),
+            EnqueueOutcome::Enqueued
+        );
+    }
+    // One past the cap latches the slow flag.
+    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Slow);
+    assert!(q.slow);
+
+    // Drain all but the last item — the latch persists while a backlog remains.
+    for _ in 0..MAX_SESSION_QUEUE - 1 {
+        assert!(q.pop_front().is_some());
+    }
+    assert!(q.slow, "latch must persist while the queue is still draining");
+
+    // Popping the final item empties the queue and clears the latch.
+    assert!(q.pop_front().is_some());
+    assert!(q.pop_front().is_none());
+    assert!(!q.slow, "slow latch must clear once the queue drains to empty");
+
+    // And enqueue works again.
+    assert_eq!(q.enqueue(response_envelope("after-recover")), EnqueueOutcome::Enqueued);
+}
+
+/// `stats()` reports depth, the backpressure latch, and the closed flag —
+/// the fields logged on every send timeout and by the periodic sampler.
+#[test]
+fn queue_stats_reports_depth_and_backpressure_flags() {
+    let mut q = SessionQueue::new();
+    let empty = q.stats();
+    assert_eq!(empty.depth, 0);
+    assert_eq!(empty.oldest_age_ms, 0);
+    assert!(!empty.slow && !empty.closed);
+
+    q.enqueue(response_envelope("a"));
+    q.enqueue(response_envelope("b"));
+    let s = q.stats();
+    assert_eq!(s.depth, 2);
+    assert!(!s.slow);
+
+    // Fill past the cap to latch slow; depth saturates at the cap.
+    for i in 0..MAX_SESSION_QUEUE {
+        q.enqueue(response_envelope(&format!("f-{i}")));
+    }
+    let full = q.stats();
+    assert!(full.slow);
+    assert_eq!(full.depth, MAX_SESSION_QUEUE);
+
+    q.closed = true;
+    assert!(q.stats().closed);
+}
+
 #[tokio::test]
 async fn sink_next_drains_queue_and_returns_none_when_closed() {
     let (tx, _rx) = oneshot::channel::<()>();
@@ -481,6 +541,105 @@ async fn send_to_app_times_out_when_app_silent() {
         )
         .await;
     assert!(matches!(result, Err(SendToAppError::Timeout)));
+}
+
+/// A saturated outbound queue must fail fast with the distinct
+/// `SessionWedged` error (not a 5s `Timeout`, and not `NotRegistered`),
+/// and tear the wedged session down so a reconnecting app re-registers
+/// cleanly. This is the acceptance criterion: "no app session" vs
+/// "session wedged" are now distinguishable.
+#[tokio::test]
+async fn send_to_app_reports_session_wedged_when_queue_saturated() {
+    let server_state = test_server_state();
+    let sink = make_session_sink();
+    // Pre-fill the sink to the cap so the send_to_app enqueue latches Slow.
+    {
+        let mut q = sink.queue.lock().unwrap();
+        for i in 0..MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(response_envelope(&format!("r-{i}"))),
+                EnqueueOutcome::Enqueued
+            );
+        }
+    }
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    // A generous timeout: if fail-fast regresses, this hangs instead of
+    // returning immediately.
+    let result = server_state
+        .send_to_app(
+            EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                run_id: "r".into(),
+                workspace_path: "/tmp".into(),
+                slot_id: 1,
+                initial_input: "claude\n".into(),
+                env: vec![],
+                summary: None,
+                task_title: None,
+            }),
+            Duration::from_secs(30),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(SendToAppError::SessionWedged)),
+        "saturated outbound queue must fail fast as SessionWedged, got {result:?}",
+    );
+    // The wedged session must be torn down — `send_to_app` closes the sink.
+    assert!(
+        sink.queue.lock().unwrap().closed,
+        "wedged session sink must be closed so the reader loop exits and the app can re-register",
+    );
+    // And the failure is recorded on the channel-health signal.
+    assert_eq!(server_state.app_channel_health.snapshot().consecutive_failures, 1);
+}
+
+/// Consecutive engine→app send failures must surface as a single
+/// `app_session_unresponsive` engine-health issue once the streak crosses
+/// the threshold, and a successful round-trip must clear it. This replaces
+/// the old "per-call `Send(Timeout)` WARN only" behaviour with a visible
+/// health signal.
+#[tokio::test]
+async fn engine_health_report_flags_unresponsive_app_channel() {
+    let state = test_server_state();
+    let stats = QueueStats {
+        depth: 220,
+        oldest_age_ms: 9_000,
+        slow: true,
+        closed: false,
+    };
+
+    let has_issue =
+        |report: &boss_protocol::EngineHealthReport| report.issues.iter().any(|i| i.kind == "app_session_unresponsive");
+
+    // A single failure is below the streak threshold — no banner yet.
+    state.app_channel_health.record_failure(&stats);
+    assert!(
+        !has_issue(&build_engine_health_report(&state)),
+        "a single send failure must not raise the banner",
+    );
+
+    // Second consecutive failure crosses the threshold.
+    state.app_channel_health.record_failure(&stats);
+    let report = build_engine_health_report(&state);
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "app_session_unresponsive")
+        .expect("app_session_unresponsive issue must be present after the streak threshold");
+    assert_eq!(issue.severity, "error");
+    assert!(
+        !issue.title.is_empty() && !issue.body.is_empty(),
+        "title and body must be populated so the banner has user-visible text",
+    );
+
+    // A successful round-trip resets the streak and clears the banner.
+    state.app_channel_health.record_success();
+    assert!(
+        !has_issue(&build_engine_health_report(&state)),
+        "a successful round-trip must clear the unhealthy signal",
+    );
 }
 
 #[tokio::test]

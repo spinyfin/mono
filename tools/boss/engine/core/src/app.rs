@@ -521,6 +521,12 @@ struct ServerState {
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+    /// Liveness signal for the engine→app push channel. Tracks the
+    /// consecutive-send-failure streak so a wedged/saturated outbound
+    /// queue surfaces as a single engine-health issue instead of only
+    /// per-call `Send(Timeout)` WARNs. See [`AppChannelHealth`].
+    #[builder(default)]
+    app_channel_health: Arc<AppChannelHealth>,
     /// Serializes outbound `SpawnWorkerPane` round-trips so the app
     /// only ever sees one pane allocation in flight at a time. See the
     /// `WorkerSpawner` impl for the why.
@@ -664,10 +670,65 @@ impl AppSessionHandle {
     }
 }
 
+/// Consecutive engine→app send failures after which the push channel is
+/// treated as unhealthy and surfaced in the engine-health report. The
+/// observed `reveal_work_item` incident failed two RPCs back-to-back, so
+/// two in a row already indicates a saturated channel rather than a
+/// one-off slow reply.
+const APP_CHANNEL_UNHEALTHY_STREAK: u64 = 2;
+
+/// Liveness signal for the engine→app push channel. Updated by every
+/// [`ServerState::send_to_app`] attempt and read synchronously by
+/// [`build_engine_health_report`]. Atomics (not a mutex) so the health
+/// path never contends with the hot send path or the `app_session` lock,
+/// and so a single wedged channel produces one visible health signal
+/// instead of a stream of per-call WARNs.
+#[derive(Default)]
+struct AppChannelHealth {
+    /// Consecutive send failures (timeout or undeliverable enqueue) since
+    /// the last successful round-trip. Reset to 0 on any success.
+    consecutive_failures: AtomicU64,
+    /// Queue depth observed at the most recent failure (health-body/log only).
+    last_queue_depth: AtomicU64,
+    /// Head-of-line envelope age (ms) observed at the most recent failure.
+    last_oldest_age_ms: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AppChannelHealthSnapshot {
+    consecutive_failures: u64,
+    last_queue_depth: u64,
+    last_oldest_age_ms: u64,
+}
+
+impl AppChannelHealth {
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failed send along with the queue stats observed at failure
+    /// time. Returns the new consecutive-failure count.
+    fn record_failure(&self, stats: &QueueStats) -> u64 {
+        self.last_queue_depth.store(stats.depth as u64, Ordering::Relaxed);
+        self.last_oldest_age_ms.store(stats.oldest_age_ms, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn snapshot(&self) -> AppChannelHealthSnapshot {
+        AppChannelHealthSnapshot {
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+            last_queue_depth: self.last_queue_depth.load(Ordering::Relaxed),
+            last_oldest_age_ms: self.last_oldest_age_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SendToAppError {
     #[error("no app session is registered")]
     NotRegistered,
+    #[error("app session outbound queue is saturated; request could not be delivered")]
+    SessionWedged,
     #[error("app disconnected before responding")]
     AppDisconnected,
     #[error("timed out waiting for app response")]
@@ -1145,40 +1206,95 @@ impl ServerState {
     }
 
     /// Send a request to the registered app session and await the
-    /// response. Returns `Err` if no app is registered, the app
-    /// disconnects before replying, or the request times out.
+    /// response. Returns `Err` if no app is registered
+    /// ([`SendToAppError::NotRegistered`]), the outbound queue is
+    /// saturated so the request can't be delivered
+    /// ([`SendToAppError::SessionWedged`]), the app disconnects before
+    /// replying, or the request times out.
+    ///
+    /// The enqueue outcome is honoured: a `Slow`/`Closed` sink means the
+    /// push can never reach the app, so we fail fast with a distinct error
+    /// and tear the wedged session down (a reconnecting app then
+    /// re-registers cleanly) rather than waiting out the full `wait` for a
+    /// reply that will never come. Timeouts and undeliverable enqueues
+    /// both feed [`ServerState::app_channel_health`] so a saturated
+    /// channel surfaces as one engine-health issue.
     pub async fn send_to_app(
         &self,
         request: EngineToAppRequest,
         wait: Duration,
     ) -> Result<EngineToAppResponse, SendToAppError> {
         let (tx, rx) = oneshot::channel();
-        let request_id = {
+        // Sink clone kept alongside the request id so we can read queue
+        // stats on a timeout without re-locking the app_session mutex (the
+        // registered handle may have been replaced by then).
+        let (request_id, sink) = {
             let mut guard = self.app_session.lock().await;
             let Some(handle) = guard.as_mut() else {
                 return Err(SendToAppError::NotRegistered);
             };
             let request_id = handle.allocate_request_id();
             handle.pending.insert(request_id.clone(), tx);
-            handle
-                .sink
-                .enqueue(FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
-                    request_id: request_id.clone(),
-                    request: request.clone(),
-                }));
-            request_id
+            let sink = handle.sink.clone();
+            let outcome = sink.enqueue(FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
+                request_id: request_id.clone(),
+                request: request.clone(),
+            }));
+            if matches!(outcome, EnqueueOutcome::Slow | EnqueueOutcome::Closed) {
+                // Undeliverable: the outbound queue is saturated or closed.
+                // Drop the pending entry (no reply will arrive), record the
+                // health signal, log the saturation with queue stats, and
+                // tear the wedged session down so the reader loop exits and
+                // a reconnecting app re-registers atomically.
+                handle.pending.remove(&request_id);
+                let stats = sink.queue_stats();
+                let session_id = handle.session_id.clone();
+                drop(guard);
+                let streak = self.app_channel_health.record_failure(&stats);
+                tracing::warn!(
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    outcome = ?outcome,
+                    queue_depth = stats.depth,
+                    oldest_age_ms = stats.oldest_age_ms,
+                    consecutive_failures = streak,
+                    "send_to_app: app outbound queue saturated — request undeliverable; \
+                     tearing down wedged app session",
+                );
+                sink.close();
+                sink.trigger_shutdown();
+                return Err(SendToAppError::SessionWedged);
+            }
+            (request_id, sink)
         };
 
         self.ipc_logger.log_request(&request_id, &request);
 
         match timeout(wait, rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                self.app_channel_health.record_success();
+                Ok(response)
+            }
             Ok(Err(_recv_err)) => {
                 self.drop_pending(&request_id).await;
                 Err(SendToAppError::AppDisconnected)
             }
             Err(_elapsed) => {
                 self.drop_pending(&request_id).await;
+                // The request was enqueued but no reply arrived before the
+                // deadline — the classic head-of-line-blocked drain. Record
+                // the health signal and log the queue stats so the
+                // saturation is diagnosable instead of a bare `Send(Timeout)`.
+                let stats = sink.queue_stats();
+                let streak = self.app_channel_health.record_failure(&stats);
+                tracing::warn!(
+                    request_id = %request_id,
+                    queue_depth = stats.depth,
+                    oldest_age_ms = stats.oldest_age_ms,
+                    slow = stats.slow,
+                    consecutive_failures = streak,
+                    "send_to_app: timed out waiting for app response",
+                );
                 Err(SendToAppError::Timeout)
             }
         }
@@ -1442,15 +1558,30 @@ impl ServerState {
         }
     }
 
-    /// Register `session_id` as the app session. Any prior
-    /// registration's pending requests are resolved as
-    /// `AppDisconnected`.
+    /// Register `session_id` as the app session, atomically replacing any
+    /// prior registration. The prior registration's pending requests are
+    /// resolved as `AppDisconnected`. Logged so an app relaunch (or a
+    /// re-register that displaces a wedged session) is attributable in the
+    /// engine trace — see the incident where the app session silently
+    /// vanished and every spawn failed "no app session is registered".
     async fn register_app_session(&self, session_id: String, sink: Arc<SessionSink>) {
         let prior = self
             .app_session
             .lock()
             .await
-            .replace(AppSessionHandle::new(session_id, sink));
+            .replace(AppSessionHandle::new(session_id.clone(), sink));
+        // A fresh registration means whatever channel-health streak the old
+        // session accumulated no longer applies.
+        self.app_channel_health.record_success();
+        match &prior {
+            Some(prior) => tracing::info!(
+                session_id = %session_id,
+                prior_session_id = %prior.session_id,
+                dropped_pending = prior.pending.len(),
+                "app session registered — replaced prior registration",
+            ),
+            None => tracing::info!(session_id = %session_id, "app session registered"),
+        }
         if let Some(prior) = prior {
             for (_, tx) in prior.pending {
                 let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
@@ -1461,17 +1592,37 @@ impl ServerState {
     }
 
     /// If `session_id` is the registered app, drop the registration
-    /// and resolve all pending requests as `AppDisconnected`.
+    /// and resolve all pending requests as `AppDisconnected`. Called from
+    /// the frontend reader loop's cleanup, so a logged drop here pins the
+    /// exact moment (and cause: connection closed / reader-loop exit) the
+    /// engine lost its app session.
     async fn drop_app_session_if_matches(&self, session_id: &str) {
         let mut guard = self.app_session.lock().await;
         let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
         if take && let Some(prior) = guard.take() {
+            drop(guard);
+            tracing::warn!(
+                session_id = %session_id,
+                dropped_pending = prior.pending.len(),
+                "app session dropped — frontend connection closed (reader-loop exit); \
+                 engine→app RPCs will report NotRegistered until the app reconnects",
+            );
             for (_, tx) in prior.pending {
                 let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
                     result: Err(EngineToAppError::AppDisconnected),
                 });
             }
         }
+    }
+
+    /// Snapshot the registered app session's outbound queue stats, if an
+    /// app session is registered. Used by the periodic queue-depth logger.
+    async fn app_session_queue_stats(&self) -> Option<QueueStats> {
+        self.app_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|handle| handle.sink.queue_stats())
     }
 
     /// Snapshot of every allocated worker slot's live runtime state.
@@ -1742,7 +1893,17 @@ impl ServerState {
                 let _ = tx.send(response);
             }
             None => {
-                tracing::warn!(request_id, "engine_response dropped: no pending request matches",);
+                // The app answered a request whose `send_to_app` caller has
+                // already given up (timed out or was cancelled). This is the
+                // late-drain signature: the push sat behind bulk traffic,
+                // the 5s send deadline elapsed, and the app's now-stale reply
+                // has nowhere to go. Call it out so it isn't mistaken for a
+                // protocol bug.
+                tracing::warn!(
+                    request_id,
+                    "engine_response dropped: no pending request matches \
+                     (caller already timed out — engine→app push likely drained late)",
+                );
             }
         }
     }
@@ -1872,13 +2033,36 @@ enum EnqueueOutcome {
     Slow,
 }
 
+/// Point-in-time view of one session's outbound queue. Emitted on every
+/// engine→app send timeout and periodically by the queue-depth logger so
+/// a saturated push channel (the `reveal_work_item` `Send(Timeout)`
+/// failure mode) is diagnosable from the engine logs instead of inferred
+/// from per-call WARNs. `oldest_age_ms` is how long the head-of-line
+/// envelope has waited — the head-of-line-blocking signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueStats {
+    depth: usize,
+    oldest_age_ms: u64,
+    slow: bool,
+    closed: bool,
+}
+
 struct SessionQueue {
-    items: VecDeque<FrontendEventEnvelope>,
+    /// Each entry is `(enqueued_at, envelope)`. The instant is stamped at
+    /// enqueue time (preserved across coalesce) so [`SessionQueue::stats`]
+    /// can report how long the head-of-line envelope has been waiting.
+    items: VecDeque<(Instant, FrontendEventEnvelope)>,
     /// For each topic with a pending unsent TopicEvent, the index of that
     /// envelope in `items` (front-relative; decremented on pop). Lets us
     /// overwrite stale invalidations instead of growing the queue.
     pending_topics: HashMap<String, usize>,
     closed: bool,
+    /// One-shot backpressure latch. Set when an enqueue overflows
+    /// `MAX_SESSION_QUEUE`; while set, further enqueues report `Slow`
+    /// without growing memory. Recoverable: [`SessionQueue::pop_front`]
+    /// clears it once the queue drains to empty, so a session that
+    /// briefly overflowed but then caught up accepts events again instead
+    /// of silently dropping every subsequent enqueue forever.
     slow: bool,
 }
 
@@ -1903,7 +2087,10 @@ impl SessionQueue {
         if let Some(topic) = topic_event_topic(&env.payload) {
             if let Some(&idx) = self.pending_topics.get(&topic) {
                 debug_assert!(idx < self.items.len());
-                self.items[idx] = env;
+                // Overwrite the stale invalidation in place, keeping the
+                // original enqueue instant so `oldest_age_ms` still reflects
+                // how long this queue slot has been waiting to flush.
+                self.items[idx].1 = env;
                 return EnqueueOutcome::Coalesced;
             }
             if self.items.len() >= MAX_SESSION_QUEUE {
@@ -1911,7 +2098,7 @@ impl SessionQueue {
                 return EnqueueOutcome::Slow;
             }
             let idx = self.items.len();
-            self.items.push_back(env);
+            self.items.push_back((Instant::now(), env));
             self.pending_topics.insert(topic, idx);
             return EnqueueOutcome::Enqueued;
         }
@@ -1920,12 +2107,12 @@ impl SessionQueue {
             self.slow = true;
             return EnqueueOutcome::Slow;
         }
-        self.items.push_back(env);
+        self.items.push_back((Instant::now(), env));
         EnqueueOutcome::Enqueued
     }
 
     fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
-        let env = self.items.pop_front()?;
+        let (_enqueued_at, env) = self.items.pop_front()?;
         // Indices in `pending_topics` are front-relative; shift them down
         // by one and drop the entry that pointed at the just-popped item.
         let mut next = HashMap::with_capacity(self.pending_topics.len());
@@ -1936,7 +2123,30 @@ impl SessionQueue {
             next.insert(topic, idx - 1);
         }
         self.pending_topics = next;
+        // Recover the backpressure latch once the backlog is fully drained:
+        // a session that caught up is no longer slow and must accept new
+        // events rather than reject them permanently.
+        if self.items.is_empty() {
+            self.slow = false;
+        }
         Some(env)
+    }
+
+    /// Snapshot depth, head-of-line age, and the backpressure/closed
+    /// flags. Cheap and lock-local — the caller already holds the queue
+    /// mutex via [`SessionSink::queue_stats`].
+    fn stats(&self) -> QueueStats {
+        let oldest_age_ms = self
+            .items
+            .front()
+            .map(|(enqueued_at, _)| Instant::now().saturating_duration_since(*enqueued_at).as_millis() as u64)
+            .unwrap_or(0);
+        QueueStats {
+            depth: self.items.len(),
+            oldest_age_ms,
+            slow: self.slow,
+            closed: self.closed,
+        }
     }
 }
 
@@ -2004,6 +2214,12 @@ impl SessionSink {
             EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
         }
         outcome
+    }
+
+    /// Snapshot this session's outbound queue depth, head-of-line age, and
+    /// backpressure/closed flags for diagnostics.
+    fn queue_stats(&self) -> QueueStats {
+        self.queue.lock().expect("session queue lock poisoned").stats()
     }
 
     fn close(&self) {
@@ -2169,9 +2385,12 @@ impl TopicBroker {
         }
 
         for (session_id, sink) in slow {
+            let stats = sink.queue_stats();
             tracing::warn!(
                 session_id = %session_id,
                 topic,
+                queue_depth = stats.depth,
+                oldest_age_ms = stats.oldest_age_ms,
                 "slow subscriber: outbound queue full, disconnecting"
             );
             sink.close();
@@ -2595,7 +2814,9 @@ async fn handle_frontend_connection(
         }
     }
 
+    tracing::info!(session_id = %session_id, "frontend connection reader loop exited; tearing down session");
     server_state.topic_broker.remove_session(&session_id).await;
+    // Clears the app-session registration iff this was the app (logged there).
     server_state.drop_app_session_if_matches(&session_id).await;
     sink.close();
     let _ = writer_task.await;

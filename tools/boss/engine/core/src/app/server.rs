@@ -1036,6 +1036,37 @@ pub async fn serve(
         });
     }
 
+    // Periodic engine→app queue-depth logger. The engine→app push channel
+    // wedging (small RPCs like reveal / pane-release stuck behind bulk
+    // snapshot traffic) was invisible in the trace: it only showed up as
+    // per-call `Send(Timeout)` WARNs with no queue context. Sample the
+    // registered app session's outbound queue every 15s and log when it is
+    // backed up (or the backpressure latch is set) so saturation is
+    // observable before every RPC starts timing out. Quiet when the queue
+    // is shallow — only emits above a small depth threshold.
+    {
+        let server_clone = Arc::clone(&server_state);
+        tokio::spawn(async move {
+            const LOG_DEPTH_THRESHOLD: usize = 32;
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let Some(stats) = server_clone.app_session_queue_stats().await else {
+                    continue;
+                };
+                if stats.slow || stats.closed || stats.depth >= LOG_DEPTH_THRESHOLD {
+                    tracing::warn!(
+                        queue_depth = stats.depth,
+                        oldest_age_ms = stats.oldest_age_ms,
+                        slow = stats.slow,
+                        closed = stats.closed,
+                        "engine→app outbound queue backed up (periodic sample)",
+                    );
+                }
+            }
+        });
+    }
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
