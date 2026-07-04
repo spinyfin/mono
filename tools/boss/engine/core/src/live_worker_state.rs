@@ -429,7 +429,7 @@ fn current_iso8601() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    format_iso8601_utc(secs)
+    crate::iso8601::format_epoch_iso8601(secs)
 }
 
 /// Format `epoch_secs` as the same fixed-width ISO-8601 UTC string
@@ -439,36 +439,7 @@ fn current_iso8601() -> String {
 /// cutoff timestamp with this and compares `last_event_at < cutoff`
 /// directly, with no date parsing.
 pub fn iso8601_utc(epoch_secs: i64) -> String {
-    format_iso8601_utc(epoch_secs)
-}
-
-/// Minimal ISO-8601 UTC formatter (`YYYY-MM-DDTHH:MM:SSZ`). Avoids
-/// pulling in chrono just to stamp event timestamps.
-fn format_iso8601_utc(epoch_secs: i64) -> String {
-    // Days since 1970-01-01.
-    let days = epoch_secs.div_euclid(86_400);
-    let seconds_in_day = epoch_secs.rem_euclid(86_400);
-    let hour = seconds_in_day / 3_600;
-    let minute = (seconds_in_day % 3_600) / 60;
-    let second = seconds_in_day % 60;
-    let (year, month, day) = ymd_from_days_since_1970(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Convert days-since-1970 into (year, month, day). Adapted from the
-/// Howard Hinnant date algorithm.
-fn ymd_from_days_since_1970(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    crate::iso8601::format_epoch_iso8601(epoch_secs)
 }
 
 #[cfg(test)]
@@ -872,12 +843,6 @@ mod tests {
             },
         );
         assert!(reg.run_id_for_work_item("chore_xyz").is_none());
-    }
-
-    #[test]
-    fn iso8601_format_known_epoch() {
-        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(format_iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
     }
 
     // ── mark_stalled_spawns (initial directory-trust prompt detection) ────────

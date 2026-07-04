@@ -144,37 +144,6 @@ fn extract_issue_number(ref_: &UpstreamRef) -> Result<u64> {
         .ok_or_else(|| TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned()))
 }
 
-/// Parse an ISO 8601 datetime string (e.g. `"2026-05-17T10:00:00Z"`) to Unix
-/// seconds. Avoids pulling in a datetime crate.
-fn parse_iso8601(s: &str) -> Option<i64> {
-    let s = s.trim_end_matches('Z');
-    let (date_part, time_part) = s.split_once('T')?;
-
-    let mut dp = date_part.split('-');
-    let y: i64 = dp.next()?.parse().ok()?;
-    let m: i64 = dp.next()?.parse().ok()?;
-    let d: i64 = dp.next()?.parse().ok()?;
-
-    // Time part may include fractional seconds; take only HH:MM:SS.
-    let time_hms = time_part.split('.').next().unwrap_or(time_part);
-    let mut tp = time_hms.split(':');
-    let h: i64 = tp.next()?.parse().ok()?;
-    let min: i64 = tp.next()?.parse().ok()?;
-    let sec: i64 = tp.next()?.parse().ok()?;
-
-    let days = days_since_epoch(y, m, d)?;
-    Some(days * 86400 + h * 3600 + min * 60 + sec)
-}
-
-fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
-    // Julian Day Number calculation; JD of 1970-01-01 = 2440588.
-    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
-    let a = y / 100;
-    let b = 2 - a + a / 4;
-    let jd = (365.25 * (y + 4716) as f64) as i64 + (30.6001 * (m + 1) as f64) as i64 + d + b - 1524;
-    Some(jd - 2_440_588)
-}
-
 /// Parse one project item node from the GraphQL `items.nodes` array.
 /// Returns `None` for non-Issue content (DraftIssue, PullRequest, etc.) and
 /// for items excluded by `label_filter`.
@@ -192,7 +161,7 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
     let state_reason = content.get("stateReason").and_then(|v| v.as_str()).unwrap_or("");
     let url = content.get("url")?.as_str()?.to_owned();
     let updated_at_str = content.get("updatedAt")?.as_str()?;
-    let updated_at = parse_iso8601(updated_at_str).unwrap_or(0);
+    let updated_at = crate::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
 
     // The repo the issue lives in, canonical `owner/repo` form.
     let repo_name_with_owner = content
@@ -235,7 +204,10 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
         .filter_map(|n| {
             let pr_url = n.get("url")?.as_str()?.to_owned();
             let merged = n.get("merged")?.as_bool()?;
-            let merged_at = n.get("mergedAt").and_then(|v| v.as_str()).and_then(parse_iso8601);
+            let merged_at = n
+                .get("mergedAt")
+                .and_then(|v| v.as_str())
+                .and_then(crate::iso8601::parse_iso8601_lenient);
             Some(UpstreamPrAssociation {
                 pr_url,
                 merged,
@@ -307,7 +279,7 @@ fn parse_rest_issue(body: &Value, org: &str, repo: &str) -> Option<UpstreamItem>
     let state_reason = body.get("state_reason").and_then(|v| v.as_str()).unwrap_or("");
     let url = body.get("html_url")?.as_str()?.to_owned();
     let updated_at_str = body.get("updated_at")?.as_str()?;
-    let updated_at = parse_iso8601(updated_at_str).unwrap_or(0);
+    let updated_at = crate::iso8601::parse_iso8601_lenient(updated_at_str).unwrap_or(0);
 
     let labels: Vec<String> = body
         .get("labels")
@@ -1741,29 +1713,5 @@ mod tests {
             json!(["tracked"]),
             "labels array must contain exactly 'tracked'"
         );
-    }
-
-    // ── parse_iso8601 ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_iso8601_known_epoch() {
-        // 1970-01-01T00:00:00Z == 0
-        assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
-    }
-
-    #[test]
-    fn parse_iso8601_known_date() {
-        // 2026-05-17T10:00:00Z == 1_779_012_000
-        // (verified: 2026-01-01 starts at day 20454 since epoch; +136 days to May 17;
-        //  × 86400 + 36000 seconds for 10:00:00 UTC = 1_779_012_000)
-        let ts = parse_iso8601("2026-05-17T10:00:00Z").expect("valid timestamp");
-        let expected: i64 = 1_779_012_000;
-        assert_eq!(ts, expected, "ts={ts} expected={expected}");
-    }
-
-    #[test]
-    fn parse_iso8601_rejects_malformed() {
-        assert_eq!(parse_iso8601("not-a-date"), None);
-        assert_eq!(parse_iso8601(""), None);
     }
 }

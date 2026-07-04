@@ -277,23 +277,9 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
     let _ = std::fs::remove_file(path);
 }
 
-#[test]
-fn parse_iso8601_to_epoch_handles_canonical_shapes() {
-    // Reference epochs cross-checked with `date -u -d '...' +%s`.
-    assert_eq!(parse_iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
-    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45Z"), Some(1_778_180_145));
-    // Fractional seconds are truncated, not rounded.
-    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45.000Z"), Some(1_778_180_145));
-    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45.999Z"), Some(1_778_180_145));
-    // Already-canonical numeric strings are left untouched.
-    assert_eq!(parse_iso8601_to_epoch("1778180145"), None);
-    assert_eq!(parse_iso8601_to_epoch(""), None);
-    // Non-UTC suffixes aren't supported (engine only writes Z).
-    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45+00:00"), None);
-    // Malformed values fall through.
-    assert_eq!(parse_iso8601_to_epoch("2026/05/07T18:55:45Z"), None);
-    assert_eq!(parse_iso8601_to_epoch("2026-13-07T18:55:45Z"), None);
-}
+// Direct unit coverage of `parse_iso8601_to_epoch` now lives with the
+// consolidated helper in `crate::iso8601`; the end-to-end migration test
+// below exercises it through the real rewrite path.
 
 #[test]
 fn migrate_timestamps_rewrites_iso_rows_to_epoch() {

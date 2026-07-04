@@ -46,8 +46,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-const SECS_PER_DAY: i64 = 86_400;
-
 /// Hard cap on the audit log size. Once exceeded, the oldest ~half of
 /// the file is dropped on the next append. Generous enough for months
 /// of normal startup/shutdown cycles.
@@ -265,7 +263,10 @@ fn write_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) {
         return;
     };
 
-    fields.insert("ts".into(), Value::String(format_iso8601(now_epoch_s)));
+    fields.insert(
+        "ts".into(),
+        Value::String(crate::iso8601::format_epoch_iso8601(now_epoch_s)),
+    );
     fields.insert("ts_epoch_s".into(), json!(now_epoch_s));
     fields.insert("event".into(), Value::String(event.to_owned()));
 
@@ -333,31 +334,6 @@ fn rotate_if_needed(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn format_iso8601(epoch_s: i64) -> String {
-    let day = epoch_s.div_euclid(SECS_PER_DAY);
-    let sec_in_day = epoch_s.rem_euclid(SECS_PER_DAY);
-    let (y, m, d) = civil_from_days(day);
-    let h = sec_in_day / 3600;
-    let mi = (sec_in_day / 60) % 60;
-    let s = sec_in_day % 60;
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-// Howard Hinnant's date algorithms — same shape as `tools/cube/src/audit.rs`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,14 +379,6 @@ mod tests {
         // file that was never written (`NotFound`). Keeping this pure makes
         // the audit tests independent under libtest's default parallelism.
         dir.path().join(name)
-    }
-
-    #[test]
-    fn iso8601_round_trip_for_known_instant() {
-        // 2026-05-07 20:04:11 UTC.
-        let day = days_from_civil(2026, 5, 7);
-        let ts = day * SECS_PER_DAY + 20 * 3600 + 4 * 60 + 11;
-        assert_eq!(format_iso8601(ts), "2026-05-07T20:04:11Z");
     }
 
     #[test]
@@ -597,7 +565,10 @@ mod tests {
     }
 
     fn make_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) -> Value {
-        fields.insert("ts".into(), Value::String(format_iso8601(now_epoch_s)));
+        fields.insert(
+            "ts".into(),
+            Value::String(crate::iso8601::format_epoch_iso8601(now_epoch_s)),
+        );
         fields.insert("ts_epoch_s".into(), json!(now_epoch_s));
         fields.insert("event".into(), Value::String(event.to_owned()));
         Value::Object(fields)
@@ -610,16 +581,5 @@ mod tests {
         let now = epoch_now_s();
         let value = make_record(now, event, fields);
         append_to(path, &value).unwrap();
-    }
-
-    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-        let m = m as i64;
-        let d = d as i64;
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = y - era * 400;
-        let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146_097 + doe - 719_468
     }
 }
