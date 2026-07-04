@@ -138,7 +138,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertTrue(plain.contains("bold"))
     }
 
-    // MARK: - Intent classification badge (Phase 1d stub, unchanged behaviour)
+    // MARK: - Intent classification badge (artifact-less fallback, unchanged behaviour)
 
     func testNewCommentHasNoIntentUntilClassified() {
         let layer = CommentLayer()
@@ -163,7 +163,24 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertNil(layer.comments[0].intent)
     }
 
-    // MARK: - `[Revise]` banner + chips (Phase 2f stub, unchanged behaviour)
+    // MARK: - Intent classification badge (engine-backed: real CommentsSetIntent RPC)
+
+    func testSetIntentSendsRPCWhenEngineBackedAndDoesNotMutateLocally() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
+        layer.setIntent(.directive, for: layer.comments[0])
+
+        XCTAssertEqual(backend.setIntentCalls.count, 1)
+        XCTAssertEqual(backend.setIntentCalls[0].commentId, "cmt_1")
+        XCTAssertEqual(backend.setIntentCalls[0].intent, "directive")
+        // No local mutation — the layer waits for the `comment_result` echo's reload.
+        XCTAssertNil(layer.comments[0].intent)
+        XCTAssertFalse(layer.comments[0].intentOverriddenByUser)
+    }
+
+    // MARK: - `[Revise]` banner + chips (artifact-less fallback, unchanged behaviour)
 
     func testDirectiveClassificationPostsNudgeAndMakesBannerRevisable() {
         let layer = CommentLayer()
@@ -194,27 +211,57 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertNil(layer.comments[0].reviseTaskId)
     }
 
-    func testResolveRevisionMarksAddressedCommentsResolved() {
+    // MARK: - `[Revise]` banner + revise doc (engine-backed: real RPCs)
+
+    func testReloadFetchesBannerState() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "a", body: "first")
-        layer.setIntent(.directive, for: layer.comments[0])
-        layer.reviseDoc()
-        let taskId = layer.comments[0].reviseTaskId!
-        layer.resolveRevision(taskId: taskId)
-        XCTAssertEqual(layer.comments[0].status, .resolved)
-        XCTAssertEqual(layer.comments[0].statusActor, "engine")
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        XCTAssertEqual(backend.fetchBannerStateCalls.count, 1)
+        XCTAssertEqual(backend.fetchBannerStateCalls[0].kind, "work_item")
+        XCTAssertEqual(backend.fetchBannerStateCalls[0].id, "t")
     }
 
-    func testReopenRevisionClearsTaskAndShowsReopenedChip() {
+    func testApplyBannerStateUpdatesPublishedBannerState() {
         let layer = CommentLayer()
-        layer.addComment(quoted: "a", body: "first")
-        layer.setIntent(.directive, for: layer.comments[0])
+        let backend = FakeCommentBackend()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
+        layer.applyBannerState(CommentsBannerState(revisable: true, unresolvedCount: 2, inRevisionCount: 1))
+        XCTAssertTrue(layer.bannerState.revisable)
+        XCTAssertEqual(layer.bannerState.unresolvedCount, 2)
+        XCTAssertEqual(layer.bannerState.inRevisionCount, 1)
+    }
+
+    func testReviseDocSendsRPCWhenEngineBacked() {
+        let layer = CommentLayer()
+        let backend = FakeCommentBackend()
+        layer.configure(
+            source: "x", baseURL: nil,
+            artifact: .prDoc(repoRemoteURL: "git@github.com:o/r.git", branch: "main", path: "d.md"),
+            backend: backend
+        )
         layer.reviseDoc()
-        let taskId = layer.comments[0].reviseTaskId!
-        layer.reopenRevision(taskId: taskId)
-        XCTAssertEqual(layer.comments[0].status, .active)
-        XCTAssertNil(layer.comments[0].reviseTaskId)
-        XCTAssertEqual(layer.comments[0].revisionChipState, .reopened)
+        XCTAssertEqual(backend.reviseDocCalls.count, 1)
+        XCTAssertEqual(backend.reviseDocCalls[0].kind, "pr_doc")
+        XCTAssertEqual(backend.reviseDocCalls[0].id, "pr_doc:git@github.com:o/r.git:main:d.md")
+    }
+
+    func testApplyReviseDocOutcomeCreatedLeavesMessageNil() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(.created(taskId: "rev_1", taskKind: "revision", addressedCommentIds: ["cmt_1"], prUrl: nil))
+        XCTAssertNil(layer.reviseDocMessage)
+    }
+
+    func testApplyReviseDocOutcomeNoUnresolvedCommentsSetsMessage() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(.noUnresolvedComments)
+        XCTAssertEqual(layer.reviseDocMessage, "No unresolved comments to revise.")
+    }
+
+    func testApplyReviseDocOutcomeAlreadyInFlightIncludesRealTaskId() {
+        let layer = CommentLayer()
+        layer.applyReviseDocOutcome(.alreadyInFlight(taskId: "rev_42"))
+        XCTAssertEqual(layer.reviseDocMessage, "Already being revised as rev_42.")
     }
 
     // MARK: - Bucket 2: answer agent (Phase 3d stub, unchanged behaviour)
@@ -291,47 +338,6 @@ final class CommentLayerTests: XCTestCase {
         layer.reclassifyFollowup(.directive, for: layer.comments[0])
         XCTAssertEqual(layer.comments[0].status, .active)
         XCTAssertNil(layer.comments[0].intent)
-    }
-
-    // MARK: - Reload merges unpersisted stub state (engine-backed path)
-
-    func testApplyListPreservesLocalIntentOverrideAcrossReload() {
-        let layer = CommentLayer()
-        let backend = FakeCommentBackend()
-        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
-        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-        layer.setIntent(.directive, for: layer.comments[0])
-        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
-
-        // A reload (e.g. triggered by an unrelated create echo) rebuilds `comments`
-        // wholesale from the engine, which hasn't seen the override yet.
-        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-
-        XCTAssertEqual(layer.comments[0].intent, .directive)
-        XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
-    }
-
-    func testApplyListPreservesLocalAnsweringStatusAcrossReload() async throws {
-        let layer = CommentLayer()
-        let backend = FakeCommentBackend()
-        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
-        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-        layer.setIntent(.question, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].status, .answering)
-
-        // Reload before the (real) engine has recorded the transition — the wire
-        // row still reports `.active`.
-        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-        XCTAssertEqual(layer.comments[0].status, .answering)
-
-        try await Task.sleep(for: .seconds(2))
-        XCTAssertEqual(layer.comments[0].status, .answered)
-        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
-
-        // A further reload must not drop the locally-appended answer thread entry.
-        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-        XCTAssertEqual(layer.comments[0].status, .answered)
-        XCTAssertEqual(layer.comments[0].threadEntries.last?.entryKind, .answer)
     }
 
     // MARK: - Engine-backed path
@@ -729,6 +735,9 @@ final class FakeCommentBackend: CommentBackend {
     var dismissCalls: [String] = []
     var setStatusCalls: [(commentId: String, status: String)] = []
     var updateAnchorCalls: [(commentId: String, anchor: CommentAnchor)] = []
+    var setIntentCalls: [(commentId: String, intent: String)] = []
+    var fetchBannerStateCalls: [(kind: String, id: String)] = []
+    var reviseDocCalls: [(kind: String, id: String)] = []
 
     func registerCommentLayer(_ layer: CommentLayer, artifactKind: String, artifactId: String) {
         registerCount += 1
@@ -747,5 +756,14 @@ final class FakeCommentBackend: CommentBackend {
     func setStatus(commentId: String, status: String) { setStatusCalls.append((commentId, status)) }
     func updateAnchor(commentId: String, anchor: CommentAnchor, newDocVersion: String) {
         updateAnchorCalls.append((commentId, anchor))
+    }
+    func setIntent(commentId: String, intent: String) {
+        setIntentCalls.append((commentId, intent))
+    }
+    func fetchBannerState(artifactKind: String, artifactId: String) {
+        fetchBannerStateCalls.append((artifactKind, artifactId))
+    }
+    func reviseDoc(artifactKind: String, artifactId: String) {
+        reviseDocCalls.append((artifactKind, artifactId))
     }
 }

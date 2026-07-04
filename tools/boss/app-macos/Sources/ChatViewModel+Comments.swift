@@ -23,6 +23,13 @@ protocol CommentBackend: AnyObject {
     func dismissComment(commentId: String)
     func setStatus(commentId: String, status: String)
     func updateAnchor(commentId: String, anchor: CommentAnchor, newDocVersion: String)
+    /// Manually reclassify a comment's intent (sidebar badge override).
+    func setIntent(commentId: String, intent: String)
+    /// Fetch the `[Revise]`-banner summary for an artifact.
+    func fetchBannerState(artifactKind: String, artifactId: String)
+    /// The `[Revise]`-banner action: batch-address every unaddressed
+    /// directive/larger_change comment on the artifact.
+    func reviseDoc(artifactKind: String, artifactId: String)
 }
 
 /// Current comment author identity. Best-effort from the macOS login name until
@@ -50,6 +57,14 @@ final class CommentEngineBridge: CommentBackend {
         let artifactId: String
     }
     private var registrations: [ObjectIdentifier: Registration] = [:]
+
+    /// FIFO queue of artifacts with an in-flight `comments_revise_doc` call.
+    /// `CommentsReviseDocResult` carries no artifact identity on the wire
+    /// (see `ReviseDocOutcome` in `wire.rs`), so replies are correlated to
+    /// the request that issued them by send order — the engine handles one
+    /// frontend request at a time per session, so a reply always corresponds
+    /// to the oldest still-pending call.
+    private var pendingReviseDocArtifacts: [(kind: String, id: String)] = []
 
     init(engine: EngineClient, author: String = CommentAuthor.current) {
         self.engine = engine
@@ -132,6 +147,19 @@ final class CommentEngineBridge: CommentBackend {
         )
     }
 
+    func setIntent(commentId: String, intent: String) {
+        engine.sendCommentsSetIntent(commentId: commentId, intent: intent)
+    }
+
+    func fetchBannerState(artifactKind: String, artifactId: String) {
+        engine.sendCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId)
+    }
+
+    func reviseDoc(artifactKind: String, artifactId: String) {
+        pendingReviseDocArtifacts.append((artifactKind, artifactId))
+        engine.sendCommentsReviseDoc(artifactKind: artifactKind, artifactId: artifactId)
+    }
+
     // MARK: Event routing (called from ChatViewModel.handle)
 
     func handleCommentsList(artifactKind: String, artifactId: String, comments: [CommentWithThread]) {
@@ -147,6 +175,16 @@ final class CommentEngineBridge: CommentBackend {
     /// stay fresh after a self-initiated create/dismiss.
     func handleCommentResult(_ comment: WorkComment) {
         forEachLayer(kind: comment.artifactKind, id: comment.artifactId) { $0.reload() }
+    }
+
+    func handleCommentsBannerState(artifactKind: String, artifactId: String, state: CommentsBannerState) {
+        forEachLayer(kind: artifactKind, id: artifactId) { $0.applyBannerState(state) }
+    }
+
+    func handleCommentsReviseDocResult(_ outcome: ReviseDocOutcome) {
+        guard !pendingReviseDocArtifacts.isEmpty else { return }
+        let artifact = pendingReviseDocArtifacts.removeFirst()
+        forEachLayer(kind: artifact.kind, id: artifact.id) { $0.applyReviseDocOutcome(outcome) }
     }
 
     /// A `comments.artifact.*` topic invalidation (fired by another session's

@@ -222,6 +222,59 @@ struct ResolvedComment: Codable, Equatable, Sendable {
     let resolution: CommentResolution
 }
 
+// MARK: - ReviseDocOutcome (types.rs ~2761) — the comments_revise_doc_result reply
+
+/// Outcome of `CommentsReviseDoc`. The engine tags this
+/// `#[serde(tag = "type", rename_all = "snake_case")]`, an internally-tagged
+/// union `Decodable` can't synthesize for an enum with associated values —
+/// hence the manual `init(from:)` below.
+enum ReviseDocOutcome: Equatable, Sendable {
+    /// A revision (open PR) or chore (merged/closed/no-PR) was created and
+    /// the addressed comments were flipped to `in_revision`.
+    case created(taskId: String, taskKind: String, addressedCommentIds: [String], prUrl: String?)
+    /// No `active` comment on the artifact carries a `directive`/`larger_change`
+    /// intent — idempotent no-op.
+    case noUnresolvedComments
+    /// A prior `CommentsReviseDoc` call already claimed every candidate comment.
+    case alreadyInFlight(taskId: String)
+    /// `resolve_doc_owner` found no design/investigation-owned task for this
+    /// artifact — not eligible for routing at all.
+    case notApplicable(reason: String)
+}
+
+extension ReviseDocOutcome: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case taskId = "task_id"
+        case taskKind = "task_kind"
+        case addressedCommentIds = "addressed_comment_ids"
+        case prUrl = "pr_url"
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .type) {
+        case "created":
+            self = .created(
+                taskId: try c.decode(String.self, forKey: .taskId),
+                taskKind: try c.decode(String.self, forKey: .taskKind),
+                addressedCommentIds: try c.decode([String].self, forKey: .addressedCommentIds),
+                prUrl: try c.decodeIfPresent(String.self, forKey: .prUrl)
+            )
+        case "no_unresolved_comments":
+            self = .noUnresolvedComments
+        case "already_in_flight":
+            self = .alreadyInFlight(taskId: try c.decode(String.self, forKey: .taskId))
+        case "not_applicable":
+            self = .notApplicable(reason: try c.decode(String.self, forKey: .reason))
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type, in: c, debugDescription: "unknown ReviseDocOutcome type: \(other)")
+        }
+    }
+}
+
 // MARK: - Plain-text projection + doc version
 
 /// The renderer's plain-text projection of a markdown source, and the opaque

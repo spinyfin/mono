@@ -238,9 +238,18 @@ enum RevisionChipState: Equatable {
 
 /// Client mirror of the engine's `CommentsBannerState`
 /// (`boss-protocol/src/types.rs`) — a read-only summary driving the
-/// `[Revise]` banner.
-struct CommentsBannerState: Equatable {
+/// `[Revise]` banner. Decoded directly from the flattened `comments_banner_state`
+/// reply (`{artifact_kind, artifact_id, revisable, unresolved_count,
+/// in_revision_count, doc_kind}`); `doc_kind` isn't rendered client-side so it's
+/// omitted here rather than decoded and discarded.
+struct CommentsBannerState: Codable, Equatable {
     let revisable: Bool
     let unresolvedCount: Int
     let inRevisionCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case revisable
+        case unresolvedCount = "unresolved_count"
+        case inRevisionCount = "in_revision_count"
+    }
 }
