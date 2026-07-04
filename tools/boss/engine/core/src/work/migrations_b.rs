@@ -1704,3 +1704,38 @@ pub(crate) fn migrate_retire_magic_wand_dispatched_comments(conn: &Connection) -
     }
     Ok(())
 }
+
+/// Add `tasks.dispatch_failed_reason` / `dispatch_failed_error` /
+/// `dispatch_failed_at` — the "failing to start" surface distinct from
+/// "waiting for a slot" (capacity wait). Set by
+/// `WorkDb::bounce_dispatch_failed_to_backlog` when a pre-start dispatch
+/// attempt (cube repo ensure, workspace lease, change create, run start,
+/// …) is determined non-transient — the same moment `record_pre_start_failure`
+/// gives up retrying and raises a `WorkAttentionItem`. Bouncing the task to
+/// `todo` with `autostart = 0` stops the silent claim→fail→release retry
+/// loop; these three columns let the kanban card render the failure and its
+/// reason inline instead of requiring a trip through dispatch logs. All
+/// `NULL` for every task with no unresolved dispatch failure (the
+/// overwhelming majority), and cleared the next time a fresh dispatch is
+/// requested for the work item.
+pub(crate) fn migrate_tasks_dispatch_failure_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "dispatch_failed_reason",
+            "ALTER TABLE tasks ADD COLUMN dispatch_failed_reason TEXT",
+        ),
+        (
+            "dispatch_failed_error",
+            "ALTER TABLE tasks ADD COLUMN dispatch_failed_error TEXT",
+        ),
+        (
+            "dispatch_failed_at",
+            "ALTER TABLE tasks ADD COLUMN dispatch_failed_at TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}

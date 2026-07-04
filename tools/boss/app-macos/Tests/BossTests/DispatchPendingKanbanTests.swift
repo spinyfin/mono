@@ -46,6 +46,20 @@ final class DispatchPendingKanbanTests: XCTestCase {
         XCTAssertEqual(task.boardColumn, .review)
     }
 
+    /// A task the engine gave up starting (`dispatchFailedReason` set) must
+    /// render in Backlog, not as a phantom "waiting for a slot" Doing card —
+    /// the two states must not look the same. The engine clears `autostart`
+    /// in the same transaction it stamps the failure, so this only holds if
+    /// that invariant holds; this test pins the client-side half of the
+    /// contract.
+    func testDispatchFailedRoutesToBacklogNotDoing() {
+        let task = makeTask(status: "todo", autostart: false, dispatchFailedReason: "cube_workspace_lease_failed")
+        XCTAssertEqual(
+            task.boardColumn, .backlog,
+            "a task the engine gave up starting must land in Backlog, not look like a genuine capacity wait"
+        )
+    }
+
     // MARK: AgentActivityState tooltip
 
     func testDispatchPendingTooltip() {
@@ -89,9 +103,10 @@ final class DispatchPendingKanbanTests: XCTestCase {
     private func makeTask(
         status: String,
         autostart: Bool,
-        kind: String = "chore"
+        kind: String = "chore",
+        dispatchFailedReason: String? = nil
     ) -> WorkTask {
-        WorkTask(
+        var task = WorkTask(
             id: "task_\(UUID().uuidString)",
             productID: "prod_test",
             projectID: nil,
@@ -107,6 +122,8 @@ final class DispatchPendingKanbanTests: XCTestCase {
             updatedAt: "2026-05-13T00:00:00Z",
             autostart: autostart
         )
+        task.dispatchFailedReason = dispatchFailedReason
+        return task
     }
 
     private func makeModel() -> ChatViewModel {

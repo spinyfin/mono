@@ -866,6 +866,27 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.completed_at` on the wire.
     var completedAt: String? = nil
 
+    /// Machine discriminator for a dispatch failure the engine gave up
+    /// retrying (e.g. `"cube_workspace_lease_failed"`) — set only when a
+    /// pre-start dispatch attempt (cube repo ensure, workspace lease,
+    /// change create, run start, …) failed non-transiently and the engine
+    /// bounced this row back to Backlog with `autostart` cleared. `nil`
+    /// for every task with no unresolved dispatch failure — the
+    /// overwhelming majority. Distinguishes a card that is genuinely
+    /// broken from one that is merely `status=="todo" && autostart` and
+    /// waiting on a free worker slot (which never sets this field).
+    /// Mirrors `Task.dispatch_failed_reason` on the wire.
+    var dispatchFailedReason: String? = nil
+    /// Human-readable error text for `dispatchFailedReason` (e.g. the
+    /// underlying cube lease error message). Rendered directly on the
+    /// kanban card so the operator can see why without digging into
+    /// dispatch logs. Mirrors `Task.dispatch_failed_error` on the wire.
+    var dispatchFailedError: String? = nil
+    /// RFC 3339 timestamp of the dispatch failure recorded in
+    /// `dispatchFailedReason`. `nil` whenever that field is `nil`.
+    /// Mirrors `Task.dispatch_failed_at` on the wire.
+    var dispatchFailedAt: String? = nil
+
     var isChore: Bool {
         kind == "chore" || kind == "followup"
     }
@@ -1565,6 +1586,15 @@ extension WorkTask {
     /// slot frees up — so they belong visually with active work, not with
     /// unscheduled backlog items. The card renders a distinct hourglass
     /// indicator to distinguish "queued" from "working".
+    ///
+    /// A row the engine gave up starting (`dispatchFailedReason` set) is
+    /// NOT dispatch-pending: the engine clears `autostart` in the same
+    /// transaction that stamps the failure (see
+    /// `WorkDb::bounce_dispatch_failed_to_backlog`), so it falls straight
+    /// through to Backlog below instead of rendering as a phantom
+    /// "waiting for a slot" card indistinguishable from genuine capacity
+    /// wait. The card still surfaces the failure via the error banner —
+    /// see `WorkBoardCardView`.
     var boardColumn: WorkBoardColumnKey {
         switch status {
         case "active":

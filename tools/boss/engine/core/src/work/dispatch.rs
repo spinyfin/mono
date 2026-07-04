@@ -233,6 +233,68 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Bounce a work item to Backlog after a **pre-start** dispatch
+    /// attempt (cube repo ensure, workspace lease, change create, run
+    /// start, …) is determined non-transient — the moment
+    /// `record_pre_start_failure` returns `PermanentFail` and gives up
+    /// retrying. Distinct from [`Self::demote_active_work_item_to_todo`],
+    /// which handles a *post*-start pane-spawn failure on an already-`active`
+    /// row: a pre-start failure can strike while the task is still `todo`
+    /// (it never made it to `active`), so this also accepts that status.
+    ///
+    /// This closes the "failing to start" vs. "waiting for a slot"
+    /// ambiguity (T2130-adjacent incident): a dispatch that keeps losing
+    /// the pool-claim race never reaches this method (pool exhaustion is a
+    /// transient capacity wait, handled entirely by the ordinary re-scan —
+    /// see `pool_exhaustion_recovers_automatically_when_slot_frees_without_manual_intervention`),
+    /// but a dispatch that repeatedly fails at a concrete pre-run stage
+    /// (e.g. cube's `refusing to move backwards` lease error) would
+    /// otherwise loop claim → fail → release → re-queue forever while
+    /// `tasks.status` never changes. This method stops that loop by:
+    ///
+    /// - clearing `autostart` (single-shot, mirroring the clear
+    ///   `start_execution_run_on_host` does on a successful start) so the
+    ///   card renders as parked in Backlog rather than "waiting for a
+    ///   slot" — the loop is over; a human must retry deliberately, and
+    ///   [`Self::request_execution_with_live_check`] clears the fields
+    ///   below the next time that happens,
+    /// - stamping `dispatch_failed_reason` / `dispatch_failed_error` /
+    ///   `dispatch_failed_at` so the kanban card can render the failure
+    ///   and its underlying error inline, without a trip through
+    ///   dispatch-events logs.
+    ///
+    /// Guarded on `status IN ('todo', 'active')` so a concurrent move to
+    /// `done`/`archived`/`blocked`/`in_review` is never stomped — this
+    /// also naturally excludes review-phase dispatch kinds (`pr_review`,
+    /// `ci_remediation`, `conflict_resolution`), which run against tasks
+    /// in those other statuses and must not be bounced back to Backlog
+    /// (that would erase review context). Returns `true` iff a row was
+    /// actually updated.
+    pub fn bounce_dispatch_failed_to_backlog(
+        &self,
+        work_item_id: &str,
+        reason: &str,
+        error_text: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let updated = conn.execute(
+            "UPDATE tasks
+             SET status = 'todo',
+                 autostart = 0,
+                 last_status_actor = 'engine',
+                 dispatch_failed_reason = ?2,
+                 dispatch_failed_error = ?3,
+                 dispatch_failed_at = ?4,
+                 updated_at = ?4
+             WHERE id = ?1
+               AND status IN ('todo', 'active')
+               AND deleted_at IS NULL",
+            params![work_item_id, reason, error_text, now],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Re-issue `RequestExecution` for every non-deleted task / chore
     /// whose status is `active` but whose latest execution is terminal
     /// (or which has no execution). This is the engine-startup

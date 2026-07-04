@@ -3206,6 +3206,32 @@ pub struct Task {
     /// filed. Set only on `kind = 'followup'` rows; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_pr_number: Option<i64>,
+
+    /// Machine discriminator for a dispatch failure the engine gave up
+    /// retrying — e.g. `"cube_workspace_lease_failed"`, matching the
+    /// `WorkAttentionItem.kind` raised for the same failure. Set by
+    /// `WorkDb::bounce_dispatch_failed_to_backlog` when a pre-start
+    /// dispatch attempt (cube repo ensure, workspace lease, change
+    /// create, run start, …) fails non-transiently; distinguishes this
+    /// from a task that is merely queued behind a full worker pool
+    /// (which never sets this field). `None` when there is no
+    /// unresolved dispatch failure. Cleared the next time a fresh
+    /// dispatch is requested for this work item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_failed_reason: Option<String>,
+
+    /// Human-readable error text for `dispatch_failed_reason` (e.g. the
+    /// underlying cube lease error message), rendered directly on the
+    /// kanban card so the operator can see why dispatch is stuck
+    /// without digging into dispatch logs. `None` whenever
+    /// `dispatch_failed_reason` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_failed_error: Option<String>,
+
+    /// RFC 3339 timestamp of the dispatch failure recorded in
+    /// `dispatch_failed_reason`. `None` whenever that field is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_failed_at: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {

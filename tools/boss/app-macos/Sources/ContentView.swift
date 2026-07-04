@@ -1761,6 +1761,10 @@ private struct WorkBoardCardItem: View {
                 WorkCardPopoverView(model: model, task: task)
             }
 
+            if let dispatchFailedReason = task.dispatchFailedReason {
+                WorkDispatchFailureBanner(reason: dispatchFailedReason, errorText: task.dispatchFailedError)
+            }
+
             if let dragRefusal {
                 WorkDragRefusalBanner(message: dragRefusal) {
                     model.clearDragRefusal()
@@ -1823,6 +1827,59 @@ private struct WorkBoardCardItem: View {
             skipReason=\(skipReason, privacy: .public)
             """
         )
+    }
+}
+
+/// Rendered directly on a kanban card whenever the engine gave up
+/// starting it (`task.dispatchFailedReason` set) — the card has been
+/// bounced to Backlog with `autostart` cleared, so it will NOT
+/// auto-retry. Distinguishes "failing to start" from "waiting for a
+/// slot": the latter never sets `dispatchFailedReason`, so this banner
+/// never appears on a card that is merely queued behind a full worker
+/// pool (see `WorkTask.boardColumn`). Read-only — the underlying state
+/// clears itself the next time a human retries the dispatch (drag to
+/// Doing, or `bossctl work start`).
+private struct WorkDispatchFailureBanner: View {
+    let reason: String
+    let errorText: String?
+
+    private var reasonLabel: String {
+        reason.replacingOccurrences(of: "_", with: " ")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .font(.caption)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Failed to start — \(reasonLabel)")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let errorText, !errorText.isEmpty {
+                    Text(errorText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.red.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.red.opacity(0.4), lineWidth: 1)
+                )
+        )
+        .accessibilityElement(children: .combine)
+        .help(errorText ?? reasonLabel)
     }
 }
 

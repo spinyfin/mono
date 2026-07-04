@@ -3726,6 +3726,35 @@ impl ExecutionCoordinator {
                     );
                 }
 
+                // Stop the silent claim → fail → release → re-queue loop
+                // (the "waiting for a slot" vs. "failing to start"
+                // ambiguity): bounce the work item to Backlog with
+                // `autostart` cleared and the failure reason/error stamped
+                // directly on the row so the kanban card renders it
+                // inline. Guarded on `status IN ('todo', 'active')`, so
+                // this is a no-op for review-phase dispatch kinds
+                // (`pr_review`, `ci_remediation`, `conflict_resolution`)
+                // whose work item sits in `in_review`/`blocked` — bouncing
+                // those would erase review context.
+                match self
+                    .work_db
+                    .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &err)
+                {
+                    Ok(true) => tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        reason = attention_kind,
+                        "bounced work item to backlog after permanent pre-start dispatch failure",
+                    ),
+                    Ok(false) => {}
+                    Err(bounce_err) => tracing::error!(
+                        ?bounce_err,
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        "failed to bounce work item to backlog after permanent pre-start dispatch failure",
+                    ),
+                }
+
                 let publisher = self.publisher.clone();
                 let execution_id = execution.id.clone();
                 let work_item_id = execution.work_item_id.clone();
@@ -6672,6 +6701,93 @@ mod tests {
         assert!(!stages.contains(&"cube_workspace_lease_attempted"));
         assert!(!stages.contains(&"run_started"));
         assert!(!stages.contains(&"pane_spawned"));
+    }
+
+    /// The "failing to start" vs. "waiting for a slot" ambiguity this
+    /// bounce closes: a chore whose lease keeps failing (e.g. the
+    /// `jj bookmark set pr/<n> … refusing to move backwards` incident)
+    /// must not be left silently looping — the loop is over, and the
+    /// operator must be able to see it's broken and why straight from
+    /// the kanban card (`dispatch_failed_reason` / `dispatch_failed_error`),
+    /// not just from a `WorkAttentionItem` a separate list call surfaces.
+    #[tokio::test]
+    async fn cube_lease_failure_bounces_work_item_to_backlog_with_error() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Cleanup")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        assert!(
+            match db.get_work_item(&chore.id).unwrap() {
+                WorkItem::Chore(t) | WorkItem::Task(t) => t.autostart,
+                other => panic!("expected chore, got {other:?}"),
+            },
+            "autostart must start true — otherwise the bounce assertion below is vacuous",
+        );
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
+        });
+        // No retries: go straight to permanent failure.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![]),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+        let task = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            task.status.as_str(),
+            "todo",
+            "a chore that fails to start must bounce back to Backlog, not strand in Doing",
+        );
+        assert!(
+            !task.autostart,
+            "autostart must be cleared so the card renders as parked in Backlog, \
+             not as a phantom \"waiting for a slot\" card",
+        );
+        assert_eq!(
+            task.dispatch_failed_reason.as_deref(),
+            Some("cube_workspace_lease_failed"),
+            "the failure reason must be stamped on the task for the kanban card to render",
+        );
+        assert_eq!(
+            task.dispatch_failed_error.as_deref(),
+            Some("cube workspace lease failed"),
+            "the underlying cube error must be stamped on the task, not just buried in an attention item",
+        );
+        assert!(task.dispatch_failed_at.is_some());
+
+        // A deliberate retry (mirroring a kanban drag or `bossctl work
+        // start`) must clear the stale error — the card shouldn't keep
+        // showing last time's failure once a fresh attempt is under way.
+        db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
+        let retried_task = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(retried_task.dispatch_failed_reason, None);
+        assert_eq!(retried_task.dispatch_failed_error, None);
+        assert_eq!(retried_task.dispatch_failed_at, None);
     }
 
     /// Pre-start failures (cube lease error, cube ensure error, etc.) should

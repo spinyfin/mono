@@ -841,6 +841,25 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 "RequestExecution: cleared stale dependency block — all prereqs satisfied",
             );
         }
+
+        // Every call into this function represents a deliberate fresh
+        // dispatch attempt (a kanban drag-to-Doing or `bossctl work
+        // start`) — automatic re-dispatch sweeps (reconcile/rescan) never
+        // reach a work item bounced by `bounce_dispatch_failed_to_backlog`
+        // because those only scan `status = 'active'` rows, and a bounced
+        // row is `todo` with `autostart = 0`. So it's safe to clear the
+        // stale error here unconditionally: this attempt gets to prove
+        // itself again, and `record_start_failure` will re-stamp the
+        // fields if it fails the same way.
+        conn.execute(
+            "UPDATE tasks
+             SET dispatch_failed_reason = NULL,
+                 dispatch_failed_error  = NULL,
+                 dispatch_failed_at     = NULL
+             WHERE id = ?1
+               AND dispatch_failed_reason IS NOT NULL",
+            params![work_item_id],
+        )?;
     }
 
     // Multi-repo Q5: route through the single resolver so the
