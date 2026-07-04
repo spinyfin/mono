@@ -151,13 +151,16 @@ const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted"
 async fn emit_exhausted_attention(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    product_id: &str,
-    work_item_id: &str,
-    pr_url: &str,
+    candidate: &PendingMergeCheck,
     used: i64,
     budget: i64,
     failing_check_names: &[&str],
 ) {
+    let PendingMergeCheck {
+        work_item_id,
+        product_id,
+        pr_url,
+    } = candidate;
     let checks_detail = if failing_check_names.is_empty() {
         String::new()
     } else {
@@ -421,17 +424,7 @@ pub async fn on_ci_failure_detected(
                     )
                     .await;
                 let check_names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
-                emit_exhausted_attention(
-                    work_db,
-                    publisher,
-                    &candidate.product_id,
-                    &candidate.work_item_id,
-                    &candidate.pr_url,
-                    used,
-                    budget,
-                    &check_names,
-                )
-                .await;
+                emit_exhausted_attention(work_db, publisher, candidate, used, budget, &check_names).await;
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
@@ -898,17 +891,7 @@ pub async fn on_merge_queue_rebounce_detected(
                 // No per-check names available in the rebounce path (the
                 // failing SHA is the synthetic merge commit, not the PR
                 // head); pass an empty slice so the body omits the list.
-                emit_exhausted_attention(
-                    work_db,
-                    publisher,
-                    &candidate.product_id,
-                    &candidate.work_item_id,
-                    &candidate.pr_url,
-                    used,
-                    budget,
-                    &[],
-                )
-                .await;
+                emit_exhausted_attention(work_db, publisher, candidate, used, budget, &[]).await;
                 tracing::info!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,

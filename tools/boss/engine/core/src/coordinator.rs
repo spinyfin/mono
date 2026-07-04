@@ -24,7 +24,8 @@ use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{
-    CreateAttentionItemInput, DispatchClass, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
+    CreateAttentionItemInput, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome, WorkDb, WorkExecution,
+    WorkItem, WorkRun,
 };
 
 // Phase-3 counter handles for the cube workspace lease boundary.
@@ -4083,14 +4084,15 @@ impl ExecutionCoordinator {
                 });
 
                 match self.work_db.finish_execution_run(
-                    &execution.id,
-                    &run.id,
-                    ExecutionStatus::Failed,
-                    "failed",
-                    None,
-                    Some(error_text.as_str()),
-                    released,
-                    attention,
+                    FinishExecutionRunInput::builder()
+                        .execution_id(&execution.id)
+                        .run_id(&run.id)
+                        .execution_status(ExecutionStatus::Failed)
+                        .run_status("failed")
+                        .error_text(error_text.as_str())
+                        .clear_workspace_lease(released)
+                        .maybe_attention(attention)
+                        .build(),
                 ) {
                     Ok((execution, _run, _)) => {
                         tracing::warn!(
@@ -4429,14 +4431,15 @@ impl ExecutionCoordinator {
         });
 
         let (execution, run, attention) = self.work_db.finish_execution_run(
-            &execution.id,
-            &run.id,
-            outcome.wait_state.execution_status(),
-            "completed",
-            outcome.result_summary.as_deref(),
-            None,
-            released,
-            attention,
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution.id)
+                .run_id(&run.id)
+                .execution_status(outcome.wait_state.execution_status())
+                .run_status("completed")
+                .maybe_result_summary(outcome.result_summary.as_deref())
+                .clear_workspace_lease(released)
+                .maybe_attention(attention)
+                .build(),
         )?;
 
         tracing::info!(
@@ -4803,7 +4806,7 @@ mod tests {
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
         AddDependencyInput, CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
-        CreateTaskInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
+        CreateTaskInput, FinishExecutionRunInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
     };
 
     /// Recorded args for each `lease_workspace` call:
@@ -10792,14 +10795,12 @@ mod tests {
             .next()
             .expect("zombie has a run");
         db.finish_execution_run(
-            &zombie.id,
-            &zrun,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            None,
-            None,
-            /* clear_workspace_lease */ false,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&zombie.id)
+                .run_id(&zrun)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
         )
         .unwrap();
 

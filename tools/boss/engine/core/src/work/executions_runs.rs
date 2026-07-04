@@ -949,15 +949,26 @@ impl WorkDb {
 
     pub fn finish_execution_run(
         &self,
-        execution_id: &str,
-        run_id: &str,
-        execution_status: ExecutionStatus,
-        run_status: &str,
-        result_summary: Option<&str>,
-        error_text: Option<&str>,
-        clear_workspace_lease: bool,
-        attention: Option<CreateAttentionItemInput>,
+        input: FinishExecutionRunInput,
     ) -> Result<(WorkExecution, WorkRun, Option<WorkAttentionItem>)> {
+        let FinishExecutionRunInput {
+            execution_id,
+            run_id,
+            execution_status,
+            run_status,
+            result_summary,
+            error_text,
+            clear_workspace_lease,
+            attention,
+        } = input;
+        // Re-borrow the owned fields as the &str/Option<&str> shapes the
+        // transaction body was written against, so the SQL below is unchanged.
+        let execution_id = execution_id.as_str();
+        let run_id = run_id.as_str();
+        let run_status = run_status.as_str();
+        let result_summary = result_summary.as_deref();
+        let error_text = error_text.as_deref();
+
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;

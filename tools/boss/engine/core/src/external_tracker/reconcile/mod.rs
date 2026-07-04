@@ -432,6 +432,32 @@ struct LabelCandidate {
     upstream_ref: UpstreamRef,
 }
 
+/// Read-only handles and per-product config threaded through the per-item
+/// reconcile helpers ([`reconcile_existing`], [`import_new`]). Bundling
+/// these keeps the helper signatures under clippy's argument-count
+/// threshold and avoids repeating the same handle list at every call site.
+#[derive(bon::Builder)]
+struct ProductReconcileCtx<'a> {
+    work_db: &'a WorkDb,
+    tracker: &'a dyn ExternalTracker,
+    ctx: &'a TrackerContext,
+    product_id: &'a str,
+    reverse_close: bool,
+    in_progress_column: &'a str,
+    metrics: &'a Registry,
+    publisher: &'a dyn WorkInvalidationPublisher,
+}
+
+/// Mutable accumulators for the deferred upstream API calls a reconcile pass
+/// queues (close, in-progress move, label-add). Populated per item, then
+/// drained after the Boss-side SQL for the whole product has committed.
+#[derive(Default)]
+struct ReconcileCandidates {
+    close: Vec<CloseCandidate>,
+    in_progress: Vec<InProgressCandidate>,
+    label: Vec<LabelCandidate>,
+}
+
 async fn process_product(
     work_db: &WorkDb,
     tracker: &dyn ExternalTracker,
@@ -544,9 +570,17 @@ async fn process_product(
     // Canonical-ids already known in Boss (active OR previously unbound).
     let known_canonical_ids: HashSet<&str> = existing.iter().map(|(_, r)| r.canonical_id.as_str()).collect();
 
-    let mut close_candidates: Vec<CloseCandidate> = Vec::new();
-    let mut in_progress_candidates: Vec<InProgressCandidate> = Vec::new();
-    let mut label_candidates: Vec<LabelCandidate> = Vec::new();
+    let rctx = ProductReconcileCtx {
+        work_db,
+        tracker,
+        ctx,
+        product_id,
+        reverse_close,
+        in_progress_column: &in_progress_column,
+        metrics,
+        publisher,
+    };
+    let mut candidates = ReconcileCandidates::default();
 
     // ── 3. Reconcile each upstream item ───────────────────────────────────────
     for item in &upstream_items {
@@ -554,21 +588,7 @@ async fn process_product(
 
         match work_db.find_by_external_ref(&item.upstream_ref.kind, canonical_id) {
             Ok(Some(task)) => {
-                reconcile_existing(
-                    work_db,
-                    &task,
-                    item,
-                    reverse_close,
-                    &in_progress_column,
-                    &mut close_candidates,
-                    &mut in_progress_candidates,
-                    &mut label_candidates,
-                    outcome,
-                    metrics,
-                    product_id,
-                    publisher,
-                )
-                .await;
+                reconcile_existing(&rctx, &task, item, &mut candidates, outcome).await;
             }
             Ok(None) => {
                 if known_canonical_ids.contains(canonical_id.as_str()) {
@@ -592,21 +612,7 @@ async fn process_product(
                         // Now the row is active; reconcile normally.
                         match work_db.find_by_external_ref(&stored_ref.kind, &stored_ref.canonical_id) {
                             Ok(Some(task)) => {
-                                reconcile_existing(
-                                    work_db,
-                                    &task,
-                                    item,
-                                    reverse_close,
-                                    &in_progress_column,
-                                    &mut close_candidates,
-                                    &mut in_progress_candidates,
-                                    &mut label_candidates,
-                                    outcome,
-                                    metrics,
-                                    product_id,
-                                    publisher,
-                                )
-                                .await;
+                                reconcile_existing(&rctx, &task, item, &mut candidates, outcome).await;
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -615,7 +621,7 @@ async fn process_product(
                         }
                     }
                 } else {
-                    import_new(work_db, tracker, ctx, product_id, item, outcome, metrics, publisher).await;
+                    import_new(&rctx, item, outcome).await;
                 }
             }
             Err(e) => {
@@ -669,7 +675,7 @@ async fn process_product(
     // ── 5. Issue close calls post-commit (Behavior 5 and Behavior 3) ──────────
     // Cap at 20 per tick to avoid saturating the rate-limit window.
     const CLOSE_BUDGET: usize = 20;
-    for candidate in close_candidates.into_iter().take(CLOSE_BUDGET) {
+    for candidate in candidates.close.into_iter().take(CLOSE_BUDGET) {
         let is_b3 = matches!(candidate.trigger, CloseTrigger::ReverseClose);
         match tracker
             .close_issue(ctx, &candidate.upstream_ref, CloseReason::Completed)
@@ -783,7 +789,7 @@ async fn process_product(
     // item's project column is not already at the configured in-progress value.
     // Cap at 20 per tick to match the close-candidates budget.
     const IN_PROGRESS_BUDGET: usize = 20;
-    for candidate in in_progress_candidates.into_iter().take(IN_PROGRESS_BUDGET) {
+    for candidate in candidates.in_progress.into_iter().take(IN_PROGRESS_BUDGET) {
         match tracker.set_project_status(ctx, &candidate.upstream_ref).await {
             Ok(()) => {
                 IN_PROGRESS_SET_SUCCEEDED.inc(metrics);
@@ -812,7 +818,7 @@ async fn process_product(
     // bug) are re-attempted on every reconcile pass until the label is confirmed
     // present in the upstream fetch. Cap at 20 to match other budgets.
     const LABEL_BUDGET: usize = 20;
-    for candidate in label_candidates.into_iter().take(LABEL_BUDGET) {
+    for candidate in candidates.label.into_iter().take(LABEL_BUDGET) {
         match tracker.add_label(ctx, &candidate.upstream_ref, TRACKED_LABEL).await {
             Ok(()) => {
                 TRACKED_LABEL_ATTACH_SUCCEEDED.inc(metrics);
@@ -856,19 +862,27 @@ async fn process_product(
 ///   the initial import-time attach failed.
 /// - Always bumps `external_ref_synced_at`.
 async fn reconcile_existing(
-    work_db: &WorkDb,
+    rctx: &ProductReconcileCtx<'_>,
     task: &boss_protocol::Task,
     upstream: &UpstreamItem,
-    reverse_close: bool,
-    in_progress_column: &str,
-    close_candidates: &mut Vec<CloseCandidate>,
-    in_progress_candidates: &mut Vec<InProgressCandidate>,
-    label_candidates: &mut Vec<LabelCandidate>,
+    candidates: &mut ReconcileCandidates,
     outcome: &mut PassOutcome,
-    metrics: &Registry,
-    product_id: &str,
-    publisher: &dyn WorkInvalidationPublisher,
 ) {
+    let &ProductReconcileCtx {
+        work_db,
+        reverse_close,
+        in_progress_column,
+        metrics,
+        product_id,
+        publisher,
+        ..
+    } = rctx;
+    let ReconcileCandidates {
+        close: close_candidates,
+        in_progress: in_progress_candidates,
+        label: label_candidates,
+    } = candidates;
+
     let work_item_id = &task.id;
 
     // Behavior 4: attach a PR URL if the boss row currently has none.
@@ -1089,16 +1103,17 @@ async fn reconcile_existing(
 /// Skip if the item is already `Closed` at first sight (bootstrap rule from
 /// Design Q7: turning on a binding must not flood Boss with historic closed
 /// issues).
-async fn import_new(
-    work_db: &WorkDb,
-    tracker: &dyn ExternalTracker,
-    ctx: &TrackerContext,
-    product_id: &str,
-    upstream: &UpstreamItem,
-    outcome: &mut PassOutcome,
-    metrics: &Registry,
-    publisher: &dyn WorkInvalidationPublisher,
-) {
+async fn import_new(rctx: &ProductReconcileCtx<'_>, upstream: &UpstreamItem, outcome: &mut PassOutcome) {
+    let &ProductReconcileCtx {
+        work_db,
+        tracker,
+        ctx,
+        product_id,
+        metrics,
+        publisher,
+        ..
+    } = rctx;
+
     // Bootstrap rule: skip items that are already closed.
     if matches!(upstream.status, UpstreamStatus::Closed { .. }) {
         SKIPPED_CLOSED_AT_FIRST_SIGHT.inc(metrics);

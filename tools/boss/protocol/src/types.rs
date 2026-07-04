@@ -1501,6 +1501,30 @@ pub struct CreateRunInput {
     pub transcript_path: Option<String>,
 }
 
+/// Everything needed to finish the active run of an execution in one atomic
+/// DB transaction (see `WorkDb::finish_execution_run`): the execution's new
+/// status, the run's terminal status and result/error text, whether to clear
+/// the workspace lease columns, and an optional execution-scoped attention
+/// item to file. Bundled into a builder-constructed input so the DB method
+/// stays under clippy's argument-count threshold, mirroring `CreateRunInput`.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FinishExecutionRunInput {
+    pub execution_id: String,
+    pub run_id: String,
+    pub execution_status: ExecutionStatus,
+    pub run_status: String,
+    pub result_summary: Option<String>,
+    pub error_text: Option<String>,
+    /// Null the `cube_lease_id` / `cube_workspace_id` / `workspace_path`
+    /// columns as part of finishing. Defaults to `false` (leave the lease
+    /// intact) — only terminal/failure paths that release the workspace set
+    /// this.
+    #[builder(default)]
+    pub clear_workspace_lease: bool,
+    pub attention: Option<CreateAttentionItemInput>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateTaskInput {

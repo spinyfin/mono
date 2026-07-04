@@ -2847,7 +2847,8 @@ mod tests {
     use crate::test_support::*;
     use crate::work::{
         AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateChoreInput, CreateCommentInput,
-        CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch,
+        CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput, WorkDb,
+        WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -6305,14 +6306,12 @@ mod tests {
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
             .unwrap();
         db.finish_execution_run(
-            &exec.id,
-            &run.id,
-            ExecutionStatus::WaitingHuman,
-            "completed",
-            None,
-            None,
-            false,
-            None,
+            FinishExecutionRunInput::builder()
+                .execution_id(&exec.id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
         )
         .unwrap();
         // Simulate orphan sweep abandoning exec_A.
