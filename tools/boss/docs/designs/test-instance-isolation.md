@@ -141,15 +141,15 @@ If (c), it cascades into: does cube need per-repo lease pools too? Today repos a
 
 ### Q2. Cube lease accounting
 
-Cube has no concept of "owner engine"; both engines lease from the same pool. **Stakes:** if production needs 8 workers and the test instance has 4 leased, production starves on `cube workspace lease` calls until the test instance releases.
+Cube has no concept of "owner engine"; both engines lease from the same registry. **Stakes:** cube workspaces are provisioned on demand — `cube workspace lease` always succeeds by growing the set on demand, so production can never starve on lease calls just because the test instance holds some. The real shared costs are disk (each leased workspace is a full checkout plus build artifacts) and lease-list legibility (`cube workspace list` mixes both engines' leases, making it harder for a human to tell at a glance who holds what).
 
 Options:
 
-- Cap the test instance worker pool at, say, 2 (`BOSS_WORKER_POOL_SIZE=2`).
-- Add an `--owner-tag` to cube leases so a human can see who holds what (cube change, not Boss change). Doesn't solve starvation but improves diagnostics.
-- Tagged pools per-profile (test profile sees only workspaces in pool `test`). Cube refactor; out of scope unless the contention is real.
+- Cap the test instance worker pool at, say, 2 (`BOSS_WORKER_POOL_SIZE=2`) to bound its disk footprint and machine load, not to avoid starvation.
+- Add an `--owner-tag` to cube leases so a human can see who holds what (cube change, not Boss change) — improves diagnostics and lease-list legibility.
+- Tagged pools per-profile (test profile sees only workspaces tagged `test`). Cube refactor; out of scope unless disk pressure or lease-list confusion becomes a real problem.
 
-Decision: probably accept contention + cap test pool size. Bias toward the simplest answer until it bites.
+Decision: cap the test worker pool size for disk/machine-load reasons. Bias toward the simplest answer until it bites.
 
 ### Q3. Crash recovery cross-talk
 
@@ -187,7 +187,6 @@ In rough order of "I don't have an obvious answer":
 2. **macOS `UserDefaults` migration.** Mechanically straightforward — every `UserDefaults.standard` becomes `defaults` injected via a helper — but it's a wide diff that touches a lot of files. Easy to miss a callsite and have one preference silently bleed across profiles. Mitigation: lint rule (grep) that fails CI if `UserDefaults.standard` reappears outside the helper.
 3. **Profile awareness in the dispatch viewer window state.** If the user is running both profiles simultaneously, do they want one dispatch viewer per engine? Two viewers on screen at once is the obvious answer; that means viewer visibility key (`Self.visibilityDefaultsKey`) must be per-profile so opening test's viewer doesn't toggle production's UI. Phase 4 handles this once `UserDefaults` is profile-aware.
 4. **Diagnosing "wrong instance" mistakes.** A bossctl invocation with `BOSS_PROFILE` unset will hit production even if the user thought they were debugging test. The `bossctl env` verb proposed in Phase 2 is a partial mitigation. Stronger: refuse to start the engine without an explicit profile (production = `BOSS_PROFILE=prod`). That's a bigger breaking change and probably not worth it.
-5. **Cube workspace contention under load (Q2).** Unknown until both instances are running concurrently. Won't surface until it does. Plan to live with it; cap test pool size as a precaution.
 
 ## 6. Out of scope (for the design phase)
 

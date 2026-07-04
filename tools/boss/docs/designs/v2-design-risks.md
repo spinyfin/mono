@@ -454,6 +454,10 @@ Boss-engine calls `cube workspace release`.
 Pool size: at least `worker_count + headroom` per repo. With 8 workers,
 12 workspaces per repo is a reasonable starting size.
 
+> **Superseded:** `cube workspace lease` auto-creates a workspace on demand
+> whenever none is free, so pool size is not a tunable — there is no
+> pre-sizing step and nothing to run out of.
+
 ### Decisive unknowns
 
 1. **Cube readiness.** ~1700 LOC exists but functional coverage of the

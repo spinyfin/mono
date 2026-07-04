@@ -12,8 +12,9 @@ candidates for work, not aspirations.
 What works (current `main`):
 
 - `cube repo add` / `list` / `info`
-- `cube workspace lease` (single-pool, no auto-create) — runs the
-  setup engine after reset; per-repo `flock` serialises lease/release
+- `cube workspace lease` (auto-creates a workspace on demand when none is
+  free) — runs the setup engine after reset; per-repo `flock` serialises
+  lease/release
 - `cube workspace release` (resets via `jj git fetch && jj new main`)
 - `cube workspace status` (delegates to `jj status`)
 - `cube workspace setup` — re-runs `<workspace>/.cube/setup.yaml`

@@ -603,9 +603,9 @@ Returns an empty list. Same shape as any other filter that matches nothing.
 
 Cube returns an error from `ensure_repo` or `lease_workspace`. The engine's existing error path (`coordinator.rs:783` — _"cube workspace lease failed; marking execution start as failed"_) catches it. The work item moves to a failure state with the cube error verbatim. The user diagnoses and updates the override.
 
-### Multi-repo product where one repo's pool exhausts
+### Multi-repo product where one repo's lease fails
 
-Cube's per-repo workspace count caps per repo, not per product. A multi-repo product whose one repo has a depleted pool sees that repo's work items queued at `ready` while other repos' work items dispatch normally. This is correct — the cap is a per-repo resource concern.
+There is no per-repo workspace cap — `cube workspace lease` provisions a new workspace on demand whenever none is free, so a repo never runs out. What can legitimately fail per-repo is a real cube fault (that repo isn't registered, its remote is unreachable, or a clone fails). A multi-repo product whose one repo hits such a fault sees that repo's work items queued at `ready` (or marked failed with cube's error) while other repos' work items dispatch normally, since dispatch resolves each item's repo independently. This is correct — repo reachability is a per-repo concern, not a shared capacity constraint.
 
 ---
 

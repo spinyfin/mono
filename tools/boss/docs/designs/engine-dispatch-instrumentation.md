@@ -6,8 +6,11 @@ Chore `task_18ad7731f2f64e68_7` was created with `autostart=true` but never
 bound to a worker. The human dragged the kanban card into Doing — `tasks.status`
 flipped to `'active'`, but no dispatch happened. An explicit
 `bossctl work start` produced a `ready` execution that still didn't bind to a
-slot. The cube pool was healthy (12+ free `mono` workspaces), so the failure
-was inside Boss's dispatch pipeline rather than at the cube boundary.
+slot. `cube workspace lease` calls were succeeding normally — leases succeeding
+is the health signal; a free-workspace count is never evidence either way,
+since cube provisions a fresh workspace on demand whenever none is free.
+So the failure was inside Boss's dispatch pipeline rather than at the
+cube boundary.
 
 Every observable surface the operator could read — kanban status, `bossctl
 agents list`, `bossctl workspace summary` — gave the _outcome state_ but no
