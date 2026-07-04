@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -151,6 +151,31 @@ pub trait HostAdapter: Send + Sync {
     /// `ssh -R` forward, returning `Ok(true)` on success.
     async fn reattach_events_forward(&self, _run_id: &str, _engine_events_socket: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Probe whether a detached remote worker process is still alive.
+    ///
+    /// Used by the periodic remote-lease reconciler
+    /// ([`crate::remote_lease_reconcile`]) to find `waiting_human` remote
+    /// runs whose worker has died without a `Stop` — the remote analogue
+    /// of the local `lost_workspace_sweep` (a `.exists()`/pid probe on the
+    /// engine host is meaningless for a worker on another machine).
+    ///
+    /// - `Ok(Some(true))` — the process is alive.
+    /// - `Ok(Some(false))` — the process is provably gone (`kill -0`
+    ///   reports no such process). Positive evidence of death: safe to
+    ///   reap + release.
+    /// - `Ok(None)` — not applicable / can't probe (the default and
+    ///   [`LocalHostAdapter`]; a local worker is covered by the local
+    ///   sweeps). Never reaped on this signal.
+    /// - `Err(..)` — the probe round-trip itself failed (host down, ssh
+    ///   error). Inconclusive: callers must NOT treat this as death, or a
+    ///   host outage would mass-reap every live worker on it.
+    ///
+    /// [`SshHostAdapter`] overrides this to run a `kill -0` over its
+    /// `ControlMaster`.
+    async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
+        Ok(None)
     }
 }
 
@@ -317,16 +342,22 @@ impl SshHostAdapter {
             }
         };
         if !output.success() {
-            let detail = if !output.stderr.trim().is_empty() {
-                output.stderr.trim().to_owned()
-            } else if !output.stdout.trim().is_empty() {
-                output.stdout.trim().to_owned()
-            } else {
-                format!("exit status {}", output.status)
+            // Preserve the structured signals (exit code + stderr) in a
+            // typed error so the dispatch-event stream can attribute the
+            // failure, instead of collapsing them into a lossy string.
+            // `SshTransport` reports `-1` when it couldn't read a code
+            // (e.g. the remote command was killed by a signal).
+            let err = crate::cube_commands::CubeCliError {
+                host: self.transport.host_id.clone(),
+                exit_code: (output.status != -1).then_some(output.status),
+                stderr: output.stderr.clone(),
+                stdout: output.stdout.clone(),
             };
-            let message = format!("ssh cube command failed on host {}: {detail}", self.transport.host_id);
-            self.record_host_health_failure(&message);
-            return Err(anyhow!(message));
+            // `Display` reproduces the previous "ssh cube command failed on
+            // host …: <detail>" message, so logs / `error_message` are
+            // unchanged; the typed fields are additive.
+            self.record_host_health_failure(&err.to_string());
+            return Err(err.into());
         }
         // The ssh/cube round trip itself succeeded — record health success
         // here rather than after the JSON decode below, since a malformed
@@ -808,6 +839,17 @@ impl HostAdapter for SshHostAdapter {
             "reattach: re-established reverse events forward for detached remote run",
         );
         Ok(true)
+    }
+
+    async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
+        // Reuse the same `kill -0` probe the spawn-time liveness ack uses,
+        // with no settle (the worker has been running a while). Maps the
+        // probe's `Result<bool>` onto the trait's tri-state: a definite
+        // alive/dead verdict, or an `Err` the reconciler treats as
+        // inconclusive (a mangled probe or a transport failure must never
+        // look like proof of death).
+        let alive = crate::ssh_spawn::probe_worker_liveness(&self.transport, remote_pid, 0).await?;
+        Ok(Some(alive))
     }
 }
 

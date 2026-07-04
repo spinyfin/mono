@@ -33,7 +33,7 @@
 //! parallel SSH session is opened for events vs. exec — they share the
 //! one multiplex, per the task's `ControlMaster`-reuse requirement.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use crate::ssh_transport::{SshOutput, SshTransport};
@@ -53,6 +53,28 @@ pub const REASON_MISSING_GH: &str = "host_missing_gh";
 /// Any other non-zero wrapper exit, or a failure to even establish the
 /// events forward before launch.
 pub const REASON_WORKER_LAUNCH_FAILED: &str = "worker_launch_failed";
+/// The wrapper backgrounded the worker and exited 0, but the worker
+/// process was already gone a moment later — it launched then died
+/// immediately (bad auth, missing config, an instant crash). Without the
+/// post-launch liveness ack this looked like a successful spawn: the run
+/// parked in `waiting_human` forever and its cube lease/workspace
+/// stranded with no terminal event and no redispatch (the anaplian
+/// failure-mode B). Reported as a terminal launch failure so the
+/// coordinator releases the lease and redispatches.
+pub const REASON_WORKER_DIED_IMMEDIATELY: &str = "worker_died_immediately";
+
+// ── Post-launch liveness ack ──────────────────────────────────────────────────
+
+/// How long to let the freshly-`nohup`'d worker settle before the
+/// liveness re-probe. Long enough to catch a worker that dies on
+/// startup, short enough that dispatch latency stays negligible and the
+/// probe finishes well inside the transport's per-command timeout.
+const WORKER_LIVENESS_SETTLE_SECS: u64 = 2;
+
+/// Sentinels the liveness probe echoes so we never mistake arbitrary
+/// remote shell noise for a verdict.
+const LIVENESS_ALIVE_SENTINEL: &str = "BOSS_WORKER_ALIVE";
+const LIVENESS_DEAD_SENTINEL: &str = "BOSS_WORKER_DEAD";
 
 /// Outcome of classifying the wrapper's exit status. `Launched` means
 /// the wrapper validated its contract and backgrounded the worker; it
@@ -299,12 +321,56 @@ pub async fn perform_remote_launch(
     let out = exec.run_with_remote_paths(&argv_refs).await?;
 
     match classify_wrapper_exit(out.status) {
-        WrapperLaunch::Launched => Ok(RemoteLaunchOutcome {
-            launched: true,
-            failure_reason: None,
-            remote_pid: parse_remote_pid(&out.stderr),
-            detail: None,
-        }),
+        WrapperLaunch::Launched => {
+            let remote_pid = parse_remote_pid(&out.stderr);
+            // Liveness ack. Wrapper `exit 0` only means it `nohup`'d the
+            // worker — NOT that the worker survived. Re-probe the reported
+            // pid so a worker that died on startup produces a terminal
+            // failure (→ lease release + redispatch upstream) instead of a
+            // phantom `waiting_human` run holding a leaked lease.
+            if let Some(pid) = remote_pid {
+                match probe_worker_liveness(exec, pid, WORKER_LIVENESS_SETTLE_SECS).await {
+                    // Alive after the settle — a genuine launch.
+                    Ok(true) => {}
+                    // Provably gone: tear down the forward we opened and
+                    // report a terminal launch failure.
+                    Ok(false) => {
+                        let _ = exec
+                            .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
+                            .await;
+                        return Ok(RemoteLaunchOutcome {
+                            launched: false,
+                            failure_reason: Some(REASON_WORKER_DIED_IMMEDIATELY),
+                            remote_pid: Some(pid),
+                            detail: Some(format!(
+                                "worker pid {pid} was not alive {WORKER_LIVENESS_SETTLE_SECS}s after launch \
+                                 (claude exited immediately; inspect {}/.boss/worker.log on the remote host)",
+                                plan.workspace_path,
+                            )),
+                        });
+                    }
+                    // Probe round-trip failed — inconclusive. Keep the
+                    // launch (never fail a healthy spawn on a probe
+                    // hiccup); the periodic remote-lease reconciler
+                    // re-checks liveness and reaps a truly-dead worker.
+                    Err(err) => {
+                        tracing::warn!(
+                            host_id = exec.host_id(),
+                            worker_pid = pid,
+                            error = %format!("{err:#}"),
+                            "remote spawn: post-launch worker liveness probe was inconclusive; \
+                             keeping the launch (reconciler will re-check)",
+                        );
+                    }
+                }
+            }
+            Ok(RemoteLaunchOutcome {
+                launched: true,
+                failure_reason: None,
+                remote_pid,
+                detail: None,
+            })
+        }
         WrapperLaunch::Failed(reason) => {
             // 4. Don't leak the forward when the launch itself failed.
             let _ = exec
@@ -317,6 +383,44 @@ pub async fn perform_remote_launch(
                 detail: Some(non_empty_detail(&out, "wrapper exited non-zero")),
             })
         }
+    }
+}
+
+/// Re-probe a just-launched remote worker's liveness over the master.
+///
+/// Runs one remote shell that settles for `settle_secs`, then `kill -0`s
+/// the worker pid and echoes an unambiguous sentinel — so a dead worker
+/// (`Ok(false)`) is distinguished from a live one (`Ok(true)`) without
+/// re-parsing arbitrary shell output. A transport failure (the ssh probe
+/// itself failing to run) surfaces as `Err`; callers treat that as
+/// inconclusive rather than proof of death, so a probe hiccup never
+/// falsely reaps a healthy worker.
+///
+/// Reused by the periodic remote-lease reconciler
+/// ([`crate::remote_lease_reconcile`]) with `settle_secs = 0` to check
+/// whether a still-`waiting_human` remote worker's process is alive.
+pub(crate) async fn probe_worker_liveness(exec: &dyn SshExec, worker_pid: i64, settle_secs: u64) -> Result<bool> {
+    // `worker_pid` is an integer parsed from the wrapper handshake, so it
+    // carries no shell metacharacters — interpolating it is safe.
+    let script = format!(
+        "sleep {settle_secs}; if kill -0 {worker_pid} 2>/dev/null; then echo {LIVENESS_ALIVE_SENTINEL}; \
+         else echo {LIVENESS_DEAD_SENTINEL}; fi"
+    );
+    let out = exec.run_shell(&script).await?;
+    if out.stdout.contains(LIVENESS_ALIVE_SENTINEL) {
+        Ok(true)
+    } else if out.stdout.contains(LIVENESS_DEAD_SENTINEL) {
+        Ok(false)
+    } else {
+        // Neither sentinel present — the probe shell itself misbehaved
+        // (no `sh`, output swallowed, …). Inconclusive: surface as an
+        // error so the caller keeps the launch and the reconciler
+        // adjudicates later, rather than reaping on a mangled probe.
+        Err(anyhow!(
+            "worker liveness probe returned no sentinel (status {}, stderr {:?})",
+            out.status,
+            out.stderr.trim()
+        ))
     }
 }
 
@@ -480,14 +584,32 @@ mod tests {
         CancelForward { remote: String, local: String },
     }
 
+    /// What the stubbed liveness probe (`run_shell` with a `kill -0`
+    /// script) reports back.
+    #[derive(Clone, Copy)]
+    enum LivenessStub {
+        /// Echo the ALIVE sentinel — worker survived the settle.
+        Alive,
+        /// Echo the DEAD sentinel — worker was gone after the settle.
+        Dead,
+        /// Echo neither sentinel — models a probe that ran but produced
+        /// unreadable output (inconclusive; the launch is kept).
+        NoSentinel,
+        /// The transport itself errors — models the ssh probe failing to
+        /// run at all (also inconclusive).
+        TransportError,
+    }
+
     /// Stubbed transport: records every call and returns a canned exit
     /// status for the wrapper-launch `run` (the one whose argv[0] ==
-    /// "env"). Forward add succeeds unless `fail_forward` is set.
+    /// "env"). Forward add succeeds unless `fail_forward` is set. The
+    /// liveness probe (`run_shell`) reports `liveness`.
     struct FakeExec {
         calls: Mutex<Vec<Call>>,
         wrapper_exit: i32,
         wrapper_stderr: String,
         fail_forward: bool,
+        liveness: LivenessStub,
     }
 
     impl FakeExec {
@@ -497,7 +619,14 @@ mod tests {
                 wrapper_exit,
                 wrapper_stderr: wrapper_stderr.to_owned(),
                 fail_forward: false,
+                // Default: a spawned worker is alive, so the happy path
+                // exercises the real "alive" branch of the liveness ack.
+                liveness: LivenessStub::Alive,
             }
+        }
+        fn with_liveness(mut self, liveness: LivenessStub) -> Self {
+            self.liveness = liveness;
+            self
         }
         fn calls(&self) -> Vec<Call> {
             self.calls.lock().unwrap().clone()
@@ -530,6 +659,28 @@ mod tests {
         }
         async fn run_shell(&self, script: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::Run(vec![script.to_owned()]));
+            // The only `run_shell` on the launch path is the liveness
+            // probe (`kill -0`). Report the canned verdict.
+            if script.contains("kill -0") {
+                return match self.liveness {
+                    LivenessStub::Alive => Ok(SshOutput {
+                        status: 0,
+                        stdout: format!("{LIVENESS_ALIVE_SENTINEL}\n"),
+                        stderr: String::new(),
+                    }),
+                    LivenessStub::Dead => Ok(SshOutput {
+                        status: 0,
+                        stdout: format!("{LIVENESS_DEAD_SENTINEL}\n"),
+                        stderr: String::new(),
+                    }),
+                    LivenessStub::NoSentinel => Ok(SshOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                    LivenessStub::TransportError => Err(anyhow!("ssh probe transport failure")),
+                };
+            }
             Ok(SshOutput {
                 status: 0,
                 stdout: String::new(),
@@ -643,6 +794,94 @@ mod tests {
             c,
             Call::Run(argv) if argv.first().map(String::as_str) == Some("env")
         )));
+    }
+
+    #[tokio::test]
+    async fn worker_dead_after_launch_reports_died_immediately_and_cancels_forward() {
+        // Wrapper exit 0 with a pid, but the worker is already gone at the
+        // liveness re-probe (failure-mode B: launched then died instantly).
+        // This MUST become a terminal launch failure — not a phantom
+        // success — and tear down the forward so it doesn't leak.
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
+            .with_liveness(LivenessStub::Dead);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.launched,
+            "a worker that died at the ack must not count as launched"
+        );
+        assert_eq!(outcome.failure_reason, Some(REASON_WORKER_DIED_IMMEDIATELY));
+        assert_eq!(
+            outcome.remote_pid,
+            Some(4242),
+            "the dead pid is surfaced for diagnostics"
+        );
+        assert!(outcome.detail.unwrap().contains("4242"));
+        // The forward opened before the (failed) launch is torn down.
+        assert!(exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));
+    }
+
+    #[tokio::test]
+    async fn worker_alive_after_launch_is_a_genuine_launch() {
+        // The ack confirms the worker survived the settle → launched.
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=99\n")
+            .with_liveness(LivenessStub::Alive);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+
+        assert!(outcome.launched);
+        assert_eq!(outcome.failure_reason, None);
+        assert_eq!(outcome.remote_pid, Some(99));
+        // A live worker's forward must persist — no cancel.
+        assert!(!exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));
+        // The liveness probe actually ran.
+        assert!(
+            exec.calls()
+                .iter()
+                .any(|c| matches!(c, Call::Run(argv) if argv.first().is_some_and(|s| s.contains("kill -0")))),
+            "the liveness ack must issue a kill -0 probe",
+        );
+    }
+
+    #[tokio::test]
+    async fn inconclusive_liveness_probe_keeps_the_launch() {
+        // A probe that produces no verdict (mangled output OR a transport
+        // failure) must NOT fail a spawn — that would false-negative a
+        // healthy worker. The launch is kept; the reconciler re-checks.
+        for stub in [LivenessStub::NoSentinel, LivenessStub::TransportError] {
+            let exec =
+                FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=7\n").with_liveness(stub);
+            let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+                .await
+                .unwrap();
+            assert!(outcome.launched, "an inconclusive probe must keep the launch");
+            assert_eq!(outcome.failure_reason, None);
+            assert_eq!(outcome.remote_pid, Some(7));
+            assert!(!exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_pid_in_handshake_skips_the_liveness_probe() {
+        // Without a parsed pid there is nothing to `kill -0`; the launch
+        // is kept as before (conservative — the reconciler is the backstop)
+        // and no probe is issued.
+        let exec = FakeExec::new(0, "boss-remote-run: starting (no pid line)\n").with_liveness(LivenessStub::Dead);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+        assert!(outcome.launched);
+        assert_eq!(outcome.remote_pid, None);
+        assert!(
+            !exec
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Run(argv) if argv.first().is_some_and(|s| s.contains("kill -0")))),
+            "no pid → no liveness probe",
+        );
     }
 
     #[tokio::test]

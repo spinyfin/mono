@@ -13,6 +13,7 @@
 //! here as free functions generic over a [`CubeJsonTransport`], and the two
 //! `impl` blocks become thin wrappers that delegate to these helpers.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,77 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus};
+
+/// A failed `cube` CLI invocation that preserves the structured signals a
+/// post-mortem needs — the process exit code and the captured
+/// stderr/stdout — instead of collapsing them into an opaque string.
+///
+/// Motivation (the anaplian failure-mode A): a remote `cube workspace
+/// lease` GRANTED the lease, then a post-lease setup step exited non-zero;
+/// the engine surfaced this only as `reason: "cube_error"` in the dispatch
+/// stream, so the real cause (`setup step copy-config-secrets failed …`)
+/// was flattened into a free-text `error_message` an operator had to dig
+/// out with `dispatch diagnose`. The remote SSH adapter returns this typed
+/// error on any non-zero cube exit; the `cube_workspace_lease_failed` emit
+/// sites downcast to it and copy `exit_code`/`stderr` straight into the
+/// event `details`, so the next remote-host failure is attributable in one
+/// read.
+#[derive(Debug, Clone)]
+pub struct CubeCliError {
+    /// Host the cube command ran on (`"local"` or a remote host id).
+    pub host: String,
+    /// Cube's process exit code, or `None` when the process was killed by
+    /// a signal / the transport could not determine one.
+    pub exit_code: Option<i32>,
+    /// Captured stderr (may be empty).
+    pub stderr: String,
+    /// Captured stdout (may be empty).
+    pub stdout: String,
+}
+
+impl CubeCliError {
+    /// The single-line human detail: trimmed stderr, else trimmed stdout,
+    /// else a synthetic exit-status clause. Matches the message the SSH
+    /// adapter historically built so `error_message` and logs are byte
+    /// identical after this change.
+    pub fn detail(&self) -> String {
+        let stderr = self.stderr.trim();
+        if !stderr.is_empty() {
+            return stderr.to_owned();
+        }
+        let stdout = self.stdout.trim();
+        if !stdout.is_empty() {
+            return stdout.to_owned();
+        }
+        match self.exit_code {
+            Some(code) => format!("exit status {code}"),
+            None => "exit status unknown (killed by signal?)".to_owned(),
+        }
+    }
+
+    /// Trimmed stderr clipped to at most `max` bytes (on a char boundary)
+    /// for embedding in a dispatch-event `details` object without bloating
+    /// the JSONL when a remote step dumps a large trace.
+    pub fn clipped_stderr(&self, max: usize) -> String {
+        let stderr = self.stderr.trim();
+        if stderr.len() <= max {
+            return stderr.to_owned();
+        }
+        let mut end = max;
+        while end > 0 && !stderr.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… (clipped)", &stderr[..end])
+    }
+}
+
+impl fmt::Display for CubeCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ssh cube command failed on host {}: {}", self.host, self.detail())
+    }
+}
+
+impl std::error::Error for CubeCliError {}
 
 /// A transport capable of running a `cube` invocation that emits JSON on
 /// stdout and returning the parsed value.
@@ -105,7 +177,22 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     allow_dirty: bool,
     exclude_workspace_ids: &[&str],
 ) -> Result<CubeWorkspaceLease> {
-    let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
+    // `--release-on-setup-failure`: the engine never wants a lease left
+    // stranded when a post-lease setup step exits non-zero (the anaplian
+    // failure-mode A leak — the engine treats the non-zero exit as a lease
+    // failure and never learns the lease id to release it). With this flag
+    // cube hands the workspace back before returning the setup error, so a
+    // remote-host setup failure surfaces as a clean lease failure with
+    // nothing leaked.
+    let mut args: Vec<&str> = vec![
+        "--json",
+        "workspace",
+        "lease",
+        repo_id,
+        "--task",
+        task,
+        "--release-on-setup-failure",
+    ];
     if let Some(prefer) = prefer_workspace_id {
         args.extend_from_slice(&["--prefer", prefer]);
     }

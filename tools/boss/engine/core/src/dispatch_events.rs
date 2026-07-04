@@ -269,6 +269,17 @@ pub enum Stage {
     /// operator can see how long the lease had been failing before the
     /// auto-reap fired.
     CubeLeaseAutoReap,
+    /// The periodic remote-lease reconciler ([`crate::remote_lease_reconcile`])
+    /// found a still-`waiting_human`/`running` execution on a remote SSH host
+    /// whose worker process was provably gone (a `kill -0` over the host's
+    /// `ControlMaster` reported no such process), reaped the execution through
+    /// the terminal `mark_execution_orphaned` path, and force-released its cube
+    /// lease on the remote so the stranded workspace (and its multi-GB clone)
+    /// is reclaimed. This is the cross-host analogue of `lost_workspace_reconcile`
+    /// (a local `.exists()`/pid probe is meaningless for a remote worker). The
+    /// `details` object carries `prior_status`, the `remote_pid`, and the
+    /// reap `reason` so the strand is diagnosable from `bossctl dispatch tail`.
+    RemoteLeaseReconcile,
 }
 
 impl Stage {
@@ -302,6 +313,7 @@ impl Stage {
             Stage::CubeLeaseHeartbeat => "cube_lease_heartbeat",
             Stage::LostWorkspaceReconcile => "lost_workspace_reconcile",
             Stage::CubeLeaseAutoReap => "cube_lease_auto_reap",
+            Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
         }
     }
 }
@@ -802,6 +814,7 @@ mod tests {
         assert_eq!(Stage::CubeLeaseHeartbeat.as_str(), "cube_lease_heartbeat");
         assert_eq!(Stage::LostWorkspaceReconcile.as_str(), "lost_workspace_reconcile");
         assert_eq!(Stage::CubeLeaseAutoReap.as_str(), "cube_lease_auto_reap");
+        assert_eq!(Stage::RemoteLeaseReconcile.as_str(), "remote_lease_reconcile");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

@@ -68,6 +68,7 @@ pub mod pr_review;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod recovery_backup;
+pub mod remote_lease_reconcile;
 pub mod remote_reattach;
 pub mod remote_transcript;
 pub mod remote_wrapper;

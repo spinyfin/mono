@@ -111,6 +111,17 @@ pub enum WorkspaceCommand {
         /// cannot livelock a dispatch loop.
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
+        /// On a post-lease setup-step failure, release the lease before
+        /// returning the error instead of retaining the workspace for
+        /// `cube workspace setup` repair. The Boss engine passes this so an
+        /// ambiguous "lease granted, then a setup step exited non-zero"
+        /// (e.g. a missing non-git secrets file on a remote host) surfaces
+        /// as a clean lease failure with NOTHING left leased — never a
+        /// stranded workspace the caller can't release because it never
+        /// learned the lease id. Interactive callers omit it and keep the
+        /// retain-for-repair default.
+        #[arg(long)]
+        release_on_setup_failure: bool,
     },
     /// Release a workspace lease.
     ///
@@ -643,6 +654,43 @@ mod tests {
                 assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
                 assert!(allow_dirty);
             }
+            _ => panic!("expected workspace lease command"),
+        }
+    }
+
+    #[test]
+    fn workspace_lease_release_on_setup_failure_flag_defaults_off_and_parses() {
+        // Default: retain-for-repair (interactive).
+        let cli = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "t"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Lease {
+                        release_on_setup_failure,
+                        ..
+                    },
+            } => assert!(!release_on_setup_failure, "flag must default off"),
+            _ => panic!("expected workspace lease command"),
+        }
+
+        // Opt-in (the engine's fail-closed lease).
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "t",
+            "--release-on-setup-failure",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Lease {
+                        release_on_setup_failure,
+                        ..
+                    },
+            } => assert!(release_on_setup_failure, "flag must parse when passed"),
             _ => panic!("expected workspace lease command"),
         }
     }

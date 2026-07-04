@@ -936,6 +936,7 @@ fn run_workspace(
             prefer,
             allow_dirty,
             exclude,
+            release_on_setup_failure,
         } => {
             let repo_record = store
                 .get_repo(&repo)?
@@ -1591,13 +1592,42 @@ fn run_workspace(
             );
 
             if let Some(failure) = setup_report.first_failure() {
-                // Lease is intentionally retained: the workspace is leased
-                // but its setup needs repair (`cube workspace setup`) or
-                // explicit release. The error surfaces the failed step so
-                // callers can decide how to recover.
                 let StepStatus::Failed { error } = &failure.status else {
                     unreachable!("first_failure returned non-failure step");
                 };
+                if release_on_setup_failure {
+                    // Fail-closed for the engine (the anaplian failure-mode A
+                    // leak): a setup failure the caller can't repair must not
+                    // leave a leased-but-unusable workspace stranded — cube
+                    // granted the lease, a setup step exited non-zero, and the
+                    // caller never learned the lease id to release it. Hand the
+                    // workspace straight back (force-release skips the reset;
+                    // the next lease resets and re-runs setup), then surface the
+                    // original setup error with nothing left leased.
+                    match store.force_release_lease(&lease_id, Some("setup_failed")) {
+                        Ok(_) => audit!(
+                            database_path,
+                            "lease.released_on_setup_failure",
+                            repo = workspace.repo,
+                            workspace_id = workspace.workspace_id,
+                            lease_id = lease_id,
+                            failed_step = failure.id,
+                        ),
+                        Err(release_err) => {
+                            // Best-effort: still surface the original setup
+                            // failure even if the compensating release fails,
+                            // but make the release failure visible.
+                            eprintln!(
+                                "warning: failed to release lease {lease_id} after setup step `{}` failed: {release_err}",
+                                failure.id,
+                            );
+                        }
+                    }
+                }
+                // Default (interactive) behavior: the lease is retained so the
+                // workspace can be repaired via `cube workspace setup` or
+                // released explicitly. The error surfaces the failed step so
+                // callers can decide how to recover.
                 return Err(CubeError::SetupStepFailed {
                     step: failure.id.clone(),
                     error: error.clone(),
@@ -12310,6 +12340,83 @@ steps:
         let record = store.get_workspace_by_path(&workspace_path).unwrap().unwrap();
         assert_eq!(record.state, crate::metadata::WorkspaceState::Leased);
         assert!(record.lease_id.is_some());
+    }
+
+    #[test]
+    fn workspace_setup_failure_with_release_flag_releases_lease() {
+        // The engine passes `--release-on-setup-failure` so a setup failure
+        // it can't repair never leaks a leased-but-unusable workspace (the
+        // anaplian failure-mode A). Same failing setup as the retain test,
+        // but the workspace must end up FREE with the lease cleared.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
+        write_setup_yaml(
+            &workspace_path,
+            r#"version: 1
+steps:
+  - id: deps
+    command: pnpm install
+    run_when: always
+"#,
+        );
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let failing = ExpectedCommand {
+            cwd: workspace_path.clone(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "pnpm install".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "pnpm install".to_string()],
+                status: Some(1),
+                stderr: "boom".to_string(),
+            }),
+            creates_dir: None,
+        };
+        let lease_runner = lease_runner_with_setup(&workspace_path, "abc1234", vec![failing]);
+
+        let error = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "demo",
+                "--release-on-setup-failure",
+            ]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect_err("lease should surface setup failure");
+        lease_runner.assert_exhausted();
+        // The original setup error is still surfaced — the flag changes the
+        // lease disposition, not the returned error.
+        match error {
+            CubeError::SetupStepFailed { step, error } => {
+                assert_eq!(step, "deps");
+                assert!(error.contains("pnpm"), "error mentions program: {error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // The lease was released: the workspace is free again and nothing
+        // is stranded (the fix for the leak).
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let record = store.get_workspace_by_path(&workspace_path).unwrap().unwrap();
+        assert_eq!(
+            record.state,
+            crate::metadata::WorkspaceState::Free,
+            "release-on-setup-failure must hand the workspace back",
+        );
+        assert!(
+            record.lease_id.is_none(),
+            "the lease id must be cleared after a released setup failure",
+        );
     }
 
     #[test]

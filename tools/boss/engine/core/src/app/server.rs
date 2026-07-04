@@ -784,6 +784,24 @@ pub async fn serve(
         crate::lost_workspace_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic remote-lease reconciler: the cross-host analogue of the
+    // lost-workspace sweep above. `lost_workspace_sweep` deliberately only
+    // judges LOCAL runs (a `.exists()` probe is meaningless for a workspace
+    // on another machine), so a REMOTE worker that dies without a `Stop`
+    // (it launched then crashed — the anaplian failure-mode B — or was
+    // killed) leaves its execution wedged `waiting_human` (blocking the
+    // redundant-spawn guard so the work item shows "queued" forever) and
+    // its cube lease stranding a remote workspace as unreclaimable waste.
+    // This sweep probes each active remote run's worker pid over the host's
+    // ControlMaster (`kill -0`) and, ONLY on positive evidence of death,
+    // orphans the execution and force-releases the leaked lease on the
+    // REMOTE cube. DB-driven (clears pre-existing strays on boot) and
+    // conservative (a host outage / missing pid never triggers a reap).
+    let _remote_lease_reconcile_handle = crate::remote_lease_reconcile::spawn_loop(
+        server_state.execution_coordinator.clone(),
+        crate::remote_lease_reconcile::DEFAULT_INTERVAL,
+    );
+
     // Periodic stale-worker liveness backstop: detects worker slots whose
     // `claude` process is still alive but has made no transcript progress
     // (no hook event) for longer than the staleness threshold while
