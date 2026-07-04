@@ -874,7 +874,8 @@ mod tests {
     use super::*;
     use crate::coordinator::ExecutionPublisher;
     use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItem, WorkItemPatch};
+    use crate::test_support::*;
+    use crate::work::{CreateChoreInput, WorkDb, WorkItem, WorkItemPatch};
 
     #[derive(Default)]
     struct RecordingPublisher {
@@ -897,16 +898,7 @@ mod tests {
     }
 
     fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: format!("Product-{name}"),
-                description: None,
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()

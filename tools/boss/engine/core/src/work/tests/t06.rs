@@ -9,16 +9,7 @@ use super::*;
 fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
     let path = disk_db_path("ci-retry-resets");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -101,16 +92,7 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
 fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
     let path = disk_db_path("list-engine-attempts");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -203,16 +185,7 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
 fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
     let path = temp_db_path("unblock-clears-blocked-fields");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:example/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -955,17 +928,7 @@ fn create_revision_inherits_repo_remote_url_from_root() {
     // execution dies pre-start with no workspace to lease.
     let db = WorkDb::open(temp_db_path("revision-inherit-repo")).unwrap();
     // Multi-repo product: no product-level repo.
-    let product_id = db
-        .create_product(CreateProductInput {
-            name: "Boss-multirepo".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id;
+    let product_id = create_test_product_with_repo(&db, "Boss-multirepo", None).id;
     let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
     // Root chore carries its own repo override (allowed: product has none).
     let root_chore = db
@@ -1020,17 +983,7 @@ fn create_revision_of_revision_inherits_repo_from_chain_root() {
     // and `insert_revision_in_tx` copies from `root` (the non-revision
     // ancestor that owns the PR), so the whole chain stays repo-aligned.
     let db = WorkDb::open(temp_db_path("revision-of-revision-repo")).unwrap();
-    let product_id = db
-        .create_product(CreateProductInput {
-            name: "Boss-multirepo-chain".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id;
+    let product_id = create_test_product_with_repo(&db, "Boss-multirepo-chain", None).id;
     let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
     let root_chore = db
         .create_chore(

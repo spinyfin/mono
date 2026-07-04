@@ -153,22 +153,10 @@ fn make_schedule_trigger() -> AutomationTrigger {
     }
 }
 
-fn make_product(db: &WorkDb) -> Product {
-    db.create_product(CreateProductInput {
-        name: "Automation Test Co".to_owned(),
-        description: None,
-        repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })
-    .unwrap()
-}
-
 #[test]
 fn create_automation_round_trips() {
     let db = WorkDb::open(temp_db_path("auto-create")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let input = CreateAutomationInput {
         product_id: product.id.clone(),
@@ -205,7 +193,7 @@ fn create_automation_round_trips() {
 #[test]
 fn list_automations_returns_empty_for_new_product() {
     let db = WorkDb::open(temp_db_path("auto-list-empty")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let list = db.list_automations(&product.id).unwrap();
     assert!(list.is_empty());
@@ -214,7 +202,7 @@ fn list_automations_returns_empty_for_new_product() {
 #[test]
 fn list_automations_returns_all_for_product() {
     let db = WorkDb::open(temp_db_path("auto-list")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let a1 = db
         .create_automation(CreateAutomationInput {
@@ -264,7 +252,7 @@ fn get_automation_returns_none_for_unknown_id() {
 #[test]
 fn get_automation_returns_row_by_id() {
     let db = WorkDb::open(temp_db_path("auto-get")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let created = db
         .create_automation(CreateAutomationInput {
@@ -288,7 +276,7 @@ fn get_automation_returns_row_by_id() {
 #[test]
 fn update_automation_applies_patch() {
     let db = WorkDb::open(temp_db_path("auto-update")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -325,7 +313,7 @@ fn update_automation_applies_patch() {
 #[test]
 fn enable_disable_automation() {
     let db = WorkDb::open(temp_db_path("auto-enable-disable")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -351,7 +339,7 @@ fn enable_disable_automation() {
 #[test]
 fn delete_automation_removes_row() {
     let db = WorkDb::open(temp_db_path("auto-delete")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -379,7 +367,7 @@ fn delete_automation_removes_row() {
 #[test]
 fn count_open_tasks_for_automation_zero_when_none() {
     let db = WorkDb::open(temp_db_path("auto-count-zero")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -402,7 +390,7 @@ fn count_open_tasks_for_automation_zero_when_none() {
 #[test]
 fn count_open_tasks_counts_only_open_statuses() {
     let db = WorkDb::open(temp_db_path("auto-count-open")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -460,7 +448,7 @@ fn count_open_tasks_counts_only_open_statuses() {
 #[test]
 fn count_open_tasks_counts_active_as_open() {
     let db = WorkDb::open(temp_db_path("auto-count-active")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
 
     let auto = db
         .create_automation(CreateAutomationInput {
@@ -515,17 +503,8 @@ fn count_open_tasks_counts_active_as_open() {
 #[test]
 fn short_ids_are_allocated_per_product() {
     let db = WorkDb::open(temp_db_path("auto-short-ids")).unwrap();
-    let p1 = make_product(&db);
-    let p2 = db
-        .create_product(CreateProductInput {
-            name: "Second Product".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let p1 = create_test_product_named(&db, "Automation Test Co");
+    let p2 = create_test_product_with_repo(&db, "Second Product", None);
 
     let make = |db: &WorkDb, product_id: &str, name: &str| {
         db.create_automation(CreateAutomationInput {
@@ -574,7 +553,7 @@ fn make_automation(db: &WorkDb, product_id: &str, limit: i64) -> boss_protocol::
 #[test]
 fn create_automation_task_stamps_provenance_and_enforces_cap() {
     let db = WorkDb::open(temp_db_path("auto-task-cap")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 1);
 
     let task = db
@@ -610,7 +589,7 @@ fn create_automation_task_stamps_provenance_and_enforces_cap() {
 #[test]
 fn create_automation_task_respects_higher_cap() {
     let db = WorkDb::open(temp_db_path("auto-task-cap-2")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
     db.create_automation_task(&automation.id, "t1", None).unwrap();
@@ -626,7 +605,7 @@ fn create_automation_task_respects_higher_cap() {
 #[test]
 fn create_automation_triage_execution_binds_to_automation() {
     let db = WorkDb::open(temp_db_path("auto-triage-exec")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 1);
 
     let exec = db
@@ -644,7 +623,7 @@ fn create_automation_triage_execution_binds_to_automation() {
 #[test]
 fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
     let db = WorkDb::open(temp_db_path("auto-triage-finalize")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 1);
     let exec = db
         .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
@@ -718,7 +697,7 @@ fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
 #[test]
 fn find_most_recent_open_task_returns_none_when_no_tasks() {
     let db = WorkDb::open(temp_db_path("auto-find-none")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
     assert!(
         db.find_most_recent_open_task_for_automation(&automation.id)
@@ -731,7 +710,7 @@ fn find_most_recent_open_task_returns_none_when_no_tasks() {
 #[test]
 fn find_most_recent_open_task_returns_open_task() {
     let db = WorkDb::open(temp_db_path("auto-find-one")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
     let task = db.create_automation_task(&automation.id, "fix clippy", None).unwrap();
@@ -748,7 +727,7 @@ fn find_most_recent_open_task_returns_open_task() {
 #[test]
 fn find_most_recent_open_task_ignores_done_tasks() {
     let db = WorkDb::open(temp_db_path("auto-find-done")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
     let task = db.create_automation_task(&automation.id, "already done", None).unwrap();
@@ -775,7 +754,7 @@ fn find_most_recent_open_task_ignores_done_tasks() {
 #[test]
 fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open() {
     let db = WorkDb::open(temp_db_path("auto-find-recent")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
 
     let t1 = db.create_automation_task(&automation.id, "task one", None).unwrap();
@@ -812,7 +791,7 @@ fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open()
 #[test]
 fn find_most_recent_open_task_ignores_deleted_tasks() {
     let db = WorkDb::open(temp_db_path("auto-find-deleted")).unwrap();
-    let product = make_product(&db);
+    let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 2);
 
     let task = db

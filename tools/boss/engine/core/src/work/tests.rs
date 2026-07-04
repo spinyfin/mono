@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::test_support::*;
 /// Returns the `:memory:` sentinel so `WorkDb::open` allocates a
 /// per-test named shared-cache in-memory database. Each call to
 /// `WorkDb::open(PathBuf::from(":memory:"))` gets a unique database;
@@ -96,16 +97,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
 /// Returns `(db, product_id, chore_id)`.
 fn setup_product_and_chore() -> (WorkDb, String, String) {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "TestProduct".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_named(&db, "TestProduct");
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -122,16 +114,7 @@ fn setup_product_and_chore() -> (WorkDb, String, String) {
 /// boilerplate. Returns the project id; the product's repo URL
 /// is the standard `mono` git@ form the rest of the suite uses.
 fn seed_project_for_design_doc(db: &WorkDb) -> (Product, Project) {
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -150,16 +133,7 @@ fn seed_project_for_design_doc(db: &WorkDb) -> (Product, Project) {
 /// product carries the standard `mono` repo so doc resolution has a
 /// repo to fall back to and classifies `SameProduct`.
 fn seed_investigation_for_doc(db: &WorkDb) -> (Product, Task) {
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(db);
     let investigation = db
         .create_investigation(
             boss_protocol::CreateInvestigationInput::builder()
@@ -218,16 +192,7 @@ fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, W
     // can open a second raw connection to the same database file.
     let path = disk_db_path(label);
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: product_repo.map(str::to_owned),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", product_repo);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -284,16 +249,7 @@ fn set_task_repo(db: &WorkDb, task_id: &str, value: Option<&str>) {
 // ── Bug A: double-spawn guard ───────────────────────────────────────────
 
 fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String) {
-    let product = db
-        .create_product(CreateProductInput {
-            name: format!("Prod-{label}"),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(db, &format!("Prod-{label}"), Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -343,16 +299,7 @@ fn make_abandoned_chore_with_workspace(db: &WorkDb, label: &str) -> (String, Str
 
 /// Helper: create a minimal product for revision tests.
 fn make_revision_product(db: &WorkDb, label: &str) -> String {
-    db.create_product(CreateProductInput {
-        name: format!("Boss-{label}"),
-        description: None,
-        repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-        design_repo: None,
-        docs_repo: None,
-        worker_branch_prefix: None,
-    })
-    .unwrap()
-    .id
+    create_test_product_named(db, &format!("Boss-{label}")).id
 }
 
 /// Helper: create a chore (non-revision root) and return its id.

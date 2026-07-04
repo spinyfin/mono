@@ -174,7 +174,8 @@ mod tests {
     use crate::host_adapter::HostAdapter;
     use crate::host_registry::Host;
     use crate::runner::RunOutcome;
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItem};
+    use crate::test_support::*;
+    use crate::work::{CreateChoreInput, WorkDb, WorkItem};
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
     use boss_protocol::{RequestExecutionInput, WorkExecution};
@@ -279,17 +280,7 @@ mod tests {
     }
 
     fn create_chore(db: &WorkDb) -> String {
-        let product = db
-            .create_product(CreateProductInput {
-                name: "p".to_owned(),
-                description: None,
-                repo_remote_url: Some("https://github.com/test/repo".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap()
-            .id;
+        let product = create_test_product_with_repo(db, "p", Some("https://github.com/test/repo")).id;
         db.create_chore(CreateChoreInput::builder().product_id(product).name("c").build())
             .unwrap()
             .id

@@ -5398,6 +5398,7 @@ mod tests {
     use crate::coordinator::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
     };
+    use crate::test_support::*;
 
     #[test]
     fn tail_snippet_collapses_whitespace_and_keeps_tail() {
@@ -5450,9 +5451,7 @@ mod tests {
     }
 
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
-    use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItem,
-    };
+    use crate::work::{CreateChoreInput, CreateExecutionInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItem};
 
     /// Captured arguments from one `detect_pr` call. Tests assert on
     /// these to confirm the branch name passed in is execution-unique
@@ -5751,16 +5750,7 @@ mod tests {
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -5812,16 +5802,7 @@ mod tests {
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7173,16 +7154,7 @@ mod tests {
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         let ws_path = ws.path().to_str().unwrap();
         let (stale_chore, stale_exec) =
@@ -7261,16 +7233,7 @@ mod tests {
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -7477,16 +7440,7 @@ mod tests {
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let description_with_pr_refs = "\
 This is a follow-up to PR #379 (the auto-bind safety net work). \
 See #379 for context. We also referenced #379 in the design doc. \
@@ -7606,16 +7560,7 @@ PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         // Description points at PR #379 repeatedly as prior art. The
         // worker is going to actually create PR #500.
         let description_with_pr_refs = "\
@@ -9274,14 +9219,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss-revision-chain-root-test")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_named(&db, "Boss-revision-chain-root-test");
         let parent = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -9412,14 +9350,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss-revision-no-pr-test")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_named(&db, "Boss-revision-no-pr-test");
         // Parent chore with NO pr_url (never opened a PR).
         let parent = db
             .create_chore(
@@ -9675,16 +9606,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss-late.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -9830,14 +9752,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss-revision-test")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_named(&db, "Boss-revision-test");
         // Parent chore: in_review with a bound pr_url.
         let parent = db
             .create_chore(
@@ -10743,14 +10658,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss-conflict-rev-test")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_named(&db, "Boss-conflict-rev-test");
         // Parent chore: blocked:merge_conflict with a bound pr_url.
         let parent = db
             .create_chore(
@@ -11334,14 +11242,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(
-                CreateProductInput::builder()
-                    .name("Boss-ci-rev-test")
-                    .repo_remote_url("git@github.com:spinyfin/mono.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_named(&db, "Boss-ci-rev-test");
         let parent = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -12394,16 +12295,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
 
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product(&db);
 
         // Producing task — starts active, gets pr_url stamped so the reviewer
         // can find the PR (mirrors what finalize_pr_transition writes on
@@ -13779,16 +13671,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
         let db = Arc::new(WorkDb::open(path).unwrap());
-        let product = db
-            .create_product(CreateProductInput {
-                name: "Satisfied Chore Test".into(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_named(&db, "Satisfied Chore Test");
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()

@@ -447,7 +447,8 @@ mod tests {
 
     use super::*;
     use crate::automation_schedule::next_occurrence_after_str;
-    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb};
+    use crate::test_support::*;
+    use crate::work::{CreateChoreInput, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED, AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT,
         AutomationPatch, AutomationTrigger, CreateAutomationInput,
@@ -496,16 +497,7 @@ mod tests {
     }
 
     fn create_product(db: &WorkDb) -> String {
-        db.create_product(CreateProductInput {
-            name: "test-product".to_owned(),
-            description: None,
-            repo_remote_url: Some("https://github.com/test/repo".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id
+        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
     }
 
     /// Create a daily-2pm-UTC automation. `open_task_limit` default 1.

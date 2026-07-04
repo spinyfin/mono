@@ -2,6 +2,7 @@ use super::super::server::{pid_is_alive, process_group_signal_target};
 use super::super::worker_events::extract_last_assistant_text;
 use super::*;
 
+use crate::test_support::*;
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
     // Our own pid is alive and has a valid process group, so the
@@ -1345,7 +1346,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // This locks in the wire shape a `bossctl probe --wait` (or
     // any other observer) would consume.
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
 
     let server_state = test_server_state();
 
@@ -1353,17 +1354,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // transcript path on disk. Without the run row the engine's
     // dispatch can't resolve a transcript path and would skip
     // emission — that's the production behaviour we want covered.
-    let product = server_state
-        .work_db
-        .create_product(CreateProductInput {
-            name: "p".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:p.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db
         .create_chore(
@@ -1529,22 +1520,12 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 /// first.
 #[tokio::test]
 async fn probe_queued_for_idle_worker_dispatches_immediately() {
-    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
 
     let server_state = test_server_state();
 
     // Minimal DB rows so transcript lookup has something to resolve.
-    let product = server_state
-        .work_db
-        .create_product(CreateProductInput {
-            name: "p".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:p.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db
         .create_chore(
@@ -1648,21 +1629,11 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
 /// immediately — this test locks in that probe delivery now matches.
 #[tokio::test]
 async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
-    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
 
     let server_state = test_server_state();
 
-    let product = server_state
-        .work_db
-        .create_product(CreateProductInput {
-            name: "p".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:p.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db
         .create_chore(
@@ -1768,21 +1739,11 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
 #[tokio::test]
 async fn completion_probe_dispatched_on_same_stop_as_completion() {
     use crate::protocol::WorkerEvent;
-    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+    use boss_protocol::{CreateChoreInput, RequestExecutionInput};
 
     let server_state = test_server_state();
 
-    let product = server_state
-        .work_db
-        .create_product(CreateProductInput {
-            name: "p".into(),
-            description: None,
-            repo_remote_url: Some("git@example.com:p.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&server_state.work_db, "p", Some("git@example.com:p.git"));
     let chore = server_state
         .work_db
         .create_chore(

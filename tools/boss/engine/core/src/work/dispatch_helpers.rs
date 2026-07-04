@@ -1082,6 +1082,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
 
     /// Open a fresh per-test in-memory `WorkDb`. Mirrors the
     /// `temp_db_path` convention in `work/tests.rs`: each
@@ -1093,16 +1094,7 @@ mod tests {
     /// Create a product with the given repo default (or none). Returns
     /// the product id.
     fn product_with_repo(db: &WorkDb, repo: Option<&str>) -> String {
-        db.create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: repo.map(str::to_owned),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id
+        create_test_product_with_repo(db, "Boss", repo).id
     }
 
     /// Raw-insert a task row with full control over `kind` and

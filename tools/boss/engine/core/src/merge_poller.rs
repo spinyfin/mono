@@ -2838,10 +2838,10 @@ mod tests {
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
         ExecutionPublisher,
     };
+    use crate::test_support::*;
     use crate::work::{
         AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateChoreInput, CreateCommentInput,
-        CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb,
-        WorkItem, WorkItemPatch,
+        CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -3006,16 +3006,7 @@ mod tests {
     /// attached — the post-completion shape that the merge poller
     /// must also sweep, not just `kind = 'chore'`.
     fn make_project_task_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: format!("Product-{name}"),
-                description: None,
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
         let project = db
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),
@@ -3049,16 +3040,7 @@ mod tests {
     }
 
     fn make_chore_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: format!("Product-{name}"),
-                description: None,
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()
@@ -6291,16 +6273,7 @@ mod tests {
     }
 
     fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, String, String) {
-        let product = db
-            .create_product(CreateProductInput {
-                name: format!("Prod-{name}"),
-                description: None,
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
-            .unwrap();
+        let product = create_test_product_with_repo(db, &format!("Prod-{name}"), Some("git@github.com:foo/bar.git"));
         let chore = db
             .create_chore(
                 CreateChoreInput::builder()

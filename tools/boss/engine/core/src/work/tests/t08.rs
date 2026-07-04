@@ -7,14 +7,7 @@ use super::*;
 /// Build a product with one project and one task; return their ids.
 fn fixture() -> (WorkDb, String, String, String) {
     let db = WorkDb::open(temp_db_path("attentions")).unwrap();
-    let product = db
-        .create_product(
-            CreateProductInput::builder()
-                .name("Boss")
-                .repo_remote_url("git@github.com:spinyfin/mono.git")
-                .build(),
-        )
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(
             CreateProjectInput::builder()

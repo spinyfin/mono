@@ -318,6 +318,7 @@ fn find_cycle(handles: &HashSet<&str>, edges: &[ProposedEdge]) -> Option<Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
     use boss_protocol::{Confidence, CreateTaskInput, EffortLevel, ProposedTask, TaskKind};
 
     use crate::work::{ClaimPlannerRunInput, WorkDb};
@@ -329,14 +330,7 @@ mod tests {
     }
 
     fn product_and_project(db: &WorkDb) -> (String, String) {
-        let product = db
-            .create_product(
-                boss_protocol::CreateProductInput::builder()
-                    .name("Test")
-                    .repo_remote_url("git@github.com:test/test.git")
-                    .build(),
-            )
-            .unwrap();
+        let product = create_test_product_with_repo(db, "Test", Some("git@github.com:test/test.git"));
         let project = db
             .create_project(
                 boss_protocol::CreateProjectInput::builder()

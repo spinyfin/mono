@@ -338,10 +338,11 @@ fn finalize_lost_automation_triage_run(work_db: &WorkDb, execution: &WorkExecuti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
     use tempfile::TempDir;
 
     use crate::dispatch_events::NoopDispatchEventSink;
-    use crate::work::{AutomationFireRecord, CreateChoreInput, CreateProductInput, WorkDb};
+    use crate::work::{AutomationFireRecord, CreateChoreInput, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
         AutomationTrigger, CreateAutomationInput, ExecutionStatus,
@@ -354,16 +355,7 @@ mod tests {
     }
 
     fn create_product(db: &WorkDb) -> String {
-        db.create_product(CreateProductInput {
-            name: "test-product".to_owned(),
-            description: None,
-            repo_remote_url: Some("https://github.com/test/repo".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id
+        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
     }
 
     fn create_automation(db: &WorkDb, product_id: &str) -> String {

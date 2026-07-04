@@ -118,16 +118,7 @@ fn migration_v6_to_v7_relaxes_work_attention_items() {
 fn conflict_resolution_round_trip() {
     let path = temp_db_path("conflict-resolution-rt");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".into(),
-            description: None,
-            repo_remote_url: Some("git@example.invalid:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@example.invalid:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -472,16 +463,7 @@ fn fresh_init_includes_ci_phase7_schema() {
     // design's documented default budget (3). A product inserted
     // through the normal path picks that up without the caller
     // having to set it.
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", None);
     let budget: i64 = conn
         .query_row(
             "SELECT ci_attempt_budget FROM products WHERE id = ?1",
@@ -541,16 +523,7 @@ fn fresh_init_includes_effort_escalations_table() {
 fn record_and_list_effort_escalations_round_trip() {
     let path = temp_db_path("effort-escalations-rt");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".into(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -961,16 +934,7 @@ fn derive_external_ref_web_url_github() {
 #[test]
 fn list_external_refs_returns_empty_when_no_refs_set() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "NoRefs".into(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "NoRefs", None);
     let refs = db.list_external_refs_for_product(&product.id).unwrap();
     assert!(refs.is_empty());
 }
@@ -1270,16 +1234,7 @@ fn task_blocked_signals_pk_enforced() {
 fn manual_override_writes_ci_failure_suppression() {
     let path = disk_db_path("ci-manual-override");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1351,16 +1306,7 @@ fn manual_override_writes_ci_failure_suppression() {
 fn manual_override_from_exhausted_writes_suppression() {
     let path = disk_db_path("ci-manual-override-exh");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1418,16 +1364,7 @@ fn manual_override_from_exhausted_writes_suppression() {
 fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
     let path = disk_db_path("ci-churn");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1523,16 +1460,7 @@ fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
 fn manual_move_unrelated_to_ci_does_not_write_suppression() {
     let path = disk_db_path("ci-manual-override-noop");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "P".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1868,16 +1796,7 @@ fn resolve_project_design_doc_classifies_other_product() {
     let (_product, project) = seed_project_for_design_doc(&db);
 
     // A second Boss product whose repo owns the design doc.
-    let wiki_product = db
-        .create_product(CreateProductInput {
-            name: "Wiki".to_owned(),
-            description: None,
-            repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let wiki_product = create_test_product_with_repo(&db, "Wiki", Some("https://github.com/myorg/wiki.git"));
 
     db.set_project_design_doc(SetProjectDesignDocInput {
         project_id: project.id.clone(),
@@ -2030,16 +1949,7 @@ fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
 
     // Product without a repo_remote_url, so a project that
     // doesn't supply one either has nothing to resolve against.
-    let product = db
-        .create_product(CreateProductInput {
-            name: "NoRepo".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "NoRepo", None);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),

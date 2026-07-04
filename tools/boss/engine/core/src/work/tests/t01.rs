@@ -93,16 +93,7 @@ fn restore_work_item_clears_tombstone() {
     let path = temp_db_path("restore");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -211,16 +202,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
     let path = temp_db_path("create-many-tasks");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -270,16 +252,7 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
     let path = temp_db_path("create-many-tasks-rollback");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -328,16 +301,7 @@ fn create_many_chores_inserts_all_atomically() {
     let path = temp_db_path("create-many-chores");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:test/repo.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
 
     let inputs = (0..3)
         .map(|i| {
@@ -368,16 +332,7 @@ fn work_tree_includes_runtime_status_per_task() {
     let path = temp_db_path("runtime");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore_idle = db
         .create_chore(
             CreateChoreInput::builder()
@@ -449,16 +404,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
     let path = temp_db_path("runtime_single");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -519,16 +465,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
     let path = temp_db_path("deps");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let prereq = db
         .create_chore(
             CreateChoreInput::builder()
@@ -556,16 +493,7 @@ fn work_tree_includes_product_scoped_dependency_edges() {
 
     // A second product with its own edge — must NOT leak into the
     // first product's tree.
-    let other_product = db
-        .create_product(CreateProductInput {
-            name: "Other".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let other_product = create_test_product_with_repo(&db, "Other", Some("git@github.com:spinyfin/other.git"));
     let other_prereq = db
         .create_chore(
             CreateChoreInput::builder()
@@ -671,16 +599,7 @@ fn reorders_project_tasks() {
     let path = temp_db_path("reorder");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -730,16 +649,7 @@ fn creates_and_lists_execution_entities() {
     let path = temp_db_path("executions");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -880,16 +790,7 @@ fn execution_requires_repo_remote_url_snapshot() {
     let path = temp_db_path("execution-repo");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
 
     let err = db
         .create_execution(
@@ -923,16 +824,7 @@ fn reconciles_missing_executions_for_product_tree() {
     let path = temp_db_path("reconcile-tree");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1011,16 +903,7 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
     let path = temp_db_path("reconcile-promote");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1084,16 +967,7 @@ fn reconcile_waits_for_product_repo_remote_url() {
     let path = temp_db_path("reconcile-repo");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     let project = db
         .create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -1164,16 +1038,7 @@ fn reconcile_dispatches_chore_against_repo_override() {
 
     // Product has no default repo — the chore provides its own override.
     // (enforce_task_repo_invariant rejects setting both simultaneously.)
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1211,16 +1076,7 @@ fn reconcile_surfaces_repo_unresolved_attention_when_unresolvable() {
     let path = temp_db_path("reconcile-repo-unresolved");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     // Neither product nor chore has a repo — enforce_task_repo_invariant now
     // blocks this at the API layer. Insert via raw SQL to represent a
     // pre-existing legacy row that the reconciler must handle gracefully.
@@ -1281,16 +1137,7 @@ fn request_execution_refuses_when_repo_unresolvable() {
     let path = temp_db_path("request-exec-repo-unresolved");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     // Neither product nor chore has a repo — enforce_task_repo_invariant now
     // blocks this at the API layer. Insert via raw SQL to represent a
     // pre-existing legacy row.
@@ -1343,16 +1190,7 @@ fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
     let path = temp_db_path("reconcile-repair-override");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", None);
     // Neither product nor chore has a repo — enforce_task_repo_invariant now
     // blocks this at the API layer. Insert via raw SQL to represent a
     // pre-existing legacy row.
@@ -1397,16 +1235,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     let path = temp_db_path("start-run");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1562,16 +1391,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     let path = temp_db_path("cancel-active");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1623,16 +1443,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     let path = temp_db_path("cancel-preserve");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1683,16 +1494,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
     let path = temp_db_path("ai-reviewing-running-only");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1801,16 +1603,7 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
     let path = temp_db_path("ai-reviewing-post-spawn");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1902,16 +1695,7 @@ fn start_execution_does_not_downgrade_done_chores() {
     let path = temp_db_path("no-downgrade");
     let db = WorkDb::open(path.clone()).unwrap();
 
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -1969,16 +1753,7 @@ fn start_execution_does_not_downgrade_done_chores() {
 fn reconcile_dispatches_active_chore_with_no_execution() {
     let path = temp_db_path("reconcile-no-exec");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2016,16 +1791,7 @@ fn reconcile_dispatches_active_chore_with_no_execution() {
 fn reconcile_redispatches_when_latest_execution_is_terminal() {
     let path = temp_db_path("reconcile-terminal");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2069,16 +1835,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
 fn reconcile_skips_active_chore_with_live_execution() {
     let path = temp_db_path("reconcile-live");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2125,16 +1882,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
 fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     let path = temp_db_path("reconcile-stale");
     let db = WorkDb::open(path.clone()).unwrap();
-    let product = db
-        .create_product(CreateProductInput {
-            name: "Boss".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product(&db);
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -2181,16 +1929,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
 /// Helper: product + chore + a started run on `host_id`, returning the
 /// execution id. The run lands in `work_runs` with status `active`.
 fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
-    let product = db
-        .create_product(CreateProductInput {
-            name: "p".to_owned(),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_named(db, "p");
     let chore = db
         .create_chore(
             CreateChoreInput::builder()

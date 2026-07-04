@@ -185,9 +185,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::work::{
-        AddDependencyInput, CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch,
-    };
+    use crate::test_support::*;
+    use crate::work::{AddDependencyInput, CreateChoreInput, ExecutionStatus, WorkDb, WorkItemPatch};
 
     fn open_db() -> (TempDir, WorkDb) {
         let dir = TempDir::new().unwrap();
@@ -196,16 +195,7 @@ mod tests {
     }
 
     fn create_product(db: &WorkDb) -> String {
-        db.create_product(CreateProductInput {
-            name: "test-product".to_owned(),
-            description: None,
-            repo_remote_url: Some("https://github.com/test/repo".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap()
-        .id
+        create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id
     }
 
     fn create_chore(db: &WorkDb, product_id: &str, name: &str) -> String {

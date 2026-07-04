@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 
 use super::*;
 use crate::merge_poller::{CiProvider, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
-use crate::work::{CreateChoreInput, CreateProductInput, TaskStatus, WorkDb, WorkItem, WorkItemPatch};
+use crate::test_support::*;
+use crate::work::{CreateChoreInput, TaskStatus, WorkDb, WorkItem, WorkItemPatch};
 
 #[derive(Default)]
 struct RecordingPublisher {
@@ -29,16 +30,7 @@ impl ExecutionPublisher for RecordingPublisher {
 }
 
 fn make_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, String) {
-    let product = db
-        .create_product(CreateProductInput {
-            name: format!("Product-{name}"),
-            description: None,
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
-        .unwrap();
+    let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("git@github.com:foo/bar.git"));
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
